@@ -153,7 +153,9 @@ def _registry(media, *server_types):
 
 
 def _item(path, hints=None):
-    return ProcessableItem(canonical_path=path, server_id="plex-1", item_id_by_server=hints or {}, title="R&M S01E01")
+    return ProcessableItem(
+        canonical_path=path, server_id="plex-1", item_id_by_server=hints or {}, title=os.path.basename(path)
+    )
 
 
 def _run(ctx, media, publishers, probe=None, stage="check", probe_effect=None, hints=None, **kwargs):
@@ -927,6 +929,7 @@ class TestKind:
         _run(_ctx(store, reg, clients=clients), ambiguous, {"jellyfin-1": jf}, probe=_probe(CHAPTERS_OPENING))
         calls_after_first = [len(c.calls) for c in clients.values()]
         out, _ = _run(_ctx(store, reg, clients=clients), ambiguous, {"jellyfin-1": jf})
+        # Not even for the job log's title: the first run's answer is the file's one lookup this process.
         assert server.get_external_ids.call_count == 1
         assert store.get_file(ambiguous).is_movie is (cached == "movie")
         assert [len(c.calls) for c in clients.values()] == calls_after_first
@@ -4679,7 +4682,10 @@ class TestStages:
         (rec,), kwargs = detector.call_args
         assert rec.canonical_path == media and rec.duration_ms == DUR
         assert kwargs["ctx"] is ctx and kwargs["gpu"] == "NVIDIA" and kwargs["gpu_device_path"] == "cuda:0"
-        assert kwargs["cancel_check"] is cancel and kwargs["phase_callback"] is phase
+        assert kwargs["cancel_check"] is cancel
+        # The phase reaches the worker row; the pipeline also keeps it for the detector's job log line.
+        kwargs["phase_callback"]("Reading the credits…")
+        phase.assert_called_with("Reading the credits…")
         # The job's own pause lets the running file finish; what freezes its ffmpeg is the job's freeze check.
         assert kwargs["pause_check"] is ctx.freeze_check and kwargs["pause_check"] is not pause
         assert clients["theintrodb"].calls[0]["cancel_check"] is cancel

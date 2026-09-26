@@ -766,6 +766,13 @@ class TestGoneFromDiskThroughThePipeline:
         logs = engine.jm.get_logs(job_id)
         assert any("INFO - Done: 1 file" in line and "1 gone from disk" in line for line in logs), logs
         assert not any("ERROR" in line or "not on disk" in line for line in logs), logs
+        # One compact line for the file; the app log's longer account stays out of the job's log.
+        messages = [line.split("] ", 1)[1] for line in logs]
+        assert (
+            "INFO - Rick and Morty (2013) S01E01: Skipped: replaced by a newer file (Rick and Morty (2013) - S01E01 - "
+            "Pilot.mkv)"
+        ) in messages, logs
+        assert not any("Source file" in line for line in logs), logs
 
     def test_a_webhook_file_missing_that_appears_later_is_published_by_the_retry(self, engine, setup, monkeypatch):
         _, publishers = setup.make([("plex-1", ServerType.PLEX)])
@@ -1037,6 +1044,46 @@ class TestCreditTextOnTheWorkers:
         assert row["worker"] == "GPU Worker 1 (Test GPU)"
         assert self._released(engine)
 
+    @pytest.mark.parametrize("rerun", [False, True], ids=["on-the-gpu", "cpu-rerun"])
+    def test_the_job_log_gives_every_line_its_own_record_in_order(self, engine, setup, rerun):
+        import re
+
+        from media_preview_generator.markers.credits import frames
+
+        if rerun:
+            setup.effects["gpu"] = frames.GpuDecodeError("the GPU decoded no frames from S01E01.mkv")
+        job = self._run(engine, setup)
+        logs = engine.jm.get_logs(job.id)
+        # Every entry is one record: its own time and level, then its message (a detail line keeps its indent).
+        stamped = [re.fullmatch(r"\[\d\d:\d\d:\d\d\] (INFO|WARNING|ERROR) - (.*)", line) for line in logs]
+        assert all(stamped), logs
+        messages = [match.group(2) for match in stamped]
+        episode = "Rick and Morty (2013) S01E01"
+        worker = "GPU Worker 1 (Test GPU)"
+        # One start line replaces the runner's, the job manager's and the dispatcher's.
+        assert messages[0] == f"Intro & Credits job {job.id[:8]} started: 1 file, manual run"
+        assert not [m for m in messages if m.startswith(("Started job", "Dispatcher: submitted"))]
+        start = messages.index(f"{worker} picked up {episode}: checking credits")
+        end = next(n for n, m in enumerate(messages) if m.startswith(f"{episode}: done in "))
+        read_on = "the CPU" if rerun else "the GPU"
+        # The file's lines are written together as it finishes; the worker's own GPU fallback warning comes before.
+        block = messages[end - 3 : end]
+        assert [line.split(":", 1)[0] for line in block] == ["  Credit text", "  Decided", "  Sent to PLEX-1"]
+        assert re.fullmatch(rf"  Credit text: none found \(read on {read_on} in [\d.]+ s\)", block[0]), block
+        assert block[1:] == ["  Decided: credits nothing found", "  Sent to PLEX-1: nothing to send"]
+        assert start < end - 3
+        assert re.fullmatch(
+            rf"{re.escape(episode)}: done in [\d.]+ s on GPU Worker 1" + (", rerun on the CPU" if rerun else ""),
+            messages[end],
+        )
+        # The totals come after the file's lines, however the job log's queue was drained; the job manager's own
+        # completion line stays last.
+        assert messages[-2:] == [
+            "Done: 1 file · 0 sent to PLEX-1 · 0 need review · 1 nothing found",
+            f"Job {job.id} completed successfully",
+        ]
+        assert end < len(messages) - 2
+
     def test_a_file_cut_short_is_no_gpu_fallback_and_is_not_read_again(self, engine, setup, monkeypatch):
         # Production, 2026-09-26: 14 of 19 GPU->CPU fallbacks were files cut short, the GPU blamed for each.
         from media_preview_generator.markers.credits import detector, frames
@@ -1057,6 +1104,7 @@ class TestCreditTextOnTheWorkers:
         assert job.status is JobStatus.COMPLETED and job.error is None
         assert _outcome(engine.jm, job.id) == {"markers_none": 1}
         assert self._released(engine)
+        assert f"INFO -   Credit text: {cut_short}" in [line.split("] ", 1)[1] for line in engine.jm.get_logs(job.id)]
 
         # The next scan of the same file: no worker, no decode.
         again = self._run(engine, setup)
@@ -1064,6 +1112,10 @@ class TestCreditTextOnTheWorkers:
         assert measured == [DURATION / 1000 - frames.EPISODE_TAIL_S]
         assert again.status is JobStatus.COMPLETED and _outcome(engine.jm, again.id) == {"markers_none": 1}
         assert any(cut_short in line for line in engine.jm.get_logs(again.id))
+        # Nothing changed since, so the file's one line says so.
+        assert "INFO - Rick and Morty (2013) S01E01: unchanged, nothing sent to PLEX-1; nothing found" in [
+            line.split("] ", 1)[1] for line in engine.jm.get_logs(again.id)
+        ]
         assert detector.credits_text_failed_here(rec, SimpleNamespace(store=setup.store)) is True
 
     def test_a_gpu_that_misses_frames_the_cpu_reads_is_a_gpu_fallback(self, engine, setup, monkeypatch):
@@ -1085,6 +1137,14 @@ class TestCreditTextOnTheWorkers:
         )
         assert job.status is JobStatus.COMPLETED and _outcome(engine.jm, job.id) == {"markers_none": 1}
         assert self._released(engine)
+        import re
+
+        credit_text = [line for line in engine.jm.get_logs(job.id) if "INFO -   Credit text: " in line]
+        assert len(credit_text) == 1, credit_text
+        assert re.search(
+            r"INFO -   Credit text: none found \(read on the CPU after the GPU read nothing \([\d.]+ s in all\)\)$",
+            credit_text[0],
+        ), credit_text
 
     def test_text_detection_read_on_the_cpu_on_a_gpu_worker_shows_on_the_worker_row(self, engine, setup):
         # The GPU helper failed this request: the pool reads it on the CPU and says so through the worker's callback.

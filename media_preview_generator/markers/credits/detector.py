@@ -92,6 +92,8 @@ DENSE_BOXES = rule_j.RULE_J.dense * RETRY_SCALE
 READING_PHASE = "Reading the credits…"
 REFINING_PHASE = "Refining the credits start…"
 REFINING_END_PHASE = "Finding where the credits end…"
+# Shown while the CPU reads again a tail the GPU read no frames from (and how the job log tells that reading apart).
+CPU_RECHECK_PHASE = "The GPU read no frames there; reading the credits on the CPU…"
 # A file whose decode timed out isn't decoded again for this long unless it changes or the run is forced (I1).
 TIMEOUT_RETRY = timedelta(days=1)
 _GIVES_UP = "credits_text_gives_up"
@@ -760,6 +762,8 @@ def detect_credits_text(
             # A GPU that silently misses frames and a file cut short look the same here: the CPU (the worker model's
             # fallback, as a failed decode's rerun) reads the file again, and only frames there make it the GPU's miss.
             logger.info("{}: {}; checking on CPU", name, exc)
+            if phase_callback is not None:
+                phase_callback(CPU_RECHECK_PHASE)
             result = read(None, None, None)
             if result.key_rows:
                 _gpu_missed(name, fallback_callback)
