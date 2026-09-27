@@ -42,8 +42,8 @@ _MISSING_CHECKED_UP_TO = "missing_files_checked_up_to"
 # build refuses the new schema, and the copy is what a downgrade puts back.
 _BACKUP_BEFORE_SCHEMA = 3
 BACKUP_SUFFIX = ".pre-v3.bak"
-# A pair's cached runs are versioned ``SEASON_AUDIO_VERSION + step × speeds`` (``audio.season.SeasonClock``, which
-# takes the step from here): caching a pair drops its rows of another season audio version, which nothing reads again.
+# A pair's cached runs are versioned ``PAIR_RUNS_VERSION + step × speeds`` (``audio.season.SeasonClock``, which
+# takes the step from here): caching a pair drops its rows of another runs version, which nothing reads again.
 PAIR_VERSION_STEP = 1_000
 # How far a replaced file's length may be from the new one's for the carry-over (``carry_over``): a snapshot with no
 # marker doesn't replace one with a marker unless their lengths are this close (a run over a half-copied file reads a

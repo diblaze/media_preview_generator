@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from typing import Any
 
 from .models import MediaIds
@@ -25,6 +26,9 @@ _SEASON_DIR_RE = re.compile(
     r"|^specials$",
     re.IGNORECASE,
 )
+_TRAILING_NUMBER_RE = re.compile(r"(\d{1,4})$")
+# Which id names a show folder's show when its name carries several (``show_key``).
+_SHOW_ID_ORDER = ("tvdb", "tmdb", "imdb")
 # Daily/talk-show dated episodes ("Show - 2024-01-15.mkv"): no SxxEyy to parse, and the
 # filename shape itself (not a movie convention) rules out guessing "movie" from a nearby id.
 _DATE_EPISODE_RE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
@@ -91,6 +95,80 @@ def is_season_folder(name: str) -> bool:
         True for a season folder.
     """
     return bool(_SEASON_DIR_RE.match(name))
+
+
+def season_folder_number(name: str) -> int | None:
+    """The season a season folder is named for (:func:`is_season_folder`).
+
+    Args:
+        name: One folder name.
+
+    Returns:
+        Its number (``Season 02`` and ``S2`` are 2), 0 for ``Specials``, None for a name that isn't a season folder.
+    """
+    if not is_season_folder(name):
+        return None
+    digits = _TRAILING_NUMBER_RE.search(name)
+    return int(digits.group(1)) if digits else 0
+
+
+def show_key(name: str) -> tuple[str, str]:
+    """What names a show folder's show: the first id its name carries of tvdb, tmdb and imdb (``{tvdb-…}``,
+    ``[tmdbid=…]``, ...), else its name without id tags, ignoring case and spacing. One key per folder, so "the same
+    show" is an equivalence: two folders are it or aren't, whichever of them is asked from.
+
+    Args:
+        name: A show folder's name.
+
+    Returns:
+        ``(scheme, value)``, or ``("name", bare name)``.
+    """
+    ids = _ids_in(name)
+    for scheme in _SHOW_ID_ORDER:
+        if scheme in ids:
+            return scheme, ids[scheme]
+    return "name", _bare_name(name)
+
+
+def same_show_names(name: str, entries: Iterable[str]) -> list[str]:
+    """The entries of a folder that are the same show as ``name`` (the same :func:`show_key`).
+
+    Only an entry holding the key's id, or the longest word of the name (one with a letter, so not the year), can be:
+    the rest aren't parsed (a TV library's folder can hold thousands of shows).
+
+    Args:
+        name: A show folder's name.
+        entries: Names in another folder.
+
+    Returns:
+        The matching entries.
+    """
+    key = show_key(name)
+    if key[0] == "name":
+        words = _ID_RE.sub(" ", name).split()  # as spelled: a casefolded "ß" is "ss", which "ß" doesn't match
+        lettered = [word for word in words if any(ch.isalpha() for ch in word)] or words
+        hint = max(lettered, key=len) if lettered else ""
+    else:
+        hint = key[1]
+    listed = list(entries)
+    if not hint:
+        return [entry for entry in listed if show_key(entry) == key]
+    could_be = re.compile(re.escape(hint), re.IGNORECASE)
+    # One scan of the listing joined by newlines, then each hit's line (a name holding a newline is checked alone).
+    text = "\n".join(entry for entry in listed if "\n" not in entry)
+    line_starts = sorted({text.rfind("\n", 0, hit.start()) + 1 for hit in could_be.finditer(text)})
+    found = [_line_at(text, at) for at in line_starts]
+    found += [entry for entry in listed if "\n" in entry]
+    return [entry for entry in found if show_key(entry) == key]
+
+
+def _line_at(text: str, start: int) -> str:
+    end = text.find("\n", start)
+    return text[start:] if end < 0 else text[start:end]
+
+
+def _bare_name(name: str) -> str:
+    return " ".join(_ID_RE.sub(" ", name).split()).casefold()
 
 
 def is_extra(canonical_path: str) -> bool:

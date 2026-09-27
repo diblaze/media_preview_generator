@@ -1,11 +1,13 @@
 """Season step (spec §5.3, §6.2 step 4, §6.4 items 4–5): the v3 matcher over a season's episodes, and the season's intro
 chapters (finding F1).
 
-A season group is the episodes of a file's folder with the same season number in their names, at most the 40 nearest by
-episode number (a flat folder can hold hundreds). Fingerprinting needs a worker (CPU ffmpeg, at most two at once): the
-first episode of a group to get one fingerprints every member that has none, so the rest of the season matches from
-cached fingerprints on the checking threads. An episode alone in its folder (a new season's first weekly release) matches against up to four cached
-episodes of the previous season; that answer is a hint (``Source.SEASON_AUDIO_PREVIOUS``). Neither decides alone in
+A season group is the episodes of a file's season with the same season number in their names, at most the 40 nearest
+by episode number (a flat folder can hold hundreds). The season is the file's folder and, in a library spread over
+several disks, the same show's folders for that season on the others (``season_folders``). Fingerprinting needs a
+worker (CPU ffmpeg, at most two at once): the first episode of a group to get one fingerprints every member that has
+none, so the rest of the season matches from cached fingerprints on the checking threads. An episode alone in its group
+(a new season's first weekly release) matches against up to four cached episodes of the previous season; that answer is
+a hint (``Source.SEASON_AUDIO_PREVIOUS``). Neither decides alone in
 phase 2 (owner, 2026-09-14). Episodes whose answer is out of date and whose intro is still undecided, or was decided
 with that answer, are handed to the job as follow-ups, which a "Season" job decides again: by the run that fingerprints
 the season, and by every run of an episode of the group (one that arrives decided by its chapters never matches).
@@ -17,13 +19,14 @@ The matcher's clusters are walked with guards against a network ident or a cold-
 from __future__ import annotations
 
 import bisect
+import errno
 import functools
 import hashlib
 import json
 import math
 import os
-import re
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -34,8 +37,9 @@ from loguru import logger
 from ...plex_client import VIDEO_EXTENSIONS
 from ..carry_over import is_carried_over
 from ..decide import DecisionStatus, intro_chapter_length_ms, intro_chapter_limit_ms
-from ..external_ids import ids_from_path, is_extra
+from ..external_ids import ids_from_path, is_extra, same_show_names, season_folder_number
 from ..freeze import Freeze
+from ..missing import library_folders
 from ..models import Candidate, FileIdentity, MarkerType, Source
 from ..outcomes import is_kept_own
 from ..probe import MediaProbe, ProbeError, ProbeStalledError, probe_media
@@ -64,21 +68,29 @@ from .matcher import (
     IntroSegment,
     Run,
     file_hits,
+    floats,
     intro_candidates,
+    meets_opening_quorum,
     meets_quorum,
     pair_runs,
 )
 
 if TYPE_CHECKING:
+    from ...servers.base import ServerConfig
     from ..pipeline import DetectorAnswer, LocalDetectorSpec, PipelineContext
     from ..store import FileRecord
 
 # The season step's own version (matcher v3 plus the silence guard, the provable pair skip, the group rule, the guards
 # against idents and music beds with where a stretch needs no dense core, matching a season of 25 fps and film-rate
-# releases at one speed, v8 with the end-picture check's move to one scaler for every vendor, and v9 a file retimed
-# only when its audio says so): stored with its answers and with cached pairs, so a change to any of them is matched
-# again.
-SEASON_AUDIO_VERSION = 9
+# releases at one speed, v8 with the end-picture check's move to one scaler for every vendor, v9 a file retimed only
+# when its audio says so, and v10 a season's folders on every disk of the library, the quorum of a second opening, a
+# bumper at the file start giving way to the title sequence and a stretch cut by the fingerprint window passed over):
+# stored with its answers, so a change to any of them is decided again.
+SEASON_AUDIO_VERSION = 10
+# What a pair's cached runs are versioned by (with the speeds, below): the runs themselves (``season_pair_runs``) last
+# changed with season audio v9, so the pairs matched since stay cached through v10's new picking rules. Bump it with any
+# change to what a pair's runs are.
+PAIR_RUNS_VERSION = 9
 # What an answer is stored under: this version, and the end-picture check's (the guard's ``end_picture.CHECK_VERSION``)
 # past its first, so a new check makes every stored answer older too, for its next run and for the re-run of answers
 # from an older version (``markers.versions``): a change to the check alone needs only the check's version. The check's
@@ -127,6 +139,10 @@ MAX_INTRO_SILENCE = 0.5
 # checking thread. Two silent 900 s openings are 53 million (about 1.2 s); the most any same-season pair of the
 # 118-episode eval has is 3,893.
 MAX_INLINE_PAIR_MATCHES = 2_000_000
+# Pairs a checking thread matches for one episode's pick: one episode's worth (its own 39 at most, and a few more). The
+# quorum of a second opening asks for other episodes' pairs, up to all of the group's; more than this is a worker's job,
+# and the pairs it caches serve every sibling's check after it.
+MAX_INLINE_NEW_PAIRS = MAX_GROUP_EPISODES
 # The matcher indexes values within ±2 of each other (matcher._VALUE_SHIFTS) and breaks a run after this many points
 # that don't match (matcher._GAP_PTS).
 _VALUE_SPREAD = 2
@@ -136,7 +152,6 @@ _GAP_PTS = int(MAX_GAP_S / POINT_S)
 # of an overlap's edges is at least the overlap minus 55 points long, so an overlap of 1024 points only holds longer ones.
 _TOO_LONG_RUN_PTS = math.floor(MAX_INTRO_S / POINT_S) + 1
 _TOO_LONG_OVERLAP_PTS = _TOO_LONG_RUN_PTS + 2 * (_GAP_PTS - 1) + 1
-_SEASON_FOLDER_RE = re.compile(r"^(?:season|series|staffel|saison)\s*(\d{1,4})$", re.IGNORECASE)
 _SEASON_AUDIO_SOURCES = frozenset({Source.SEASON_AUDIO.value, Source.SEASON_AUDIO_PREVIOUS.value})
 # An episode's new season audio answer that moved less than this at both ends keeps the times stored with its last
 # one. Every episode that joins the season matches the others again and moves their answers by a few milliseconds;
@@ -168,8 +183,44 @@ def _folder_video(path: str) -> FolderVideo:
     return FolderVideo(path, ids.season, ids.episode)
 
 
-def folder_videos(folder: str) -> tuple[FolderVideo, ...]:
-    """The video files of a folder that aren't extras (read once, then shared by every group of the folder)."""
+# Errors that say a disk is there but can't be read right now (a stale or hung network mount, a failing disk): the
+# season can't be told until it reads again. Any other error (not a folder, no permission) is lasting, and the folder is
+# taken as holding nothing of the season.
+_PASSING_ERRNOS = frozenset({errno.ESTALE, errno.EIO, errno.ENOTCONN, errno.ETIMEDOUT, errno.EHOSTDOWN})
+# How often the same folder's trouble is logged (a season on a stale disk is asked about on every episode's run).
+_LOG_AGAIN_AFTER_S = 3600.0
+_logged_at: dict[str, float] = {}
+
+
+def _log_once_in_a_while(folder: str, message: str, *args: object, warning: bool = False) -> None:
+    now = time.monotonic()
+    last = _logged_at.get(folder)
+    if last is not None and now - last < _LOG_AGAIN_AFTER_S:
+        return
+    _logged_at[folder] = now
+    (logger.warning if warning else logger.info)(message, *args)
+
+
+def _listing_failed(folder: str, exc: OSError, unreadable: set[str] | None) -> None:
+    """Note a folder whose listing failed: ``unreadable`` gains it for an error that passes; a lasting one other than
+    "not found" or "not a folder" is logged (no permission)."""
+    if exc.errno in _PASSING_ERRNOS:
+        if unreadable is not None:
+            unreadable.add(folder)
+    elif not isinstance(exc, FileNotFoundError | NotADirectoryError):
+        _log_once_in_a_while(folder, "Season audio can't list {}: {}", folder, exc, warning=True)
+
+
+def folder_videos(folder: str, unreadable: set[str] | None = None) -> tuple[FolderVideo, ...]:
+    """The video files of a folder that aren't extras (read once, then shared by every group of the folder).
+
+    Args:
+        folder: The folder.
+        unreadable: Gains the folder when it is there but can't be read right now (``_PASSING_ERRNOS``).
+
+    Returns:
+        Its videos; none when it can't be read.
+    """
     try:
         with os.scandir(folder) as entries:
             return tuple(
@@ -179,23 +230,143 @@ def folder_videos(folder: str) -> tuple[FolderVideo, ...]:
                 and not is_extra(entry.path)
                 and entry.is_file()
             )
-    except OSError:
+    except OSError as exc:
+        _listing_failed(folder, exc, unreadable)
         return ()
+
+
+def _entry_names(folder: str, unreadable: set[str] | None) -> list[str]:
+    try:
+        return os.listdir(folder)
+    except OSError as exc:
+        _listing_failed(folder, exc, unreadable)  # not found: the show, or its folder, isn't on that disk
+        return []
+
+
+def _show_folders(show: str, configs: Iterable[ServerConfig], unreadable: set[str] | None) -> set[str]:
+    """A show folder and the same show's folders at its place under the other folders of each library holding it, and
+    of each library holding one of those (so every folder of the show finds the same set, whichever libraries hold it)."""
+    libraries = [
+        {os.path.normpath(folder) for folder, _mapping_root in folders if folder} - {"/"}
+        for folders in library_folders(configs)
+    ]
+    name = os.path.basename(show)
+    found, waiting, listed = {show}, [show], set()
+    while waiting:
+        folder = waiting.pop()
+        for roots in libraries:
+            holding = [root for root in roots if folder.startswith(root + "/")]
+            if not holding:
+                continue
+            home = max(holding, key=len)
+            below = os.path.relpath(os.path.dirname(folder), home)
+            for root in roots:
+                if root != home and (root.startswith(home + "/") or home.startswith(root + "/")):
+                    continue  # a library folder inside or around this one: the same place there is another show's
+                parent = root if below == "." else os.path.join(root, below)
+                if parent in listed:
+                    continue
+                listed.add(parent)
+                for entry in same_show_names(name, _entry_names(parent, unreadable)):
+                    other = os.path.join(parent, entry)
+                    if other not in found and os.path.isdir(other):  # not "Show {tvdb-1}.nfo" beside the folder
+                        found.add(other)
+                        waiting.append(other)
+    return found
+
+
+def _numbered_season_folders(shows: Iterable[str], number: int, unreadable: set[str] | None) -> set[str]:
+    return {
+        os.path.join(show, entry)
+        for show in shows
+        for entry in _entry_names(show, unreadable)
+        if season_folder_number(entry) == number and os.path.isdir(os.path.join(show, entry))
+    }
+
+
+def _distinct(folders: Iterable[str], first: str | None = None) -> tuple[str, ...]:
+    """``first``, then the other folders sorted, leaving out one that is the same directory as one kept (a linked
+    disk) and one that isn't a directory."""
+    kept = [first] if first is not None else []
+    seen = {os.path.realpath(first)} if first is not None else set()
+    for folder in sorted(set(folders) - {first}):
+        real = os.path.realpath(folder)
+        if real not in seen and os.path.isdir(folder):
+            seen.add(real)
+            kept.append(folder)
+    return tuple(kept)
+
+
+def season_folders(
+    canonical_path: str, configs: Iterable[ServerConfig], unreadable: set[str] | None = None
+) -> tuple[str, ...]:
+    """The folders a file's season is kept in: its own, and the same show's folders for that season on the library's
+    other disks (spec §5.3).
+
+    The file's show folder is its folder's parent when its folder is a season folder (``Season 02``, ``S2``,
+    ``Specials``: :func:`external_ids.season_folder_number`), else its folder (a show kept without season folders).
+    Under each folder of every enabled server's library holding the file, at the same place below it, the same show is
+    a folder with the same :func:`external_ids.show_key` (its tvdb, tmdb or imdb id, else its name); the libraries
+    holding one found are looked in too, so every folder of the show finds the same set. Its season is its season folder
+    with the same number, or the show folder itself for a show kept without them. Library folders inside or around the
+    deepest one holding a folder are left out (the same place there is another show's), and so is a folder that is the
+    same directory as one already listed (a linked disk). A path not in normal form (``..``, ``.``, doubled or trailing
+    slashes) keeps its own folder only.
+
+    Args:
+        canonical_path: Local path of one episode.
+        configs: The servers' configs.
+        unreadable: Gains each folder looked in that is there but can't be read right now (a stale network handle, an
+            I/O error): the season can't be told then. A missing folder is only one the show isn't in, and one that
+            can't be read for good (no permission, logged) holds nothing of it.
+
+    Returns:
+        The file's own folder first, then the others sorted.
+    """
+    own = os.path.dirname(canonical_path)
+    if not os.path.isabs(own) or os.path.normpath(own) != own:
+        return (own,)
+    number = season_folder_number(os.path.basename(own))
+    if number is None:
+        return _distinct(_show_folders(own, configs, unreadable), own)
+    shows = _show_folders(os.path.dirname(own), configs, unreadable)
+    return _distinct(_numbered_season_folders(shows, number, unreadable), own)
+
+
+def season_videos(
+    canonical_path: str, configs: Iterable[ServerConfig], unreadable: set[str] | None = None
+) -> tuple[FolderVideo, ...]:
+    """:func:`folder_videos` of each of a file's :func:`season_folders`: what :func:`season_group` picks from.
+
+    Args:
+        canonical_path: Local path of one episode.
+        configs: The servers' configs.
+        unreadable: As for :func:`season_folders`.
+
+    Returns:
+        The videos, folder by folder.
+    """
+    folders = season_folders(canonical_path, configs, unreadable)
+    return tuple(video for folder in folders for video in folder_videos(folder, unreadable))
+
+
+def _server_configs(ctx: PipelineContext) -> list[ServerConfig]:
+    return list(ctx.registry.configs())
 
 
 def season_group(canonical_path: str, videos: Sequence[FolderVideo] | None = None) -> SeasonGroup:
     """The episodes a file is matched with (spec §5.3: the season on disk, server-agnostic).
 
-    Files of its folder with the same season number in their names (files without one are a group of their own); in a
-    folder with more than 40 of them, the 40 nearest by episode number, ties by name (by position in name order when a
-    name carries no episode number).
+    Files of its season (its folder, or its :func:`season_videos` on every disk) with the same season number in their
+    names (files without one are a group of their own); with more than 40 of them, the 40 nearest by episode number,
+    ties by path (by position in path order when a name carries no episode number).
 
     Args:
         canonical_path: Local path of one episode.
-        videos: The folder's :func:`folder_videos`, when the caller already read them.
+        videos: The files to pick from (:func:`season_videos`); None reads the file's own folder only.
 
     Returns:
-        The folder and the group's paths, sorted, the file itself included.
+        The file's own folder and the group's paths, sorted, the file itself included.
     """
     folder = os.path.dirname(canonical_path)
     listed = folder_videos(folder) if videos is None else videos
@@ -218,7 +389,7 @@ def season_size(canonical_path: str, videos: Sequence[FolderVideo] | None = None
 
     Args:
         canonical_path: Local path of one episode.
-        videos: The folder's :func:`folder_videos`, when the caller already read them.
+        videos: The files to count from (:func:`season_videos`); None reads the file's own folder only.
 
     Returns:
         The count, the file itself included.
@@ -238,15 +409,15 @@ def groups_holding(
     videos: Sequence[FolderVideo],
     group_of: Callable[[str], SeasonGroup] | None = None,
 ) -> tuple[str, ...]:
-    """The other files of a folder whose own season group holds this file (in a flat folder, not only its group's).
+    """The other files of a season whose own season group holds this file (in a flat folder, not only its group's).
 
     A group is the 40 nearest files, so a file with 39 or more others strictly between it and this one (by episode
     number, or by name order when names carry none) can't hold it: those are all nearer to it. Only the rest are checked.
 
     Args:
         canonical_path: Local path of one episode.
-        videos: The folder's :func:`folder_videos`.
-        group_of: :func:`season_group` of another file of the folder, when the caller keeps them.
+        videos: The season's files (:func:`season_videos`).
+        group_of: :func:`season_group` of another file of the season, when the caller keeps them.
 
     Returns:
         Their paths, sorted.
@@ -277,31 +448,34 @@ def groups_holding(
     return tuple(holding)
 
 
-def previous_season_files(canonical_path: str) -> tuple[str, ...]:
-    """The first episodes (by path, at most 4) of the season folder numbered one lower than this file's.
+def previous_season_files(
+    canonical_path: str, configs: Iterable[ServerConfig] = (), unreadable: set[str] | None = None
+) -> tuple[str, ...]:
+    """The first episodes (by episode number, then path; at most 4) of the season numbered one lower than this file's,
+    in the same show's folders on every disk of the library (:func:`season_folders`).
 
     Args:
         canonical_path: Local path of one episode.
+        configs: The servers' configs (none: the file's own show folder only).
+        unreadable: As for :func:`season_folders`.
 
     Returns:
-        Their paths; empty for specials, a first season, or a folder that isn't named like a season.
+        Their paths; empty for specials, a first season, a folder that isn't named like a season, or a path not in
+        normal form.
     """
     folder = os.path.dirname(canonical_path)
-    match = _SEASON_FOLDER_RE.match(os.path.basename(folder))
-    if not match or int(match.group(1)) <= 1:
+    number = season_folder_number(os.path.basename(folder))
+    if number is None or number <= 1 or not os.path.isabs(folder) or os.path.normpath(folder) != folder:
         return ()
-    wanted, show = int(match.group(1)) - 1, os.path.dirname(folder)
-    try:
-        names = sorted(os.listdir(show))
-    except OSError:
-        return ()
-    for name in names:
-        other = _SEASON_FOLDER_RE.match(name)
-        previous = os.path.join(show, name)
-        if other and int(other.group(1)) == wanted and os.path.isdir(previous):
-            episodes = sorted(v.path for v in folder_videos(previous) if v.season is not None)
-            return tuple(episodes[:MAX_PREVIOUS_SEASON_FILES])
-    return ()
+    shows = _show_folders(os.path.dirname(folder), configs, unreadable)
+    videos = [
+        video
+        for previous in _distinct(_numbered_season_folders(shows, number - 1, unreadable))
+        for video in folder_videos(previous, unreadable)
+        if video.season is not None
+    ]
+    videos.sort(key=lambda v: (v.episode is None, v.episode or 0, v.path))
+    return tuple(v.path for v in videos[:MAX_PREVIOUS_SEASON_FILES])
 
 
 def silence_share(points: np.ndarray) -> float:
@@ -447,16 +621,33 @@ def needs_dense_core(segment: IntroSegment) -> bool:
     return length_s < CORE_FREE_LATER_MIN_S or segment.support < CORE_FREE_LATER_MIN_SUPPORT
 
 
+def cut_by_window(segment: IntroSegment, points: np.ndarray) -> bool:
+    """Whether a stretch reaches the end of the episode's fingerprint (within the matcher's 3.5 s gap bridge): its end
+    there is the fingerprint window's, not the audio's, so the stretch may go on past it (Alias S02E09's title sequence
+    runs from 881 s to 906 s, and the 900 s window ended it at 897.5 s).
+
+    Args:
+        segment: A cluster's segment, in the episode's matched seconds.
+        points: The episode's fingerprint as matched.
+
+    Returns:
+        True when the stretch could go on past the window.
+    """
+    return segment.end_s >= (len(points) - 1) * POINT_S - MAX_GAP_S
+
+
 def _passes_guards(
     target: str,
     candidate: IntroCandidate,
     points: Mapping[str, np.ndarray],
     end_picture_passes: Callable[[IntroCandidate], bool],
 ) -> bool:
-    """Whether a candidate passes the guards against idents and music beds (``FILE_START_S`` above); the end picture,
-    the only one that decodes, is asked last."""
+    """Whether a candidate passes the guards against idents and music beds (``FILE_START_S`` above) and isn't cut by the
+    fingerprint window (:func:`cut_by_window`); the end picture, the only one that decodes, is asked last."""
     segment = candidate.segment
     if segment.start_s < FILE_START_S and segment.end_s - segment.start_s < MIN_FILE_START_LENGTH_S:
+        return False
+    if cut_by_window(segment, points[target]):
         return False
     if needs_dense_core(segment) and dense_core_s(target, candidate, points) < MIN_DENSE_CORE_S:
         return False
@@ -474,8 +665,13 @@ def guarded_pick(
     """The best ranked of the v3 matcher's clusters for one episode that passes the guards (before the silence guard).
 
     The clusters are walked in the matcher's ranking order (:func:`matcher.intro_candidates`): the walk ends, with no
-    intro, at the first cluster without the quorum; a quorum cluster that fails a guard (too short at the file's start,
-    no dense core where one is needed, or an early one whose end picture differs) is passed over.
+    intro, at the first cluster without the quorum, of the season or of its own opening
+    (:func:`matcher.meets_opening_quorum`); a quorum cluster that fails a guard (too short at the file's start, no dense
+    core where one is needed, an early one whose end picture differs, or one cut by the fingerprint window) is passed
+    over. A pick starting in the first 2 s gives way to the best later cluster that floats (:func:`matcher.floats`), has
+    the quorum and passes the guards: a stretch at the very start of every file, found as widely as the title sequence
+    that follows the cold open, is a bumper put before each episode (Star Trek: Strange New Worlds S04's "Star Trek 60",
+    0-28 s, found by 9 of 9 others against the title sequence's 7).
 
     Args:
         target: The episode (one of ``files``).
@@ -488,12 +684,34 @@ def guarded_pick(
         The cluster's segment with its support, or None.
     """
     others = len(files) - 1
-    for candidate in intro_candidates(file_hits(target, files, runs_between)):
-        if not meets_quorum(candidate.segment.support, others):
+    candidates = intro_candidates(file_hits(target, files, runs_between))
+    memo: dict = {}
+
+    def has_quorum(candidate: IntroCandidate) -> bool:
+        return meets_quorum(candidate.segment.support, others) or meets_opening_quorum(
+            target, candidate, files, runs_between, _season_and_episode, memo
+        )
+
+    def passes(candidate: IntroCandidate) -> bool:
+        return _passes_guards(target, candidate, points, end_picture_passes)
+
+    for candidate in candidates:
+        if not has_quorum(candidate):
             return None
-        if _passes_guards(target, candidate, points, end_picture_passes):
-            return candidate.segment
-    return None
+        if passes(candidate):
+            break
+    else:
+        return None
+    if candidate.segment.start_s < FILE_START_S:
+        end_s = candidate.segment.end_s
+        later = (c for c in candidates if c.segment.start_s >= end_s and floats(c) and has_quorum(c) and passes(c))
+        candidate = next(later, candidate)
+    return candidate.segment
+
+
+def _season_and_episode(path: str) -> tuple[int, int] | None:
+    video = _folder_video(path)
+    return None if video.season is None or video.episode is None else (video.season, video.episode)
 
 
 def season_intro(
@@ -542,7 +760,7 @@ class SeasonClock:
     factors: Mapping[str, float] = field(default_factory=dict)
 
     def pair_version(self, first: str, second: str) -> int:
-        """The version a pair's runs are cached under: :data:`SEASON_AUDIO_VERSION` for two files at their own speed,
+        """The version a pair's runs are cached under: :data:`PAIR_RUNS_VERSION` for two files at their own speed,
         and another for each combination of the two sides' speeds (own, retimed to film, retimed to 25 fps)."""
         return _pair_version(self.side(first), self.side(second))
 
@@ -552,7 +770,7 @@ class SeasonClock:
 
 
 def _pair_version(first_side: int, second_side: int) -> int:
-    return SEASON_AUDIO_VERSION + _PAIR_VERSION_STEP * (3 * first_side + second_side)
+    return PAIR_RUNS_VERSION + _PAIR_VERSION_STEP * (3 * first_side + second_side)
 
 
 def season_clock(speeds: Mapping[str, float | None]) -> SeasonClock:
@@ -782,9 +1000,14 @@ def season_intro_chapter_limits(ctx: PipelineContext, canonical_path: str) -> tu
 
     Returns:
         This episode's limit, and the limit each sibling would be decided with now (None: none applies, because the
-        episode has no intro chapter or fewer than two others have one).
+        episode has no intro chapter or fewer than two others have one). While a folder of the season can't be read,
+        the limit this episode's last decisions used, and no sibling.
     """
     view = _season_view(ctx, canonical_path)
+    if view.unreadable:
+        # The season can't be told: this episode keeps the limit its last decisions used, and no sibling is asked.
+        rec = _current_record(ctx, canonical_path)
+        return (ctx.store.get_intro_chapter_limit(rec.id)[1] if rec is not None else None), {}
     group = view.group()
     siblings = [path for path in group.episodes if path != canonical_path]
     siblings += [path for path in groups_holding(canonical_path, view.videos, view.group) if path not in group.episodes]
@@ -807,9 +1030,14 @@ def season_intro_chapter_limits(ctx: PipelineContext, canonical_path: str) -> tu
     return limit(canonical_path, group.episodes), {path: limit(path, episodes) for path, episodes in groups.items()}
 
 
-def _signature_paths(canonical_path: str, group: SeasonGroup) -> tuple[str, ...]:
+def _signature_paths(
+    canonical_path: str,
+    group: SeasonGroup,
+    configs: Iterable[ServerConfig],
+    unreadable: set[str] | None = None,
+) -> tuple[str, ...]:
     if len(group.episodes) == 1:
-        return group.episodes + previous_season_files(canonical_path)
+        return group.episodes + previous_season_files(canonical_path, configs, unreadable)
     return group.episodes
 
 
@@ -868,22 +1096,25 @@ def _signature(
 
 
 class _SeasonView:
-    """What one run of an episode reads of its season: the folder listing, groups, previous-season files, and each
+    """What one run of an episode reads of its season: its folders' listing, groups, previous-season files, and each
     file's signature item and signature. Kept for the run in ``ctx.run_memo`` (the pipeline drops it once a detector
     ran), so the chapter step, the follow-ups hook, the early-stop and pending checks (``season_audio_due``) and
-    ``needs_worker`` read the season once."""
+    ``needs_worker`` read the season once. ``unreadable`` holds the folders of the season's disks that are there but
+    can't be read: season audio then can't tell the season, and waits (``season_audio_due``)."""
 
     def __init__(self, ctx: PipelineContext, canonical_path: str) -> None:
         self._ctx = ctx
         self.canonical_path = canonical_path
-        self.videos = folder_videos(os.path.dirname(canonical_path))
+        self.configs = _server_configs(ctx)
+        self.unreadable: set[str] = set()
+        self.videos = season_videos(canonical_path, self.configs, self.unreadable)
         self.on_disk: dict[str, list] = {}
         self._groups: dict[str, SeasonGroup] = {}
         self._signatures: dict[str, str] = {}
         self._previous: tuple[str, ...] | None = None
 
     def group(self, path: str | None = None) -> SeasonGroup:
-        """The season group of this run's episode, or of another file of its folder."""
+        """The season group of this run's episode, or of another file of its season."""
         path = path or self.canonical_path
         if path not in self._groups:
             self._groups[path] = season_group(path, self.videos)
@@ -892,7 +1123,7 @@ class _SeasonView:
     def previous_season(self) -> tuple[str, ...]:
         """This run's episode's :func:`previous_season_files`."""
         if self._previous is None:
-            self._previous = previous_season_files(self.canonical_path)
+            self._previous = previous_season_files(self.canonical_path, self.configs, self.unreadable)
         return self._previous
 
     def signature(self, path: str) -> str:
@@ -902,7 +1133,7 @@ class _SeasonView:
             if path == self.canonical_path and len(group.episodes) == 1:
                 paths = group.episodes + self.previous_season()
             else:
-                paths = _signature_paths(path, group)
+                paths = _signature_paths(path, group, self.configs, self.unreadable)
             self._signatures[path] = _signature(self._ctx, paths, on_disk=self.on_disk)
         return self._signatures[path]
 
@@ -922,21 +1153,28 @@ def season_audio_due(rec: FileRecord, ctx: PipelineContext) -> bool:
         ctx: The job's context.
 
     Returns:
-        True when the detector should run again.
+        True when the detector should run again; False while a folder of the season's disks can't be read (the stored
+        answer stands: a season read without that disk would be another one, and read again once it is back).
     """
-    current = _season_view(ctx, rec.canonical_path).signature(rec.canonical_path)
+    view = _season_view(ctx, rec.canonical_path)
+    current = view.signature(rec.canonical_path)
+    if view.unreadable:
+        folders = ", ".join(sorted(view.unreadable))
+        _log_once_in_a_while(folders, "Season audio waits for {} to be read again", folders)
+        return False
     return ctx.store.get_detector_run(rec.id, Source.SEASON_AUDIO) != current
 
 
 def season_audio_needs_worker(rec: FileRecord, ctx: PipelineContext) -> bool:
     """Whether this episode's season audio has to run on a worker.
 
-    It does while an episode of the folder (this one included) still needs ffmpeg or ffprobe (a sibling's frame rate
+    It does while an episode of the group (this one included) still needs ffmpeg or ffprobe (a sibling's frame rate
     included; this episode's own is read here, inline like its own probe, when it was stored before frame rates were
     read), while a file at another frame rate than the group has no retimed fingerprint yet (:class:`SeasonClock`),
     while a pair not matched yet is too slow for a checking thread (:func:`slow_to_match`: long constant stretches in
-    both openings that don't provably rule out an intro) — one of this episode's, or one that tells a file at another
-    frame rate which speed its audio plays at (:func:`clock_by_audio`, pairs of other episodes included) — or while
+    both openings that don't provably rule out an intro) — one of this episode's, one that tells a file at another
+    frame rate which speed its audio plays at (:func:`clock_by_audio`, pairs of other episodes included), or one of
+    other episodes that the quorum of a second opening asks for (:func:`matcher.meets_opening_quorum`) — or while
     the season step would meet a cluster starting in the first 30 s whose end picture isn't checked yet (decoding is a
     worker's job). That last question is the season step itself, run here with the end-picture check reading only
     markers.db: the pairs it matches are cached for the detector, whichever thread it then runs on. Otherwise matching
@@ -951,6 +1189,8 @@ def season_audio_needs_worker(rec: FileRecord, ctx: PipelineContext) -> bool:
         True when the detector has to run on a worker.
     """
     view = _season_view(ctx, rec.canonical_path)
+    if view.unreadable:
+        return False  # not due (season_audio_due)
     group = view.group()
     fingerprinted: dict[str, tuple[FileRecord, np.ndarray]] = {}
     for path in group.episodes:
@@ -1002,8 +1242,8 @@ def season_audio_needs_worker(rec: FileRecord, ctx: PipelineContext) -> bool:
     ):
         return True
     try:
-        _intro(ctx, target, matching, records, _EndPictures(ctx, rec, records, decode=False))
-    except _EndPictureUncheckedError:
+        _intro(ctx, target, matching, records, _EndPictures(ctx, rec, records, decode=False), inline=True)
+    except (_EndPictureUncheckedError, _SlowPairError):
         return True
     except end_picture.CheckUnavailableError:
         return False  # this episode's own file couldn't be read lately: the detector gives up without decoding
@@ -1103,9 +1343,10 @@ def _cached_runs(
     version: int,
     *,
     inline: bool = False,
+    before_match: Callable[[], None] | None = None,
 ) -> list[Run]:
     """:func:`season_pair_runs` of two files' points (``first``'s as the matcher's first argument), cached in
-    markers.db under ``version``.
+    markers.db under ``version``. ``before_match`` is called before a pair not cached yet is matched (it may raise).
 
     Raises:
         _SlowPairError: ``inline`` and the pair isn't cached yet and :func:`slow_to_match`.
@@ -1116,6 +1357,8 @@ def _cached_runs(
         return [Run(*run) for run in cached]
     if inline and slow_to_match(a, b):
         raise _SlowPairError(f"{os.path.basename(first)} and {os.path.basename(second)}")
+    if before_match is not None:
+        before_match()
     runs = season_pair_runs(a, b)
     ctx.store.set_season_pair(
         rec_a.id,
@@ -1338,15 +1581,43 @@ def _intro(
     matching: _Matching,
     records: dict[str, FileRecord],
     end_pictures: _EndPictures,
+    *,
+    inline: bool = False,
 ) -> IntroSegment | None:
     """:func:`season_intro` on the matching's points, pairs cached in markers.db; the answer, and each end picture
-    checked, in the files' own seconds."""
+    checked, in the files' own seconds.
+
+    Each pair is read from markers.db once per call.
+
+    Raises:
+        _SlowPairError: ``inline``, and a pair the walk asks for (other episodes' pairs included, for the quorum of a
+            second opening) isn't cached yet and is too slow for a checking thread, or more than
+            ``MAX_INLINE_NEW_PAIRS`` pairs aren't cached yet.
+    """
     points, clock = matching.points, matching.clock
+    read: dict[tuple[str, str], list[Run]] = {}
+    matched_here = 0
+
+    def before_match() -> None:
+        nonlocal matched_here
+        matched_here += 1
+        if inline and matched_here > MAX_INLINE_NEW_PAIRS:
+            raise _SlowPairError(f"more than {MAX_INLINE_NEW_PAIRS} pairs to match")
 
     def runs_between(first: str, second: str) -> list[Run]:
-        return _cached_runs(
-            ctx, records, first, second, points[first], points[second], clock.pair_version(first, second)
-        )
+        if (first, second) not in read:
+            read[(first, second)] = _cached_runs(
+                ctx,
+                records,
+                first,
+                second,
+                points[first],
+                points[second],
+                clock.pair_version(first, second),
+                inline=inline,
+                before_match=before_match,
+            )
+        return read[(first, second)]
 
     segment = season_intro(
         target,
@@ -1367,7 +1638,8 @@ def _previous_season_points(
     """The previous season's files a lone episode is matched with: current records with a cached fingerprint that
     isn't empty (each record is added to ``records``)."""
     previous: dict[str, np.ndarray] = {}
-    for path in previous_season_files(canonical_path) if previous_files is None else previous_files:
+    listed = previous_season_files(canonical_path, _server_configs(ctx)) if previous_files is None else previous_files
+    for path in listed:
         member = _current_record(ctx, path)
         cached = _cached_points(ctx, member)
         if member is not None and cached is not None and len(cached):
@@ -1449,6 +1721,9 @@ def _request_redecide(
     signature: str,
     *,
     matched: Mapping[str, FileRecord],
+    group: SeasonGroup,
+    videos: Sequence[FolderVideo],
+    configs: Sequence[ServerConfig],
 ) -> None:
     """Ask again for the siblings whose intro is undecided, or decided with a season audio answer, and whose answer
     was based on other season files than this run's. A sibling season audio never answered for is left alone: its own
@@ -1456,27 +1731,25 @@ def _request_redecide(
 
     ``signature`` is this run's answer's; a sibling whose own group is another (a season of more than 40 episodes gives
     each file its 40 nearest) is compared with the signature its own group has with the files this run ``matched``,
-    since its answer never equals this run's even when nothing it used changed.
+    since its answer never equals this run's even when nothing it used changed. Only ``group``'s episodes are asked
+    (``members`` can hold the previous season's files); ``videos`` are the season's files the group was picked from.
     """
-    folder = os.path.dirname(rec.canonical_path)
-    videos: tuple[FolderVideo, ...] | None = None
     own_group: SeasonGroup | None = None
     on_disk: dict[str, list] = {}
     stale = []
     for path, member in members.items():
-        if member.id == rec.id or os.path.dirname(path) != folder:
+        if member.id == rec.id or path not in group.episodes:
             continue
         answer = ctx.store.get_detector_run(member.id, Source.SEASON_AUDIO)
         if answer is None or answer == signature:
             continue
         if _intro_settled(ctx, member):
             continue
-        if videos is None:
-            videos = folder_videos(folder)
+        if own_group is None:
             own_group = season_group(rec.canonical_path, videos)
-        group = season_group(path, videos)
-        if group.episodes != own_group.episodes and answer == _signature(
-            ctx, _signature_paths(path, group), matched, on_disk
+        sibling_group = season_group(path, videos)
+        if sibling_group.episodes != own_group.episodes and answer == _signature(
+            ctx, _signature_paths(path, sibling_group, configs), matched, on_disk
         ):
             continue
         stale.append(path)
@@ -1503,6 +1776,8 @@ def season_audio_followups(rec: FileRecord, ctx: PipelineContext) -> list[str]:
         The siblings' paths, sorted.
     """
     view = _season_view(ctx, rec.canonical_path)
+    if view.unreadable:
+        return []  # the season can't be told while a folder of it can't be read
     group = view.group()
     siblings = [*group.episodes]
     siblings += [
@@ -1576,7 +1851,10 @@ def detect_season_audio(
     ffmpeg = chromaprint_ffmpeg(getattr(ctx.config, "ffmpeg_path", None))
     if ffmpeg is None:
         raise DetectorUnavailableError("no ffmpeg with chromaprint")
-    group = season_group(rec.canonical_path)
+    view = _season_view(ctx, rec.canonical_path)
+    if view.unreadable:
+        raise DetectorUnavailableError(f"{', '.join(sorted(view.unreadable))} can't be read")
+    configs, group = view.configs, view.group()
 
     def fingerprint_of(member: FileRecord, retime: float | None = None) -> np.ndarray | None:
         """A group file's fingerprint (retimed by ``retime``), computed when missing; None leaves a sibling out."""
@@ -1615,7 +1893,7 @@ def detect_season_audio(
                 return None
             if not (cancel_check and cancel_check()):
                 # Siblings' runs don't ask for this file again until its season changes (season_audio_followups).
-                attempted = _signature(ctx, _signature_paths(rec.canonical_path, group))
+                attempted = _signature(ctx, _signature_paths(rec.canonical_path, group, configs))
                 ctx.store.set_detector_failure(rec.id, Source.SEASON_AUDIO, attempted)
             raise DetectorUnavailableError(str(exc)) from exc
         if found is None and own_file:
@@ -1692,8 +1970,8 @@ def detect_season_audio(
     # this answer due.
     matched = {path: member for path, member in records.items() if path not in left_out}
     rates = matching.rates if matching is not None else None
-    signature = _signature(ctx, _signature_paths(rec.canonical_path, group), matched, rates=rates)
-    _request_redecide(ctx, rec, records, signature, matched=matched)
+    signature = _signature(ctx, _signature_paths(rec.canonical_path, group, configs), matched, rates=rates)
+    _request_redecide(ctx, rec, records, signature, matched=matched, group=group, videos=view.videos, configs=configs)
     if left_out_changed:
         # The sibling's own run in this job reads it again, and its request for this file would be dropped as one of
         # the job's own items: the job asks for this file after it finishes (season_audio_answer_outdated).
@@ -1720,7 +1998,11 @@ def season_audio_answer_outdated(ctx: PipelineContext, canonical_path: str) -> b
     answer = ctx.store.get_detector_run(rec.id, Source.SEASON_AUDIO) if rec is not None else None
     if answer is None or _intro_settled(ctx, rec):
         return False
-    signature = _signature(ctx, _signature_paths(canonical_path, season_group(canonical_path)))
+    configs, unreadable = _server_configs(ctx), set()
+    group = season_group(canonical_path, season_videos(canonical_path, configs, unreadable))
+    signature = _signature(ctx, _signature_paths(canonical_path, group, configs, unreadable))
+    if unreadable:
+        return False  # the season can't be told while a folder of it can't be read
     return answer != signature and ctx.store.get_detector_failure(rec.id, Source.SEASON_AUDIO) != signature
 
 
@@ -1763,7 +2045,11 @@ def season_audio_compared(rec: FileRecord, ctx: PipelineContext) -> bool:
     Returns:
         True when another episode of the season group has a stored fingerprint.
     """
-    for path in season_group(rec.canonical_path).episodes:
+    unreadable: set[str] = set()
+    videos = season_videos(rec.canonical_path, _server_configs(ctx), unreadable)
+    if unreadable:
+        return False  # season audio waits (season_audio_due): it compared nothing this time
+    for path in season_group(rec.canonical_path, videos).episodes:
         if path == rec.canonical_path:
             continue
         member = ctx.store.get_file(path)

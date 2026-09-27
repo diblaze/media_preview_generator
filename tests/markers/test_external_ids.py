@@ -10,6 +10,9 @@ from media_preview_generator.markers.external_ids import (
     is_extra,
     is_season_folder,
     merge_ids,
+    same_show_names,
+    season_folder_number,
+    show_key,
 )
 from media_preview_generator.markers.models import MediaIds
 
@@ -476,6 +479,66 @@ class TestIsExtra:
 )
 def test_is_season_folder(name, expected):
     assert is_season_folder(name) is expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Season 02", 2),
+        ("Season 2", 2),
+        ("season02", 2),
+        ("S02", 2),
+        ("Staffel 3", 3),
+        ("Säsong 9", 9),
+        ("S2024", 2024),
+        ("Specials", 0),
+        ("Season 01 Extras", None),
+        ("Rick and Morty (2013) {tvdb-275274}", None),
+    ],
+)
+def test_season_folder_number(name, expected):
+    assert season_folder_number(name) == expected
+
+
+class TestShowKey:
+    @pytest.mark.parametrize(
+        ("name", "key"),
+        [
+            ("Alias (2001) {tvdb-75930}", ("tvdb", "75930")),
+            ("Alias (2001) [tvdbid-75930]", ("tvdb", "75930")),
+            ("Alias (2001) {tmdb-2} {tvdb-75930}", ("tvdb", "75930")),  # tvdb first, wherever it stands
+            ("Alias (2001) {tmdb-2} {imdb-tt0285333}", ("tmdb", "2")),
+            ("Alias (2001) {imdb-tt0285333}", ("imdb", "tt0285333")),
+            ("ALIAS  (2001)", ("name", "alias (2001)")),
+            ("Alias (2001) {tmdb-tt5}", ("name", "alias (2001)")),  # a malformed id is no id
+        ],
+    )
+    def test_the_first_id_of_tvdb_tmdb_imdb_else_the_name(self, name, key):
+        assert show_key(name) == key
+
+    @pytest.mark.parametrize(
+        ("name", "other", "same"),
+        [
+            ("Alias (2001) {tvdb-75930}", "Alias {tvdb-75930}", True),  # the id decides, not the name
+            ("Alias (2001) {tvdb-75930}", "Alias (2001) {tvdb-1}", False),
+            ("Alias (2001) {tvdb-75930}", "alias  (2001)", False),  # one key per folder: an equivalence
+            ("Alias (2001)", "alias  (2001)", True),
+            ("Alias (2001)", "Alias Grace (2017)", False),
+            ("The Office (US)", "The Office (UK)", False),
+        ],
+    )
+    def test_the_same_show_is_the_same_key_whichever_is_asked(self, name, other, same):
+        assert (other in same_show_names(name, [other])) is same
+        assert (name in same_show_names(other, [name])) is same
+
+    def test_names_lists_only_the_same_show(self):
+        entries = ["Alias Grace (2017) {tvdb-329586}", "Alias {tvdb-75930}", "ALIAS (2001)", "Other {tvdb-75930}"]
+        assert same_show_names("Alias (2001) {tvdb-75930}", entries) == ["Alias {tvdb-75930}", "Other {tvdb-75930}"]
+        assert same_show_names("Alias (2001)", entries) == ["ALIAS (2001)"]
+
+    def test_a_name_spelled_with_a_sharp_s_is_found_as_spelled(self):
+        # Its key is casefolded ("weissensee"); the listing is searched for the word as spelled.
+        assert same_show_names("Weißensee (2010)", ["Other (2010)", "WEIßENSEE (2010)"]) == ["WEIßENSEE (2010)"]
 
 
 class TestIdsFromServerDict:

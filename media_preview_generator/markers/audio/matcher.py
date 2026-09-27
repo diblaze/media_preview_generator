@@ -208,6 +208,75 @@ def meets_quorum(support: int, others: int) -> bool:
     return support >= max(1, QUORUM * others)
 
 
+def floats(candidate: IntroCandidate) -> bool:
+    """Whether a cluster sits at another time in most of the episodes it was found in (its partners' stretches start
+    more than the cluster tolerance, 4 s, from its own): what follows a cold open whose length varies does."""
+    moved = sum(abs(hit.partner_start_s - hit.start_s) > CLUSTER_TOLERANCE_S for hit in candidate.members)
+    return 2 * moved > len(candidate.members)
+
+
+def meets_opening_quorum(
+    target: str,
+    candidate: IntroCandidate,
+    files: Sequence[str],
+    runs_between: Callable[[str, str], list[Run]],
+    order_of: Callable[[str], tuple[int, int] | None],
+    memo: dict | None = None,
+) -> bool:
+    """Whether a cluster below the season's quorum has the quorum of its own opening, in a season whose opening changes
+    once (an anime's second cour: SPY x FAMILY S01's 25 episodes hold two, each found by 10 or 11 of the 24 others).
+
+    Only a cluster at least 15 s long counts, like the second opening. The other episodes that don't support it hold a
+    second opening when some of them each have their best cluster, among those episodes only, at least 15 s long and
+    found by half of them. The cluster is an opening of its own when none of its supporters has that second opening
+    (their best cluster among its episodes, with the same limits: otherwise it is a stretch shared with an episode
+    that has the season's opening, a recap say), and when its episodes (the target and its supporters) all come before
+    or all after the second opening's, by season and episode number. It then needs half of the other episodes that
+    don't have the second opening.
+
+    Args:
+        target: The episode (one of ``files``).
+        candidate: One of its clusters.
+        files: The group, in matching order.
+        runs_between: Runs for ``(earlier, later)`` in that order (pairs of other episodes are asked too).
+        order_of: A file's (season, episode) numbers, None when its name carries none.
+        memo: Shared by the calls for one episode's clusters.
+
+    Returns:
+        True when the cluster has its opening's quorum.
+    """
+    if candidate.segment.end_s - candidate.segment.start_s < PREFERRED_MIN_S:
+        return False
+    memo = {} if memo is None else memo
+    supporters = frozenset(hit.partner for hit in candidate.members)
+    rest = frozenset(f for f in files if f != target and f not in supporters)
+    second = frozenset(f for f in rest if _has_opening_among(f, rest - {f}, files, runs_between, memo))
+    if not second or any(_has_opening_among(f, second, files, runs_between, memo) for f in supporters):
+        return False
+    ours = [order_of(f) for f in supporters | {target}]
+    theirs = [order_of(f) for f in second]
+    if None in ours or None in theirs:
+        return False
+    if not (max(ours) < min(theirs) or min(ours) > max(theirs)):
+        return False
+    return meets_quorum(candidate.segment.support, len(files) - 1 - len(second))
+
+
+def _has_opening_among(
+    episode: str, pool: frozenset[str], files: Sequence[str], runs_between: Callable[[str, str], list[Run]], memo: dict
+) -> bool:
+    """Whether an episode's best cluster against ``pool`` only is at least 15 s long and found by half of ``pool``."""
+    key = (episode, pool)
+    if key not in memo:
+        members = [f for f in files if f == episode or f in pool]
+        candidates = intro_candidates(file_hits(episode, members, runs_between))
+        best = candidates[0].segment if candidates else None
+        memo[key] = (
+            best is not None and best.end_s - best.start_s >= PREFERRED_MIN_S and meets_quorum(best.support, len(pool))
+        )
+    return memo[key]
+
+
 def intro_candidates(hits: Sequence[Hit]) -> list[IntroCandidate]:
     """Every cluster of one episode's hits, in :func:`intro_for`'s ranking order.
 
