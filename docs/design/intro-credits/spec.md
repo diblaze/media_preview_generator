@@ -91,6 +91,23 @@ settings, the credits scaler and 640×360 re-reads, two playback speeds, season 
   win such a pair was wrong on In Treatment S02 ×4 and Family Guy S14E01. Westworld S03E07 stays there too (lengths
   5.03 s apart), and the rule 4 composition gap the property test found (predates these rules) is unfixed.
 
+**Open after the 2026-09-27 credits accuracy fixes** (§14 2026-09-27 "Credits accuracy",
+`evidence/credits-accuracy/README.md`):
+- **Late rule J starts** are most of what is left wrong: first cards over footage it reads after the roll starts
+  (17 Again 82 s, '71 120 s with SkipDB agreeing, 21 Jump Street 102 s, #SKYKING 24 s, several 6–12 s). On the
+  audit's Plex comparison ours is 12 of 81 wrong against Plex's 8 of 80, though ours skips story on 1 and Plex's on 8.
+- **Two early chapters credit text can't correct**: 10 Things I Hate About You (rule J's own start 166 s late) and A
+  Beautiful Imperfection (rule J starts on the same epilogue text as the chapter).
+- **The Accused epilogue-card gap** gains a file: version 6's refine walks back over credits over the footage onto an
+  epilogue card on black that touches them (5.5 s early; it was 7.5 s late).
+- **The lab matrices have drifted from the app** (found by this lane's row-13 run; details in
+  `evidence/credits-accuracy/README.md` "Lab regression"): phase 2 and 3 rows that set the removed `publish_when`
+  stop on a `KeyError`, and phase 2 rows 6 and 18 and phase 3 rows 3, 5 and 9 check behaviour that changed on purpose
+  since 2026-09-21 (season audio deciding alone, the worker's thread count, one scaler; row 5 not traced). Each fails the
+  same way on `dev`. The matrices need updating before the next full lab regression can gate anything.
+- **Spring of the Blade S01E14's intro** now ends at the title card but starts on the licence cards 11 s before the
+  title sequence (the chapter's start and IntroDB's).
+
 **Working rules (owner's, non-negotiable).**
 - Prove server behaviour on the **lab servers on storage** (§10.3), never on the prod Plex on `plex`. Prod Plex DB:
   read-only queries only (`sqlite3 "file:<db>?mode=ro"`). The owner's two one-off exceptions (§14 2026-09-16 Q7,
@@ -504,6 +521,33 @@ and logo, a lower third's words — makes credit frames of 3–5 boxes that the 
 `overlay_boxes` can't take it: it is on screen only in the stretch the run opens on, never across the story before
 (I Survived S01E14: court footage, 68 s early). Sparse text the roll runs into without a break stays its start. It
 moves starts later only.
+**Version 6** (2026-09-27 in §14, `evidence/credits-accuracy/`). *The 1 fps refine walks back over the roll's own
+frames* (`rule_j.refine_start`): a credit frame, or a frame whose text sits in the band of the run the start came from
+(`in_band`). A roll's first card over the closing footage reads one or two boxes on a lit frame, under the three a lit
+credit frame needs, and the walk used to stop at the first dense card behind it (Accused, Killer Cases, Homicide
+Hunter: 6–8 s late). The walk starts from the latest such frame within `REFINE_GAP_S` of the coarse start, never from a
+caption cut off from it (Homicide Hunter S06E13: a mugshot caption 14 s before the roll, 13 s early); only when no 1 fps
+frame near the coarse start shows the roll does it start from the latest credit frame in the window, as before.
+*A file with a credits chapter is read against it* (`decide.credits_chapter_start_ms`: the chapter rule 3 decides
+from, when chapters are on). The answer keeps rule J's own start and carries `decide.chapter_hint`: whether the frames
+show that chapter off the roll (`rule_j.moves_chapter`). Off it means one of two shapes. *Inside the roll*: the roll
+starts more than 10 s before the chapter and text stays on the screen all the way (no stretch of keyframes without a
+box over 8 s, and no lit keyframe without one after the start's own 1 s, the fade into the first card). *On the
+story*: the roll starts more than 10 s after the chapter and every keyframe between them, at least one, is lit and
+holds no text. How far a chapter moves is bounded only by the moved marker's sanity checks (rule 2; distance caps of
+240 and 60 s changed nothing on the verdict set or the replay). The lit-keyframe checks came from sflix's replay: 5 chapters the frames moved earlier onto
+story text (a T-shirt, a poster, a screen, an epilogue caption; every one with a lit keyframe without text between) and
+2 moved later off black cards 320×180 reads nothing on (The Half of It, Dark Matter S02E05). An answer read against
+another chapter than today's, or before the file had one, is read again (`credits_text_due`: the run's basis
+names the chapter); with chapters off a found answer stays as it is (the chapter never changes the start).
+Harness, GPU decode, version 5 → 6 on the same decodes: rule J alone on the 80 (78 on disk) 65 → 66 within 10 s,
+early 2 → 2, late 5 → 5; the 80's gate 5 of 5 both; the 205 Medium useful 101 → 101, wrong 15 → 18, High wrong
+14 → 17 by the set's truth, and the three new answers are on credits by frame check (Mayday's end titles over the
+closing shots, 127 s before the crawl the set's truth marks; Wild Wild Punjab's cast-name montage; The Young
+Offenders' cast roll over the last shot, 1 s earlier than version 5); Accused 50 / 4 / 3 counts unchanged, 28 of 57
+starts moved, 26 nearer the first card (16 now within 1 s of it) and 2 further, one of them from 7.5 s late to 5.5 s
+early onto an epilogue card touching the roll (the gap §0 lists); I Survived unchanged; the 43 online cases' credits
+useful 33 → 35.
 An intra-only file's thinned keyframe pass counts its stride from the seek, so its rest of the file is decoded from the
 tail's own start and the rows before the end dropped: the frames after the end are then the ones the 320×180 reading
 read (the cost: its whole tail again, thinned; 450 frames for a movie). At 640×360 each text detection request carries 16 frames, the pixels of 64 at 320×180, so the helper's
@@ -807,7 +851,25 @@ Each source yields candidates `{type, start_ms, end_ms, source, confidence}`.
    (credit text: a decode error or a timeout recorded for this size and mtime, `LocalDetectorSpec.failed_here`) leaves
    the source order (`pipeline._decide`), so the chapter then decides as before, on the same run or the next. A
    replaced file waits again for its own read. Somebody Somewhere S03E02–E07: HMAX "Credits" chapters 40–70 s late, SkipDB and
-   credit text within 2 s of the frame-checked start.
+   credit text within 2 s of the frame-checked start. **A credits chapter off the roll (2026-09-27):** credit text reads
+   every file whose credits a chapter decided alone (`LocalDetectorSpec.checks_chapters`: the pipeline asks it while
+   the type rests on chapters and server markers only, unlocked, and not again after it failed to read the file as
+   it is, `failed_here`). When its answer's `chapter_hint` says the frames move this
+   chapter (§5.4 version 6), the answer starts more than 10 s from it and no other source agrees with the chapter's
+   start, the chapter keeps the window and credit text supplies the start: end the earlier of the chapter's and the
+   text's, `decided_by` chapters + credit text, reason `decide.TEXT_MOVES_CHAPTER_REASON`; a moved marker failing sanity
+   leaves the chapter. A release's "Credits" chapter was more than 5 s off the first card on 10 of 41 frame-checked
+   chapter files of the 2026-09-27 audit, 3 of them on the story (A Christmas Carol 1984, 13 s before the roll). **An
+   intro chapter an online answer ends inside (2026-09-27):** when IntroDB, TheIntroDB or SkipDB (or an importer's copy)
+   ends the intro inside the chapter more than 5 s before its end, nothing agrees with the chapter's end, and season
+   audio is among the sources without an answer, the chapter waits in Needs review (`decide.AUDIO_CHECKS_CHAPTER_REASON`)
+   so season audio reads the episode in the same run (a detector that can't answer here leaves the order as above;
+   season audio's `failed_here` is a fingerprint failure of this file). When every agreeing cluster that contradicts an
+   intro chapter holds season audio and a non-server source of another group, and the intro they compose (rule 4, rule
+   13's end) ends inside the chapter, they decide (`decide.AUDIO_OVER_CHAPTER_REASON`). A chapter that ends before them
+   stays in Needs review as before: on the library chapter set the chapter was the right one every time (Family Guy
+   S14). Spring of the Blade S01E02/E03/E14: WEB "Intro" chapters ending 5–37 s into the episode; IntroDB and season
+   audio end at the episode's title card.
 4. Otherwise accept when two independent sources agree: intro/recap **end** within 5 s; credits/preview **start**
    within 10 s. An agreeing set needs a candidate that is neither markers already on a server nor season audio (or its
    previous-season hint): season audio and a server's own detection never decide together (G3; with season audio
@@ -818,7 +880,16 @@ Each source yields candidates `{type, start_ms, end_ms, source, confidence}`.
    from the first of them in source order; the other edge takes the safer value across them (latest intro/recap
    start, earliest credits/preview end). If the composed marker fails sanity → "Needs review". (Taking the safest
    agreed edge instead was tried in the phase-1 audit and rejected: it hid a contradiction and published a wrong
-   Daredevil S03E02 intro.)
+   Daredevil S03E02 intro.) **Credit text's credits start (2026-09-27):** in agreeing credits, a confirming credit
+   text answer supplies the start whenever the source-order winner starts more than 5 s from it
+   (`decide.TEXT_OVER_ONLINE_MS`); the reason then adds "; start from credit text" (`decide.took_start_from_text`).
+   Online times come from whichever release their users timed (Stargate Atlantis S01E06/E07: IntroDB, on this file's
+   clock, 6–7 s into the roll where credit text had the first card). **A partial season match (2026-09-27):** a season
+   audio intro only one other episode supports (label `1/n`) that starts more than 15 s after an agreeing answer of
+   another source that isn't a server's marker is part of the opening those two files share, so it doesn't set the
+   agreed intro's start (`decide._partial_season_match`, the 15 s of rule 14's `OTHER_RELEASE_MIN_SHIFT_MS`). Game of Thrones S03E04/E09: the
+   season split over three disks left two episodes matched with each other alone, at 63–112 s of a 5–112 s title
+   sequence IntroDB had right (held fix 3 would regroup the season itself).
 5. If two groups of agreeing sources would publish times that don't agree with each other → "Needs review". Before
    anything is published (chapters, agreement or "Medium"), any two agreeing candidates from different independent
    sources that are both outside the tolerance of the published time send it to "Needs review" — a third source that
@@ -939,7 +1010,15 @@ Each source yields candidates `{type, start_ms, end_ms, source, confidence}`.
     or went) or is turned off; a marker no server was sent, a carried-over marker (it rests on no source) and every new
     file get today's rules, and a locked type is always decided. The case
     that asked for it: SkipDB never deciding alone (rule 6) would otherwise take intros users already see off every
-    install that has no season audio to confirm them (arm64 has no chromaprint).
+    install that has no season audio to confirm them (arm64 has no chromaprint). Since 2026-09-27 a marker resting only
+    on sources that never decide alone (rule 6) is kept only while nothing that reads the file speaks against it: not
+    when such a source answers the type and disagrees, nor when a detector that reads the file for the type read it at
+    its version now and gave no agreeing answer (`keep_published(read_by=…)`, the pipeline passing the local detectors
+    answered at this version that had something to compare the file with, `LocalDetectorSpec.compared`: season
+    audio only when another episode of the season group has a fingerprint, since alone it finds nothing whatever
+    the episode holds). The check the rule waited for has then been made (Somebody Somewhere S03E07: a lone
+    SkipDB intro 9 s into the story that season audio found no match for). Its cost: S03E03's lone SkipDB intro, which
+    was right, goes to Needs review the same way, as on every new install.
 
 ### 5.6 Resource rules
 Intro & Credits jobs run on the preview workers with no worker cap of their own: priority alone orders the work. The
@@ -3341,3 +3420,42 @@ C# builds for each target ABI in CI; smoke test on lab containers before any rel
     and a one-version item still shows exactly what was decided (2026-09-25). A move of 0.5 s or more is stored and
     published as before; a lock or the user's own edit, however small, is never subject to it. The cost: an answer
     built up week by week can stay up to 0.5 s from the one all its episodes at once would give.
+
+- 2026-09-27 · **Credits accuracy after the sflix audit** (§5.4 version 6; §5.5 rules 3, 4 and 16;
+  `evidence/credits-accuracy/`). The audit frame-checked a stratified sample of the 1403 markers published to sflix's
+  Plex (credits 22.9 % [13.8–35.5 %] more than 5 s off, nearly all late; six that skip story) and compared credits with
+  Plex's own on 86 files. Each failure shape is fixed where it starts, and nothing is tuned to one file:
+  - **A release's "Credits" chapter was trusted outright**; it was more than 5 s off the first card on 10 of 41
+    frame-checked chapter files, 3 on the story. Credit text now reads every file a chapter decided, against that
+    chapter, and moves its start where the frames show it off the roll (rule 3; rule J's `moves_chapter`); the chapter
+    keeps the window and its end, and a file without an answer keeps the chapter. The lit-keyframe checks came from the
+    replay of sflix's copy: without them 5 chapters moved earlier onto story text and 2 later off black cards too small
+    to read.
+  - **Rule J missed a roll's first card over footage** (Accused, Killer Cases, Homicide Hunter: 6–8 s late) and started
+    one episode on a caption 14 s before the roll: version 6's refine walks back over the roll's own band from near the
+    coarse start (§5.4).
+  - **Source order beat the frames**: IntroDB's credits start on Stargate Atlantis S01E06/E07, 6–7 s into the roll, won
+    by order over credit text's. Credit text now supplies an agreeing credits start more than 5 s from the winner's
+    (rule 4), and the reason says "start from credit text".
+  - **An "Intro" chapter ran into the story** (Spring of the Blade S01E02/E03/E14, 5–37 s): an intro chapter an online
+    answer ends inside waits for season audio, and the two agreeing overrule it (rule 3).
+  - **A lone online answer was kept by "published before a rule change"** (Somebody Somewhere S03E07, 9 s into the
+    story): it goes once a detector that reads the file answered at its version without agreeing (rule 16).
+  - **Season audio matched half the title sequence** (Game of Thrones S03E04/E09, split over three disks): a match only
+    one other episode supports doesn't set an agreed intro's start (rule 4). Held fix 3 stays held.
+  Measured before (`dev` `4a34687`) and after, on the audit's verdict set split 70/30 by file (`random.Random(20260927)`):
+  credits wrong 22 of 88 → 10 of 88 (tuning 14/61 → 6/61, held out 8/27 → 4/27), skipping story 4 → 2; intros 4 of 51
+  wrong before and after, skipping story 2 → 0. On the audit's Plex comparison ours 16 of 81 → 12 of 81 wrong (Plex's
+  own 8 of 80), skipping story 2 → 1 (Plex's 8). The six harmful markers: A Christmas Carol (1984) and Homicide Hunter
+  S06E13 come right, Somebody Somewhere S03E07 goes to Needs review, Spring of the Blade S01E14 no longer skips story;
+  10 Things I Hate About You and A Beautiful Imperfection don't change (§0). The replay of sflix's whole copy moved 104
+  credits starts and 7 intros; every show among them was frame-checked (README). Versions: `DECIDE_RULES_VERSION` 2
+  (every decided file is decided again after the update, and a chapter file's credit text is read in that run: 342 on
+  sflix's copy), `CREDITS_TEXT_VERSION` 6 (the 617 files whose credits rest on credit text are read again once). Cost:
+  one credit text read per chapter file, a median 6.5 s per episode and 11 s per film on storage's P5000. The job log
+  names each rule in plain words: "the "Credits" chapter, moved to the first credit card by credit text", "start from
+  credit text", "the "Intro" chapter runs on into the episode", and credit text's own line says whether it moves or
+  keeps the chapter. The lab's row-13 run found one regression, fixed here: a replaced file that now goes to a worker
+  for credit text lost its delayed verify job, because the checking stage stores the new file before handing it on;
+  the job keeps "replaced" from its first stage to the worker's (phase 1 16 of 16 after). The run's other failures are
+  the matrices' own drift and fail the same way on `dev` (§0).
