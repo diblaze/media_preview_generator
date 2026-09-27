@@ -1,0 +1,49 @@
+diff --git a/media_preview_generator/markers/audio/season.py b/media_preview_generator/markers/audio/season.py
+index 5f3d3fd..0056dae 100644
+--- a/media_preview_generator/markers/audio/season.py
++++ b/media_preview_generator/markers/audio/season.py
+@@ -62,6 +62,7 @@ from .matcher import (
+     MAX_BIT_DIFF,
+     MAX_GAP_S,
+     MAX_INTRO_S,
++    MIN_RUN_S,
+     TOP_SHIFTS,
+     Hit,
+     IntroCandidate,
+@@ -699,6 +700,10 @@ def guarded_pick(
+ 
+     for candidate in candidates:
+         if not has_quorum(candidate):
++            if candidate.segment.support < 2:
++                # One other episode's stretch (a song, a flashback) sets no season's intro, and is no reason to drop
++                # the one most of them share (Glass Heart S01E03: 16 s with one partner over the 13 s title card).
++                continue
+             return None
+         if passes(candidate):
+             break
+@@ -708,9 +713,25 @@ def guarded_pick(
+         end_s = candidate.segment.end_s
+         later = (c for c in candidates if c.segment.start_s >= end_s and floats(c) and has_quorum(c) and passes(c))
+         candidate = next(later, candidate)
++    if _part_of_a_longer_stretch(candidate.segment, candidates):
++        return None
+     return candidate.segment
+ 
+ 
++def _part_of_a_longer_stretch(pick: IntroSegment, candidates: Sequence[IntroCandidate]) -> bool:
++    """Whether a stretch two or more other episodes share runs straight on from the pick (overlapping it or within the
++    gap bridge) for at least a run's length past it: the pick is then part of a longer shared stretch cut differently
++    in each episode, a title sequence re-cut to each episode's guest list (Evil S04: the crew half every episode
++    shares, the cast half only some). Half of it would be a wrong answer; none is the honest one."""
++    for other in candidates:
++        seg = other.segment
++        if seg.support < 2 or seg.start_s > pick.end_s + MAX_GAP_S or seg.end_s < pick.start_s - MAX_GAP_S:
++            continue
++        if seg.start_s < pick.start_s - MIN_RUN_S or seg.end_s > pick.end_s + MIN_RUN_S:
++            return True
++    return False
++
++
+ def _season_and_episode(path: str) -> tuple[int, int] | None:
+     video = _folder_video(path)
+     return None if video.season is None or video.episode is None else (video.season, video.episode)

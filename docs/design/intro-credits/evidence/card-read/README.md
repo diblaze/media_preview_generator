@@ -4,6 +4,20 @@ Three fixes the owner approved from the prior-art research: read the card the cr
 fingerprint half the episode up to 20 minutes (season audio v11), and let an intro run up to 300 s. Spec: §5.3 "Half
 the episode, and intros up to 300 s", §5.4 "Version 8, prose cards", §14 2026-09-27 "Card read and intro window".
 
+**Held (this branch, `fix/intro-window-cap`):** the window and cap changes are not in #327. On the library chapter set
+they add new wrong verdicts (Evil S04 ×4 now partial where they were missed; Glass Heart S01E03 loses its title card),
+and the bar is no new wrong answer on any set. Two general rules were tried at the new window on that set
+(`season/tried_rules.patch`, cached pairs). Both were worse than v10's 113 / 54 / 57, at 109 / 57 / 58:
+- **A one-partner stretch never ends the walk**: it is passed over for the quorum cluster below it.
+  - Glass Heart S01E03 comes right.
+  - The Simpsons S17E02/E05 go from missed to wrong: 0–11.3 s, the theme's start before each episode's couch gag.
+  - RuPaul's Drag Race S12E05 goes from missed to wrong.
+- **No answer for part of a longer shared stretch**: this fires when a stretch that 2 or more other episodes share runs
+  on from the pick for 8 s or more past it, within the 3.5 s gap bridge.
+  - Evil S04E02, E12 and E13 return to no answer, but S04E14 stays partial.
+  - Sex and the City S04 ×4 lose right intros.
+  - Recipes for Love and Murder S01E01 goes from wrong to missed.
+
 Local-only (gitignored): `local/` holds the base tree (`local/base`, `git archive 95c222c`), the models
 (`python3 scripts/fetch_textdet_model.py --out local/models`) and the season step's pair caches; each script writes
 its answers, replays and logs beside itself (they hold library paths). The scripts ran from one scratch folder, the
