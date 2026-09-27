@@ -6,6 +6,7 @@ are split across them; Lioness S02E08, alone on one disk, matched nothing until 
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import zlib
@@ -159,20 +160,38 @@ class TestSeasonFolders:
             folders = season.season_folders(path, configs)
             assert folders[0] == os.path.dirname(path) and set(folders) == wanted
 
-    def test_a_folder_there_that_cant_be_read_is_reported(self, disks, monkeypatch):
+    @pytest.mark.parametrize(
+        ("code", "passing"),
+        [
+            (errno.ESTALE, True),
+            (errno.EIO, True),
+            (errno.ENOTCONN, True),
+            (errno.ETIMEDOUT, True),
+            (errno.EHOSTDOWN, True),
+            (errno.EACCES, False),  # no permission lasts: the folder holds nothing of the season, logged
+            (errno.ENOTDIR, False),
+        ],
+    )
+    def test_only_a_folder_that_cant_be_read_for_now_is_reported(
+        self, disks, monkeypatch, loguru_caplog, code, passing
+    ):
         (e1,) = _episodes(disks[0], 1, 1)
         _episodes(disks[1], 1, 2)
         real_listdir = os.listdir
 
-        def stale(folder):
+        def failing(folder):
             if str(folder) == str(disks[1]):
-                raise OSError(116, "Stale file handle")
+                raise OSError(code, os.strerror(code))
             return real_listdir(folder)
 
-        monkeypatch.setattr(season.os, "listdir", stale)
+        monkeypatch.setattr(season.os, "listdir", failing)
         unreadable: set[str] = set()
-        assert season.season_folders(e1, [_library(str(disks[0]), str(disks[1]))], unreadable) == (os.path.dirname(e1),)
-        assert unreadable == {str(disks[1])}
+        configs = [_library(str(disks[0]), str(disks[1]))]
+        for _ in range(2):
+            assert season.season_folders(e1, configs, unreadable) == (os.path.dirname(e1),)
+        assert unreadable == ({str(disks[1])} if passing else set())
+        warned = [r for r in loguru_caplog.records if "can't list" in r.getMessage()]
+        assert len(warned) == (1 if code == errno.EACCES else 0)  # once, however often it is asked
 
     def test_a_missing_library_folder_is_not_unreadable(self, disks, tmp_path):
         (e1,) = _episodes(disks[0], 1, 1)
@@ -227,6 +246,18 @@ class TestSeasonFolders:
         (e1,) = _episodes(disks[0], 1, 1)
         (disks[1] / SHOW).write_bytes(b"not a folder")
         assert season.season_folders(e1, [_library(str(disks[0]), str(disks[1]))]) == (os.path.dirname(e1),)
+
+    @pytest.mark.parametrize("flat", [False, True])
+    def test_a_file_carrying_the_shows_id_beside_its_folder_is_not_a_folder_of_it(self, disks, flat):
+        folder = disks[0] / SHOW
+        folder.mkdir()
+        e1 = str(folder / "Lioness - S01E01.mkv") if flat else _episodes(disks[0], 1, 1)[0]
+        open(e1, "ab").close()
+        (disks[1] / "Lioness {tvdb-1}.nfo").write_bytes(b"<tvshow/>")
+        (disks[1] / "Lioness (2023) [tvdbid=1].jpg").write_bytes(b"\xff\xd8")
+        unreadable: set[str] = set()
+        folders = season.season_folders(e1, [_library(str(disks[0]), str(disks[1]))], unreadable)
+        assert folders == (os.path.dirname(e1),) and unreadable == set()
 
 
 class TestSeasonGroupAcrossDisks:
@@ -389,6 +420,13 @@ class TestLibrariesOnDifferentDisks:
         assert origins == {"7/7"}
 
 
+def _record(store, path: str):
+    st = os.stat(path)
+    return store.upsert_file(
+        FileIdentity(path, st.st_size, st.st_mtime_ns), duration_ms=DUR, season_key=None, is_movie=False
+    )
+
+
 class TestUnreadableDisk:
     def test_a_season_disk_that_cant_be_read_holds_season_audio_until_it_can(self, disks, store, monkeypatch):
         (e8,) = _episodes(disks[0], 2, 8)
@@ -424,3 +462,40 @@ class TestUnreadableDisk:
                 assert store.get_detector_run(rec.id, Source.SEASON_AUDIO) == answer
             assert season.season_audio_due(rec, ctx) is True
             assert e9 in season.season_group(e8, season.season_videos(e8, ctx.registry.configs())).episodes
+
+    @pytest.mark.parametrize("stored", [None, 41_000])
+    def test_a_season_disk_that_cant_be_read_keeps_the_episodes_chapter_limit(self, disks, store, monkeypatch, stored):
+        (e8,) = _episodes(disks[0], 2, 8)
+        _episodes(disks[1], 2, *range(1, 8))
+        registry = FakeRegistry({"plex-1": _library(str(disks[0]), str(disks[1]))})
+        ctx = _ctx(store, registry, detectors=(_spec(),), settings_raw=SEASON_RAW)
+        rec = _record(store, e8)
+        if stored is not None:
+            store.set_intro_chapter_limit(rec.id, stored)
+        real_listdir = os.listdir
+
+        def stale(folder):
+            if str(folder).startswith(str(disks[1])):
+                raise OSError(errno.ESTALE, "Stale file handle")
+            return real_listdir(folder)
+
+        monkeypatch.setattr(season.os, "listdir", stale)
+        assert season.season_intro_chapter_limits(ctx, e8) == (stored, {})
+
+    def test_the_wait_is_logged_once_however_often_it_is_asked(self, disks, store, monkeypatch, loguru_caplog):
+        (e8,) = _episodes(disks[0], 2, 8)
+        _episodes(disks[1], 2, *range(1, 8))
+        registry = FakeRegistry({"plex-1": _library(str(disks[0]), str(disks[1]))})
+        ctx = _ctx(store, registry, detectors=(_spec(),), settings_raw=SEASON_RAW)
+        rec = _record(store, e8)
+        real_listdir = os.listdir
+
+        def stale(folder):
+            if str(folder).startswith(str(disks[1])):
+                raise OSError(errno.ESTALE, "Stale file handle")
+            return real_listdir(folder)
+
+        monkeypatch.setattr(season.os, "listdir", stale)
+        for _ in range(3):
+            assert season.season_audio_due(rec, ctx) is False
+        assert sum("waits for" in r.getMessage() for r in loguru_caplog.records) == 1

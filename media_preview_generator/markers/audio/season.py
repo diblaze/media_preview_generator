@@ -19,11 +19,13 @@ The matcher's clusters are walked with guards against a network ident or a cold-
 from __future__ import annotations
 
 import bisect
+import errno
 import functools
 import hashlib
 import json
 import math
 import os
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -181,12 +183,40 @@ def _folder_video(path: str) -> FolderVideo:
     return FolderVideo(path, ids.season, ids.episode)
 
 
+# Errors that say a disk is there but can't be read right now (a stale or hung network mount, a failing disk): the
+# season can't be told until it reads again. Any other error (not a folder, no permission) is lasting, and the folder is
+# taken as holding nothing of the season.
+_PASSING_ERRNOS = frozenset({errno.ESTALE, errno.EIO, errno.ENOTCONN, errno.ETIMEDOUT, errno.EHOSTDOWN})
+# How often the same folder's trouble is logged (a season on a stale disk is asked about on every episode's run).
+_LOG_AGAIN_AFTER_S = 3600.0
+_logged_at: dict[str, float] = {}
+
+
+def _log_once_in_a_while(folder: str, message: str, *args: object, warning: bool = False) -> None:
+    now = time.monotonic()
+    last = _logged_at.get(folder)
+    if last is not None and now - last < _LOG_AGAIN_AFTER_S:
+        return
+    _logged_at[folder] = now
+    (logger.warning if warning else logger.info)(message, *args)
+
+
+def _listing_failed(folder: str, exc: OSError, unreadable: set[str] | None) -> None:
+    """Note a folder whose listing failed: ``unreadable`` gains it for an error that passes; a lasting one other than
+    "not found" or "not a folder" is logged (no permission)."""
+    if exc.errno in _PASSING_ERRNOS:
+        if unreadable is not None:
+            unreadable.add(folder)
+    elif not isinstance(exc, FileNotFoundError | NotADirectoryError):
+        _log_once_in_a_while(folder, "Season audio can't list {}: {}", folder, exc, warning=True)
+
+
 def folder_videos(folder: str, unreadable: set[str] | None = None) -> tuple[FolderVideo, ...]:
     """The video files of a folder that aren't extras (read once, then shared by every group of the folder).
 
     Args:
         folder: The folder.
-        unreadable: Gains the folder when it is there but can't be read (not when it is missing).
+        unreadable: Gains the folder when it is there but can't be read right now (``_PASSING_ERRNOS``).
 
     Returns:
         Its videos; none when it can't be read.
@@ -200,22 +230,16 @@ def folder_videos(folder: str, unreadable: set[str] | None = None) -> tuple[Fold
                 and not is_extra(entry.path)
                 and entry.is_file()
             )
-    except FileNotFoundError:
-        return ()
-    except OSError:
-        if unreadable is not None:
-            unreadable.add(folder)
+    except OSError as exc:
+        _listing_failed(folder, exc, unreadable)
         return ()
 
 
 def _entry_names(folder: str, unreadable: set[str] | None) -> list[str]:
     try:
         return os.listdir(folder)
-    except FileNotFoundError:
-        return []  # the show, or the folder it sits in, isn't on that disk
-    except OSError:
-        if unreadable is not None:
-            unreadable.add(folder)  # a stale handle or a failing disk: what it holds can't be told
+    except OSError as exc:
+        _listing_failed(folder, exc, unreadable)  # not found: the show, or its folder, isn't on that disk
         return []
 
 
@@ -245,7 +269,7 @@ def _show_folders(show: str, configs: Iterable[ServerConfig], unreadable: set[st
                 listed.add(parent)
                 for entry in same_show_names(name, _entry_names(parent, unreadable)):
                     other = os.path.join(parent, entry)
-                    if other not in found:
+                    if other not in found and os.path.isdir(other):  # not "Show {tvdb-1}.nfo" beside the folder
                         found.add(other)
                         waiting.append(other)
     return found
@@ -292,8 +316,9 @@ def season_folders(
     Args:
         canonical_path: Local path of one episode.
         configs: The servers' configs.
-        unreadable: Gains each folder looked in that is there but can't be read (a stale network handle): the season
-            can't be told then. A missing folder is only one the show isn't in.
+        unreadable: Gains each folder looked in that is there but can't be read right now (a stale network handle, an
+            I/O error): the season can't be told then. A missing folder is only one the show isn't in, and one that
+            can't be read for good (no permission, logged) holds nothing of it.
 
     Returns:
         The file's own folder first, then the others sorted.
@@ -975,9 +1000,14 @@ def season_intro_chapter_limits(ctx: PipelineContext, canonical_path: str) -> tu
 
     Returns:
         This episode's limit, and the limit each sibling would be decided with now (None: none applies, because the
-        episode has no intro chapter or fewer than two others have one).
+        episode has no intro chapter or fewer than two others have one). While a folder of the season can't be read,
+        the limit this episode's last decisions used, and no sibling.
     """
     view = _season_view(ctx, canonical_path)
+    if view.unreadable:
+        # The season can't be told: this episode keeps the limit its last decisions used, and no sibling is asked.
+        rec = _current_record(ctx, canonical_path)
+        return (ctx.store.get_intro_chapter_limit(rec.id)[1] if rec is not None else None), {}
     group = view.group()
     siblings = [path for path in group.episodes if path != canonical_path]
     siblings += [path for path in groups_holding(canonical_path, view.videos, view.group) if path not in group.episodes]
@@ -1000,9 +1030,14 @@ def season_intro_chapter_limits(ctx: PipelineContext, canonical_path: str) -> tu
     return limit(canonical_path, group.episodes), {path: limit(path, episodes) for path, episodes in groups.items()}
 
 
-def _signature_paths(canonical_path: str, group: SeasonGroup, configs: Iterable[ServerConfig]) -> tuple[str, ...]:
+def _signature_paths(
+    canonical_path: str,
+    group: SeasonGroup,
+    configs: Iterable[ServerConfig],
+    unreadable: set[str] | None = None,
+) -> tuple[str, ...]:
     if len(group.episodes) == 1:
-        return group.episodes + previous_season_files(canonical_path, configs)
+        return group.episodes + previous_season_files(canonical_path, configs, unreadable)
     return group.episodes
 
 
@@ -1098,7 +1133,7 @@ class _SeasonView:
             if path == self.canonical_path and len(group.episodes) == 1:
                 paths = group.episodes + self.previous_season()
             else:
-                paths = _signature_paths(path, group, self.configs)
+                paths = _signature_paths(path, group, self.configs, self.unreadable)
             self._signatures[path] = _signature(self._ctx, paths, on_disk=self.on_disk)
         return self._signatures[path]
 
@@ -1124,11 +1159,8 @@ def season_audio_due(rec: FileRecord, ctx: PipelineContext) -> bool:
     view = _season_view(ctx, rec.canonical_path)
     current = view.signature(rec.canonical_path)
     if view.unreadable:
-        logger.info(
-            "Season audio waits for {}: {} can't be read",
-            os.path.basename(rec.canonical_path),
-            ", ".join(sorted(view.unreadable)),
-        )
+        folders = ", ".join(sorted(view.unreadable))
+        _log_once_in_a_while(folders, "Season audio waits for {} to be read again", folders)
         return False
     return ctx.store.get_detector_run(rec.id, Source.SEASON_AUDIO) != current
 
@@ -1968,9 +2000,9 @@ def season_audio_answer_outdated(ctx: PipelineContext, canonical_path: str) -> b
         return False
     configs, unreadable = _server_configs(ctx), set()
     group = season_group(canonical_path, season_videos(canonical_path, configs, unreadable))
+    signature = _signature(ctx, _signature_paths(canonical_path, group, configs, unreadable))
     if unreadable:
         return False  # the season can't be told while a folder of it can't be read
-    signature = _signature(ctx, _signature_paths(canonical_path, group, configs))
     return answer != signature and ctx.store.get_detector_failure(rec.id, Source.SEASON_AUDIO) != signature
 
 

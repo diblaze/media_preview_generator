@@ -18,8 +18,9 @@ show folders, but the grouping doesn't rely on that: the same show is told by th
   the name only without ids. One key per folder, so "the same show" can't depend on which folder asks.
 - **Closure over libraries**: the libraries holding any folder found are looked in too, so an episode on a disk only
   one server holds finds the same season as one on a disk every server holds.
-- **An unreadable disk holds the season**: a folder that errors (a stale handle) makes season audio wait, rather than
-  re-decide the season without that disk and again when it is back.
+- **An unreadable disk holds the season**: a folder that can't be read for now (a stale handle, an I/O error) makes
+  season audio wait, rather than re-decide the season without that disk and again when it is back. A folder without
+  permission holds nothing of the season (a warning).
 - **At most 40 new pairs inline**: a second opening's quorum asks for other episodes' pairs; past one episode's worth,
   a worker matches them once for every sibling.
 - **Folder names, not server calls**: every run, the Season view and Season Publish must see one group, server up or not.

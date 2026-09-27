@@ -388,10 +388,12 @@ landed (sflix: 8,058 of 10,555 seasons in more than one folder), and each part w
   same number (or the show folder, for a show kept without them). The file's own disk is looked at the same way (a
   second "Season 1" beside "Season 01"). Library folders inside or around the deepest one holding a folder, a linked
   copy of a folder, and a path not in normal form add nothing. Folder names, not server calls: every run, the Season
-  view and Season Publish see the same group whether or not a server answers. A folder there that can't be read (a
-  stale network handle) makes the season unknown: season audio isn't due, gives no answer and asks nothing of its
-  siblings until it reads again, so a flapping disk doesn't re-decide the season; a missing or empty folder is only one
-  the show isn't in. The previous-season hint reads the same show's folders (its first 4 episodes by number).
+  view and Season Publish see the same group whether or not a server answers. A folder there that can't be read for
+  now (a stale or hung network mount, an I/O error: `season._PASSING_ERRNOS`) makes the season unknown: season audio
+  isn't due, gives no answer, keeps the episode's intro-chapter limit and asks nothing of its siblings until it reads
+  again, so a flapping disk doesn't re-decide the season; a missing or empty folder is only one the show isn't in, and
+  one without permission holds nothing of it (a warning, once an hour). The previous-season hint reads the same show's
+  folders (its first 4 episodes by number).
 - **A second opening** (`matcher.meets_opening_quorum`): an opening that changes once partway through a season (an
   anime's second cour) left each half under the quorum (SPY x FAMILY S01: 10 or 11 of 24). A stretch of at least 15 s
   under the season's quorum counts when the episodes that don't support it hold a second opening — some of them each
