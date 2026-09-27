@@ -752,8 +752,12 @@ audio; needs another source", and "Intro chapter is much longer than the rest of
 
 Season audio compares an episode with the other episodes of its season on disk: the video files in the same folder
 with the same season number in their names (in a folder holding more than 40 of them, the 40 nearest by episode
-number). The first episode of a season a job checks fingerprints every member that has no fingerprint yet, on a
-worker (once per file; a replaced file is fingerprinted again). The rest of the season then matches from those saved
+number). When a library spans several disks and a show's season is split across them, the show's folders for that
+season on every disk of the library count as one season, in matching and in the Season view. The same show is told by
+the id in its folder name (`{tvdb-…}`, else `{tmdb-…}`, else `{imdb-…}`), or by the folder name when there's none. While
+a disk of the season can't be read, season audio waits for it rather than deciding the season without it. The first
+episode of a season a job checks fingerprints every member that has no fingerprint yet, on a worker (once per file; a
+replaced file is fingerprinted again). The rest of the season then matches from those saved
 fingerprints, normally without taking a worker. An episode ffmpeg can't fingerprint (damaged audio, a network read that
 stalls) is left out of the other episodes' matching for a day while the file stays unchanged; its own check and a
 re-detect still try it.
@@ -767,7 +771,10 @@ picture in the episodes it repeats in. An online database's intro that starts in
 seconds (a streaming service's logo) is ignored for the same reason, and so is a server plugin's copy of one. That
 check decodes 3 seconds of video from the episode and two others once,
 on a worker (its GPU when it has one), and saves the answer. A show whose title card after the cold open lasts only a
-few seconds gets no intro, as with Plex's own detection. After updating, one job decides every intro that came from
+few seconds gets no intro, as with Plex's own detection. A season whose opening changes partway (an anime's second
+cour) gets both, and a bumper at the start of every file (a streaming service's anniversary spot) gives way to the
+title sequence after the cold open. An intro still playing where the fingerprinted part of the file ends (the first
+15 minutes at most) is left out rather than cut short. After updating, one job decides every intro that came from
 season audio again (a locked one is left alone) and takes any that no longer holds off your servers.
 
 A season can mix releases that play at slightly different speeds: European broadcasts and some web releases play the

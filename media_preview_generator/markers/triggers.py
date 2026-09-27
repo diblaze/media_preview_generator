@@ -17,7 +17,7 @@ from ..servers.ownership import webhook_path_candidates
 from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
 from ..web.jobs import PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Job, get_job_manager, is_live_retry_chain
 from ..web.settings_manager import get_settings_manager
-from .audio.season import season_group
+from .audio.season import season_group, season_videos
 from .external_ids import ids_from_path, is_season_folder
 from .job_runner import (
     DECIDE_AGAIN,
@@ -582,11 +582,11 @@ def _season_job_name(episode: str, folder: str) -> str:
 def submit_season_publish(episode: str) -> str:
     """Queue the Season view's "Publish": a NORMAL-priority, not forced job over the episodes of an episode's season group.
 
-    The group is the one the Season view lists (``season_group``: same folder and season number, at most the 40 nearest),
-    so a flat folder holding several seasons sends only this season. Jobs publish every decided marker, so decided
-    episodes go to every server that doesn't show them yet and undecided ones are checked again (owner ruling R4, at
-    NORMAL priority since 2026-09-15). While a Publish of exactly these episodes is still queued or running, that job is
-    returned instead.
+    The group is the one the Season view lists (``season_group``: the same show's season folders on every disk of the
+    library, the same season number, at most the 40 nearest), so a flat folder holding several seasons sends only this
+    season. Jobs publish every decided marker, so decided episodes go to every server that doesn't show them yet and
+    undecided ones are checked again (owner ruling R4, at NORMAL priority since 2026-09-15). While a Publish of exactly
+    these episodes is still queued or running, that job is returned instead.
 
     Args:
         episode: The local path of any episode of the season, already validated by the caller.
@@ -594,7 +594,7 @@ def submit_season_publish(episode: str) -> str:
     Returns:
         The id of the new or the reused job.
     """
-    group = season_group(episode)
+    group = season_group(episode, season_videos(episode, _server_configs()))
     episodes = list(group.episodes)
     jm = get_job_manager()
     # Shared with re-detect: a double-click on either Inspector button queues one job.

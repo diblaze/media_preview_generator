@@ -72,15 +72,15 @@ files stay beside them: `evidence/lab/env` (tokens), `evidence/lab/synth/` (webm
 **Open after the 2026-09-25 integration** (five lanes: gone-from-disk previews, "Keep Plex's" and Plex's marker
 settings, the credits scaler and 640×360 re-reads, two playback speeds, season audio's guards; then the intro-end rule,
 §14 2026-09-25). Each has its evidence folder under `evidence/` (map in `evidence/README.md`):
-- **Held fix 3, a season on every disk:** the patch and its notes, `evidence/season-across-disks/` (README "Before
-  it comes back": a quorum per opening for seasons with two openings, and start-of-file bumpers such as SNW S04's).
+- ~~Held fix 3, a season on every disk~~: done in season audio v10 (§5.3, §14 2026-09-27), with the quorum of a
+  second opening and the file-start bumper rule it waited for.
 - **The Accused epilogue-card gap:** cards glued onto the front of a roll 320×180 does see are still answered
   11.5–40.5 s early on 4 Accused files (`evidence/credits/small-text-retry.md`, `evidence/credits/small-text-retry/`).
 - **Plex-host checks before release** (the plex host was down): the text helper's 640×360 self-test on the TITAN RTX
   and the Intel iGPU, a 4K VAAPI tail's timing, and the Intel answers with this code
   (`evidence/credits/small-text-retry.md` "Before release").
-- **The Alias S02E09 miss:** season audio alone ends its intro 8.4 s early, nothing else answers
-  (`evidence/intro-end/README.md`).
+- ~~The Alias S02E09 miss~~: the title sequence runs past the 900 s fingerprint window; v10 passes over a stretch the
+  window cuts, so it gets no season audio intro instead of a short one (§5.3). Answering it needs a longer fingerprint.
 - **A replaced file with no evidence drops an intro that worked** (owner's call; §14 2026-09-25, RuPaul's Drag Race
   UK S08E04): and season audio's "no match" for that episode.
 - **After the 2026-09-25 decision rules** (§14 "Decision rules", `evidence/decide-rules/README.md`): the decision
@@ -90,6 +90,15 @@ settings, the credits scaler and 640×360 re-reads, two playback speeds, season 
   answers (the harness: S04E01 563.6–661.4 s, right) SkipDB's shorter answer disagrees with it; letting season audio
   win such a pair was wrong on In Treatment S02 ×4 and Family Guy S14E01. Westworld S03E07 stays there too (lengths
   5.03 s apart), and the rule 4 composition gap the property test found (predates these rules) is unfixed.
+
+**Open after season audio v10** (§14 2026-09-27 "A season on every disk"; `evidence/season-across-disks/README.md`):
+- **What the whole season shows** (each would give the same answer today on a season kept on one disk): Turning Point
+  9/11 S01E02/E04 are answered with the middle of the title sequence (its runs break at 3.5 s gaps; no story skipped);
+  The WONDERfools S01E02/E04 lose their intro (the theme's end splits the season in two by 8 s, 3 of 7 each); Family
+  Guy S14E07/E17 and SPY x FAMILY S01E24/E25 fail the end-picture check against other partners (a spinning end shot
+  0.12 s off; two releases' pictures).
+- **Star Trek: Strange New Worlds S04E01** keeps the bumper: its first audio track is German, so its title sequence
+  matches nothing. S04E03's title sequence differs for its first 34 s.
 
 **Open after the 2026-09-27 credits accuracy fixes** (§14 2026-09-27 "Credits accuracy",
 `evidence/credits-accuracy/README.md`):
@@ -287,12 +296,13 @@ them, with the worker's threads and the pause of §5.6.
 **Matcher (v3)** for every episode pair: inverted index (±2 value shift); per shift, runs where
 `popcount(a^b) ≤ 6`, gaps ≤ 3.5 s, length 8–120 s; keep all non-overlapping runs. Per episode: cluster candidates
 (start, end) within ±4 s; rank by (length ≥ 15 s, number of supporting episodes, length); require support from
-≥ 50% of the other episodes in the group (≥ 1 when only one other). Group = the video files in the episode's folder
+≥ 50% of the other episodes in the group (≥ 1 when only one other). Group = the video files of the episode's season
 with the same parsed season number, at most the 40 nearest by episode number (a flat folder can hold hundreds;
-server-agnostic); mixed releases in one season work (Rick and Morty S01). An intro whose points are more than half
-chromaprint's silence value (±2, or ≤ 6 bits apart) is dropped, and a pair that provably can't hold a run of 120 s or
-less is skipped (two silent openings); neither changes the 118-episode numbers (`evidence/eval/phase2-harness.md`,
-Task 7).
+server-agnostic); the season is the episode's folder and, in a library spread over several disks, the same show's
+folders for that season on the others (v10, below); mixed releases in one season work (Rick and Morty S01). An intro
+whose points are more than half chromaprint's silence value (±2, or ≤ 6 bits apart) is dropped, and a pair that
+provably can't hold a run of 120 s or less is skipped (two silent openings); neither changes the 118-episode numbers
+(`evidence/eval/phase2-harness.md`, Task 7).
 
 **Guards against idents and music beds** (season audio v5; the dense-core exemptions v7; §14 2026-09-24). A network
 ident at the start of the file, or a music bed under the cold open, repeats in every episode just as the theme does,
@@ -363,6 +373,57 @@ without it, so the answer is due again once it is made; every matched file enter
 (`_Matching.rates`), so a rate read meanwhile makes the answer due too. Measured on Bones S05: retimed so
 (speed and pitch), 85 of 85 cross pairs match; a pitch-keeping stretch (`atempo`), 0 of 85 — a release that keeps
 the pitch when it speeds up stays unmatched, as before.
+
+**A season on every disk, and three picking rules** (season audio v10, §14 2026-09-27;
+`evidence/season-across-disks/`). A library spread over several disks puts one show's season wherever each file
+landed (sflix: 8,058 of 10,555 seasons in more than one folder), and each part was matched alone:
+- **The group spans the library's disks** (`season.season_folders`): the file's show folder is its folder's parent when
+  that is a season folder (`external_ids.season_folder_number`, the §5.7 table), else its folder. Under every folder of
+  each enabled server's library holding the file, at the same place below it, the same show is a folder with the
+  same key (`external_ids.show_key`: the first of its tvdb, tmdb and imdb ids in its name, `{tvdb-…}` or
+  `[tvdbid=…]`, else its name without tags, case and spacing aside), and the libraries holding a folder found are
+  looked in too. One key per folder and that closure make the group the same whichever disk's episode asks, when
+  servers' libraries hold different disks (Plex disks 1–2, Jellyfin 1 and 3): a sibling's signature built from
+  another run's listing must equal its own, or every run asks for it again. Its season is its season folder with the
+  same number (or the show folder, for a show kept without them). The file's own disk is looked at the same way (a
+  second "Season 1" beside "Season 01"). Library folders inside or around the deepest one holding a folder, a linked
+  copy of a folder, and a path not in normal form add nothing. Folder names, not server calls: every run, the Season
+  view and Season Publish see the same group whether or not a server answers. A folder there that can't be read (a
+  stale network handle) makes the season unknown: season audio isn't due, gives no answer and asks nothing of its
+  siblings until it reads again, so a flapping disk doesn't re-decide the season; a missing or empty folder is only one
+  the show isn't in. The previous-season hint reads the same show's folders (its first 4 episodes by number).
+- **A second opening** (`matcher.meets_opening_quorum`): an opening that changes once partway through a season (an
+  anime's second cour) left each half under the quorum (SPY x FAMILY S01: 10 or 11 of 24). A stretch of at least 15 s
+  under the season's quorum counts when the episodes that don't support it hold a second opening — some of them each
+  have their best stretch among those episodes at least 15 s long and found by half of them — that none of the
+  stretch's supporters has (else it is a recap shared with an episode that has the season's opening), and its episodes
+  all come before, or all after, the second opening's by season and episode number (two cuts of one opening taken in
+  turn through a season, The Simpsons S03, don't count). It then needs half of the other episodes without the second
+  opening. It asks for pairs of other episodes: a checking thread matches at most 40 new pairs for one episode
+  (`season.MAX_INLINE_NEW_PAIRS`, one episode's own) and none too slow; past that the episode goes to a worker, whose
+  pairs are cached for every sibling's check.
+- **A bumper at the start of every file** (`matcher.floats`): a pick starting in the first 2 s gives way to the best
+  later stretch that sits at another time in most of its partners (more than the 4 s cluster tolerance apart), has the
+  quorum and passes the guards. A distributor's spot at 0 s is found in every episode, as widely as the title sequence
+  after a cold open of varying length, and support ranks first (Star Trek: Strange New Worlds S04's "Star Trek 60",
+  0–28 s, 9 of 9, against the title sequence's 7 of 9).
+- **The fingerprint window's end** (`season.cut_by_window`, a guard): a stretch ending within the 3.5 s gap bridge of
+  the episode's last fingerprint point may go on past the window (`min(900 s, 35 %)`), so it is passed over. Alias
+  S02E09's title sequence runs 881–906 s; the window ended it at 897.5 s, 8.4 s early (frames checked). No other file
+  of the four sets reaches the window's end. Answering it would need a second, longer fingerprint of that file.
+Pairs keep their cached runs (`PAIR_RUNS_VERSION` stays 9: v10 changes what is picked from the runs, not the runs), so
+the version bump re-picks from cache; only pairs of files in different folders and members never fingerprinted are
+new. Measured before (`dev` `cab4ccf`, own folder) and after, season step only, useful / wrong / missed:
+
+| Set | Before | After |
+|---|---|---|
+| Accused | 3 / 0 / 53 | 3 / 0 / 53 |
+| lab 118 (114 still on disk) | 87 / 10 / 17 | 86 / 8 / 20 |
+| held-out 175 (Plex 69 / 4 / 102) | 124 / 4 / 47 | 142 / 4 / 29 |
+| library chapter set (224) | 106 / 58 / 60 | 113 / 54 / 57 |
+| split sample, 42 episodes of 14 seasons (frame-checked: correct / wrong) | 20 / 0 | 24 / 0 |
+| SPY x FAMILY S01, 25 episodes (answered, each at its opening) | 16 | 18 |
+| Star Trek: Strange New Worlds S04, 10 episodes (frame-checked: correct / wrong) | 6 / 4 | 8 / 2 |
 
 **Measured** on 118 episodes with studio-chapter truth ("useful" = end within 5 s and start within 15 s)
 (`evidence/eval/`):
@@ -2907,7 +2968,8 @@ C# builds for each target ABI in CI; smoke test on lab containers before any rel
   **124 / 4 / 47 → 121 / 5 / 49** (wrong 5 against Plex's 4; SPY x FAMILY S01, whose 25 episodes hold two openings,
   lost 10), lab 118 **91 / 10 / 17 → 90 / 8 / 20**, and Star Trek: Strange New Worlds S04E10 took a "Star Trek 60"
   bumper at 0.0–27.6 s over its title sequence. It comes back as its own lane with matcher changes for seasons with
-  two openings and start-of-file bumpers. The patch, notes and measurements: `evidence/season-across-disks/`.
+  two openings and start-of-file bumpers. The patch, notes and measurements: `evidence/season-across-disks/` (it came
+  back as season audio v10, 2026-09-27).
 - 2026-09-25 · **Second review of the two-speed and intro fixes** (0 HIGH, 3 MED, 8 LOW; all applied).
   - **The 25 fps server-marker rule is gone.** It stopped a server's own marker from confirming raw online times on a
     25 fps file, and also held back native 25 fps shows (UK, European, Australian TV) whose Plex marker and IntroDB
@@ -3464,3 +3526,27 @@ C# builds for each target ABI in CI; smoke test on lab containers before any rel
   for credit text lost its delayed verify job, because the checking stage stores the new file before handing it on;
   the job keeps "replaced" from its first stage to the worker's (phase 1 16 of 16 after). The run's other failures are
   the matrices' own drift and fail the same way on `dev` (§0).
+- 2026-09-27 · **A season on every disk, a second opening, a bumper, the window's end** (season audio v10, §5.3;
+  `evidence/season-across-disks/`). Held fix 3 comes back with the two matcher changes it waited for, and the Alias
+  S02E09 miss is traced to the fingerprint window:
+  - **The group spans the library's disks**, the same show told by the id in its folder names (or the name), not by
+    path alone, and the same group whichever disk asks; sflix's four TV disks split 8,058 of 10,555 seasons. A season
+    disk that can't be read holds season audio instead of shrinking its group.
+  - **A second opening has its own quorum**, only when its episodes come before or after the other opening's and share
+    nothing of it (SPY x FAMILY S01's two cours; The Simpsons S03's alternating cuts, a recap shared with an episode
+    that has the season's opening, and RuPaul S12E14's 11 s stretch stay unanswered). Without it the whole season
+    lost 10 SPY x FAMILY intros; with it Food Wars! S01 and My Hero Academia S07 gain 7.
+  - **A bumper at 0 s gives way** to a later stretch that floats with the cold open (SNW S04's "Star Trek 60").
+  - **A stretch the fingerprint window cuts is passed over** (Alias S02E09: 881–906 s, cut at 897.5 s).
+  Measured before (`dev` `cab4ccf`) and after, the season step on its own: Accused 3 / 0 / 53 unchanged; lab 118
+  87 / 10 / 17 → 86 / 8 / 20; held-out 175 124 / 4 / 47 → 142 / 4 / 29 (Plex 69 / 4 / 102); library chapter set
+  106 / 58 / 60 → 113 / 54 / 57. A fixed-seed sample of sflix's split seasons (`random.Random(20260927)`, 14 seasons,
+  42 episodes, each answer frame-checked): 20 correct / 0 wrong → 24 / 0, nothing skipping story. SPY x FAMILY S01
+  answered 16 → 18 episodes, SNW S04 correct 6 → 8 of 10, wrong 4 → 2. New wrong verdicts, all from seeing the whole
+  season and none skipping story: Family Guy S14E03 (0–29.5 s; the frames show the chapter's 0–15.2 s cuts the theme
+  song, so ours is right), Dateline NBC 2025-07-11 (ends at the show's title, the chapter adds the episode's title
+  card), Turning Point 9/11 S01E02/E04 (the title sequence's middle; §0). Lost: The WONDERfools S01E02/E04, Family Guy
+  S14E07/E17 (§0). One-time cost on sflix's copy of today (2,124 season audio answers in 1,414 groups, 54 of them
+  across disks): 308 members to fingerprint (CPU, 2–14 s each), 3,419 new pairs (6.3 ms each, under a CPU-minute) and
+  a re-pick of every answer from cached pairs; the whole library's split seasons hold 374,539 cross-folder pairs
+  (about 0.7 CPU-hours). A group lookup lists each library folder once (about 16 ms for sflix's four).

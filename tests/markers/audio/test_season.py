@@ -30,7 +30,7 @@ from media_preview_generator.markers.sources.chapters import CHAPTER_RULES_VERSI
 from media_preview_generator.markers.sources.online import LookupResult
 from media_preview_generator.markers.store import CachedShare, EndPictureKey, MarkerStore
 from media_preview_generator.servers.base import ServerType
-from tests.markers.fakes import ready_publisher
+from tests.markers.fakes import FakeRegistry, ready_publisher
 from tests.markers.test_pipeline import EPISODE_IDS, MOVIE_IDS, _clients, _ctx, _item, _registry, _run
 
 DUR = 1_321_472
@@ -320,8 +320,8 @@ class TestSeasonAudio:
                 _run(ctx, e2, {"plex-1": ready_publisher()})
         a, b = store.get_file(e1), store.get_file(e2)
         assert (
-            store.get_season_pair(a.id, b.id, season.SEASON_AUDIO_VERSION) is not None
-            and store.get_season_pair(b.id, a.id, season.SEASON_AUDIO_VERSION) is None
+            store.get_season_pair(a.id, b.id, season.PAIR_RUNS_VERSION) is not None
+            and store.get_season_pair(b.id, a.id, season.PAIR_RUNS_VERSION) is None
         )
 
     @pytest.mark.parametrize(
@@ -401,8 +401,10 @@ class TestSeasonAudio:
     def test_the_detector_is_registered_with_the_season_audio_source_and_version(self):
         spec = _spec()
         assert (spec.source, spec.types) == (Source.SEASON_AUDIO, frozenset({MarkerType.INTRO}))
-        # An answer is stored under the step's version and the end-picture check's past its first (9 + 2 × 1000).
-        assert (season.SEASON_AUDIO_VERSION, season.end_picture.CHECK_VERSION, spec.version) == (9, 3, 2009)
+        # An answer is stored under the step's version and the end-picture check's past its first (10 + 2 × 1000).
+        assert (season.SEASON_AUDIO_VERSION, season.end_picture.CHECK_VERSION, spec.version) == (10, 3, 2010)
+        # Pairs keep the runs version they were matched under: v10 changed how the runs are picked from, not the runs.
+        assert season.PAIR_RUNS_VERSION == 9
         assert spec.stored_sources == {Source.SEASON_AUDIO, Source.SEASON_AUDIO_PREVIOUS}
         assert (spec.due, spec.needs_worker) == (season.season_audio_due, season.season_audio_needs_worker)
 
@@ -840,7 +842,7 @@ class TestMixedSpeeds:
         assert cand.origin == "3/3"
         a, d = store.get_file(e1), store.get_file(e4)
         # Matched as it plays: the pair's answer is the one cached at both files' own speed.
-        assert store.get_season_pair(a.id, d.id, season.SEASON_AUDIO_VERSION) is not None
+        assert store.get_season_pair(a.id, d.id, season.PAIR_RUNS_VERSION) is not None
 
     def test_a_group_at_one_speed_fingerprints_nothing_retimed(self, store, show):
         paths = show(1, 4)
@@ -872,7 +874,7 @@ class TestMixedSpeeds:
                 _detect_and_store(ctx, store.get_file(e4))
         a, d = store.get_file(e1), store.get_file(e4)
         clock = season.SeasonClock(FILM, {e4: TO_FILM})
-        assert store.get_season_pair(a.id, d.id, season.SEASON_AUDIO_VERSION) == []  # as it plays: nothing
+        assert store.get_season_pair(a.id, d.id, season.PAIR_RUNS_VERSION) == []  # as it plays: nothing
         assert store.get_season_pair(a.id, d.id, clock.pair_version(e1, e4))  # slowed to film speed: the theme
 
     def test_telling_a_siblings_speed_from_a_pair_too_slow_to_match_inline_needs_a_worker(self, store, show):
@@ -894,7 +896,7 @@ class TestMixedSpeeds:
         assert season.slow_to_match(own[e2], own[e4])
         assert season.season_audio_needs_worker(recs[e1], _season_ctx(store, e1)) is True
         second = recs[e2]
-        store.set_season_pair(second.id, fourth.id, season.SEASON_AUDIO_VERSION, [],
+        store.set_season_pair(second.id, fourth.id, season.PAIR_RUNS_VERSION, [],
                               identity_a=(second.size, second.mtime_ns), identity_b=(fourth.size, fourth.mtime_ns))  # fmt: skip
         assert season.season_audio_needs_worker(recs[e1], _season_ctx(store, e1)) is False
 
@@ -915,7 +917,7 @@ class TestMixedSpeeds:
     def test_a_group_whose_files_all_play_at_one_speed_by_ear_retimes_nothing(self):
         clock = season.SeasonClock(25.0, {"/d": TO_PAL})
         settled = season.clock_by_audio(clock, ["/a", "/b"], lambda path, retimed, ref: not retimed)
-        assert settled.factors == {} and settled.pair_version("/a", "/d") == season.SEASON_AUDIO_VERSION
+        assert settled.factors == {} and settled.pair_version("/a", "/d") == season.PAIR_RUNS_VERSION
 
     @pytest.mark.parametrize(("first", "silent", "heard"), [(True, False, True), (True, True, False),
                                                            (False, False, True), (False, True, False)])  # fmt: skip
@@ -938,7 +940,7 @@ class TestMixedSpeeds:
             clock.pair_version(x, y) for clock in (film, pal) for x, y in (("/b", "/a"), ("/a", "/b"), ("/b", "/c"))
         ]
         assert len(set(versions)) == 6  # one retimed side either way round, or both, at either speed
-        own = season.SEASON_AUDIO_VERSION
+        own = season.PAIR_RUNS_VERSION
         assert (
             film.pair_version("/a", "/d")
             == pal.pair_version("/a", "/d")
@@ -1312,8 +1314,8 @@ class TestWeeklyReleases:
         for path in s1:
             old = store.get_file(path)
             assert (
-                store.get_season_pair(new.id, old.id, season.SEASON_AUDIO_VERSION) is not None
-                and store.get_season_pair(old.id, new.id, season.SEASON_AUDIO_VERSION) is None
+                store.get_season_pair(new.id, old.id, season.PAIR_RUNS_VERSION) is not None
+                and store.get_season_pair(old.id, new.id, season.PAIR_RUNS_VERSION) is None
             )
         assert ctx.take_followups() == []
 
@@ -2132,13 +2134,48 @@ class TestDegenerateInput:
         store.set_season_pair(
             a.id,
             b.id,
-            season.SEASON_AUDIO_VERSION,
+            season.PAIR_RUNS_VERSION,
             [],
             identity_a=(a.size, a.mtime_ns),
             identity_b=(b.size, b.mtime_ns),
         )
         assert season.season_audio_needs_worker(a, ctx) is False
         assert season.season_audio_needs_worker(b, ctx) is False
+
+    def test_a_slow_pair_of_two_other_episodes_asked_about_a_second_opening_needs_a_worker(self, store, show):
+        # E1's 40 s stretch is found by E2 only: under the season's quorum, so the quorum of a second opening asks
+        # for the pairs of the episodes that don't have it, and E4-E5's two constant openings are too slow inline.
+        e1, e2, e3, e4, e5 = show(1, 5)
+        ctx = _season_ctx(store, e1)
+        first, second = noise(1, 3_000), noise(2, 3_000)
+        first[500:823] = second[700:1023] = noise(88, 323)
+        a = _store_fingerprint(store, e1, first)
+        _store_fingerprint(store, e2, second)
+        _store_fingerprint(store, e3, noise(3, 3_000))
+        fourth, fifth = _constant_then_intro(4, 0x12345678, gap=40), _constant_then_intro(5, 0x12345678, gap=60)
+        d, e = _store_fingerprint(store, e4, fourth), _store_fingerprint(store, e5, fifth)
+        assert season.slow_to_match(fourth, fifth)
+        assert season.season_audio_needs_worker(a, ctx) is True
+        store.set_season_pair(
+            d.id, e.id, season.PAIR_RUNS_VERSION, [], identity_a=(d.size, d.mtime_ns), identity_b=(e.size, e.mtime_ns)
+        )
+        assert season.season_audio_needs_worker(a, ctx) is False
+
+    def test_more_new_pairs_than_the_inline_budget_need_a_worker(self, store, show, monkeypatch):
+        # E1's 40 s stretch is found by E2 only, so a second opening's quorum asks for E3-E5's pairs: with a budget of
+        # 5, E1's own 4 and the others' 3 don't fit on a checking thread; the ones it matched stay cached.
+        e1, e2, e3, e4, e5 = show(1, 5)
+        ctx = _season_ctx(store, e1)
+        first, second = noise(1, 3_000), noise(2, 3_000)
+        first[500:823] = second[700:1023] = noise(88, 323)
+        a = _store_fingerprint(store, e1, first)
+        _store_fingerprint(store, e2, second)
+        for path, seed in ((e3, 3), (e4, 4), (e5, 5)):
+            _store_fingerprint(store, path, noise(seed, 3_000))
+        monkeypatch.setattr(season, "MAX_INLINE_NEW_PAIRS", 5)
+        assert season.season_audio_needs_worker(a, ctx) is True
+        monkeypatch.setattr(season, "MAX_INLINE_NEW_PAIRS", 2)
+        assert season.season_audio_needs_worker(a, ctx) is False  # 5 cached: the 2 left fit
 
     def test_a_silent_season_matches_on_the_checking_thread(self, store, show):
         e1, e2, e3 = show(1, 3)
@@ -2643,7 +2680,7 @@ class TestConcurrentChanges:
             a = store.get_file(paths[0])
             _detect_and_store(ctx, a)
             b = store.get_file(paths[1])
-            cached = store.get_season_pair(a.id, b.id, season.SEASON_AUDIO_VERSION)
+            cached = store.get_season_pair(a.id, b.id, season.PAIR_RUNS_VERSION)
             assert cached is None or cached == [tuple(r) for r in matcher.pair_runs(a_pts, new_b)]
             assert season.season_audio_due(a, ctx) is True
             (b_intro,) = _detect_and_store(ctx, b)
@@ -3341,7 +3378,12 @@ class TestAnswersRestingOnSeasonAudio:
         if state in ("undecided", "kept-own"):
             # The two other predicates on the same conditions: after a job, and a run re-deciding its siblings.
             assert season.season_audio_answer_outdated(ctx, e2) is listed
-            season._request_redecide(ctx, recs[e1], {e2: sibling}, "newer", matched={})
+            configs = ctx.registry.configs()
+            videos = season.season_videos(e1, configs)
+            group = season.season_group(e1, videos)
+            season._request_redecide(
+                ctx, recs[e1], {e2: sibling}, "newer", matched={}, group=group, videos=videos, configs=configs
+            )
             assert ctx.take_followups() == ([e2] if listed else [])
 
     def test_a_new_episode_of_a_long_season_asks_again_only_for_siblings_it_changed(self, store, show):
@@ -3589,12 +3631,12 @@ class TestWhatTheRulesAskOfSeasonAudio:
         first, second = show(1, 2)
         rec = _store_fingerprint(store, first, noise(1, 3_000))
         _store_fingerprint(store, second, noise(2, 3_000))
-        assert season.season_audio_compared(rec, SimpleNamespace(store=store)) is True
+        assert season.season_audio_compared(rec, SimpleNamespace(store=store, registry=FakeRegistry({}))) is True
 
     def test_an_episode_whose_siblings_have_no_fingerprint_was_not_compared(self, store, show):
         first, second = show(1, 2)
         rec = _store_fingerprint(store, first, noise(1, 3_000))
-        ctx = SimpleNamespace(store=store)
+        ctx = SimpleNamespace(store=store, registry=FakeRegistry({}))
         assert season.season_audio_compared(rec, ctx) is False  # the sibling was never read
         store.upsert_file(
             FileIdentity(second, *_identity(second)),
@@ -3607,12 +3649,12 @@ class TestWhatTheRulesAskOfSeasonAudio:
     def test_an_episode_alone_in_its_season_was_not_compared(self, store, show):
         (only,) = show(1, 1)
         rec = _store_fingerprint(store, only, noise(1, 3_000))
-        assert season.season_audio_compared(rec, SimpleNamespace(store=store)) is False
+        assert season.season_audio_compared(rec, SimpleNamespace(store=store, registry=FakeRegistry({}))) is False
 
     def test_a_fingerprint_failure_recorded_for_the_file_is_a_failure_here(self, store, show):
         (only,) = show(1, 1)
         rec = _store_fingerprint(store, only, noise(1, 3_000))
-        ctx = SimpleNamespace(store=store)
+        ctx = SimpleNamespace(store=store, registry=FakeRegistry({}))
         assert season.season_audio_failed_here(rec, ctx) is False
         store.set_detector_failure(rec.id, Source.SEASON_AUDIO, "fingerprint failed")
         assert season.season_audio_failed_here(rec, ctx) is True

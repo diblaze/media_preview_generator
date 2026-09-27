@@ -470,14 +470,22 @@ def _queue_verify(job, cfg: dict, files: set[str], sender_paths: dict[str, str])
         logger.exception("Could not queue the later check of the replaced files job {} published", job.id)
 
 
-def _season_job_name(paths: list[str]) -> str:
-    folders = sorted({os.path.dirname(p) for p in paths})
-    if len(folders) > 1:
-        return f"Season: {len(folders)} seasons"
-    name = os.path.basename(folders[0])
+def _season_of(path: str) -> tuple[str, str]:
+    """A file's show and season folder names ("" for a show kept without season folders): one season kept on several
+    disks of a library is one season (``season.season_folders``)."""
+    folder = os.path.dirname(path)
+    name = os.path.basename(folder)
     if is_season_folder(name):
-        return f"Season: {os.path.basename(os.path.dirname(folders[0]))} · {name}"
-    return f"Season: {name}"
+        return os.path.basename(os.path.dirname(folder)), name
+    return name, ""
+
+
+def _season_job_name(paths: list[str]) -> str:
+    seasons = sorted({_season_of(p) for p in paths})
+    if len(seasons) > 1:
+        return f"Season: {len(seasons)} seasons"
+    show, name = seasons[0]
+    return f"Season: {show} · {name}" if name else f"Season: {show}"
 
 
 # What started the preview job a follow-up follows (its ``source``), in words.
@@ -588,7 +596,7 @@ def _running_season_jobs(jm, priority: int) -> list:
 
 
 def _leave_to_running_season_jobs(jm, job, paths: list[str], priority: int, pin: str | None = None) -> list[str]:
-    """Hand each file to a running Season job at ``priority`` that lists an episode of its folder and publishes where the
+    """Hand each file to a running Season job at ``priority`` that lists an episode of its season and publishes where the
     request does (``pin``; call under ``FOLLOW_UP_LOCK``). The Season job runs it again once it has finished, in one
     follow-up, only when its own run of the file started before this request (``_pass_on_late_requests``), under its
     own pin.
@@ -603,9 +611,9 @@ def _leave_to_running_season_jobs(jm, job, paths: list[str], priority: int, pin:
             # Its follow-up publishes where it does: a request for other servers would lose them, one for fewer gain.
             continue
         late = dict(cfg.get(LATE_REQUESTS) or {})
-        folders = {os.path.dirname(path) for path in [*(cfg.get("file_paths") or []), *late]}
+        seasons = {_season_of(path) for path in [*(cfg.get("file_paths") or []), *late]}
         room = MAX_RETRY_FILES - len(late)
-        taken = [path for path in left if os.path.dirname(path) in folders][: max(0, room)]
+        taken = [path for path in left if _season_of(path) in seasons][: max(0, room)]
         if not taken:
             continue
         number = sequence_number()

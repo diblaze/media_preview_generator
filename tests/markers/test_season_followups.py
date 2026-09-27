@@ -85,9 +85,23 @@ class TestSeasonFollowUpJob:
         create = self._run(env, [_item(ep(S1, 9))], [ep(S1, 1), ep(S2, 1)])
         assert create.call_args.kwargs["library_name"] == "Season: 2 seasons"
 
+    def test_one_season_split_over_two_disks_is_named_as_one_season(self, env):
+        disk2 = S1.replace("/media/", "/media2/", 1)
+        assert disk2 != S1
+        create = self._run(env, [_item(ep(S1, 9))], [ep(S1, 1), ep(disk2, 2)])
+        assert create.call_args.kwargs["file_paths"] == [ep(S1, 1), ep(disk2, 2)]
+        assert create.call_args.kwargs["library_name"] == "Season: Show (2020) {tvdb-1} · Season 01"
+
     def test_a_flat_show_folder_is_named_after_the_show(self, env):
         flat = "/media/tv/Show (2020) {tvdb-1}"
         create = self._run(env, [_item(f"{flat}/Show - S01E03.mkv")], [f"{flat}/Show - S01E01.mkv"])
+        assert create.call_args.kwargs["library_name"] == "Season: Show (2020) {tvdb-1}"
+
+    def test_a_flat_show_on_two_disks_under_differently_named_library_folders_is_one_season(self, env):
+        one, two = "/media/tv/Show (2020) {tvdb-1}", "/media2/series/Show (2020) {tvdb-1}"
+        create = self._run(
+            env, [_item(f"{one}/Show - S01E03.mkv")], [f"{one}/Show - S01E01.mkv", f"{two}/Show - S01E02.mkv"]
+        )
         assert create.call_args.kwargs["library_name"] == "Season: Show (2020) {tvdb-1}"
 
     @pytest.mark.parametrize(
@@ -354,7 +368,7 @@ class TestAnEpisodeRunBeforeItsChangedSibling:
         e1, e2 = self._season_answered_then_sibling_replaced(store, show)
 
         def failed_on_this_season(ctx):
-            now = season._signature(ctx, season._signature_paths(e1, season.season_group(e1)))
+            now = season._signature(ctx, season._signature_paths(e1, season.season_group(e1), ctx.registry.configs()))
             store.set_detector_failure(store.get_file(e1).id, season.Source.SEASON_AUDIO, now)
 
         _job, queue_season = self._job(store, [e1, e2], "schedule", before_queue=failed_on_this_season)

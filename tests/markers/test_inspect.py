@@ -2605,6 +2605,24 @@ class TestSeasonPayload:
         assert len(payload["episodes"]) == listed
         assert (payload["counts"]["episodes"], payload["counts"]["total_episodes"]) == (listed, files)
 
+    def test_a_season_split_over_two_disks_of_the_library_lists_both(self, tmp_path, store):
+        disks = [tmp_path / "media" / f"disk{n}" / "TV Shows" for n in (1, 2)]
+        paths = []
+        for disk, episodes in zip(disks, ((8,), (1, 2)), strict=True):
+            folder = disk / "Lioness (2023)" / "Season 02"
+            folder.mkdir(parents=True)
+            for e in episodes:
+                (folder / f"Lioness (2023) - S02E{e:02d}.mkv").write_bytes(b"x")
+                paths.append(str(folder / f"Lioness (2023) - S02E{e:02d}.mkv"))
+        library = Library("1", "TV Shows", (str(disks[0]), str(disks[1])))
+        reg = _registry(server_config("plex-1", ServerType.PLEX, libraries=[library]))
+
+        payload = inspect.season_payload(paths[0], registry=reg, store=store)
+
+        assert payload["folder"] == os.path.dirname(paths[0])
+        assert [e["path"] for e in payload["episodes"]] == sorted(paths)
+        assert (payload["counts"]["episodes"], payload["counts"]["total_episodes"]) == (3, 3)
+
     def test_a_failed_publish_keeps_its_last_markers_but_is_failed(self, season):
         intro = Marker(T.INTRO, 127_000, 157_000, ("skipdb",))
         rec = self._decide(season.store, season.paths[0], intro)

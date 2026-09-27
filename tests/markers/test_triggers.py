@@ -646,7 +646,7 @@ class TestSeasonPublish:
     or running."""
 
     @pytest.fixture
-    def jm(self, tmp_path, monkeypatch):
+    def jm(self, tmp_path, monkeypatch, settings):
         from media_preview_generator.web.jobs import JobManager
 
         jm = JobManager(config_dir=str(tmp_path / "config"))
@@ -732,6 +732,18 @@ class TestSeasonPublish:
         second = triggers.submit_season_publish(season[0])
         assert second != first
         assert jm.get_job(second).config["file_paths"] == [*season, e04]
+
+    def test_a_season_split_over_two_disks_of_the_library_sends_both(self, jm, settings, tmp_path):
+        disks = [tmp_path / f"disk{n}" / "TV Shows" for n in (1, 2)]
+        (e8,) = self._files(disks[0] / "Lioness" / "Season 02", "Lioness - S02E08.mkv")
+        others = self._files(disks[1] / "Lioness" / "Season 02", "Lioness - S02E01.mkv", "Lioness - S02E02.mkv")
+        library = {"id": "1", "name": "TV Shows", "remote_paths": [str(disks[0]), str(disks[1])]}
+        settings["media_servers"] = [_server("plex-1", "plex", markers=PLEX_CONFIRMED, libraries=[library])]
+
+        job = jm.get_job(triggers.submit_season_publish(e8))
+
+        assert job.config["file_paths"] == sorted([e8, *others])
+        assert job.library_name == "Intro & Credits: Lioness · Season 2"
 
     @pytest.mark.parametrize(
         ("source", "paths", "force"),

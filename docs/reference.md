@@ -719,9 +719,10 @@ per-episode `GET /api/markers/item` stays the place for what a server shows righ
   episode's name.
 - `servers` — the enabled servers holding the episode, in server order: `server_id`, `server_name`, `server_type`,
   `markers_enabled` (Intro & Credits is on there and this library is selected).
-- `episodes` — the episodes matched as one season (same folder and season number; at most the 40 nearest in a flat
-  folder of hundreds; extras left out), each with `path`, `name`, `episode` (`"E01"`), `known` (the app has looked at
-  it), `duration_ms`, `intro` and `credits` (`{status, reason, marker, proposed}` as in `GET /api/markers/item`),
+- `episodes` — the episodes matched as one season (the show's folders for that season on every disk of the library,
+  and the same season number; at most the 40 nearest in a flat folder of hundreds; extras left out), each with `path`,
+  `name`, `episode` (`"E01"`), `known` (the app has looked at it), `duration_ms`, `intro` and `credits`
+  (`{status, reason, marker, proposed}` as in `GET /api/markers/item`),
   `needs_review` (any marker type in Needs review, recap and preview included) with `review_reason` (the first such
   type's reason, `""` when none),
   `evidence` chips (`[{source, label}]`: the sources with intro or credits evidence, markers already on servers left

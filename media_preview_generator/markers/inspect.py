@@ -19,7 +19,7 @@ from loguru import logger
 
 from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import OwnershipMatch, apply_path_mappings
-from .audio.season import folder_videos, season_group, season_size
+from .audio.season import season_group, season_size, season_videos
 from .decide import DecisionStatus, shortened_by
 from .external_ids import ids_from_path, is_season_folder
 from .models import SERVER_SOURCES, Marker, MarkerType, Source
@@ -1022,7 +1022,7 @@ def season_payload(canonical_path: str, *, registry: Any, store: MarkerStore) ->
         ``folder``; ``show`` and ``season`` as the Publish job names them (the show folder's name; "Season N" or
         "Specials"); ``servers`` (the enabled servers owning the asked file, in registry order, with
         ``markers_enabled``: Intro & Credits on there and its library selected); ``episodes`` (the season group's
-        files, sorted; each with ``path``, ``name``, ``episode`` "E01", ``known``, ``duration_ms``, ``intro`` and
+        files from every disk of the library, sorted; each with ``path``, ``name``, ``episode`` "E01", ``known``, ``duration_ms``, ``intro`` and
         ``credits`` in ``item_payload``'s decision shape without ``shortened_by``, ``needs_review`` (any marker type
         in Needs review) with ``review_reason`` (the first such type's reason, intro first), ``evidence`` chips
         ``{source, label}``, and ``servers`` dots ``{server_id: {state, message}}``: ``off`` (Intro & Credits off
@@ -1032,7 +1032,7 @@ def season_payload(canonical_path: str, *, registry: Any, store: MarkerStore) ->
         cap), ``ready`` (at least one decided marker of any type: what Publish sends, even when another type is in
         Needs review) and ``needs_review`` (any type in Needs review).
     """
-    videos = folder_videos(os.path.dirname(canonical_path))
+    videos = season_videos(canonical_path, registry.configs())
     group = season_group(canonical_path, videos)
     owners = list(_owners(canonical_path, registry))
     servers = [
