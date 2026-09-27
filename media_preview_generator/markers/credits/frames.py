@@ -737,3 +737,69 @@ def decode_rows(
     return run_decode(command, hw_active=hw_active, detect_boxes=detect_boxes, cancel_check=cancel_check,
                       pause_check=pause_check, timeout_s=timeout_s, pts_offset_s=offset_s, name=name, scale=scale,
                       chunk_frames=max(1, CHUNK_FRAMES // (scale * scale)))  # fmt: skip
+
+
+def read_text_at(
+    path: str,
+    *,
+    ffmpeg: str,
+    at_s: float,
+    scale: int,
+    gpu: str | None,
+    gpu_device_path: str | None,
+    read_text: Callable[[np.ndarray], list[list[str]]],
+    cancel_check: Callable[[], bool] | None = None,
+    timeout_s: float = DECODE_TIMEOUT_S,
+    start_time_s: float | None = None,
+    download_format: str | None = None,
+    pause_check: Callable[[], bool] | Freeze | None = None,
+    ffmpeg_threads: int | None = None,
+) -> list[str]:
+    """The words on the frame at ``at_s``: one second decoded at 1 fps and ``scale`` times 320x180 exactly as a refine
+    window is (the worker's device, the one scaler), and its frame read (a card at a credits start, spec §5.4).
+
+    Args:
+        path: The media file (read only).
+        ffmpeg: ffmpeg binary.
+        at_s: The frame's time, seconds from the start of the file.
+        scale: The frame size in multiples of 320x180 (``cards.READ_SCALE``).
+        gpu: The worker's GPU type, None on a CPU worker.
+        gpu_device_path: The worker's device.
+        read_text: The words on each of (n, H, W) uint8 luma planes.
+        cancel_check: As :func:`decode_rows`.
+        timeout_s: As :func:`decode_rows`.
+        start_time_s: As :func:`decode_rows`.
+        download_format: As :func:`decode_rows`.
+        pause_check: As :func:`decode_rows`.
+        ffmpeg_threads: As :func:`decode_rows`.
+
+    Returns:
+        The frame's text, one entry per box the detection model finds on it, top to bottom; empty when ffmpeg gave no
+        frame there.
+
+    Raises:
+        Everything :func:`decode_rows` raises.
+    """
+    name = os.path.basename(path)
+    if cancel_check and cancel_check():
+        raise DecodeCancelledError(f"cancelled before decoding {name}")
+    command, hw_active = decode_command(
+        ffmpeg, path, start_s=at_s, length_s=1.0, keyframes_only=False, fps=1, gpu=gpu, gpu_device_path=gpu_device_path,
+        scale=scale, download_format=download_format, ffmpeg_threads=ffmpeg_threads,
+    )  # fmt: skip
+    offset_s = (
+        container_start_s(path, ffmpeg, timeout_s=min(PROBE_TIMEOUT_S, timeout_s))
+        if start_time_s is None
+        else start_time_s
+    )
+    lines: list[list[str]] = []
+
+    def read(planes: np.ndarray) -> list[tuple[Box, ...]]:
+        if not lines:  # a second frame (``-t 1`` at 1 fps can give two) isn't read
+            lines.extend(read_text(planes))
+        return [() for _ in planes]
+
+    # One frame per request: a card's full-size frame is read on its own, not with others.
+    run_decode(command, hw_active=hw_active, detect_boxes=read, cancel_check=cancel_check, pause_check=pause_check,
+               timeout_s=timeout_s, pts_offset_s=offset_s, name=name, scale=scale, chunk_frames=1)  # fmt: skip
+    return lines[0] if lines else []

@@ -287,7 +287,8 @@ def reproduce(
         port = {f: _as_tuple(seg) for f, seg in season_intros(fps).items()}
         step = SeasonStep(season, fps, report, end_pictures, speed=speed, retimed=retimed)
         if with_reference:
-            reference = fp3_reference.analyse_points(fps, sorted(fps))
+            # The measured algorithm with the matcher's own run cap (300 s since season audio v11; it was 120 s).
+            reference = fp3_reference.analyse_points(fps, sorted(fps), max_len=MAX_INTRO_S)
             for f in sorted(fps):
                 if port[f] != _as_tuple(reference[f]["segment"]):
                     report.port_vs_reference.append({"season": season, "file": f, "port": port[f],

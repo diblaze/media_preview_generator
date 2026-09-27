@@ -1361,6 +1361,68 @@ class TestDecodeRows:
         assert expected[expected.index("-bsf:V:0") + 1] == bsf
 
 
+class TestReadTextAt:
+    @pytest.mark.parametrize(
+        ("gpu", "device", "hw"), [("NVIDIA", "cuda:0", True), (None, None, False)], ids=["gpu", "cpu"]
+    )
+    def test_one_second_at_the_read_size_on_the_workers_device_one_frame_per_request(
+        self, monkeypatch, gpu, device, hw
+    ):
+        seen: dict = {}
+        asked: list[tuple] = []
+
+        def fake_run(command, **kwargs):
+            seen["command"] = command
+            seen.update(kwargs)
+            assert kwargs["detect_boxes"](np.zeros((1, 720, 1280), np.uint8)) == [()]
+            assert kwargs["detect_boxes"](np.zeros((1, 720, 1280), np.uint8)) == [()]
+            return []
+
+        def read_text(planes):
+            asked.append(planes.shape)
+            return [["THE INVESTIGATION", "IS NOW CLOSED."] if len(asked) == 1 else ["LATER"]]
+
+        def cancel():
+            return False
+
+        monkeypatch.setattr(frames, "run_decode", fake_run)
+        lines = frames.read_text_at(MOVIE, ffmpeg=FF, at_s=5692.0, scale=4, gpu=gpu, gpu_device_path=device,
+                                    read_text=read_text, cancel_check=cancel, timeout_s=42.0, start_time_s=0.0,
+                                    download_format="p010le", ffmpeg_threads=3)  # fmt: skip
+        expected_command, _ = frames.decode_command(
+            FF, MOVIE, start_s=5692.0, length_s=1.0, keyframes_only=False, fps=1, gpu=gpu, gpu_device_path=device,
+            scale=4, download_format="p010le", ffmpeg_threads=3,
+        )  # fmt: skip
+        # The first frame of the second is the card's: a second frame (the next second's, when ffmpeg rounds) is never
+        # read at all.
+        assert lines == ["THE INVESTIGATION", "IS NOW CLOSED."]
+        assert asked == [(1, 720, 1280)]
+        seen.pop("detect_boxes")
+        assert seen == {
+            "command": expected_command,
+            "hw_active": hw,
+            "cancel_check": cancel,
+            "pause_check": None,
+            "timeout_s": 42.0,
+            "pts_offset_s": 0.0,
+            "name": "Movie.mkv",
+            "scale": 4,
+            "chunk_frames": 1,
+        }
+
+    def test_no_frame_there_reads_nothing(self, monkeypatch):
+        monkeypatch.setattr(frames, "run_decode", lambda command, **kwargs: [])
+        lines = frames.read_text_at(MOVIE, ffmpeg=FF, at_s=5692.0, scale=4, gpu=None, gpu_device_path=None,
+                                    read_text=lambda planes: [["NEVER"]], start_time_s=0.0)  # fmt: skip
+        assert lines == []
+
+    def test_a_cancel_before_the_decode_starts_none(self, monkeypatch):
+        monkeypatch.setattr(frames, "run_decode", lambda command, **kwargs: pytest.fail("decoded after a cancel"))
+        with pytest.raises(frames.DecodeCancelledError):
+            frames.read_text_at(MOVIE, ffmpeg=FF, at_s=5692.0, scale=4, gpu=None, gpu_device_path=None,
+                                read_text=lambda planes: [], cancel_check=lambda: True, start_time_s=0.0)  # fmt: skip
+
+
 def _packets(count: int, *, fps: float = 24.0, start_s: float = 0.0, keyframe: bool = True) -> list[VideoPacket]:
     return [VideoPacket(round(start_s + i / fps, 6), keyframe) for i in range(count)]
 
