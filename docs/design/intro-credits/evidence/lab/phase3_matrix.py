@@ -306,28 +306,53 @@ def gpu_threads(decodes: list[str], threads: int = 2) -> bool:
 
 
 class ProcessSampler(threading.Thread):
-    """Credit-text decodes and text detection helpers in mlab-app, every 0.5 s, until the block ends."""
+    """Credit-text decodes and text detection helpers in mlab-app, every ``INTERVAL_S``, until the block ends.
+
+    One ``ps`` loop runs inside the container for the whole block. A refine window's decode lasts under a second on the
+    P5000 (0.7-0.9 s measured on 2026-09-27), and the earlier poll -- a new ``docker exec`` every 0.5 s, 0.1 s each --
+    let one go unseen: phase 3 row 16's premise failed on a working app in the full run (``CHANGES.md``). The loop ends
+    when the block does (a stop file), and at the latest after ``MAX_S``.
+    """
+
+    INTERVAL_S = 0.05
+    MAX_S = 3 * 3600
+    SAMPLE_END = "--mlab-sample--"
 
     def __init__(self) -> None:
         super().__init__(daemon=True)
         self.decodes: list[str] = []
         self.helpers: dict[str, str] = {}
         self.peak_helpers = 0
+        self.samples = 0
         self.stop = threading.Event()
+        self._stop_file = f"/tmp/mlab-sampler-{os.getpid()}-{id(self)}"
+        self._proc: subprocess.Popen | None = None
 
     def run(self) -> None:
-        while not self.stop.is_set():
-            out = sh("docker", "exec", "mlab-app", "ps", "-eo", "pid=,args=", check=False)
-            running = 0
-            for line in out.splitlines():
-                pid, _, args = line.strip().partition(" ")
-                if is_credit_decode(args) and args not in self.decodes:
-                    self.decodes.append(args)
-                if "textdet_helper" in args and "--check" not in args:
-                    running += 1
-                    self.helpers.setdefault(pid, args)
-            self.peak_helpers = max(self.peak_helpers, running)
-            self.stop.wait(0.5)
+        rounds = int(self.MAX_S / self.INTERVAL_S)
+        script = (
+            f'i=0; while [ ! -e "$1" ] && [ "$i" -lt {rounds} ]; do ps -eo pid=,args=; echo {self.SAMPLE_END}; '
+            f'i=$((i + 1)); sleep {self.INTERVAL_S}; done; rm -f "$1"'
+        )
+        self._proc = subprocess.Popen(
+            ["docker", "exec", "mlab-app", "sh", "-c", script, "mlab-sampler", self._stop_file],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )  # fmt: skip
+        running = 0
+        for raw in self._proc.stdout or []:
+            line = raw.strip()
+            if line == self.SAMPLE_END:
+                self.peak_helpers = max(self.peak_helpers, running)
+                self.samples += 1
+                running = 0
+                continue
+            pid, _, args = line.partition(" ")
+            if is_credit_decode(args) and args not in self.decodes:
+                self.decodes.append(args)
+            if "textdet_helper" in args and "--check" not in args:
+                running += 1
+                self.helpers.setdefault(pid, args)
+        self._proc.wait()
 
     def webgpu_pids(self) -> list[str]:
         """The helper PIDs seen running with the WebGPU backend.
@@ -343,7 +368,11 @@ class ProcessSampler(threading.Thread):
 
     def __exit__(self, *exc: object) -> None:
         self.stop.set()
-        self.join(timeout=5)
+        sh("docker", "exec", "mlab-app", "touch", self._stop_file, check=False)
+        self.join(timeout=10)
+        if self.is_alive() and self._proc is not None:
+            self._proc.kill()
+            self.join(timeout=5)
 
 
 def helper_threads(pid: str) -> str:
@@ -1051,9 +1080,10 @@ def row_16_roll_to_the_end() -> dict:
     }  # fmt: skip
     # The stored end being None is decisive for what was stored. It implies no end window was decoded only because
     # this fixture's coarse end sits inside the 30 s bound (rule_j.KEEP_AFTER_CREDITS_S): in general credits_end can
-    # also return None after decoding the window, when the refined end fails that same check. A 0.5 s sampler can
-    # miss a 21 s window's decode, so the process check above corroborates, it doesn't stand on its own.
-    notes = [f"decodes seen: {len(decodes)} ({len(refines)} refine window(s))"]
+    # also return None after decoding the window, when the refined end fails that same check. A sampler can still
+    # miss a 21 s window's decode (under a second on the P5000), so the process check above corroborates, it doesn't
+    # stand on its own.
+    notes = [f"decodes seen: {len(decodes)} ({len(refines)} refine window(s)) in {sampler.samples} process samples"]
     return checks_result(16, "A roll that runs to the end of the file", premise, checks, evidence, notes)
 
 
