@@ -1,7 +1,8 @@
-/* Navbar hover menus: Automation and Settings (base.html, `.nav-hover-menu`).
+/* Navbar hover menus: Automation, Settings and Tools (base.html, `.nav-hover-menu`).
  *
- * At the navbar's expanded width (xl, 1200px and up) the word is a plain link to its page, and its list of the
- * page's sections opens on hover, or from the keyboard with ArrowDown / ArrowUp / Space. Escape closes it.
+ * At the navbar's expanded width (xl, 1200px and up) the word is a plain link to its page (Tools: to its first
+ * item), and its list (the page's sections; Tools: its pages) opens on hover, or from the keyboard with ArrowDown /
+ * ArrowUp / Space. Escape closes it.
  * Below xl the same lists sit in the offcanvas phone menu, where a tap on the word expands them like the other
  * groups there.
  *
@@ -21,7 +22,7 @@
     var expandedNavbar = window.matchMedia('(min-width: 1200px)');
     var menus = [];
 
-    // One navbar list open at a time, Bootstrap's click-opened ones (Tools, Help, notifications) included.
+    // One navbar list open at a time, Bootstrap's click-opened ones (Help, notifications) included.
     function closeAll(except) {
         menus.forEach(function (menu) {
             if (menu !== except) menu.close();
