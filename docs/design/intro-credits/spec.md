@@ -128,6 +128,14 @@ settings, the credits scaler and 640×360 re-reads, two playback speeds, season 
   Evil S04 ×4 become partial (their title music is re-cut per episode) and Glass Heart S01E03 loses its 13 s title
   card; the two general rules tried against them lost more (that branch's `evidence/card-read/README.md`).
 
+**Open after credit text v9** (§14 2026-09-29 "A captioned story's own captions"; `evidence/captions/README.md`):
+- **Scene text as a short run, story around it**: Killer Cases S04E05 (two lower-third frames 20 s apart make a 20 s
+  run at 38:00, answered with an end 290 s before the file's), S03E04 (a courtroom sign's credit frames 22 s before the
+  roll, joined to it: 38 s early) and I Live Alone S2024E576 (a 23 s run on the studio talk, 64 s of story). No
+  captioned story around them, so v9 doesn't reach them.
+- **I Live Alone's six answers on the next-episode preview**: wrong, no story skipped; its real credits are a framed name
+  panel over the preview's last seconds.
+
 **Working rules (owner's, non-negotiable).**
 - Prove server behaviour on the **lab servers on storage** (§10.3), never on the prod Plex on `plex`. Prod Plex DB:
   read-only queries only (`sqlite3 "file:<db>?mode=ro"`). The owner's two one-off exceptions (§14 2026-09-16 Q7,
@@ -684,6 +692,30 @@ read (the cost: its whole tail again, thinned; 450 frames for a movie). At 640×
 per-request timeout holds at either size. A larger reading of a tail without an answer that times out is no answer,
 and the file waits a day as after a 320×180 timeout; any other failure of the larger reading (other than on the GPU, by
 a cancel or by the app stopping), or a timeout after an answer, keeps the 320×180 answer or "nothing found".
+**Version 9, captioned stories** (2026-09-29 in §14, `evidence/captions/`). A variety show captions most of its
+story: big burned-in captions anywhere on the frame, on most shots but not all. Its story's keyframes carry text at
+43–69 %, under step 8's 80 %, and wherever three caption boxes land on one lit keyframe rule J has a credit frame; at the
+show's 1 s keyframes they come every few seconds, so the 24 s join chains them into a run of up to 515 s that ends on
+the real credits (a framed name panel over the last seconds of the next-episode preview) and starts mid-story (the
+2026-09-28 final audit: 47 of 48 episodes wrong, 29 skipping 10–400 s of story). What gives the run away is the story
+inside it: lit keyframes that show no text at all, 34–153 s of them where the answer skipped story, where a roll after
+such a story shows text or black. `rule_j.captions_all_through`: when 40 % or more of the keyframes before the start
+carry any text (`CAPTIONED_STORY_SHARE`, counted as step 8 counts, on the rows as decoded) and the lit keyframes
+without any text from the start to the run's latest credit keyframe (on the rows as decoded less step 4's overlays)
+add up to more than one join (24 s), there is no answer, and the tail is read at 640×360 as any tail without an answer
+is; the larger reading runs the same check. Credits over closing footage after an uncaptioned story keep theirs however
+much footage they hold (A Trip to Infinity: 77 s after a story texted on 4 % of its keyframes), and so does a captioned
+story whose roll holds less than a join of it (the show's one right answer: 1.6 s). On the 1,387 answers of the sets and
+sflix read at 320×180, every run holding more than a join of such keyframes follows a story texted on at most 37 %;
+every share from 0.37 to 0.43, and at 0.4 every length from 17 to 27 s, gives the same answers. The margin is thin on
+the share (90 Day Fiancé S12E12: 24.02 s at 37 %). Box height, the share of the run's keyframes that are credit frames,
+the band and the story's share alone each overlap right answers and were not used. Measured before → after: the show 1
+useful / 47 wrong / 29 skipping story → 1 / 7 / 1 (40 answers gone; six on the preview skip no story, and E576's 23 s
+run with an end is another shape); every credits set, the answer key, the final audit's other verdicts and the fresh
+sample unchanged; of the 1,452 sflix files with an answer, 43 change: the show's 40, two wrong *Beavis and Butt-Head*
+answers at 640×360 gone and *Legend of the White Dragon* 265 s late → on its first card. Not reached: Killer Cases
+S04E05 (two lower-third frames 20 s apart make a run mid-episode) and S03E04 (a courtroom sign 22 s before the roll,
+joined to it), neither after a captioned story. `CREDITS_TEXT_VERSION` 9 reads every stored answer again once.
 **Runs on any GPU vendor, CPU fallback** (owner 2026-09-13: "make sure all GPU types work";
 `evidence/credits/gpu/RESULTS.md`). Same ONNX model on every path, identical boxes: post-processing is vendored in
 `markers/credits/textdet.py` (pyclipper kept for the unclip step, T-R2); identical box counts to
@@ -879,7 +911,9 @@ and its answer is version 2's (`rule_j.boxes_of`).
    loses its answer too: on 51 broadcast recordings with channel logos that was one right answer, against five wrong
    ones the step removed (`evidence/eval/phase3-harness.md`). It counts the rows **as they were decoded**, step 4's
    overlays included — it is the step that catches a file whose overlay step 4 doesn't find, and counting them out
-   would take those answers away.
+   would take those answers away. **Version 9:** a run is refused too when 40 % or more of the keyframes before it
+   carry text and its lit keyframes without any text add up to more than one join (`rule_j.captions_all_through`;
+   "Version 9, captioned stories" above).
 9. **Refine** with the 1 fps decode: walk back from the coarse start through contiguous credit frames (gaps ≤ 2.5 s),
    then back over the fade (luma < 12, steps ≤ 4 s). The 1 fps rows are read without step 4's overlays too, so the
    walk can't step back over a bug the keyframes already dropped. **Version 7:** a walk over the roll's own frames
@@ -3720,3 +3754,16 @@ C# builds for each target ABI in CI; smoke test on lab containers before any rel
   House of the Dragon S02E03 gaining 0:06–1:46.6, frame-checked). Baseline answer key: credits wrong 10 → 9 of 88
   (skips story 3 → 2; held out 4 → 4), Plex comparison 10 → 9 of 81; fresh sample (seed 20260929) published wrong
   11 of 78 → 10 of 77 (held out 2 → 2), Game of Thrones S08E06 back. Season audio's four truth sets: no answer changes.
+- 2026-09-29 · **A captioned story's own captions are not a roll** (credit text v9, §5.4 "Version 9, captioned
+  stories", step 8; `evidence/captions/`). The final audit after the re-check found *I Live Alone*'s 48 episodes with 47
+  credits markers wrong, 29 skipping 10–400 s of story, all credit text alone: the show's burned-in captions make credit
+  frames wherever three boxes land on a lit keyframe, the 24 s join chains them into runs of up to 515 s, and the
+  story's keyframes, texted at 43–69 %, stay under step 8's 80 %. No answer now when 40 % or more of the keyframes
+  before the start carry text and the run's lit keyframes without any text add up to more than one join. Measured
+  (useful / wrong / skips story): the show 1 / 47 / 29 → 1 / 7 / 1; the final audit's other verdicts on today's markers
+  (115), the fresh sample (75 judged), the 09-27 answer key (credits wrong 12 of 88, held out 4 of 27; Plex comparison
+  11 of 81), the 80, the 205, Accused and I Survived unchanged; every sflix file with a credit text answer (1,452): 43
+  answers change, the show's 40 and three frame-checked better (two wrong *Beavis and Butt-Head* answers gone, *Legend
+  of the White Dragon* 265 s late → its first card); replayed on sflix's copy, 41 credits decisions change and no intro.
+  The version re-run lists 1,631 files there. Not reached, other shapes: Killer Cases S04E05 and S03E04, and six of the
+  show's answers on its next-episode preview (they skip no story).

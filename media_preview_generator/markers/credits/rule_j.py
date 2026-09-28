@@ -104,6 +104,17 @@ STORY_BEFORE_RUN_S = 30.0
 # review) that was one answer (one episode on the GPU decode, 0.895), against five wrong ones this share and
 # the 30 s above took away over both decode paths.
 TEXT_ALL_THROUGH_SHARE = 0.8
+# Version 9 (2026-09-29 audit, a Korean variety show's 48 episodes: 47 answers wrong, 29 of them skipping 10-400 s of
+# story): a story that carries text on this share of its keyframes or more -- burned-in captions on most shots -- makes
+# credit frames of its own captions wherever three boxes land on one lit frame, and the 24 s join chains them into a run
+# minutes long that ends on the real credits. Such a run is its captions, not a roll, when the lit keyframes without any
+# text inside it add up to more than one join (``RuleParams.gap_s``): story the join glued in
+# (:func:`captions_all_through`).
+# Measured on the harness's sets and every sflix file with a credit text answer (1,387 answers read at 320x180): every
+# run holding more than a join of text-free lit keyframes follows a story texted on at most 37 % of its keyframes
+# (credits over closing footage), the variety show's on 43-69 %. Every share from 0.37 to 0.43, and at 0.4 every length
+# from 17 to 27 s, gives the same answers (``evidence/captions/``).
+CAPTIONED_STORY_SHARE = 0.4
 # When the run is under STORY_BEFORE_RUN_S into the tail and only dark rows (luma under 30) come before it there, the
 # roll may have begun before the tail (one show's episodes: 462 s rolls against a 450 s tail), so the
 # keyframes of this much before the tail are read too, and the run is judged on both when it continues into them
@@ -846,6 +857,41 @@ def too_little_story(rows: Sequence[Row], coarse: Coarse) -> bool:
     return coarse.pts_s - min(row[0] for row in rows) < STORY_BEFORE_RUN_S
 
 
+def captions_all_through(
+    rows: Sequence[Row], shown: Sequence[Row], coarse: Coarse, end_s: float, params: RuleParams = RULE_J
+) -> bool:
+    """Whether a run is a captioned story's own captions rather than a roll (rule J version 9).
+
+    :func:`text_all_through` refuses text on screen through the whole tail. A captioned story -- a variety show's
+    burned-in captions, on most shots but not all -- stays under its share, yet its captions make credit frames wherever
+    three boxes land on one lit frame, and the 24 s join chains them into a run minutes long that ends on the real
+    credits (one variety show: runs of up to 515 s, 47 of 48 answers wrong, 29 skipping story). A roll after such a
+    story holds no stretch of it: its keyframes show text, or are dark (black between cards, the fade), and a lit
+    keyframe that shows no text at all is the story, as :func:`chapter_moves_to` and :func:`end_keyframe_s` read it.
+    So when ``CAPTIONED_STORY_SHARE`` or more of the keyframes before the start carry any text, a run whose lit
+    keyframes without text add up to more than one join (``params.gap_s``) from its start to its latest credit keyframe
+    is the story the join glued together, and there is no answer. Credits over closing footage after an uncaptioned
+    story keep theirs however much footage they hold, as do captioned stories whose roll holds less story than a join.
+
+    Args:
+        rows: Keyframe rows of the tail, in decode order, as decoded (the share is :func:`text_all_through`'s).
+        shown: The same rows without the overlays' boxes (:func:`without_overlays`): a channel bug boxed on a story
+            keyframe is no text on it.
+        coarse: The coarse start.
+        end_s: The run's latest credit keyframe (:func:`coarse_end_s`).
+        params: Rule thresholds (``dark`` and ``gap_s``).
+
+    Returns:
+        True when there should be no answer.
+    """
+    before = [row for row in rows if row[0] < coarse.pts_s]
+    if not before or sum(1 for row in before if row[1] >= 1) < CAPTIONED_STORY_SHARE * len(before):
+        return False
+    span = sorted((row for row in shown if coarse.pts_s <= row[0] <= end_s), key=lambda row: row[0])
+    story_s = sum(b[0] - a[0] for a, b in zip(span, span[1:], strict=False) if a[2] >= params.dark and a[1] == 0)
+    return story_s > params.gap_s
+
+
 def opens_on_the_run(rows: Sequence[Row], coarse: Coarse, params: RuleParams = RULE_J) -> bool:
     """Whether a run too close to the first row for :func:`text_all_through` may have begun before the rows do.
 
@@ -1068,14 +1114,16 @@ def credits_start(
 
     Returns:
         The credits start in seconds, or None when the keyframe rows hold no credit run, when the overlay leaves the
-        chosen run fewer than two credit frames (:func:`coarse_start`), or when its text is on screen all through the
-        tail (:func:`text_all_through`).
+        chosen run fewer than two credit frames (:func:`coarse_start`), when its text is on screen all through the
+        tail (:func:`text_all_through`), or when the run is a captioned story's captions (:func:`captions_all_through`).
     """
     overlays = overlay_boxes(rows, params)
     rule_rows = without_overlays(rows, overlays)
     coarse = coarse_start(rows, params, without=rule_rows)
     # The guard counts the rows as they were decoded, exactly as the detector does: see :func:`overlay_boxes`.
     if coarse is None or text_all_through(rows, coarse):
+        return None
+    if captions_all_through(rows, rule_rows, coarse, coarse_end_s(rule_rows, coarse, params), params):
         return None
     return refine_start(rule_rows, coarse, without_overlays(fine_rows, overlays), before_s=before_s, params=params)
 

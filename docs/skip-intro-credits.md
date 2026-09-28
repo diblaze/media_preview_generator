@@ -38,3 +38,4 @@ When it isn't sure, it sends nothing. The file waits in **Needs review** instead
 - **Sports libraries start switched off.** No online source covers sports, and a broadcast's on-screen text is easily taken for credits.
 - **Movies have little online coverage**, so they mostly rely on the credit roll.
 - **Broadcast TV with channel logos or scores on screen is a weak spot.** It sometimes skips into the story.
+- **Shows that caption most of their story** (variety shows with burned-in captions) usually get no credits marker from on-screen text.

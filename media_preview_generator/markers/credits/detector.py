@@ -68,7 +68,10 @@ if TYPE_CHECKING:
 # 8: the card the start lands on is read, and a start on prose cards on black (an epilogue's sentences) moves on to the
 # first card after them that isn't prose (``cards``, :func:`_past_prose`); a credits chapter on those cards moves with
 # it (:func:`chapter_origin`). Only starts on such cards move, later only.
-CREDITS_TEXT_VERSION = 8
+# 9: a run whose story carries text on most keyframes and that holds more than one join of text-free lit keyframes is
+# the story's captions, not a roll (``rule_j.captions_all_through``: a variety show's burned-in captions chained into
+# runs minutes long). Found answers can go, and a file that loses its 320x180 answer is read at 640x360.
+CREDITS_TEXT_VERSION = 9
 # A stored answer's version is CREDITS_TEXT_VERSION for Automatic (what it has always been, so nothing is decoded again
 # on upgrade) and CREDITS_TEXT_VERSION + window seconds * this for a window the user chose. The smallest window
 # (300 s) gives 300,000 plus the version, so a chosen window's version never equals Automatic's, and another window's
@@ -476,7 +479,7 @@ def _read_credits(
     if coarse is not None and scale > 1:
         shown = rule_j.without_overlays(key_rows, overlays)
         coarse = rule_j.start_on_dense_text(rule_rows, coarse, run_rows, shown, dense_boxes=DENSE_BOXES)
-    if coarse is None or rule_j.text_all_through(key_rows, coarse):
+    if coarse is None or rule_j.text_all_through(key_rows, coarse) or _captions(key_rows, rule_rows, coarse, overlays):
         return CreditsTextResult(None, None, tuple(key_rows), (), (), overlays, scale, run_rows)
     show(REFINING_PHASE)
     # max() can't bind while text_all_through holds an answered run 30 s past its first row; it keeps -ss non-negative.
@@ -592,6 +595,32 @@ def _past_prose(
         return found
     logger.debug("{}: the credits start at {:.1f} s is on prose cards; moved to {:.1f} s", name, start, moved)
     return dataclasses.replace(found, start_s=moved, prose_start_s=start)
+
+
+def _captions(
+    key_rows: Sequence[rule_j.Row],
+    rule_rows: Sequence[rule_j.Row],
+    coarse: rule_j.Coarse,
+    overlays: Sequence[rule_j.Box],
+) -> bool:
+    """Whether the run is a captioned story's own captions (``rule_j.captions_all_through``, version 9).
+
+    The story's share is counted on the rows as decoded, as ``rule_j.text_all_through`` counts it. The text-free lit
+    keyframes inside the run are read on the rows as decoded without the overlays -- at 640x360 with the text the
+    320x180 reading boxed still in them, so a keyframe only that reading boxed text on is no story -- up to the run's
+    latest credit keyframe, found on the rows rule J read.
+
+    Args:
+        key_rows: The keyframe rows as decoded (joined with the steps before the tail when those were read).
+        rule_rows: The rows rule J read (``coarse`` indexes them).
+        coarse: The coarse start.
+        overlays: The tail's overlays.
+
+    Returns:
+        True when there should be no answer.
+    """
+    shown = rule_j.without_overlays(key_rows, overlays)
+    return rule_j.captions_all_through(key_rows, shown, coarse, rule_j.coarse_end_s(rule_rows, coarse))
 
 
 def _small_text(rows: Sequence[rule_j.Row], seen_boxes: dict[float, tuple[rule_j.Box, ...]]) -> list[rule_j.Row]:
