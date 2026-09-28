@@ -41,11 +41,24 @@
 <body>
     {% if request.endpoint != 'main.login' %}
     <!-- Navigation -->
-    <nav class="navbar navbar-expand-lg border-bottom sticky-top">
+    <nav class="navbar navbar-expand-xl border-bottom sticky-top">
         <div class="container-fluid">
-            <a class="navbar-brand" href="{{ url_for('main.index') }}">
-                <img class="navbar-brand-mark me-2" src="{{ url_for('static', filename='images/icon.svg') }}" alt="" width="26" height="26">Media Preview Generator
-            </a>
+            <div class="navbar-brand-group">
+                <a class="navbar-brand" href="{{ url_for('main.index') }}">
+                    <img class="navbar-brand-mark me-2" src="{{ url_for('static', filename='images/icon.svg') }}" alt="" width="26" height="26">Media Preview Generator
+                </a>
+                {# The running build, stacked under the wordmark so it costs the crowded bar no width. The dot
+                   comes from the last cached update check: rendering never waits on GitHub. #}
+                {% set version_note = 'Version ' ~ navbar_version.latest_version ~ ' is available' if navbar_version.update_available else 'Release notes' %}
+                <a class="navbar-version" id="navVersion"
+                   href="https://github.com/stevezau/media_preview_generator/releases/latest"
+                   target="_blank" rel="noopener noreferrer"
+                   data-bs-toggle="tooltip" data-bs-placement="bottom" title="{{ version_note }}"
+                   aria-label="Version {{ navbar_version.label }}. {{ version_note }}, opens in a new tab">
+                    <span id="navVersionText">{{ navbar_version.label }}</span>
+                    {%- if navbar_version.update_available %}<span class="navbar-version-dot" id="navVersionDot" aria-hidden="true"></span>{% endif %}
+                </a>
+            </div>
             <!-- The standard ``.navbar-toggler-icon`` SVG is just three
                  horizontal bars; the close affordance got muddled when
                  it was just a rotated hamburger. Use Bootstrap Icons —
@@ -57,12 +70,14 @@
                     aria-controls="navbarNav" aria-expanded="false" aria-label="Open navigation menu">
                 <i class="bi bi-list navbar-toggler-glyph" aria-hidden="true"></i>
             </button>
-            <!-- ``offcanvas offcanvas-end offcanvas-lg`` makes this menu
+            <!-- ``offcanvas offcanvas-end offcanvas-xl`` makes this menu
                  slide in from the right (like a native iOS drawer) on
-                 viewports below ``lg``, while staying as a regular
-                 inline navbar at ``lg`` and up. Bootstrap 5.2+ handles
-                 the responsive switch for us. -->
-            <div class="offcanvas offcanvas-end offcanvas-lg" tabindex="-1" id="navbarNav"
+                 viewports below ``xl`` (1200px), while staying as a regular
+                 inline navbar at ``xl`` and up. Bootstrap 5.2+ handles
+                 the responsive switch for us. ``xl``, not ``lg``: with wider
+                 fonts than ours (a Linux box falling back to DejaVu Sans) the
+                 full bar doesn't fit below 1200px and wraps or scrolls sideways. -->
+            <div class="offcanvas offcanvas-end offcanvas-xl" tabindex="-1" id="navbarNav"
                  aria-labelledby="navbarOffcanvasLabel">
                 <div class="offcanvas-header border-bottom">
                     <h5 class="offcanvas-title" id="navbarOffcanvasLabel">
@@ -176,7 +191,7 @@
                          column of unlabelled icons after the primary links and
                          can't tell which is what. Hidden on desktop where the
                          right-aligned cluster naturally separates them. -->
-                    <li class="nav-item d-lg-none">
+                    <li class="nav-item d-xl-none">
                         <hr class="dropdown-divider my-2">
                     </li>
                     <li class="nav-item dropdown notification-bell-wrapper">
@@ -195,7 +210,7 @@
                                  label inline below `lg` so it matches the rest
                                  of the menu. Desktop hides it (icon + tooltip
                                  is enough where horizontal space is tight). -->
-                            <span class="d-lg-none ms-2">Notifications</span>
+                            <span class="d-xl-none ms-2" id="notificationBellLabel">Notifications</span>
                             <span class="position-absolute translate-middle badge rounded-pill bg-danger d-none"
                                   id="notificationBellBadge"
                                   style="top: 35%; left: 70%; font-size: 0.65rem;">
@@ -231,7 +246,7 @@
                                 aria-label="Help and report an issue"
                                 title="Help / Report an issue">
                             <i class="bi bi-question-circle"></i>
-                            <span class="d-lg-none ms-2">Help &amp; feedback</span>
+                            <span class="d-xl-none ms-2">Help &amp; feedback</span>
                         </button>
                         <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="helpMenuBtn">
                             <li>
@@ -269,9 +284,9 @@
                             <li><hr class="dropdown-divider"></li>
                             <li>
                                 <a class="dropdown-item d-flex align-items-center"
-                                   href="https://github.com/sponsors/stevezau"
+                                   href="https://ko-fi.com/stevezau"
                                    target="_blank" rel="noopener noreferrer">
-                                    <i class="bi bi-heart-fill me-2 sponsor-heart"></i>Sponsor this project
+                                    <i class="bi bi-cup-hot-fill me-2 sponsor-cup"></i>Buy me a coffee
                                     <i class="bi bi-box-arrow-up-right ms-auto small text-muted" aria-label="Opens in a new tab"></i>
                                 </a>
                             </li>
@@ -286,23 +301,34 @@
                         </ul>
                     </li>
                     <li class="nav-item">
-                        {# Sponsor heart sits between Help and the theme toggle so it reads as a
-                           utility affordance, not a nag. Styled by #sponsorLinkBtn in style.css,
-                           which opts it into the same 38px circular hover treatment as the bell
-                           and theme toggle (desktop) / full-width labelled row (mobile). #}
+                        {# The coffee cup and Star match the docs site's nav (docs/_includes/nav.html): a cup
+                           says what a click does where a heart didn't. Both sit between Help and the theme
+                           toggle so they read as utilities, not a nag. #sponsorLinkBtn gets the 38px circle
+                           of the bell and theme toggle on desktop and a labelled row in the phone menu. #}
                         <a class="nav-link btn btn-link d-flex align-items-center" id="sponsorLinkBtn"
-                           href="https://github.com/sponsors/stevezau"
+                           href="https://ko-fi.com/stevezau"
                            target="_blank" rel="noopener noreferrer"
-                           aria-label="Sponsor this project on GitHub" title="Sponsor this project">
-                            <i class="bi bi-heart-fill sponsor-heart"></i>
-                            <span class="d-lg-none ms-2">Sponsor this project</span>
+                           aria-label="Buy me a coffee on Ko-fi" title="Buy me a coffee on Ko-fi">
+                            <i class="bi bi-cup-hot-fill sponsor-cup" aria-hidden="true"></i>
+                            <span class="d-xl-none ms-2">Buy me a coffee</span>
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        {# "Star" opens the repo, where GitHub's own Star button is: no URL stars a repo. #}
+                        <a class="nav-link btn btn-link d-flex align-items-center" id="navStarBtn"
+                           href="https://github.com/stevezau/media_preview_generator"
+                           target="_blank" rel="noopener noreferrer"
+                           aria-label="Star Media Preview Generator on GitHub" title="Star Media Preview Generator on GitHub">
+                            <i class="bi bi-star-fill navbar-star" aria-hidden="true"></i>
+                            <span class="navbar-star-word">Star</span>
+                            <span class="d-xl-none ms-2">Star on GitHub</span>
                         </a>
                     </li>
                     <li class="nav-item">
                         <button type="button" class="nav-link btn btn-link d-flex align-items-center" id="themeToggleBtn"
                                 aria-label="Toggle dark/light theme" title="Toggle dark/light theme">
                             <i class="bi bi-moon-stars-fill" id="themeToggleIcon"></i>
-                            <span class="d-lg-none ms-2" id="themeToggleLabel">Switch to light theme</span>
+                            <span class="d-xl-none ms-2" id="themeToggleLabel">Switch to light theme</span>
                         </button>
                     </li>
                     <li class="nav-item">
@@ -472,11 +498,11 @@
                 if (link.matches('[data-bs-toggle="dropdown"]')) return;
                 var href = link.getAttribute('href') || '';
                 if (href === '' || href === '#') return;
-                // Only dismiss on viewports below the navbar-expand-lg
-                // breakpoint (992px). At lg+ the offcanvas isn't really
+                // Only dismiss on viewports below the navbar-expand-xl
+                // breakpoint (1200px). At xl+ the offcanvas isn't really
                 // an offcanvas — it renders inline as a regular navbar
                 // and there's nothing to hide.
-                if (window.innerWidth >= 992) return;
+                if (window.innerWidth >= 1200) return;
                 var instance = window.bootstrap.Offcanvas.getInstance(offcanvasEl)
                     || new window.bootstrap.Offcanvas(offcanvasEl);
                 instance.hide();
