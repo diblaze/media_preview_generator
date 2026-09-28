@@ -74,8 +74,10 @@ class TestCheckedFilm:
         timeline = authed_page.locator("#inspTimeline")
         expect(timeline.locator(".insp-tl-range")).to_have_text("0:00 – 2:16:18")
         expect(timeline.locator(".insp-tl-title .info-icon")).to_have_attribute(
-            "aria-label", re.compile(r"^Every preview frame in order, one every 2 s\. Scroll or drag the strip")
+            "aria-label", re.compile(r"^Every preview frame in order, one every 2 s\.")
         )
+        # How to move around the strip is the ⓘ's detail, so the hover says "Click for more.".
+        expect(timeline.locator(".insp-tl-title .info-icon")).to_have_class(re.compile(r"\binfo-icon-more\b"))
         expect(authed_page.locator("#inspJumps button")).to_have_text(
             ["No intro", "Credits2:09:25", "Plex2:08:00", "Plex2:09:28"]
         )
@@ -248,10 +250,16 @@ class TestCheckedFilm:
     def test_the_timeline_info_says_the_bar_can_be_dragged(self, authed_page: Page, app_url: str) -> None:
         fx.install(authed_page, _api_with(fx.checked_film()))
         _open(authed_page, app_url, fx.FILM)
-        expect(authed_page.locator("#inspTimeline .insp-tl-title .info-icon")).to_have_attribute(
+        icon = authed_page.locator("#inspTimeline .insp-tl-title .info-icon")
+        expect(icon).to_have_attribute(
             "aria-label",
-            "Every preview frame in order, one every 2 s. Scroll or drag the strip, or click or drag along the bar "
-            "above it to jump. Click a frame to see it large. Each row below shows what that server gives viewers.",
+            "Every preview frame in order, one every 2 s. Each row below shows what that server gives viewers.",
+        )
+        # How to move around the strip is the ⓘ's detail (the app-wide ⓘ rule keeps the hover to what it is).
+        icon.click()
+        expect(authed_page.locator("#globalInfoBody")).to_have_text(
+            "Scroll or drag the strip, or click or drag along the bar above it to jump. Click a frame to see it large.",
+            timeout=5000,
         )
 
     def test_dragging_moves_the_strip_and_is_not_a_click(self, authed_page: Page, app_url: str) -> None:
