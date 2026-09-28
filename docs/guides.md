@@ -63,7 +63,7 @@ After setup completes, you'll land on the dashboard. You can add additional serv
 
 The version you're running shows under the app's name in the top bar, on every page. An orange dot beside it means a newer version is out; click the version for the release notes.
 
-In the top bar, **Automation** and **Settings** open their page when clicked. Hover over either to jump straight to one of its sections (or focus it and press the Down arrow). On a phone, tap either one in the menu to list its sections.
+In the top bar, **Automation** and **Settings** open their page when clicked, and **Tools** opens the Inspector. Hover over any of them to see what's inside and jump straight there (or focus it and press the Down arrow). On a phone, tap one in the menu to list what's inside.
 
 ### Dashboard Features
 

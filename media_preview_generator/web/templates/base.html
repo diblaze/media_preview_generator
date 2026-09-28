@@ -97,8 +97,9 @@
                             <i class="bi bi-hdd-stack me-1"></i>Servers
                         </a>
                     </li>
-                    {# Automation and Settings are hover menus (nav_menus.js): the word is a real link to the page, and
-                       hovering it, or ArrowDown / Space on it, opens the page's sections. No data-bs-toggle, or
+                    {# Automation, Settings and Tools are hover menus (nav_menus.js): the word is a real link to the page
+                       (Tools: to its first item), and hovering it, or ArrowDown / Space on it, opens the page's
+                       sections (Tools: its pages). No data-bs-toggle, or
                        Bootstrap would swallow the click. In the phone menu a tap expands the list instead. Each item's
                        data-anchor lets nav_menus.js mark the one the URL's #hash points at. #}
                     <li class="nav-item dropdown nav-hover-menu">
@@ -183,27 +184,21 @@
                             </li>
                         </ul>
                     </li>
-                    <!-- Tools dropdown — diagnostic surfaces grouped together so the primary
-                         nav stays focused on configuration. Previously Logs and Preview
-                         Inspector were each a top-level nav entry; users navigating to "where
-                         do I configure X" had to mentally skip over them. The "Run setup again"
-                         entry exposes /setup so users can re-onboard after swapping servers
-                         (the route always worked; nothing in the UI previously linked to it
-                         after first-run). -->
-                    <li class="nav-item dropdown">
-                        {# <button> not <a href="#"> — the latter races with
-                           iOS-Safari's synthesized click and momentarily
-                           sets location.hash = "" on tap, which fires the
-                           hashchange listener below and clears any deep-link
-                           highlight on the Automation dropdown. Same pattern
-                           as the Help and Notification toggles further down. #}
-                        <button type="button"
-                                class="nav-link btn btn-link dropdown-toggle d-flex align-items-center {% if request.endpoint in ('main.logs_page','main.webhook_activity_page','main.inspector') %}active{% endif %}"
-                                id="navToolsDropdown"
-                                data-bs-toggle="dropdown" aria-expanded="false">
+                    {# Tools groups the diagnostic pages, keeping the main bar to configuration. "Run setup again"
+                       lets users re-onboard after swapping servers. #}
+                    <li class="nav-item dropdown nav-hover-menu">
+                        <a class="nav-link dropdown-toggle {% if request.endpoint in ('main.logs_page','main.webhook_activity_page','main.inspector') %}active{% endif %}"
+                           href="{{ url_for('main.inspector') }}" id="navToolsDropdown" data-nav-menu-toggle
+                           aria-haspopup="true" aria-expanded="false" aria-controls="navToolsMenu">
                             <i class="bi bi-wrench-adjustable me-1"></i>Tools
-                        </button>
-                        <ul class="dropdown-menu" aria-labelledby="navToolsDropdown">
+                        </a>
+                        <ul class="dropdown-menu" id="navToolsMenu" aria-labelledby="navToolsDropdown">
+                            <li>
+                                {# One page for a file's preview frames and its intro & credits. #}
+                                <a class="dropdown-item {% if request.endpoint == 'main.inspector' %}active{% endif %}" href="{{ url_for('main.inspector') }}">
+                                    <i class="bi bi-film me-2"></i>Inspector
+                                </a>
+                            </li>
                             <li>
                                 <a class="dropdown-item {% if request.endpoint == 'main.logs_page' %}active{% endif %}" href="{{ url_for('main.logs_page') }}">
                                     <i class="bi bi-terminal me-2"></i>Logs
@@ -212,12 +207,6 @@
                             <li>
                                 <a class="dropdown-item {% if request.endpoint == 'main.webhook_activity_page' %}active{% endif %}" href="{{ url_for('main.webhook_activity_page') }}">
                                     <i class="bi bi-clock-history me-2"></i>Webhook Activity
-                                </a>
-                            </li>
-                            <li>
-                                {# One page for a file's preview frames and its intro & credits. #}
-                                <a class="dropdown-item {% if request.endpoint == 'main.inspector' %}active{% endif %}" href="{{ url_for('main.inspector') }}">
-                                    <i class="bi bi-film me-2"></i>Inspector
                                 </a>
                             </li>
                             <li><hr class="dropdown-divider"></li>
@@ -551,7 +540,7 @@
         })();
     </script>
 
-    <!-- Automation / Settings hover menus and their #section highlight. -->
+    <!-- Automation / Settings / Tools hover menus and their #section highlight. -->
     <script src="{{ url_for('static', filename='js/nav_menus.js') }}"></script>
 
     <!-- Theme toggle — flips data-bs-theme on <html> and persists to

@@ -136,7 +136,7 @@ class TestOverlaysStayAboveThePinnedNavbar:
         _open(authed_page, app_url, "settings")
         _scroll_down(authed_page)
 
-        authed_page.locator("#navToolsDropdown").click()
+        authed_page.locator("#navToolsDropdown").hover()
         menu = authed_page.locator("#navToolsDropdown + .dropdown-menu")
         expect(menu).to_be_visible()
 

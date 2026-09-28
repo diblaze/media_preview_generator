@@ -20,7 +20,8 @@ class TestToolsMenuEntry:
     def test_one_entry_opens_the_inspector(self, authed_page: Page, app_url: str) -> None:
         fx.install(authed_page)
         authed_page.goto(f"{app_url}/logs")
-        authed_page.locator("#navToolsDropdown").click()
+        authed_page.locator("#navToolsDropdown").hover()
+        expect(authed_page.locator("#navToolsMenu")).to_be_visible()
 
         items = authed_page.locator("#navToolsDropdown + .dropdown-menu .dropdown-item")
         labels = [t.strip() for t in items.all_inner_texts()]
@@ -39,7 +40,7 @@ class TestToolsMenuEntry:
         fx.install(authed_page)
         authed_page.goto(f"{app_url}/inspector")
         expect(authed_page.locator("#navToolsDropdown")).to_have_class(re.compile(r"\bactive\b"))
-        authed_page.locator("#navToolsDropdown").click()
+        authed_page.locator("#navToolsDropdown").hover()
         expect(authed_page.locator("#navToolsDropdown + .dropdown-menu a[href='/inspector']")).to_have_class(
             re.compile(r"\bactive\b")
         )
