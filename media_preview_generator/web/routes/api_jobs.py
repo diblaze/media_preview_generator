@@ -1139,7 +1139,7 @@ def fire_webhook_now(job_id):
 @api.route("/jobs/<job_id>/pause", methods=["POST"])
 @api_token_required
 def pause_job(job_id):
-    """Pause a job. Intro & Credits jobs pause on their own; preview jobs pause all processing (legacy)."""
+    """Pause a job. Intro & Credits and loudness jobs pause on their own; preview jobs pause all processing (legacy)."""
     job_manager = get_job_manager()
     job = job_manager.get_job(job_id)
     if not job:
@@ -1154,7 +1154,7 @@ def pause_job(job_id):
 @api.route("/jobs/<job_id>/resume", methods=["POST"])
 @api_token_required
 def resume_job(job_id):
-    """Resume a job. Intro & Credits jobs resume on their own; preview jobs resume all processing (legacy)."""
+    """Resume a job. Intro & Credits and loudness jobs resume on their own; preview jobs resume all processing (legacy)."""
     job_manager = get_job_manager()
     job = job_manager.get_job(job_id)
     if not job:
@@ -1224,7 +1224,8 @@ def pause_processing():
     job_manager = get_job_manager()
     sm.processing_paused = True
     for running in job_manager.get_running_jobs():
-        # Intro & Credits jobs are held by the global flag itself; their per-job flag is the user's own pause.
+        # Intro & Credits and loudness jobs are held by the global flag itself; their per-job flag is the user's own
+        # pause.
         if running.kind in SELF_PAUSED_KINDS:
             continue
         job_manager.request_pause(running.id)

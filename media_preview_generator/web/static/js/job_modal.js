@@ -1489,7 +1489,7 @@ function _fileOutcomeMeta(key) {
 
 // Each job kind has its own outcomes; options tagged with another kind are hidden (untagged ones are shared).
 function _showFileOutcomesForKind(select, kind) {
-    var current = kind === 'intro_credits' ? 'intro_credits' : 'previews';
+    var current = kind === 'intro_credits' || kind === 'loudness' ? kind : 'previews';
     Array.prototype.forEach.call(select.options, function (opt) {
         var other = !!opt.dataset.kind && opt.dataset.kind !== current;
         opt.hidden = other;

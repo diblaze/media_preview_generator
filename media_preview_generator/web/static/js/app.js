@@ -1554,9 +1554,17 @@ const STATUS_META = {
     markers_no_owners:      { label: 'No server with Intro & Credits on', cls: 'bg-secondary', tip: 'No server with Intro & Credits turned on has this file' },
     markers_skipped:        { label: 'Skipped', cls: 'bg-secondary', tip: 'The server can\'t take markers right now (for example, a plugin is missing), or the file is a trailer or other extra' },
     markers_waiting:        { label: 'Waiting', cls: 'bg-info text-dark', tip: 'The server hasn\'t added the file yet (the job tries it again later), or the item\'s versions don\'t agree yet' },
+
+    // Plex loudness: file outcomes and per-server row statuses (loudness/job.py).
+    loudness_written:        { label: 'Loudness written', cls: 'bg-success', tip: 'Plex\'s loudness analysis was stored for at least one audio track, or its item marked analysed' },
+    loudness_up_to_date:     { label: 'Up to date', cls: 'bg-secondary', tip: 'Plex already has loudness for every audio track, or the file has none' },
+    loudness_no_owners:      { label: 'No server with Loudness on', cls: 'bg-secondary', tip: 'No Plex server with Loudness turned on has this file' },
+    loudness_not_in_library: { label: 'Not in Plex yet', cls: 'bg-info text-dark', tip: 'Plex hadn\'t added this file yet; a retry job checks it again later (up to 3 times)' },
+    loudness_waiting:        { label: 'Waiting for Plex', cls: 'bg-info text-dark', tip: 'Plex\'s database couldn\'t be written just then (restarting or busy); a retry job checks it again later' },
 };
 
 const JOB_KIND_INTRO_CREDITS = 'intro_credits';
+const JOB_KIND_LOUDNESS = 'loudness';
 // Waiting rows whose server hasn't indexed the file yet (markers.outcomes.NOT_IN_LIBRARY); a "Retry: …" job follows.
 const MARKERS_NOT_IN_LIBRARY = 'not_in_library';
 const MARKERS_NOT_IN_LIBRARY_LABEL = 'Not in the server\'s library yet — will retry';
@@ -1571,13 +1579,17 @@ window._isMarkersJob = _isMarkersJob;
 
 // Kinds with their own runner (job_kinds.SELF_PAUSED_KINDS): they pause on their own and list their files.
 function _hasOwnRunner(job) {
-    return !!job && job.kind === JOB_KIND_INTRO_CREDITS;
+    return !!job && (job.kind === JOB_KIND_INTRO_CREDITS || job.kind === JOB_KIND_LOUDNESS);
 }
 window._hasOwnRunner = _hasOwnRunner;
 
 // job_kinds.parse_job_kind defaults a missing/unknown kind to previews server-side, so this mirrors that default.
 const JOB_KIND_PREVIEWS = 'previews';
-const JOB_KIND_LABELS = { [JOB_KIND_PREVIEWS]: 'Previews', [JOB_KIND_INTRO_CREDITS]: 'Intro & Credits' };
+const JOB_KIND_LABELS = {
+    [JOB_KIND_PREVIEWS]: 'Previews',
+    [JOB_KIND_INTRO_CREDITS]: 'Intro & Credits',
+    [JOB_KIND_LOUDNESS]: 'Plex loudness',
+};
 
 // The one place every job's kind tag is built — the queue table row, the "waiting to retry" active-job
 // card and the modal header (job_modal.js) all call this so the label and markup can't drift between them.
@@ -2150,8 +2162,8 @@ function updateJobQueue(force) {
                     <i class="bi bi-lightning-fill"></i>
                 </button>`
                 : '';
-            // Retry now drives retry chains (preview and Intro & Credits); an old "Retry: …" Intro & Credits job
-            // just waits out its delay.
+            // Retry now drives retry chains (preview and Intro & Credits); a "Retry: …" Intro & Credits or loudness
+            // job just waits out its delay.
             const retryNowBtn = isWaitingRetryRow && (!ownRunner || !!(job.config && job.config.is_retry_chain))
                 ? `<button class="btn btn-outline-warning" onclick="retryNowFromRow('${escapeHtml(job.id)}')" title="Skip the retry backoff — attempt now" aria-label="Retry now">
                     <i class="bi bi-arrow-clockwise"></i>
@@ -3041,7 +3053,7 @@ function showNewJobModal() {
     const sortByEl = document.getElementById('jobSortBy');
     if (sortByEl) sortByEl.value = '';
     // Back to Previews; the priority is only reset when the last open left it on the Intro & Credits default.
-    const wasMarkers = _jobKindIsMarkers();
+    const wasOwnRunner = _jobKindIsMarkers() || _jobKindIsLoudness();
     const previewsKind = document.getElementById('jobKindPreviews');
     if (previewsKind) previewsKind.checked = true;
     const markersForce = document.getElementById('jobMarkersForce');
@@ -3049,7 +3061,7 @@ function showNewJobModal() {
     const findMarkers = document.getElementById('jobMarkersModeFind');
     if (findMarkers) findMarkers.checked = true;
     _showJobKindControls();
-    if (wasMarkers) document.getElementById('jobPriority').value = '2';
+    if (wasOwnRunner) document.getElementById('jobPriority').value = '2';
 
     // Always show all libraries grouped by server. The per-server scope
     // is sent explicitly via the data-server-id attribute the renderer
@@ -3155,7 +3167,9 @@ function _updateJobScopeBadge() {
             '<span class="badge bg-secondary-subtle text-secondary-emphasis border">'
             + (_jobKindIsMarkers()
                 ? '<i class="bi bi-globe2 me-1"></i>Checking every library with Intro &amp; Credits turned on'
-                : '<i class="bi bi-globe2 me-1"></i>Scanning every enabled library across all servers')
+                : _jobKindIsLoudness()
+                    ? '<i class="bi bi-globe2 me-1"></i>Checking every library with Loudness turned on'
+                    : '<i class="bi bi-globe2 me-1"></i>Scanning every enabled library across all servers')
             + '</span>';
         return;
     }
@@ -3173,7 +3187,7 @@ function _updateJobScopeBadge() {
         serverNames.add(sid);
         singleServerName = cb.dataset.serverName || sid;
     }
-    const verb = _jobKindIsMarkers() ? 'Checking' : 'Scanning';
+    const verb = _jobKindIsMarkers() || _jobKindIsLoudness() ? 'Checking' : 'Scanning';
     if (serverNames.size === 1) {
         badge.innerHTML =
             '<span class="badge bg-success-subtle text-success-emphasis border">'
@@ -3194,6 +3208,11 @@ function _jobKindIsMarkers() {
     return !!(radio && radio.checked);
 }
 
+function _jobKindIsLoudness() {
+    const radio = document.getElementById('jobKindLoudness');
+    return !!(radio && radio.checked);
+}
+
 // Intro & Credits · Check servers reads back every server, so it has no libraries and no "re-check" switch.
 function _jobChecksServers() {
     const radio = document.getElementById('jobMarkersModeCheckServers');
@@ -3204,6 +3223,8 @@ function _jobChecksServers() {
 // instead.
 function _showJobKindControls() {
     const markers = _jobKindIsMarkers();
+    // Plex loudness, like Intro & Credits, checks every file of the chosen libraries (files already done are skipped).
+    const ownRunner = markers || _jobKindIsLoudness();
     const checksServers = _jobChecksServers();
     const toggle = function (id, hidden) {
         const el = document.getElementById(id);
@@ -3211,8 +3232,8 @@ function _showJobKindControls() {
     };
     toggle('jobMarkersModeGroup', !markers);
     toggle('jobLibrariesGroup', checksServers);
-    toggle('jobProcessingModeGroup', markers);
-    toggle('jobSortByGroup', markers);
+    toggle('jobProcessingModeGroup', ownRunner);
+    toggle('jobSortByGroup', ownRunner);
     toggle('jobMarkersForceGroup', !markers || checksServers);
     _updateJobScopeBadge();
 }
@@ -3221,7 +3242,7 @@ function _showJobKindControls() {
 function onJobKindChange() {
     _showJobKindControls();
     const priority = document.getElementById('jobPriority');
-    if (priority) priority.value = _jobKindIsMarkers() ? '3' : '2';
+    if (priority) priority.value = _jobKindIsMarkers() || _jobKindIsLoudness() ? '3' : '2';
 }
 
 function toggleAllLibraries(checkbox) {
@@ -3307,6 +3328,28 @@ async function _startMarkersJob() {
     await _submitNewJob('/api/markers/jobs', payload, 'Intro & Credits job has been started');
 }
 
+// Plex loudness: libraries go as server + library pairs like Intro & Credits; an empty list means every library with
+// Loudness turned on. Libraries without it are skipped by the server (named in the job's warning).
+async function _startLoudnessJob() {
+    const allTicked = document.getElementById('jobLibraryAll').checked;
+    const ticked = allTicked ? [] : Array.from(document.querySelectorAll('.job-library-checkbox:checked'));
+    if (!allTicked && ticked.length === 0) {
+        showToast('Error', 'Please select at least one library', 'warning');
+        return;
+    }
+    const picked = ticked.map(cb => ({ server_id: cb.dataset.serverId || '', library_id: cb.value }));
+    const names = picked
+        .map(p => (libraries.find(l => String(l.id) === p.library_id && (l.server_id || '') === p.server_id) || {}).name)
+        .filter(Boolean);
+    const label = allTicked ? 'All Libraries' : _jobLibraryLabel(names, picked.length);
+    const payload = {
+        libraries: picked,
+        priority: parseInt(document.getElementById('jobPriority').value, 10) || 3,
+        library_name: `Plex loudness: ${label}`,
+    };
+    await _submitNewJob('/api/loudness/jobs', payload, 'Plex loudness job has been started');
+}
+
 // The answer to a Check servers request (POST /api/markers/reconcile, or Re-run on a Check servers job): job_id is
 // null when Intro & Credits is off everywhere; only one Check servers job is queued or running at a time.
 function _showCheckServersAnswer(result) {
@@ -3348,6 +3391,10 @@ async function startNewJob() {
     }
     if (_jobKindIsMarkers()) {
         await _startMarkersJob();
+        return;
+    }
+    if (_jobKindIsLoudness()) {
+        await _startLoudnessJob();
         return;
     }
     const allLibrariesCheckbox = document.getElementById('jobLibraryAll');
@@ -3759,7 +3806,7 @@ async function cancelJob(jobId) {
 // The server decides the scope by job kind: an Intro & Credits job pauses on its own, a preview job pauses all
 // processing (legacy). The message follows what actually happened.
 async function pauseJob(jobId) {
-    const markers = _isMarkersJob(jobs.find(j => j.id === jobId));
+    const markers = _hasOwnRunner(jobs.find(j => j.id === jobId));
     try {
         await apiPost(`/api/jobs/${jobId}/pause`);
         await loadJobs({ force: true });

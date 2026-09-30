@@ -1342,7 +1342,7 @@ class JobManager:
             job.status = JobStatus.PENDING
             job.error = None
             job.completed_at = None
-            # An Intro & Credits job's own pause is the user's (or its schedule's stop time's) intent and
+            # An Intro & Credits or loudness job's own pause is the user's (or its schedule's stop time's) intent and
             # outlives the restart like the global pause does; its runner re-applies it. The preview runner
             # can't hold a revived job paused, so a preview job's pause is dropped as before.
             job.paused = job.paused and job.kind in SELF_PAUSED_KINDS
