@@ -23,6 +23,7 @@ Complete reference for all configuration options and REST API endpoints.
 - [Web Interface Settings](#web-interface-settings)
 - [Webhook Settings](#webhook-settings)
 - [Intro & Credits](#intro--credits)
+- [Plex loudness](#plex-loudness)
 - [Path Mappings](#path-mappings)
 - [REST API](#rest-api)
 - [WebSocket Events](#websocket-events)
@@ -789,6 +790,17 @@ or low"}`. `503` when the config directory isn't writable (checked before the bo
 > [Servers](#servers-beyond-the-basics-in-multi-media-server-endpoints)).
 
 ---
+
+## Plex loudness
+
+Plex's loudness analysis run on this app's workers. Plex servers only; off until turned on per server.
+
+### Per-server settings (`media_servers[].loudness`)
+
+| Key | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Default `false`. Turning it on needs the server's Plex database write confirmed (`markers.plex.db_write_confirmed_at`), and no Plex marker agent (`markers.plex.agent.enabled`). |
+| `library_ids` | array of strings \| `null` | Libraries it goes to. `null` = every movie and TV library; a list is taken literally (music included). |
 
 ## Path Mappings
 
