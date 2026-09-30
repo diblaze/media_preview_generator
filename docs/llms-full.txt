@@ -1443,6 +1443,22 @@ three times. Jobs share the workers, priorities, pause and cancel of every other
 
 Plex keeps analysing on its own schedule too: whichever gets to a track first stores it, and the other skips it.
 
+## Undoing it
+
+Every write is recorded in `loudness-writes.jsonl` in the app's config folder, with the track's (or item's) data before
+and after. To put the tracks and items back as they were, stop Plex and run, in the app's container:
+
+```
+docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \
+  --db "/path/to/com.plexapp.plugins.library.db" --log /config/loudness-writes.jsonl
+```
+
+`--db` is Plex's database as the container sees it. Add `--dry-run` to count what would be restored first.
+
+A track or item still holding exactly what the app wrote gets its old data back. One Plex changed since keeps
+Plex's change and loses only the fields the app added, and is left alone if Plex changed those fields too. The
+`updated_at` time the write set on a track isn't put back.
+
 ---
 
 # Guides & Troubleshooting
