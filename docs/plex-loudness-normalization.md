@@ -48,7 +48,9 @@ The same file listed twice in Plex is analysed once and written to both.
    libraries are chosen by hand, because Plex keeps more loudness data for music (album gain, fade ramps) than this
    writes.
 
-Start a **Plex loudness** job from the dashboard (**New job**), for chosen libraries or all of them. A file Plex
+New files get it after their previews (and their Intro & Credits, when that's on), when Sonarr, Radarr or Plex sends
+a webhook. For the files you already have,
+start a **Plex loudness** job from the dashboard (**New job**), for chosen libraries or all of them. A file Plex
 hasn't added to its library yet, or met while Plex was restarting or its database busy, is checked again later, up to
 three times. Jobs share the workers, priorities, pause and cancel of every other job.
 

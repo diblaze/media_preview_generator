@@ -28,6 +28,7 @@ from ..markers.job_runner import (
     job_freeze_check,
     sent_by_a_sender,
     server_pin,
+    wait_for_preceding_job,
     wait_for_retry_time,
     wait_releasing_slot_while_paused,
     worker_cards,
@@ -308,6 +309,9 @@ def run_loudness_job(job_id: str) -> None:
     try:
         with failure_scope(job_id):
             try:
+                if not wait_for_preceding_job(job_id, cfg.get("follows_job_id"), cancel_check):
+                    jm.cancel_job(job_id)
+                    return
                 if not wait_for_retry_time(job_id, cfg, cancel_check):
                     jm.cancel_job(job_id)
                     return
@@ -484,6 +488,7 @@ def create_loudness_job(
     source: str,
     libraries: list[dict] | None = None,
     file_paths: list[str] | None = None,
+    follows_job_id: str | None = None,
     server_id: str | None = None,
     retry_attempt: int = 0,
     retry_delay_s: int = 0,
@@ -496,7 +501,9 @@ def create_loudness_job(
         source: What created it (``manual``, a webhook source).
         libraries: ``[{"server_id", "library_id"}]``; empty with no ``file_paths`` = every library loudness is on for.
         file_paths: Explicit files or folders instead of libraries.
-        server_id: Only this server; None = every server with loudness on.
+        follows_job_id: The job this one waits for before taking a slot: a webhook's Intro & Credits follow-up, else
+            its preview job.
+        server_id: Only this server (the preview job's pin); None = every server with loudness on.
         retry_attempt: For a retry (``_queue_retry``): which retry (1-based).
         retry_delay_s: For a retry: seconds to wait before it takes a slot.
 
@@ -508,6 +515,7 @@ def create_loudness_job(
         "source": source,
         "libraries": list(libraries or []),
         "file_paths": list(file_paths or []),
+        "follows_job_id": follows_job_id,
     }
     if server_id:
         config["server_id"] = server_id

@@ -1,4 +1,4 @@
-"""run_loudness_job's lifecycle (slot, completion, retry of files Plex hadn't added)."""
+"""run_loudness_job's lifecycle (slot, completion, retry of files Plex hadn't added) and the webhook follow-up."""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ def run(monkeypatch):
         "_ensure_gpu_cache": lambda: [],
         "_build_selected_gpus": lambda *a, **kw: [],
         "get_or_create_dispatcher": lambda config, gpus: dispatcher,
+        "wait_for_preceding_job": lambda *a: True,
         "wait_for_retry_time": lambda *a: True,
         "wait_releasing_slot_while_paused": lambda *a, **kw: None,
         "set_file_result_callback": lambda fn, job_id: callback.__setitem__("fn", fn),
@@ -128,7 +129,7 @@ def test_a_job_started_while_processing_is_paused_stays_pending(run, monkeypatch
     run["gate"].acquire.assert_not_called()
 
 
-@pytest.mark.parametrize("wait", ["wait_for_retry_time", "hold_pause_from_before_restart"])
+@pytest.mark.parametrize("wait", ["wait_for_preceding_job", "wait_for_retry_time", "hold_pause_from_before_restart"])
 def test_a_job_cancelled_while_it_waits_to_start_holds_no_slot(run, monkeypatch, wait):
     run["jm"].get_job.return_value.paused = True
     monkeypatch.setattr(job, "hold_pause_from_before_restart", lambda *a: True)
@@ -260,3 +261,76 @@ def test_a_file_no_server_owns_any_more_by_the_worker_stage(monkeypatch):
     ctx = job.LoudnessContext(registry=None, ffmpeg="ffmpeg")
     item = ProcessableItem(canonical_path="/m/a.mkv", server_id="", title="a")
     assert job.process_item(item, ctx=ctx).outcome_key == job.NO_OWNERS
+
+
+# --- webhook follow-up ------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def follow_up(monkeypatch):
+    from media_preview_generator.markers import triggers
+
+    plex = SimpleNamespace(id="plex-1", enabled=True, type=None)
+    monkeypatch.setattr(triggers, "_server_configs", lambda: [plex])
+    jm = MagicMock()
+    jm.get_pending_jobs.return_value = []
+    jm.get_running_jobs.return_value = []
+    jm.get_job.return_value = SimpleNamespace(priority=1, library_name="Show S01E01")
+    monkeypatch.setattr(triggers, "get_job_manager", lambda: jm)
+    created = []
+    monkeypatch.setattr(job, "create_loudness_job", lambda **kw: created.append(kw))
+    return triggers, created
+
+
+def test_follow_up_is_skipped_when_loudness_is_off_everywhere(follow_up, monkeypatch):
+    triggers, created = follow_up
+    monkeypatch.setattr("media_preview_generator.loudness.settings.loudness_enabled_anywhere", lambda configs: False)
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv"], "sonarr", None)
+    assert created == []
+
+
+def test_follow_up_drops_a_pin_that_is_not_a_loudness_plex(follow_up, monkeypatch):
+    triggers, created = follow_up
+    monkeypatch.setattr(
+        "media_preview_generator.loudness.settings.loudness_enabled_anywhere",
+        lambda configs: any(c.id == "plex-1" for c in configs),
+    )
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv"], "sonarr", "jellyfin-1")
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv"], "sonarr", "plex-1")
+    assert [c["server_id"] for c in created] == [None, "plex-1"]
+    assert created[0]["follows_job_id"] == "p1" and created[0]["file_paths"] == ["/m/a.mkv"]
+
+
+def test_a_failing_loudness_follow_up_never_costs_the_intro_follow_up(monkeypatch):
+    from media_preview_generator.markers import triggers
+
+    jm = MagicMock()
+    jm.get_job.return_value = SimpleNamespace(
+        config={triggers.INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": ["/m/a.mkv"], "source": "sonarr"}
+    )
+    monkeypatch.setattr(triggers, "get_job_manager", lambda: jm)
+    monkeypatch.setattr(triggers, "submit_follow_ups", lambda **kw: ["intro-job"])
+    monkeypatch.setattr(triggers, "_server_configs", MagicMock(side_effect=RuntimeError("settings unreadable")))
+    assert triggers.submit_pending_follow_up("p1") == ["intro-job"]
+
+
+def test_follow_up_runs_at_normal_and_skips_paths_already_queued_for_the_preview(follow_up, monkeypatch):
+    triggers, created = follow_up
+    monkeypatch.setattr("media_preview_generator.loudness.settings.loudness_enabled_anywhere", lambda configs: True)
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv"], "sonarr", None)
+    assert created[0]["priority"] == triggers.PRIORITY_NORMAL  # never ahead of its High preview, nor below Normal
+    assert created[0]["library_name"] == "Plex loudness · Show S01E01"
+    earlier = SimpleNamespace(kind=job.JOB_KIND_LOUDNESS, config={"follows_job_id": "p1", "file_paths": ["/m/a.mkv"]})
+    triggers.get_job_manager().get_pending_jobs.return_value = [earlier]
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv", "/m/b.mkv"], "sonarr", None)
+    assert created[1]["file_paths"] == ["/m/b.mkv"]
+    triggers._submit_loudness_follow_up("p1", [], ["/m/a.mkv"], "sonarr", None)
+    assert len(created) == 2
+
+
+def test_follow_up_waits_for_the_intro_and_credits_follow_up_when_there_is_one(follow_up, monkeypatch):
+    triggers, created = follow_up
+    monkeypatch.setattr("media_preview_generator.loudness.settings.loudness_enabled_anywhere", lambda configs: True)
+    triggers._submit_loudness_follow_up("p1", ["intro-1"], ["/m/a.mkv"], "sonarr", None)
+    triggers._submit_loudness_follow_up("p2", [], ["/m/b.mkv"], "sonarr", None)
+    assert [c["follows_job_id"] for c in created] == ["intro-1", "p2"]

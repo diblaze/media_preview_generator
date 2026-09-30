@@ -807,7 +807,8 @@ off until turned on per server.
 
 Same `Job` row, queue, priorities, pause and cancel as the other kinds (see [Jobs Endpoints](#jobs-endpoints)). `config`
 holds `kind` (`"loudness"`), `source`, `libraries` (`[{"server_id", "library_id"}]`; empty with no `file_paths` = every
-library loudness goes to), `file_paths` and `server_id` (only that server, when set). File outcomes:
+library loudness goes to), `file_paths`, `follows_job_id` (the preview job a webhook follow-up waits for) and, for a
+follow-up, `server_id`. File outcomes:
 
 | Outcome | Meaning |
 |---|---|
