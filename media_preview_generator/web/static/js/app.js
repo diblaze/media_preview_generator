@@ -1366,7 +1366,7 @@ function toggleJobFiles(jobId) {
     } else {
         expandedJobFileRows.add(jobId);
         const job = jobs.find(function (j) { return String(j.id) === String(jobId); });
-        if (_isMarkersJob(job)) _loadJobFileList(job);
+        if (_hasOwnRunner(job)) _loadJobFileList(job);
     }
     const icon = btn.querySelector('i');
     if (icon) {
@@ -1569,6 +1569,12 @@ function _isMarkersJob(job) {
 }
 window._isMarkersJob = _isMarkersJob;
 
+// Kinds with their own runner (job_kinds.SELF_PAUSED_KINDS): they pause on their own and list their files.
+function _hasOwnRunner(job) {
+    return !!job && job.kind === JOB_KIND_INTRO_CREDITS;
+}
+window._hasOwnRunner = _hasOwnRunner;
+
 // job_kinds.parse_job_kind defaults a missing/unknown kind to previews server-side, so this mirrors that default.
 const JOB_KIND_PREVIEWS = 'previews';
 const JOB_KIND_LABELS = { [JOB_KIND_PREVIEWS]: 'Previews', [JOB_KIND_INTRO_CREDITS]: 'Intro & Credits' };
@@ -1585,7 +1591,7 @@ window._jobKindBadgeHtml = _jobKindBadgeHtml;
 // Pause all doesn't set an Intro & Credits job's own flag, so the global flag is read here; a job paused before a
 // restart comes back running + paused without a slot, which reads as 'own' too.
 function _markersPauseState(job) {
-    if (!_isMarkersJob(job) || job.status !== 'running') return '';
+    if (!_hasOwnRunner(job) || job.status !== 'running') return '';
     if (job.paused) return 'own';
     return processingPaused ? 'all' : '';
 }
@@ -1681,7 +1687,7 @@ function _loadJobFileList(job) {
 function _orderFollowUps(list) {
     const ids = new Set(list.map(function (j) { return String(j.id); }));
     const leaderOf = function (job) {
-        const lead = _isMarkersJob(job) && job.config ? String(job.config.follows_job_id || '') : '';
+        const lead = _hasOwnRunner(job) && job.config ? String(job.config.follows_job_id || '') : '';
         return lead && lead !== String(job.id) && ids.has(lead) ? lead : '';
     };
     const followers = new Map();
@@ -2011,7 +2017,7 @@ function _markersPauseNote(state) {
 
 // Intro & Credits jobs pause on their own; preview jobs only have the global Pause Processing button.
 function _markersPauseButton(job) {
-    if (!_isMarkersJob(job) || job.status !== 'running') return '';
+    if (!_hasOwnRunner(job) || job.status !== 'running') return '';
     const jid = escapeHtml(job.id);
     if (job.paused) {
         return `<button class="btn btn-outline-success" onclick="resumeJob('${jid}')" title="Resume this job" aria-label="Resume job">
@@ -2089,6 +2095,7 @@ function updateJobQueue(force) {
 
     for (const job of _orderFollowUps(jobs)) {
         const isMarkers = _isMarkersJob(job);
+        const ownRunner = _hasOwnRunner(job);
         const markersPause = _markersPauseState(job);
         const statusBadge = getStatusBadge(
             job.status, job.paused || markersPause === 'all', job.error, job.progress && job.progress.outcome,
@@ -2145,7 +2152,7 @@ function updateJobQueue(force) {
                 : '';
             // Retry now drives retry chains (preview and Intro & Credits); an old "Retry: …" Intro & Credits job
             // just waits out its delay.
-            const retryNowBtn = isWaitingRetryRow && (!isMarkers || !!(job.config && job.config.is_retry_chain))
+            const retryNowBtn = isWaitingRetryRow && (!ownRunner || !!(job.config && job.config.is_retry_chain))
                 ? `<button class="btn btn-outline-warning" onclick="retryNowFromRow('${escapeHtml(job.id)}')" title="Skip the retry backoff — attempt now" aria-label="Retry now">
                     <i class="bi bi-arrow-clockwise"></i>
                 </button>`
@@ -2183,12 +2190,12 @@ function updateJobQueue(force) {
         // Phase H5: also show the toggle when publisher rows exist, so single-file
         // jobs surface their per-server publish breakdown. An Intro & Credits job always lists its files.
         const hasPublishers = Array.isArray(job.publishers) && job.publishers.length > 0;
-        const hasExpandableDetail = hasMultiFile || hasPublishers || isMarkers;
+        const hasExpandableDetail = hasMultiFile || hasPublishers || ownRunner;
         const isFilesExpanded = expandedJobFileRows.has(String(job.id));
         const libraryTitle = webhookBasenames.length > 0
             ? ` title="${escapeHtml(webhookBasenames.join(', '))}"`
             : '';
-        const toggleTitle = hasMultiFile || isMarkers ? 'Show files' : 'Show publishers';
+        const toggleTitle = hasMultiFile || ownRunner ? 'Show files' : 'Show publishers';
         const filesToggleBtn = hasExpandableDetail
             ? ` <button type="button" class="btn btn-sm btn-link p-0 ms-1 align-baseline" id="job-files-toggle-${escapeHtml(job.id)}"
                         onclick="toggleJobFiles('${escapeHtml(job.id)}')" aria-expanded="${isFilesExpanded ? 'true' : 'false'}" aria-controls="job-detail-${escapeHtml(job.id)}" title="${toggleTitle}">
@@ -2286,7 +2293,7 @@ function updateJobQueue(force) {
             let filesBlock = hasMultiFile
                 ? `<strong>Files:</strong><div class="mt-1">${filesList}${overflow}</div>`
                 : '';
-            if (isMarkers) filesBlock = _markersFilesBlock(job);
+            if (ownRunner) filesBlock = _markersFilesBlock(job);
             // Phase H5: per-server publisher block. Empty for legacy jobs.
             const publishersBlock = _renderPublishersBlock(job);
             html += `
@@ -2303,7 +2310,7 @@ function updateJobQueue(force) {
     _disposeBootstrapTooltips(tbody);
     tbody.innerHTML = html;
     jobs.forEach(function (job) {
-        if (_isMarkersJob(job) && expandedJobFileRows.has(String(job.id))) _loadJobFileList(job);
+        if (_hasOwnRunner(job) && expandedJobFileRows.has(String(job.id))) _loadJobFileList(job);
     });
 
     // Status badges and ⓘs (the Retry chip's) get their tooltips; ⓘs also get the app-wide ⓘ rule.

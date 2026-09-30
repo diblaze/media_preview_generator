@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS
+from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, SELF_PAUSED_KINDS
 from ..job_gate import format_wait_message
 from ..jobs import (
     PRIORITY_NORMAL,
@@ -362,7 +362,7 @@ def resume_running_and_drain_pending() -> None:
     for running in jm.get_running_jobs():
         # A global resume must not clear an Intro & Credits job's own pause; Pause all holds those jobs through
         # the global flag, which the caller has already cleared.
-        if running.kind == JOB_KIND_INTRO_CREDITS:
+        if running.kind in SELF_PAUSED_KINDS:
             continue
         jm.request_resume(running.id)
     pending = sorted(jm.get_pending_jobs(), key=lambda j: (j.priority, j.created_at or ""))

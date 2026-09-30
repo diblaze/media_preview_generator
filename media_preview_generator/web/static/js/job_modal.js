@@ -1570,8 +1570,8 @@ function renderFileResultsTable(files) {
     countEl.textContent = label;
 
     // Intro & Credits pills name each server's status: several servers can end differently for one file.
-    var showServerStatus = typeof _isMarkersJob === 'function'
-        && _isMarkersJob(jobs.find(function (j) { return j.id === _logsModalJobId; }));
+    var showServerStatus = typeof _hasOwnRunner === 'function'
+        && _hasOwnRunner(jobs.find(function (j) { return j.id === _logsModalJobId; }));
     var html = '';
     for (var i = 0; i < files.length; i++) {
         var f = files[i];

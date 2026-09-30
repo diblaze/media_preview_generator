@@ -11,7 +11,7 @@ from flask import Response, current_app, jsonify, request, session
 from loguru import logger
 
 from ...config import MAX_CPU_THREADS
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS
+from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, SELF_PAUSED_KINDS
 from ..auth import (
     api_token_required,
     get_auth_method,
@@ -1144,7 +1144,7 @@ def pause_job(job_id):
     job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if job.kind == JOB_KIND_INTRO_CREDITS:
+    if job.kind in SELF_PAUSED_KINDS:
         if not job_manager.request_pause(job_id):
             return jsonify({"error": "Only running jobs can be paused"}), 409
         return jsonify(job_manager.get_job(job_id).to_dict())
@@ -1159,7 +1159,7 @@ def resume_job(job_id):
     job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if job.kind == JOB_KIND_INTRO_CREDITS:
+    if job.kind in SELF_PAUSED_KINDS:
         from ..settings_manager import get_settings_manager
 
         if not job_manager.request_resume(job_id):
@@ -1225,7 +1225,7 @@ def pause_processing():
     sm.processing_paused = True
     for running in job_manager.get_running_jobs():
         # Intro & Credits jobs are held by the global flag itself; their per-job flag is the user's own pause.
-        if running.kind == JOB_KIND_INTRO_CREDITS:
+        if running.kind in SELF_PAUSED_KINDS:
             continue
         job_manager.request_pause(running.id)
     job_manager.emit_processing_paused_changed(True)

@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_PREVIEWS, parse_job_kind
+from ..job_kinds import JOB_KIND_PREVIEWS, SELF_PAUSED_KINDS, parse_job_kind
 from ..utils import redact_secrets
 
 # Message shown in UI when a job's log file was removed by retention policy.
@@ -1345,7 +1345,7 @@ class JobManager:
             # An Intro & Credits job's own pause is the user's (or its schedule's stop time's) intent and
             # outlives the restart like the global pause does; its runner re-applies it. The preview runner
             # can't hold a revived job paused, so a preview job's pause is dropped as before.
-            job.paused = job.paused and job.kind == JOB_KIND_INTRO_CREDITS
+            job.paused = job.paused and job.kind in SELF_PAUSED_KINDS
             job.progress = JobProgress()
 
         self.add_log(

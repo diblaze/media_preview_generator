@@ -431,7 +431,7 @@ def _warn_unhealthy_media_mounts(media_servers: list) -> list[dict[str, str]]:
     return issues
 
 
-def _fail_unrevived_intro_credits_jobs() -> None:
+def _fail_unrevived_own_runner_jobs() -> None:
     """Settle the Intro & Credits jobs a restart left behind and didn't revive.
 
     Left PENDING they would block their schedule and absorb webhook follow-ups for good. A Season job among them passes
@@ -489,7 +489,7 @@ def _requeue_interrupted_on_startup(config_dir: str) -> None:
         )
         if not auto_requeue_enabled:
             logger.info("Auto-requeue on restart is disabled")
-            _fail_unrevived_intro_credits_jobs()
+            _fail_unrevived_own_runner_jobs()
             _fail_unrevived_preview_jobs()
             return
 
@@ -515,7 +515,7 @@ def _requeue_interrupted_on_startup(config_dir: str) -> None:
                 if job.kind == JOB_KIND_PREVIEWS and job.status is JobStatus.PENDING
             }
         revived = [*revived, *job_manager.requeue_interrupted_followers(kept)]
-        _fail_unrevived_intro_credits_jobs()
+        _fail_unrevived_own_runner_jobs()
         if not paused:
             # While paused, the older ones are jobs the pause is holding (a webhook queued during a long pause
             # isn't re-sent), so they stay PENDING and Resume starts them, as it would have without the restart.
