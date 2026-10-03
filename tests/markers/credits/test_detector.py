@@ -27,6 +27,7 @@ from media_preview_generator.markers.store import FileRecord, MarkerStore
 from media_preview_generator.processing.generator import CodecNotSupportedError
 from media_preview_generator.servers.base import ServerType
 from tests.markers import test_pipeline
+from tests.markers.credits.test_rule_j import captioned_tail
 from tests.markers.fakes import ready_publisher
 
 media = test_pipeline.media
@@ -715,6 +716,22 @@ class TestFindCredits:
                                        detect_boxes=count, gpu=None, gpu_device_path=None)  # fmt: skip
         assert (result.start_s, result.fine_rows) == (None, ())
         assert [call["scale"] for call in decodes.calls] == [1, 2]
+
+    @pytest.mark.parametrize(("story_every", "start"), [(2, None), (3, 1080.0)])
+    def test_a_captioned_storys_own_captions_are_no_answer(self, monkeypatch, probes, story_every, start):
+        # Rule J version 9 (the 2026-09-29 audit's variety show): captions on half the story's keyframes, and a run of
+        # three-box captions the 24 s join chains over 60 s of text-free story before the dark cards. No refine window
+        # is decoded, and the tail is read again at 640x360, which finds no text the 320x180 reading didn't box. With
+        # captions on a third of the story the same run keeps its answer (credits over the closing footage).
+        tail = [(t - 130.0, *rest) for t, *rest in captioned_tail(story_every, 60)]  # 870-1317 s of a 1320 s episode
+        decodes = Decodes(tail, [])
+        monkeypatch.setattr(detector.frames, "decode_rows", decodes)
+        result = detector.find_credits(EPISODE.canonical_path, duration_ms=EPISODE.duration_ms, is_episode=True,
+                                       ffmpeg="/ff", detect_boxes=count, gpu=None, gpu_device_path=None)  # fmt: skip
+        assert (result.start_s, result.end_s, result.scale) == (start, None, 1)
+        assert [(call["scale"], call["keyframes_only"]) for call in decodes.calls] == (
+            [(1, True), (2, True)] if start is None else [(1, True), (1, False)]
+        )
 
     def test_a_run_the_larger_frame_makes_of_boxes_too_tall_for_small_text_is_no_answer(self, monkeypatch, probes):
         # Frankenstein: The Anatomy Lesson (2025), a making-of: at 640x360 the model boxes dark set footage as text --
