@@ -1875,6 +1875,7 @@ def reprocess_job(job_id):
     new_config.pop(SLOT_WAIT_SINCE, None)
     for key in (
         "webhook_debounce_pending",
+        "webhook_delay_mode",
         "webhook_fire_at",
         "webhook_server_id",
         "webhook_batch_opened_at",

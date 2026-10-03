@@ -426,6 +426,8 @@ Automatically generate preview thumbnails when Radarr or Sonarr imports new medi
 
 ### How It Works
 
+The source-specific URLs batch imports as described below. The universal `/incoming` and `/server/<server_id>` URLs also wait before processing, but keep a separate job for each resolved file version. All webhook URLs use **Delay before processing** unless overridden with `delay`.
+
 1. Radarr/Sonarr imports a file (or an external tool sends a custom webhook) and a POST is sent to this app.
 2. The app **queues** the file and starts (or resets) a timer. Imports from the same source (Radarr, Sonarr, or Custom) and server selection are batched together.
 3. Each accepted new file resets the timer using the URL's `delay` parameter, or the global delay if omitted. A batch becomes ready when that wait expires or it reaches its maximum age, whichever comes first. The maximum age is **10 minutes**, extended to the longest delay accepted into the batch if that exceeds 10 minutes, measured from its first file. Files arriving once that limit is reached start the next batch. Processing also waits for an available worker and honors the global pause.
@@ -485,11 +487,13 @@ If the URL already contains a query parameter such as `server_id` or `token`, ap
 http://your-server:8080/api/webhooks/radarr?server_id=plex-main&delay=30
 ```
 
-Omitting `delay` uses the current global setting. The parameter applies to `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and `/plex` under `/api/webhooks`. The universal `/incoming` and `/server/<server_id>` routes dispatch immediately and do not support this batching delay.
+Omitting `delay` uses the current global setting on **every ingestion URL**: `/radarr`, `/sonarr`, `/sportarr`, `/custom`, `/plex`, `/incoming`, and `/server/<server_id>` under `/api/webhooks`. For example, a Plex, Emby, or Jellyfin URL can use `/api/webhooks/incoming?token=YOUR_TOKEN&delay=30`.
 
-The latest accepted new file sets the wait for its whole source/server batch, subject to the batch's maximum age. That age limit is the greater of 10 minutes and the longest delay accepted into the batch, measured from its first file. Thus `delay=3600` allows a full hour for a new batch without letting later imports postpone it forever. Files joining near the age limit can receive less than the full delay. If requests in one batch use different delays, the latest request's value sets the timer; keep the URL consistent for predictable batching. Duplicate notifications ignored by deduplication do not reset the timer.
+**Existing universal URL users:** `/incoming` and `/server/<server_id>` previously started jobs immediately. They now use **Delay before processing** by default. No URL change is required; append `delay=1` for the shortest supported wait. These routes keep one job per resolved file version, each with its own deadline. The wait starts when the job is queued; any media-server lookup needed to resolve the incoming item happens first. Later notifications do not extend another job's wait, and ignored duplicates do not create a new job.
 
-This controls the initial wait only. Automatic retries keep their existing retry backoff, and manual **Reprocess** does not repeat the initial wait. Pending batches retain their deadline across a restart when automatic job recovery is enabled; a restart does not start a fresh delay. Media-server scan requests still happen when each import arrives.
+On the source-specific `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and legacy `/plex` URLs, the latest accepted new file sets the wait for its whole source/server batch, subject to the batch's maximum age. That age limit is the greater of 10 minutes and the longest delay accepted into the batch, measured from its first file. Thus `delay=3600` allows a full hour for a new batch without letting later imports postpone it forever. Files joining near the age limit can receive less than the full delay. If requests in one batch use different delays, the latest request's value sets the timer; keep the URL consistent for predictable batching. Duplicate notifications ignored by deduplication do not reset the timer.
+
+This controls the initial wait only. Automatic retries keep their existing retry backoff, and manual **Reprocess** does not repeat the initial wait. Pending webhook jobs retain their deadline across a restart when automatic job recovery is enabled; a restart does not start a fresh delay. Media-server scan requests still happen when each import arrives.
 
 ### Custom Webhook (Tdarr, scripts, etc.)
 
@@ -587,7 +591,7 @@ All settings are configurable from the **Automation** page → **Triggers** tab 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Enable Webhooks** | On | Master toggle |
-| **Delay before processing** | 60s | Default wait after the latest new file in a source/server batch (slider: 10–300 s). Each request can override it with `delay=1` through `delay=3600` (one hour). The batch's maximum age is the greater of 10 minutes and its longest accepted delay. |
+| **Delay before processing** | 60s | Default initial wait for every webhook URL (slider: 10–300 s); override per request with `delay=1` through `delay=3600`. Universal/per-server routes wait per job. Source-specific routes reset their batch timer on new files, with a maximum age of the greater of 10 minutes and the longest accepted delay. |
 | **Webhook Secret** | *(empty)* | Dedicated authentication token for webhooks |
 
 Webhook processing uses your Settings library selection. If a webhook path belongs to an unchecked library, it is skipped.
@@ -602,7 +606,7 @@ By default, webhooks authenticate using your main API token. You can optionally 
 
 ### Batching and the delay
 
-When multiple files are imported in quick succession (e.g., a season pack), the app **queues** them per source and server selection. Each accepted new file **resets** the timer using that request's delay. A batch becomes ready when the timer expires or reaches its maximum age: the greater of 10 minutes and its longest accepted delay, measured from the first file. Radarr and Sonarr have separate batches, so a new episode does not extend a movie's wait.
+On the source-specific URLs, when multiple files are imported in quick succession (e.g., a season pack), the app **queues** them per source and server selection. Each accepted new file **resets** the timer using that request's delay. A batch becomes ready when the timer expires or reaches its maximum age: the greater of 10 minutes and its longest accepted delay, measured from the first file. Radarr and Sonarr have separate batches, so a new episode does not extend a movie's wait.
 
 **Example:** Sonarr imports 10 episodes over 30 seconds with a 60s delay. The timer keeps resetting as each episode arrives. One job runs 60 seconds after the *last* episode and processes all 10 files. A file that arrived at 59 seconds is not processed in an earlier batch — it goes in this batch, and the batch runs 60 seconds after it, so Plex has time to index it.
 

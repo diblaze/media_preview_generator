@@ -555,6 +555,11 @@
                          time). Pre-fix this tab was Plex-only and Emby/Jellyfin users
                          had no place to find the webhook URL. -->
                     <div class="tab-pane fade" id="edit-tab-automation">
+                        <p class="small text-muted mb-3">
+                            Webhook jobs use <strong>Delay before processing</strong> in Automation &rarr; Triggers.
+                            To override it, append <code>?delay=30</code> to the webhook URL, or <code>&amp;delay=30</code>
+                            if it already contains <code>?</code>. Valid values are 1–3600 seconds; each file version waits independently.
+                        </p>
                         <div id="editPlexWebhookServerCaption" class="small text-muted mb-3"></div>
 
                         <!-- Emby / Jellyfin Webhook info card (shown by JS for non-Plex servers). -->

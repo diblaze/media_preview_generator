@@ -226,6 +226,8 @@ class TestVendorWebhooks:
                 server_id=next(iter(hints or {}), None),
                 server_id_filter=server_id_filter,
             )
+            assert preview_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(preview_id))
 
         assert [(r["job_id"], r["server_id_filter"]) for r in previews] == [(preview_id, server_id_filter)]
         (markers,) = _markers_jobs()
@@ -237,7 +239,11 @@ class TestVendorWebhooks:
         from media_preview_generator.web import webhooks as wh
 
         with app.app_context():
-            wh.create_vendor_webhook_job(source="plex", canonical_path=EPISODE, server_id_filter="plex-1")
+            queued_vendor_id = wh.create_vendor_webhook_job(
+                source="plex", canonical_path=EPISODE, server_id_filter="plex-1"
+            )
+            assert queued_vendor_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
         assert len(previews) == 1
         assert _markers_jobs() == []
 

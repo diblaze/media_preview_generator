@@ -1813,6 +1813,8 @@ Automatically generate preview thumbnails when Radarr or Sonarr imports new medi
 
 ### How It Works
 
+The source-specific URLs batch imports as described below. The universal `/incoming` and `/server/<server_id>` URLs also wait before processing, but keep a separate job for each resolved file version. All webhook URLs use **Delay before processing** unless overridden with `delay`.
+
 1. Radarr/Sonarr imports a file (or an external tool sends a custom webhook) and a POST is sent to this app.
 2. The app **queues** the file and starts (or resets) a timer. Imports from the same source (Radarr, Sonarr, or Custom) and server selection are batched together.
 3. Each accepted new file resets the timer using the URL's `delay` parameter, or the global delay if omitted. A batch becomes ready when that wait expires or it reaches its maximum age, whichever comes first. The maximum age is **10 minutes**, extended to the longest delay accepted into the batch if that exceeds 10 minutes, measured from its first file. Files arriving once that limit is reached start the next batch. Processing also waits for an available worker and honors the global pause.
@@ -1872,11 +1874,13 @@ If the URL already contains a query parameter such as `server_id` or `token`, ap
 http://your-server:8080/api/webhooks/radarr?server_id=plex-main&delay=30
 ```
 
-Omitting `delay` uses the current global setting. The parameter applies to `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and `/plex` under `/api/webhooks`. The universal `/incoming` and `/server/<server_id>` routes dispatch immediately and do not support this batching delay.
+Omitting `delay` uses the current global setting on **every ingestion URL**: `/radarr`, `/sonarr`, `/sportarr`, `/custom`, `/plex`, `/incoming`, and `/server/<server_id>` under `/api/webhooks`. For example, a Plex, Emby, or Jellyfin URL can use `/api/webhooks/incoming?token=YOUR_TOKEN&delay=30`.
 
-The latest accepted new file sets the wait for its whole source/server batch, subject to the batch's maximum age. That age limit is the greater of 10 minutes and the longest delay accepted into the batch, measured from its first file. Thus `delay=3600` allows a full hour for a new batch without letting later imports postpone it forever. Files joining near the age limit can receive less than the full delay. If requests in one batch use different delays, the latest request's value sets the timer; keep the URL consistent for predictable batching. Duplicate notifications ignored by deduplication do not reset the timer.
+**Existing universal URL users:** `/incoming` and `/server/<server_id>` previously started jobs immediately. They now use **Delay before processing** by default. No URL change is required; append `delay=1` for the shortest supported wait. These routes keep one job per resolved file version, each with its own deadline. The wait starts when the job is queued; any media-server lookup needed to resolve the incoming item happens first. Later notifications do not extend another job's wait, and ignored duplicates do not create a new job.
 
-This controls the initial wait only. Automatic retries keep their existing retry backoff, and manual **Reprocess** does not repeat the initial wait. Pending batches retain their deadline across a restart when automatic job recovery is enabled; a restart does not start a fresh delay. Media-server scan requests still happen when each import arrives.
+On the source-specific `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and legacy `/plex` URLs, the latest accepted new file sets the wait for its whole source/server batch, subject to the batch's maximum age. That age limit is the greater of 10 minutes and the longest delay accepted into the batch, measured from its first file. Thus `delay=3600` allows a full hour for a new batch without letting later imports postpone it forever. Files joining near the age limit can receive less than the full delay. If requests in one batch use different delays, the latest request's value sets the timer; keep the URL consistent for predictable batching. Duplicate notifications ignored by deduplication do not reset the timer.
+
+This controls the initial wait only. Automatic retries keep their existing retry backoff, and manual **Reprocess** does not repeat the initial wait. Pending webhook jobs retain their deadline across a restart when automatic job recovery is enabled; a restart does not start a fresh delay. Media-server scan requests still happen when each import arrives.
 
 ### Custom Webhook (Tdarr, scripts, etc.)
 
@@ -1974,7 +1978,7 @@ All settings are configurable from the **Automation** page → **Triggers** tab 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Enable Webhooks** | On | Master toggle |
-| **Delay before processing** | 60s | Default wait after the latest new file in a source/server batch (slider: 10–300 s). Each request can override it with `delay=1` through `delay=3600` (one hour). The batch's maximum age is the greater of 10 minutes and its longest accepted delay. |
+| **Delay before processing** | 60s | Default initial wait for every webhook URL (slider: 10–300 s); override per request with `delay=1` through `delay=3600`. Universal/per-server routes wait per job. Source-specific routes reset their batch timer on new files, with a maximum age of the greater of 10 minutes and the longest accepted delay. |
 | **Webhook Secret** | *(empty)* | Dedicated authentication token for webhooks |
 
 Webhook processing uses your Settings library selection. If a webhook path belongs to an unchecked library, it is skipped.
@@ -1989,7 +1993,7 @@ By default, webhooks authenticate using your main API token. You can optionally 
 
 ### Batching and the delay
 
-When multiple files are imported in quick succession (e.g., a season pack), the app **queues** them per source and server selection. Each accepted new file **resets** the timer using that request's delay. A batch becomes ready when the timer expires or reaches its maximum age: the greater of 10 minutes and its longest accepted delay, measured from the first file. Radarr and Sonarr have separate batches, so a new episode does not extend a movie's wait.
+On the source-specific URLs, when multiple files are imported in quick succession (e.g., a season pack), the app **queues** them per source and server selection. Each accepted new file **resets** the timer using that request's delay. A batch becomes ready when the timer expires or reaches its maximum age: the greater of 10 minutes and its longest accepted delay, measured from the first file. Radarr and Sonarr have separate batches, so a new episode does not extend a movie's wait.
 
 **Example:** Sonarr imports 10 episodes over 30 seconds with a 60s delay. The timer keeps resetting as each episode arrives. One job runs 60 seconds after the *last* episode and processes all 10 files. A file that arrived at 59 seconds is not processed in an earlier batch — it goes in this batch, and the batch runs 60 seconds after it, so Plex has time to index it.
 
@@ -3624,10 +3628,17 @@ The router auto-detects the vendor by payload shape and matches the source
 server by the identifier embedded in every vendor's payload (Plex's
 `Server.uuid`, Emby's `Server.Id`, Jellyfin's `ServerId`).
 
-For delayed batching, use the source-specific URLs instead, such as
-`/api/webhooks/radarr?delay=30` or `/api/webhooks/sonarr?delay=300`.
-The universal and per-server router URLs dispatch immediately and do not
-support `delay`. See [Set a delay per webhook URL](https://mediapreviewgenerator.dev/guides/#set-a-delay-per-webhook-url).
+Every webhook ingestion URL accepts `delay=1` through `delay=3600` (seconds).
+For example, append `&delay=30` to the token-bearing URL above, or use
+`/api/webhooks/server/<server_id>?delay=30`. Omitting it uses the global
+**Delay before processing** setting (60 seconds by default).
+
+**Changed behavior:** universal and per-server URLs previously started immediately;
+they now apply this initial wait to each resolved file version, without merging
+separate jobs. Use `delay=1` for the shortest wait. Source-specific URLs such as
+`/api/webhooks/radarr?delay=30` and `/api/webhooks/sonarr?delay=300` instead batch
+new files from the same source/server and reset the batch timer. See
+[Set a delay per webhook URL](https://mediapreviewgenerator.dev/guides/#set-a-delay-per-webhook-url).
 
 | Vendor | Webhook source |
 |---|---|
@@ -4127,7 +4138,7 @@ Settings for automatic preview generation when media is imported via Radarr or S
 | Setting | Default | Web UI | Description |
 |---------|---------|--------|-------------|
 | `webhook_enabled` | `true` | Yes | Master enable/disable for webhook processing |
-| `webhook_delay` | `60` | Yes | Default batching delay in seconds (UI slider: 10–300; runtime bounds: 1–3600). Each new file resets its source/server batch timer, capped by a maximum batch age of the greater of 10 minutes and its longest accepted delay. An optional `delay` URL parameter overrides this value for that request; see [Webhook delay parameter](https://mediapreviewgenerator.dev/reference/#webhook-delay-parameter). |
+| `webhook_delay` | `60` | Yes | Default initial delay for all webhook ingestion URLs (UI slider: 10–300; runtime bounds: 1–3600). Universal/per-server routes wait per job; source-specific routes reset their batch timer on new files, capped by a maximum batch age of the greater of 10 minutes and its longest accepted delay. An optional `delay` URL parameter overrides this value for that request; see [Webhook delay parameter](https://mediapreviewgenerator.dev/reference/#webhook-delay-parameter). |
 | `webhook_secret` | *(empty)* | Yes | Dedicated secret for webhook auth (falls back to API token) |
 | `plex_webhook_enabled` | `false` | Yes | Enable the Plex direct webhook (`/api/webhooks/plex`). Requires Plex Pass on the server-owner account. |
 | `plex_webhook_public_url` | *(empty)* | Yes | URL Plex Media Server should POST to. Defaults to the URL you registered through. Override for reverse-proxy / split-network setups. |
@@ -5306,19 +5317,23 @@ Inbound webhook endpoints for Radarr/Sonarr/Custom integration. Webhook endpoint
 
 #### Webhook delay parameter
 
-`POST /api/webhooks/radarr`, `/sonarr`, `/sportarr`, `/custom`, and `/plex` accept optional `delay=<seconds>` in the URL query string. The value must be a whole number from **1 to 3600** (up to one hour); invalid values return **400**. Omission uses the current `webhook_delay` setting.
+All ingestion routes — `POST /api/webhooks/radarr`, `/sonarr`, `/sportarr`, `/custom`, `/plex`, `/incoming`, and `/server/<server_id>` — accept optional `delay=<seconds>` in the URL query string. The value must be a whole number from **1 to 3600** (up to one hour); invalid values return **400**. Omission uses the current `webhook_delay` setting.
 
-Examples: `/api/webhooks/radarr?delay=30`, `/api/webhooks/sonarr?delay=300`, or `/api/webhooks/radarr?server_id=plex-main&delay=30` when another query parameter is already present.
+Examples: `/api/webhooks/radarr?delay=30`, `/api/webhooks/sonarr?delay=300`, `/api/webhooks/incoming?token=YOUR_TOKEN&delay=30`, or `/api/webhooks/server/plex-main?delay=30`. Use `&delay=30` when another query parameter is already present.
 
-Each accepted new file resets its source/server batch deadline using that request's effective delay. The latest request sets the timer if values differ within one batch, subject to a maximum batch age equal to the greater of 600 seconds and the longest delay accepted into that batch. The age is measured from its first file, so late arrivals can receive less than the full delay; arrivals after the limit open a new batch. Ignored duplicates do not reset the deadline. The deadline and batch age limit are persisted with the job and restored by automatic restart recovery. Processing still honors pause and worker availability. **Fire now** skips the remaining initial wait; automatic retries use their separate retry backoff, and manual **Reprocess** starts without the original batching delay.
+On `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and legacy `/plex`, each accepted new file resets its source/server batch deadline using that request's effective delay. The latest request sets the timer if values differ within one batch, subject to a maximum batch age equal to the greater of 600 seconds and the longest delay accepted into that batch. The age is measured from its first file, so late arrivals can receive less than the full delay; arrivals after the limit open a new batch. Ignored duplicates do not reset the deadline. The batch age limit is persisted with the job.
 
-`/api/webhooks/incoming` and `/api/webhooks/server/<server_id>` dispatch immediately and do not support `delay`. Initial media-server scan requests are also immediate, regardless of the batching delay.
+On `/incoming` and `/server/<server_id>`, each resolved file version keeps its own job and initial deadline. The wait starts when that job is queued, after any vendor API lookup needed to resolve the payload. Jobs retain their vendor item IDs, publisher pin, and optional `regenerate` flag. Later arrivals do not reset other jobs' deadlines; existing duplicate suppression still applies. **Behavior change:** these two routes previously started immediately; they now use the global delay when omitted. Use `delay=1` for the shortest supported wait.
+
+All pending webhook deadlines are persisted and restored by automatic restart recovery. Processing still honors pause and worker availability. **Fire now** skips the remaining initial wait; automatic retries use their separate retry backoff, and manual **Reprocess** starts without the original batching delay.
+
+Initial media-server scan requests on source-specific import routes remain immediate; the delay controls job processing.
 
 #### POST /api/webhooks/incoming
 
 Universal webhook router. Inspect the request body, classify it as Plex / Emby / Jellyfin / Sonarr / Radarr / generic-`{path: ...}`, and dispatch to every server that owns the resolved canonical path. Works alongside the per-vendor URLs below — you can keep using those, or replace them all with this one.
 
-Returns 200 with the dispatch result (`status`, `kind`, `canonical_path`, `publishers[]`, `frame_count`) on success, 202 with `status: "ignored"` for noise events the router intentionally drops (e.g. Jellyfin `PlaybackStart`), 400 for unrecognised payloads, 401 for bad auth, 413 for payloads above the 1 MiB cap.
+Returns **202** with `status: "queued"`, `kind`, `canonical_path`, and `job_id` for one resolved version; multiple versions return a `jobs` array and `version_count`. Jobs wait for the [webhook delay](https://mediapreviewgenerator.dev/reference/#webhook-delay-parameter) before processing. Duplicate notifications return **202** with `status: "ignored_duplicate"`; noise events return **202** with `status: "ignored"`. Returns **400** for unrecognised payloads or invalid delays, **401** for bad auth, and **413** for payloads above the 1 MiB cap.
 
 #### POST /api/webhooks/server/{server_id}
 
@@ -5576,7 +5591,7 @@ unless noted.
 | POST | `/api/jobs/{id}/priority` | Change a pending/running job's priority (`{"priority": 1\|2\|3}`; 1 = high) |
 | POST | `/api/jobs/{id}/reprocess` | Re-run a finished job with the same config: `201` with the new job (an Intro & Credits job keeps its schedule), `409` while it's pending or running. A Check servers job is queued like `POST /api/markers/reconcile` and answers the same way (`202` `{"job_id", "already_queued"}`, reusing one already queued or running). A Re-run clears the global pause. |
 | POST | `/api/jobs/{id}/retry-now` | Skip the retry back-off on a chain-head job whose next attempt is currently in the back-off countdown. Returns 200 + `{"fired": true, ...}` on success, 409 when no retry is pending, 400 if the job isn't a chain head. |
-| POST | `/api/jobs/{id}/fire-webhook-now` | Skip the debounce window on a webhook-batch job that's still waiting to dispatch. Looks up the in-memory batch by `job_id` and cancels its threading timer, then dispatches the same callback synchronously. 202 on success, 404 when the job has no live pending batch (already fired, never had one, or container restart cleared the in-memory dict). |
+| POST | `/api/jobs/{id}/fire-webhook-now` | Skip the initial wait on a pending webhook job, including source-specific batches and universal/per-server jobs. Returns 202 when dispatched, or 404 when no pending webhook timer exists for the job. Automatic restart recovery restores pending timers from saved job deadlines. |
 | GET | `/api/jobs/{id}/logs` | Paginated log stream — `?offset=&limit=` (limit capped at 5000); or legacy `?last=N` for the tail |
 | GET | `/api/jobs/{id}/files` | Per-file outcomes — paginated `?page=&per_page=` (per_page capped at 500), plus optional `?outcome=` and `?search=` filters. The underlying per-job JSONL is itself soft-capped at 5000 rows; past that, a `truncated` marker row appears and aggregate counts remain in `progress.outcome`. |
 | POST | `/api/jobs/clear` | Delete completed/failed jobs from the queue |
@@ -5620,8 +5635,8 @@ unless noted.
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/webhooks/sportarr` | Sonarr-compatible feed for [Sportarr](https://github.com/Sportarr/Sportarr) (falls back to flat `filePath`) |
-| GET | `/api/webhooks/pending` | Batches currently debouncing — per-source key, countdown, and queued paths |
-| POST | `/api/webhooks/pending/{debounce_key}/fire-now` | Skip the debounce timer and dispatch the batch immediately |
+| GET | `/api/webhooks/pending` | Pending webhook waits — batch or job key, countdown, and queued paths |
+| POST | `/api/webhooks/pending/{debounce_key}/fire-now` | Skip the initial timer and dispatch the pending webhook job immediately |
 
 ### System & diagnostics
 

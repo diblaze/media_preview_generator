@@ -161,6 +161,8 @@ def test_a_vendor_webhook_asks_and_hands_its_item_ids_and_pin_to_the_runner(
             server_id=None,
             server_id_filter=server_id_filter,
         )
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
     assert _saved_config(job_id)[INTRO_CREDITS_FOLLOW_UP] is True
     (start,) = started
     with patch(SUBMIT, return_value=[]) as submit:
@@ -176,6 +178,8 @@ def test_a_vendor_webhook_asks_and_hands_its_item_ids_and_pin_to_the_runner(
 def test_the_vendor_request_uses_the_sanitised_source(started):
     with patch.object(wh, "_check_and_record_dedup", return_value=None):
         job_id = wh.create_vendor_webhook_job(source="  JellyFin ", canonical_path="/data/Movies/Foo.mkv")
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
     with patch(SUBMIT, return_value=[]) as submit:
         triggers.submit_pending_follow_up(job_id, started[0]["overrides"])
     assert submit.call_args.kwargs["source"] == "jellyfin"

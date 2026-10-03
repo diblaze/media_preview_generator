@@ -208,10 +208,17 @@ The router auto-detects the vendor by payload shape and matches the source
 server by the identifier embedded in every vendor's payload (Plex's
 `Server.uuid`, Emby's `Server.Id`, Jellyfin's `ServerId`).
 
-For delayed batching, use the source-specific URLs instead, such as
-`/api/webhooks/radarr?delay=30` or `/api/webhooks/sonarr?delay=300`.
-The universal and per-server router URLs dispatch immediately and do not
-support `delay`. See [Set a delay per webhook URL](guides.md#set-a-delay-per-webhook-url).
+Every webhook ingestion URL accepts `delay=1` through `delay=3600` (seconds).
+For example, append `&delay=30` to the token-bearing URL above, or use
+`/api/webhooks/server/<server_id>?delay=30`. Omitting it uses the global
+**Delay before processing** setting (60 seconds by default).
+
+**Changed behavior:** universal and per-server URLs previously started immediately;
+they now apply this initial wait to each resolved file version, without merging
+separate jobs. Use `delay=1` for the shortest wait. Source-specific URLs such as
+`/api/webhooks/radarr?delay=30` and `/api/webhooks/sonarr?delay=300` instead batch
+new files from the same source/server and reset the batch timer. See
+[Set a delay per webhook URL](guides.md#set-a-delay-per-webhook-url).
 
 | Vendor | Webhook source |
 |---|---|

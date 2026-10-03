@@ -1518,6 +1518,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             "webhook_retry_count": effective_max,
                             "webhook_retry_delay": retry_delay_sec,
                         }
+                        if current_job and (current_job.config or {}).get("source"):
+                            retry_async_config["source"] = current_job.config["source"]
                         # K1: thread server_id through so the retry's worker
                         # builds Config from the right per-server view.
                         # CRITICAL: only inherit the publish-pin when the
@@ -1566,8 +1568,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         # ``source`` comes from the chain head (``parent_id``)
                         # not from ``current_job`` — when this spawner runs
                         # inside an already-active retry continuation,
-                        # current_job is the retry child and its config
-                        # doesn't carry the trigger label.
+                        # current_job is the retry child; older retry children
+                        # may not carry the trigger label in their config.
                         _chain_head_for_source = job_manager.get_job(parent_id) if parent_id != job_id else current_job
                         _chain_head_source = (
                             (_chain_head_for_source.config or {}).get("source") if _chain_head_for_source else None

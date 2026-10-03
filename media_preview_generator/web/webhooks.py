@@ -422,6 +422,7 @@ def create_vendor_webhook_job(
     server_id_filter: str | None = None,
     regenerate: bool = False,
     title: str | None = None,
+    delay: int | None = None,
 ) -> str | None:
     """Create a single-file Job for a Plex/Emby/Jellyfin vendor webhook.
 
@@ -453,6 +454,7 @@ def create_vendor_webhook_job(
             says the source is unchanged.
         title: Optional human-readable title (e.g. show + episode) for
             the Jobs UI. Falls back to the file basename.
+        delay: Initial wait in seconds; defaults to the global webhook delay.
     """
     safe_source = str(source or "vendor").strip().lower() or "vendor"
     canonical_path = (canonical_path or "").strip()
@@ -481,24 +483,9 @@ def create_vendor_webhook_job(
 
     b_sid, b_sname, b_stype = _resolve_webhook_server_context(server_id)
 
-    job_manager = get_job_manager()
-    job = job_manager.create_job(
-        library_name=library_display,
-        config={
-            "source": safe_source,
-            "path_count": 1,
-            "webhook_basenames": [basename],
-            # The preview runner queues the Intro & Credits job for this file when it starts the job.
-            INTRO_CREDITS_FOLLOW_UP: True,
-        },
-        server_id=b_sid,
-        server_name=b_sname,
-        server_type=b_stype,
-        priority=incoming_job_priority(),
-    )
-
     settings = get_settings_manager()
     retry_count, retry_delay = retry_policy(settings)
+    delay = _effective_webhook_delay(delay)
 
     overrides: dict[str, object] = {
         "sort_by": "newest",
@@ -525,14 +512,34 @@ def create_vendor_webhook_job(
     if regenerate:
         overrides["force_generate"] = True
 
-    from .routes import _start_job_async
-
-    _start_job_async(job.id, overrides)
+    # Save the complete executable config before the job is visible to recovery.
+    # Vendor jobs retain their item hints and one-job-per-version response shape;
+    # they do not join the path-only source batches used by dedicated routes.
+    with _pending_lock:
+        fire_at = datetime.now(UTC).timestamp() + delay
+        job = get_job_manager().create_job(
+            library_name=library_display,
+            config={
+                **overrides,
+                "path_count": 1,
+                "webhook_basenames": [basename],
+                INTRO_CREDITS_FOLLOW_UP: True,
+                "webhook_debounce_pending": True,
+                "webhook_delay_mode": "vendor",
+                "webhook_fire_at": datetime.fromtimestamp(fire_at, tz=UTC).isoformat(),
+                "webhook_server_id": server_id,
+            },
+            server_id=b_sid,
+            server_name=b_sname,
+            server_type=b_stype,
+            priority=incoming_job_priority(),
+        )
+        ensure_pending_webhook(job.id)
     _add_history_entry(
         safe_source,
         "Webhook",
         title or basename,
-        "triggered",
+        "queued",
         job_id=job.id,
         path_count=1,
         files_preview=[basename],
@@ -541,11 +548,12 @@ def create_vendor_webhook_job(
         server_type=b_stype,
     )
     logger.info(
-        "Webhook from {}: created job {} for '{}'{}",
+        "Webhook from {}: created job {} for '{}'{} — processing in {}s",
         safe_source,
         job.id[:8],
         basename,
         f" (pinned to {b_sname or server_id_filter})" if server_id_filter else "",
+        delay,
     )
     return job.id
 
@@ -869,6 +877,16 @@ def _webhook_job_kwargs(server_id: str | None) -> dict:
     return kwargs
 
 
+def _effective_webhook_delay(delay: int | None) -> int:
+    """Resolve the shared initial wait for every webhook ingestion route."""
+    if delay is None:
+        try:
+            delay = int(get_settings_manager().get("webhook_delay", 60))
+        except (TypeError, ValueError):
+            delay = 60
+    return max(1, min(_MAX_WEBHOOK_DELAY_SECONDS, delay))
+
+
 def _arm_webhook_timer(key: str, batch: dict, delay: float | None = None) -> None:
     """Arm a wakeup bound to this exact batch revision; caller holds the pending lock."""
     old_timer = _pending_timers.pop(key, None)
@@ -885,7 +903,7 @@ def _arm_webhook_timer(key: str, batch: dict, delay: float | None = None) -> Non
 
 
 def ensure_pending_webhook(job_id: str) -> bool:
-    """Restore a waiting webhook batch instead of letting restart/resume start it early.
+    """Restore a waiting webhook job or batch instead of starting it early on resume.
 
     Returns:
         True when the job is owned by the debounce scheduler.
@@ -901,7 +919,8 @@ def ensure_pending_webhook(job_id: str) -> bool:
             return True
         source = job.config.get("source", "unknown")
         server_id = job.config.get("webhook_server_id")
-        key = _debounce_key(source, server_id)
+        mode = job.config.get("webhook_delay_mode")
+        key = f"vendor:{job.id}" if mode == "vendor" else _debounce_key(source, server_id)
         batch = _pending_batches.get(key)
         if batch is not None:
             if batch["job_id"] != job_id:
@@ -918,6 +937,7 @@ def ensure_pending_webhook(job_id: str) -> bool:
             manager.complete_job(job_id, error="Stored webhook processing deadline is invalid; reprocess this job.")
             return True
         batch = {
+            "mode": mode,
             "source": source,
             "server_id": server_id,
             "job_id": job_id,
@@ -968,15 +988,9 @@ def _schedule_webhook_job(
         )
         return False
 
-    settings = get_settings_manager()
     # Apply the same bound to settings and URL overrides so accepted delays
     # are never silently shortened by the scheduler.
-    if delay is None:
-        try:
-            delay = int(settings.get("webhook_delay", 60))
-        except (TypeError, ValueError):
-            delay = 60
-    delay = max(1, min(_MAX_WEBHOOK_DELAY_SECONDS, delay))
+    delay = _effective_webhook_delay(delay)
     debounce_key = _debounce_key(safe_source, server_id)
     normalized_path = os.path.normpath(normalized_input_path).replace("\\", "/")
     basename = os.path.basename(normalized_path)
@@ -1277,14 +1291,37 @@ def _execute_webhook_job(debounce_key: str, token: object | None = None) -> None
         _dispatch_webhook_batch(debounce_key, batch)
 
 
-def _dispatch_webhook_batch(debounce_key: str, batch: dict) -> None:
-    """Persist the complete executable job before handing the claimed batch to the runner."""
+def _start_ready_webhook_job(job_id: str, config: dict) -> None:
+    """Consume initial wait metadata before dispatch or a later paused-job resume."""
     from .routes import _start_job_async
 
+    config = dict(config)
+    for key in (
+        "webhook_debounce_pending",
+        "webhook_delay_mode",
+        "webhook_fire_at",
+        "webhook_server_id",
+        "webhook_batch_opened_at",
+        "webhook_batch_max_wait",
+    ):
+        config.pop(key, None)
+    get_job_manager().update_job_config(job_id, config)
+    # Do not create a paused worker that could absorb a concurrent resume call.
+    if not get_settings_manager().processing_paused:
+        _start_job_async(job_id, config)
+
+
+def _dispatch_webhook_batch(debounce_key: str, batch: dict) -> None:
+    """Persist the complete executable job before handing the claimed batch to the runner."""
     source = str(batch.get("source", "unknown"))
     batch_titles = batch.get("titles") or []
 
     try:
+        if batch.get("mode") == "vendor":
+            job = get_job_manager().get_job(batch["job_id"])
+            if job is not None:
+                _start_ready_webhook_job(job.id, job.config)
+            return
         webhook_paths = sorted(path for path in batch.get("file_paths", set()) if isinstance(path, str) and path)
         if not webhook_paths:
             logger.warning(
@@ -1370,19 +1407,7 @@ def _dispatch_webhook_batch(debounce_key: str, batch: dict) -> None:
             "path_count": len(webhook_paths),
             "webhook_basenames": basenames[:_HISTORY_FILES_PREVIEW_CAP],
         }
-        for key in (
-            "webhook_debounce_pending",
-            "webhook_fire_at",
-            "webhook_server_id",
-            "webhook_batch_opened_at",
-            "webhook_batch_max_wait",
-        ):
-            config.pop(key, None)
-        job_manager.update_job_config(job.id, config)
-        # A paused batch is ready for resume without creating an in-flight worker
-        # that could absorb the resume signal just before exiting for the pause.
-        if not settings.processing_paused:
-            _start_job_async(job.id, config)
+        _start_ready_webhook_job(job.id, config)
         _add_history_entry(
             source,
             "Download",
@@ -2283,7 +2308,7 @@ def clear_webhook_history():
 @webhooks_bp.route("/pending")
 @api_token_required
 def get_pending_webhooks():
-    """Return currently pending (debouncing) webhook batches with countdown info."""
+    """Return waiting webhook jobs and debounce batches with countdown info."""
     now = datetime.now(UTC).timestamp()
     pending = []
     with _pending_lock:

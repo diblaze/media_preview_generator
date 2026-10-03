@@ -868,8 +868,8 @@ async function loadPendingWebhooks() {
         const n = pending.length;
         chipText.textContent = `${n} waiting`;
         chip.title = n === 1
-            ? 'One webhook is debouncing — click to jump to its row in the queue'
-            : `${n} webhooks debouncing — click to jump to the next one in the queue`;
+            ? 'One webhook is waiting — click to jump to its row in the queue'
+            : `${n} webhooks waiting — click to jump to the next one in the queue`;
     } catch (error) {
         // Network blip: hide rather than show a stale count.
         chip.classList.add('d-none');
@@ -910,7 +910,7 @@ async function fireWebhookNow(jobId) {
     if (!jobId) return;
     try {
         await apiPost('/api/jobs/' + encodeURIComponent(jobId) + '/fire-webhook-now', {});
-        showToast('Webhook Fired', 'Skipped the debounce — dispatching now.', 'success');
+        showToast('Webhook Fired', 'Skipped the initial wait — dispatching now.', 'success');
         await Promise.all([loadJobs(), loadPendingWebhooks()]);
     } catch (error) {
         showToast('Error', 'Could not fire webhook: ' + (error && error.message || error), 'danger');
@@ -2168,7 +2168,7 @@ function updateJobQueue(force) {
             // map to different upstream actions, even though both feel
             // like "do it now" from the user's seat.
             const fireWebhookBtn = isWaitingWebhookRow
-                ? `<button class="btn btn-outline-warning" onclick="fireWebhookNow('${escapeHtml(job.id)}')" title="Skip the webhook debounce — dispatch now" aria-label="Fire webhook now">
+                ? `<button class="btn btn-outline-warning" onclick="fireWebhookNow('${escapeHtml(job.id)}')" title="Skip the webhook wait — dispatch now" aria-label="Fire webhook now">
                     <i class="bi bi-lightning-fill"></i>
                 </button>`
                 : '';

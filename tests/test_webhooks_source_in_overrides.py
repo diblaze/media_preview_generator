@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from media_preview_generator.web import webhooks as wh
 from media_preview_generator.web.webhooks import (
     create_vendor_webhook_job,
 )
@@ -68,15 +69,17 @@ def _isolate_settings(tmp_path, monkeypatch):
 def _isolate_jobs(tmp_path):
     import media_preview_generator.web.jobs as jobs_mod
 
+    wh.reset_webhook_debounce()
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
     yield
+    wh.reset_webhook_debounce()
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
 
 
 class TestVendorWebhookJobCarriesSourceInOverrides:
-    """``create_vendor_webhook_job`` is the immediate-dispatch path
+    """``create_vendor_webhook_job`` is the delayed vendor-dispatch path
     (Plex / Emby / Jellyfin direct webhook receivers). It must put
     ``source`` in BOTH ``job.config`` (UI badge) AND the overrides
     dict (Config plumbing for retry-chain rows).
@@ -94,6 +97,8 @@ class TestVendorWebhookJobCarriesSourceInOverrides:
                 canonical_path="/data/Movies/Foo (2024)/Foo (2024).mkv",
                 server_id=None,
             )
+            assert job_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
         assert job_id, "Webhook job creation should not be deduped under a fresh state"
         assert captured_overrides, "create_vendor_webhook_job MUST hand the job to _start_job_async"
         last = captured_overrides[-1]
@@ -319,9 +324,11 @@ class TestWebhookJobsUseTheGlobalRetryPolicy:
     def test_vendor_webhook_job(self, values, expected, captured_overrides):
         self._configure(values)
         with patch("media_preview_generator.web.webhooks._check_and_record_dedup", return_value=None):
-            create_vendor_webhook_job(
+            queued_vendor_id = create_vendor_webhook_job(
                 source="jellyfin", title="Test", canonical_path="/data/Movies/Q (2024)/Q (2024).mkv", server_id=None
             )
+            assert queued_vendor_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
         assert self._retry(captured_overrides[-1]["overrides"]) == expected
 
     @pytest.mark.parametrize(("values", "expected"), CASES, ids=IDS)

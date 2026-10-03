@@ -1258,6 +1258,8 @@ def test_create_vendor_webhook_job_regenerate_propagates_force_generate(mock_sta
             item_id_by_server={"plex-1": "12345"},
             regenerate=True,
         )
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
 
     assert job_id, "job should have been created"
     assert mock_start.call_count == 1
@@ -1280,11 +1282,13 @@ def test_create_vendor_webhook_job_carries_hints_keyed_by_path(mock_start, app):
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={"plex-1": "k1"},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     hints = overrides.get("webhook_item_id_hints")
@@ -1305,6 +1309,8 @@ def test_create_vendor_webhook_job_dedupes_within_ttl(mock_start, app):
             item_id_by_server={"plex-1": "k1"},
             server_id="plex-1",
         )
+        assert first is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(first))
         second = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
@@ -1335,11 +1341,15 @@ def test_create_vendor_webhook_job_does_NOT_dedup_across_sources(mock_start, app
             item_id_by_server={"plex-1": "k1"},
             server_id="plex-1",
         )
+        assert plex_job is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(plex_job))
         sonarr_job = wh.create_vendor_webhook_job(
             source="sonarr",
             canonical_path="/data/x.mkv",
             server_id=None,
         )
+        assert sonarr_job is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(sonarr_job))
 
     assert plex_job is not None
     assert sonarr_job is not None
@@ -1496,6 +1506,8 @@ def test_create_vendor_webhook_job_handles_unicode_path(mock_start, app):
             canonical_path=unicode_path,
             item_id_by_server={"plex-1": "12345"},
         )
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
 
     assert job_id, "unicode path must produce a job"
     overrides = mock_start.call_args.args[1]
@@ -1513,11 +1525,13 @@ def test_create_vendor_webhook_job_empty_hint_dict_treated_as_no_hint(mock_start
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     assert "webhook_item_id_hints" not in overrides, "empty hint dict must not produce a hints override"
@@ -1531,11 +1545,13 @@ def test_create_vendor_webhook_job_filters_falsy_hint_keys(mock_start, app):
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={"": "k1", "plex-1": "", "valid-sid": "valid-id"},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     hints = overrides.get("webhook_item_id_hints")
@@ -1558,13 +1574,15 @@ def test_create_vendor_webhook_job_server_id_filter_pins_publishers(mock_start, 
     # collapsing the two like the previous test did made it impossible to
     # detect a regression where the wrong kwarg drove the publisher pin.
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="jellyfin",
             canonical_path="/data/y.mkv",
             item_id_by_server={"jelly-1": "j1"},
             server_id="other-server",
             server_id_filter="jelly-1",
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     assert overrides.get("server_id") == "jelly-1", (
