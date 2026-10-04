@@ -1,0 +1,154 @@
+--- a/libavfilter/ebur128.c
++++ b/libavfilter/ebur128.c
+@@ -97,6 +97,9 @@
+     unsigned long window;
+     /** Data pointer array for interleaved data */
+     void **data_ptrs;
++    /** Sum of squares of each 100 ms block of audio_data, per channel
++     *  (block * channels + c); negative when not summed since the block was last written. */
++    double *block_energy;
+ };
+ 
+ static AVOnce histogram_init = AV_ONCE_INIT;
+@@ -258,6 +261,11 @@
+                              st->channels * sizeof(*st->d->audio_data));
+     CHECK_ERROR(!st->d->audio_data, 0, free_sample_peak)
+ 
++    st->d->block_energy =
++        (double *) av_calloc(st->d->audio_data_frames / st->d->samples_in_100ms,
++                             st->channels * sizeof(*st->d->block_energy));
++    CHECK_ERROR(!st->d->block_energy, 0, free_audio_data)
++
+     ebur128_init_filter(st);
+ 
+     st->d->block_energy_histogram =
+@@ -288,6 +296,7 @@
+ free_block_energy_histogram:
+     av_free(st->d->block_energy_histogram);
+ free_audio_data:
++    av_free(st->d->block_energy);
+     av_free(st->d->audio_data);
+ free_sample_peak:
+     av_free(st->d->sample_peak);
+@@ -306,6 +315,7 @@
+     av_free((*st)->d->block_energy_histogram);
+     av_free((*st)->d->short_term_block_energy_histogram);
+     av_free((*st)->d->audio_data);
++    av_free((*st)->d->block_energy);
+     av_free((*st)->d->channel_map);
+     av_free((*st)->d->sample_peak);
+     av_free((*st)->d->data_ptrs);
+@@ -314,6 +324,19 @@
+     *st = NULL;
+ }
+ 
++/* Forget the cached energy of every 100 ms block the next write of frames touches. */
++static void ebur128_invalidate_blocks(FFEBUR128State *st, size_t frames)
++{
++    size_t first = st->d->audio_data_index / st->channels;
++    size_t i;
++
++    if (!frames)
++        return;
++    for (i = first / st->d->samples_in_100ms * st->channels;
++         i < ((first + frames - 1) / st->d->samples_in_100ms + 1) * st->channels; ++i)
++        st->d->block_energy[i] = -1.0;
++}
++
+ #define EBUR128_FILTER(type, scaling_factor)                                       \
+ static void ebur128_filter_##type(FFEBUR128State* st, const type** srcs,           \
+                                   size_t src_index, size_t frames,                 \
+@@ -321,6 +344,7 @@
+     double* audio_data = st->d->audio_data + st->d->audio_data_index;              \
+     size_t i, c;                                                                   \
+                                                                                    \
++    ebur128_invalidate_blocks(st, frames);                                         \
+     if ((st->mode & FF_EBUR128_MODE_SAMPLE_PEAK) == FF_EBUR128_MODE_SAMPLE_PEAK) { \
+         for (c = 0; c < st->channels; ++c) {                                       \
+             double max = 0.0;                                                      \
+@@ -388,39 +412,62 @@
+     return index_min;
+ }
+ 
++static double ebur128_sum_squares(FFEBUR128State *st, size_t c,
++                                  size_t from, size_t to)
++{
++    double sum = 0.0;
++    size_t i;
++
++    for (i = from; i < to; ++i)
++        sum += st->d->audio_data[i * st->channels + c] *
++               st->d->audio_data[i * st->channels + c];
++    return sum;
++}
++
++/* Sum of squares of channel c over ring frames [from, to) (no wrap): whole
++ * 100 ms blocks come from the cache, so a 3 s window costs 30 additions
++ * instead of a pass over every sample; partial blocks at the edges are summed. */
++static double ebur128_window_sum(FFEBUR128State *st, size_t c,
++                                 size_t from, size_t to)
++{
++    const size_t block = st->d->samples_in_100ms;
++    double sum = 0.0;
++
++    while (from < to) {
++        size_t start = from / block * block;
++        size_t end = FFMIN(start + block, to);
++
++        if (from == start && end == start + block) {
++            double *energy = &st->d->block_energy[from / block * st->channels + c];
++            if (*energy < 0.0)
++                *energy = ebur128_sum_squares(st, c, from, end);
++            sum += *energy;
++        } else {
++            sum += ebur128_sum_squares(st, c, from, end);
++        }
++        from = end;
++    }
++    return sum;
++}
++
+ static void ebur128_calc_gating_block(FFEBUR128State * st,
+                                       size_t frames_per_block,
+                                       double *optional_output)
+ {
+-    size_t i, c;
++    size_t c;
++    size_t end = st->d->audio_data_index / st->channels;
+     double sum = 0.0;
+     double channel_sum;
+     for (c = 0; c < st->channels; ++c) {
+         if (st->d->channel_map[c] == FF_EBUR128_UNUSED)
+             continue;
+-        channel_sum = 0.0;
+-        if (st->d->audio_data_index < frames_per_block * st->channels) {
+-            for (i = 0; i < st->d->audio_data_index / st->channels; ++i) {
+-                channel_sum += st->d->audio_data[i * st->channels + c] *
+-                    st->d->audio_data[i * st->channels + c];
+-            }
+-            for (i = st->d->audio_data_frames -
+-                 (frames_per_block -
+-                  st->d->audio_data_index / st->channels);
+-                 i < st->d->audio_data_frames; ++i) {
+-                channel_sum += st->d->audio_data[i * st->channels + c] *
+-                    st->d->audio_data[i * st->channels + c];
+-            }
++        if (end < frames_per_block) {
++            channel_sum = ebur128_window_sum(st, c, 0, end);
++            channel_sum += ebur128_window_sum(st, c,
++                                              st->d->audio_data_frames - (frames_per_block - end),
++                                              st->d->audio_data_frames);
+         } else {
+-            for (i =
+-                 st->d->audio_data_index / st->channels - frames_per_block;
+-                 i < st->d->audio_data_index / st->channels; ++i) {
+-                channel_sum +=
+-                    st->d->audio_data[i * st->channels +
+-                                      c] * st->d->audio_data[i *
+-                                                             st->channels +
+-                                                             c];
+-            }
++            channel_sum = ebur128_window_sum(st, c, end - frames_per_block, end);
+         }
+         if (st->d->channel_map[c] == FF_EBUR128_Mp110 ||
+             st->d->channel_map[c] == FF_EBUR128_Mm110 ||

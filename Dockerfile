@@ -20,6 +20,18 @@ FROM toolchain AS model
 COPY scripts/fetch_textdet_model.py /tmp/fetch_textdet_model.py
 RUN python3 /tmp/fetch_textdet_model.py --out /models
 
+# Loudness analysis binary (amd64): one jellyfin-ffmpeg8 package release built from jellyfin's own source plus an
+# ebur128 patch (docker/ffmpeg-loudnorm). Stock loudnorm re-sums a 3 s window of 192 kHz samples every 100 ms, about 87%
+# of its CPU; the patch caches 100 ms block energies (values equal at the two decimals Plex stores; 4-15x less CPU).
+# loudness/analyze.py uses it only while the installed jellyfin-ffmpeg8 is that release, else jellyfin-ffmpeg itself.
+# Drop the stage once jellyfin-ffmpeg ships an FFmpeg release with the patch.
+FROM toolchain AS ffmpeg-loudnorm
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends make nasm patch libc6-dev zlib1g-dev libbz2-dev curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY docker/ffmpeg-loudnorm/ /tmp/ffmpeg-loudnorm/
+RUN /tmp/ffmpeg-loudnorm/build.sh
+
 FROM toolchain AS builder
 WORKDIR /build
 
@@ -157,6 +169,7 @@ RUN pip3 install --no-cache-dir --no-index /tmp/wheels/*.whl \
 # Loaded only by the credit text detection helper process (markers/credits/textdet_helper.py).
 COPY --from=model /models/ch_PP-OCRv4_det_infer.onnx /app/models/ch_PP-OCRv4_det_infer.onnx
 COPY --from=model /models/latin_PP-OCRv5_rec_mobile.onnx /app/models/latin_PP-OCRv5_rec_mobile.onnx
+COPY --from=ffmpeg-loudnorm /out/ /usr/local/lib/ffmpeg-loudnorm/
 
 # Replace init-adduser with clean version (no branding)
 COPY docker-init-user.sh /etc/s6-overlay/s6-rc.d/init-adduser/run
