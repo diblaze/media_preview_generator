@@ -1688,6 +1688,7 @@ def worker_cards(jm) -> Callable[[list], None]:
                     eta=_format_eta(float(remaining)) if isinstance(remaining, int | float) and remaining > 0 else "",
                     ffmpeg_started=bool(w.get("ffmpeg_started", False)),
                     current_phase=w.get("current_phase", "") or "",
+                    chapter_progress=w.get("chapter_progress"),
                     fallback_active=bool(w.get("fallback_active", False)),
                     fallback_reason=w.get("fallback_reason"),
                     fallback_title=w.get("fallback_title", "") or "",

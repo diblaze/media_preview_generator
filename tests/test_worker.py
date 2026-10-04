@@ -23,6 +23,65 @@ from tests.conftest import _ms, _pi, _pi_list_or_passthrough  # noqa: F401
 class TestWorker:
     """Test Worker class functionality."""
 
+    @patch("media_preview_generator.processing.multi_server.process_canonical_path")
+    def test_chapter_progress_resets_per_task_and_idle_without_marking_gpu_ffmpeg_started(self, process):
+        worker = Worker(0, "GPU", "NVIDIA", "cuda", 0, "NVIDIA")
+        expected = {"stage": "extracting", "processed": 2, "total": 5, "ready": 1, "failed": 1}
+        worker.chapter_progress = {"stage": "complete", "processed": 10, "total": 10, "ready": 10, "failed": 0}
+
+        def run(**kwargs):
+            assert worker.chapter_progress is None
+            assert kwargs["canonical_path"] == "/data/test_key.mkv"
+            callback = kwargs["chapter_progress_callback"]
+            snapshot = dict(expected)
+            callback(snapshot)
+            snapshot["processed"] = 99
+            assert worker.get_progress_data()["chapter_progress"] == expected
+            assert not worker.ffmpeg_started
+            callback(None)
+            assert worker.chapter_progress is None
+            callback(expected)
+            return _ms("generated")
+
+        process.side_effect = run
+        worker.assign_task(_pi("test_key"), MagicMock(), MagicMock())
+        worker.current_thread.join(timeout=2)
+        assert worker.last_task_succeeded()
+        assert worker.get_progress_data()["chapter_progress"] == expected
+        assert worker.check_completion()
+        assert worker.chapter_progress is None
+        assert worker.get_progress_data()["chapter_progress"] is None
+
+    @patch("media_preview_generator.processing.multi_server.process_canonical_path")
+    def test_headless_worker_status_preserves_live_chapter_progress(self, process, monkeypatch):
+        monkeypatch.setattr("media_preview_generator.jobs.worker.WORKER_STATUS_EMIT_INTERVAL_S", 0)
+        expected = {"stage": "registering", "processed": 2, "total": 2, "ready": 2, "failed": 0}
+        reported = threading.Event()
+        statuses = []
+
+        def run(**kwargs):
+            assert kwargs["canonical_path"] == "/data/test_key.mkv"
+            kwargs["chapter_progress_callback"](expected)
+            assert reported.wait(timeout=3)
+            return _ms("generated")
+
+        def capture(workers):
+            statuses.extend(workers)
+            if any(row.get("chapter_progress") == expected for row in workers):
+                reported.set()
+
+        process.side_effect = run
+        pool = WorkerPool(cpu_workers=1, gpu_workers=0, selected_gpus=[])
+        try:
+            pool.process_items_headless([_pi("test_key")], MagicMock(), MagicMock(), worker_callback=capture)
+            assert reported.is_set()
+            busy = next(row for row in statuses if row.get("chapter_progress") == expected)
+            assert busy["status"] == "processing"
+            assert busy["ffmpeg_started"] is False
+        finally:
+            reported.set()
+            pool.shutdown()
+
     def test_worker_initialization(self):
         """Test worker is initialized correctly."""
         worker = Worker(0, "GPU", "NVIDIA", "cuda", 0, "NVIDIA GeForce RTX 3080")

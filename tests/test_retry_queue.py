@@ -7,9 +7,42 @@ import pytest
 from media_preview_generator.processing.retry_queue import (
     BACKOFF_SCHEDULE,
     DEFAULT_RETRY_COUNT,
+    publisher_needs_retry,
+    publisher_retry_count,
     retry_policy,
     scaled_backoff_delay,
 )
+
+
+@pytest.mark.parametrize(
+    "status,flag,expected",
+    [
+        ("published_pending_chapters", None, True),
+        ("published_pending_chapters", True, True),
+        ("published_pending_chapters", False, False),
+        ("published_chapters_failed", None, False),
+        ("published_chapters_failed", True, True),
+        ("published_chapters_failed", False, False),
+        ("published", True, False),
+        ("skipped_output_exists", True, False),
+        ("published_pending_registration", False, True),
+        ("skipped_not_indexed", None, True),
+    ],
+)
+def test_chapter_retry_flag_overrides_legacy_policy_without_changing_other_publishers(status, flag, expected):
+    row = {"status": status, "artifacts": {"chapters": {}}}
+    if flag is not None:
+        row["artifacts"]["chapters"]["retryable"] = flag
+    assert publisher_needs_retry(row) is expected
+
+
+def test_aggregate_retry_count_substitutes_flags_without_double_counting_waiting():
+    publisher = {
+        "counts": {"published_pending_chapters": 5, "published_chapters_failed": 8, "skipped_not_indexed": 2},
+        "retryable_counts": {"published_pending_chapters": 3, "published_chapters_failed": 4},
+    }
+    assert publisher_retry_count(publisher) == 9
+    assert publisher_retry_count({"counts": publisher["counts"]}) == 7
 
 
 def _settings(values: dict) -> MagicMock:

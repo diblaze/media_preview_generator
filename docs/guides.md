@@ -224,9 +224,30 @@ without that base layer, such as Profile 5, reports unsupported chapters while p
    A normal run keeps current scrubber previews and fills missing or stale
    chapter images. **Regenerate** rebuilds the enabled outputs.
 
-The job's Files panel reports scrubber and chapter results separately. A file Plex has not indexed yet can have
-its scrubber preview ready while chapters wait for a retry. Chapter retries reuse completed output, so they do not
-need to regenerate a current scrubber preview. A file with no chapters has no chapter images to generate.
+Worker cards show the chapter count and percentage as images are checked or attempted, followed by
+**Registering with Plex**. The percentage measures image work; **Ready** confirms registration succeeded.
+Chapter extraction runs on CPU even when the assigned slot is named GPU Worker. Failed image attempts count toward
+progress and are shown separately. Older running workers without chapter counts show an activity indicator instead.
+
+The job's **Files** panel reports scrubber and chapter results separately:
+
+- **Ready**: chapter images are complete and registered with Plex.
+- **Waiting for Plex**: Plex has not indexed the file or analyzed its chapters yet. The detail names what is missing.
+- **Failed**: chapter extraction or registration failed. The detail gives the error, even when a retry is allowed.
+- **No chapters**: there are no chapter images to generate.
+- **Incomplete**: an older job recorded unfinished chapter work without distinguishing waiting from failure. Read its
+  saved detail for the reason.
+
+Server summaries count scrubber and chapter results separately. **Scrubber already existed** can appear beside
+**Chapters updated** when a run creates chapter images or repairs their Plex references while reusing the scrubber.
+**Chapters already existed** means those images and references were already current. Counts are files, not individual images.
+**Chapters waiting for Plex** and **Chapters failed** name the remaining work. Older results can show **Chapters ready**
+without update history, or **Chapters incomplete** without a precise waiting/failure classification; open **Files** for details.
+For older job summaries without chapter counts, **Previews updated** reports how many files completed publication.
+It can appear beside **Scrubber already existed**, but does not identify which preview output changed.
+The job's retry details show whether another attempt is actually scheduled. Retry eligibility depends on the failure
+and your retry policy. Chapter retries reuse completed output, so they do not need to regenerate a current scrubber
+preview.
 Plex's normal file checks can rewrite chapter image references even when its own generation is set to **Never**.
 A later Previews job reconciles those references without decoding current images again. This is separate from
 Plex generating and replacing the images itself.

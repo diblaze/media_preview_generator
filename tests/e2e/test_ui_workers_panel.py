@@ -331,3 +331,107 @@ class TestWorkerCardPhaseRendering:
 
         assert result["title"] == "Switched to CPU"
         assert result["body"] == f'GPU Worker 1 (Quadro P5000) fell back to CPU for "AV1 Clip 3 (2019)" — {reason}'
+
+
+@pytest.mark.e2e
+class TestChapterWorkerProgress:
+    @pytest.mark.parametrize("width", [390, 1440])
+    @pytest.mark.parametrize("ffmpeg_started", [False, True])
+    def test_chapter_counts_override_scrubber_progress_and_fit_card(
+        self, authed_page: Page, app_url: str, width: int, ffmpeg_started: bool
+    ) -> None:
+        mock_dashboard_defaults(authed_page)
+        authed_page.set_viewport_size({"width": width, "height": 900})
+        authed_page.goto(f"{app_url}/")
+        result = authed_page.evaluate(
+            """(ffmpegStarted) => {
+                const worker = {
+                    worker_id: 'chapter-test', worker_type: 'GPU',
+                    worker_name: 'GPU Worker 1 (NVIDIA TITAN RTX)', status: 'processing',
+                    current_title: 'The Bourne Ultimatum', ffmpeg_started: ffmpegStarted,
+                    progress_percent: 100, speed: '9.2x', eta: '0s',
+                    chapter_progress: {stage: 'extracting', processed: 10, total: 40, ready: 9, failed: 1},
+                };
+                window.updateWorkerStatuses([worker]);
+                const card = document.querySelector('[data-worker-key$="_chapter-test"]');
+                const metrics = card.querySelector('[data-metrics]');
+                const first = {
+                    percent: card.querySelector('[data-percent]').textContent,
+                    stage: card.querySelector('[data-chapter-stage]').textContent,
+                    width: card.querySelector('[data-progress]').style.width,
+                    accessibleValue: card.querySelector('[data-progress-wrap]').getAttribute('aria-valuenow'),
+                    speedHidden: card.querySelector('[data-speed]').style.display === 'none',
+                    etaHidden: card.querySelector('[data-eta]').parentElement.style.display === 'none',
+                    cpuIcon: card.querySelector('[data-icon]').classList.contains('bi-cpu'),
+                    fits: metrics.scrollWidth <= metrics.clientWidth,
+                };
+                worker.chapter_progress = {stage: 'registering', processed: 40, total: 40, ready: 40, failed: 0};
+                window.updateWorkerStatuses([worker]);
+                const registering = card.querySelector('[data-chapter-stage]').textContent;
+                worker.status = 'idle';
+                window.updateWorkerStatuses([worker]);
+                return {...first, registering,
+                    idleHidden: card.querySelector('[data-metrics]').style.visibility === 'hidden',
+                    idleChapterHidden: card.querySelector('[data-chapter-stage]').classList.contains('d-none'),
+                    idleWidth: card.querySelector('[data-progress]').style.width,
+                };
+            }""",
+            ffmpeg_started,
+        )
+        assert result == {
+            "percent": "Chapters 10/40 · 25%",
+            "stage": "Generating · 1 failed",
+            "width": "25%",
+            "accessibleValue": "25.0",
+            "speedHidden": True,
+            "etaHidden": True,
+            "cpuIcon": True,
+            "fits": True,
+            "registering": "Registering with Plex",
+            "idleHidden": True,
+            "idleChapterHidden": True,
+            "idleWidth": "0%",
+        }
+
+    @pytest.mark.parametrize("stage", [None, "preparing", "waiting"])
+    def test_unknown_chapter_count_is_indeterminate_and_resets_for_video(
+        self, authed_page: Page, app_url: str, stage: str | None
+    ) -> None:
+        mock_dashboard_defaults(authed_page)
+        authed_page.goto(f"{app_url}/")
+        result = authed_page.evaluate(
+            """(stage) => {
+                const worker = {
+                    worker_id: 'chapter-test', worker_type: 'GPU', worker_name: 'GPU Worker 1',
+                    status: 'processing', current_title: 'Movie', ffmpeg_started: true,
+                    current_phase: 'Chapter thumbnails for Plex…', progress_percent: 100, speed: '7.0x',
+                    chapter_progress: stage ? {stage, processed: 0, total: 0, ready: 0, failed: 0} : null,
+                };
+                window.updateWorkerStatuses([worker]);
+                const card = document.querySelector('[data-worker-key$="_chapter-test"]');
+                const first = {
+                    animated: card.querySelector('[data-progress]').classList.contains('progress-bar-animated'),
+                    value: card.querySelector('[data-progress-wrap]').getAttribute('aria-valuenow'),
+                    percent: card.querySelector('[data-percent]').textContent,
+                    stage: card.querySelector('[data-chapter-stage]').textContent,
+                    speedHidden: card.querySelector('[data-speed]').style.display === 'none',
+                };
+                Object.assign(worker, {chapter_progress: null, current_phase: '', progress_percent: 12.5});
+                window.updateWorkerStatuses([worker]);
+                return {...first,
+                    videoPercent: card.querySelector('[data-percent]').textContent,
+                    videoAnimated: card.querySelector('[data-progress]').classList.contains('progress-bar-animated'),
+                    videoSpeedVisible: card.querySelector('[data-speed]').style.display !== 'none',
+                };
+            }""",
+            stage,
+        )
+        assert result["animated"] is True
+        assert result["value"] is None
+        assert "%" not in result["percent"]
+        assert result["speedHidden"] is True
+        if stage == "waiting":
+            assert result["stage"] == "Waiting for chapter access"
+        assert result["videoPercent"] == "12.5%"
+        assert result["videoAnimated"] is False
+        assert result["videoSpeedVisible"] is True

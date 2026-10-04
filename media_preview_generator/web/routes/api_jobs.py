@@ -450,13 +450,10 @@ def get_chain_attempts(chain_id):
         except (TypeError, ValueError):
             return None
 
-    # Single source of truth for "this server is still pending" status
-    # values. Shared with the retry-decision scan in
-    # ``web/routes/job_runner.py`` so the modal's per-pill chips and
-    # the retry-spawn decision can't drift.
+    # Retry eligibility is shared with the scheduler; a failed chapter attempt may be retryable.
     from ...job_kinds import JOB_KIND_LOUDNESS
     from ...loudness.job import NOT_IN_LIBRARY, WAITING
-    from ...processing.retry_queue import PENDING_PUBLISHER_STATUSES as _PENDING_PUBLISHER_STATUSES
+    from ...processing.retry_queue import publisher_needs_retry, publisher_retry_count
 
     def _pending_servers(job_obj) -> list[dict]:
         """Derive the list of per-server "still pending" counts from
@@ -481,10 +478,11 @@ def get_chain_attempts(chain_id):
             counts = pub.get("counts") or {}
             if not isinstance(counts, dict):
                 continue
-            pending_statuses = (
-                (WAITING, NOT_IN_LIBRARY) if job_obj.kind == JOB_KIND_LOUDNESS else _PENDING_PUBLISHER_STATUSES
+            n = (
+                sum(counts.get(status, 0) for status in (WAITING, NOT_IN_LIBRARY))
+                if job_obj.kind == JOB_KIND_LOUDNESS
+                else publisher_retry_count(pub)
             )
-            n = sum(counts.get(s, 0) for s in pending_statuses)
             if n > 0:
                 rows.append(
                     {
@@ -585,7 +583,7 @@ def get_chain_attempts(chain_id):
                 stale_paths += 1
                 continue
             for s in fr.get("servers") or []:
-                if (s.get("status") or "") in _PENDING_PUBLISHER_STATUSES:
+                if publisher_needs_retry(s):
                     name = s.get("name") or "?"
                     pending_by_server[name] = pending_by_server.get(name, 0) + 1
         if not pending_by_server and stale_paths == 0:
@@ -1737,6 +1735,7 @@ def _build_idle_workers_from_config():
         "fallback_title": "",
         "ffmpeg_started": False,
         "current_phase": "",
+        "chapter_progress": None,
     }
 
     # Use the shared label helper so the panel reads identically whether

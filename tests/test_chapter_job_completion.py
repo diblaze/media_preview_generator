@@ -14,7 +14,7 @@ from media_preview_generator.web.routes.job_runner import _chapter_completion_wa
     [
         ("published_chapters_failed", True, "chapter thumbnails failed for 1"),
         ("published_chapters_failed", False, "chapter thumbnails failed for 1"),
-        ("published_pending_chapters", True, "chapter thumbnails are still pending for 1"),
+        ("published_pending_chapters", True, "chapter thumbnails remain incomplete for 1"),
         ("published_pending_chapters", False, None),
         ("published", True, None),
         ("skipped_output_exists", True, None),
@@ -95,7 +95,7 @@ def test_mixed_servers_count_outputs_without_double_counting_successes():
     ]
     warning = _chapter_completion_warning(publishers, include_pending=True)
     assert "failed for 3 server item(s)" in warning
-    assert "pending for 1 server item(s)" in warning
+    assert "incomplete for 1 server item(s)" in warning
 
 
 @pytest.mark.parametrize("reseed", [False, True])
@@ -115,7 +115,7 @@ def test_large_success_scan_does_not_drop_chapter_failure_or_its_later_repair(tm
     assert {row["file"] for row in rows} >= {"/chapters.mkv", "/waiting.mkv"}
     assert len(rows) == 6  # Three successes, their cap marker, and both incomplete artifacts.
     warning = _chapter_completion_warning(merge_chain_publishers_best_per_path(rows), include_pending=True)
-    assert "failed for 1" in warning and "pending for 1" in warning
+    assert "failed for 1" in warning and "incomplete for 1" in warning
     for path in ("/chapters.mkv", "/waiting.mkv"):
         manager.record_file_result(
             job.id, path, "generated", servers=[{"server_id": "plex", "status": "published"}], uncapped=True

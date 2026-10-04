@@ -23,10 +23,10 @@ What remains:
   by ``_spawn_retry_job``. Public so any caller that wants to display the
   "next retry in Xs" countdown shares the canonical timing.
 * :data:`PENDING_PUBLISHER_STATUSES` — the per-publisher status values
-  that flag a file for retry. Shared between the retry-decision scan in
-  ``web/routes/job_runner.py`` and the ``/api/jobs/<chain_id>/attempts``
-  response helper in ``web/routes/api_jobs.py`` so the two code paths
-  can't drift.
+  that flag older results and non-chapter outputs for retry.
+* :func:`publisher_needs_retry` and :func:`publisher_retry_count` — shared
+  retry eligibility for file rows and server aggregates, including chapter
+  failures whose retry flag is independent of their displayed status.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def scaled_backoff_delay(attempt: int, retry_delay_sec: int) -> int:
 #: :class:`PublisherStatus`) that flag a file as "still needs another
 #: attempt because the destination server isn't ready yet."
 #:
-#: Two consumers must agree on this set:
+#: The shared eligibility helpers apply this legacy policy to:
 #:
 #: * ``web/routes/job_runner.py`` — the retry-decision scan that walks
 #:   the per-file JSONL after each dispatch to decide whether to spawn
@@ -84,9 +84,7 @@ def scaled_backoff_delay(attempt: int, retry_delay_sec: int) -> int:
 #:   computes the ``pending_servers`` field on each ``/attempts`` entry
 #:   so the modal can render per-pill vendor chips.
 #:
-#: Adding a fourth status (e.g. ``"skipped_metadata_unavailable"``) only
-#: at one call site would silently desync the retry decision from the
-#: UI rendering — both must reference this single source of truth.
+#: Chapter artifacts with explicit retry flags override these status defaults.
 PENDING_PUBLISHER_STATUSES: frozenset[str] = frozenset(
     {
         "published_pending_registration",
@@ -95,6 +93,39 @@ PENDING_PUBLISHER_STATUSES: frozenset[str] = frozenset(
         "skipped_not_in_library",
     }
 )
+
+
+CHAPTER_PUBLISHER_STATUSES = frozenset({"published_pending_chapters", "published_chapters_failed"})
+
+
+def publisher_needs_retry(row: dict) -> bool:
+    """Read retry eligibility separately from a chapter's displayed result.
+
+    Older saved chapter results have no retry flag, so retain their existing policy.
+    """
+    if not isinstance(row, dict):
+        return False
+    status = row.get("status")
+    if status in CHAPTER_PUBLISHER_STATUSES:
+        artifacts = row.get("artifacts")
+        chapter = artifacts.get("chapters") if isinstance(artifacts, dict) else None
+        if isinstance(chapter, dict) and type(chapter.get("retryable")) is bool:
+            return chapter["retryable"]
+    return status in PENDING_PUBLISHER_STATUSES
+
+
+def publisher_retry_count(publisher: dict) -> int:
+    """Count retryable server items without treating every chapter failure as transient."""
+    counts = publisher.get("counts") or {}
+    eligible = publisher.get("retryable_counts") or {}
+    if not isinstance(counts, dict) or not isinstance(eligible, dict):
+        return 0
+    total = 0
+    for status in PENDING_PUBLISHER_STATUSES | CHAPTER_PUBLISHER_STATUSES:
+        count = eligible.get(status, counts.get(status, 0) if status in PENDING_PUBLISHER_STATUSES else 0)
+        if type(count) is int and count > 0:
+            total += count
+    return total
 
 
 def _clamped_int(settings: Any, key: str, default: int, low: int, high: int) -> int:

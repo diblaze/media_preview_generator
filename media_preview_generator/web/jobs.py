@@ -334,6 +334,7 @@ class WorkerStatus:
     # worker is busy with — e.g. "Resolving item id on EmbyTest…"
     # explains a 30s gap that would otherwise look like a hang.
     current_phase: str = ""
+    chapter_progress: dict | None = None
     # GPU→CPU fallback state of the worker's current (or just-finished)
     # task. fallback_title names the file that fell back: current_title
     # is blank once the task is done, and a short clip's CPU rerun can

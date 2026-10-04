@@ -2369,6 +2369,7 @@ def process_canonical_path(
     retry_attempt: int = 0,
     server_id_filter: str | None = None,
     phase_callback=None,
+    chapter_progress_callback=None,
     deleted_paths: list[str] | None = None,
     display_name: str | None = None,
     source: str | None = None,
@@ -2422,7 +2423,12 @@ def process_canonical_path(
     plans = {}
     planning_failures = {}
 
+    def preparing_chapters() -> None:
+        if chapter_progress_callback:
+            chapter_progress_callback({"stage": "preparing", "processed": 0, "total": 0, "ready": 0, "failed": 0})
+
     def prepare(path: str) -> None:
+        preparing_chapters()
         for server, _adapter, hint in _resolve_publishers(path, registry, item_id_by_server=item_id_by_server):
             if server.id not in enabled:
                 continue
@@ -2438,6 +2444,8 @@ def process_canonical_path(
 
     if os.path.isfile(canonical_path):
         prepare(canonical_path)
+    if chapter_progress_callback:
+        chapter_progress_callback(None)
     result = _process_canonical_path_previews(canonical_path, registry, config, **options)
     if result.status not in {
         MultiServerStatus.PUBLISHED,
@@ -2449,6 +2457,8 @@ def process_canonical_path(
         plans.clear()
         planning_failures.clear()
         prepare(result.canonical_path)
+    if plans:
+        preparing_chapters()
     needs_chapters = any(chapter_work_needed(plan, regenerate=force) for plan in plans.values())
     if check_only and (result.status is MultiServerStatus.NEEDS_GENERATION or needs_chapters):
         return MultiServerResult(
@@ -2480,6 +2490,7 @@ def process_canonical_path(
         else:
             if phase_callback:
                 phase_callback(f"Chapter thumbnails for {publisher.server_name}…")
+            preparing_chapters()
             had_work = chapter_work_needed(plan, regenerate=force)
             outcome = publish_chapters(
                 plan,
@@ -2488,14 +2499,18 @@ def process_canonical_path(
                 cancel_check=cancel_check,
                 pause_check=pause_check,
                 ffmpeg_threads_override=ffmpeg_threads_override,
+                chapter_progress_callback=chapter_progress_callback,
             )
             publisher_changed = had_work and outcome.status == "ready"
             changed = changed or publisher_changed
-        publisher.artifacts = {"bif": {"status": publisher.status.value}, "chapters": outcome.to_dict()}
-        if outcome.status in {"pending", "failed"}:
+        publisher.artifacts = {
+            "bif": {"status": publisher.status.value},
+            "chapters": {**outcome.to_dict(), "updated": publisher_changed},
+        }
+        if outcome.status in {"waiting", "pending", "failed"}:
             publisher.status = (
                 PublisherStatus.PUBLISHED_PENDING_CHAPTERS
-                if outcome.status == "pending"
+                if outcome.status in {"waiting", "pending"}
                 else PublisherStatus.PUBLISHED_CHAPTERS_FAILED
             )
             publisher.message = f"Scrubber ready; chapters {outcome.status}: {outcome.message}"
@@ -2503,8 +2518,9 @@ def process_canonical_path(
         elif publisher_changed and publisher.status is PublisherStatus.SKIPPED_OUTPUT_EXISTS:
             publisher.status = PublisherStatus.PUBLISHED
             publisher.message = "Scrubber ready; chapter thumbnails ready"
-    if incomplete or changed:
+    if changed:
         result.status = MultiServerStatus.PUBLISHED
+    if incomplete or changed:
         result.message = (
             "Scrubber previews ready; chapter work incomplete" if incomplete else "Enabled preview outputs ready"
         )

@@ -1331,6 +1331,7 @@ class JobDispatcher:
                     # run — user-reported "I never see ffmpeg %/speed".
                     "ffmpeg_started": bool(getattr(worker, "ffmpeg_started", False)) if is_busy else False,
                     "current_phase": (getattr(worker, "current_phase", "") or "") if is_busy else "",
+                    "chapter_progress": progress_data.get("chapter_progress") if is_busy else None,
                 }
             )
         return statuses

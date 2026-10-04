@@ -319,8 +319,8 @@ class TestRetryCompletionMessage:
         )
         assert level == "WARNING", "exhausted chains must NOT log INFO success"
         assert msg == (
-            "1 file(s) still weren't indexed by the media server after 3 retries, so no more retries are queued. "
-            "The next scheduled scan will pick them up. (JellyTest pending × 1)"
+            "1 file(s) still need attention after 3 retries, so no more retries are queued. "
+            "The next scheduled scan will pick them up. (JellyTest needs another attempt × 1)"
         )
 
     def test_chain_exhausted_orders_pending_servers_by_count(self):
@@ -334,9 +334,11 @@ class TestRetryCompletionMessage:
             effective_max=3,
         )
         assert level == "WARNING"
-        assert msg.index("JellyTest pending × 3") < msg.index("EmbyTest pending × 2") < msg.index("Plex pending × 1"), (
-            f"pending servers must sort by count descending; got {msg!r}"
-        )
+        assert (
+            msg.index("JellyTest needs another attempt × 3")
+            < msg.index("EmbyTest needs another attempt × 2")
+            < msg.index("Plex needs another attempt × 1")
+        ), f"pending servers must sort by count descending; got {msg!r}"
 
     def test_chain_exhausted_falls_back_when_pending_by_server_empty(self):
         """If pending_by_server got cleared but retry_paths still has entries,
@@ -350,7 +352,9 @@ class TestRetryCompletionMessage:
             effective_max=3,
         )
         assert level == "WARNING"
-        assert "2 path(s) still pending" in msg, f"empty pending_by_server must fall back to a path count; got {msg!r}"
+        assert "2 path(s) still incomplete" in msg, (
+            f"empty pending_by_server must fall back to a path count; got {msg!r}"
+        )
 
     def test_retry_succeeded_logs_info_success(self):
         """retry_paths empty = chain succeeded = original INFO message preserved."""
@@ -424,14 +428,14 @@ class TestNotIndexedMessage:
                 True,
                 3,
                 3,
-                "2 file(s) still weren't indexed by the media server after 3 retries, so no more retries are queued. "
+                "2 file(s) still need attention after 3 retries, so no more retries are queued. "
                 "The next scheduled scan will pick them up.",
             ),
             (
                 True,
                 1,
                 1,
-                "2 file(s) still weren't indexed by the media server after 1 retry, so no more retries are queued. "
+                "2 file(s) still need attention after 1 retry, so no more retries are queued. "
                 "The next scheduled scan will pick them up.",
             ),
             (

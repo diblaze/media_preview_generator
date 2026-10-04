@@ -1464,6 +1464,222 @@ class TestFilesPanel:
         expect(page.locator("#logsModalHeader")).not_to_contain_text("Intro & Credits")
         expect(page.locator("#logsModalHeader .job-kind-badge")).to_have_text("Previews")
 
+    @pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}])
+    def test_chapter_states_explain_failures_and_waits_without_promising_a_retry(
+        self, dashboard, tmp_path, viewport
+    ) -> None:
+        preview = _preview_job()
+        page = dashboard([preview])
+        page.set_viewport_size(viewport)
+        cases = [
+            ("ready", "Ready", "", "published", False),
+            (
+                "waiting",
+                "Waiting for Plex",
+                "Plex has not analyzed the source chapters yet",
+                "published_pending_chapters",
+                True,
+            ),
+            (
+                "failed",
+                "Failed",
+                "Chapter frame extraction failed: decoder unavailable",
+                "published_chapters_failed",
+                True,
+            ),
+            ("failed", "Failed", "Unsupported chapter color format", "published_chapters_failed", False),
+            (
+                "pending",
+                "Incomplete",
+                "Chapter JPEG must be 1280 pixels wide (got 1278)",
+                "published_pending_chapters",
+                True,
+            ),
+            ("none", "No chapters", "", "skipped_output_exists", False),
+            ("failed", "Failed", '<img src=x onerror="alert(1)">', "published_chapters_failed", False),
+        ]
+        files = [
+            {
+                "file": f"/data/Movies/Chapter example {index + 1}.mkv",
+                "outcome": "generated",
+                "reason": "",
+                "worker": "CPU Worker 1",
+                "servers": [
+                    {
+                        "id": "plex-1",
+                        "name": "Home Plex",
+                        "type": "plex",
+                        "status": publisher_status,
+                        "artifacts": {
+                            "bif": {"status": "skipped_output_exists"},
+                            "chapters": {
+                                "status": status,
+                                "completed": 3 if status == "ready" else 0,
+                                "total": 0 if status == "none" else 3,
+                                "message": message,
+                                "retryable": retryable,
+                            },
+                        },
+                    }
+                ],
+            }
+            for index, (status, _label, message, publisher_status, retryable) in enumerate(cases)
+        ]
+
+        self._open_files(page, preview, files)
+
+        notes = page.locator("#fileResultsBody .chapter-server-note")
+        expect(notes).to_have_count(len(cases))
+        for index, (status, label, message, _publisher_status, _retryable) in enumerate(cases):
+            note = notes.nth(index)
+            expect(note).to_contain_text(f"Home Plex: Scrubber: Ready; Chapters: {label}")
+            if message:
+                expect(note).to_contain_text(message)
+            if status == "failed":
+                expect(note).to_have_class(re.compile(r"\btext-danger-emphasis\b"))
+        expect(notes.nth(0)).to_contain_text("Ready (3/3)")
+        expect(notes.nth(4)).not_to_contain_text("Waiting for Plex")
+        rows = page.locator("#fileResultsBody tr")
+        waiting_pill = rows.nth(1).locator("td").nth(2).locator(".badge")
+        expect(waiting_pill).to_have_attribute(
+            "title", "Home Plex — Waiting for Plex: Plex has not analyzed the source chapters yet"
+        )
+        expect(page.locator("#fileResultsBody")).not_to_contain_text(
+            re.compile(r"pending|queued|scheduled|auto-retrying", re.I)
+        )
+        expect(page.locator("#fileResultsBody [onerror]")).to_have_count(0)
+        if viewport["width"] < 600:
+            notes.nth(1).scroll_into_view_if_needed()
+        page.locator("#logsModal .modal-content").screenshot(
+            path=str(tmp_path / f"chapter-status-{viewport['width']}.png")
+        )
+
+    @pytest.mark.parametrize("has_frame_sources", [True, False])
+    def test_chapter_aggregate_preserves_legacy_uncertainty_without_promising_retry(
+        self, dashboard, has_frame_sources
+    ) -> None:
+        preview = _preview_job()
+        publisher = preview["publishers"][0]
+        publisher["counts"] = {"published_pending_chapters": 2, "published_chapters_failed": 3}
+        publisher["retryable_counts"] = {"published_pending_chapters": 2, "published_chapters_failed": 1}
+        if not has_frame_sources:
+            publisher.pop("frame_sources")
+        page = dashboard([preview])
+
+        page.locator(f"#job-files-toggle-{preview['id']}").click()
+        row = page.locator(f"#job-detail-{preview['id']}")
+        expect(row).to_contain_text("Chapters incomplete × 2")
+        expect(row).to_contain_text("Chapters failed × 3")
+        expect(row).not_to_contain_text(
+            re.compile(r"Chapters pending|Waiting for Plex|auto-retrying|retry scheduled", re.I)
+        )
+        incomplete = row.locator(".badge", has_text="Chapters incomplete")
+        expect(incomplete).to_have_attribute("title", re.compile("open Files for each file’s status and reason"))
+        expect(row.locator(".badge", has_text="Chapters failed")).to_have_class(re.compile(r"\bbg-danger\b"))
+        self._open_files(page, preview, [])
+        expect(page.locator("#logsModal")).to_contain_text("Chapters incomplete × 2")
+        expect(page.locator("#logsModal")).to_contain_text("Chapters failed × 3")
+
+    @pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}])
+    def test_chapter_updates_stay_visible_when_every_scrubber_already_existed(
+        self, dashboard, tmp_path, viewport
+    ) -> None:
+        preview = _preview_job()
+        preview["publishers"][0].update(
+            counts={"published": 9, "skipped_output_exists": 2379},
+            frame_sources={"output_existed": 2388},
+            chapter_counts={"updated": 9, "already_existed": 487, "none": 1892},
+        )
+        page = dashboard([preview])
+        page.set_viewport_size(viewport)
+        page.locator(f"#job-files-toggle-{preview['id']}").click()
+        details = page.locator(f"#job-detail-{preview['id']}")
+        for text in [
+            "Scrubber already existed × 2388",
+            "Chapters updated × 9",
+            "Chapters already existed × 487",
+            "No chapters × 1892",
+        ]:
+            expect(details).to_contain_text(text)
+        expect(details.locator(".badge", has_text="Chapters updated")).to_have_attribute(
+            "title", "Chapter images were generated or their Plex references were repaired for these files."
+        )
+        self._open_files(page, preview, [])
+        modal = page.locator("#logsModal")
+        expect(modal).to_contain_text("Scrubber already existed × 2388")
+        expect(modal).to_contain_text("Chapters updated × 9")
+        expect(modal).to_contain_text("Chapters already existed × 487")
+        modal.locator(".modal-content").screenshot(
+            path=str(tmp_path / f"chapter-summary-{viewport['width']}.png"), animations="disabled"
+        )
+
+    @pytest.mark.parametrize("has_frame_sources", [True, False])
+    def test_typed_chapter_counts_distinguish_waiting_failure_and_legacy_without_duplicate_badges(
+        self, dashboard, has_frame_sources
+    ) -> None:
+        preview = _preview_job()
+        publisher = preview["publishers"][0]
+        publisher["counts"] = {"published_pending_chapters": 5, "published_chapters_failed": 3, "published": 4}
+        publisher["chapter_counts"] = {"waiting": 2, "incomplete": 3, "failed": 3, "ready": 4}
+        if not has_frame_sources:
+            publisher.pop("frame_sources")
+        page = dashboard([preview])
+        page.locator(f"#job-files-toggle-{preview['id']}").click()
+        details = page.locator(f"#job-detail-{preview['id']}")
+        for label in [
+            "Chapters waiting for Plex × 2",
+            "Chapters incomplete × 3",
+            "Chapters failed × 3",
+            "Chapters ready × 4",
+        ]:
+            expect(details.locator(".badge", has_text=label)).to_have_count(1)
+        expect(details).not_to_contain_text("Chapters incomplete × 5")
+        expect(details).not_to_contain_text("Chapters updated")
+        expect(details).not_to_contain_text("Chapters already existed")
+
+    @pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}])
+    def test_legacy_published_files_remain_visible_without_inventing_chapter_counts(
+        self, dashboard, tmp_path, viewport
+    ) -> None:
+        preview = _preview_job()
+        preview["publishers"][0].update(
+            counts={"published": 9, "skipped_output_exists": 2379},
+            frame_sources={"output_existed": 2388},
+        )
+        page = dashboard([preview])
+        page.set_viewport_size(viewport)
+        page.locator(f"#job-files-toggle-{preview['id']}").click()
+        details = page.locator(f"#job-detail-{preview['id']}")
+        expect(details).to_contain_text("Scrubber already existed × 2388")
+        expect(details).to_contain_text("Previews updated × 9")
+        expect(details).not_to_contain_text("Chapters")
+        expect(details.locator(".badge", has_text="Previews updated")).to_have_attribute(
+            "title",
+            "This run completed publication for these files. Older results do not record which preview output changed.",
+        )
+        self._open_files(page, preview, [])
+        modal = page.locator("#logsModal")
+        expect(modal).to_contain_text("Scrubber already existed × 2388")
+        expect(modal).to_contain_text("Previews updated × 9")
+        expect(modal).not_to_contain_text("Chapters")
+        modal.locator(".modal-content").screenshot(
+            path=str(tmp_path / f"legacy-preview-summary-{viewport['width']}.png"), animations="disabled"
+        )
+
+    def test_legacy_mixed_scrubber_results_do_not_attribute_publication_to_chapters(self, dashboard) -> None:
+        preview = _preview_job()
+        preview["publishers"][0].update(
+            counts={"published": 2, "skipped_output_exists": 3},
+            frame_sources={"extracted": 2, "output_existed": 3},
+        )
+        page = dashboard([preview])
+        page.locator(f"#job-files-toggle-{preview['id']}").click()
+        details = page.locator(f"#job-detail-{preview['id']}")
+        expect(details).to_contain_text("Scrubber generated × 2")
+        expect(details).to_contain_text("Scrubber already existed × 3")
+        expect(details).to_contain_text("Previews updated × 2")
+        expect(details).not_to_contain_text("Chapters")
+
 
 def _running(job: dict, paused: bool = False) -> dict:
     job = json.loads(json.dumps(job))

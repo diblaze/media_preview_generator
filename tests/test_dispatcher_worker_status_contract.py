@@ -61,6 +61,7 @@ class TestBuildWorkerStatusesContract:
             worker.remaining_time = 30.0
             worker.ffmpeg_started = True
             worker.current_phase = "Encoding frames"
+            worker.chapter_progress = {"stage": "extracting", "processed": 2, "total": 5, "ready": 1, "failed": 1}
 
             statuses = dispatcher._build_worker_statuses()
             assert len(statuses) == 1
@@ -82,6 +83,7 @@ class TestBuildWorkerStatusesContract:
                 "fallback_title",
                 "ffmpeg_started",
                 "current_phase",
+                "chapter_progress",
             }
             missing = required_keys - payload.keys()
             assert not missing, (
@@ -100,6 +102,7 @@ class TestBuildWorkerStatusesContract:
             assert payload["current_phase"] == "Encoding frames", (
                 f"current_phase must reflect worker.current_phase; got {payload['current_phase']!r}"
             )
+            assert payload["chapter_progress"] == worker.chapter_progress
         finally:
             dispatcher.shutdown()
 
@@ -117,6 +120,7 @@ class TestBuildWorkerStatusesContract:
             worker.is_busy = False
             worker.ffmpeg_started = True  # leftover from prior task
             worker.current_phase = "Encoding frames"  # leftover
+            worker.chapter_progress = {"stage": "complete", "processed": 5, "total": 5, "ready": 5, "failed": 0}
 
             statuses = dispatcher._build_worker_statuses()
             assert len(statuses) == 1
@@ -130,6 +134,7 @@ class TestBuildWorkerStatusesContract:
             assert payload["current_phase"] == "", (
                 f"Idle workers must clear current_phase; got {payload['current_phase']!r}"
             )
+            assert payload["chapter_progress"] is None
         finally:
             dispatcher.shutdown()
 

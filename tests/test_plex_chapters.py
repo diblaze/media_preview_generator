@@ -102,6 +102,55 @@ def test_register_changes_only_existing_chapter_thumb_urls_and_is_idempotent(bac
 
 
 @pytest.mark.parametrize(
+    "change, reason",
+    [
+        (
+            "UPDATE taggings SET end_time_offset=9999 WHERE id=2",
+            "Invalid chapter timing for chapter 2: start 10000ms, end 9999ms",
+        ),
+        (
+            "UPDATE taggings SET time_offset=11000, end_time_offset=12000 WHERE id=1",
+            "chapter 1 starts at 11000ms but chapter 2 starts at 10000ms",
+        ),
+    ],
+)
+def test_invalid_chapter_metadata_explains_the_exact_timing_without_writes(backend, change, reason):
+    mutate(backend, change)
+    before = rows(backend)
+
+    with pytest.raises(ChapterError) as caught:
+        read(backend)
+
+    assert caught.value.code == "unsupported"
+    assert reason in str(caught.value)
+    assert rows(backend) == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE taggings SET end_time_offset=0 WHERE id=1",
+        "UPDATE taggings SET end_time_offset=10000 WHERE id=2",
+        "UPDATE taggings SET end_time_offset=15000 WHERE id=1",
+        "UPDATE taggings SET time_offset=0 WHERE id=2",
+    ],
+)
+def test_rounded_or_overlapping_chapters_register_images_without_changing_timing(backend, change):
+    mutate(backend, change)
+    target = read(backend)
+    before = rows(backend)
+    _, revisions = images(backend)
+
+    backend.register(target, revisions, VERSION, deadline=time.monotonic() + 3)
+
+    after = rows(backend)
+    for old, new in zip(before, after, strict=True):
+        assert old[:6] == new[:6] and old[7:] == new[7:]
+    assert after[0][6] == chapter_url(10, 1, revisions[1])
+    assert after[1][6] == chapter_url(10, 2, revisions[2])
+
+
+@pytest.mark.parametrize(
     "change",
     [
         "UPDATE media_parts SET hash='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
