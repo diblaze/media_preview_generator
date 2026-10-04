@@ -196,3 +196,68 @@ def test_missing_ffmpeg_is_an_item_analysis_error(monkeypatch):
     monkeypatch.setattr(analyze.subprocess, "Popen", MagicMock(side_effect=FileNotFoundError(2, "No such file")))
     with pytest.raises(analyze.LoudnessError, match="Could not start ffmpeg"):
         analyze.run("missing-ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
+
+
+@pytest.fixture
+def builds(tmp_path, monkeypatch):
+    """A fast build of jellyfin-ffmpeg 8.1.3-1 and a jellyfin-ffmpeg script; ``make(fast_body, jellyfin_body)``."""
+    fast_dir = tmp_path / "fast"
+    fast_dir.mkdir()
+    (fast_dir / "jellyfin-release").write_text("8.1.3-1\n")
+    monkeypatch.setattr(analyze, "FAST_DIR", str(fast_dir))
+    monkeypatch.setattr(analyze, "_twins", {})
+    monkeypatch.setattr(analyze, "_installed_jellyfin", lambda: "8.1.3-1-noble")
+
+    def make(fast_body: str, jellyfin_body: str) -> str:
+        script = fast_dir / "ffmpeg"
+        script.write_text("#!/bin/sh\n" + fast_body + "\n")
+        script.chmod(0o755)
+        jellyfin = _fake_ffmpeg(tmp_path, jellyfin_body)
+        monkeypatch.setattr(analyze, "JELLYFIN_FFMPEG", jellyfin)
+        return jellyfin
+
+    return make
+
+
+REPORTS = "cat >&2 <<'EOT'\n" + REPORT + "\nEOT"
+
+
+def test_measure_uses_the_fast_build_of_the_installed_release(tmp_path, builds):
+    jellyfin = builds(REPORTS, f"touch {tmp_path}/jellyfin-ran; exit 1")
+    assert analyze.measure(jellyfin, "/m/a.mkv", 1, duration_ms=1000) == PLEX_FIELDS
+    assert not (tmp_path / "jellyfin-ran").exists()
+
+
+def test_measure_skips_a_fast_build_of_another_release(tmp_path, builds, monkeypatch):
+    jellyfin = builds(f"touch {tmp_path}/fast-ran; exit 1", REPORTS)
+    monkeypatch.setattr(analyze, "_installed_jellyfin", lambda: "8.1.3-2-noble")
+    assert analyze.measure(jellyfin, "/m/a.mkv", 1, duration_ms=1000) == PLEX_FIELDS
+    assert not (tmp_path / "fast-ran").exists()
+
+
+def test_the_fast_build_only_stands_in_for_jellyfin_ffmpeg(builds):
+    builds(REPORTS, "exit 1")
+    assert analyze.fast_twin("/usr/local/bin/ffmpeg") is None
+
+
+def test_measure_retries_a_stream_the_fast_build_fails_on(builds):
+    jellyfin = builds("echo 'Decoder not found' >&2; exit 234", REPORTS)
+    assert analyze.measure(jellyfin, "/m/a.mkv", 1, duration_ms=1000) == PLEX_FIELDS
+
+
+def test_measure_never_retries_a_timeout(tmp_path, builds, monkeypatch):
+    monkeypatch.setattr(analyze, "timeout_for", lambda duration_ms: 0.3)
+    monkeypatch.setattr(analyze, "_POLL_S", 0.05)
+    jellyfin = builds("exec sleep 30", f"touch {tmp_path}/jellyfin-ran; exit 1")
+    with pytest.raises(analyze.LoudnessTimeout):
+        analyze.measure(jellyfin, "/m/a.mkv", 1, duration_ms=1000)
+    assert not (tmp_path / "jellyfin-ran").exists()
+
+
+def test_measure_never_retries_a_stream_cancelled_mid_run(tmp_path, builds, monkeypatch):
+    monkeypatch.setattr(analyze, "_POLL_S", 0.05)
+    started = tmp_path / "fast-started"
+    jellyfin = builds(f"touch {started}; exec sleep 30", f"touch {tmp_path}/jellyfin-ran; exit 1")
+    with pytest.raises(analyze.LoudnessError, match="cancelled"):
+        analyze.measure(jellyfin, "/m/a.mkv", 1, duration_ms=1000, cancel_check=started.exists)
+    assert not (tmp_path / "jellyfin-ran").exists()

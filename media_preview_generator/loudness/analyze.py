@@ -8,6 +8,8 @@ import os
 import subprocess
 from collections.abc import Callable
 
+from loguru import logger
+
 from ..markers.freeze import Freeze
 from ..markers.probe import kill_and_collect
 
@@ -18,6 +20,10 @@ LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1:LRA=9:print_format=json"
 NO_DRC_CODECS = frozenset({"eac3"})
 # The version Plex writes beside its fields (``ln:loudnessAnalysisVersion``).
 ANALYSIS_VERSION = "0.02"
+# The amd64 image's analysis-only FFmpeg (Dockerfile stage ``ffmpeg-loudnorm``): one jellyfin-ffmpeg8 package release
+# built from its own source plus a loudnorm patch, so the same decoders and values for a fraction of the CPU.
+FAST_DIR = "/usr/local/lib/ffmpeg-loudnorm"
+JELLYFIN_FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 # loudnorm's report key → Plex's field.
 _FIELDS = {
     "input_i": "ln:loudness",
@@ -36,6 +42,10 @@ REAPER = "loudness-reaper"
 
 class LoudnessError(Exception):
     """ffmpeg failed, timed out, was cancelled, or printed no loudnorm report."""
+
+
+class LoudnessTimeout(LoudnessError):
+    """ffmpeg ran past its time limit."""
 
 
 def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
@@ -188,8 +198,9 @@ def run(
                 freeze.hold(proc, cancel_check=cancel_check, name=name)
                 cancelled = bool(cancel_check and cancel_check())
                 if cancelled or freeze.clock() > deadline:
-                    why = "cancelled" if cancelled else f"timed out after {timeout_s:.0f} s"
-                    raise LoudnessError(f"Loudness analysis of {name} {why}") from None
+                    if cancelled:
+                        raise LoudnessError(f"Loudness analysis of {name} cancelled") from None
+                    raise LoudnessTimeout(f"Loudness analysis of {name} timed out after {timeout_s:.0f} s") from None
     except BaseException:
         kill_and_collect(proc, what=f"ffmpeg analysing loudness of {name}", reaper_name=REAPER, wait_s=KILL_WAIT_S)
         raise
@@ -199,3 +210,58 @@ def run(
     if proc.returncode != 0:
         raise LoudnessError(f"ffmpeg exited {proc.returncode} analysing {name} stream {index}: {text.strip()[-200:]}")
     return ln_fields(parse(text))
+
+
+_twins: dict[str, str | None] = {}
+
+
+def _installed_jellyfin() -> str:
+    """The installed jellyfin-ffmpeg8 package version (``8.1.3-1-noble``)."""
+    return subprocess.run(
+        ["dpkg-query", "-W", "-f=${Version}", "jellyfin-ffmpeg8"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.strip()
+
+
+def fast_twin(ffmpeg: str) -> str | None:
+    """The fast build when ``ffmpeg`` is the jellyfin-ffmpeg package release it was built from, else None."""
+    if ffmpeg in _twins:
+        return _twins[ffmpeg]
+    binary = os.path.join(FAST_DIR, "ffmpeg")
+    if ffmpeg != JELLYFIN_FFMPEG or not os.access(binary, os.X_OK):
+        _twins[ffmpeg] = None
+        return None
+    try:
+        with open(os.path.join(FAST_DIR, "jellyfin-release"), encoding="utf-8") as f:
+            built = f.read().strip()
+        installed = _installed_jellyfin()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info("Fast loudness ffmpeg not used for now: {}", exc)  # not cached: the next stream asks again
+        return None
+    same = installed == built or installed.startswith(built + "-")
+    if not same:
+        logger.info("Fast loudness ffmpeg not used: built from jellyfin-ffmpeg {}, {} installed", built, installed)
+    _twins[ffmpeg] = binary if same else None
+    return _twins[ffmpeg]
+
+
+def measure(ffmpeg: str, path: str, index: int, **kwargs) -> dict[str, str]:
+    """``run`` with the fast twin of ``ffmpeg`` when there is one; a stream it fails on runs again with ``ffmpeg``.
+
+    A timeout is not retried: the source stalled, and a second full time limit would only hold the worker longer.
+    """
+    fast = fast_twin(ffmpeg)
+    if fast:
+        try:
+            return run(fast, path, index, **kwargs)
+        except LoudnessTimeout:
+            raise
+        except LoudnessError as exc:
+            cancel_check = kwargs.get("cancel_check")
+            if cancel_check and cancel_check():
+                raise
+            logger.warning("Fast loudness analysis failed ({}); retrying with {}", exc, ffmpeg)
+    return run(ffmpeg, path, index, **kwargs)

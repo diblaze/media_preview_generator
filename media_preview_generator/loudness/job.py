@@ -257,7 +257,7 @@ def process_item(
             if phase_callback:
                 phase_callback(f"Loudness {n}/{len(todo)}")
             try:
-                fields = analyze.run(
+                fields = analyze.measure(
                     ctx.ffmpeg,
                     path,
                     index,
