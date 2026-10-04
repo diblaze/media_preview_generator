@@ -9,7 +9,7 @@ from loguru import logger
 from .base import MediaServer, ServerConfig
 
 CHAPTER_PREF = "GenerateChapterThumbBehavior"
-_NATIVE_MODES = {
+NATIVE_MODES = {
     "never": "Never",
     "scheduled": "As a scheduled task",
     "asap": "As a scheduled task and when media is added",
@@ -71,7 +71,7 @@ def chapter_readiness_section(
         }
 
     mode = preferences.get(CHAPTER_PREF)
-    known = isinstance(mode, str) and mode in _NATIVE_MODES
+    known = isinstance(mode, str) and mode in NATIVE_MODES
     native_off = known and mode == "never"
     if not known:
         label = "Could not check Plex's chapter setting"
@@ -99,7 +99,7 @@ def chapter_readiness_section(
         ),
         "ok": native_off,
         "severity": "recommended",
-        "current": _NATIVE_MODES[mode] if known else "Unable to verify",
+        "current": NATIVE_MODES[mode] if known else "Unable to verify",
         "recommended": "Never",
         "reason": native_reason,
         "actions": {},

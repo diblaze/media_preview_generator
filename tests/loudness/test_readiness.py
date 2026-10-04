@@ -55,3 +55,38 @@ def test_stored_unsupported_music_selection_is_not_reported_as_ready():
     capability.assert_not_called()
     assert not section["ok"]
     assert "movie and TV" in section["checks"][0]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "row", "ok"),
+    [
+        ("never", "Plex's own loudness analysis is off", True),
+        ("scheduled", "Plex also analyses loudness itself", False),
+        ("asap", "Plex also analyses loudness itself", False),
+        (None, None, True),
+        ("new-value", None, True),
+        ([], None, True),
+    ],
+)
+def test_plexs_own_loudness_analysis_gets_a_row_when_its_setting_is_known(mode, row, ok):
+    prefs = {} if mode is None else {"LoudnessAnalysisBehavior": mode}
+    with patch(
+        "media_preview_generator.loudness.guard.loudness_capability", return_value=MagicMock(ready=True, message="")
+    ):
+        section = loudness_readiness_section(MagicMock(), _cfg({"enabled": True}), prefs)
+    rows = {check["id"]: check for check in section["checks"]}
+    assert section["ok"] is ok
+    if row is None:
+        assert "loudness_plex_analysis" not in rows
+        return
+    check = rows["loudness_plex_analysis"]
+    assert (check["label"], check["ok"], check["recommended"], check["severity"]) == (row, ok, "Never", "recommended")
+    assert (check["reason"] is None) is ok
+
+
+def test_plexs_setting_is_left_out_while_loudness_cant_be_stored_or_is_off():
+    prefs = {"LoudnessAnalysisBehavior": "scheduled"}
+    with patch("media_preview_generator.loudness.guard.loudness_capability", side_effect=RuntimeError("offline")):
+        section = loudness_readiness_section(MagicMock(), _cfg({"enabled": True}), prefs)
+    assert [c["id"] for c in section["checks"]] == ["loudness_registration"] and section["severity"] == "critical"
+    assert loudness_readiness_section(MagicMock(), _cfg({"enabled": False}), prefs) is None

@@ -1401,6 +1401,18 @@ class TestPlexPreviewsReadiness:
         # Healthy wiring → overall_ok.
         assert payload["overall_ok"] is True
 
+    def test_loudness_health_gets_plexs_prefs(self, plex_wrapper):
+        with (
+            patch.object(PlexServer, "test_connection") as tc,
+            patch("media_preview_generator.servers.plex.requests.get") as prefs_get,
+            patch.object(PlexServer, "get_vendor_extraction_status", return_value={}),
+            patch("media_preview_generator.servers.loudness_readiness.loudness_readiness_section") as loudness,
+        ):
+            tc.return_value = ConnectionResult(ok=True, server_id="m", server_name="Plex", version="1.43.4.0")
+            prefs_get.return_value = self._prefs_response(LoudnessAnalysisBehavior="scheduled")
+            plex_wrapper.previews_readiness()
+        assert loudness.call_args.args[2]["LoudnessAnalysisBehavior"] == "scheduled"
+
     def test_plex_config_folder_probe_never_writes(self, plex_wrapper, tmp_path):
         """CRITICAL: the plex_config_folder readiness probe MUST be
         read-only. Writing into the user's Plex bundles folder is a

@@ -1094,7 +1094,7 @@ class PlexServer(MediaServer):
 
         from .loudness_readiness import loudness_readiness_section
 
-        loudness_section = loudness_readiness_section(self, self._server_config)
+        loudness_section = loudness_readiness_section(self, self._server_config, current_by_id)
         if loudness_section is not None:
             sections.append(loudness_section)
 
