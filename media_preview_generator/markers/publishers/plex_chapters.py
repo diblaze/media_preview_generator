@@ -129,10 +129,20 @@ def target_from_json(raw: Any) -> ChapterTarget:
         raise ValueError("Invalid source identity")
     if [c.index for c in chapters] != list(range(1, len(chapters) + 1)):
         raise ValueError("Chapter indexes must be consecutive and start at one")
-    if any(c.end_ms <= c.start_ms for c in chapters):
-        raise ValueError("Invalid chapter timing")
-    if any(left.end_ms > right.start_ms for left, right in pairwise(chapters)):
-        raise ValueError("Chapter timings overlap or are out of order")
+    for chapter in chapters:
+        if chapter.end_ms < chapter.start_ms:
+            raise ValueError(
+                f"Invalid chapter timing for chapter {chapter.index}: "
+                f"start {chapter.start_ms}ms, end {chapter.end_ms}ms"
+            )
+    for left, right in pairwise(chapters):
+        # Images use chapter starts; Plex can round very short chapters to
+        # zero duration or retain overlapping ends. Never rewrite that timing.
+        if left.start_ms > right.start_ms:
+            raise ValueError(
+                f"Chapter start times are out of order: chapter {left.index} starts at {left.start_ms}ms "
+                f"but chapter {right.index} starts at {right.start_ms}ms"
+            )
     return target
 
 
@@ -266,7 +276,11 @@ class LocalChapters:
         try:
             target = ChapterTarget(*row, tuple(Chapter(*c) for c in chapters), machine_identifier)
             return target_from_json(target_to_json(target))
-        except (KeyError, TypeError, ValueError) as exc:
+        except ValueError as exc:
+            raise ChapterError(
+                f"Plex source or chapter metadata is incomplete or unsupported: {exc}", code="unsupported"
+            ) from exc
+        except (KeyError, TypeError) as exc:
             raise ChapterError(
                 "Plex source or chapter metadata is incomplete or unsupported", code="unsupported"
             ) from exc

@@ -1450,14 +1450,28 @@ backfill. The app compares Plex's live identity with the mounted config, checks 
 matches the file's size and Plex bundle hash before analysis. Inside the write transaction it checks the file and
 stream snapshot again. A changed source is left unwritten and checked again later.
 
-New files get it after their previews (and their Intro & Credits, when that's on), when Sonarr, Radarr or Plex sends
-a webhook. For the files you already have,
+Enabled files get a loudness follow-up after their previews and any relevant Intro & Credits jobs, including
+webhooks, manual library runs and scheduled preview scans. Recently Added processing uses the same follow-up flow.
+Chapter thumbnails remain part of the Previews job; Intro & Credits and loudness are separate jobs. Follow-ups can
+appear in the queue together while waiting for the preceding jobs' first passes; they do not wait through every
+retry of those jobs. For a loudness-only backfill,
 start a **Plex loudness** job from the dashboard (**New job**), for chosen libraries or all of them. A file Plex
 hasn't added to its library yet, or met while Plex was restarting or its database busy, is checked again according to
 your retry settings. The same job row shows the countdown and attempt count; **Retry now** skips the wait.
 After retries end, unresolved files leave a failure or a completion warning when other files succeeded. The Files
 panel gives the reason. These retries are automatic and do not require review or approval.
 Jobs share the workers, priorities, pause and cancel of every other job.
+
+### Checking the results
+
+Open a file in **Tools → Inspector**. Its **Loudness** section shows the measurements Plex reports for each audio
+track and whether normalization is available. It also displays complete native Plex results when this app's
+automatic loudness analysis is off. Availability means Plex can normalize the track; the player's **Normalize
+Loudness** setting is separate.
+
+The Inspector distinguishes missing measurements, incomplete results and a server it cannot reach. It reads metadata
+without changing it or starting a job. The job banner identifies **Plex loudness** separately from Previews and Intro
+& Credits, and the results refresh when the job finishes.
 
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
 publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item. Setup
@@ -1716,9 +1730,33 @@ without that base layer, such as Profile 5, reports unsupported chapters while p
    A normal run keeps current scrubber previews and fills missing or stale
    chapter images. **Regenerate** rebuilds the enabled outputs.
 
-The job's Files panel reports scrubber and chapter results separately. A file Plex has not indexed yet can have
-its scrubber preview ready while chapters wait for a retry. Chapter retries reuse completed output, so they do not
-need to regenerate a current scrubber preview. A file with no chapters has no chapter images to generate.
+Worker cards show the chapter count and percentage as images are checked or attempted, followed by
+**Registering with Plex**. The percentage measures image work; **Ready** confirms registration succeeded.
+Chapter extraction runs on CPU even when the assigned slot is named GPU Worker. Failed image attempts count toward
+progress and are shown separately. Older running workers without chapter counts show an activity indicator instead.
+
+The job's **Files** panel reports scrubber and chapter results separately:
+
+- **Ready**: chapter images are complete and registered with Plex.
+- **Waiting for Plex**: Plex has not indexed the file or analyzed its chapters yet. The detail names what is missing.
+- **Failed**: chapter extraction or registration failed. The detail gives the error, even when a retry is allowed.
+- **No chapters**: there are no chapter images to generate.
+- **Incomplete**: an older job recorded unfinished chapter work without distinguishing waiting from failure. Read its
+  saved detail for the reason.
+
+Server summaries count scrubber and chapter results separately. **Scrubber already existed** can appear beside
+**Chapters updated** when a run creates chapter images or repairs their Plex references while reusing the scrubber.
+**Chapters already existed** means those images and references were already current. Counts are files, not individual images.
+**Chapters waiting for Plex** and **Chapters failed** name the remaining work. Older results can show **Chapters ready**
+without update history, or **Chapters incomplete** without a precise waiting/failure classification; open **Files** for details.
+For older job summaries without chapter counts, **Previews updated** reports how many files completed publication.
+It can appear beside **Scrubber already existed**, but does not identify which preview output changed.
+The job's retry details show whether another attempt is actually scheduled. Retry eligibility depends on the failure
+and your retry policy. Chapter retries reuse completed output, so they do not need to regenerate a current scrubber
+preview.
+If chapter extraction stops making progress or reports an invalid Matroska container, the app stops the remaining
+chapter attempts for that file and keeps completed images. A stalled attempt can be retried under your retry policy;
+an invalid container needs a repaired or replaced source. Partial chapter sets are not registered with Plex.
 Plex's normal file checks can rewrite chapter image references even when its own generation is set to **Never**.
 A later Previews job reconciles those references without decoding current images again. This is separate from
 Plex generating and replacing the images itself.
@@ -1802,8 +1840,8 @@ The legacy `/webhooks` and `/schedules` URLs still work — they 302-redirect to
 
 ### Inspector
 
-**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, and where its intro
-and credits are on each server.
+**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, where its intro
+and credits are on each server, and the loudness measurements Plex reports for its audio tracks.
 
 - **Search.** Type a title and results appear as you type, from every server (or the one picked in the dropdown). A
   film several servers have is one row. Each row says whether the preview is ready (and how many frames it has) and
@@ -1823,6 +1861,10 @@ and credits are on each server.
 - **How it was decided** lists every source, what it found and whether it was used. **On your servers** says, per
   server, what it shows, its intro & credits state and its preview; **File locations** opens to each preview's path
   (Plex's bundle BIF, Emby's BIF next to the video, Jellyfin's trickplay folder).
+- **Loudness** shows each Plex audio track's integrated loudness, true peak, loudness range, threshold and gain
+  offset, together with whether Plex can normalize the track. These are the measurements reported by Plex, including
+  native results when this app's loudness feature is off. Missing, incomplete or unavailable results are labelled;
+  opening the Inspector does not start analysis. Use **New job → Plex loudness** to run it for enabled libraries.
 - **A file not checked yet** is the same page: the rows show what each server has today, and **Check intro & credits
   now** checks it.
 - **Regenerate preview** rebuilds the preview for every server that has the file (a job on the Dashboard);
@@ -4925,15 +4967,16 @@ off until turned on per server.
 
 Same `Job` row, queue, priorities, pause and cancel as the other kinds (see [Jobs Endpoints](https://mediapreviewgenerator.dev/reference/#jobs-endpoints)). `config`
 holds `kind` (`"loudness"`), `source`, `libraries` (`[{"server_id", "library_id"}]`; empty with no `file_paths` = every
-library loudness goes to), `file_paths`, `follows_job_id` (the preview job a webhook follow-up waits for) and, for a
-follow-up, `server_id`. File outcomes:
+library loudness goes to), `file_paths`, and the originating `server_id` when pinned to one server. Automatic
+follow-ups retain `follows_job_id` and `follows_job_ids` for the preview and relevant Intro & Credits jobs they wait
+for. They wait for those jobs' first passes, not their entire retry chains. File outcomes:
 
 | Outcome | Meaning |
 |---|---|
 | `loudness_written` | At least one audio track was analysed and stored, or the item marked analysed. |
 | `loudness_up_to_date` | Plex already has loudness for every track, and the item is marked analysed, or the file has no audio track. |
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
-| `loudness_not_in_library` | Plex hasn't added the file yet; a retry job (`retry_attempt`, up to 3, 15 min × attempt later) checks it again. |
+| `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |
@@ -5497,7 +5540,7 @@ session (the `POST` routes also the page's CSRF token from a browser).
 |--------|----------|-------------|
 | POST | `/api/inspector/status` | Preview and Intro & Credits state for search rows |
 | POST | `/api/inspector/show` | A show's seasons and episodes, each with its Intro & Credits state |
-| GET | `/api/inspector/file?path=...` | Where each server keeps one file's preview, what it holds, a job working on the file, other versions |
+| GET | `/api/inspector/file?path=...` | Where each server keeps one file's preview, Plex loudness measurements, a job working on the file, other versions |
 | GET | `/api/inspector/frames?path=...&start_ms=...&count=...&width=...` | Exact frames one second apart, read from the video |
 
 #### POST /api/inspector/status
@@ -5553,6 +5596,19 @@ Legacy (2024) · S01E01"); `kind`; `quality`; and, for a file that is there and 
   more than a quarter, gets length ÷ frames.
 - `versions`: `[{path, label, current}]` when the server keeps several versions of the item on this disk.
 - `job`: the queued or running job for this file (`id`, `kind`, `status`, `name`, `percent`), or null.
+- `loudness`: per-server Plex audio measurements, read without starting analysis or changing metadata. Each row
+  contains `server_id`, `server_name`, `server_type`, `enabled` (this file's library opt-in, not database write
+  readiness), `source`, `source_note`, `state`, `note` and `streams`. State is `available`, `not_analysed`, `partial`,
+  `unavailable` or `unsupported`. `available` means Plex reports recognized measurements and normalization capability;
+  it does not prove that Plex has reanalysed a same-size replacement at the same path.
+
+Each loudness stream identifies `item_id`, `part_id`, `part_file` (basename), `stream_id`, `index`, `codec`, `language`,
+`channels`, `title` and `default`. Its result contains `state`, `note`, `analysis_version`, `normalization_available`,
+`integrated_lufs`, `true_peak_dbtp`, `lra_lu`, `threshold_lufs` and `gain_offset_db`. `normalization_available` describes
+Plex's capability, not the player's Normalize Loudness switch. Measurements are finite JSON numbers or null;
+recognized native silence/short-track sentinel values use the strings `"-inf"` and `"inf"` where applicable. Invalid
+or unknown reports remain distinguishable from measurements that are simply absent. Complete native values remain
+visible when the app's loudness opt-in is off.
 
 `400` when `path` isn't an absolute path inside the media folder.
 
@@ -5818,13 +5874,23 @@ Example payload:
   "event": "job_progress",
   "data": {
     "job_id": "job-123",
-    "progress": 50,
-    "completed": 50,
-    "total": 100,
-    "current_item": "Movie Title"
+    "kind": "loudness",
+    "progress": {
+      "percent": 50.0,
+      "processed_items": 50,
+      "total_items": 100,
+      "current_item": "Checking Plex loudness…",
+      "current_files": ["/media/movies/Film.mkv"]
+    },
+    "publishers": []
   }
 }
 ```
+
+Progress events also identify the job's `kind`. Loudness jobs expose `progress.current_files` in events and full job
+snapshots: canonical local paths currently being checked or processed. This list is bounded by active execution
+slots, not library size; a path can occur twice while two slots are using it. Inspector uses these paths to track
+library jobs and webhook jobs whose sender paths differ from local paths, then refreshes results when the job ends.
 
 ---
 

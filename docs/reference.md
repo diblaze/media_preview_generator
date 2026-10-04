@@ -848,15 +848,16 @@ off until turned on per server.
 
 Same `Job` row, queue, priorities, pause and cancel as the other kinds (see [Jobs Endpoints](#jobs-endpoints)). `config`
 holds `kind` (`"loudness"`), `source`, `libraries` (`[{"server_id", "library_id"}]`; empty with no `file_paths` = every
-library loudness goes to), `file_paths`, `follows_job_id` (the preview job a webhook follow-up waits for) and, for a
-follow-up, `server_id`. File outcomes:
+library loudness goes to), `file_paths`, and the originating `server_id` when pinned to one server. Automatic
+follow-ups retain `follows_job_id` and `follows_job_ids` for the preview and relevant Intro & Credits jobs they wait
+for. They wait for those jobs' first passes, not their entire retry chains. File outcomes:
 
 | Outcome | Meaning |
 |---|---|
 | `loudness_written` | At least one audio track was analysed and stored, or the item marked analysed. |
 | `loudness_up_to_date` | Plex already has loudness for every track, and the item is marked analysed, or the file has no audio track. |
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
-| `loudness_not_in_library` | Plex hasn't added the file yet; a retry job (`retry_attempt`, up to 3, 15 min × attempt later) checks it again. |
+| `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |
@@ -1420,7 +1421,7 @@ session (the `POST` routes also the page's CSRF token from a browser).
 |--------|----------|-------------|
 | POST | `/api/inspector/status` | Preview and Intro & Credits state for search rows |
 | POST | `/api/inspector/show` | A show's seasons and episodes, each with its Intro & Credits state |
-| GET | `/api/inspector/file?path=...` | Where each server keeps one file's preview, what it holds, a job working on the file, other versions |
+| GET | `/api/inspector/file?path=...` | Where each server keeps one file's preview, Plex loudness measurements, a job working on the file, other versions |
 | GET | `/api/inspector/frames?path=...&start_ms=...&count=...&width=...` | Exact frames one second apart, read from the video |
 
 #### POST /api/inspector/status
@@ -1476,6 +1477,19 @@ Legacy (2024) · S01E01"); `kind`; `quality`; and, for a file that is there and 
   more than a quarter, gets length ÷ frames.
 - `versions`: `[{path, label, current}]` when the server keeps several versions of the item on this disk.
 - `job`: the queued or running job for this file (`id`, `kind`, `status`, `name`, `percent`), or null.
+- `loudness`: per-server Plex audio measurements, read without starting analysis or changing metadata. Each row
+  contains `server_id`, `server_name`, `server_type`, `enabled` (this file's library opt-in, not database write
+  readiness), `source`, `source_note`, `state`, `note` and `streams`. State is `available`, `not_analysed`, `partial`,
+  `unavailable` or `unsupported`. `available` means Plex reports recognized measurements and normalization capability;
+  it does not prove that Plex has reanalysed a same-size replacement at the same path.
+
+Each loudness stream identifies `item_id`, `part_id`, `part_file` (basename), `stream_id`, `index`, `codec`, `language`,
+`channels`, `title` and `default`. Its result contains `state`, `note`, `analysis_version`, `normalization_available`,
+`integrated_lufs`, `true_peak_dbtp`, `lra_lu`, `threshold_lufs` and `gain_offset_db`. `normalization_available` describes
+Plex's capability, not the player's Normalize Loudness switch. Measurements are finite JSON numbers or null;
+recognized native silence/short-track sentinel values use the strings `"-inf"` and `"inf"` where applicable. Invalid
+or unknown reports remain distinguishable from measurements that are simply absent. Complete native values remain
+visible when the app's loudness opt-in is off.
 
 `400` when `path` isn't an absolute path inside the media folder.
 
@@ -1741,13 +1755,23 @@ Example payload:
   "event": "job_progress",
   "data": {
     "job_id": "job-123",
-    "progress": 50,
-    "completed": 50,
-    "total": 100,
-    "current_item": "Movie Title"
+    "kind": "loudness",
+    "progress": {
+      "percent": 50.0,
+      "processed_items": 50,
+      "total_items": 100,
+      "current_item": "Checking Plex loudness…",
+      "current_files": ["/media/movies/Film.mkv"]
+    },
+    "publishers": []
   }
 }
 ```
+
+Progress events also identify the job's `kind`. Loudness jobs expose `progress.current_files` in events and full job
+snapshots: canonical local paths currently being checked or processed. This list is bounded by active execution
+slots, not library size; a path can occur twice while two slots are using it. Inspector uses these paths to track
+library jobs and webhook jobs whose sender paths differ from local paths, then refreshes results when the job ends.
 
 ---
 

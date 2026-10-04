@@ -1531,8 +1531,8 @@ const STATUS_META = {
     // Success — file generated this run OR successfully published to a server.
     generated:              { label: 'Generated',     cls: 'bg-success', tip: 'Preview was generated' },
     published:              { label: 'Generated',     cls: 'bg-success', tip: 'Preview was published to this server' },
-    published_pending_chapters: { label: 'Chapters pending', cls: 'bg-warning text-dark', tip: 'Scrubber previews are ready; chapter thumbnails still need work. The job retries according to your retry policy; see the file details.' },
-    published_chapters_failed: { label: 'Chapters failed', cls: 'bg-warning text-dark', tip: 'Scrubber previews are ready, but chapter thumbnails could not be completed. See the file details for the reason.' },
+    published_pending_chapters: { label: 'Chapters incomplete', cls: 'bg-warning text-dark', tip: 'Scrubber previews are ready. Chapter thumbnails are incomplete; open Files for each file’s status and reason.' },
+    published_chapters_failed: { label: 'Chapters failed', cls: 'bg-danger', tip: 'Scrubber previews are ready, but chapter thumbnails failed. Open Files for the reason.' },
     // Tiles / sidecar are on disk, but the server hadn't indexed the file at publish
     // time so the per-item registration call (Jellyfin Media Preview Bridge plugin or
     // /Items/{id}/Refresh) was skipped. The retry queue picks this back up — once the
@@ -1896,6 +1896,12 @@ function _renderPublishersBlock(job) {
         const sname = entry.server_name || stype.toUpperCase() || 'Server';
         const counts = (entry && typeof entry.counts === 'object' && entry.counts) ? entry.counts : {};
         const fs = (entry && typeof entry.frame_sources === 'object' && entry.frame_sources) ? entry.frame_sources : null;
+        const chapters = !isMarkers && entry.chapter_counts && typeof entry.chapter_counts === 'object'
+            ? entry.chapter_counts : null;
+        const hasChapters = chapters && Object.values(chapters).some(function (n) { return Number.isInteger(n) && n > 0; });
+        const legacyPreviewUpdates = !isMarkers && !chapters && fs && fs.output_existed > 0
+            && Number.isInteger(counts.published) && counts.published > 0 ? counts.published : 0;
+        const chapterStatuses = ['published_pending_chapters', 'published_chapters_failed'];
         const badgeSpecs = [];
         if (isMarkers) {
             // Intro & Credits: no frame provenance; per-server marker statuses in a fixed order.
@@ -1921,10 +1927,18 @@ function _renderPublishersBlock(job) {
             [['extracted', 'Generated', 'bg-success', 'FFmpeg ran fresh for this server'],
              ['cache_hit', 'Reused', 'bg-info text-dark', 'Frames reused from another server — no second FFmpeg'],
              ['output_existed', 'Already Existed', 'bg-secondary', 'Output was already on disk and unchanged']]
-                .forEach(function (s) { if (fs[s[0]] > 0) badgeSpecs.push({label: s[1], cls: s[2], count: fs[s[0]], tip: s[3]}); });
+                .forEach(function (s) {
+                    if (fs[s[0]] > 0) badgeSpecs.push({
+                        label: hasChapters || legacyPreviewUpdates ? 'Scrubber ' + s[1].toLowerCase() : s[1],
+                        cls: s[2], count: fs[s[0]],
+                        tip: (hasChapters || legacyPreviewUpdates) && s[0] === 'output_existed'
+                            ? 'Scrubber images were already on disk and reused.' : s[3]
+                    });
+                });
             // Plus attention-worthy statuses NOT captured by frame provenance
             // (failures, pending registration, index issues).
             ['failed', 'published_pending_registration', 'published_pending_chapters', 'published_chapters_failed', 'skipped_not_indexed', 'not_indexed', 'skipped_not_in_library', 'no_owners', 'no_frames']
+                .filter(function (k) { return !hasChapters || !chapterStatuses.includes(k); })
                 .forEach(function (k) { if (counts[k] > 0) { const m = _statusMeta(k); badgeSpecs.push({label: m.label, cls: m.cls, count: counts[k], tip: m.tip}); } });
         } else {
             // Fallback for jobs recorded before per-server frame_sources existed.
@@ -1932,7 +1946,30 @@ function _renderPublishersBlock(job) {
             const seen = new Set();
             statusOrder.filter(function (k) { seen.add(k); return counts[k] > 0; })
                 .concat(Object.keys(counts).filter(function (k) { return !seen.has(k) && counts[k] > 0; }))
+                .filter(function (k) { return !hasChapters || !chapterStatuses.includes(k); })
                 .forEach(function (status) { const m = _statusMeta(status); badgeSpecs.push({label: m.label, cls: m.cls, count: counts[status], tip: m.tip}); });
+        }
+        if (legacyPreviewUpdates) {
+            badgeSpecs.push({
+                label: 'Previews updated', cls: 'bg-success', count: legacyPreviewUpdates,
+                tip: 'This run completed publication for these files. Older results do not record which preview output changed.'
+            });
+        }
+        if (hasChapters) {
+            // Scrubber provenance cannot say whether this run created chapter images or repaired their references.
+            [
+                ['updated', 'Chapters updated', 'bg-success', 'Chapter images were generated or their Plex references were repaired for these files.'],
+                ['already_existed', 'Chapters already existed', 'bg-secondary', 'Chapter images and their Plex references were already current for these files.'],
+                ['ready', 'Chapters ready', 'bg-success', 'Chapter images are ready; this older result does not record whether this run changed them.'],
+                ['none', 'No chapters', 'bg-secondary', 'These files have no chapters to generate images for.'],
+                ['waiting', 'Chapters waiting for Plex', 'bg-warning text-dark', 'Plex has not indexed the source or analyzed its chapters yet. Open Files for the reason.'],
+                ['incomplete', 'Chapters incomplete', 'bg-warning text-dark', 'Older results do not distinguish waiting from failure. Open Files for each saved reason.'],
+                ['failed', 'Chapters failed', 'bg-danger', 'Chapter extraction or registration failed. Open Files for the reason.']
+            ].forEach(function (s) {
+                if (Number.isInteger(chapters[s[0]]) && chapters[s[0]] > 0) {
+                    badgeSpecs.push({label: s[1], cls: s[2], count: chapters[s[0]], tip: s[3]});
+                }
+            });
         }
         if (!badgeSpecs.length) return '';
         const badges = badgeSpecs.map(function (b) {
@@ -2857,8 +2894,9 @@ function updateWorkerStatuses(workers, options = {}) {
                         <div class="progress" data-progress-wrap style="height: 6px;">
                             <div class="progress-bar" data-progress style="width: 0%"></div>
                         </div>
-                        <div class="d-flex justify-content-between small text-muted mt-1" data-metrics>
+                        <div class="d-flex flex-wrap gap-1 justify-content-between small text-muted mt-1" data-metrics>
                             <span data-percent>0.0%</span>
+                            <span class="d-none" data-chapter-stage></span>
                             <span data-speed>0.0x</span>
                             <span>ETA: <span data-eta>-</span></span>
                         </div>
@@ -2900,6 +2938,10 @@ function _patchWorkerCard(col, worker) {
     const percent = col.querySelector('[data-percent]');
     const speed = col.querySelector('[data-speed]');
     const eta = col.querySelector('[data-eta]');
+    const chapterStage = col.querySelector('[data-chapter-stage]');
+    const chapterProgress = isProcessing ? worker.chapter_progress : null;
+    // Older running workers only report a phase, so keep their activity indeterminate.
+    const isChapterWork = isProcessing && (!!chapterProgress || /^Chapter thumbnails for /i.test(worker.current_phase || ''));
 
     // Attribute on the card itself so the .workers-panel-card[data-status]
     // CSS rule can flip the row's accent without re-rendering anything.
@@ -2917,7 +2959,7 @@ function _patchWorkerCard(col, worker) {
     card.classList.toggle('border-warning', fallbackActive);
 
     // Icon (gpu-card vs cpu, fallback flips to cpu)
-    const iconClass = fallbackActive
+    const iconClass = (fallbackActive || isChapterWork)
         ? 'bi-cpu'
         : (worker.worker_type === 'GPU' ? 'bi-gpu-card' : 'bi-cpu');
     if (!icon.classList.contains(iconClass)) {
@@ -2978,13 +3020,27 @@ function _patchWorkerCard(col, worker) {
     // pre-FFmpeg phase we show "Working…" instead of "0.0% / 0.0x"
     // so the user can tell the worker isn't stuck.
     const ffmpegStarted = !!worker.ffmpeg_started;
-    const progressPercent = isProcessing ? (worker.progress_percent || 0) : 0;
-    const showProgress = isProcessing && ffmpegStarted;
-    const desiredWidth = showProgress ? `${progressPercent.toFixed(1)}%` : '0%';
+    const chapterTotal = Math.max(0, Number(chapterProgress?.total) || 0);
+    const chapterProcessed = Math.min(chapterTotal, Math.max(0, Number(chapterProgress?.processed) || 0));
+    const chapterDeterminate = chapterTotal > 0 && !['preparing', 'waiting'].includes(chapterProgress?.stage);
+    const progressPercent = isChapterWork
+        ? (chapterTotal ? chapterProcessed / chapterTotal * 100 : 0)
+        : (isProcessing ? (worker.progress_percent || 0) : 0);
+    const indeterminate = isChapterWork && !chapterDeterminate;
+    const showProgress = isChapterWork ? chapterDeterminate : isProcessing && ffmpegStarted;
+    const desiredWidth = indeterminate ? '100%' : (showProgress ? `${progressPercent.toFixed(1)}%` : '0%');
     if (progress.style.width !== desiredWidth) {
         progress.style.width = desiredWidth;
     }
     progress.classList.toggle('bg-warning', fallbackActive);
+    progress.classList.toggle('progress-bar-striped', indeterminate);
+    progress.classList.toggle('progress-bar-animated', indeterminate);
+    progressWrap.setAttribute('role', 'progressbar');
+    progressWrap.setAttribute('aria-label', isChapterWork ? 'Chapter thumbnails' : 'Video previews');
+    progressWrap.setAttribute('aria-valuemin', '0');
+    progressWrap.setAttribute('aria-valuemax', '100');
+    if (indeterminate) progressWrap.removeAttribute('aria-valuenow');
+    else progressWrap.setAttribute('aria-valuenow', progressPercent.toFixed(1));
 
     // Footer — when FFmpeg hasn't started yet, show the live sub-phase
     // string the worker emitted (e.g. "Resolving item id on EmbyTest…",
@@ -3005,7 +3061,28 @@ function _patchWorkerCard(col, worker) {
     //   7a9d025b). The green check makes "fast cache hit" obvious.
     const etaWrap = eta.parentElement;
     const _PHASE_REUSE_RE = /(reusing|reused|already exists|skipped)/i;
-    if (isProcessing && !ffmpegStarted) {
+    chapterStage.classList.toggle('d-none', !isChapterWork || !chapterProgress);
+    if (isChapterWork) {
+        const stages = {
+            preparing: 'Checking chapters', waiting: 'Waiting for chapter access',
+            extracting: 'Generating', registering: 'Registering with Plex',
+            complete: 'Ready', failed: 'Failed',
+        };
+        const failures = Math.max(0, Number(chapterProgress?.failed) || 0);
+        const stageLabel = stages[chapterProgress?.stage] || 'Processing chapters';
+        chapterStage.textContent = `${stageLabel}${failures ? ` · ${failures} failed` : ''}`;
+        percent.textContent = chapterDeterminate
+            ? `Chapters ${chapterProcessed}/${chapterTotal} · ${progressPercent.toFixed(0)}%`
+            : (chapterProgress ? 'Chapter thumbnails' : 'Generating chapters');
+        percent.title = chapterDeterminate
+            ? 'Chapter images checked or attempted; Plex registration follows.'
+            : 'Chapter thumbnail work is active; no chapter count is available yet.';
+        percent.classList.remove('text-truncate', 'text-success', 'fw-semibold');
+        percent.style.flex = '';
+        percent.style.minWidth = '';
+        speed.style.display = 'none';
+        if (etaWrap) etaWrap.style.display = 'none';
+    } else if (isProcessing && !ffmpegStarted) {
         const phaseRaw = (worker.current_phase || '').trim();
         const isReusePhase = phaseRaw && _PHASE_REUSE_RE.test(phaseRaw);
         const phaseLabel = phaseRaw || 'Working…';

@@ -845,7 +845,7 @@ class TestStartJobAsyncRetryBranchPublisherStatuses:
 
         assert len(run_calls) == 3, f"original + 2 retries expected; got {run_calls!r}"
         gave_up = (
-            "1 file(s) still weren't indexed by the media server after 2 retries, so no more retries are queued. "
+            "1 file(s) still need attention after 2 retries, so no more retries are queued. "
             "The next scheduled scan will pick them up."
         )
         assert any(line.endswith(f"WARNING - {gave_up}") for line in last_logs), (
@@ -861,7 +861,7 @@ class TestStartJobAsyncRetryBranchPublisherStatuses:
         """Retry-spawn log lines must:
           1. Carry the ``WARNING - `` level prefix (not ``INFO - ``).
           2. Name the actual blocker server in the reason text, e.g.
-             ``WARNING - JellyTest pending × 1, retry scheduled in 30s``.
+             ``WARNING - JellyTest needs another attempt × 1, retry scheduled in 30s``.
 
         Pre-2026-05-13 this line was INFO and named only generic counts
         — operators couldn't grep their Job log for "what's slow" and
@@ -996,7 +996,7 @@ class TestStartJobAsyncRetryBranchPublisherStatuses:
             f"Expected at least one 'WARNING - … retry scheduled' line on the PARENT job's log "
             f"from the FIRST retry spawn; got parent_logs={parent_logs!r}"
         )
-        assert any("JellyTest pending" in line for line in first_spawn), (
+        assert any("JellyTest needs another attempt" in line for line in first_spawn), (
             f"First-retry-spawn log must name the blocker server; matching warn lines: {first_spawn!r}"
         )
         # The real first wait (the patched 1 s schedule step scaled by the 30 s setting), not the setting itself.
@@ -1015,7 +1015,7 @@ class TestStartJobAsyncRetryBranchPublisherStatuses:
             f"Expected at least one 'WARNING - Retry N/M: …, next retry in …' line on a retry-child "
             f"log from the continuation branch; got child_logs={child_logs!r}"
         )
-        assert any("JellyTest pending" in line for line in continuation), (
+        assert any("JellyTest needs another attempt" in line for line in continuation), (
             f"Continuation-retry log must name the blocker server; matching warn lines: {continuation!r}"
         )
 
@@ -2323,6 +2323,108 @@ class TestFilesNotFoundBesideSuccesses:
         assert finished.error == "6 of 6 items skipped (file not found locally) — check path mapping configuration"
 
 
+@pytest.mark.parametrize(
+    "status,retryable,expect_retry",
+    [
+        ("published_chapters_failed", True, True),
+        ("published_chapters_failed", False, False),
+        ("published_pending_chapters", True, True),
+        ("published_pending_chapters", False, False),
+        ("published_pending_chapters", None, True),
+        ("published_chapters_failed", None, False),
+    ],
+)
+def test_chapter_retry_scan_uses_eligibility_and_dispatches_only_the_affected_path(
+    app, no_retry_wait, status, retryable, expect_retry
+):
+    from media_preview_generator.jobs.orchestrator import fold_publisher_rows_into_aggregate
+    from media_preview_generator.processing.generator import ProcessingResult, _notify_file_result
+    from media_preview_generator.web.jobs import get_job_manager
+    from media_preview_generator.web.routes.job_runner import _start_job_async
+
+    path = "/data/movies/Chapter movie.mkv"
+    calls = []
+
+    def processing(config, selected_gpus, **kwargs):
+        calls.append((list(config.webhook_paths), config.server_id_filter, kwargs["job_id"]))
+        chapter = {"status": "failed" if status.endswith("failed") else "waiting"}
+        if retryable is not None:
+            chapter["retryable"] = retryable
+        done = len(calls) > 1
+        row = {
+            "server_id": "plex-1",
+            "server_name": "Plex Main",
+            "server_type": "plex",
+            "status": "skipped_output_exists" if done else status,
+            "artifacts": {"chapters": {"status": "ready", "retryable": False} if done else chapter},
+        }
+        _notify_file_result(path, ProcessingResult.SKIPPED_BIF_EXISTS, "", "Checking", servers=[row])
+        aggregate = {}
+        fold_publisher_rows_into_aggregate(aggregate, [row])
+        get_job_manager().set_publishers(kwargs["job_id"], list(aggregate.values()))
+        return {"outcome": {"skipped_bif_exists": 1}, "webhook_resolution": _all_resolved(1, {path: path})}
+
+    with app.app_context(), patch("media_preview_generator.jobs.orchestrator.run_processing", side_effect=processing):
+        manager = get_job_manager()
+        job = manager.create_job(library_name="Chapter movie", config={"source": "manual"})
+        _start_job_async(
+            job.id,
+            config_overrides={"webhook_paths": [path], "server_id": "plex-1", "webhook_retry_count": 1},
+        )
+        retries = _retries_of(manager, job.id)
+
+    assert calls[0] == ([path], "plex-1", job.id)
+    assert len(retries) == int(expect_retry)
+    if expect_retry:
+        assert calls[1:] == [([path], "plex-1", retries[0].id)]
+        assert retries[0].config["webhook_paths"] == [path]
+        assert retries[0].config["retry_reason"] == {
+            "unresolved": 0,
+            "stale_paths": 0,
+            "pending_by_server": {"Plex Main": 1},
+        }
+    else:
+        assert len(calls) == 1
+
+
+def test_chapter_progress_survives_job_runner_status_and_socket_serialization(app):
+    from media_preview_generator.web.jobs import get_job_manager
+    from media_preview_generator.web.routes.job_runner import _start_job_async
+
+    snapshot = {"stage": "extracting", "processed": 2, "total": 5, "ready": 1, "failed": 1}
+    observed = []
+
+    def processing(_config, _selected_gpus, **kwargs):
+        callback = kwargs["worker_callback"]
+        callback(
+            [
+                {
+                    "worker_id": 0,
+                    "worker_type": "GPU",
+                    "worker_name": "GPU Worker 1",
+                    "status": "processing",
+                    "ffmpeg_started": False,
+                    "chapter_progress": snapshot,
+                }
+            ]
+        )
+        manager = get_job_manager()
+        observed.extend(status.to_dict() for status in manager.get_worker_statuses())
+        return {"outcome": {"skipped_bif_exists": 1}}
+
+    with app.app_context(), patch("media_preview_generator.jobs.orchestrator.run_processing", side_effect=processing):
+        manager = get_job_manager()
+        job = manager.create_job(library_name="Chapter progress", config={})
+        with patch.object(manager, "_emit_event") as emit:
+            _start_job_async(job.id)
+
+    assert len(observed) == 1
+    assert observed[0]["chapter_progress"] == snapshot
+    assert observed[0]["ffmpeg_started"] is False
+    worker_events = [call.args[1] for call in emit.call_args_list if call.args[0] == "worker_update"]
+    assert any(event["workers"] and event["workers"][0]["chapter_progress"] == snapshot for event in worker_events)
+
+
 class TestRetryRunsOnlyTheUnresolvedFiles:
     """Production chains 861c0385 ("10 files": 6 done, 4 not found, every retry re-ran all 10 and the chain ended
     "did not register 10 file(s)") and f928a863 ("Retry: 18 files" ran 6)."""
@@ -2430,7 +2532,10 @@ class TestRetryRunsOnlyTheUnresolvedFiles:
         assert [r.config["retry_reason"] for r in retries] == [
             {"unresolved": 0, "stale_paths": 0, "pending_by_server": {"Plex Main": 1}}
         ]
-        assert any(line.endswith("Plex Main pending × 1, retry scheduled in 60s (retry 1 of 3)") for line in head_logs)
+        assert any(
+            line.endswith("Plex Main needs another attempt × 1, retry scheduled in 60s (retry 1 of 3)")
+            for line in head_logs
+        )
         assert ends == [("completed", "completed", "1 file(s) weren't found on disk", None)]
 
 
@@ -2438,7 +2543,7 @@ class TestExhaustedChainEnd:
     """An exhausted chain is red only when none of its files succeeded, and counts only the files still missing."""
 
     GAVE_UP_ONE = (
-        "1 file(s) still weren't indexed by the media server after 2 retries, so no more retries are queued. "
+        "1 file(s) still need attention after 2 retries, so no more retries are queued. "
         "The next scheduled scan will pick them up."
     )
 
@@ -2541,12 +2646,12 @@ class TestExhaustedChainEnd:
             attempt: [
                 line.split("] ", 1)[1]
                 for line in lines
-                if "still weren't indexed" in line and "completed with warnings" not in line
+                if "still need attention" in line and "completed with warnings" not in line
             ]
             for attempt, lines in logs.items()
         }
         assert said == {1: [], 2: [f"WARNING - {self.GAVE_UP_ONE}"]}
-        warnings = [line for line in logs[2] if "WARNING" in line and "still weren't indexed" in line]
+        warnings = [line for line in logs[2] if "WARNING" in line and "still need attention" in line]
         assert len(warnings) == 1, warnings
 
 
@@ -2764,7 +2869,7 @@ class TestDefaultRetryCount:
             (
                 "exhausted",
                 "failed",
-                "1 file(s) still weren't indexed by the media server after 5 retries, so no more retries are queued. "
+                "1 file(s) still need attention after 5 retries, so no more retries are queued. "
                 "The next scheduled scan will pick them up. Check the Files panel for the affected paths.",
                 0,
             )

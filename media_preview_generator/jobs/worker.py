@@ -212,6 +212,7 @@ class Worker:
         # to the UI so the user sees what the worker is actually doing
         # before FFmpeg starts reporting.
         self.current_phase: str = ""
+        self.chapter_progress: dict | None = None
 
         # FFmpeg data fields for display
         self.frame = 0
@@ -388,6 +389,7 @@ class Worker:
         self.last_publishers = []
         self.last_ms_message = ""
         self.current_phase = ""
+        self.chapter_progress = None
 
         self.is_busy = True
         self.current_task = item.canonical_path
@@ -496,6 +498,10 @@ class Worker:
                 # Single-writer (worker thread) → no lock needed.
                 self.current_phase = text or ""
 
+            def _chapter_progress_cb(snapshot: dict | None) -> None:
+                # Replace snapshots instead of mutating one while a status reader serializes it.
+                self.chapter_progress = dict(snapshot) if snapshot is not None else None
+
             # Pin precedence (config pin wins → non-Plex originator scopes to
             # itself → Plex originator fans out) lives in resolve_per_item_pin,
             # the single source both this generation path and the dispatcher's
@@ -531,6 +537,7 @@ class Worker:
                     server_id_filter=per_item_pin,
                     regenerate=bool(getattr(config, "regenerate_thumbnails", False)),
                     phase_callback=_phase_cb,
+                    chapter_progress_callback=_chapter_progress_cb,
                     # Radarr/Sonarr deletedFiles[] from upgrade webhooks.
                     # The job-wide list is forwarded as-is; the cleanup
                     # pass inside process_canonical_path looks at each
@@ -918,6 +925,7 @@ class Worker:
             self.is_busy = False
             self.current_task = None
             self.current_phase = ""
+            self.chapter_progress = None
             return True
 
         return False
@@ -966,6 +974,7 @@ class Worker:
             "size": self.size,
             "time_str": self.time_str,
             "bitrate": self.bitrate,
+            "chapter_progress": self.chapter_progress if self.is_busy else None,
         }
 
     def shutdown(self) -> None:
@@ -1646,6 +1655,7 @@ class WorkerPool:
                             "fallback_reason": getattr(worker, "fallback_reason", None),
                             "ffmpeg_started": bool(getattr(worker, "ffmpeg_started", False)) if is_busy else False,
                             "current_phase": (getattr(worker, "current_phase", "") or "") if is_busy else "",
+                            "chapter_progress": progress_data.get("chapter_progress") if is_busy else None,
                         }
                     )
                 worker_callback(worker_statuses)

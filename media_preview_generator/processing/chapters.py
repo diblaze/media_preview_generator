@@ -8,18 +8,20 @@ import json
 import os
 import tempfile
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image
+from requests import RequestException
 
 from ..config.paths import expand_path_mapping_candidates
-from ..markers.probe import ProbeError, ffprobe_path_for, probe_media
-from ..markers.publishers.base import PublishError
+from ..markers.probe import ProbeError, ProbeStalledError, ProbeTimeoutError, ffprobe_path_for, probe_media
+from ..markers.publishers.base import Capability, PublishError
 from ..output.plex_bundle import PlexBundleAdapter
 from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, calculate_plex_hash, get_source_fingerprint
-from .ffmpeg_runner import create_ffmpeg_runner
+from .ffmpeg_runner import STALL_WATCHDOG_LINE, create_ffmpeg_runner
 from .generator import CancellationError, MediaInfo
 from .hdr_detection import is_dv_no_backward_compat, is_hdr_transfer
 
@@ -37,6 +39,32 @@ class UnsupportedChapterFormatError(RuntimeError):
     code = "unsupported"
 
 
+class ChapterExtractionStalledError(TimeoutError):
+    """The managed runner stopped a seek; defer the rest of this source."""
+
+
+class ChapterSourceCorruptionError(RuntimeError):
+    """The demuxer identified malformed container data while extracting."""
+
+
+def _check_fatal_extraction(returncode: int, stderr: list[str], start_ms: int) -> None:
+    """Stop a chapter set only for explicit container corruption or a watchdog stop."""
+    if returncode == 0:
+        return
+    if any(
+        "[matroska" in line.lower() and "invalid as first byte of an ebml number" in line.lower() for line in stderr
+    ):
+        raise ChapterSourceCorruptionError(
+            f"Chapter extraction failed at {start_ms}ms: malformed Matroska container data; "
+            "remaining chapter attempts stopped. Completed images are preserved."
+        )
+    if STALL_WATCHDOG_LINE in stderr:
+        raise ChapterExtractionStalledError(
+            f"Chapter extraction stalled at {start_ms}ms and was stopped by the watchdog; "
+            "remaining chapter attempts stopped. Completed images are preserved."
+        )
+
+
 @dataclass(frozen=True)
 class ChapterOutcome:
     """Chapter completion independent of an item's scrubber result."""
@@ -45,6 +73,7 @@ class ChapterOutcome:
     completed: int = 0
     total: int = 0
     message: str = ""
+    retryable: bool = False
 
     def to_dict(self) -> dict:
         """Return the persisted and displayed artifact outcome."""
@@ -61,7 +90,7 @@ class ChapterPlan:
     folder: Path
     profile: dict
     target: ChapterTarget | None = None
-    outcome: ChapterOutcome = field(default_factory=lambda: ChapterOutcome("pending"))
+    outcome: ChapterOutcome = field(default_factory=lambda: ChapterOutcome("queued"))
 
     @property
     def manifest_path(self) -> Path:
@@ -72,8 +101,28 @@ class ChapterPlan:
 def _failure(exc: Exception, completed: int = 0, total: int = 0) -> ChapterOutcome:
     from ..utils import redact_secrets
 
-    terminal = getattr(exc, "code", "") == "unsupported"
-    return ChapterOutcome("failed" if terminal else "pending", completed, total, redact_secrets(str(exc)))
+    code = getattr(exc, "code", "")
+    waiting = code == "pending_index"
+    retryable = (
+        waiting
+        or code == "source_changed"
+        or isinstance(
+            exc, SourceFileChangedError | ProbeTimeoutError | ProbeStalledError | RequestException | TimeoutError
+        )
+    )
+    if isinstance(exc, PublishError):
+        retryable = retryable or exc.state in {
+            None,
+            Capability.READY,
+            Capability.UNREACHABLE,
+            Capability.AGENT_UNAVAILABLE,
+        }
+    if code == "unsupported":
+        retryable = False
+    message = str(exc)
+    if isinstance(exc, PermissionError):
+        message = f"Cannot write or read chapter files: {exc}. Check the app user's access to the source and Plex Media folder."
+    return ChapterOutcome("waiting" if waiting else "failed", completed, total, redact_secrets(message), retryable)
 
 
 def prepare_chapters(
@@ -106,9 +155,9 @@ def prepare_chapters(
                     raise
                 last_error = exc
         if plan.target is None:
-            raise last_error or OSError("Plex has not indexed this source yet")
+            raise last_error or ChapterError("Waiting for Plex to index this source", code="pending_index")
         if plan.target.bundle_hash != bundle_hash or plan.target.source_size != fingerprint[2]:
-            raise SourceFileChangedError("Plex has not analyzed the current source yet; chapter images are pending.")
+            raise ChapterError("Waiting for Plex to analyze the current source", code="pending_index")
         _check_source(plan)
         if not plan.target.chapters:
             if cancel_check and cancel_check():
@@ -123,7 +172,7 @@ def prepare_chapters(
                 raise ChapterError("Plex has not analyzed the source chapters yet", code="pending_index")
             plan.outcome = ChapterOutcome("none", message="No chapters")
         else:
-            plan.outcome = ChapterOutcome("pending", total=len(plan.target.chapters))
+            plan.outcome = ChapterOutcome("queued", total=len(plan.target.chapters))
     except CancellationError:
         raise
     except (PublishError, ProbeError, OSError, ValueError, RuntimeError) as exc:
@@ -140,7 +189,9 @@ def _check_source(plan: ChapterPlan) -> None:
 def _revision(path: Path) -> str:
     with Image.open(path) as image:
         if image.format != "JPEG" or image.width != _WIDTH or image.height < 1:
-            raise ValueError("Chapter extraction did not produce a valid 1280px JPEG")
+            raise ValueError(
+                f"Chapter extraction expected a 1280px JPEG; got {image.format} {image.width}x{image.height}"
+            )
         image.load()
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -253,13 +304,33 @@ def extract_chapter_frame(
     local_config = copy.copy(config)
     local_config.thumbnail_quality = _QUALITY
     threads = max(1, int(ffmpeg_threads_override or config.ffmpeg_threads or 2))
-    scale = f"scale=w={_WIDTH}:h=-2:force_original_aspect_ratio=decrease"
+    scale = f"scale=w={_WIDTH}:h=-2"
+    # Container color metadata may be absent from decoded frames (notably PQ).
+    # Supply only the input properties the source actually declares.
+    input_colors = []
+    for option, value, choices in (
+        (
+            "tin",
+            transfer,
+            {"pq": "smpte2084", "smpte st 2084": "smpte2084", "hlg": "arib-std-b67", "arib std-b67": "arib-std-b67"},
+        ),
+        ("pin", getattr(track, "color_primaries", None), {"bt.2020": "bt2020", "bt.709": "bt709"}),
+        (
+            "min",
+            getattr(track, "matrix_coefficients", None),
+            {"bt.2020 non-constant": "bt2020nc", "bt.2020 constant": "bt2020c", "bt.709": "bt709"},
+        ),
+    ):
+        mapped = choices.get(value.strip().lower()) if isinstance(value, str) else None
+        if mapped:
+            input_colors.append(f"{option}={mapped}")
+    zscale_input = ":".join([*input_colors, "t=linear", "npl=100"])
     tonemap = (
-        "zscale=t=linear:npl=100,format=gbrpf32le,"
+        f"zscale={zscale_input},format=gbrpf32le,"
         f"zscale=p=bt709,tonemap={config.tonemap_algorithm}:desat=0,"
         "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
     )
-    runner = create_ffmpeg_runner(
+    runner_options = dict(
         video_file=video_path,
         output_folder=str(output.parent),
         gpu=None,
@@ -276,12 +347,32 @@ def extract_chapter_frame(
         base_scale=scale,
         fps_filter="null",
         hdr10_zscale_chain=tonemap,
-        chapter_start_ms=start_ms,
         chapter_output=str(output),
     )
-    rc, _, _, _stderr = runner(use_skip=False)
+    runner = create_ffmpeg_runner(**runner_options, chapter_start_ms=start_ms)
+    rc, _, _, stderr = runner(use_skip=False)
+    _check_fatal_extraction(rc, stderr, start_ms)
+    stderr_text = "\n".join(stderr).lower()
+    premature_end = "file ended prematurely" in stderr_text
+    no_frame = "no filtered frames" in stderr_text or (rc == 0 and not output.exists())
+    try:
+        duration_ms = float(track.duration)
+    except (AttributeError, TypeError, ValueError):
+        duration_ms = 0
+    # Plex can round a final chapter past the last video frame. Seek at most
+    # one second before the chapter; container duration can extend past video.
+    if no_frame and not premature_end and 1000 <= duration_ms < float("inf") and abs(start_ms - duration_ms) <= 1000:
+        fallback_ms = max(0, start_ms - 1000)
+        if fallback_ms < start_ms:
+            if cancel_check and cancel_check():
+                raise CancellationError("Chapter extraction cancelled")
+            runner = create_ffmpeg_runner(**runner_options, chapter_start_ms=fallback_ms)
+            rc, _, _, stderr = runner(use_skip=False)
+            _check_fatal_extraction(rc, stderr, fallback_ms)
+            premature_end = "file ended prematurely" in "\n".join(stderr).lower()
     if rc != 0:
-        raise RuntimeError(f"Chapter extraction failed at {start_ms}ms (FFmpeg exit {rc})")
+        detail = "; source ended prematurely" if premature_end else ""
+        raise RuntimeError(f"Chapter extraction failed at {start_ms}ms (FFmpeg exit {rc}){detail}")
     _revision(output)
 
 
@@ -293,22 +384,34 @@ def publish_chapters(
     cancel_check=None,
     pause_check=None,
     ffmpeg_threads_override: int | None = None,
+    chapter_progress_callback: Callable[[dict | None], None] | None = None,
 ) -> ChapterOutcome:
     """Publish missing images atomically and register only a complete current set."""
     from ..servers.plex_chapters import register_chapters
 
     if plan.target is None or not plan.target.chapters:
         return plan.outcome
+    images = {}
+    total = len(plan.target.chapters)
+    processed = failed = 0
+
+    def report(stage: str) -> None:
+        if chapter_progress_callback:
+            chapter_progress_callback(
+                {"stage": stage, "processed": processed, "total": total, "ready": len(images), "failed": failed}
+            )
+
     lock = _LOCKS[hash(str(plan.folder)) % len(_LOCKS)]
+    report("waiting")
     while not lock.acquire(timeout=0.1):
         if cancel_check and cancel_check():
             raise CancellationError("Chapter processing cancelled")
-    images = {}
-    total = len(plan.target.chapters)
     try:
+        report("preparing")
         _check_source(plan)
         plan.folder.mkdir(parents=True, exist_ok=True)
         images = {} if regenerate else _fresh_images(plan)
+        processed = len(images)
         if regenerate:
             _write_manifest(plan, images)
         errors = []
@@ -318,6 +421,7 @@ def publish_chapters(
                 raise CancellationError("Chapter processing cancelled")
             if str(chapter.index) in images:
                 continue
+            report("extracting")
             _check_source(plan)
             try:
                 if media_info is None:
@@ -345,24 +449,39 @@ def publish_chapters(
                     _write_manifest(plan, images)
             except CancellationError:
                 raise
+            except (ChapterExtractionStalledError, ChapterSourceCorruptionError):
+                failed += 1
+                processed += 1
+                raise
             except (OSError, ValueError, RuntimeError) as exc:
                 errors.append(exc)
+                failed += 1
+            processed += 1
+            report("extracting")
         _check_source(plan)
         if len(images) != total:
-            return _failure(errors[0] if errors else RuntimeError("Chapter images are incomplete"), len(images), total)
+            report("failed")
+            return _failure(
+                errors[0] if errors else RuntimeError("Chapter images are incomplete"),
+                len(images),
+                total,
+            )
         if cancel_check and cancel_check():
             raise CancellationError("Chapter processing cancelled")
         if not _registered(plan, images) or not _verified(plan, images):
+            report("registering")
             register_chapters(
                 plan.server, plan.target, {int(index): entry["sha256"] for index, entry in images.items()}
             )
             _check_source(plan)
             _write_manifest(plan, images, verified=True)
         _check_source(plan)
+        report("complete")
         return ChapterOutcome("ready", total, total, "Chapter thumbnails ready")
     except CancellationError:
         raise
     except (PublishError, OSError, ValueError, RuntimeError) as exc:
+        report("failed")
         return _failure(exc, len(images), total)
     finally:
         lock.release()

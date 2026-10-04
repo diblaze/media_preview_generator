@@ -10,6 +10,7 @@ from media_preview_generator.web.settings_manager import get_settings_manager
 @pytest.fixture
 def mock_auth_config(tmp_path, monkeypatch):
     """Mock auth module to use temp directory."""
+    monkeypatch.delenv("WEB_AUTH_TOKEN", raising=False)
     auth_file = str(tmp_path / "auth.json")
     monkeypatch.setattr("media_preview_generator.web.auth.AUTH_FILE", auth_file)
     monkeypatch.setattr("media_preview_generator.web.auth.get_config_dir", lambda: str(tmp_path))

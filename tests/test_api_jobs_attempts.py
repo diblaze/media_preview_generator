@@ -191,6 +191,43 @@ class TestJobsListFilter:
 
 
 class TestAttemptsEndpoint:
+    def test_chapter_failure_retry_flags_match_attempt_badges_and_legacy_reconstruction(self, client):
+        from media_preview_generator.jobs.orchestrator import fold_publisher_rows_into_aggregate
+        from media_preview_generator.web.jobs import get_job_manager
+
+        manager = get_job_manager()
+        chain_id, child_ids = _seed_chain_with_attempts(
+            manager, canonical_path="/movie.mkv", basename="Chapters", num_attempts=1
+        )
+        rows = [
+            {
+                "server_id": "plex",
+                "server_name": "Plex",
+                "server_type": "plex",
+                "status": status,
+                "artifacts": {"chapters": {"retryable": retryable}},
+            }
+            for status, retryable in [
+                ("published_chapters_failed", True),
+                ("published_chapters_failed", False),
+                ("published_pending_chapters", False),
+            ]
+        ]
+        aggregate = {}
+        fold_publisher_rows_into_aggregate(aggregate, rows)
+        manager.set_publishers(child_ids[0], list(aggregate.values()))
+        for index, row in enumerate(rows):
+            manager.record_file_result(chain_id, f"/movie-{index}.mkv", "skipped_bif_exists", servers=[row])
+
+        response = client.get(f"/api/jobs/{chain_id}/attempts", headers=_headers())
+
+        assert response.status_code == 200
+        child = next(attempt for attempt in response.get_json()["attempts"] if attempt["id"] == child_ids[0])
+        assert child["pending_servers"] == [
+            {"server_id": "plex", "server_name": "Plex", "server_type": "plex", "count": 1}
+        ]
+        assert child["retry_reason"] == {"unresolved": 0, "stale_paths": 0, "pending_by_server": {"Plex": 1}}
+
     def test_returns_attempts_with_original_prepended(self, client):
         """Post-rewrite the chain IS the originating dispatch. The
         endpoint returns the original as Attempt 0 (is_originating=True)

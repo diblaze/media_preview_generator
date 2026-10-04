@@ -334,6 +334,7 @@ class WorkerStatus:
     # worker is busy with — e.g. "Resolving item id on EmbyTest…"
     # explains a 30s gap that would otherwise look like a hang.
     current_phase: str = ""
+    chapter_progress: dict | None = None
     # GPU→CPU fallback state of the worker's current (or just-finished)
     # task. fallback_title names the file that fell back: current_title
     # is blank once the task is done, and a short clip's CPU rerun can
@@ -358,6 +359,8 @@ class JobProgress:
     speed: str = "0.0x"
     current_file: str = ""
     workers: list[WorkerStatus] = field(default_factory=list)
+    # Canonical paths currently in a checking or processing slot, never the whole library.
+    current_files: list[str] = field(default_factory=list)
     outcome: dict[str, int] | None = None
     # ISO end-time + duration of an in-progress retry-backoff wait.
     # Lets the UI render a smooth client-side countdown + a bar that
@@ -2003,6 +2006,9 @@ class JobManager:
         processed_items: int | None = None,
         speed: str | None = None,
         current_file: str | None = None,
+        current_files: list[str] | None = None,
+        file_started: str | None = None,
+        file_finished: str | None = None,
         retry_eta: str | None | _UnsetType = _UNSET,
         retry_wait_total: int | None | _UnsetType = _UNSET,
     ) -> Job | None:
@@ -2022,6 +2028,13 @@ class JobManager:
                     job.progress.speed = speed
                 if current_file is not None:
                     job.progress.current_file = current_file
+                if current_files is not None:
+                    job.progress.current_files = list(current_files)
+                # One entry per active slot keeps duplicate paths active until their last slot finishes.
+                if file_started is not None:
+                    job.progress.current_files.append(file_started)
+                if file_finished is not None and file_finished in job.progress.current_files:
+                    job.progress.current_files.remove(file_finished)
                 # Sentinel-default lets callers explicitly set retry_eta
                 # back to None to clear the countdown — `None` already
                 # means "leave it alone" for the other fields.
@@ -2038,6 +2051,7 @@ class JobManager:
                     "job_progress",
                     {
                         "job_id": job_id,
+                        "kind": job.kind,
                         "progress": job.progress.to_dict(),
                         "publishers": list(job.publishers or []),
                     },

@@ -132,7 +132,7 @@ def _chapter_completion_warning(
     if failed:
         parts.append(f"chapter thumbnails failed for {failed:,} server item(s)")
     if include_pending and pending:
-        parts.append(f"chapter thumbnails are still pending for {pending:,} server item(s)")
+        parts.append(f"chapter thumbnails remain incomplete for {pending:,} server item(s)")
     if truncated:
         parts.append("additional chapter thumbnails remain incomplete; run the library again after resolving the cause")
     if not parts:
@@ -232,14 +232,17 @@ def _retry_completion_message(
 
     Returns:
         ``("INFO", "Retry job completed successfully")`` when the chain succeeded.
-        ``("WARNING", "N file(s) still weren't indexed … after M retries, … (Plex pending × N)")`` when
+        ``("WARNING", "N file(s) still need attention … after M retries, …")`` when
         ``retry_paths`` is non-empty AND ``spawned_retry_id`` is ``None``
         (chain ran out of attempts).
     """
     if retry_paths and not spawned_retry_id:
         pending_summary = (
-            ", ".join(f"{name} pending × {n}" for name, n in sorted(pending_by_server.items(), key=lambda kv: -kv[1]))
-            or f"{len(retry_paths)} path(s) still pending"
+            ", ".join(
+                f"{name} needs another attempt × {n}"
+                for name, n in sorted(pending_by_server.items(), key=lambda kv: -kv[1])
+            )
+            or f"{len(retry_paths)} path(s) still incomplete"
         )
         return "WARNING", f"{_gave_up_text(len(retry_paths), effective_max)} ({pending_summary})"
     return "INFO", "Retry job completed successfully"
@@ -269,7 +272,7 @@ def _retries_text(count: int) -> str:
 def _gave_up_text(file_count: int, retries: int) -> str:
     """The final give-up of a retry chain, as the job log and the chain head's row say it."""
     return (
-        f"{file_count} file(s) still weren't indexed by the media server after {_retries_text(retries)}, so no more "
+        f"{file_count} file(s) still need attention after {_retries_text(retries)}, so no more "
         "retries are queued. The next scheduled scan will pick them up."
     )
 
@@ -324,7 +327,7 @@ def _not_indexed_message(count: int, *, is_retry: bool, retry_attempt: int, effe
 
 
 def _format_retry_wait_server_label(parent_job, run_job_config) -> str:
-    """Return the "({label} may still be indexing)" label for the retry-wait log.
+    """Name the servers whose items need another attempt in the retry-wait log.
 
     Pure function so the five fallback cells (1/2/3+ pending publishers,
     pin-match-source, generic) are testable without spinning up the
@@ -343,9 +346,7 @@ def _format_retry_wait_server_label(parent_job, run_job_config) -> str:
     3. Otherwise, the generic ``"the media server"`` — accurate for both
        single-server and fan-out topologies.
     """
-    from media_preview_generator.processing.retry_queue import (
-        PENDING_PUBLISHER_STATUSES as _PENDING_PUBLISHER_STATUSES,
-    )
+    from media_preview_generator.processing.retry_queue import publisher_retry_count
 
     pending_labels: list[str] = []
     for pub in (parent_job.publishers or []) if parent_job else []:
@@ -354,7 +355,7 @@ def _format_retry_wait_server_label(parent_job, run_job_config) -> str:
         counts = pub.get("counts") or {}
         if not isinstance(counts, dict):
             continue
-        if sum(counts.get(s, 0) for s in _PENDING_PUBLISHER_STATUSES) > 0:
+        if publisher_retry_count(pub) > 0:
             label = pub.get("server_name") or (pub.get("server_type") or "").title() or None
             if label:
                 pending_labels.append(label)
@@ -917,6 +918,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         eta=worker_eta,
                         ffmpeg_started=bool(worker_data.get("ffmpeg_started", False)),
                         current_phase=worker_data.get("current_phase", "") or "",
+                        chapter_progress=worker_data.get("chapter_progress"),
                         fallback_active=bool(worker_data.get("fallback_active", False)),
                         fallback_reason=worker_data.get("fallback_reason"),
                         fallback_title=worker_data.get("fallback_title", "") or "",
@@ -942,7 +944,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     )
                 job_manager.add_log(
                     job_id,
-                    f"INFO - Waiting {delay_sec}s before retry ({_server_label} may still be indexing)",
+                    f"INFO - Waiting {delay_sec}s before retry ({_server_label} needs another attempt)",
                 )
                 job_manager.update_progress(
                     job_id,
@@ -1354,21 +1356,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     not_found_on_disk: list[str] = []
                     pending_registration_paths: list[str] = []
 
-                    # Per-publisher statuses that mean "this file needs
-                    # another attempt because the destination server
-                    # isn't ready yet." The values are PublisherStatus
-                    # enum values serialised as their .value strings via
-                    # Worker._capture_publishers (see jobs/worker.py).
-                    # We always scan the JSONL — PENDING_REGISTRATION
-                    # lives on per-publisher status, not the aggregate
-                    # outcome counter, so the only way to detect it is
-                    # to inspect each row's ``servers`` field. The set
-                    # is defined once in ``retry_queue`` so this scan
-                    # and the ``/attempts`` endpoint's ``pending_servers``
-                    # helper can't drift.
-                    from media_preview_generator.processing.retry_queue import (
-                        PENDING_PUBLISHER_STATUSES as RETRY_PUBLISHER_STATUSES,
-                    )
+                    # Chapters distinguish the attempt's outcome from retry eligibility. Older publisher rows
+                    # retain their status-based policy through the same helper used by the attempts API.
+                    from media_preview_generator.processing.retry_queue import publisher_needs_retry
 
                     # Retry children write their per-file outcomes to the
                     # PARENT's JSONL (see _file_result_cb redirect above).
@@ -1383,7 +1373,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # While scanning for retry-eligible paths, also tally a
                     # per-server pending count. The reason-building blocks
                     # below use it to produce log lines like
-                    # "Retry 1/3: JellyTest pending × 4, next retry in 120s"
+                    # "Retry 1/3: JellyTest needs another attempt × 4, next retry in 120s"
                     # so the operator sees the actual blocker — and the
                     # frontend can derive the chain-summary subtitle from
                     # the /attempts response that mirrors this data.
@@ -1403,9 +1393,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             not_found_on_disk.append(file_path)
                         else:
                             servers = fr.get("servers") or []
-                            pending_server_names = [
-                                s.get("name") or "?" for s in servers if s.get("status") in RETRY_PUBLISHER_STATUSES
-                            ]
+                            pending_server_names = [s.get("name") or "?" for s in servers if publisher_needs_retry(s)]
                             if pending_server_names:
                                 pending_registration_paths.append(file_path)
                                 for _name in pending_server_names:
@@ -1688,7 +1676,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
                                 _by_server_sorted = sorted(pending_by_server.items(), key=lambda kv: -kv[1])
-                                reason_parts.append(", ".join(f"{name} pending × {n}" for name, n in _by_server_sorted))
+                                reason_parts.append(
+                                    ", ".join(f"{name} needs another attempt × {n}" for name, n in _by_server_sorted)
+                                )
                             reason = " + ".join(reason_parts) or "issues"
                             # WARNING (not INFO): a retry being scheduled
                             # means something on this run didn't resolve.
@@ -1713,7 +1703,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
                                 _by_server_sorted = sorted(pending_by_server.items(), key=lambda kv: -kv[1])
-                                reason_parts.append(", ".join(f"{name} pending × {n}" for name, n in _by_server_sorted))
+                                reason_parts.append(
+                                    ", ".join(f"{name} needs another attempt × {n}" for name, n in _by_server_sorted)
+                                )
                             reason = ", ".join(reason_parts) or "issues"
                             # WARNING (not INFO): same rationale as the
                             # is_retry branch above — the original dispatch

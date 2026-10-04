@@ -10,7 +10,7 @@ from PIL import Image
 
 from media_preview_generator.output.plex_bundle import PlexBundleAdapter
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
-from media_preview_generator.processing import chapters
+from media_preview_generator.processing import chapters, multi_server
 from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.processing.multi_server import MultiServerStatus, PublisherStatus, process_canonical_path
 from media_preview_generator.servers import ServerRegistry
@@ -46,7 +46,7 @@ def plan(tmp_path, config):
         tmp_path / "Chapters",
         {"version": 1, "width": 1280, "quality": 4, "tonemap": "hable"},
         target,
-        chapters.ChapterOutcome("pending", total=2),
+        chapters.ChapterOutcome("queued", total=2),
     )
 
 
@@ -78,7 +78,7 @@ def test_partial_failure_keeps_success_and_retries_only_failed_chapter(plan, con
 
     run.side_effect = first
     result = chapters.publish_chapters(plan, config)
-    assert (result.status, result.completed, result.total) == ("pending", 1, 2)
+    assert (result.status, result.completed, result.total) == ("failed", 1, 2)
     assert old.read_bytes() == old_bytes
     register.assert_not_called()
     assert set(chapters._fresh_images(plan)) == {"1"}
@@ -94,7 +94,8 @@ def test_partial_failure_keeps_success_and_retries_only_failed_chapter(plan, con
 def test_registration_retry_reuses_images(plan, config, extraction):
     run, register = extraction
     register.side_effect = ChapterError("Plex unavailable", code="registration")
-    assert chapters.publish_chapters(plan, config).status == "pending"
+    outcome = chapters.publish_chapters(plan, config)
+    assert outcome.status == "failed" and outcome.retryable
     assert run.call_count == 2
     run.reset_mock()
     register.side_effect = None
@@ -129,7 +130,7 @@ def test_registered_fresh_images_need_no_work_but_cleared_refs_do(plan, config, 
     register.assert_called_once()
 
 
-def test_committed_refs_without_api_visibility_remain_pending(plan, config, extraction):
+def test_committed_refs_without_api_visibility_fail_verification_and_can_retry(plan, config, extraction):
     run, register = extraction
 
     def committed_but_unverified(_server, _target, revisions):
@@ -143,10 +144,12 @@ def test_committed_refs_without_api_visibility_remain_pending(plan, config, extr
         raise ChapterError("Plex API verification failed", code="registration")
 
     register.side_effect = committed_but_unverified
-    assert chapters.publish_chapters(plan, config).status == "pending"
+    outcome = chapters.publish_chapters(plan, config)
+    assert outcome.status == "failed" and outcome.retryable
     run.reset_mock()
     assert chapters.chapter_work_needed(plan)
-    assert chapters.publish_chapters(plan, config).status == "pending"
+    outcome = chapters.publish_chapters(plan, config)
+    assert outcome.status == "failed" and outcome.retryable
     run.assert_not_called()
     assert chapters.chapter_work_needed(plan)
     register.side_effect = None
@@ -195,7 +198,7 @@ def test_force_failure_does_not_leave_prior_manifest_fresh(plan, config, extract
     chapters.publish_chapters(plan, config)
     run.side_effect = RuntimeError("extraction failed")
     result = chapters.publish_chapters(plan, config, regenerate=True)
-    assert result.status == "pending"
+    assert result.status == "failed"
     assert result.completed == 0
     assert chapters._fresh_images(plan) == {}
 
@@ -209,7 +212,7 @@ def test_source_changed_during_extraction_never_replaces_image_or_registers(plan
 
     run.side_effect = replace_source
     result = chapters.publish_chapters(plan, config)
-    assert result.status == "pending"
+    assert result.status == "failed" and result.retryable
     assert not (plan.folder / "chapter1.jpg").exists()
     register.assert_not_called()
 
@@ -222,7 +225,7 @@ def test_cancel_preserves_existing_outputs_and_stops_registration(plan, config, 
     register.assert_not_called()
 
 
-def test_stale_plex_hash_is_pending_without_image_work(plan, config, monkeypatch):
+def test_stale_plex_hash_waits_for_plex_without_image_work(plan, config, monkeypatch):
     server = plan.server
     server.path_mappings = []
     monkeypatch.setattr(
@@ -233,7 +236,7 @@ def test_stale_plex_hash_is_pending_without_image_work(plan, config, monkeypatch
         server, SimpleNamespace(output={"plex_config_folder": str(plan.folder.parent)}), plan.canonical_path, config
     )
     assert prepared.target is None
-    assert prepared.outcome.status == "pending"
+    assert prepared.outcome.status == "waiting" and prepared.outcome.retryable
     assert "current source" in prepared.outcome.message
     assert not plan.folder.exists()
 
@@ -254,8 +257,89 @@ def test_timestamp_runner_uses_correct_color_path_and_bounded_threads(tmp_path, 
     assert kwargs["chapter_output"] == str(output)
     assert kwargs["ffmpeg_threads_override"] == 2
     assert kwargs["gpu"] is None
+    assert kwargs["base_scale"] == "scale=w=1280:h=-2"
     assert kwargs["path_kind"] == ("sdr" if kind == "sdr" else "hdr10_zscale")
     assert runner.call_args.kwargs == {"use_skip": False}
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("FFmpeg exit 234"), ValueError("Invalid JPEG"), OSError("No frame")])
+def test_extraction_errors_fail_instead_of_waiting_for_plex(plan, config, extraction, failure):
+    run, register = extraction
+    run.side_effect = failure
+
+    result = chapters.publish_chapters(plan, config)
+
+    assert result.status == "failed"
+    assert (result.completed, result.total) == (0, 2)
+    assert result.message == str(failure)
+    register.assert_not_called()
+
+
+def test_rejected_image_reports_actual_dimensions(tmp_path):
+    output = tmp_path / "frame.jpg"
+    Image.new("RGB", (1278, 534)).save(output, "JPEG")
+
+    with pytest.raises(ValueError, match="expected a 1280px JPEG; got JPEG 1278x534"):
+        chapters._revision(output)
+
+
+@pytest.mark.parametrize(
+    "error, status, retryable",
+    [
+        (ChapterError("Plex has not indexed the source", code="pending_index"), "waiting", True),
+        (ChapterError("Plex chapter snapshot changed", code="source_changed"), "failed", True),
+        (ChapterError("API verification failed", code="registration"), "failed", True),
+        (ChapterError("Unsupported source", code="unsupported"), "failed", False),
+        (chapters.SourceFileChangedError("File changed"), "failed", True),
+        (chapters.ProbeTimeoutError("Probe timed out"), "failed", True),
+        (chapters.ProbeStalledError("Probe stalled"), "failed", True),
+        (chapters.ProbeError("Unreadable source"), "failed", False),
+        (chapters.RequestException("Connection failed"), "failed", True),
+        (TimeoutError("Connection timed out"), "failed", True),
+        (PermissionError("Read-only folder"), "failed", False),
+        (FileNotFoundError("Missing source"), "failed", False),
+        (RuntimeError("Decoder failed"), "failed", False),
+        (ValueError("Wrong image dimensions"), "failed", False),
+        (chapters.UnsupportedChapterFormatError("Unsupported Dolby Vision"), "failed", False),
+    ],
+)
+def test_chapter_failure_and_retry_eligibility_are_independent(error, status, retryable):
+    result = chapters._failure(error, completed=2, total=3)
+
+    assert result.status == status
+    assert result.retryable is retryable
+    assert (result.completed, result.total) == (2, 3)
+    assert str(error) in result.message
+    assert result.to_dict()["retryable"] is retryable
+
+
+@pytest.mark.parametrize("state", [None, *chapters.Capability])
+def test_only_transient_publisher_capability_failures_can_retry(state):
+    result = chapters._failure(chapters.PublishError("Registration unavailable", state=state))
+
+    assert result.status == "failed"
+    assert result.retryable is (
+        state
+        in {None, chapters.Capability.READY, chapters.Capability.UNREACHABLE, chapters.Capability.AGENT_UNAVAILABLE}
+    )
+
+
+def test_unwritable_chapter_folder_fails_with_actionable_reason(plan, config, extraction, monkeypatch):
+    mkdir = Path.mkdir
+
+    def denied(path, *args, **kwargs):
+        if path == plan.folder:
+            raise PermissionError("Permission denied: Chapters")
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+
+    result = chapters.publish_chapters(plan, config)
+
+    assert result.status == "failed" and not result.retryable
+    assert "Check the app user's access" in result.message
+    extraction[0].assert_not_called()
+    extraction[1].assert_not_called()
 
 
 def test_dv_without_compatible_base_fails_without_starting_unselected_gpu(tmp_path, config, monkeypatch):
@@ -312,16 +396,31 @@ def test_existing_bif_chapter_backfill_does_not_extract_or_pack_bif(
     pack = MagicMock(side_effect=AssertionError("BIF packing must not run"))
     monkeypatch.setattr("media_preview_generator.processing.multi_server.generate_images", generate)
     monkeypatch.setattr("media_preview_generator.processing.generator.generate_bif", pack)
-    result = process_canonical_path(plan.canonical_path, registry, mock_config, check_only=check_only)
+    progress = []
+    previews = multi_server._process_canonical_path_previews
+
+    def check_scrubber_progress(*args, **kwargs):
+        assert progress[-1] is None  # Clear chapter preparation before any scrubber work.
+        return previews(*args, **kwargs)
+
+    preview_boundary = MagicMock(side_effect=check_scrubber_progress)
+    monkeypatch.setattr(multi_server, "_process_canonical_path_previews", preview_boundary)
+    result = process_canonical_path(
+        plan.canonical_path, registry, mock_config, check_only=check_only, chapter_progress_callback=progress.append
+    )
     assert result.status is (MultiServerStatus.NEEDS_GENERATION if check_only else MultiServerStatus.PUBLISHED)
     assert bif.read_bytes() == b"existing BIF"
     generate.assert_not_called()
     pack.assert_not_called()
+    preview_boundary.assert_called_once()
     if check_only:
         extraction[0].assert_not_called()
     else:
         assert extraction[0].call_count == 2
         assert result.publishers[0].artifacts["chapters"]["status"] == "ready"
+        assert result.publishers[0].artifacts["chapters"]["updated"] is True
+        assert progress[-1] == {"stage": "complete", "processed": 2, "total": 2, "ready": 2, "failed": 0}
+    assert progress[0]["stage"] == "preparing"
 
 
 def test_disabled_chapters_never_resolve_metadata(plan, mock_config, monkeypatch):
@@ -332,7 +431,99 @@ def test_disabled_chapters_never_resolve_metadata(plan, mock_config, monkeypatch
     prepare.assert_not_called()
 
 
-def test_pending_chapters_preserve_bif_success_and_request_retry(plan, mock_config, monkeypatch):
+@pytest.mark.parametrize("already_registered", [False, True])
+def test_chapter_update_provenance_distinguishes_registration_from_reused_outputs(
+    plan, mock_config, config, extraction, monkeypatch, already_registered
+):
+    run, register = extraction
+    registry = _registry(plan)
+    bif = PlexBundleAdapter.bundle_bif_path(
+        registry.get_config("plex").output["plex_config_folder"], plan.target.bundle_hash
+    )
+    bif.parent.mkdir(parents=True)
+    bif.write_bytes(b"existing BIF")
+    assert chapters.publish_chapters(plan, config).status == "ready"
+    images = chapters._fresh_images(plan)
+    if already_registered:
+        plan.target = replace(
+            plan.target,
+            chapters=tuple(
+                replace(
+                    c, thumb_url=f"/library/media/2/chapterImages/{c.index}?mpgChapter={images[str(c.index)]['sha256']}"
+                )
+                for c in plan.target.chapters
+            ),
+        )
+    monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
+    run.reset_mock()
+    register.reset_mock()
+
+    result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+    assert result.status is (MultiServerStatus.SKIPPED if already_registered else MultiServerStatus.PUBLISHED)
+    artifact = result.publishers[0].artifacts["chapters"]
+    assert artifact["status"] == "ready"
+    assert artifact["updated"] is (not already_registered)
+    run.assert_not_called()
+    if already_registered:
+        register.assert_not_called()
+    else:
+        register.assert_called_once_with(
+            plan.server, plan.target, {int(index): entry["sha256"] for index, entry in images.items()}
+        )
+
+
+def test_ffmpeg_failure_preserves_existing_bif_and_records_chapter_warning(plan, mock_config, monkeypatch, tmp_path):
+    from media_preview_generator.jobs.orchestrator import (
+        _outcome_for_multi_server_status,
+        _publisher_rows_from_result,
+        merge_chain_publishers_best_per_path,
+    )
+    from media_preview_generator.web.jobs import JobManager
+    from media_preview_generator.web.routes.job_runner import _chapter_completion_warning
+
+    registry = _registry(plan)
+    bif = PlexBundleAdapter.bundle_bif_path(
+        registry.get_config("plex").output["plex_config_folder"], plan.target.bundle_hash
+    )
+    bif.parent.mkdir(parents=True)
+    bif.write_bytes(b"existing BIF")
+    monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
+    track = SimpleNamespace(hdr_format=None, transfer_characteristics=None)
+    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: SimpleNamespace(video_tracks=[track]))
+    runner = MagicMock(return_value=(234, 0.1, 0, ["File ended prematurely"]))
+    factory = MagicMock(return_value=runner)
+    monkeypatch.setattr(chapters, "create_ffmpeg_runner", factory)
+    register = MagicMock()
+    monkeypatch.setattr("media_preview_generator.servers.plex_chapters.register_chapters", register)
+
+    result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+    assert result.status is MultiServerStatus.SKIPPED
+    assert bif.read_bytes() == b"existing BIF"
+    assert [call.kwargs["chapter_start_ms"] for call in factory.call_args_list] == [0, 1000]
+    assert all(call.kwargs["base_scale"] == "scale=w=1280:h=-2" for call in factory.call_args_list)
+    assert all(call.kwargs == {"use_skip": False} for call in runner.call_args_list)
+    register.assert_not_called()
+    manager = JobManager(config_dir=str(tmp_path / "jobs"))
+    job = manager.create_job(library_name="Chapters")
+    manager.record_file_result(
+        job.id,
+        plan.canonical_path,
+        _outcome_for_multi_server_status(result.status).value,
+        servers=_publisher_rows_from_result(result, plan.canonical_path),
+    )
+    stored = manager.get_file_results(job.id)
+    assert stored[0]["outcome"] == "skipped_bif_exists"
+    outcome = stored[0]["servers"][0]["artifacts"]["chapters"]
+    assert outcome["status"] == "failed"
+    assert "FFmpeg exit 234" in outcome["message"]
+    assert "chapter thumbnails failed for 1" in _chapter_completion_warning(
+        merge_chain_publishers_best_per_path(stored), include_pending=True
+    )
+
+
+def test_waiting_chapters_preserve_bif_success_and_request_retry(plan, mock_config, monkeypatch):
     registry = _registry(plan)
     bif = PlexBundleAdapter.bundle_bif_path(
         registry.get_config("plex").output["plex_config_folder"], plan.target.bundle_hash
@@ -340,18 +531,19 @@ def test_pending_chapters_preserve_bif_success_and_request_retry(plan, mock_conf
     bif.parent.mkdir(parents=True)
     bif.write_bytes(b"existing BIF")
     plan.target = None
-    plan.outcome = chapters.ChapterOutcome("pending", message="Plex has not indexed this source yet")
+    plan.outcome = chapters.ChapterOutcome("waiting", message="Plex has not indexed this source yet", retryable=True)
     monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
     result = process_canonical_path(plan.canonical_path, registry, mock_config, check_only=True)
     publisher = result.publishers[0]
     assert publisher.status is PublisherStatus.PUBLISHED_PENDING_CHAPTERS
     assert publisher.artifacts["bif"]["status"] == "skipped_output_exists"
+    assert publisher.artifacts["chapters"]["updated"] is False
     from media_preview_generator.processing.retry_queue import PENDING_PUBLISHER_STATUSES
 
     assert publisher.status.value in PENDING_PUBLISHER_STATUSES
 
 
-@pytest.mark.parametrize("source_chapters, expected", [((), "none"), ((object(),), "pending")])
+@pytest.mark.parametrize("source_chapters, expected", [((), "none"), ((object(),), "waiting")])
 def test_empty_plex_rows_require_positive_source_chapter_check(plan, config, monkeypatch, source_chapters, expected):
     plan.server.path_mappings = []
     monkeypatch.setattr(
@@ -407,4 +599,92 @@ def test_empty_plex_rows_never_complete_after_probe_failure_or_source_race(plan,
             prepare()
     else:
         result = prepare()
-        assert result.target is None and result.outcome.status == "pending"
+        assert result.target is None and result.outcome.status == "failed"
+        assert result.outcome.retryable
+
+
+@pytest.mark.parametrize("cached", [0, 1, 2])
+def test_chapter_progress_counts_cached_images_and_reports_registration(plan, config, extraction, cached):
+    run, register = extraction
+    if cached:
+        assert chapters.publish_chapters(plan, config).status == "ready"
+        if cached == 1:
+            (plan.folder / "chapter2.jpg").unlink()
+    run.reset_mock()
+    register.reset_mock()
+    progress = []
+    during_registration = []
+    register.side_effect = lambda *_a, **_kw: during_registration.append(progress[-1])
+
+    result = chapters.publish_chapters(plan, config, chapter_progress_callback=progress.append)
+
+    assert result.status == "ready"
+    assert [call.args[1] for call in run.call_args_list] == [0, 1000][cached:]
+    expected = {"stage": "registering", "processed": 2, "total": 2, "ready": 2, "failed": 0}
+    assert during_registration == [expected]
+    assert progress[-1] == {**expected, "stage": "complete"}
+    if cached < 2:
+        first_attempt = next(snapshot for snapshot in progress if snapshot["stage"] == "extracting")
+        assert first_attempt == {"stage": "extracting", "processed": cached, "total": 2, "ready": cached, "failed": 0}
+    assert [snapshot["processed"] for snapshot in progress] == sorted(snapshot["processed"] for snapshot in progress)
+
+
+def test_failed_chapter_attempt_advances_work_progress_without_counting_as_ready(plan, config, extraction):
+    run, register = extraction
+
+    def extract(_source, start, output, *_args, **_kwargs):
+        if start == 0:
+            raise RuntimeError("Cannot decode first chapter")
+        _image(output)
+
+    run.side_effect = extract
+    progress = []
+    result = chapters.publish_chapters(plan, config, chapter_progress_callback=progress.append)
+
+    assert result.status == "failed"
+    assert progress[-1] == {"stage": "failed", "processed": 2, "total": 2, "ready": 1, "failed": 1}
+    assert {"stage": "extracting", "processed": 1, "total": 2, "ready": 0, "failed": 1} in progress
+    assert all(snapshot["stage"] != "complete" for snapshot in progress)
+    register.assert_not_called()
+
+
+def test_chapter_registration_failure_keeps_completed_image_progress(plan, config, extraction):
+    _, register = extraction
+    register.side_effect = ChapterError("Plex verification failed", code="registration")
+    progress = []
+
+    result = chapters.publish_chapters(plan, config, chapter_progress_callback=progress.append)
+
+    assert result.status == "failed"
+    assert progress[-2:] == [
+        {"stage": "registering", "processed": 2, "total": 2, "ready": 2, "failed": 0},
+        {"stage": "failed", "processed": 2, "total": 2, "ready": 2, "failed": 0},
+    ]
+
+
+def test_cancellation_never_reports_remaining_chapter_work_complete(plan, config, extraction):
+    run, register = extraction
+    progress = []
+    with pytest.raises(CancellationError):
+        chapters.publish_chapters(
+            plan,
+            config,
+            chapter_progress_callback=progress.append,
+            cancel_check=lambda: bool(progress and progress[-1]["processed"] == 1),
+        )
+    assert progress[-1] == {"stage": "extracting", "processed": 1, "total": 2, "ready": 1, "failed": 0}
+    assert [call.args[1] for call in run.call_args_list] == [0]
+    register.assert_not_called()
+
+
+def test_waiting_for_chapter_lock_reports_no_attempts_and_can_cancel(plan, config, extraction, monkeypatch):
+    lock = MagicMock()
+    lock.acquire.return_value = False
+    monkeypatch.setattr(chapters, "_LOCKS", (lock,))
+    progress = []
+    with pytest.raises(CancellationError):
+        chapters.publish_chapters(plan, config, chapter_progress_callback=progress.append, cancel_check=lambda: True)
+    assert progress == [{"stage": "waiting", "processed": 0, "total": 2, "ready": 0, "failed": 0}]
+    lock.acquire.assert_called_once_with(timeout=0.1)
+    lock.release.assert_not_called()
+    extraction[0].assert_not_called()

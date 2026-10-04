@@ -862,6 +862,7 @@
             } else {
                 parts.push(statTiles([serversStat(), foundStat(), previewStat(), checkedStat()]));
                 parts.push(timelineCard());
+                if ((state.file.loudness || []).length) parts.push(loudnessCard());
                 const lower = el('div', 'insp-grid-2');
                 let left;
                 if (!state.item) left = itemErrorCard();
@@ -1145,7 +1146,7 @@
         box.setAttribute('role', 'status');
         const running = job.status === 'running';
         box.appendChild(running ? el('span', 'spinner-border spinner-border-sm insp-banner-icon') : icon('hourglass-split'));
-        const what = job.kind === MARKERS_JOB ? 'Intro & Credits' : 'Preview';
+        const what = job.kind === JOB_KIND_PREVIEWS ? 'Preview' : (JOB_KIND_LABELS[job.kind] || 'Processing');
         const pctText = running && job.percent ? ` · ${Math.round(job.percent)}%` : '';
         box.appendChild(el('span', 'insp-banner-text', `${running ? 'Working on this file' : 'Queued for this file'}: ${what} job “${job.name || job.id}”${pctText}`));
         const link = el('a', 'insp-banner-link', 'Open on the Dashboard');
@@ -3083,6 +3084,78 @@
         return card;
     }
 
+    function loudnessValue(value, unit) {
+        if (value === '-inf') return '−∞ ' + unit;
+        if (value === 'inf') return '∞ ' + unit;
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'Not reported';
+        return value.toLocaleString(undefined, { maximumFractionDigits: 2 }) + ' ' + unit;
+    }
+
+    function loudnessCard() {
+        const card = el('section', 'insp-card insp-loudness');
+        card.id = 'inspLoudness';
+        card.setAttribute('aria-labelledby', 'inspLoudnessTitle');
+        const heading = el('h2', 'insp-card-heading', 'Loudness');
+        heading.id = 'inspLoudnessTitle';
+        card.append(heading, el('p', 'insp-loudness-note',
+            'Measurements reported by Plex for this file’s audio tracks.'));
+        const labels = {
+            available: 'Available in Plex', not_analysed: 'Not analysed', partial: 'Partial measurements',
+            unavailable: 'Couldn’t read loudness', unsupported: 'Unsupported',
+        };
+        const fields = [
+            ['integrated_lufs', 'Integrated loudness', 'LUFS'], ['true_peak_dbtp', 'True peak', 'dBTP'],
+            ['lra_lu', 'Loudness range', 'LU'], ['threshold_lufs', 'Threshold', 'LUFS'],
+            ['gain_offset_db', 'Gain offset', 'dB'],
+        ];
+        state.file.loudness.forEach(function (server) {
+            const row = el('div', 'insp-loudness-server');
+            row.dataset.serverId = server.server_id;
+            const head = el('div', 'insp-loudness-head');
+            head.append(el('h3', 'insp-loudness-name', server.server_name || server.server_id),
+                el('span', 'insp-loudness-status', labels[server.state] || labels.unavailable));
+            row.appendChild(head);
+            if (server.server_type === 'plex' && server.enabled === false) {
+                row.appendChild(el('p', 'insp-loudness-note', 'Loudness analysis by this app is off for this file. Existing Plex measurements are still shown.'));
+            }
+            if (server.note) row.appendChild(el('p', 'insp-loudness-note', server.note));
+            const streams = server.streams || [];
+            const parts = new Set(streams.map(function (s) { return String(s.item_id) + ':' + String(s.part_id); }));
+            streams.forEach(function (stream, index) {
+                const track = el('div', 'insp-loudness-track');
+                track.dataset.streamId = stream.stream_id;
+                const description = [stream.title, stream.language, stream.codec && String(stream.codec).toUpperCase(),
+                    stream.channels ? stream.channels + ' channels' : '', stream.default ? 'Default' : ''].filter(Boolean);
+                const trackHead = el('div', 'insp-loudness-head');
+                trackHead.append(el('h4', 'insp-loudness-track-name', 'Audio track ' + (index + 1)
+                    + (description.length ? ' · ' + description.join(' · ') : '')),
+                    el('span', 'insp-loudness-status', labels[stream.state] || labels.unavailable));
+                track.appendChild(trackHead);
+                if (parts.size > 1) track.appendChild(el('p', 'insp-loudness-note',
+                    [stream.part_file, 'Plex item ' + stream.item_id, 'Part ' + stream.part_id].filter(Boolean).join(' · ')));
+                if (stream.note) track.appendChild(el('p', 'insp-loudness-note', stream.note));
+                if (fields.some(function (f) { return stream[f[0]] !== null && stream[f[0]] !== undefined; })) {
+                    const values = el('dl', 'insp-loudness-values');
+                    fields.forEach(function (field) {
+                        const metric = el('div');
+                        metric.append(el('dt', '', field[1]), el('dd', 'insp-mono', loudnessValue(stream[field[0]], field[2])));
+                        values.appendChild(metric);
+                    });
+                    track.appendChild(values);
+                }
+                const details = [];
+                if (stream.analysis_version !== null && stream.analysis_version !== undefined) details.push('Analysis version ' + stream.analysis_version);
+                if (stream.normalization_available === true) details.push('Normalization available');
+                else if (stream.normalization_available === false) details.push('Normalization unavailable');
+                else details.push('Normalization not reported');
+                track.appendChild(el('p', 'insp-loudness-note', details.join(' · ')));
+                row.appendChild(track);
+            });
+            card.appendChild(row);
+        });
+        return card;
+    }
+
     // ---------------------------------------------------------------- actions
 
     // Both answer after an await: the job banner is only set when the file it was asked for is still the one open.
@@ -3128,6 +3201,7 @@
         if ((cfg.file_paths || []).indexOf(state.path) !== -1 || (cfg.webhook_paths || []).indexOf(state.path) !== -1) return true;
         const progress = job.progress || {};
         if (progress.current_file === state.path) return true;
+        if ((progress.current_files || []).indexOf(state.path) !== -1) return true;
         return (progress.workers || []).some(function (w) { return w && w.current_file === state.path; });
     }
 
@@ -3140,7 +3214,7 @@
             state.job = null;
             renderJobBanner();
             clearTimeout(reloadTimer);
-            // A finished Intro & Credits job changed what was decided; a preview job the frames. Either way: read again.
+            // Refresh measurements as well as markers and preview frames after any job finishes.
             reloadTimer = setTimeout(function () {
                 if (state.adjust) return;
                 loadFile();
@@ -3162,10 +3236,25 @@
         if (!data || !state.path) return;
         const tracked = state.job && state.job.id === data.job_id;
         const progress = data.progress || {};
-        const touches = progress.current_file === state.path || (progress.workers || []).some(function (w) { return w && w.current_file === state.path; });
+        const touches = progress.current_file === state.path || (progress.current_files || []).indexOf(state.path) !== -1
+            || (progress.workers || []).some(function (w) { return w && w.current_file === state.path; });
         if (!tracked && !touches) return;
-        state.job = Object.assign({}, state.job || { id: data.job_id, kind: '', name: '' }, { status: 'running', percent: progress.percent || 0 });
+        state.job = Object.assign({}, tracked ? state.job : { id: data.job_id, kind: data.kind || '', name: '' }, { status: 'running', percent: progress.percent || 0 });
         renderJobBanner();
+        if (!state.job.kind && !state.job.detailsRequested) {
+            state.job.detailsRequested = true;
+            const path = state.path;
+            getJson('/api/jobs/' + encodeURIComponent(data.job_id)).then(function (res) {
+                if (!res.ok || state.path !== path || !state.job || state.job.id !== data.job_id) return;
+                if (['completed', 'failed', 'cancelled'].includes(res.data.status)) {
+                    onJobEvent(res.data, true);
+                    return;
+                }
+                state.job.kind = res.data.kind;
+                state.job.name = res.data.library_name || '';
+                renderJobBanner();
+            }).catch(function () { /* Keep the neutral label when job details cannot be read. */ });
+        }
     }
 
     function watchJobs() {

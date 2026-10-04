@@ -224,9 +224,33 @@ without that base layer, such as Profile 5, reports unsupported chapters while p
    A normal run keeps current scrubber previews and fills missing or stale
    chapter images. **Regenerate** rebuilds the enabled outputs.
 
-The job's Files panel reports scrubber and chapter results separately. A file Plex has not indexed yet can have
-its scrubber preview ready while chapters wait for a retry. Chapter retries reuse completed output, so they do not
-need to regenerate a current scrubber preview. A file with no chapters has no chapter images to generate.
+Worker cards show the chapter count and percentage as images are checked or attempted, followed by
+**Registering with Plex**. The percentage measures image work; **Ready** confirms registration succeeded.
+Chapter extraction runs on CPU even when the assigned slot is named GPU Worker. Failed image attempts count toward
+progress and are shown separately. Older running workers without chapter counts show an activity indicator instead.
+
+The job's **Files** panel reports scrubber and chapter results separately:
+
+- **Ready**: chapter images are complete and registered with Plex.
+- **Waiting for Plex**: Plex has not indexed the file or analyzed its chapters yet. The detail names what is missing.
+- **Failed**: chapter extraction or registration failed. The detail gives the error, even when a retry is allowed.
+- **No chapters**: there are no chapter images to generate.
+- **Incomplete**: an older job recorded unfinished chapter work without distinguishing waiting from failure. Read its
+  saved detail for the reason.
+
+Server summaries count scrubber and chapter results separately. **Scrubber already existed** can appear beside
+**Chapters updated** when a run creates chapter images or repairs their Plex references while reusing the scrubber.
+**Chapters already existed** means those images and references were already current. Counts are files, not individual images.
+**Chapters waiting for Plex** and **Chapters failed** name the remaining work. Older results can show **Chapters ready**
+without update history, or **Chapters incomplete** without a precise waiting/failure classification; open **Files** for details.
+For older job summaries without chapter counts, **Previews updated** reports how many files completed publication.
+It can appear beside **Scrubber already existed**, but does not identify which preview output changed.
+The job's retry details show whether another attempt is actually scheduled. Retry eligibility depends on the failure
+and your retry policy. Chapter retries reuse completed output, so they do not need to regenerate a current scrubber
+preview.
+If chapter extraction stops making progress or reports an invalid Matroska container, the app stops the remaining
+chapter attempts for that file and keeps completed images. A stalled attempt can be retried under your retry policy;
+an invalid container needs a repaired or replaced source. Partial chapter sets are not registered with Plex.
 Plex's normal file checks can rewrite chapter image references even when its own generation is set to **Never**.
 A later Previews job reconciles those references without decoding current images again. This is separate from
 Plex generating and replacing the images itself.
@@ -310,8 +334,8 @@ The legacy `/webhooks` and `/schedules` URLs still work — they 302-redirect to
 
 ### Inspector
 
-**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, and where its intro
-and credits are on each server.
+**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, where its intro
+and credits are on each server, and the loudness measurements Plex reports for its audio tracks.
 
 - **Search.** Type a title and results appear as you type, from every server (or the one picked in the dropdown). A
   film several servers have is one row. Each row says whether the preview is ready (and how many frames it has) and
@@ -331,6 +355,10 @@ and credits are on each server.
 - **How it was decided** lists every source, what it found and whether it was used. **On your servers** says, per
   server, what it shows, its intro & credits state and its preview; **File locations** opens to each preview's path
   (Plex's bundle BIF, Emby's BIF next to the video, Jellyfin's trickplay folder).
+- **Loudness** shows each Plex audio track's integrated loudness, true peak, loudness range, threshold and gain
+  offset, together with whether Plex can normalize the track. These are the measurements reported by Plex, including
+  native results when this app's loudness feature is off. Missing, incomplete or unavailable results are labelled;
+  opening the Inspector does not start analysis. Use **New job → Plex loudness** to run it for enabled libraries.
 - **A file not checked yet** is the same page: the rows show what each server has today, and **Check intro & credits
   now** checks it.
 - **Regenerate preview** rebuilds the preview for every server that has the file (a job on the Dashboard);

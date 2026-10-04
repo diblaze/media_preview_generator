@@ -1637,20 +1637,21 @@ function _renderFileServerNotes(servers, showMessages) {
             var chapter = artifacts.chapters;
             var bifStatus = (artifacts.bif || {}).status;
             var bifReady = bifStatus === 'published' || bifStatus === 'skipped_output_exists';
-            var labels = { ready: 'ready', pending: 'pending', failed: 'failed', none: 'no chapters' };
-            var chapterText = labels[chapter.status] || 'checking';
+            // Older jobs used pending for both waiting and failed extraction, so only an explicit waiting is Plex's wait.
+            var labels = { ready: 'Ready', waiting: 'Waiting for Plex', pending: 'Incomplete', failed: 'Failed', none: 'No chapters' };
+            var chapterText = labels[chapter.status] || 'Incomplete';
             if (Number.isFinite(chapter.total) && chapter.total > 0 && Number.isFinite(chapter.completed)) {
                 chapterText += ' (' + Math.max(0, Math.floor(chapter.completed))
                     + '/' + Math.floor(chapter.total) + ')';
             }
             var artifactText = (s.name || 'Server') + ': Scrubber: '
-                + (bifReady ? 'ready' : (_fileOutcomeMeta(bifStatus).label || 'pending'))
+                + (bifReady ? 'Ready' : (_fileOutcomeMeta(bifStatus).label || 'Incomplete'))
                 + '; Chapters: ' + chapterText;
-            if (chapter.message && (chapter.status === 'pending' || chapter.status === 'failed')) {
+            if (chapter.message && chapter.status !== 'ready' && chapter.status !== 'none') {
                 artifactText += ' — ' + chapter.message;
             }
-            var artifactCls = chapter.status === 'pending' || chapter.status === 'failed'
-                ? 'text-warning-emphasis' : 'text-muted';
+            var artifactCls = chapter.status === 'failed' ? 'text-danger-emphasis'
+                : (chapter.status === 'pending' || chapter.status === 'waiting') ? 'text-warning-emphasis' : 'text-muted';
             return '<div class="small chapter-server-note ' + artifactCls + '">'
                 + escapeHtml(artifactText) + '</div>';
         }
@@ -1716,9 +1717,12 @@ function _renderFileServerPills(servers, showStatus) {
         // "this server skipped it" signal without needing a second column.
         var dim = (status && status !== 'published' && status !== 'markers_written') ? ' style="opacity:.55;"' : '';
         var meta = _fileOutcomeMeta(status);
+        var chapter = (s.artifacts || {}).chapters;
+        var chapterLabel = chapter && { waiting: 'Waiting for Plex', failed: 'Chapters failed', pending: 'Chapters incomplete' }[chapter.status];
+        var chapterTip = chapterLabel && (chapterLabel + (chapter.message ? ': ' + chapter.message : ''));
         var tip = s.reason_code === MARKERS_NOT_IN_LIBRARY
             ? MARKERS_NOT_IN_LIBRARY_LABEL
-            : (showStatus && s.message && !MARKERS_ROUTINE_MESSAGE.test(s.message) && s.message)
+            : chapterTip || (showStatus && s.message && !MARKERS_ROUTINE_MESSAGE.test(s.message) && s.message)
                 || meta.label || status || '';
         var title = tip ? (escapeHtmlAttr(label) + ' \u2014 ' + escapeHtmlAttr(tip)) : escapeHtmlAttr(label);
         html += '<span class="badge me-1 ' + cls + '"' + dim + ' title="' + title + '">'

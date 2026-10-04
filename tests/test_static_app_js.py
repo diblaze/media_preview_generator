@@ -234,25 +234,24 @@ class TestRenderMarkdownBasicHandlesGitHubReleaseBodies:
         version of this test as bug-blind because every assertion
         could pass on the doc-comment substring alone.
         """
-        # Locate the worker-card phase render block. Anchor on the
-        # ``isProcessing && !ffmpegStarted`` branch — the regex
-        # declaration sits a few lines above and the executable code
-        # sits below, all within ~50 lines.
-        idx = app_js.find("isProcessing && !ffmpegStarted")
-        assert idx != -1, "worker-card phase render block missing — UI feedback regressed"
-        # Reach back ~10 lines so the ``const _PHASE_REUSE_RE = …``
-        # declaration (which is hoisted just above the if-branch) is
-        # in the window, plus forward 1500 chars for the body.
-        start = max(0, idx - 600)
-        snippet = app_js[start : idx + 1500]
+        # Inspect the complete card-render function, so adding another
+        # progress phase cannot move the reuse branch outside a fixed
+        # character window. Top-level function boundaries exclude other UI.
+        import re as _re
+
+        match = _re.search(
+            r"^function _patchWorkerCard\([^\n]*\) \{.*?(?=^(?:async )?function |\Z)",
+            app_js,
+            flags=_re.MULTILINE | _re.DOTALL,
+        )
+        assert match is not None, "worker-card renderer missing — UI feedback regressed"
+        snippet = match.group(0)
 
         # Strip JS-style comments from the snippet so assertions hit
         # actual code lines. ``//`` line comments and ``/* … */`` block
         # comments both lie outside the executed program — keeping
         # them in the haystack would let the test pass on documentation
         # alone (the bug-blind shape called out in architecture review).
-        import re as _re
-
         code_only = _re.sub(r"/\*.*?\*/", "", snippet, flags=_re.DOTALL)
         code_only = _re.sub(r"//[^\n]*", "", code_only)
 

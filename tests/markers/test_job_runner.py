@@ -814,6 +814,71 @@ class TestRun:
         assert status.fallback_reason == "GPU processing failed (exit code 255)"
         assert status.fallback_title == "Intro & Credits · a.mkv"
 
+    def test_marker_callback_preserves_other_jobs_chapter_progress_through_socket(self, env, tmp_path, monkeypatch):
+        from media_preview_generator.jobs.dispatcher import JobDispatcher
+        from media_preview_generator.jobs.worker import WorkerPool
+        from media_preview_generator.web.jobs import JobManager
+
+        emitted = []
+        delivered = threading.Event()
+
+        def capture(event, data, namespace):
+            if event == "worker_update":
+                assert namespace == "/jobs"
+                emitted.append(data)
+                delivered.set()
+
+        manager = JobManager(str(tmp_path), socketio=SimpleNamespace(emit=capture))
+        pool = WorkerPool(cpu_workers=2, gpu_workers=0, selected_gpus=[])
+        dispatcher = JobDispatcher(pool)
+        for method in ("update_worker_status", "prune_worker_statuses", "emit_worker_statuses"):
+            monkeypatch.setattr(env.jm, method, getattr(manager, method))
+        preview, marker = pool._snapshot_workers()
+        preview.is_busy = marker.is_busy = True
+        preview.current_job_id = "preview-job"
+        marker.current_job_id = "j1"
+        marker.media_title = "Episode"
+        marker.current_phase = "Fingerprinting audio…"
+
+        def during_wait(timeout=None):
+            callback = env.dispatcher.submit_items.call_args.kwargs["callbacks"]["worker_callback"]
+            for title, processed, total, stage in (
+                ("Movie A", 2, 6, "extracting"),
+                ("Movie A", 4, 6, "extracting"),
+                ("Movie B", 0, 0, "preparing"),
+                ("Movie B", 1, 3, "extracting"),
+            ):
+                preview.media_title = title
+                preview.current_phase = "Chapter thumbnails for Plex…"
+                snapshot = {"stage": stage, "processed": processed, "total": total, "ready": processed, "failed": 0}
+                preview.chapter_progress = snapshot
+                delivered.clear()
+                callback(dispatcher._build_worker_statuses())
+                assert delivered.wait(2), "Worker update never reached the SocketIO emitter"
+                rows = emitted[-1]["workers"]
+                assert rows[0]["current_title"] == title
+                assert rows[0]["chapter_progress"] == snapshot
+                assert rows[0]["ffmpeg_started"] is False
+                assert rows[1]["current_phase"] == "Fingerprinting audio…"
+                assert rows[1]["chapter_progress"] is None
+                assert manager.get_worker_statuses()[0].to_dict()["chapter_progress"] == snapshot
+            preview.is_busy = False
+            delivered.clear()
+            callback(dispatcher._build_worker_statuses())
+            assert delivered.wait(2)
+            assert emitted[-1]["workers"][0]["chapter_progress"] is None
+            assert emitted[-1]["workers"][0]["current_title"] == ""
+            return True
+
+        env.tracker.wait.side_effect = during_wait
+        try:
+            self._run()
+            assert len(emitted) == 5
+        finally:
+            preview.is_busy = marker.is_busy = False
+            pool.shutdown()
+            manager.close()
+
     def test_file_results_are_recorded_on_this_job(self, env):
         with patch.object(job_runner, "set_file_result_callback") as set_cb:
             self._run()
