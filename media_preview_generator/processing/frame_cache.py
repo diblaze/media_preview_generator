@@ -5,7 +5,7 @@ succession (e.g. Sonarr fires on download, then Plex fires on its own
 ``library.new`` for the same file a few seconds later), the second hit
 should not pay for another FFmpeg pass. The :class:`FrameCache` keeps
 the extracted JPGs from the first call in a dedicated cache directory,
-keyed by canonical path + file mtime, with TTL- and size-based
+keyed by canonical path and a source fingerprint, with TTL- and size-based
 eviction.
 
 The dispatcher (:func:`processing.multi_server.process_canonical_path`)
@@ -18,9 +18,9 @@ cache is safe to share across the worker pool.
 
 Cache validity rules:
 
-- Entry is valid only when the source file's ``mtime`` matches the
-  recorded mtime. A file that's been re-encoded / replaced returns a
-  miss and the cache entry is evicted.
+- Entry is valid only when the source file's identity, size and nanosecond
+  modification/change times match. Replacing a file while preserving its
+  mtime must not reuse frames extracted from the old file.
 - Entry is valid only when the lookup's ``extraction_key`` (the settings
   that shape the frames: interval, JPEG quality, tone map) equals the
   one stored at ``put`` time. Frames made at a 10 s interval can't fill
@@ -28,7 +28,9 @@ Cache validity rules:
   The key is required on both calls so no caller can skip the check.
 - Entries expire after ``ttl_seconds`` regardless of mtime — protects
   against cache file corruption or partial writes from a previous run
-  by bounding the trust window.
+  by bounding the trust window. Expired entries are removed on lookup
+  and whenever frames are stored; slot directories a previous process
+  left behind are removed the same way once they are that old.
 - LRU eviction keeps the cache to ``max_entries`` directories.
 
 The cache directory is set up under
@@ -41,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import threading
 import time
@@ -49,11 +52,16 @@ from pathlib import Path
 
 from loguru import logger
 
+from ..output.plex_hash import SourceFingerprint, get_source_fingerprint
+
 _DEFAULT_TTL_SECONDS = 3600  # 1 hour — covers cross-vendor webhook arrivals (e.g. Plex
 # fires immediately, Jellyfin fires 15-30 min later for the same file once the user has
 # both servers configured). Tunable via the ``frame_reuse`` block in settings.json.
 _DEFAULT_MAX_ENTRIES = 1024  # generous; the disk cap below is the real backstop
 _DEFAULT_MAX_DISK_MB = 2048  # 2 GB ceiling on the on-disk cache
+
+# A cache slot's directory name (``FrameCache.frame_dir_for``); the sweep removes nothing else.
+_SLOT_DIR_RE = re.compile(r"frames-([0-9a-f]{16})")
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,7 @@ class CacheEntry:
     source_mtime: float
     cached_at: float
     extraction_key: tuple
+    source_fingerprint: SourceFingerprint | None = None
 
 
 class FrameCache:
@@ -77,7 +86,8 @@ class FrameCache:
         max_entries: Maximum number of cached entries; oldest is evicted
             when the cache is full.
         ttl_seconds: Maximum age of a cache entry. Entries older than
-            this miss on lookup and are evicted lazily.
+            this miss on lookup, and are evicted then or when the next
+            frames are stored.
     """
 
     def __init__(
@@ -103,6 +113,8 @@ class FrameCache:
         # fires race on FFmpeg's rename loop in the shared tmp dir.
         self._generation_locks: dict[str, threading.Lock] = {}
         self._generation_locks_lock = threading.Lock()
+        with self._lock:
+            self._sweep_expired()
 
     # ---------------------------------------------------------- key helpers
     def _key(self, canonical_path: str) -> str:
@@ -128,7 +140,9 @@ class FrameCache:
         and never evicted (the dict grows with the universe of files
         ever processed; that's bounded by the user's library size).
         """
-        key = self._key(canonical_path)
+        return self._generation_lock_for_key(self._key(canonical_path))
+
+    def _generation_lock_for_key(self, key: str) -> threading.Lock:
         with self._generation_locks_lock:
             lock = self._generation_locks.get(key)
             if lock is None:
@@ -144,7 +158,7 @@ class FrameCache:
         - it exists in the in-memory map,
         - it was stored with the same ``extraction_key``,
         - its frame directory still exists on disk,
-        - the source file's mtime is unchanged since the entry was cached,
+        - the source file's identity and change markers match the extraction,
         - the entry is younger than ``ttl_seconds``.
 
         On any failure the entry is evicted (memory + disk) so a
@@ -191,20 +205,17 @@ class FrameCache:
                 return None
 
             try:
-                current_mtime = os.path.getmtime(canonical_path)
+                current_fingerprint = get_source_fingerprint(canonical_path)
             except OSError:
                 # Source file disappeared — invalidate the entry.
                 logger.info("Frame cache miss: source file no longer at {}; evicting", canonical_path)
                 self._evict(key)
                 return None
 
-            # Tolerate a sub-second mtime drift (some filesystems round).
-            if abs(current_mtime - entry.source_mtime) > 1.0:
+            if current_fingerprint != entry.source_fingerprint:
                 logger.info(
-                    "Frame cache miss: source changed for {} (mtime {} → {}); will re-extract",
+                    "Frame cache miss: source identity or change markers differ for {}; will re-extract",
                     canonical_path,
-                    entry.source_mtime,
-                    current_mtime,
                 )
                 self._evict(key)
                 return None
@@ -222,30 +233,35 @@ class FrameCache:
         frame_count: int,
         extraction_key: tuple,
         source_mtime: float | None = None,
+        source_fingerprint: SourceFingerprint | None = None,
     ) -> CacheEntry:
         """Record a freshly-generated frame directory in the cache.
 
         ``frame_dir`` must already exist and contain the JPG frames; we
         don't move or copy anything — the caller is expected to have
         used :meth:`frame_dir_for` to write directly into the cache
-        slot. We just record the metadata.
+        slot. Pass ``source_fingerprint`` captured before extraction so a
+        concurrent replacement cannot label old frames as belonging to the
+        new file. Entries lacking a readable source are never reusable.
 
         Args:
             canonical_path: Source media file the frames were extracted from.
             frame_dir: Directory holding the JPG frames.
             frame_count: Number of frames in ``frame_dir``.
-            extraction_key: The settings the frames were made with. A later
-                :meth:`get` only hits when it asks for the same key.
+            extraction_key: Settings the frames were made with; lookups must match.
             source_mtime: Source mtime at extraction; read from disk when omitted.
+            source_fingerprint: Source identity captured before extracting frames.
 
         Returns:
             The stored entry.
         """
-        if source_mtime is None:
+        if source_fingerprint is None:
             try:
-                source_mtime = os.path.getmtime(canonical_path)
+                source_fingerprint = get_source_fingerprint(canonical_path)
             except OSError:
-                source_mtime = 0.0
+                source_fingerprint = None
+        if source_mtime is None:
+            source_mtime = source_fingerprint[3] / 1_000_000_000 if source_fingerprint is not None else 0.0
 
         entry = CacheEntry(
             canonical_path=canonical_path,
@@ -254,11 +270,13 @@ class FrameCache:
             source_mtime=float(source_mtime),
             cached_at=time.time(),
             extraction_key=extraction_key,
+            source_fingerprint=source_fingerprint,
         )
         key = self._key(canonical_path)
         with self._lock:
             self._entries.pop(key, None)
             self._entries[key] = entry
+            self._sweep_expired(keep=key)
             self._enforce_caps()
         return entry
 
@@ -293,8 +311,59 @@ class FrameCache:
         except OSError as exc:
             logger.debug("Frame cache: failed to rmtree {}: {}", entry.frame_dir, exc)
 
+    def _sweep_expired(self, keep: str | None = None) -> None:
+        """Remove what has outlived the TTL. Caller holds the lock.
+
+        That is every expired entry, and every slot directory no entry owns that was last written longer ago than
+        the TTL: a previous process's leftovers, which nothing would otherwise remove.
+
+        Args:
+            keep: Key of the entry the caller just stored and is about to use.
+        """
+        now = time.time()
+        expired = [key for key, entry in self._entries.items() if now - entry.cached_at > self._ttl_seconds]
+        try:
+            with os.scandir(self._base_dir) as slots:
+                for slot in slots:
+                    name = _SLOT_DIR_RE.fullmatch(slot.name)
+                    if name is None or name.group(1) in self._entries or not slot.is_dir(follow_symlinks=False):
+                        continue
+                    if now - slot.stat(follow_symlinks=False).st_mtime > self._ttl_seconds:
+                        expired.append(name.group(1))
+        except OSError as exc:
+            logger.debug("Frame cache: could not list {}: {}", self._base_dir, exc)
+        for key in expired:
+            if key != keep:
+                self._remove_slot_if_idle(key)
+
+    def _remove_slot_if_idle(self, key: str) -> bool:
+        """Remove slot ``key``'s entry and directory unless a dispatcher is using it. Caller holds the lock.
+
+        A dispatcher holds the slot's generation lock for as long as it writes or reads those frames, so the slot is
+        only removed while this call holds that lock itself; a busy slot is left for a later sweep.
+
+        Returns:
+            False when the slot was in use and left alone.
+        """
+        in_use = self._generation_lock_for_key(key)
+        if not in_use.acquire(blocking=False):
+            return False
+        try:
+            if key in self._entries:
+                self._evict(key)
+            else:
+                shutil.rmtree(self._base_dir / f"frames-{key}")
+        except OSError as exc:
+            logger.debug("Frame cache: failed to remove slot {}: {}", key, exc)
+        finally:
+            in_use.release()
+        return True
+
     def _enforce_caps(self) -> None:
         """Trim oldest entries until under both caps. Caller holds the lock.
+
+        A slot a dispatcher is writing or publishing from is never trimmed (see :meth:`_remove_slot_if_idle`), so
+        the cache can sit over a cap until that dispatcher is done.
 
         Two caps:
         * ``max_entries`` — hard ceiling on number of in-memory entries.
@@ -304,9 +373,10 @@ class FrameCache:
           when ``ttl_seconds`` is set to multiple hours.
         """
         # Entry-count cap.
-        while len(self._entries) > self._max_entries:
-            oldest_key = next(iter(self._entries))
-            self._evict(oldest_key)
+        for key in list(self._entries):
+            if len(self._entries) <= self._max_entries:
+                break
+            self._remove_slot_if_idle(key)
 
         # Disk-size cap. Walk MRU order (insertion-oldest first) and
         # drop until we're under the limit. Stat failures are skipped
@@ -339,9 +409,8 @@ class FrameCache:
         for key in keys_in_order[:-1]:  # skip the most recent entry
             if total <= self._max_disk_bytes:
                 break
-            sz = sizes.get(key, 0)
-            self._evict(key)
-            total -= sz
+            if self._remove_slot_if_idle(key):
+                total -= sizes.get(key, 0)
 
 
 # Singleton accessor so the dispatcher and the worker pool share one cache.

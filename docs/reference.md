@@ -82,6 +82,13 @@ Per-vendor notes:
 | Emby | `password`, `api_key` | `auth.user_id`, `auth.access_token` |
 | Jellyfin | `password`, `quick_connect`, `api_key` | `auth.user_id`, `auth.access_token` |
 
+Plex's optional `media_servers[].output.chapter_thumbnails` setting is a JSON boolean, default `false`.
+The API rejects strings such as `"false"` and numeric values. The **Generate chapter thumbnails** switch in
+**Servers → Edit → General** controls it. It adds chapter images to existing Previews jobs and updates existing
+chapter image references in Plex's database. It requires a supported local Plex database or a compatible configured
+Plex helper; Intro & Credits can stay off. Currently supported: Plex Media Server **1.43.4.x**.
+See the [chapter thumbnail guide](guides.md#plex-chapter-thumbnails) for setup and retry behavior.
+
 > **Runtime state, not persisted.** Jellyfin's Media Preview Bridge plugin
 > presence is probed live via `JellyfinServer.check_plugin_installed()` and
 > surfaced in the `/previews-readiness` payload — it isn't stored on the
@@ -126,7 +133,45 @@ GPU settings are configured per-GPU in **Settings** → **Processing Options**. 
 | `thumbnail_quality` | Yes | `4` | Preview quality 1-10, lower = better quality (2 = highest) |
 | `thumbnail_interval` | Yes | `10` | Interval between preview images (1–60 s). Matches Plex/BIF community convention (see sidecar `-{width}-10.bif` files). |
 | `selected_libraries` | Yes | All | Library IDs to process |
-| `sort_by` (per-run) | Yes | `newest` | Order items are processed: `newest`, `oldest`, `random`, or empty for Plex's natural order. Set per manual run (New Job modal) or per schedule — not a global setting. |
+| `sort_by` (per-run) | Yes | `newest` | Full-scan queue order: `newest`/`oldest` use the date added to the library, within each library, on Plex, Emby, and Jellyfin. `default` preserves server order; `random` shuffles the combined selected libraries and servers. Parallel checks and workers may start or finish out of order. Set per manual run or schedule. The UI sends `default` explicitly; the configuration fallback remains `newest`. Existing schedules without an override continue to inherit the configured order. |
+
+### Per-job media filters
+
+**Start New Job → Filter media** and scheduled **Full library scans** can limit
+the media selected for a run. All filters are optional and default to unrestricted.
+They are stored in the job or schedule's `config`, not in global settings.
+
+- **Shared — Added to library:** `added_filter` is `all` (default), `last_days`, or
+  `date_range`. `last_days` requires a positive integer `added_last_days`; its
+  rolling window is calculated once when the job starts. `date_range` requires
+  `added_from` and `added_to` as `YYYY-MM-DD`. Both calendar dates are included,
+  using the app's timezone (`TZ` or the container's local timezone).
+- **TV shows — Most recent available seasons:** `latest_seasons` is a positive
+  integer, or `null`/omitted for all seasons. It counts distinct, positive season
+  numbers available for each show in each selected server library. For example,
+  the most recent two of seasons 1, 3, and 5 are seasons 3 and 5. Specials (season
+  0) are excluded when this filter is active. Movies are unaffected.
+- **Movies — Release year:** `movie_year_from` and `movie_year_to` are inclusive
+  integer bounds from 1 to 9999. Either bound may be omitted or `null`; both
+  omitted means all years. Episodes are unaffected.
+
+The added date is the media server's catalog date (`addedAt` on Plex,
+`DateCreated` on Emby/Jellyfin), not the release date or file modification time.
+Applicable filters combine with **AND**. The latest available seasons are
+determined before applying added-date filters or checking existing previews;
+older seasons are never substituted when the latest ones have no matches.
+All versions of qualifying media remain eligible.
+
+Items missing metadata required by an active filter are excluded; the scan logs
+aggregate exclusion counts. Library enumeration is still needed to select the
+latest seasons, even though excluded files are not queued for generation.
+Changing library selection in the UI clears filters for media types no longer
+selected. **Clear** restores unrestricted selection.
+
+These options apply only to full-library jobs. **Manual Trigger** file/folder
+jobs, webhooks, **Recently Added** scanner schedules, and **Intro & Credits**
+jobs and schedules retain their existing selection behavior. Relative windows on scheduled full scans are recalculated
+for each execution; a saved date range stays fixed.
 
 ### Frame Reuse Cache (frame_reuse)
 
@@ -245,7 +290,7 @@ Settings for automatic preview generation when media is imported via Radarr or S
 | Setting | Default | Web UI | Description |
 |---------|---------|--------|-------------|
 | `webhook_enabled` | `true` | Yes | Master enable/disable for webhook processing |
-| `webhook_delay` | `60` | Yes | Delay before processing (10–300 s). Incoming webhooks are queued per source; a batch runs after this many seconds with no new imports, or 10 minutes after its first webhook, whichever comes first. |
+| `webhook_delay` | `60` | Yes | Default initial delay for all webhook ingestion URLs (UI slider: 10–300; runtime bounds: 1–3600). Universal/per-server routes wait per job; source-specific routes reset their batch timer on new files, capped by a maximum batch age of the greater of 10 minutes and its longest accepted delay. An optional `delay` URL parameter overrides this value for that request; see [Webhook delay parameter](#webhook-delay-parameter). |
 | `webhook_secret` | *(empty)* | Yes | Dedicated secret for webhook auth (falls back to API token) |
 | `plex_webhook_enabled` | `false` | Yes | Enable the Plex direct webhook (`/api/webhooks/plex`). Requires Plex Pass on the server-owner account. |
 | `plex_webhook_public_url` | *(empty)* | Yes | URL Plex Media Server should POST to. Defaults to the URL you registered through. Override for reverse-proxy / split-network setups. |
@@ -305,26 +350,25 @@ independent sources agree on something different; any other source needs an inde
 on-screen credit text (credits) and season audio (intros) may decide alone. IntroDB, TheIntroDB, SkipDB, the
 previous-season hint (`season_audio_previous`) and markers already on servers never decide alone, and season audio (or `season_audio_previous`) with markers already on servers isn't an agreeing
 pair on its own. An agreeing server marker doesn't hold season audio back (it decides as if alone, credited to
-`season_audio` only); the hint with only a server's marker stays in Needs review. The removed
+`season_audio` only); the hint with only a server's marker decides nothing. The removed
 `publish_when` key (`"high"` / `"medium"`) is ignored when an older `settings.json` or client sends it, and schema
-version 16 deletes it and has the next start queue one job, **Intro & Credits: Needs review and waiting files, decided
-again** (Low priority, source `decide_again`), an ordinary Intro & Credits job over every file in Needs review and
-every file whose last row waits for its item's other versions, listed when it runs. The request (settings key
+version 16 deletes it and has the next start queue one job (Low priority, source `decide_again`), an ordinary Intro &
+Credits job over every file it left undecided, listed when it runs. The request (settings key
 `_markers_decide_again`) is cleared when that job completes; until then every start queues it again (or finds it
 queued), and with Intro & Credits off on every server it waits. An intro season audio decided alone keeps asking the
-online sources on their schedule: one that later disagrees sends it to Needs review.
+online sources on their schedule.
 
 After an update that raises a detector's or reader's version (credit text, season audio and its end-picture check,
 the server-marker reader, chapter rules, an online parser), every start queues **Intro & Credits: re-checking
 files after an update** (Low priority, source `version_rerun`) while a file is left: an ordinary Intro & Credits job
 over at most 100 files still on disk where an unlocked decided type rests on an older answer, or a type that answer
-covers is in Needs review or not found. Credit text and season audio check what other sources decided (a credits
+covers wasn't found. Credit text and season audio check what other sources decided (a credits
 chapter or an online start, an intro chapter or a lone online intro), so their older answer lists an unlocked decided
 type whatever decided it. It also takes files whose one-version Plex item still shows times within
-2 s of an older decision, and, after an update that changes the decision rules, every file not yet decided under
-them with an unlocked type that has a stored answer (decided, Needs review, not found, or kept as the server's own;
+2 s of an older decision and, after an update that changes the decision rules, every file not yet decided under
+them with an unlocked type that has a stored answer (decided, not found, or kept as the server's own;
 not a type whose detection is off) or a marker carried over from a file it replaced: each run that decides a file records the rules version it used (`decide_rules` in
-`version_reruns`). A marker such a run's new rules alone would move to Needs review (or leave out) stays while
+`version_reruns`). A marker such a run's new rules alone would leave out stays while
 a server has it and no new or changed answer disagrees, its reason starting "kept: published before a rule change". The next batch is queued 30 minutes after one completes; after a cancelled or failed batch
 the next start queues one. A job keeps its batch in its config (`version_rerun_files`, removed when it ends) so a job
 revived after a restart runs the same files, and each file is recorded in markers.db (`version_reruns`) with the
@@ -424,7 +468,7 @@ the warning `Couldn't check what N file(s) show on <server>`. A job where an onl
 partway through completes with one warning per source that ran out (see `GET /api/markers/sources/usage` above for
 the same state in Settings), and doesn't queue a retry for those files — nothing was stored for the source, so the
 next scheduled or manual run for the same files asks it again on its own. For TheIntroDB only, the files it left with
-a type undecided (`needs_review` / `no_evidence`) join one waiting LOW-priority job (`source: "theintrodb_recheck"`,
+a type undecided (`no_evidence`) join one waiting LOW-priority job (`source: "theintrodb_recheck"`,
 named "TheIntroDB recheck: N files", at most 500 files) due 5 minutes after the next 00:00 UTC (`retry_not_before`);
 when it runs it drops files decided since, and lists nothing if TheIntroDB has been turned off. TheIntroDB also isn't
 asked about a series (keyed by the tmdb/tvdb/imdb id it's sent) for 7 days once 3 of its episodes got "no entry"
@@ -445,7 +489,7 @@ job or retry for a file gone from disk. A cancelled job queues none. The request
 job completes drops them, and the season's next run asks again. Every job that completes, except Season, retry and verify
 jobs, then starts a background cleanup once it has given back its slot (at most one running, and at most one start an
 hour). It checks up to 2,000 fingerprinted files on disk for at most 60 s, those checked longest ago first, and clears
-the cached fingerprints (and the matches made with them) of files gone from a folder that still exists. The app log
+the cached fingerprints (and the matches made with them) of files gone from a folder that still exists, or marked missing for 30 days. The app log
 line, not the job's, is `Cleared the cached audio fingerprints of N file(s) no longer on disk`. Plex/Emby/Jellyfin webhooks arrive one episode at a
 time: an episode whose season folder a webhook follow-up that hasn't read its files yet already covers joins that
 follow-up (renamed "Intro & Credits · N files") while it stays within 500 files, instead of queuing another. A joined
@@ -486,23 +530,21 @@ Per-file outcomes (`markers.outcomes.FileOutcome`, shown in the job's Files pane
 
 | Key | Label | Meaning |
 |---|---|---|
-| `markers_published` | Markers written | The job changed what at least one server shows (a forced restore included); another marker type may still need review, and the reason names it |
+| `markers_published` | Markers written | The job changed what at least one server shows (a forced restore included); the reason names any other marker type that wasn't found |
 | `markers_up_to_date` | Up to date | Every enabled server already showed these markers (read back before saying so) |
-| `markers_waiting` | Waiting | A server hasn't indexed the file yet, Plex didn't answer its Plex Pass check, or a Plex item's versions don't yet agree |
-| `markers_needs_review` | Needs review | At least one marker wasn't sent (the sources disagree, or the only answer can't decide alone), and the job wrote nothing else for the file. The server row's message gives each such marker's reason |
-| `markers_none` | No markers found | No source found an intro or credits for this file |
+| `markers_waiting` | Waiting | A server hasn't indexed the file yet, or Plex didn't answer its Plex Pass check |
+| `markers_none` | No markers found | No source found an intro or credits for this file, or nothing confirmed one; the server row's message gives the reason |
 | `markers_no_owners` | No server with Intro & Credits on | No enabled server with Intro & Credits on holds this file |
 | `skipped_file_not_found` | Not Found | File not found on disk |
 | `markers_skipped` | Skipped | Every server that owns this file can't take markers right now (see the [capability states](guides.md#troubleshooting-intro--credits) — a plugin missing, Plex not ready, etc.), or the file is a trailer or other extra (reason "Extras aren't checked for markers") |
 | `failed` | Failed | Processing failed |
 
 Per-server row statuses (`markers.outcomes.ServerStatus`) use the same `markers_written` / `markers_up_to_date` /
-`markers_needs_review` / `markers_skipped` / `markers_waiting` / `failed` keys, plus `markers_none` (nothing to
+`markers_skipped` / `markers_waiting` / `failed` keys, plus `markers_none` (nothing to
 publish on that server). A file's overall outcome shows what still needs something, first match wins: any server
 failed → failed; any server waiting with a retry queued (not indexed yet, Plex Pass unconfirmed) → waiting; any
-written → published (or waiting while another server waits for the item's versions); any marker in review → needs
-review; any server waiting → waiting; any up to date → up to date; any with nothing to publish → no markers; otherwise
-skipped. So one server that is still
+written → published; any server waiting → waiting; any up to date → up to date; any with nothing to publish → no
+markers; otherwise skipped. So one server that is still
 waiting (or failed) is never hidden behind another server that was written or is up to date. Retries and verify jobs
 read the per-server rows, not this outcome.
 
@@ -521,13 +563,15 @@ decided, per marker type:
 {"intro": {"chapters": 40, "theintrodb+skipdb": 6}, "credits": {"chapters": 40, "credits_text": 9, "theintrodb+server_markers": 3}}
 ```
 
+Any job's `progress.cpu_fallback_files` counts the files a GPU worker ran on the CPU because its GPU failed (`0`
+when none did); the job summary shows it as "N files ran on the CPU because the GPU failed".
+
 A file counts once per decided marker type, under one group: its marker's sources (source ids from Settings, joined
 with `+`, in your source order). A marker a chapter set counts as `chapters` even when other sources agreed (a chapter
 decides on its own; they only confirmed or trimmed it); markers already on servers (`server_markers`, importer copies
 included) are named only when they were the one other opinion a single source needed; the user's own marker is
 `user`. A file counts when its run ends with any outcome but `failed`, so a file whose every server was skipped still
-counts what its sources decided, while a type in review, and a file not found, with no server, or an extra, never
-count. A job revived after a restart counts the files it carries from what the markers store holds for them. The
+counts what its sources decided, while a file not found, with no server, or an extra never counts. A job revived after a restart counts the files it carries from what the markers store holds for them. The
 Dashboard shows these as **Decided by** under the job's per-server breakdown, biggest group first, at most five groups
 per type (the rest add up under "other").
 
@@ -672,7 +716,7 @@ length cap and the position windows that catch a wrong source are not applied.
 ```
 
 `markers` holds every stored marker of the file, keyed by type. Per server, `result` is `written`, `unchanged`,
-`waiting`, `failed`, `not_enabled` (Intro & Credits is off there), `nothing_to_publish` or `needs_review`; `message` is
+`waiting`, `failed`, `not_enabled` (Intro & Credits is off there) or `nothing_to_publish`; `message` is
 the same wording a job's row carries. `can_show` is what that server type can display and `cant_show` the saved types it
 can't (Plex and Emby take no recap or preview). `notes` are per-field notes: on Emby an edited credits `end` is accepted
 and published start-only, and the note says so. `replaced_own` lists the types whose own markers that server lost to
@@ -706,7 +750,7 @@ run decides those types again.
 
 **Response:** `200` with `canonical_path`, `unlocked` (the requested types that were locked; the rest were already
 unlocked), `markers` (the file's remaining stored markers) and `decisions`, by type, for the requested types that have
-one: `{"intro": {"status": "needs_review", "reason": "unlocked; the next run decides this type again"}}`. `400`, `404`
+one: `{"intro": {"status": "no_evidence", "reason": "unlocked; the next run decides this type again"}}`. `400`, `404`
 and `503` as above; `409` when the server is off or the file was never analysed.
 
 #### GET /api/markers/season
@@ -727,15 +771,12 @@ per-episode `GET /api/markers/item` stays the place for what a server shows righ
   and the same season number; at most the 40 nearest in a flat folder of hundreds; extras left out), each with `path`,
   `name`, `episode` (`"E01"`), `known` (the app has looked at it), `duration_ms`, `intro` and `credits`
   (`{status, reason, marker, proposed}` as in `GET /api/markers/item`),
-  `needs_review` (any marker type in Needs review, recap and preview included) with `review_reason` (the first such
-  type's reason, `""` when none),
   `evidence` chips (`[{source, label}]`: the sources with intro or credits evidence, markers already on servers left
   out; only season audio has a `label`, e.g. `"10/10"`) and `servers` dots (`{server_id: {state, message}}`, `state`
   one of `ok` — last publish wrote our markers, `none` — nothing of ours there or never published, `waiting`,
   `failed`, `skipped`, or `off` — Intro & Credits off there, or this episode's library isn't selected or is excluded).
-- `counts` — `episodes` (the episodes listed), `total_episodes` (the season's size before the 40-nearest cap), `ready`
-  (at least one decided marker of any type: what Publish sends, even when another type is in Needs review) and
-  `needs_review` (any type in Needs review).
+- `counts` — `episodes` (the episodes listed), `total_episodes` (the season's size before the 40-nearest cap) and
+  `ready` (at least one decided marker of any type: what Publish sends).
 
 `400` `{"error": "Path is not a file inside any server library"}` (also for a missing `path`) or `{"error": "Not a TV
 episode"}` (no `SxxEyy` in its name). `500` `{"error": "Couldn't build the Season view for this file"}`.
@@ -793,15 +834,15 @@ or low"}`. `503` when the config directory isn't writable (checked before the bo
 
 ## Plex loudness
 
-Plex's loudness analysis run on this app's workers ([Plex loudness](plex-loudness-normalization.md)). Plex servers only;
+Audio loudness analysis on this app's workers ([Plex loudness](plex-loudness-normalization.md)). Plex servers only;
 off until turned on per server.
 
 ### Per-server settings (`media_servers[].loudness`)
 
 | Key | Type | Notes |
 |---|---|---|
-| `enabled` | bool | Default `false`. Turning it on needs the server's Plex database write confirmed (`markers.plex.db_write_confirmed_at`), and no Plex marker agent (`markers.plex.agent.enabled`). |
-| `library_ids` | array of strings \| `null` | Libraries it goes to. `null` = every movie and TV library; a list is taken literally (music included). |
+| `enabled` | bool | Default `false`. Independent of Intro & Credits and its write confirmation. Requires a local Plex 1.43.4.x database on the same machine; the Plex helper (`markers.plex.agent.enabled`) is unsupported. Setup Health checks readiness. |
+| `library_ids` | array of strings \| `null` | Libraries it goes to. `null` = every movie and TV library. An explicit list selects video libraries only; known music and other non-video types are refused. |
 
 ### Job kind `loudness`
 
@@ -842,7 +883,7 @@ follow-up, `server_id`. File outcomes:
 | Media server (Plex / Emby / Jellyfin) | `/data/media/Movies/film.mkv` |
 | This Container | `/media/Movies/film.mkv` |
 
-Without mapping, you'll see "Skipping as file not found" errors.
+Without mapping, the app can't find the files and jobs report them as not found.
 
 ### Configuration (Web UI)
 
@@ -1212,6 +1253,33 @@ An optional `config` object may set `force_generate`, `regenerate_thumbnails`, `
 
 **Response:** `{"id": "job-123", "status": "pending", "message": "Job created successfully"}`
 
+Optional [media filters](#per-job-media-filters) go in `config`. For example,
+process movies added in the last 30 days and released in 2020 or later:
+
+```json
+{
+  "library_id": "1",
+  "library_name": "Movies",
+  "config": {
+    "sort_by": "newest",
+    "added_filter": "last_days",
+    "added_last_days": 30,
+    "movie_year_from": 2020
+  }
+}
+```
+
+For TV libraries, `"latest_seasons": 2` selects the most recent two available
+seasons per show. In mixed selections, movie-year restrictions affect only
+movies and season restrictions affect only episodes. Shared added-date
+restrictions apply to both.
+
+Invalid filter values return HTTP 400 before a job is created. Days and season
+counts must be positive JSON integers, not strings, booleans, or fractions.
+Date ranges need both valid endpoints in chronological order; a movie-year
+range may have one bound, but cannot have its lower bound exceed its upper bound.
+Fields belonging to an inactive added-date mode are cleared during normalization.
+
 #### GET /api/jobs/{id}
 
 ```json
@@ -1293,9 +1361,13 @@ explicit `null` clears it.
 
 `config.job_type` accepts:
 
-- `"full_library"` *(default — optional, omit to get the same behaviour)* — schedule runs a full library scan via the standard job pipeline, processing every item in `library_id` that's missing previews.
+- `"full_library"` *(default — optional, omit to get the same behaviour)* — schedule runs a full library scan via the standard job pipeline, processing matching items in `library_id` that are missing previews. Its `config` accepts the same [media filters](#per-job-media-filters) as `POST /api/jobs`.
 - `"recently_added"` — schedule runs a Recently Added scan instead. Requires `config.lookback_hours` (float, clamped to 0.25–720). Scans only items added within the lookback window (Plex `addedAt`, Emby/Jellyfin `DateCreated`), counted back from when the job was created (a job that waited for a slot, or was revived after a restart, still covers that window; a tick while the schedule's last scan hasn't started queues nothing, widening that scan's window when this tick looks further back), as one preview job with a Files-panel row per file, the usual retry for files a server hasn't indexed yet, and revival after a restart. Its files also get an Intro & Credits follow-up (`source: "recently_added"`) when a server with Intro & Credits on holds them. When `library_id` is `null`, the scan falls back to the globally selected libraries in Settings (or every supported library when no global filter is set); when set, only that section is scanned. Works for Plex, Emby, and Jellyfin — each vendor's processor implements `scan_recently_added` against its native API.
 - `"intro_credits"` — schedule creates an [Intro & Credits](#intro--credits) job (`kind=intro_credits`) instead of a preview job, for the schedule's libraries (every library Intro & Credits goes to when none are chosen). LOW priority unless the schedule sets one. A schedule with a `server_id` publishes to that server only (the job's `server_id`), as a scheduled preview job does. Skipped while an earlier Find markers job from the same schedule is still pending or running. With `config.reconcile: true` it queues Intro & Credits · Check servers instead (every server; libraries and server don't apply; the UI shows it as "All servers"), skipped while any Check servers job is still pending or running. A start tick (or `POST /api/schedules/{id}/run`) first resumes every Intro & Credits job of the schedule that its stop time paused, whichever of the two it is (the schedule may have been switched since), and then queues nothing that tick; the check above applies only when it resumed nothing. A job paused by hand (`POST /api/jobs/{id}/pause`) is never resumed by a tick, and a stop tick doesn't take over a pause made by hand; the job's config carries `paused_by_schedule: true` from a stop-time pause until the next resume, pause by hand, or the job's end. Deleting a schedule leaves its paused jobs paused and logs a WARNING naming each; so does a `PUT` that switches `config.job_type` to a kind its start ticks don't resume (`intro_credits` ↔ `full_library`, or either to `recently_added`), for each job its stop time paused. While a Check servers job runs, its config also carries `check_servers_listing` (the files it listed), so a run revived after a restart checks those same files; the key is dropped when the job ends.
+
+Full-scan media filters are cleared when saving a Recently Added or Intro & Credits schedule. Filter
+validation also runs before creating or updating a full-library schedule; invalid
+values return HTTP 400 without changing the saved schedule.
 
 ### System Endpoints
 
@@ -1320,7 +1392,7 @@ For full design and per-vendor details see [Multi-Media-Server](multi-server.md)
 | POST | `/api/servers/test-connection` | Test a candidate config without saving |
 | POST | `/api/servers/<id>/refresh-libraries` | Re-fetch the server's library list |
 | GET | `/api/servers/owners?path=...` | Diagnose which servers own a given path |
-| GET | `/api/servers/<id>/output-status?path=...&item_id=...` | Whether publisher output files exist for a path on this server. `item_id` is required for **Plex** servers (the bundle hash is keyed by item id); optional for Emby and Jellyfin. Plex requests without `item_id` return `{"needs_item_id": true}`. |
+| GET | `/api/servers/<id>/output-status?path=...&item_id=...` | Whether publisher output files exist for a path on this server. Plex computes its bundle destination from the readable local source file and requires neither `item_id` nor a live connection. Emby also derives its path locally. Jellyfin off-media output requires `item_id`. |
 | POST | `/api/servers/auth/emby/password` | Username+password → Emby token |
 | POST | `/api/servers/auth/jellyfin/password` | Username+password → Jellyfin token |
 | POST | `/api/servers/auth/jellyfin/quick-connect/initiate` | Begin Quick Connect ceremony |
@@ -1372,7 +1444,7 @@ Every other one:
 ```
 
 `quality` comes from the file's name. `preview.state` is `ready`, `missing`, or `unknown` (a server couldn't be
-asked); `frames` is the BIF's frame count (null for trickplay). `markers.state` is `not_checked`, `needs_review`,
+asked); `frames` is the BIF's frame count (null for trickplay). `markers.state` is `not_checked`,
 `both` ("Intro + credits"), `credits` ("Credits set" for a film, "Credits only" for an episode), `intro` or `none`
 ("Nothing found"), from markers.db only. A file that took longer than 12 seconds to check has `error` instead.
 `400` for a body that isn't `{"paths": [...]}` or has more than 30.
@@ -1430,11 +1502,25 @@ Inbound webhook endpoints for Radarr/Sonarr/Custom integration. Webhook endpoint
 > [!TIP]
 > The new **universal webhook URL** at `POST /api/webhooks/incoming` auto-detects the vendor (Plex / Emby / Jellyfin / Sonarr / Radarr / templated path) so you only need one URL across every server. Falls back to per-server URLs at `POST /api/webhooks/server/<server_id>` for ambiguous setups (rare). See [Multi-Media-Server — Webhook configuration](multi-server.md#webhook-configuration-per-vendor) for details.
 
+#### Webhook delay parameter
+
+All ingestion routes — `POST /api/webhooks/radarr`, `/sonarr`, `/sportarr`, `/custom`, `/plex`, `/incoming`, and `/server/<server_id>` — accept optional `delay=<seconds>` in the URL query string. The value must be a whole number from **1 to 3600** (up to one hour); invalid values return **400**. Omission uses the current `webhook_delay` setting.
+
+Examples: `/api/webhooks/radarr?delay=30`, `/api/webhooks/sonarr?delay=300`, `/api/webhooks/incoming?token=YOUR_TOKEN&delay=30`, or `/api/webhooks/server/plex-main?delay=30`. Use `&delay=30` when another query parameter is already present.
+
+On `/radarr`, `/sonarr`, `/sportarr`, `/custom`, and legacy `/plex`, each accepted new file resets its source/server batch deadline using that request's effective delay. The latest request sets the timer if values differ within one batch, subject to a maximum batch age equal to the greater of 600 seconds and the longest delay accepted into that batch. The age is measured from its first file, so late arrivals can receive less than the full delay; arrivals after the limit open a new batch. Ignored duplicates do not reset the deadline. The batch age limit is persisted with the job.
+
+On `/incoming` and `/server/<server_id>`, each resolved file version keeps its own job and initial deadline. The wait starts when that job is queued, after any vendor API lookup needed to resolve the payload. Jobs retain their vendor item IDs, publisher pin, and optional `regenerate` flag. Later arrivals do not reset other jobs' deadlines; existing duplicate suppression still applies. **Behavior change:** these two routes previously started immediately; they now use the global delay when omitted. Use `delay=1` for the shortest supported wait.
+
+All pending webhook deadlines are persisted and restored by automatic restart recovery. Processing still honors pause and worker availability. **Fire now** skips the remaining initial wait; automatic retries use their separate retry backoff, and manual **Reprocess** starts without the original batching delay.
+
+Initial media-server scan requests on source-specific import routes remain immediate; the delay controls job processing.
+
 #### POST /api/webhooks/incoming
 
 Universal webhook router. Inspect the request body, classify it as Plex / Emby / Jellyfin / Sonarr / Radarr / generic-`{path: ...}`, and dispatch to every server that owns the resolved canonical path. Works alongside the per-vendor URLs below — you can keep using those, or replace them all with this one.
 
-Returns 200 with the dispatch result (`status`, `kind`, `canonical_path`, `publishers[]`, `frame_count`) on success, 202 with `status: "ignored"` for noise events the router intentionally drops (e.g. Jellyfin `PlaybackStart`), 400 for unrecognised payloads, 401 for bad auth, 413 for payloads above the 1 MiB cap.
+Returns **202** with `status: "queued"`, `kind`, `canonical_path`, and `job_id` for one resolved version; multiple versions return a `jobs` array and `version_count`. Jobs wait for the [webhook delay](#webhook-delay-parameter) before processing. Duplicate notifications return **202** with `status: "ignored_duplicate"`; noise events return **202** with `status: "ignored"`. Returns **400** for unrecognised payloads or invalid delays, **401** for bad auth, and **413** for payloads above the 1 MiB cap.
 
 #### POST /api/webhooks/server/{server_id}
 
@@ -1692,7 +1778,7 @@ unless noted.
 | POST | `/api/jobs/{id}/priority` | Change a pending/running job's priority (`{"priority": 1\|2\|3}`; 1 = high) |
 | POST | `/api/jobs/{id}/reprocess` | Re-run a finished job with the same config: `201` with the new job (an Intro & Credits job keeps its schedule), `409` while it's pending or running. A Check servers job is queued like `POST /api/markers/reconcile` and answers the same way (`202` `{"job_id", "already_queued"}`, reusing one already queued or running). A Re-run clears the global pause. |
 | POST | `/api/jobs/{id}/retry-now` | Skip the retry back-off on a chain-head job whose next attempt is currently in the back-off countdown. Returns 200 + `{"fired": true, ...}` on success, 409 when no retry is pending, 400 if the job isn't a chain head. |
-| POST | `/api/jobs/{id}/fire-webhook-now` | Skip the debounce window on a webhook-batch job that's still waiting to dispatch. Looks up the in-memory batch by `job_id` and cancels its threading timer, then dispatches the same callback synchronously. 202 on success, 404 when the job has no live pending batch (already fired, never had one, or container restart cleared the in-memory dict). |
+| POST | `/api/jobs/{id}/fire-webhook-now` | Skip the initial wait on a pending webhook job, including source-specific batches and universal/per-server jobs. Returns 202 when dispatched, or 404 when no pending webhook timer exists for the job. Automatic restart recovery restores pending timers from saved job deadlines. |
 | GET | `/api/jobs/{id}/logs` | Paginated log stream — `?offset=&limit=` (limit capped at 5000); or legacy `?last=N` for the tail |
 | GET | `/api/jobs/{id}/files` | Per-file outcomes — paginated `?page=&per_page=` (per_page capped at 500), plus optional `?outcome=` and `?search=` filters. The underlying per-job JSONL is itself soft-capped at 5000 rows; past that, a `truncated` marker row appears and aggregate counts remain in `progress.outcome`. |
 | POST | `/api/jobs/clear` | Delete completed/failed jobs from the queue |
@@ -1715,7 +1801,7 @@ unless noted.
 | PUT | `/api/settings/log-level` | Change runtime log verbosity (`{"level": "DEBUG"\|"INFO"\|...}`) |
 | POST | `/api/settings/validate-local-path` | Pre-flight a mount/volume path before saving (exists + readable) |
 | POST | `/api/settings/validate-plex-config-folder` | Pre-flight a Plex config folder (looks for `Cache/Media/Metadata`) |
-| GET | `/api/settings/backups` | List rolling settings.json backup snapshots |
+| GET | `/api/settings/backups` | List the backups of each config file (`settings.json`, `schedules.json`, `webhook_history.json`, `setup_state.json`) |
 | POST | `/api/settings/backups/restore` | Restore a prior settings.json snapshot |
 | POST | `/api/setup/skip` | Skip the setup wizard (advanced — saves `setup_complete=true` with minimal state) |
 | POST | `/api/setup/validate-paths` | Pre-flight wizard path fields in bulk |
@@ -1736,8 +1822,8 @@ unless noted.
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/webhooks/sportarr` | Sonarr-compatible feed for [Sportarr](https://github.com/Sportarr/Sportarr) (falls back to flat `filePath`) |
-| GET | `/api/webhooks/pending` | Batches currently debouncing — per-source key, countdown, and queued paths |
-| POST | `/api/webhooks/pending/{debounce_key}/fire-now` | Skip the debounce timer and dispatch the batch immediately |
+| GET | `/api/webhooks/pending` | Pending webhook waits — batch or job key, countdown, and queued paths |
+| POST | `/api/webhooks/pending/{debounce_key}/fire-now` | Skip the initial timer and dispatch the pending webhook job immediately |
 
 ### System & diagnostics
 
@@ -1751,8 +1837,8 @@ unless noted.
 | GET | `/api/system/version` | App version + commit SHA + build date |
 | GET | `/api/system/browse` | Folder picker: lists sub-directories of `?path=` (default `/`). `?include_files=1` also returns video files (each entry has `is_dir`); `?show_hidden=1` includes dot-entries. System dirs (`/proc`, `/sys`, …) are denied. |
 | GET | `/api/system/notifications` | In-app notification list (health checks, deprecations, warnings) |
-| POST | `/api/system/notifications/{id}/dismiss` | Session-only dismiss |
-| POST | `/api/system/notifications/{id}/dismiss-permanent` | Persistent dismiss (stored in settings) |
+| POST | `/api/system/notifications/{id}/dismiss` | Dismiss until the next restart |
+| POST | `/api/system/notifications/{id}/dismiss-permanent` | Dismiss for good (stored in settings). `400` for `media_mount_unhealthy` (a media folder that looks empty or unmounted) and `gpu_keeps_failing_<device>` (a GPU whose last 5 files ran on the CPU), which can only be dismissed until the next restart. A dismissed **Settings migrated** notice comes back after the next upgrade that changes the settings format |
 | POST | `/api/system/notifications/reset-dismissed` | Clear all permanent dismissals |
 | GET | `/api/system/whats-new` | Release-notes viewer payload (version + changes since last-seen) |
 | POST | `/api/system/whats-new/dismiss` | Mark the current version's notes as seen |

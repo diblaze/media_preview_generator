@@ -1206,6 +1206,7 @@ class TestJobsAPI:
             "remaining_time",
             "fallback_active",
             "fallback_reason",
+            "fallback_title",
             "ffmpeg_started",
             "current_phase",
         }
@@ -2290,7 +2291,7 @@ class TestSettingsAPI:
         resp = client.get("/api/settings", headers=_api_headers())
         assert resp.status_code == 200
         data = resp.get_json()
-        assert data["webhook_retry_count"] == 3
+        assert data["webhook_retry_count"] == 5
         assert data["webhook_retry_delay"] == 30
 
     def test_save_webhook_retry_settings(self, client):
@@ -2425,6 +2426,66 @@ class TestJobConfigPathMappings:
         assert len(captured_configs) == 1
         expected = normalize_path_mappings({"path_mappings": settings_path_mappings})
         assert captured_configs[0].path_mappings == expected
+
+    def test_worker_callback_carries_the_cpu_fallback_state_to_the_workers_api(self, client, tmp_path):
+        """Mid-job the Workers panel reads ``job_manager`` rows, not the dispatcher's
+        dicts. Dropping the fallback fields there meant the browser first saw
+        ``fallback_active`` after the job ended, when the title was already blank.
+        """
+        from media_preview_generator.web.jobs import get_job_manager
+
+        seen: list[dict] = []
+        done = threading.Event()
+
+        def capture_run_processing(config, *args, **kwargs):
+            kwargs["worker_callback"](
+                [
+                    {
+                        "worker_id": 1,
+                        "worker_type": "GPU",
+                        "worker_name": "GPU Worker 1 (Quadro P5000)",
+                        "status": "processing",
+                        "current_title": "AV1 Clip 3 (2019)",
+                        "fallback_active": True,
+                        "fallback_reason": "GPU processing failed (exit code 255)",
+                        "fallback_title": "AV1 Clip 3 (2019)",
+                    }
+                ]
+            )
+            seen.extend(w.to_dict() for w in get_job_manager().get_worker_statuses())
+            done.set()
+
+        mock_config = MagicMock()
+        mock_config.path_mappings = []
+        mock_config.tmp_folder = str(tmp_path)
+        mock_config.plex_url = "http://test"
+        mock_config.plex_token = "token"
+
+        with (
+            patch(
+                "media_preview_generator.jobs.orchestrator.run_processing",
+                side_effect=capture_run_processing,
+            ),
+            patch("media_preview_generator.config.load_config", return_value=mock_config),
+            patch(
+                "media_preview_generator.processing.generator._verify_tmp_folder_health",
+                return_value=(True, []),
+            ),
+            patch(
+                "media_preview_generator.utils.setup_working_directory",
+                return_value=str(tmp_path / "work"),
+            ),
+            patch("media_preview_generator.gpu.detect.detect_all_gpus", return_value=[]),
+        ):
+            resp = client.post("/api/jobs", headers=_api_headers(), json={})
+            assert resp.status_code == 201
+            assert done.wait(timeout=2.0), "run_processing was not called"
+
+        assert len(seen) == 1, seen
+        assert seen[0]["worker_name"] == "GPU Worker 1 (Quadro P5000)"
+        assert seen[0]["fallback_active"] is True
+        assert seen[0]["fallback_reason"] == "GPU processing failed (exit code 255)"
+        assert seen[0]["fallback_title"] == "AV1 Clip 3 (2019)"
 
     def test_start_job_does_NOT_accept_path_mappings_override(self, client, tmp_path):
         """``path_mappings`` is a Settings-level concept, not a per-job override.
@@ -6577,6 +6638,39 @@ class TestBackupRestore:
         ]
         assert any(p.read_text() == '{"label": "current"}' for p in snapshots)
 
+    def test_restores_within_one_second_keep_the_file_as_it_was_before_the_first(self, client, monkeypatch, tmp_path):
+        """Two restores in one second: the snapshot of that second is the file before either (``utils.backup_file``),
+        not the first restore's result written over it."""
+        from datetime import datetime as _real_datetime
+
+        from media_preview_generator import utils
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        class _FrozenClock:
+            @staticmethod
+            def now(tz=None):
+                return _real_datetime(2026, 9, 1, 12, 0, 0, tzinfo=tz)
+
+        monkeypatch.setattr(utils, "datetime", _FrozenClock)
+        monkeypatch.setattr(get_settings_manager(), "config_dir", tmp_path)
+        live = tmp_path / "settings.json"
+        live.write_text('{"label": "current"}')
+        january = tmp_path / "settings.json.20260101-100000.bak"
+        february = tmp_path / "settings.json.20260201-100000.bak"
+        january.write_text('{"label": "from-january"}')
+        february.write_text('{"label": "from-february"}')
+
+        for backup in (january.name, february.name):
+            resp = client.post(
+                "/api/settings/backups/restore",
+                headers=_api_headers(),
+                json={"file": "settings.json", "backup": backup},
+            )
+            assert resp.status_code == 200, resp.get_json()
+
+        assert live.read_text() == '{"label": "from-february"}'
+        assert (tmp_path / "settings.json.20260901-120000.bak").read_text() == '{"label": "current"}'
+
     def test_restore_defaults_to_newest_when_backup_param_omitted(self, client, monkeypatch, tmp_path):
         """Backwards-compat: restore without `backup` picks the newest snapshot."""
         from media_preview_generator.web.settings_manager import get_settings_manager
@@ -6713,3 +6807,103 @@ class TestSettingsManagerWebhookMigration:
         sm = SettingsManager(config_dir=str(cfg))
         assert sm.get("plex_webhook_public_url") is None
         assert sm.get("media_servers") == []
+
+
+class TestFullScanFilterAPI:
+    @pytest.mark.parametrize("endpoint", ["jobs", "schedules", "schedule_update"])
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"added_filter": "last_days", "added_last_days": True},
+            {"added_filter": "last_days", "added_last_days": 0},
+            {"added_filter": "last_days", "added_last_days": 10**100},
+            {"added_filter": "date_range", "added_from": "2026-02-30", "added_to": "2026-03-01"},
+            {"latest_seasons": 1.5},
+            {"movie_year_from": 2026, "movie_year_to": 2025},
+        ],
+    )
+    def test_rejects_invalid_filter_before_mutating_job_or_schedule(self, client, endpoint: str, config: dict) -> None:
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        manager = get_schedule_manager()
+        old_schedule = manager.create_schedule(name="Original", cron_expression="0 3 * * *", enabled=False)
+        before = manager.get_all_schedules()
+        with patch("media_preview_generator.web.routes.api_jobs._start_job_async") as start:
+            if endpoint == "schedule_update":
+                response = client.put(
+                    f"/api/schedules/{old_schedule['id']}", headers=_api_headers(), json={"config": config}
+                )
+            else:
+                response = client.post(
+                    f"/api/{endpoint}",
+                    headers=_api_headers(),
+                    json={"name": "Filtered", "cron_expression": "0 3 * * *", "config": config},
+                )
+        assert response.status_code == 400, response.get_json()
+        assert response.get_json()["error"]
+        start.assert_not_called()
+        assert get_job_manager().get_all_jobs() == []
+        assert manager.get_all_schedules() == before
+
+    def test_valid_filter_config_roundtrips_job_overrides_and_schedule_edits(self, client) -> None:
+        filters = {"added_filter": "last_days", "added_last_days": 30, "latest_seasons": 2, "movie_year_from": 2020}
+        with patch("media_preview_generator.web.routes.api_jobs._start_job_async") as start:
+            response = client.post("/api/jobs", headers=_api_headers(), json={"config": filters})
+        assert response.status_code == 201, response.get_json()
+        stored = response.get_json()["config"]
+        overrides = start.call_args.args[1]
+        for key, value in filters.items():
+            assert stored[key] == overrides[key] == value
+        assert stored["added_from"] is stored["added_to"] is stored["movie_year_to"] is None
+
+        response = client.post(
+            "/api/schedules",
+            headers=_api_headers(),
+            json={"name": "Filtered", "cron_expression": "0 3 * * *", "enabled": False, "config": filters},
+        )
+        assert response.status_code == 201, response.get_json()
+        schedule = response.get_json()
+        from media_preview_generator.scan_filters import FILTER_CONFIG_KEYS
+
+        assert schedule["config"] == {key: stored[key] for key in FILTER_CONFIG_KEYS}
+        reset = client.put(
+            f"/api/schedules/{schedule['id']}",
+            headers=_api_headers(),
+            json={"config": {"added_filter": "all", "added_last_days": 30, "added_from": "invalid"}},
+        )
+        assert reset.status_code == 200, reset.get_json()
+        reset_config = reset.get_json()["config"]
+        assert reset_config["added_filter"] == "all"
+        assert all(
+            reset_config[key] is None
+            for key in (
+                "added_last_days",
+                "added_from",
+                "added_to",
+                "latest_seasons",
+                "movie_year_from",
+                "movie_year_to",
+            )
+        )
+
+    @pytest.mark.parametrize("job_type", ["recently_added", "intro_credits"])
+    def test_non_full_scan_schedule_drops_full_scan_filters(self, client, job_type: str) -> None:
+        response = client.post(
+            "/api/schedules",
+            headers=_api_headers(),
+            json={
+                "name": "Recent",
+                "interval_minutes": 60,
+                "enabled": False,
+                "config": {
+                    "job_type": job_type,
+                    "lookback_hours": 1,
+                    "latest_seasons": -1,
+                    "added_filter": "last_days",
+                    "added_last_days": False,
+                },
+            },
+        )
+        assert response.status_code == 201, response.get_json()
+        assert response.get_json()["config"] == {"job_type": job_type, "lookback_hours": 1}

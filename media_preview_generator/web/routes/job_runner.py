@@ -5,6 +5,8 @@ Separated from route handlers for clarity -- this is the bridge between
 the web layer and the CLI processing pipeline.
 """
 
+import os
+import re
 import threading
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
@@ -12,9 +14,12 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, SELF_PAUSED_KINDS
+from ...jobs.orchestrator import SUCCESS_OUTCOME_KEYS, count_successes
+from ...scan_filters import FILTER_CONFIG_KEYS
 from ..job_gate import format_wait_message
 from ..jobs import (
     PRIORITY_NORMAL,
+    JobStatus,
     WorkerStatus,
     get_job_manager,
     incoming_job_priority,
@@ -33,7 +38,131 @@ _inflight_lock = threading.Lock()
 # The only Config attributes a job override may set directly; the other overrides are the named keys the
 # override loop in run_job translates itself. Anything else that names a Config attribute (ffmpeg_path,
 # plex_token, ...) is ignored, since the saved job config is replayed on every start path.
-_CONFIG_ATTRIBUTE_OVERRIDES = frozenset({"regenerate_thumbnails", "sort_by"})
+_CONFIG_ATTRIBUTE_OVERRIDES = frozenset({"regenerate_thumbnails", "sort_by"}) | FILTER_CONFIG_KEYS
+
+
+def _not_found_message(not_found: int, total: int, *, nothing_succeeded: bool, retry_scheduled: bool) -> str:
+    """What a finished job says about files that weren't on disk.
+
+    Path mappings are only blamed when nothing succeeded: a scan that found 115,831 previews in place and 6 files
+    missing has working mappings (job c091d637).
+
+    Args:
+        not_found: Files that ended ``skipped_file_not_found``.
+        total: Every file the job counted.
+        nothing_succeeded: No file ended with its preview in place.
+        retry_scheduled: This job queued a retry.
+
+    Returns:
+        The job log line and completion message.
+    """
+    if not nothing_succeeded:
+        return f"{not_found:,} file(s) weren't found on disk"
+    if retry_scheduled:
+        return f"{not_found} of {total} items had stale Plex paths — Plex rescan triggered, retry scheduled"
+    return f"{not_found} of {total} items skipped (file not found locally) — check path mapping configuration"
+
+
+def _file_problem_clauses(failure_count: int, outcome: dict | None, *, retry_scheduled: bool) -> list[str]:
+    """What a finished job says about files that failed or weren't on disk, each count once.
+
+    Args:
+        failure_count: FFmpeg failures recorded for the job. Only used when the tally counts no failed file.
+        outcome: The job's per-file outcome tally.
+        retry_scheduled: This job queued a retry for stale paths.
+
+    Returns:
+        The clauses, in the order they're read: failed, not found, how many were fine.
+    """
+    outcome = outcome or {}
+    not_found = outcome.get("skipped_file_not_found", 0)
+    failed = outcome.get("failed", 0)
+    total = sum(outcome.values())
+    nothing_succeeded = count_successes(outcome) == 0
+    # A file still waiting on its server isn't a failure of this run.
+    fine = count_successes(outcome) + outcome.get("skipped_not_indexed", 0)
+    # With files not found and nothing made, the not-found clause already says the run made nothing.
+    tally_failed = failed > 0 and not (not_found > 0 and nothing_succeeded)
+
+    clauses = []
+    if tally_failed and fine == 0:
+        clauses.append(
+            f"{failed} of {total} item(s) failed; no previews were generated. Check the per-item logs above."
+        )
+    elif tally_failed:
+        clauses.append(f"{failed:,} file(s) failed")
+    elif failure_count:
+        clauses.append(f"{failure_count:,} file(s) failed")
+    if not_found > 0:
+        clauses.append(
+            _not_found_message(not_found, total, nothing_succeeded=nothing_succeeded, retry_scheduled=retry_scheduled)
+        )
+    if tally_failed and fine > 0:
+        clauses.append(f"{fine:,} of {total:,} file(s) were fine")
+    return clauses
+
+
+def _chapter_completion_warning(
+    publishers: list[dict] | None, *, include_pending: bool, truncated: bool = False
+) -> str | None:
+    """Summarize incomplete chapter artifacts while preserving successful scrubber counts.
+
+    Args:
+        publishers: The current run's aggregates, or merged latest chain aggregates.
+        include_pending: Include waiting chapters when no retry message already explains them.
+        truncated: Some incomplete chapter rows exceeded their own retention cap and could not be retried.
+
+    Returns:
+        A completion warning, or None when all enabled chapter work is complete.
+    """
+    failed = pending = 0
+    for publisher in publishers or []:
+        if not isinstance(publisher, dict) or not isinstance(publisher.get("counts"), dict):
+            continue
+        counts = publisher["counts"]
+        for status, is_pending in (("published_chapters_failed", False), ("published_pending_chapters", True)):
+            count = counts.get(status, 0)
+            if type(count) is not int or count < 1:
+                continue
+            if is_pending:
+                pending += count
+            else:
+                failed += count
+    parts = []
+    if failed:
+        parts.append(f"chapter thumbnails failed for {failed:,} server item(s)")
+    if include_pending and pending:
+        parts.append(f"chapter thumbnails are still pending for {pending:,} server item(s)")
+    if truncated:
+        parts.append("additional chapter thumbnails remain incomplete; run the library again after resolving the cause")
+    if not parts:
+        return None
+    return "Scrubber previews ready; " + "; ".join(parts) + ". See the Files panel for details."
+
+
+_FILE_COUNT_NAME = re.compile(r"\d+ files?$")
+
+
+def _retry_job_label(parent_name: str, paths: list[str]) -> str:
+    """Name a retry job after its parent, counting the files the retry itself runs.
+
+    A parent named for its file count ("8 files", "Manual: 8 files") would otherwise label a 4-file retry
+    "Retry: 8 files". A parent with a real title keeps it.
+
+    Args:
+        parent_name: The parent job's name (a retry's own "Retry: " prefix is dropped, so it never stacks).
+        paths: The files this retry runs.
+
+    Returns:
+        ``"Retry: <name>"``.
+    """
+    name = parent_name.removeprefix("Retry: ")
+    count = "1 file" if len(paths) == 1 else f"{len(paths)} files"
+    if not name:
+        name = os.path.basename(paths[0]) if len(paths) == 1 else count
+    else:
+        name = _FILE_COUNT_NAME.sub(count, name)
+    return f"Retry: {name}"
 
 
 def _classify_job_completion(
@@ -65,16 +194,9 @@ def _classify_job_completion(
     success columns) also trips.
     """
     outcome = outcome or {}
-    success_total = (
-        outcome.get("generated", 0)
-        + outcome.get("published", 0)
-        + outcome.get("skipped_output_exists", 0)
-        + outcome.get("skipped_bif_exists", 0)
-    )
+    success_total = count_successes(outcome)
     has_any_failure = bool(failures) or outcome.get("failed", 0) > 0
-    all_not_found = (
-        outcome.get("generated", 0) == 0 and outcome.get("skipped_file_not_found", 0) > 0 and not spawned_retry_id
-    )
+    all_not_found = success_total == 0 and outcome.get("skipped_file_not_found", 0) > 0 and not spawned_retry_id
     all_items_failed = has_any_failure and success_total == 0
     nothing_resolved = total_paths > 0 and resolved_count == 0 and not spawned_retry_id
     retry_exhausted = is_retry and bool(retry_paths) and not spawned_retry_id
@@ -150,6 +272,27 @@ def _gave_up_text(file_count: int, retries: int) -> str:
         f"{file_count} file(s) still weren't indexed by the media server after {_retries_text(retries)}, so no more "
         "retries are queued. The next scheduled scan will pick them up."
     )
+
+
+def _chain_leftover_warning(not_found: int, failed: int) -> str | None:
+    """What a retry chain that finished still warns about on its head's row.
+
+    A chain re-runs the files waiting on a server and a webhook's missing files. A scan's files that failed or
+    weren't on disk get no retry, so the chain finishing must not wipe them to a green "Completed".
+
+    Args:
+        not_found: Files whose latest result is still ``skipped_file_not_found``.
+        failed: Files whose latest result is still ``failed``.
+
+    Returns:
+        The warning, or None when every file finished.
+    """
+    parts = []
+    if failed:
+        parts.append(f"{failed} file(s) failed")
+    if not_found:
+        parts.append(_not_found_message(not_found, not_found, nothing_succeeded=False, retry_scheduled=False))
+    return _join_error_clauses(parts) or None
 
 
 def _not_indexed_message(count: int, *, is_retry: bool, retry_attempt: int, effective_max: int) -> str:
@@ -387,29 +530,62 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
     try:
         queued = get_job_manager().get_job(job_id)
     except Exception as exc:
-        # The preview thread below reads the job again and reports the failure on the job.
-        logger.debug("Could not read job {} to pick its runner: {}", job_id, exc)
-        queued = None
-    if queued is not None and queued.kind == JOB_KIND_INTRO_CREDITS:
+        # Without its saved state we cannot safely select a runner or honor a
+        # webhook deadline. Leave it pending for a later resume/recovery call.
+        logger.error("Could not read job {} before starting; leaving it unchanged: {}", job_id, exc)
+        return
+    if queued is None:
+        return
+    if queued.kind == JOB_KIND_INTRO_CREDITS:
         from ...markers.job_runner import start_intro_credits_job_async
 
         start_intro_credits_job_async(job_id, config_overrides)
         return
-    if queued is not None and queued.kind == JOB_KIND_LOUDNESS:
+    if queued.kind == JOB_KIND_LOUDNESS:
         from ...loudness.job import start_loudness_job_async
 
         start_loudness_job_async(job_id, config_overrides)
         return
+    from ..webhooks import ensure_pending_webhook
+
+    if ensure_pending_webhook(job_id):
+        return
+    if (config_overrides or {}).get("webhook_debounce_pending") is True:
+        # A timer can close the batch while restart/resume holds an earlier snapshot.
+        # Use the final paths; never reinstall that snapshot's obsolete deadline.
+        current = get_job_manager().get_job(job_id)
+        if current is None or current.status != JobStatus.PENDING:
+            return
+        config_overrides = dict(current.config)
     if config_overrides and INTRO_CREDITS_FOLLOW_UP in config_overrides:
         # Only the saved config asks for the follow-up (a revival passes a copy of it): the job's own writes below
         # must never put back a request already taken.
         config_overrides = {k: v for k, v in config_overrides.items() if k != INTRO_CREDITS_FOLLOW_UP}
     with _inflight_lock:
         duplicate = job_id in _inflight_jobs
+        terminal = False
         if not duplicate:
-            _inflight_jobs.add(job_id)
-    if duplicate:
-        logger.info("Skipping duplicate _start_job_async for {} — already in flight", job_id)
+            try:
+                current = get_job_manager().get_job(job_id)
+                terminal = current is None or current.status in (
+                    JobStatus.CANCELLED,
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                )
+            except Exception as exc:
+                logger.debug("Could not re-read job {} before starting its thread: {}", job_id, exc)
+                # A failed lookup is unknown, unlike a successful missing-row read. Let the preview thread
+                # report the error unless the last successful read already proved the job terminal.
+                terminal = queued is not None and queued.status in (
+                    JobStatus.CANCELLED,
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                )
+            if not terminal:
+                _inflight_jobs.add(job_id)
+    if duplicate or terminal:
+        if duplicate:
+            logger.info("Skipping duplicate _start_job_async for {} — already in flight", job_id)
         _queue_intro_credits_follow_up(job_id, config_overrides)
         return
 
@@ -437,7 +613,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
             from ...config import ConfigValidationError, load_config
             from ...jobs.orchestrator import run_processing
-            from ...jobs.worker import is_job_thread_for, register_job_thread
+            from ...jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread
             from ...processing.generator import (
                 _verify_tmp_folder_health,
                 clear_failures,
@@ -483,9 +659,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                 The thread→job_id mapping in worker.py is keyed per job, so
                 a sibling job's worker threads (e.g. a Radarr webhook
                 completing while a manual library scan is winding down)
-                won't leak into this job's log buffer (D5).
+                won't leak into this job's log buffer (D5). A record bound
+                with ``JOB_LOG_SKIP`` is the app log's only.
                 """
-                return is_job_thread_for(record["thread"].id, job_id)
+                return not record["extra"].get(JOB_LOG_SKIP) and is_job_thread_for(record["thread"].id, job_id)
 
             sm = get_settings_manager()
             job_log_level = sm.get("log_level", "INFO").upper()
@@ -740,6 +917,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         eta=worker_eta,
                         ffmpeg_started=bool(worker_data.get("ffmpeg_started", False)),
                         current_phase=worker_data.get("current_phase", "") or "",
+                        fallback_active=bool(worker_data.get("fallback_active", False)),
+                        fallback_reason=worker_data.get("fallback_reason"),
+                        fallback_title=worker_data.get("fallback_title", "") or "",
                     )
                     job_manager.update_worker_status(worker_key, status)
                 job_manager.prune_worker_statuses(active_worker_keys)
@@ -952,6 +1132,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         else None
                     ) or job_id
 
+                    # A retry's row replaces the file's earlier one, so the head's per-outcome cap must not drop it.
+                    _is_retry_row = _file_results_target != job_id
+
                     def _file_result_cb(file_path, outcome_str, reason, worker, servers=None):
                         job_manager.record_file_result(
                             _file_results_target,
@@ -960,6 +1143,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason,
                             worker,
                             servers=servers,
+                            uncapped=_is_retry_row,
                         )
 
                     # Keyed by job_id so concurrent jobs don't clobber each
@@ -974,7 +1158,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     def _on_dispatch_start():
                         """Transition PENDING -> RUNNING when items are dispatched."""
                         job_manager.start_job(job_id)
-                        job_manager.add_log(job_id, "INFO - Job started")
 
                     def _on_pool_available(pool):
                         """Register pool and reconcile workers with current settings.
@@ -1110,6 +1293,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             upath,
                             unresolved_outcome,
                             f"{unresolved_label} \u2014 {per_path_detail}",
+                            uncapped=_is_retry_row,
                         )
                     is_retry = job_config.get("is_retry", False)
                     retry_attempt = int(job_config.get("retry_attempt", 0))
@@ -1127,12 +1311,14 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # in settings still gets 0 retries everywhere.
                     _cfg_retry_count = job_config.get("webhook_retry_count")
                     if _cfg_retry_count is None:
+                        from ...processing.retry_queue import DEFAULT_RETRY_COUNT
+
                         try:
                             from ..settings_manager import get_settings_manager as _gsm
 
-                            _cfg_retry_count = _gsm().get("webhook_retry_count", 3)
+                            _cfg_retry_count = _gsm().get("webhook_retry_count", DEFAULT_RETRY_COUNT)
                         except Exception:
-                            _cfg_retry_count = 3
+                            _cfg_retry_count = DEFAULT_RETRY_COUNT
                     retry_count = max(0, int(_cfg_retry_count))
                     _cfg_retry_delay = job_config.get("webhook_retry_delay")
                     if _cfg_retry_delay is None:
@@ -1202,10 +1388,17 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # frontend can derive the chain-summary subtitle from
                     # the /attempts response that mirrors this data.
                     pending_by_server: dict[str, int] = {}
+                    # Each file's latest result across the chain, for how the chain head's row ends.
+                    chain_successes = 0
+                    chain_failed = 0
                     for fr in job_manager.get_file_results(_retry_scan_target, dedup_by_path=True):
                         file_path = fr.get("file")
                         if not file_path:
                             continue
+                        if fr.get("outcome") in SUCCESS_OUTCOME_KEYS:
+                            chain_successes += 1
+                        elif fr.get("outcome") == "failed":
+                            chain_failed += 1
                         if fr.get("outcome") == "skipped_file_not_found":
                             not_found_on_disk.append(file_path)
                         else:
@@ -1224,23 +1417,33 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     all_scan_paths = list(unresolved_paths) + not_found_on_disk
 
                     # For retries, start with unresolved webhook paths and add
-                    # original webhook paths when files were not found on disk
-                    # (we can't reverse-map stale Plex paths back to webhook
-                    # paths, so resubmit the originals — already-processed
-                    # items will be skipped as bif_exists). Pending-registration
+                    # the webhook path of each file that wasn't found on disk
+                    # (resubmitted as the webhook sent it, so it resolves again
+                    # from scratch and keeps its item-id hint). Pending-registration
                     # paths are appended directly (already the canonical path
                     # on disk; the fast path in process_canonical_path skips
                     # files whose outputs+sidecars are fresh).
+                    #
+                    # A not-found file this job didn't dispatch has no webhook
+                    # path and isn't resubmitted: a scan's own not-found files,
+                    # which its retry reads in the chain head's rows, used to
+                    # make that retry resubmit every path it had (55b098af).
                     #
                     # webhook_paths lives on the JOB's config dict, not on
                     # global settings — older code read settings.get(...)
                     # which would silently inherit stale paths from any
                     # past job that ever wrote the key globally.
+                    input_by_canonical: dict[str, str] = resolution.get("input_by_canonical") or {}
+                    webhook_inputs = job_config.get("webhook_paths") or []
+                    stale_inputs: list[str] = []
+                    for nf in not_found_on_disk:
+                        wp = input_by_canonical.get(nf) or (nf if nf in webhook_inputs else None)
+                        if wp and wp not in stale_inputs:
+                            stale_inputs.append(wp)
                     retry_paths = list(unresolved_paths)
-                    if not_found_on_disk:
-                        for wp in job_config.get("webhook_paths") or []:
-                            if wp not in retry_paths:
-                                retry_paths.append(wp)
+                    for wp in stale_inputs:
+                        if wp not in retry_paths:
+                            retry_paths.append(wp)
                     for pp in pending_registration_paths:
                         if pp not in retry_paths:
                             retry_paths.append(pp)
@@ -1285,7 +1488,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             parent_library = parent_library[len("Retry: ") :]
                         if not parent_library:
                             parent_library = basenames[0] if len(paths) == 1 else f"{len(paths)} files"
-                        retry_library_name = f"Retry: {parent_library}"
+                        retry_library_name = _retry_job_label(parent_library, paths)
                         parent_id = job_config.get("parent_job_id") or job_id
                         # D15 — the slow backoff schedule (1m, 2m, 5m, 15m, 60m).
                         # The old formula `30 * 2^(n-1)` capped at 5min spaced
@@ -1358,6 +1561,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             "webhook_retry_count": effective_max,
                             "webhook_retry_delay": retry_delay_sec,
                         }
+                        if current_job and (current_job.config or {}).get("source"):
+                            retry_async_config["source"] = current_job.config["source"]
                         # K1: thread server_id through so the retry's worker
                         # builds Config from the right per-server view.
                         # CRITICAL: only inherit the publish-pin when the
@@ -1398,14 +1603,16 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         #               acquires the gate, below)
                         #   completed → parent.status COMPLETED (set at end
                         #               of rj when no more pending)
-                        #   exhausted → parent.status FAILED (set at end of
-                        #               rj when max attempts hit)
+                        #   exhausted → parent.status FAILED, or COMPLETED with a
+                        #               warning when any file of the chain
+                        #               succeeded (set at end of rj when max
+                        #               attempts hit)
                         #
                         # ``source`` comes from the chain head (``parent_id``)
                         # not from ``current_job`` — when this spawner runs
                         # inside an already-active retry continuation,
-                        # current_job is the retry child and its config
-                        # doesn't carry the trigger label.
+                        # current_job is the retry child; older retry children
+                        # may not carry the trigger label in their config.
                         _chain_head_for_source = job_manager.get_job(parent_id) if parent_id != job_id else current_job
                         _chain_head_source = (
                             (_chain_head_for_source.config or {}).get("source") if _chain_head_for_source else None
@@ -1464,7 +1671,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         # ``published_pending_registration``).
                         retry_reason = {
                             "unresolved": len(unresolved_paths),
-                            "stale_paths": len(not_found_on_disk),
+                            "stale_paths": len(stale_inputs),
                             "pending_by_server": dict(pending_by_server),
                         }
 
@@ -1477,8 +1684,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} unresolved")
-                            if not_found_on_disk:
-                                reason_parts.append(f"{len(not_found_on_disk)} stale path(s)")
+                            if stale_inputs:
+                                reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
                                 _by_server_sorted = sorted(pending_by_server.items(), key=lambda kv: -kv[1])
                                 reason_parts.append(", ".join(f"{name} pending × {n}" for name, n in _by_server_sorted))
@@ -1502,8 +1709,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} not found on any server")
-                            if not_found_on_disk:
-                                reason_parts.append(f"{len(not_found_on_disk)} stale path(s)")
+                            if stale_inputs:
+                                reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
                                 _by_server_sorted = sorted(pending_by_server.items(), key=lambda kv: -kv[1])
                                 reason_parts.append(", ".join(f"{name} pending × {n}" for name, n in _by_server_sorted))
@@ -1520,9 +1727,12 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # Terminal chain transition: this is a retry Job, it
                     # didn't spawn another retry, and the parent Job is
                     # the user-visible chain row. Mark the parent terminal:
-                    #   - retry_paths empty → chain succeeded → parent COMPLETED
+                    #   - retry_paths empty → chain finished → parent COMPLETED
+                    #     (with a warning for files no retry covered; FAILED when
+                    #     that warning is set and none of the chain's files succeeded)
                     #   - retry_paths non-empty but max attempts hit →
-                    #     chain exhausted → parent FAILED
+                    #     chain exhausted → parent FAILED when none of the
+                    #     chain's files succeeded, else COMPLETED with a warning
                     # Cancellation is handled in the next block.
                     if (
                         is_retry
@@ -1541,7 +1751,15 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                     )
                                 else:
                                     _chain_outcome = "completed"
-                                    _chain_reason = None
+                                    # Rows stop at the per-outcome cap; the head's own tally doesn't. A file past the
+                                    # cap has no row, so no retry ran it: it is still as the head's run left it.
+                                    _head_tally = _chain_parent.progress.outcome or {}
+                                    _row_cap = job_manager._FILE_RESULTS_PER_OUTCOME_CAP
+                                    _chain_reason = _chain_leftover_warning(
+                                        len(not_found_on_disk)
+                                        + max(0, _head_tally.get("skipped_file_not_found", 0) - _row_cap),
+                                        chain_failed + max(0, _head_tally.get("failed", 0) - _row_cap),
+                                    )
 
                                 # Refresh the chain head's publishers snapshot
                                 # from the parent's JSONL. Walks every attempt
@@ -1556,19 +1774,19 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                 # the modal displayed "already existed"
                                 # everywhere for freshly-generated previews.
                                 _chain_publishers = None
+                                _chapter_rows_truncated = False
                                 try:
                                     from ...jobs.orchestrator import merge_chain_publishers_best_per_path
 
+                                    _chain_file_results = list(
+                                        job_manager.get_file_results(_chain_parent_id, dedup_by_path=False)
+                                    )
+                                    _chapter_rows_truncated = any(
+                                        row.get("outcome") == "truncated:chapter_incomplete"
+                                        for row in _chain_file_results
+                                    )
                                     _chain_publishers = (
-                                        merge_chain_publishers_best_per_path(
-                                            list(
-                                                job_manager.get_file_results(
-                                                    _chain_parent_id,
-                                                    dedup_by_path=False,
-                                                )
-                                            )
-                                        )
-                                        or None
+                                        merge_chain_publishers_best_per_path(_chain_file_results) or None
                                     )
                                 except Exception as exc:
                                     logger.debug(
@@ -1577,6 +1795,14 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                         type(exc).__name__,
                                         exc,
                                     )
+
+                                chapter_warning = _chapter_completion_warning(
+                                    _chain_publishers,
+                                    include_pending=not bool(retry_paths),
+                                    truncated=_chapter_rows_truncated,
+                                )
+                                if chapter_warning:
+                                    _chain_reason = " ".join(part for part in (_chain_reason, chapter_warning) if part)
 
                                 try:
                                     job_manager.upsert_retry_chain_job(
@@ -1591,6 +1817,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                         reason=_chain_reason,
                                         source=(_chain_parent.config or {}).get("source"),
                                         publishers=_chain_publishers,
+                                        successes=max(chain_successes, count_successes(_chain_parent.progress.outcome)),
                                     )
                                 except Exception as exc:
                                     # WARNING (not DEBUG): a terminal-state
@@ -1622,61 +1849,20 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                     job_id,
                                     f"ERROR - {i}. {wt}exit={f['exit_code']} | {f['reason']} | {f['file']}",
                                 )
-                            error_parts.append(f"{len(failures)} failed file(s)")
 
-                        if outcome:
-                            not_found = outcome.get("skipped_file_not_found", 0)
-                            generated = outcome.get("generated", 0)
-                            outcome_failed = outcome.get("failed", 0)
-                            total_outcome = sum(outcome.values())
-                            if not_found > 0 and generated == 0:
-                                if spawned_retry_id:
-                                    msg = (
-                                        f"{not_found} of {total_outcome} items "
-                                        "had stale Plex paths — Plex rescan "
-                                        "triggered, retry scheduled"
-                                    )
-                                else:
-                                    msg = (
-                                        f"{not_found} of {total_outcome} items "
-                                        "skipped (file not found locally) — "
-                                        "check path mapping configuration"
-                                    )
-                                job_manager.add_log(job_id, f"WARNING - {msg}")
-                                error_parts.append(msg)
-                            # Per-item failures (FFmpeg crashes, adapter errors)
-                            # leave the job-level result as "completed" but the
-                            # item outcome counter records them. Surface them
-                            # so the UI badge reflects "all items failed" jobs
-                            # as Failed, not green-Completed.
-                            #
-                            # "Success" includes both legacy ``generated`` AND
-                            # multi-server ``published`` / ``skipped_output_exists``
-                            # — anything where a publisher actually wrote (or
-                            # confirmed) an output counts. Without this, jobs
-                            # that ran via the multi-server scan would always
-                            # report ``generated == 0`` and trip the all-failed
-                            # branch even when most items succeeded.
-                            elif outcome_failed > 0:
-                                published_total = (
-                                    generated
-                                    + outcome.get("published", 0)
-                                    + outcome.get("skipped_output_exists", 0)
-                                    + outcome.get("skipped_bif_exists", 0)
-                                    + outcome.get("skipped_not_indexed", 0)
-                                )
-                                if published_total == 0:
-                                    msg = (
-                                        f"{outcome_failed} of {total_outcome} item(s) failed; "
-                                        "no previews were generated. Check the per-item logs above."
-                                    )
-                                else:
-                                    msg = (
-                                        f"{outcome_failed} of {total_outcome} item(s) failed "
-                                        f"(but {published_total} succeeded)."
-                                    )
-                                job_manager.add_log(job_id, f"WARNING - {msg}")
-                                error_parts.append(msg)
+                        # Not logged clause by clause: the joined summary below is the job log's one line for them.
+                        error_parts.extend(
+                            _file_problem_clauses(
+                                len(failures), outcome, retry_scheduled=bool(spawned_retry_id and stale_inputs)
+                            )
+                        )
+
+                        chapter_warning = _chapter_completion_warning(
+                            current_job.publishers if current_job else None,
+                            include_pending=not bool(spawned_retry_id),
+                        )
+                        if chapter_warning:
+                            error_parts.append(chapter_warning)
 
                         if spawned_retry_id:
                             error_parts.append(f"{len(retry_paths)} path(s) sent for retry")
@@ -1742,7 +1928,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                                 )
                                 if enumeration_warning:
                                     msg = _join_error_clauses([msg, enumeration_warning])
-                                job_manager.add_log(job_id, f"INFO - {msg}")
+                                job_manager.add_log(job_id, f"WARNING - {msg}")
                                 job_manager.complete_job(job_id, warning=msg)
                             elif is_retry:
                                 _level, _msg = _retry_completion_message(

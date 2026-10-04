@@ -12,6 +12,7 @@ from loguru import logger
 
 from ...config import MAX_CPU_THREADS
 from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, SELF_PAUSED_KINDS
+from ...scan_filters import FILTER_CONFIG_KEYS, normalize_scan_filter_config
 from ..auth import (
     api_token_required,
     get_auth_method,
@@ -453,7 +454,9 @@ def get_chain_attempts(chain_id):
     # values. Shared with the retry-decision scan in
     # ``web/routes/job_runner.py`` so the modal's per-pill chips and
     # the retry-spawn decision can't drift.
-    from media_preview_generator.processing.retry_queue import PENDING_PUBLISHER_STATUSES as _PENDING_PUBLISHER_STATUSES
+    from ...job_kinds import JOB_KIND_LOUDNESS
+    from ...loudness.job import NOT_IN_LIBRARY, WAITING
+    from ...processing.retry_queue import PENDING_PUBLISHER_STATUSES as _PENDING_PUBLISHER_STATUSES
 
     def _pending_servers(job_obj) -> list[dict]:
         """Derive the list of per-server "still pending" counts from
@@ -478,7 +481,10 @@ def get_chain_attempts(chain_id):
             counts = pub.get("counts") or {}
             if not isinstance(counts, dict):
                 continue
-            n = sum(counts.get(s, 0) for s in _PENDING_PUBLISHER_STATUSES)
+            pending_statuses = (
+                (WAITING, NOT_IN_LIBRARY) if job_obj.kind == JOB_KIND_LOUDNESS else _PENDING_PUBLISHER_STATUSES
+            )
+            n = sum(counts.get(s, 0) for s in pending_statuses)
             if n > 0:
                 rows.append(
                     {
@@ -683,6 +689,10 @@ def create_job():
         return blocked
 
     data = request.get_json() or {}
+    try:
+        raw_config = normalize_scan_filter_config(data.get("config"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     library_ids = list(data.get("library_ids") or [])
     library_names = list(data.get("library_names") or [])
@@ -721,13 +731,13 @@ def create_job():
     # is saved: revival, resume and Reprocess replay the saved config as
     # overrides, so a key saved here would reach the worker's Config later.
     _ALLOWED_OVERRIDES = {
+        *FILTER_CONFIG_KEYS,
         "force_generate",
         "regenerate_thumbnails",
         "sort_by",
         "selected_libraries",
         "selected_library_ids",
     }
-    raw_config = data.get("config") or {}
     config_overrides = {k: v for k, v in raw_config.items() if k in _ALLOWED_OVERRIDES}
     dropped = sorted(str(k) for k in raw_config if k not in _ALLOWED_OVERRIDES)
     if dropped:
@@ -1127,7 +1137,7 @@ def fire_webhook_now(job_id):
             404,
         )
 
-    if not _fire_pending_batch_now(debounce_key):
+    if not _fire_pending_batch_now(debounce_key, job_id=job_id):
         # Race: another caller fired between the lookup and the
         # cancel. Return 404 so the frontend re-fetches.
         return jsonify({"error": "Batch already fired"}), 404
@@ -1724,6 +1734,7 @@ def _build_idle_workers_from_config():
         "remaining_time": 0.0,
         "fallback_active": False,
         "fallback_reason": None,
+        "fallback_title": "",
         "ffmpeg_started": False,
         "current_phase": "",
     }
@@ -1868,6 +1879,15 @@ def reprocess_job(job_id):
     new_config.pop(INTRO_CREDITS_FOLLOW_UP, None)
     # The new job hasn't waited for a slot yet: a restart must age it from its own wait, not the old job's.
     new_config.pop(SLOT_WAIT_SINCE, None)
+    for key in (
+        "webhook_debounce_pending",
+        "webhook_delay_mode",
+        "webhook_fire_at",
+        "webhook_server_id",
+        "webhook_batch_opened_at",
+        "webhook_batch_max_wait",
+    ):
+        new_config.pop(key, None)
     new_job = job_manager.create_job(
         library_id=job.library_id,
         library_name=library_name,

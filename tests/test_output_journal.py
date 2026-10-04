@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from media_preview_generator.output.journal import (
     JOURNAL_SCHEMA_VERSION,
     _meta_path_for,
@@ -12,6 +14,7 @@ from media_preview_generator.output.journal import (
     outputs_fresh_for_source,
     write_meta,
 )
+from media_preview_generator.output.plex_hash import get_source_fingerprint
 
 
 class TestMetaPath:
@@ -42,10 +45,11 @@ class TestWriteMeta:
         assert meta_a["publisher"] == "emby_sidecar"
         assert meta_a["schema"] == JOURNAL_SCHEMA_VERSION
         assert meta_b["source_size"] == 1234
+        assert meta_a["source_fingerprint"] == list(get_source_fingerprint(source))
 
     def test_silently_skips_when_source_missing(self, tmp_path):
         out = tmp_path / "a.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         write_meta([out], str(tmp_path / "ghost.mkv"))
         assert not _meta_path_for(out).exists()
 
@@ -53,7 +57,7 @@ class TestWriteMeta:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"data")
         good = tmp_path / "good.bif"
-        good.write_bytes(b"")
+        good.write_bytes(b"bif")
 
         # Make a path whose parent doesn't exist so .meta write fails.
         bad = tmp_path / "subdir-not-created" / "bad.bif"
@@ -65,11 +69,60 @@ class TestWriteMeta:
 
 
 class TestOutputsFreshForSource:
+    @pytest.mark.parametrize("require_fingerprint", [False, True])
+    def test_same_size_replacement_preserving_mtime_invalidates_new_journal(self, tmp_path, require_fingerprint):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"old bytes")
+        before = source.stat()
+        out = tmp_path / "out.bif"
+        out.write_bytes(b"old frames")
+        write_meta([out], str(source))
+        replacement = tmp_path / "replacement.mkv"
+        replacement.write_bytes(b"new bytes")
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, source)
+
+        assert not outputs_fresh_for_source([out], str(source), require_source_fingerprint=require_fingerprint)
+
+    @pytest.mark.parametrize("metadata", ["absent", "legacy", "corrupt", "strong"])
+    def test_cross_publisher_reuse_requires_strong_matching_metadata(self, tmp_path, metadata):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"source")
+        out = tmp_path / "out.bif"
+        out.write_bytes(b"frames")
+        if metadata in ("legacy", "strong"):
+            write_meta([out], str(source))
+        if metadata == "legacy":
+            payload = json.loads(_meta_path_for(out).read_text())
+            del payload["source_fingerprint"]
+            for source_record in payload["sources"]:
+                del source_record["source_fingerprint"]
+            _meta_path_for(out).write_text(json.dumps(payload))
+        if metadata == "corrupt":
+            _meta_path_for(out).write_text("not json")
+
+        assert outputs_fresh_for_source([out], str(source)) is True
+        assert outputs_fresh_for_source([out], str(source), require_source_fingerprint=True) is (metadata == "strong")
+
+    def test_journal_uses_extraction_snapshot_when_source_changes_before_stamping(self, tmp_path):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"old bytes")
+        expected = get_source_fingerprint(source)
+        out = tmp_path / "out.bif"
+        out.write_bytes(b"frames from old source")
+        source.write_bytes(b"new different bytes")
+
+        write_meta([out], str(source), source_fingerprint=expected)
+
+        payload = json.loads(_meta_path_for(out).read_text())
+        assert payload["source_fingerprint"] == list(expected)
+        assert not outputs_fresh_for_source([out], str(source))
+
     def test_fresh_when_meta_matches(self, tmp_path):
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         write_meta([out], str(source))
 
         assert outputs_fresh_for_source([out], str(source)) is True
@@ -79,7 +132,7 @@ class TestOutputsFreshForSource:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         write_meta([out], str(source))
 
         # Replace source with different size + new mtime.
@@ -91,7 +144,7 @@ class TestOutputsFreshForSource:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         write_meta([out], str(source))
 
         with source.open("ab") as f:
@@ -109,7 +162,7 @@ class TestOutputsFreshForSource:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         # No write_meta call.
         assert outputs_fresh_for_source([out], str(source)) is True
 
@@ -122,14 +175,14 @@ class TestOutputsFreshForSource:
 
     def test_not_fresh_when_source_missing(self, tmp_path):
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         assert outputs_fresh_for_source([out], str(tmp_path / "ghost.mkv")) is False
 
     def test_handles_corrupt_meta_as_legacy(self, tmp_path):
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         _meta_path_for(out).write_text("not json {")
         # Corrupt meta is ignored entirely; behaves as legacy.
         assert outputs_fresh_for_source([out], str(source)) is True
@@ -139,8 +192,8 @@ class TestOutputsFreshForSource:
         source.write_bytes(b"x" * 100)
         out_a = tmp_path / "a.bif"
         out_b = tmp_path / "b.bif"
-        out_a.write_bytes(b"")
-        out_b.write_bytes(b"")
+        out_a.write_bytes(b"bif")
+        out_b.write_bytes(b"bif")
         # Only out_a stamped.
         write_meta([out_a], str(source))
         assert outputs_fresh_for_source([out_a, out_b], str(source)) is True
@@ -156,8 +209,8 @@ class TestOutputsFreshForSource:
         source.write_bytes(b"x" * 100)
         out_a = tmp_path / "a.bif"
         out_b = tmp_path / "b.bif"
-        out_a.write_bytes(b"")
-        out_b.write_bytes(b"")
+        out_a.write_bytes(b"bif")
+        out_b.write_bytes(b"bif")
         write_meta([out_a, out_b], str(source))
         # Source replaced after stamping.
         source.write_bytes(b"y" * 200)
@@ -184,8 +237,8 @@ class TestOutputsFreshForSource:
         source.write_bytes(b"x" * 100)
         out_a = tmp_path / "a.bif"
         out_b = tmp_path / "b.bif"
-        out_a.write_bytes(b"")
-        out_b.write_bytes(b"")
+        out_a.write_bytes(b"bif")
+        out_b.write_bytes(b"bif")
         # out_a: stamp matches the live source.
         write_meta([out_a], str(source))
         # out_b: hand-write a mismatching .meta with a clearly-wrong
@@ -224,7 +277,7 @@ class TestOutputsFreshForSource:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         # Hand-write a .meta with literal schema=0 (old / unknown version).
         # Production: ``int(data.get("schema", 0)) != JOURNAL_SCHEMA_VERSION
         # → continue`` → no readable .meta → legacy fallback returns True.
@@ -265,7 +318,7 @@ class TestOutputsFreshForSource:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         # Hand-write a partial .meta — has schema + source_mtime, MISSING
         # source_size. The dict.get() default fires → -1 → mismatch.
         _meta_path_for(out).write_text(
@@ -293,7 +346,7 @@ class TestClearMeta:
         source = tmp_path / "movie.mkv"
         source.write_bytes(b"x" * 100)
         out = tmp_path / "out.bif"
-        out.write_bytes(b"")
+        out.write_bytes(b"bif")
         write_meta([out], str(source))
         assert _meta_path_for(out).exists()
 
@@ -339,6 +392,27 @@ class TestOutputSharedByCopies:
             (str(original), 1_000_000, 500),
             (str(copy), 2_000_000, 500),
         ]
+
+    def test_replacing_one_shared_source_does_not_borrow_another_copys_fingerprint(self, tmp_path):
+        original = tmp_path / "a.mkv"
+        original.write_bytes(b"old bytes")
+        copy = _copy_of(original, tmp_path / "b.mkv", mtime=int(original.stat().st_mtime))
+        os.utime(original, ns=(copy.stat().st_atime_ns, copy.stat().st_mtime_ns))
+        bif = tmp_path / "index-sd.bif"
+        bif.write_bytes(b"frames")
+        write_meta([bif], str(original), publisher="plex_bundle")
+        write_meta([bif], str(copy), publisher="plex_bundle")
+        assert outputs_fresh_for_source([bif], str(original), require_source_fingerprint=True)
+        assert outputs_fresh_for_source([bif], str(copy), require_source_fingerprint=True)
+
+        replacement = tmp_path / "replacement.mkv"
+        replacement.write_bytes(b"new bytes")
+        os.utime(replacement, ns=(original.stat().st_atime_ns, original.stat().st_mtime_ns))
+        os.replace(replacement, original)
+
+        assert not outputs_fresh_for_source([bif], str(original))
+        assert not outputs_fresh_for_source([bif], str(original), require_source_fingerprint=True)
+        assert outputs_fresh_for_source([bif], str(copy), require_source_fingerprint=True)
 
     def test_copy_not_yet_recorded_is_not_fresh_when_output_has_another_source(self, tmp_path):
         original = tmp_path / "a.mkv"
@@ -474,3 +548,264 @@ class TestOutputSharedByCopies:
         write_meta([bif], str(source))
 
         assert sorted(p.name for p in tmp_path.iterdir()) == ["index-sd.bif", "index-sd.bif.meta", "movie.mkv"]
+
+
+class TestEmptyOutputIsNotFresh:
+    """A 0-byte output holds no preview, so it is never fresh.
+
+    A power loss shortly after a publish left 0-byte ``index-sd.bif`` files with 0-byte ``.meta`` next to them; an
+    existence-only check called them fresh on every scan, so they were never rebuilt.
+    """
+
+    @pytest.mark.parametrize("meta", ["no_meta", "empty_meta", "matching_meta"])
+    def test_not_fresh_when_output_is_zero_bytes(self, tmp_path, meta):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        out = tmp_path / "index-sd.bif"
+        out.write_bytes(b"real bif")
+        if meta == "matching_meta":
+            write_meta([out], str(source))
+        elif meta == "empty_meta":
+            _meta_path_for(out).write_bytes(b"")
+        out.write_bytes(b"")
+
+        assert outputs_fresh_for_source([out], str(source)) is False
+
+    def test_not_fresh_when_one_of_several_outputs_is_zero_bytes(self, tmp_path):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        good_a = tmp_path / "a.bif"
+        empty = tmp_path / "b.bif"
+        good_c = tmp_path / "c.bif"
+        for out in (good_a, empty, good_c):
+            out.write_bytes(b"real bif")
+        write_meta([good_a, empty, good_c], str(source))
+        empty.write_bytes(b"")
+
+        assert outputs_fresh_for_source([good_a, empty, good_c], str(source)) is False
+
+    def test_fresh_when_output_has_data_and_no_meta(self, tmp_path):
+        """Outputs from before the journal existed have no ``.meta``; they must not all regenerate."""
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        out = tmp_path / "index-sd.bif"
+        out.write_bytes(b"real bif")
+
+        assert outputs_fresh_for_source([out], str(source)) is True
+
+    def test_fresh_when_output_is_a_bif_with_no_thumbnails(self, tmp_path):
+        """A 72-byte BIF (header and an empty index) is small but complete: only 0 bytes counts as empty."""
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        out = tmp_path / "index-sd.bif"
+        out.write_bytes(b"\x89BIF\r\n\x1a\n" + bytes(64))
+
+        assert out.stat().st_size == 72
+        assert outputs_fresh_for_source([out], str(source)) is True
+
+
+class TestMetaForcedToDisk:
+    """The ``.meta`` data is on disk before its name is: a power loss can't leave an empty sidecar in place."""
+
+    def test_fsyncs_the_temp_file_before_renaming_it_into_place(self, tmp_path):
+        from unittest.mock import patch
+
+        from media_preview_generator.output import journal
+
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        bif = tmp_path / "index-sd.bif"
+        bif.write_bytes(b"bif")
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            synced = os.fstat(fd)
+            events.append(("fsync", synced.st_ino, synced.st_size))
+            real_fsync(fd)
+
+        def replace(src, dst):
+            events.append(("replace", os.stat(src).st_ino, str(dst)))
+            real_replace(src, dst)
+
+        with patch.object(journal.os, "fsync", side_effect=fsync), patch.object(journal.os, "replace", replace):
+            write_meta([bif], str(source))
+
+        meta = _meta_path_for(bif)
+        written = meta.stat()
+        assert events == [("fsync", written.st_ino, written.st_size), ("replace", written.st_ino, str(meta))]
+        assert written.st_size > 0
+
+    def test_meta_still_written_when_fsync_is_not_supported(self, tmp_path):
+        from unittest.mock import patch
+
+        from media_preview_generator.output import journal
+
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"x" * 100)
+        bif = tmp_path / "index-sd.bif"
+        bif.write_bytes(b"bif")
+
+        with patch.object(journal.os, "fsync", side_effect=OSError(22, "Invalid argument")) as fsync:
+            write_meta([bif], str(source))
+
+        fsync.assert_called_once()
+        assert json.loads(_meta_path_for(bif).read_text())["source_size"] == 100
+        assert outputs_fresh_for_source([bif], str(source)) is True
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["index-sd.bif", "index-sd.bif.meta", "movie.mkv"]
+
+
+class TestPlexPendingNotifications:
+    @pytest.fixture
+    def publication(self, tmp_path):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"video")
+        output = tmp_path / "index-sd.bif"
+        output.write_bytes(b"frames")
+        write_meta([output], str(source), publisher="plex_bundle")
+        return source, output
+
+    @pytest.mark.parametrize("journal", ["absent", "legacy", "unmarked", "corrupt"])
+    def test_existing_output_without_marker_never_requests_analyze(self, publication, journal):
+        from media_preview_generator.output.journal import get_plex_refresh_pending
+
+        source, output = publication
+        meta = _meta_path_for(output)
+        if journal == "absent":
+            meta.unlink()
+        elif journal == "legacy":
+            meta.write_text(json.dumps({"schema": 1, "source_size": 5, "source_mtime": int(source.stat().st_mtime)}))
+        elif journal == "corrupt":
+            meta.write_text("broken json")
+        assert get_plex_refresh_pending([output], str(source), "plex-a") is None
+
+    def test_acknowledgement_clears_only_matching_source_and_server(self, publication, tmp_path):
+        from media_preview_generator.output.journal import (
+            clear_plex_refresh_pending,
+            get_plex_refresh_pending,
+            mark_plex_refresh_pending,
+        )
+
+        source, output = publication
+        first = mark_plex_refresh_pending([output], str(source), "plex-a")
+        second = mark_plex_refresh_pending([output], str(source), "plex-b")
+        copy = tmp_path / "copy.mkv"
+        copy.write_bytes(source.read_bytes())
+        write_meta([output], str(copy), publisher="plex_bundle")
+        copied = mark_plex_refresh_pending([output], str(copy), "plex-a")
+        assert first and second and copied
+        assert len({first, second, copied}) == 3
+        assert get_plex_refresh_pending([output], str(source), "plex-a") == first
+        clear_plex_refresh_pending([output], str(copy), "plex-b", first)
+        assert get_plex_refresh_pending([output], str(source), "plex-a") == first
+        clear_plex_refresh_pending([output], str(source), "plex-a", first)
+        assert get_plex_refresh_pending([output], str(source), "plex-a") is None
+        assert get_plex_refresh_pending([output], str(source), "plex-b") == second
+        assert get_plex_refresh_pending([output], str(copy), "plex-a") == copied
+        assert outputs_fresh_for_source([output], str(source), require_source_fingerprint=True)
+        assert outputs_fresh_for_source([output], str(copy), require_source_fingerprint=True)
+
+    def test_late_ack_cannot_clear_regenerated_same_source(self, publication):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        from media_preview_generator.output.journal import (
+            clear_plex_refresh_pending,
+            get_plex_refresh_pending,
+            mark_plex_refresh_pending,
+        )
+
+        source, output = publication
+        fingerprint = get_source_fingerprint(source)
+        old = mark_plex_refresh_pending([output], str(source), "plex", source_fingerprint=fingerprint)
+        waiting, analyzed = Event(), Event()
+
+        def old_request():
+            waiting.set()
+            assert analyzed.wait(5)
+            clear_plex_refresh_pending([output], str(source), "plex", old, source_fingerprint=fingerprint)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(old_request)
+            assert waiting.wait(5)
+            write_meta([output], str(source), publisher="plex_bundle", source_fingerprint=fingerprint)
+            new = mark_plex_refresh_pending([output], str(source), "plex", source_fingerprint=fingerprint)
+            assert old and new and old != new
+            analyzed.set()
+            future.result(timeout=5)
+        assert get_plex_refresh_pending([output], str(source), "plex") == new
+
+    def test_replaced_source_does_not_reuse_marker_or_ack_wrong_fingerprint(self, publication):
+        from media_preview_generator.output.journal import (
+            clear_plex_refresh_pending,
+            get_plex_refresh_pending,
+            mark_plex_refresh_pending,
+        )
+
+        source, output = publication
+        old_fingerprint = get_source_fingerprint(source)
+        old = mark_plex_refresh_pending([output], str(source), "plex")
+        source.write_bytes(b"replacement")
+        assert get_plex_refresh_pending([output], str(source), "plex") is None
+        assert mark_plex_refresh_pending([output], str(source), "plex") is None
+        write_meta([output], str(source), publisher="plex_bundle")
+        new = mark_plex_refresh_pending([output], str(source), "plex")
+        assert new and new != old
+        clear_plex_refresh_pending([output], str(source), "plex", new, source_fingerprint=old_fingerprint)
+        assert get_plex_refresh_pending([output], str(source), "plex") == new
+
+    def test_unrecorded_source_cannot_claim_shared_output(self, publication, tmp_path):
+        from media_preview_generator.output.journal import get_plex_refresh_pending, mark_plex_refresh_pending
+
+        source, output = publication
+        other = tmp_path / "other.mkv"
+        other.write_bytes(source.read_bytes())
+        assert mark_plex_refresh_pending([output], str(other), "plex") is None
+        assert get_plex_refresh_pending([output], str(other), "plex") is None
+
+    def test_regeneration_retains_other_pending_markers_but_invalidates_freshness(self, publication):
+        from media_preview_generator.output.journal import get_plex_refresh_pending, mark_plex_refresh_pending
+
+        source, output = publication
+        token = mark_plex_refresh_pending([output], str(source), "other-plex")
+        clear_meta([output], preserve_plex_refresh_pending=True)
+        assert not outputs_fresh_for_source([output], str(source))
+        assert get_plex_refresh_pending([output], str(source), "other-plex") == token
+        write_meta([output], str(source), publisher="plex_bundle")
+        assert get_plex_refresh_pending([output], str(source), "other-plex") == token
+        assert outputs_fresh_for_source([output], str(source))
+
+    def test_failed_marker_update_keeps_previous_journal(self, publication, monkeypatch):
+        from media_preview_generator.output import journal
+
+        source, output = publication
+        before = _meta_path_for(output).read_bytes()
+
+        def fail_replace(*args):
+            raise PermissionError("read-only journal")
+
+        monkeypatch.setattr(journal.os, "replace", fail_replace)
+        assert journal.mark_plex_refresh_pending([output], str(source), "plex") is None
+        assert _meta_path_for(output).read_bytes() == before
+        assert not _meta_path_for(output).with_suffix(".meta.tmp").exists()
+
+    def test_concurrent_servers_retain_both_pending_markers(self, publication):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        from media_preview_generator.output.journal import get_plex_refresh_pending, mark_plex_refresh_pending
+
+        source, output = publication
+        ready = Barrier(2)
+
+        def mark(server_id):
+            ready.wait(timeout=5)
+            return mark_plex_refresh_pending([output], str(source), server_id)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            a = pool.submit(mark, "plex-a")
+            b = pool.submit(mark, "plex-b")
+            first, second = a.result(timeout=5), b.result(timeout=5)
+        assert first and second and first != second
+        assert get_plex_refresh_pending([output], str(source), "plex-a") == first
+        assert get_plex_refresh_pending([output], str(source), "plex-b") == second

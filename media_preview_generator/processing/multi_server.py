@@ -43,21 +43,30 @@ from ..bif_reader import read_bif_metadata, unpack_bif_to_jpegs
 from ..config import resolve_frame_interval
 from ..markers.external_ids import ids_from_path, is_extra
 from ..markers.fs import gone_from_disk
-from ..markers.missing import disk_roots
+from ..markers.missing import disk_roots, library_folders
 from ..output import BifBundle, EmbyBifAdapter, JellyfinTrickplayAdapter, PlexBundleAdapter
 from ..output.base import OutputAdapter
-from ..output.journal import clear_meta, outputs_fresh_for_source, write_meta
+from ..output.journal import (
+    clear_meta,
+    get_plex_refresh_pending,
+    mark_plex_refresh_pending,
+    outputs_fresh_for_source,
+    write_meta,
+)
+from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint
 from ..servers.base import LibraryNotYetIndexedError, MediaServer, ServerConfig, ServerType
 from ..servers.ownership import find_library_matches
 from .frame_cache import get_frame_cache
 from .generator import (
     FALLBACK_CODEC,
+    NO_DECODER_SUMMARY,
     CancellationError,
     CodecNotSupportedError,
     _cleanup_temp_directory,
     generate_images,
     gpu_fallback_announcement,
 )
+from .plex_refresh import enqueue_plex_refresh
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -69,6 +78,8 @@ class PublisherStatus(str, Enum):
 
     PUBLISHED = "published"
     PUBLISHED_PENDING_REGISTRATION = "published_pending_registration"
+    PUBLISHED_PENDING_CHAPTERS = "published_pending_chapters"
+    PUBLISHED_CHAPTERS_FAILED = "published_chapters_failed"
     SKIPPED_NOT_INDEXED = "skipped_not_indexed"
     SKIPPED_NOT_IN_LIBRARY = "skipped_not_in_library"
     SKIPPED_OUTPUT_EXISTS = "skipped_output_exists"
@@ -82,7 +93,9 @@ class MultiServerStatus(str, Enum):
     SKIPPED = "skipped"  # owners exist but every one was skipped (output already on disk)
     SKIPPED_NOT_INDEXED = "skipped_not_indexed"  # owners exist but every one was waiting on the server's index
     SKIPPED_FILE_NOT_FOUND = "skipped_file_not_found"  # source file missing on disk (retryable — usually mid-copy)
-    SKIPPED_SOURCE_GONE = "skipped_source_gone"  # replaced by a newer file in its folder (terminal, no retry)
+    # Replaced by a newer file in its folder, or in the same folder under another folder of the file's library
+    # (terminal, no retry).
+    SKIPPED_SOURCE_GONE = "skipped_source_gone"
     NO_OWNERS = "no_owners"  # no enabled library covers the path
     FAILED = "failed"  # generation or every publisher failed
     NO_FRAMES = "no_frames"  # FFmpeg produced 0 frames (unrecoverable)
@@ -113,6 +126,7 @@ class PublisherResult:
     output_paths: list[Path] = field(default_factory=list)
     message: str = ""
     frame_source: str = "extracted"  # one of: "extracted", "cache_hit", "output_existed"
+    artifacts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -138,6 +152,8 @@ _PUBLISHED_LIKE_STATUSES: frozenset[PublisherStatus] = frozenset(
         # to a retry. From the user's "did the file generate?" angle it
         # counts as published.
         PublisherStatus.PUBLISHED_PENDING_REGISTRATION,
+        PublisherStatus.PUBLISHED_PENDING_CHAPTERS,
+        PublisherStatus.PUBLISHED_CHAPTERS_FAILED,
     }
 )
 
@@ -584,9 +600,8 @@ def _resolve_item_id_for(server: MediaServer, canonical_path: str, hint: str | N
     When the caller (webhook router, scan loop) already knows the
     server's item id we use it directly. Otherwise we ask the server
     via :meth:`MediaServer.resolve_remote_path_to_item_id`; servers
-    without a reverse-lookup implementation return ``None`` (only
-    Plex's bundle path and Jellyfin's manifest actually need the id,
-    and the corresponding adapters degrade gracefully when missing).
+    without a reverse-lookup implementation return ``None``. The resolver
+    policy calls this only when an ID is useful for output registration.
 
     INFO logs bracket the network call so an op tailing the log can
     tell *why* the dispatch is sitting idle when the lookup is slow.
@@ -613,14 +628,9 @@ def _resolve_item_id_for(server: MediaServer, canonical_path: str, hint: str | N
     if result:
         logger.info("Resolved '{}' on {} → item {} ({:.1f}s)", basename, server.name, result, elapsed)
     else:
-        # WARNING (not INFO): the server didn't find the file in its
-        # library yet. Operator-visible because the typical cause is a
-        # slow library scan on the destination server — the per-job
-        # retry chain catches this and re-attempts, but surfacing the
-        # condition at WARNING in both the Job log viewer and
-        # container logs makes it grep-able for "what's blocking this
-        # webhook batch."
-        logger.warning(
+        # INFO: expected right after an import, on every lookup of every attempt, until the server's scan indexes the
+        # file. The retry chain re-attempts; the line that ends a chain is the one that warns.
+        logger.info(
             "'{}' not found on {} ({:.1f}s) — indexing may be delayed",
             basename,
             server.name,
@@ -669,8 +679,8 @@ def _make_item_id_resolver(canonical_path: str, phase_callback=None):
     Lookup policy depends on what each vendor's adapter actually needs
     and how much the lookup costs:
 
-    * **Plex** — bundle-hash path REQUIRES an item id. Always look up
-      (call is fast: Plex's ``/library/metadata/…`` search is O(log N)).
+    * **Plex** — derive the bundle hash from the local file. No reverse
+      lookup is needed to publish, even when metadata hints are stale.
     * **Emby** — sidecar BIF is filename-derived; the adapter never
       needs an id. ``trigger_refresh`` gracefully falls back to the
       path-based ``/Library/Media/Updated`` endpoint when id is None.
@@ -695,8 +705,8 @@ def _make_item_id_resolver(canonical_path: str, phase_callback=None):
       retry → exhaust) is the right no-op, not an unsatisfiable loop to
       paper over here.
 
-    Result is cached per-dispatch so the (still-slow-for-Plex-misses)
-    lookup doesn't re-burn across sub-phases.
+    Results are cached per dispatch so registration lookups do not repeat
+    across sub-phases.
     """
     cache: dict[str, str | None] = {}
 
@@ -708,15 +718,15 @@ def _make_item_id_resolver(canonical_path: str, phase_callback=None):
             return hint
 
         # Per-vendor lookup policy. See docstring.
-        if server.type is ServerType.EMBY:
+        if server.type in (ServerType.PLEX, ServerType.EMBY):
             cache[server.id] = None
             return None
         if server.type is ServerType.JELLYFIN and not _jellyfin_plugin_cached_installed(server):
             cache[server.id] = None
             return None
 
-        # Stamp the worker UI just before the (potentially slow) lookup
-        # — Plex misses can still burn seconds, and without this the
+        # Stamp the worker UI just before the potentially slow lookup;
+        # without this the
         # worker card sits on a generic "Working…" the whole time,
         # indistinguishable from a hung thread.
         if phase_callback:
@@ -815,7 +825,7 @@ def _try_reuse_existing_bif(
                 continue
             if not os.path.isfile(candidate_str):
                 continue
-            if not outputs_fresh_for_source([candidate], canonical_path):
+            if not outputs_fresh_for_source([candidate], canonical_path, require_source_fingerprint=True):
                 # The BIF exists but the source has changed since it was
                 # written — using these stale frames would give the user
                 # previews from the *previous* version of the file. Pass.
@@ -873,11 +883,15 @@ def _missing_on_disk_message(canonical_path: str, sibling_candidates: list[str])
     mounts were probed and none held the file, that's the signal the
     media volume may not be mounted in this container rather than a path
     typo (see project_stale_bindmount_missing_on_disk).
+
+    The advice covers both ways a path gets here, because this function isn't told which: a webhook's new download
+    (often still copying) and a scan's listing (the server still names a file that was deleted or moved).
     """
     base = (
         f"Source video file is missing on disk: {canonical_path}. "
-        "This often happens when a webhook fires before the file finishes copying, or "
-        "when the file was moved/deleted between scan and dispatch."
+        "Either it is still being copied (a new download can be announced before its copy finishes), or "
+        "it was deleted or moved and the media server still lists it — the server drops it after its own "
+        "library scan (Plex: once its trash is emptied)."
     )
     if sibling_candidates:
         base += (
@@ -1032,16 +1046,31 @@ def _replacement_video(canonical_path: str, *, movie_library: bool) -> str | Non
     return max(same_episode, key=_entry_mtime).name if same_episode else None
 
 
+def _same_file_on_other_library_folders(canonical_path: str, configs: list[ServerConfig]) -> list[str]:
+    """Where else a file of a library with several folders could sit: the same relative path under each other folder
+    of every library holding it (a library spread over several disks), each once."""
+    paths: list[str] = []
+    for folders in library_folders(configs):
+        local_folders = [folder for folder, _mapping_root in folders if folder]
+        for folder in local_folders:
+            if canonical_path.startswith(folder + "/"):
+                tail = canonical_path[len(folder) :]
+                paths.extend(other + tail for other in local_folders if other != folder)
+    return list(dict.fromkeys(paths))
+
+
 def source_replaced_reason(canonical_path: str, registry: ServerRegistry) -> str | None:
     """Say which newer file replaced a missing source file, or ``None`` when it may still turn up.
 
     A webhook can name a file that's already been replaced: Sonarr or Radarr importing the same episode or movie again
     under a new name deletes the old file, and no retry can find it. Previews and Intro & Credits (``markers.pipeline``)
-    both end such a file on this answer. Only a replacement sitting in the file's own folder
-    counts, and only while the library's disk looks plainly mounted: ``gone_from_disk`` with the path mapping and
+    both end such a file on this answer. Only a replacement sitting in the file's own folder counts, or in that same
+    folder under another folder of the file's library (a library spread over several disks: the import can land on any
+    of them), and only while the library's disk looks plainly mounted: ``gone_from_disk`` with the path mapping and
     library folders as roots says "not gone" when one of them is missing, empty or unreadable (a stale bind mount shows
     an empty underlay), and when the file sits directly in one. A missing folder is never taken as a deletion: a union
-    filesystem that lost a disk looks exactly the same.
+    filesystem that lost a disk looks exactly the same. The file's own disk has to pass that check before any other is
+    looked at, and another disk that fails it is skipped: it says nothing either way.
 
     Args:
         canonical_path: The local path that isn't on disk.
@@ -1054,16 +1083,63 @@ def source_replaced_reason(canonical_path: str, registry: ServerRegistry) -> str
         return None
     try:
         configs = registry.configs()
-        roots = disk_roots(canonical_path, configs)
+        candidates = [canonical_path, *_same_file_on_other_library_folders(canonical_path, configs)]
+        roots = {path: disk_roots(path, configs) for path in candidates}
     except Exception as exc:
         logger.debug("Couldn't read the library folders for {}: {}", canonical_path, exc)
         return None
-    if not roots or not gone_from_disk([canonical_path], roots={canonical_path: roots}, trust_roots=True):
-        return None
-    if not os.path.isdir(os.path.dirname(canonical_path)):
-        return None
-    replacement = _replacement_video(canonical_path, movie_library=_in_movie_library(canonical_path, configs))
-    return f"Skipped: replaced by a newer file ({replacement})" if replacement else None
+    for path in candidates:
+        if not roots[path] or not gone_from_disk([path], roots={path: roots[path]}, trust_roots=True):
+            if path == canonical_path:
+                return None
+            continue
+        if not os.path.isdir(os.path.dirname(path)):
+            continue
+        replacement = _replacement_video(path, movie_library=_in_movie_library(canonical_path, configs))
+        if replacement:
+            return f"Skipped: replaced by a newer file ({replacement})"
+    return None
+
+
+def _source_missing_result(
+    canonical_path: str, registry: ServerRegistry, sibling_candidates: list[str]
+) -> MultiServerResult:
+    """The outcome of a source file that isn't on disk, whenever that's found out (the up-front check, or FFmpeg
+    reaching for a file that went away after it).
+
+    Args:
+        canonical_path: The local path that isn't on disk.
+        registry: The server registry (``source_replaced_reason``).
+        sibling_candidates: The sibling-mount paths already checked for the file, for the warning.
+
+    Returns:
+        ``SKIPPED_SOURCE_GONE`` when a newer file replaced it (no retry), else the retryable
+        ``SKIPPED_FILE_NOT_FOUND``.
+    """
+    replaced_reason = source_replaced_reason(canonical_path, registry)
+    if replaced_reason is not None:
+        logger.info(
+            "Source file {} is no longer on disk and a newer file took its place ({}); skipping without a retry. "
+            "The newer file gets its own preview from its own webhook or the next scan.",
+            canonical_path,
+            replaced_reason.removeprefix("Skipped: "),
+        )
+        return MultiServerResult(
+            canonical_path=canonical_path,
+            status=MultiServerStatus.SKIPPED_SOURCE_GONE,
+            message=replaced_reason,
+        )
+    logger.warning(_missing_on_disk_message(canonical_path, sibling_candidates))
+    # SKIPPED_FILE_NOT_FOUND (not FAILED) so the webhook-retry path
+    # in job_runner picks it up and reschedules — webhooks fire at
+    # download-START in many *arrs, so a "file missing" right now
+    # is usually "still copying", which the retry backoff (1m, 2m,
+    # 5m, …) is exactly designed to wait through.
+    return MultiServerResult(
+        canonical_path=canonical_path,
+        status=MultiServerStatus.SKIPPED_FILE_NOT_FOUND,
+        message=f"Source file not found: {canonical_path}",
+    )
 
 
 def _summarise_results(results: list[PublisherResult], status: MultiServerStatus) -> str:
@@ -1131,20 +1207,48 @@ def _server_needs_item_registration(server: MediaServer) -> bool:
     ``any(... PENDING_REGISTRATION ...)`` continuation condition was
     permanently true.
 
-    Plex doesn't reach this code path with ``item_id=None`` because its
-    adapter declares :meth:`OutputAdapter.needs_server_metadata` =
-    True — we short-circuit upstream into ``SKIPPED_NOT_IN_LIBRARY``.
+    Plex reads BIFs from disk and does not require per-item registration.
     """
     if type(server)._trigger_item_refresh is MediaServer._trigger_item_refresh:
         return False
     # Mirror the resolver's no-lookup policy in ``_make_item_id_resolver``.
     # Without this guard, Emby (always) and Jellyfin-without-plugin chains
     # exhaust at attempt 5 with no path to terminate.
-    if server.type is ServerType.EMBY:
+    if server.type in (ServerType.PLEX, ServerType.EMBY):
         return False
     if server.type is ServerType.JELLYFIN and not _jellyfin_plugin_cached_installed(server):
         return False
     return True
+
+
+def _refresh_after_publish(
+    server: MediaServer,
+    item_id: str | None,
+    canonical_path: str,
+    deleted_paths: list[str] | None,
+    *,
+    output_paths: list[Path],
+    source_fingerprint: SourceFingerprint | None,
+    new_output: bool = False,
+) -> None:
+    """Notify Plex only for newly written or durably pending previews."""
+    if server.type is ServerType.PLEX:
+        marker = mark_plex_refresh_pending if new_output else get_plex_refresh_pending
+        token = marker(output_paths, canonical_path, server.id, source_fingerprint=source_fingerprint)
+        if new_output or token is not None:
+            enqueue_plex_refresh(
+                server,
+                canonical_path,
+                item_id,
+                output_paths=tuple(output_paths),
+                notification_token=token,
+                source_fingerprint=source_fingerprint,
+            )
+        return
+    try:
+        server.trigger_refresh(item_id=item_id, remote_path=canonical_path, deleted_paths=deleted_paths)
+    except Exception as exc:
+        logger.debug("trigger_refresh failed for {}: {}", server.name, exc)
 
 
 def _publish_one(
@@ -1174,16 +1278,18 @@ def _publish_one(
     webhooks) is forwarded to ``server.trigger_refresh`` so the server
     drops its stale library row for the replaced source path.
     """
-    # Short-circuit when the adapter requires server metadata (Plex bundle
-    # hash, Jellyfin item id) and the upstream lookup returned None. This
+    # Off-media Jellyfin requires an item GUID; a missing lookup means
+    # its destination cannot yet be resolved. This
     # is the "the file isn't in this server's library" case — different
     # from a hard failure. Catching it here gives the user a clean, actionable
     # message instead of the cryptic "publish-time bookkeeping" ValueError
     # that compute_output_paths would otherwise raise. Also nudges the
-    # server to scan (best-effort — Jellyfin only has a full /Library/Refresh,
-    # so the cooldown inside trigger_refresh prevents scan-thrash). The
-    # dispatcher then schedules a retry on SKIPPED_NOT_IN_LIBRARY so the
-    # next attempt picks up the freshly-indexed item.
+    # server to scan (best-effort; Plex's partial scan is rate-limited per
+    # folder inside plex_client.trigger_plex_partial_scan, so a nudge sent
+    # within a minute of another for the same folder is dropped and a later
+    # attempt sends it). The dispatcher then schedules a retry on
+    # SKIPPED_NOT_IN_LIBRARY so the next attempt picks up the
+    # freshly-indexed item.
     if adapter.needs_server_metadata() and item_id is None:
         try:
             server.trigger_refresh(item_id=None, remote_path=bundle.canonical_path)
@@ -1204,6 +1310,11 @@ def _publish_one(
 
     try:
         output_paths = adapter.compute_output_paths(bundle, server, item_id)
+        if (
+            bundle.source_fingerprint is not None
+            and get_source_fingerprint(bundle.canonical_path) != bundle.source_fingerprint
+        ):
+            raise SourceFileChangedError("Source file changed while resolving preview output")
     except LibraryNotYetIndexedError as exc:
         return PublisherResult(
             server_id=server.id,
@@ -1237,7 +1348,8 @@ def _publish_one(
     # regeneration. Falls through to publish if the meta is missing
     # (older publishes pre-journal) or if it doesn't match.
     if skip_if_exists and output_paths and outputs_fresh_for_source(output_paths, bundle.canonical_path):
-        # Three distinct sub-cases when we land here:
+        # Plex retries only a persisted pending notification; ordinary fresh
+        # outputs stay silent. Other servers retain their refresh behavior:
         #   (a) duplicate webhook for an already-published file with
         #       item_id known — fire trigger_refresh so the path-based
         #       scan nudge re-runs (an in-place re-encode that left the
@@ -1251,26 +1363,25 @@ def _publish_one(
         #       chains exhausted at attempt 5 because the
         #       continuation condition was permanently true).
         #   (c) PENDING_REGISTRATION retry on a server where item_id
-        #       CAN resolve (Plex / Jellyfin-with-plugin) — outputs
+        #       CAN resolve (Jellyfin-with-plugin) — outputs
         #       are on disk but previous attempt's item_id was None
         #       so the plugin bridge / /Items/{id}/Refresh never
         #       fired. On retry, item_id may now resolve. Fire
         #       trigger_refresh so the registration completes and
         #       the next dispatch rolls over to plain
         #       SKIPPED_OUTPUT_EXISTS.
-        try:
-            server.trigger_refresh(
-                item_id=item_id,
-                remote_path=bundle.canonical_path,
-                deleted_paths=deleted_paths,
-            )
-        except Exception as exc:
-            logger.debug("trigger_refresh on skip-if-exists failed for {}: {}", server.name, exc)
+        _refresh_after_publish(
+            server,
+            item_id,
+            bundle.canonical_path,
+            deleted_paths,
+            output_paths=output_paths,
+            source_fingerprint=bundle.source_fingerprint,
+        )
         if item_id is None and _server_needs_item_registration(server):
             # Registration still didn't fire — re-arm the retry so
             # we try once the server indexes the file. Only reachable
-            # for Plex (via SKIPPED upstream) and Jellyfin-with-plugin
-            # — the discriminator excludes the unsatisfiable cases.
+            # for Jellyfin-with-plugin; other publishers need no registration.
             return PublisherResult(
                 server_id=server.id,
                 server_name=server.name,
@@ -1295,6 +1406,11 @@ def _publish_one(
 
     try:
         adapter.publish(bundle, output_paths, item_id)
+        if (
+            bundle.source_fingerprint is not None
+            and get_source_fingerprint(bundle.canonical_path) != bundle.source_fingerprint
+        ):
+            raise SourceFileChangedError("Source file changed while publishing previews")
     except (TypeError, ValueError, OSError, RuntimeError, requests.RequestException) as exc:
         logger.warning(
             "Failed to write preview output for media server {!r} (format: {}): {}. "
@@ -1316,17 +1432,22 @@ def _publish_one(
 
     # Stamp the journal so the next webhook for an unchanged source can
     # short-circuit. Best-effort — see ``write_meta``.
-    write_meta(output_paths, bundle.canonical_path, publisher=adapter.name)
+    write_meta(
+        output_paths,
+        bundle.canonical_path,
+        publisher=adapter.name,
+        source_fingerprint=bundle.source_fingerprint,
+    )
 
-    # Best-effort refresh; failures are logged but don't fail the publisher.
-    try:
-        server.trigger_refresh(
-            item_id=item_id,
-            remote_path=bundle.canonical_path,
-            deleted_paths=deleted_paths,
-        )
-    except Exception as exc:
-        logger.debug("trigger_refresh failed for {}: {}", server.name, exc)
+    _refresh_after_publish(
+        server,
+        item_id,
+        bundle.canonical_path,
+        deleted_paths,
+        output_paths=output_paths,
+        source_fingerprint=bundle.source_fingerprint,
+        new_output=True,
+    )
 
     # When the server activates trickplay via per-item API but we
     # didn't have an item_id at publish time, the plugin-bridge /
@@ -1359,7 +1480,7 @@ def _publish_one(
     )
 
 
-def process_canonical_path(
+def _process_canonical_path_previews(
     canonical_path: str,
     registry: ServerRegistry,
     config: Config,
@@ -1572,31 +1693,29 @@ def process_canonical_path(
                 ", ".join(f"{srv.name}/{adp.name}" for srv, adp, _ in publishers),
             )
         else:
-            replaced_reason = source_replaced_reason(canonical_path, registry)
-            if replaced_reason is not None:
-                logger.info(
-                    "Source file {} is no longer on disk and a newer file took its place in the same folder ({}); "
-                    "skipping without a retry. The newer file gets its own preview from its own webhook or the next "
-                    "scan.",
-                    canonical_path,
-                    replaced_reason.removeprefix("Skipped: "),
-                )
-                return MultiServerResult(
-                    canonical_path=canonical_path,
-                    status=MultiServerStatus.SKIPPED_SOURCE_GONE,
-                    message=replaced_reason,
-                )
-            logger.warning(_missing_on_disk_message(canonical_path, sibling_candidates))
-            # SKIPPED_FILE_NOT_FOUND (not FAILED) so the webhook-retry path
-            # in job_runner picks it up and reschedules — webhooks fire at
-            # download-START in many *arrs, so a "file missing" right now
-            # is usually "still copying", which the retry backoff (30s, 2m,
-            # 5m, …) is exactly designed to wait through.
-            return MultiServerResult(
-                canonical_path=canonical_path,
-                status=MultiServerStatus.SKIPPED_FILE_NOT_FOUND,
-                message=f"Source file not found: {canonical_path}",
-            )
+            return _source_missing_result(canonical_path, registry, sibling_candidates)
+
+    try:
+        source_fingerprint = get_source_fingerprint(canonical_path)
+    except OSError as exc:
+        return MultiServerResult(
+            canonical_path=canonical_path,
+            status=MultiServerStatus.FAILED,
+            message=f"Could not inspect source file: {exc}",
+        )
+
+    def _source_changed() -> bool:
+        try:
+            return get_source_fingerprint(canonical_path) != source_fingerprint
+        except OSError:
+            return True
+
+    def _source_changed_result() -> MultiServerResult:
+        return MultiServerResult(
+            canonical_path=canonical_path,
+            status=MultiServerStatus.FAILED,
+            message="Source file changed during processing; publishing stopped. Retry after the file is stable.",
+        )
 
     # Pre-FFmpeg short-circuit: when every owning publisher's outputs
     # already exist AND the journal confirms the source hasn't changed
@@ -1608,18 +1727,16 @@ def process_canonical_path(
     # When ``regenerate=True`` we deliberately bypass this and force a
     # fresh run; we also clear stale ``.meta`` sidecars so the new run
     # writes them rather than running into mismatched fingerprints
-    # later. ``compute_output_paths`` may need to call the server (Plex
-    # bundle hash); we tolerate failures here and fall back to the full
+    # later. ``compute_output_paths`` may need to read the source file;
+    # we tolerate failures here and fall back to the full
     # pipeline rather than spuriously refusing to publish.
     # ``compute_output_paths`` only needs the canonical_path and frame_interval
     # from a BifBundle; the frame_dir/bif_path/dimensions are placeholders for
     # the probe path. Build one helper so the three call-sites below stay in
     # sync (a divergence here previously hid behind copy-pasted dataclass kwargs).
     probe_frame_interval = int(getattr(config, "thumbnail_interval", 10) or 10)
-    # Per-server pre-fetched (hash, file) pairs lifted from the calling
-    # ProcessableItem. Plex enumeration captures these from
-    # ``item.media[*].parts[*]`` so PlexBundleAdapter can skip the
-    # /library/metadata/{id}/tree round-trip per item.
+    # Preserve enumeration metadata for callers that inspect bundles;
+    # Plex output paths use the current file's hash, not these staleable hints.
     _bundle_meta_by_server = bundle_metadata_by_server or {}
 
     def _probe_bundle(server_id: str = "") -> BifBundle:
@@ -1633,6 +1750,7 @@ def process_canonical_path(
             height=180,
             frame_count=0,
             prefetched_bundle_metadata=prefetched,
+            source_fingerprint=source_fingerprint,
         )
 
     # Per-dispatch memoiser for server reverse-lookups. Without this,
@@ -1668,6 +1786,8 @@ def process_canonical_path(
                 all_fresh = False
                 break
         if all_fresh:
+            if _source_changed():
+                return _source_changed_result()
             # DEBUG: the job's "Processing complete: … already existed" line counts these.
             logger.debug(
                 "All publishers' outputs already fresh for {} — skipping FFmpeg",
@@ -1698,19 +1818,15 @@ def process_canonical_path(
                 # Cheap and idempotent: per-path nudge is a single POST
                 # with no rate limit, /Items/{id}/Refresh is a no-op
                 # when the item's metadata is current.
-                if _server_needs_item_registration(server) or deleted_paths:
-                    try:
-                        server.trigger_refresh(
-                            item_id=item_id,
-                            remote_path=canonical_path if _server_needs_item_registration(server) else None,
-                            deleted_paths=deleted_paths,
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "trigger_refresh on all-fresh fast path failed for {}: {}",
-                            server.name,
-                            exc,
-                        )
+                if server.type is ServerType.PLEX or _server_needs_item_registration(server) or deleted_paths:
+                    _refresh_after_publish(
+                        server,
+                        item_id,
+                        canonical_path,
+                        deleted_paths,
+                        output_paths=paths,
+                        source_fingerprint=source_fingerprint,
+                    )
                 if needs_registration:
                     results.append(
                         PublisherResult(
@@ -1788,7 +1904,10 @@ def process_canonical_path(
         for server, adapter, item_id_hint in publishers:
             try:
                 item_id = resolve_item_id(server, item_id_hint)
-                clear_meta(adapter.compute_output_paths(_probe_bundle(server.id), server, item_id))
+                clear_meta(
+                    adapter.compute_output_paths(_probe_bundle(server.id), server, item_id),
+                    preserve_plex_refresh_pending=True,
+                )
             except Exception:
                 continue
 
@@ -1895,6 +2014,8 @@ def process_canonical_path(
                 frame_interval_ms=config.plex_bif_frame_interval * 1000,
             )
             if recovered:
+                if _source_changed():
+                    return _source_changed_result()
                 tmp_path = unpack_dest
                 frame_count = recovered
                 cache_hit = True
@@ -1903,6 +2024,7 @@ def process_canonical_path(
                     frame_dir=Path(unpack_dest),
                     frame_count=recovered,
                     extraction_key=extraction_key,
+                    source_fingerprint=source_fingerprint,
                 )
                 _phase("Reusing sibling BIF")
                 logger.info(
@@ -1961,6 +2083,16 @@ def process_canonical_path(
                 logger.info("Frame extraction cancelled for {} — stopping this file.", canonical_path)
                 raise
             except Exception as exc:
+                if not os.path.isfile(canonical_path):
+                    # It passed the up-front check and went away since (an upgrade replacing it mid-run).
+                    logger.debug(
+                        "Frame extraction stopped for {}: the file is no longer on disk ({}: {})",
+                        canonical_path,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    moved_to, sibling_candidates = _probe_sibling_mounts(canonical_path, registry)
+                    return _source_missing_result(canonical_path, registry, [] if moved_to else sibling_candidates)
                 logger.exception(
                     "Could not extract preview frames from {} ({}: {}). "
                     "This file will be marked failed and skipped — the rest of the queue keeps running. "
@@ -1989,6 +2121,12 @@ def process_canonical_path(
         else:
             gen_result = None
 
+        if frame_count == 0 and isinstance(gen_result, tuple) and gen_result[-1] == NO_DECODER_SUMMARY:
+            # Already logged, once, by the FFmpeg run that found it.
+            return MultiServerResult(
+                canonical_path=canonical_path, status=MultiServerStatus.NO_FRAMES, message=NO_DECODER_SUMMARY
+            )
+
         if frame_count == 0:
             # Bake the diagnostic guidance into the message itself, not just
             # the log line. The Files panel's Details cell surfaces this
@@ -2012,12 +2150,21 @@ def process_canonical_path(
                 message=ms_message,
             )
 
+        if _source_changed():
+            return _source_changed_result()
+
         # Store in cache only on a fresh generation; cache hits already
         # have an entry. Regenerate re-populates the slot too — that's
         # intended: it just re-extracted into the (now emptied) shared dir,
         # so the entry it writes describes exactly the frames on disk.
         if not cache_hit and use_frame_cache:
-            cache.put(canonical_path, frame_dir=Path(tmp_path), frame_count=frame_count, extraction_key=extraction_key)
+            cache.put(
+                canonical_path,
+                frame_dir=Path(tmp_path),
+                frame_count=frame_count,
+                extraction_key=extraction_key,
+                source_fingerprint=source_fingerprint,
+            )
 
         # ``width``/``height`` are documentation-only on BifBundle —
         # adapters that need real frame dimensions (Jellyfin tile-grid)
@@ -2028,13 +2175,8 @@ def process_canonical_path(
         # 320x180 the FFmpeg pass uses.
         gen_width = int(gen_result[3]) if isinstance(gen_result, tuple) and len(gen_result) > 3 else 320
 
-        # Per-server bundle factory: every publisher gets its own BifBundle
-        # populated with that server's pre-fetched bundle metadata (Plex
-        # only) and its display name (so generate_bif's log line can name
-        # the destination server). Sharing one bundle across publishers
-        # would force a single prefetched_bundle_metadata value, defeating
-        # the per-server hint. Building a fresh dataclass per publisher is
-        # cheap.
+        # Keep server attribution on each bundle while sharing frames and
+        # the source snapshot across all destinations.
         def _bundle_for_server(server: MediaServer) -> BifBundle:
             return BifBundle(
                 canonical_path=canonical_path,
@@ -2046,6 +2188,7 @@ def process_canonical_path(
                 frame_count=frame_count,
                 prefetched_bundle_metadata=_bundle_meta_by_server.get(server.id, ()),
                 server_display_name=server.name,
+                source_fingerprint=source_fingerprint,
             )
 
         # Tag each publisher's result with where its frames came from so
@@ -2057,6 +2200,8 @@ def process_canonical_path(
 
         results: list[PublisherResult] = []
         for server, adapter, item_id_hint in publishers:
+            if _source_changed():
+                return _source_changed_result()
             _phase(f"Publishing to {server.name}…")
             item_id = resolve_item_id(server, item_id_hint)
             outcome = _publish_one(
@@ -2203,3 +2348,164 @@ def process_canonical_path(
         # populated cache.
         if generation_lock is not None:
             generation_lock.release()
+
+
+def process_canonical_path(
+    canonical_path: str,
+    registry: ServerRegistry,
+    config: Config,
+    *,
+    item_id_by_server: dict[str, str] | None = None,
+    bundle_metadata_by_server: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    gpu: str | None = None,
+    gpu_device_path: str | None = None,
+    progress_callback=None,
+    ffmpeg_threads_override: int | None = None,
+    cancel_check=None,
+    pause_check=None,
+    regenerate: bool = False,
+    use_frame_cache: bool = True,
+    schedule_retry_on_not_indexed: bool = True,
+    retry_attempt: int = 0,
+    server_id_filter: str | None = None,
+    phase_callback=None,
+    deleted_paths: list[str] | None = None,
+    display_name: str | None = None,
+    source: str | None = None,
+    originating_job_id: str | None = None,
+    check_only: bool = False,
+) -> MultiServerResult:
+    """Publish scrubber previews and independently complete enabled Plex chapters.
+
+    Chapter planning never makes an indexed Plex item a prerequisite for
+    BIF generation. Checking is read-only for chapters; a chapter-only job
+    retains the existing worker permit without extracting interval frames.
+    """
+    options = dict(
+        item_id_by_server=item_id_by_server,
+        bundle_metadata_by_server=bundle_metadata_by_server,
+        gpu=gpu,
+        gpu_device_path=gpu_device_path,
+        progress_callback=progress_callback,
+        ffmpeg_threads_override=ffmpeg_threads_override,
+        cancel_check=cancel_check,
+        pause_check=pause_check,
+        regenerate=regenerate,
+        use_frame_cache=use_frame_cache,
+        schedule_retry_on_not_indexed=schedule_retry_on_not_indexed,
+        retry_attempt=retry_attempt,
+        server_id_filter=server_id_filter,
+        phase_callback=phase_callback,
+        deleted_paths=deleted_paths,
+        display_name=display_name,
+        source=source,
+        originating_job_id=originating_job_id,
+        check_only=check_only,
+    )
+    enabled = {
+        cfg.id: cfg
+        for cfg in registry.configs()
+        if cfg.enabled
+        and cfg.type is ServerType.PLEX
+        and cfg.output.get("chapter_thumbnails") is True
+        and (not server_id_filter or server_id_filter == cfg.id)
+    }
+    if not enabled:
+        return _process_canonical_path_previews(canonical_path, registry, config, **options)
+
+    from .chapters import ChapterOutcome, _failure, chapter_work_needed, prepare_chapters, publish_chapters
+
+    # Retry jobs complete the still-missing artifacts, even when their
+    # original dispatch was an explicit regeneration.
+    force = regenerate and retry_attempt == 0
+    options["regenerate"] = force
+    plans = {}
+    planning_failures = {}
+
+    def prepare(path: str) -> None:
+        for server, _adapter, hint in _resolve_publishers(path, registry, item_id_by_server=item_id_by_server):
+            if server.id not in enabled:
+                continue
+            try:
+                bare_hint = int(str(hint).rsplit("/", 1)[-1]) if hint else None
+                plans[server.id] = prepare_chapters(
+                    server, enabled[server.id], path, config, item_id_hint=bare_hint, cancel_check=cancel_check
+                )
+            except CancellationError:
+                raise
+            except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+                planning_failures[server.id] = _failure(exc)
+
+    if os.path.isfile(canonical_path):
+        prepare(canonical_path)
+    result = _process_canonical_path_previews(canonical_path, registry, config, **options)
+    if result.status not in {
+        MultiServerStatus.PUBLISHED,
+        MultiServerStatus.SKIPPED,
+        MultiServerStatus.NEEDS_GENERATION,
+    }:
+        return result
+    if result.canonical_path != canonical_path:
+        plans.clear()
+        planning_failures.clear()
+        prepare(result.canonical_path)
+    needs_chapters = any(chapter_work_needed(plan, regenerate=force) for plan in plans.values())
+    if check_only and (result.status is MultiServerStatus.NEEDS_GENERATION or needs_chapters):
+        return MultiServerResult(
+            result.canonical_path,
+            MultiServerStatus.NEEDS_GENERATION,
+            message="Enabled preview outputs need generation or registration",
+        )
+    if cancel_check and cancel_check():
+        raise CancellationError("Chapter processing cancelled")
+    changed = False
+    incomplete = False
+    for publisher in result.publishers:
+        publisher_changed = False
+        plan = plans.get(publisher.server_id)
+        if plan is None and publisher.server_id not in planning_failures:
+            continue
+        if publisher.status not in _PUBLISHED_LIKE_STATUSES | {PublisherStatus.SKIPPED_OUTPUT_EXISTS}:
+            continue
+        if plan is None:
+            outcome = planning_failures[publisher.server_id]
+        elif check_only:
+            outcome = (
+                plan.outcome
+                if plan.target is None or not plan.target.chapters
+                else ChapterOutcome(
+                    "ready", len(plan.target.chapters), len(plan.target.chapters), "Chapter thumbnails ready"
+                )
+            )
+        else:
+            if phase_callback:
+                phase_callback(f"Chapter thumbnails for {publisher.server_name}…")
+            had_work = chapter_work_needed(plan, regenerate=force)
+            outcome = publish_chapters(
+                plan,
+                config,
+                regenerate=force,
+                cancel_check=cancel_check,
+                pause_check=pause_check,
+                ffmpeg_threads_override=ffmpeg_threads_override,
+            )
+            publisher_changed = had_work and outcome.status == "ready"
+            changed = changed or publisher_changed
+        publisher.artifacts = {"bif": {"status": publisher.status.value}, "chapters": outcome.to_dict()}
+        if outcome.status in {"pending", "failed"}:
+            publisher.status = (
+                PublisherStatus.PUBLISHED_PENDING_CHAPTERS
+                if outcome.status == "pending"
+                else PublisherStatus.PUBLISHED_CHAPTERS_FAILED
+            )
+            publisher.message = f"Scrubber ready; chapters {outcome.status}: {outcome.message}"
+            incomplete = True
+        elif publisher_changed and publisher.status is PublisherStatus.SKIPPED_OUTPUT_EXISTS:
+            publisher.status = PublisherStatus.PUBLISHED
+            publisher.message = "Scrubber ready; chapter thumbnails ready"
+    if incomplete or changed:
+        result.status = MultiServerStatus.PUBLISHED
+        result.message = (
+            "Scrubber previews ready; chapter work incomplete" if incomplete else "Enabled preview outputs ready"
+        )
+    return result

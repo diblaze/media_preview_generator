@@ -22,6 +22,7 @@ from loguru import logger
 
 from media_preview_generator.bif_reader import read_bif_metadata
 from media_preview_generator.processing.frame_cache import get_frame_cache, reset_frame_cache
+from media_preview_generator.processing.generator import NO_DECODER_SUMMARY
 from media_preview_generator.processing.multi_server import (
     _PUBLISHED_LIKE_STATUSES,
     MultiServerStatus,
@@ -739,6 +740,206 @@ class TestSourceGoneFromDisk:
         self._assert_retries(result, stale)
 
 
+def _spanning_registry(disks: list[Path], *, folder: str = "TV Shows", kind: str | None = None, mapped: bool = True):
+    """One Emby library whose folders sit on several disks, each disk its own path mapping (as a multi-disk install)."""
+    cfg = _server_config(
+        server_id="emby-1",
+        server_type=ServerType.EMBY,
+        libraries=[
+            Library(id="1", name="Library", remote_paths=tuple(str(d / folder) for d in disks), enabled=True),
+        ],
+    )
+    cfg["libraries"][0]["kind"] = kind
+    if mapped:
+        cfg["path_mappings"] = [{"remote_prefix": str(d), "local_prefix": str(d)} for d in disks]
+    return ServerRegistry.from_settings([cfg])
+
+
+class TestSourceReplacedOnAnotherDisk:
+    """A library spread over several disks: the file that replaced a missing one can land on another of them.
+
+    Production, 2026-09-29/30: Sonarr imported upgrades onto a different disk of the TV library than the file they
+    replaced. Every such file was reported "not found", retried, and the job blamed on path mappings (22 of 22), while
+    every replacement that landed on the same disk ended as "replaced by a newer file" (6 of 6).
+
+    The same rule as in the file's own folder applies to the same folder under each other folder of its library, and
+    only what is seen there counts: a disk that's missing or empty says nothing, and the missing file's own disk must
+    still look plainly mounted.
+    """
+
+    SHOW = "Brothers (2026)"
+    OLD = "Brothers (2026) - S01E03 - Little Woody [WEBDL-1080p]-RAWR.mkv"
+    NEW = "Brothers (2026) - S01E03 - Little Woody [WEBDL-1080p]-HONE.mkv"
+
+    _run = staticmethod(TestSourceGoneFromDisk._run)
+    _assert_retries = staticmethod(TestSourceGoneFromDisk._assert_retries)
+
+    @staticmethod
+    def _mounted(disk: Path) -> Path:
+        """A disk that looks plainly mounted: its library folder holds some other show."""
+        _video(disk / "TV Shows" / "Other Show (2019)" / "Season 01" / "Other Show (2019) - S01E01 - Pilot.mkv")
+        return disk
+
+    @classmethod
+    def _disks(cls, tmp_path: Path, count: int = 2) -> list[Path]:
+        return [cls._mounted(tmp_path / f"disk{n}") for n in range(1, count + 1)]
+
+    def _assert_replaced(self, result, missing: Path, replacement: str = NEW) -> None:
+        assert result.status is MultiServerStatus.SKIPPED_SOURCE_GONE
+        assert result.message == f"Skipped: replaced by a newer file ({replacement})"
+        assert result.canonical_path == str(missing)
+        assert result.publishers == []
+
+    @pytest.mark.parametrize("mapped", [True, False], ids=["one-mapping-per-disk", "no-mappings"])
+    def test_replacement_on_another_disk_with_the_show_gone_from_this_one(
+        self, mock_config_for_processing, tmp_path, mapped
+    ):
+        disk1, disk2 = self._disks(tmp_path)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        result = self._run(missing, _spanning_registry([disk1, disk2], mapped=mapped), mock_config_for_processing)
+
+        self._assert_replaced(result, missing)
+
+    def test_replacement_on_another_disk_with_other_episodes_still_on_this_one(
+        self, mock_config_for_processing, tmp_path
+    ):
+        disk1, disk2 = self._disks(tmp_path)
+        season = disk1 / "TV Shows" / self.SHOW / "Season 01"
+        _video(season / "Brothers (2026) - S01E01 - On the Road.mkv")
+        missing = season / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        result = self._run(missing, _spanning_registry([disk1, disk2]), mock_config_for_processing)
+
+        self._assert_replaced(result, missing)
+
+    def test_replacement_on_the_third_disk_past_one_without_the_show(self, mock_config_for_processing, tmp_path):
+        disk1, disk2, disk3 = self._disks(tmp_path, 3)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk3 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        result = self._run(missing, _spanning_registry([disk1, disk2, disk3]), mock_config_for_processing)
+
+        self._assert_replaced(result, missing)
+
+    def test_replacement_in_the_files_own_folder_is_named_before_one_on_another_disk(
+        self, mock_config_for_processing, tmp_path
+    ):
+        disk1, disk2 = self._disks(tmp_path)
+        season = disk1 / "TV Shows" / self.SHOW / "Season 01"
+        _video(season / "Brothers (2026) - S01E03 - Little Woody-SAME-DISK.mkv")
+        missing = season / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        result = self._run(missing, _spanning_registry([disk1, disk2]), mock_config_for_processing)
+
+        self._assert_replaced(result, missing, "Brothers (2026) - S01E03 - Little Woody-SAME-DISK.mkv")
+
+    @pytest.mark.parametrize("kind", ["movies", "movie"], ids=["emby-movies", "plex-movie"])
+    def test_movie_replaced_by_the_one_feature_in_its_folder_on_another_disk(
+        self, mock_config_for_processing, tmp_path, kind
+    ):
+        disks = [tmp_path / "disk1", tmp_path / "disk2"]
+        for disk in disks:
+            _video(disk / "Movies" / "Kept Movie (2001)" / "Kept Movie (2001).mkv")
+        missing = disks[0] / "Movies" / "Film (2021)" / "Film (2021) - 1080p-GRP.mkv"
+        _video(disks[1] / "Movies" / "Film (2021)" / "Film (2021) - 2160p.mkv")
+        _video(disks[1] / "Movies" / "Film (2021)" / "Film (2021)-trailer.mkv")
+
+        result = self._run(missing, _spanning_registry(disks, folder="Movies", kind=kind), mock_config_for_processing)
+
+        self._assert_replaced(result, missing, "Film (2021) - 2160p.mkv")
+
+    def test_no_replacement_on_any_disk_still_retries(self, mock_config_for_processing, tmp_path):
+        disk1, disk2 = self._disks(tmp_path)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / "Brothers (2026) - S01E01 - On the Road.mkv")
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 02" / "Brothers (2026) - S02E03 - Other Season.mkv")
+
+        self._assert_retries(
+            self._run(missing, _spanning_registry([disk1, disk2]), mock_config_for_processing), missing
+        )
+
+    @pytest.mark.parametrize("state", ["missing", "empty", "empty-library-folder"])
+    def test_other_disk_missing_or_empty_still_retries(self, mock_config_for_processing, tmp_path, state):
+        """A disk that isn't mounted (or shows a stale, empty underlay) holds nothing to see: not proof of anything."""
+        disk1, disk2 = self._mounted(tmp_path / "disk1"), tmp_path / "disk2"
+        if state == "empty":
+            disk2.mkdir()
+        elif state == "empty-library-folder":
+            (disk2 / "TV Shows").mkdir(parents=True)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+
+        self._assert_retries(
+            self._run(missing, _spanning_registry([disk1, disk2]), mock_config_for_processing), missing
+        )
+
+    @pytest.mark.parametrize("state", ["missing", "empty"])
+    def test_one_unmounted_disk_does_not_hide_a_replacement_on_another(
+        self, mock_config_for_processing, tmp_path, state
+    ):
+        disk1, disk2, disk3 = self._mounted(tmp_path / "disk1"), tmp_path / "disk2", self._mounted(tmp_path / "disk3")
+        if state == "empty":
+            disk2.mkdir()
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk3 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        result = self._run(missing, _spanning_registry([disk1, disk2, disk3]), mock_config_for_processing)
+
+        self._assert_replaced(result, missing)
+
+    @pytest.mark.parametrize("state", ["missing", "empty", "empty-library-folder"])
+    def test_files_own_disk_unmounted_still_retries_whatever_another_disk_holds(
+        self, mock_config_for_processing, tmp_path, state
+    ):
+        """The missing file may be sitting on its own disk, out of sight: a same-episode file elsewhere proves nothing."""
+        disk1, disk2 = tmp_path / "disk1", self._mounted(tmp_path / "disk2")
+        if state == "empty":
+            disk1.mkdir()
+        elif state == "empty-library-folder":
+            (disk1 / "TV Shows").mkdir(parents=True)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / self.NEW)
+
+        self._assert_retries(
+            self._run(missing, _spanning_registry([disk1, disk2]), mock_config_for_processing), missing
+        )
+
+    def test_same_episode_in_another_library_on_another_disk_still_retries(self, mock_config_for_processing, tmp_path):
+        """Another library's copy (a 4K library on its own disk) is a different file, not this one's replacement."""
+        disk1, disk2 = self._disks(tmp_path)
+        cfg = _server_config(
+            server_id="emby-1",
+            server_type=ServerType.EMBY,
+            libraries=[
+                Library(id="1", name="TV", remote_paths=(str(disk1 / "TV Shows"),), enabled=True),
+                Library(id="2", name="TV 4K", remote_paths=(str(disk2 / "TV Shows"),), enabled=True),
+            ],
+        )
+        cfg["path_mappings"] = [{"remote_prefix": str(d), "local_prefix": str(d)} for d in (disk1, disk2)]
+        season = disk1 / "TV Shows" / self.SHOW / "Season 01"
+        _video(season / "Brothers (2026) - S01E01 - On the Road.mkv")
+        missing = season / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / "Brothers (2026) - S01E03 - Little Woody [2160p].mkv")
+
+        self._assert_retries(
+            self._run(missing, ServerRegistry.from_settings([cfg]), mock_config_for_processing), missing
+        )
+
+    def test_same_named_file_on_another_disk_is_not_a_replacement(self, tmp_path):
+        """The file itself on another disk of its library has moved, not been replaced (Intro & Credits asks this
+        without previews' sibling-mount rebind in front of it)."""
+        from media_preview_generator.processing.multi_server import source_replaced_reason
+
+        disk1, disk2 = self._disks(tmp_path)
+        missing = disk1 / "TV Shows" / self.SHOW / "Season 01" / self.OLD
+        _video(disk2 / "TV Shows" / self.SHOW / "Season 01" / self.OLD)
+
+        assert source_replaced_reason(str(missing), _spanning_registry([disk1, disk2])) is None
+
+
 class TestSinglePublisher:
     def test_emby_publisher_runs_one_ffmpeg_pass(self, mock_config_for_processing, tmp_path):
         media_dir = tmp_path / "data" / "movies" / "Test (2024)"
@@ -945,6 +1146,9 @@ class TestCrossServerBifReuse:
         # _seed_canonical_file's touch happens after our BIF write.
         bif_mtime = existing_bif.stat().st_mtime
         os.utime(media_file, (bif_mtime - 1, bif_mtime - 1))
+        from media_preview_generator.output.journal import write_meta
+
+        write_meta([existing_bif], str(media_file), publisher="emby_sidecar")
 
         registry = ServerRegistry.from_settings(
             [
@@ -1073,6 +1277,9 @@ class TestCrossServerBifReuse:
         )
         if truncate_plex_bif_to is not None:
             plex_bif.write_bytes(plex_bif.read_bytes()[:truncate_plex_bif_to])
+        from media_preview_generator.output.journal import write_meta
+
+        write_meta([plex_bif], str(media_file), publisher="plex_bundle")
 
         library = Library(id="1", name="Movies", remote_paths=(str(media_root),), enabled=True)
         registry = ServerRegistry.from_settings(
@@ -1236,116 +1443,11 @@ class TestPartialFailureIsolation:
         assert statuses["jelly-1"] in _PUBLISHED_LIKE_STATUSES
 
 
-class TestNotYetIndexedRoutesToSkip:
-    def test_plex_returns_skipped_not_indexed_when_hash_missing(
-        self, mock_config_for_processing, tmp_path, mock_config
-    ):
-        media_dir = tmp_path / "data" / "movies"
-        media_file = _seed_canonical_file(media_dir)
+class TestJellyfinWithoutItemLookup:
+    """Default Jellyfin sidecar publishing does not require a server item ID.
 
-        registry = ServerRegistry.from_settings(
-            [
-                _server_config(
-                    server_id="plex-1",
-                    server_type=ServerType.PLEX,
-                    libraries=[
-                        Library(
-                            id="1",
-                            name="Movies",
-                            remote_paths=(str(media_dir),),
-                            enabled=True,
-                        )
-                    ],
-                    output={
-                        "adapter": "plex_bundle",
-                        "plex_config_folder": str(tmp_path / "plex"),
-                        "frame_interval": 10,
-                    },
-                )
-            ],
-            legacy_config=mock_config,
-        )
-
-        # D31-aware: stub the underlying plex.query (NOT get_bundle_metadata)
-        # so the URL-construction layer actually runs. Mocking get_bundle_metadata
-        # directly was the test pattern that hid D31 — every Sonarr/Radarr → Plex
-        # webhook silently malformed the /tree URL and got 404'd. By mocking one
-        # layer deeper we exercise the bare-id normalisation + URL builder.
-        from xml.etree import ElementTree as ET
-
-        plex_query_calls: list[str] = []
-
-        def fake_plex_query(url):
-            plex_query_calls.append(url)
-            # Return XML with NO MediaPart hash — same end-state as "not indexed"
-            # but proves get_bundle_metadata's URL was correctly formed.
-            return ET.fromstring("<MediaContainer></MediaContainer>")
-
-        def install_fake_plex(server_self):
-            mock_plex = MagicMock()
-            mock_plex.query = fake_plex_query
-            server_self._plex = mock_plex
-            return mock_plex
-
-        with patch.object(PlexServer, "_connect", autospec=True, side_effect=install_fake_plex):
-
-            def fake_generate_images(video_file, output_folder, *args, **kwargs):
-                _populate_frames(output_folder, count=3)
-                return (True, 3, "h264", 1.0, 30.0, None)
-
-            with patch(
-                "media_preview_generator.processing.multi_server.generate_images",
-                side_effect=fake_generate_images,
-            ):
-                result = process_canonical_path(
-                    canonical_path=str(media_file),
-                    registry=registry,
-                    config=mock_config_for_processing,
-                    item_id_by_server={"plex-1": "42"},
-                    # Don't schedule a real retry timer — pytest tears down
-                    # loguru sinks after the test, and a 30s-later retry
-                    # firing after teardown floods CI with
-                    # "ValueError: I/O operation on closed file".
-                    schedule_retry_on_not_indexed=False,
-                )
-
-        # Single skipped publisher — overall status is the dedicated
-        # SKIPPED_NOT_INDEXED (D13). Distinct from generic SKIPPED so
-        # the worker can map to ProcessingResult.SKIPPED_NOT_INDEXED and
-        # the file outcome chip matches the per-server pill ("Not
-        # Indexed Yet" everywhere) instead of falsely reading "Already
-        # Existed" — which used to confuse users into thinking the BIF
-        # was on disk when in fact the server was still scanning.
-        assert len(result.publishers) == 1
-        assert result.publishers[0].status is PublisherStatus.SKIPPED_NOT_INDEXED
-        from media_preview_generator.processing.multi_server import MultiServerStatus
-
-        assert result.status is MultiServerStatus.SKIPPED_NOT_INDEXED
-        # D16 — friendly user-facing message; no "publisher" jargon, no
-        # misleading "0 of 1 succeeded" wording.
-        assert "Waiting for 1 server" in result.message
-        assert "publisher" not in result.message.lower()
-        # D31 — confirm every URL we hit Plex with had the correct, single-prefix
-        # shape. Without this, a regression that doubled the prefix would still
-        # produce an empty MediaPart list and this test would silently pass.
-        # (The freshness pre-check + publisher path both query, hence multiple calls.)
-        assert plex_query_calls, "plex.query was never called — adapter never reached Plex"
-        for url in plex_query_calls:
-            assert url == "/library/metadata/42/tree", (
-                f"plex.query called with {url!r} — D31 regression "
-                "(doubled /library/metadata/ prefix) would slip past this test."
-            )
-
-
-class TestNotInLibraryRoutesToSkip:
-    """When ``resolve_remote_path_to_item_id`` returns None for an
-    adapter that needs an item id (Jellyfin trickplay, Plex bundle),
-    the publisher must report SKIPPED_NOT_IN_LIBRARY with a friendly
-    message — NOT a confusing FAILED with the "publish-time bookkeeping"
-    ValueError. Reproduces job b350d2ac where the user's Jellyfin had a
-    different release of the same episode on a different drive than the
-    canonical path, so the basename match returned None and every
-    publish attempt was reported as a hard failure.
+    Path-based refresh follows publication without a reverse lookup. An item
+    lookup remains necessary for Jellyfin's separate off-media output layout.
     """
 
     def test_jellyfin_publishes_without_item_id_lookup(self, mock_config_for_processing, tmp_path):
@@ -1422,84 +1524,6 @@ class TestNotInLibraryRoutesToSkip:
         assert refresh_calls, "trigger_refresh was never called post-publish"
         assert refresh_calls[0][0] is None  # no item_id → path-based nudge
         assert refresh_calls[0][1] == str(media_file)
-
-    def test_plex_returns_skipped_not_in_library_when_item_id_unresolvable(self, mock_config_for_processing, tmp_path):
-        """TEST_AUDIT P0.3 matrix completion — Plex bundle adapter.
-
-        Existing test (above) covers the Jellyfin path. Plex bundle adapter
-        ALSO returns ``needs_server_metadata=True`` (per output/plex_bundle.py
-        line 45 — bundle hash comes from /tree endpoint, no hash → no path).
-        Same code path (multi_server.py:536-552) handles both.
-
-        Without this matrix variant, a regression that ONLY fixed the Plex
-        branch (or only broke it) would slip through with the Jellyfin
-        test still passing. Per CLAUDE.md "Cover the matrix, not one cell."
-        """
-        from media_preview_generator.servers.plex import PlexServer
-
-        media_dir = tmp_path / "data" / "movies"
-        media_file = _seed_canonical_file(media_dir)
-
-        registry = ServerRegistry.from_settings(
-            [
-                _server_config(
-                    server_id="plex-1",
-                    server_type=ServerType.PLEX,
-                    libraries=[
-                        Library(
-                            id="1",
-                            name="Movies",
-                            remote_paths=(str(media_dir),),
-                            enabled=True,
-                        )
-                    ],
-                    output={"adapter": "plex_bundle", "plex_config_folder": "/cfg"},
-                )
-            ],
-        )
-
-        scan_nudges: list[tuple[str | None, str | None]] = []
-
-        def fake_trigger_refresh(self, *, item_id, remote_path, deleted_paths=None):
-            scan_nudges.append((item_id, remote_path))
-
-        def fake_generate_images(video_file, output_folder, *args, **kwargs):
-            _populate_frames(output_folder, count=3)
-            return (True, 3, "h264", 1.0, 30.0, None)
-
-        with (
-            patch.object(PlexServer, "resolve_remote_path_to_item_id", return_value=None),
-            patch.object(PlexServer, "trigger_refresh", autospec=True, side_effect=fake_trigger_refresh),
-            patch(
-                "media_preview_generator.processing.multi_server.generate_images",
-                side_effect=fake_generate_images,
-            ),
-        ):
-            result = process_canonical_path(
-                canonical_path=str(media_file),
-                registry=registry,
-                config=mock_config_for_processing,
-                schedule_retry_on_not_indexed=False,
-            )
-
-        assert len(result.publishers) == 1
-        assert result.publishers[0].status is PublisherStatus.SKIPPED_NOT_IN_LIBRARY, (
-            f"Plex bundle adapter with no item_id should SKIP_NOT_IN_LIBRARY, "
-            f"NOT {result.publishers[0].status}. Bug class: cryptic 'publish-time bookkeeping' "
-            f"ValueError leaking from compute_output_paths instead of graceful skip."
-        )
-        # Same user-facing message contract as the Jellyfin variant.
-        assert "library" in result.publishers[0].message.lower()
-        assert "bookkeeping" not in result.publishers[0].message.lower()
-        assert "valueerror" not in result.publishers[0].message.lower()
-        # Aggregate must collapse to SKIPPED_NOT_INDEXED so the file outcome
-        # chip matches the per-server pill (D13 contract).
-        assert result.status is MultiServerStatus.SKIPPED_NOT_INDEXED
-        # Scan was nudged with item_id=None (Plex falls back to a path-based
-        # /library/sections/{id}/refresh on the not-in-library branch).
-        assert scan_nudges, "trigger_refresh was never called for Plex not-in-library publisher"
-        assert scan_nudges[0][0] is None
-        assert scan_nudges[0][1] == str(media_file)
 
 
 class TestSkipIfExists:
@@ -1621,7 +1645,7 @@ class TestCopiesSharingOnePlexBundle:
                         item_id_by_server={"plex-1": "689756"},
                     )
                 )
-        assert {c.args[0] for c in tree.call_args_list} <= {"689756"}
+        tree.assert_not_called()
         return results
 
     def test_copies_are_not_regenerated_when_both_have_published(self, mock_config_for_processing, tmp_path):
@@ -1642,7 +1666,13 @@ class TestCopiesSharingOnePlexBundle:
                 )
             ],
         )
-        shared_bif = plex_config / "Media/localhost/7" / f"{self._HASH[1:]}.bundle/Contents/Indexes/index-sd.bif"
+        from media_preview_generator.output.plex_hash import calculate_plex_hash
+
+        local_hash = calculate_plex_hash(str(original))
+        assert calculate_plex_hash(str(copy)) == local_hash
+        shared_bif = (
+            plex_config / "Media/localhost" / local_hash[0] / f"{local_hash[1:]}.bundle/Contents/Indexes/index-sd.bif"
+        )
 
         first_night: list[str] = []
         results = self._scan(mock_config_for_processing, registry, [copy, original], first_night)
@@ -1943,6 +1973,236 @@ class TestNoFrames:
 
         assert result.status is MultiServerStatus.NO_FRAMES
 
+    @pytest.mark.parametrize(
+        ("summary", "message_says", "second_warning"),
+        [
+            (NO_DECODER_SUMMARY, NO_DECODER_SUMMARY, False),
+            ("Conversion failed!", "FFmpeg produced 0 frames", True),
+        ],
+        ids=["no-decoder", "other-cause"],
+    )
+    def test_a_video_no_device_can_decode_is_not_reported_a_second_time(
+        self, mock_config_for_processing, tmp_path, summary, message_says, second_warning
+    ):
+        """The FFmpeg run already logged that file's one failure line; the Files panel shows the same reason."""
+        media_dir = tmp_path / "data" / "movies"
+        media_file = _seed_canonical_file(media_dir)
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="emby-1",
+                    server_type=ServerType.EMBY,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_dir),), enabled=True)],
+                )
+            ],
+        )
+        warnings: list[str] = []
+        sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{message}")
+        try:
+            with patch(
+                "media_preview_generator.processing.multi_server.generate_images",
+                return_value=(False, 0, False, 0.1, "0.0x", summary),
+            ):
+                result = process_canonical_path(
+                    canonical_path=str(media_file), registry=registry, config=mock_config_for_processing
+                )
+        finally:
+            logger.remove(sink)
+
+        assert result.status is MultiServerStatus.NO_FRAMES
+        assert message_says in result.message
+        assert any("produced no preview frames" in line for line in warnings) is second_warning, warnings
+
+    @pytest.mark.parametrize("keyframe_gap", [1.0, None], ids=["keyframe", "full-decode"])
+    def test_ffmpegs_own_no_decoder_failure_ends_the_file_without_a_second_report(
+        self, mock_config_for_processing, tmp_path, keyframe_gap
+    ):
+        """The real ``generate_images`` over a fake FFmpeg process: what it returns is what ends the file here."""
+        from media_preview_generator.processing.generator import failure_scope
+        from tests.test_processing_failure_diagnosis import (
+            NO_DECODER_EXIT,
+            NO_DECODER_KEYFRAME_STDERR,
+            NO_DECODER_STDERR,
+        )
+
+        media_dir = tmp_path / "data" / "movies"
+        media_file = _seed_canonical_file(media_dir)
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="emby-1",
+                    server_type=ServerType.EMBY,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_dir),), enabled=True)],
+                )
+            ],
+        )
+        runs: list[bool] = []
+
+        def popen(args, **kwargs):
+            keyframe_only = "-skip_frame:v" in args
+            runs.append(keyframe_only)
+            kwargs["stderr"].write("\n".join(NO_DECODER_KEYFRAME_STDERR if keyframe_only else NO_DECODER_STDERR) + "\n")
+            kwargs["stderr"].flush()
+            proc = MagicMock(pid=4242, returncode=NO_DECODER_EXIT)
+            proc.poll.return_value = NO_DECODER_EXIT
+            return proc
+
+        track = MagicMock(hdr_format=None, transfer_characteristics=None, duration=2_523_000)
+        warnings: list[str] = []
+        sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{message}")
+        try:
+            with (
+                failure_scope("no-decoder-job"),
+                patch("media_preview_generator.processing.generator.MediaInfo") as mediainfo,
+                patch(
+                    "media_preview_generator.processing.generator._probe_max_keyframe_gap", return_value=keyframe_gap
+                ),
+                patch("media_preview_generator.processing.ffmpeg_runner.subprocess.Popen", side_effect=popen),
+            ):
+                mediainfo.parse.return_value = MagicMock(video_tracks=[track])
+                result = process_canonical_path(
+                    canonical_path=str(media_file), registry=registry, config=mock_config_for_processing
+                )
+        finally:
+            logger.remove(sink)
+
+        assert runs == [keyframe_gap is not None], "one FFmpeg run, no rerun"
+        assert result.status is MultiServerStatus.NO_FRAMES
+        assert result.message == NO_DECODER_SUMMARY
+        assert not any("produced no preview frames" in line for line in warnings), warnings
+
+
+class TestSourceVanishesDuringGeneration:
+    """A file that's there for the up-front check and gone by the time its frames are read ends like one that was
+    never there: replaced by a newer file, or not found and retried. It isn't a corrupt video.
+
+    Production, 2026-09-30 14:14: Sonarr replaced The Drop S01E04 two seconds after its job passed the check; the job
+    logged an ERROR with a traceback ("Common causes: corrupt video file…") and the file was marked failed.
+    """
+
+    OLD = "The Drop (2026) - S01E04 - The Big Push [HDR10].mkv"
+    NEW = "The Drop (2026) - S01E04 - The Big Push [DV HDR10Plus]-RAWR.mkv"
+
+    @staticmethod
+    def _season(tmp_path: Path) -> Path:
+        root = tmp_path / "tv"
+        _video(root / "Other Show (2019)" / "Season 01" / "Other Show (2019) - S01E01 - Pilot.mkv")
+        return root / "The Drop (2026)" / "Season 01"
+
+    @staticmethod
+    def _run(source: Path, config, tmp_path: Path, generate):
+        """Run ``source`` with ``generate`` standing in for FFmpeg; returns the result and the (level, message) log."""
+        config.tmp_folder = str(tmp_path / "cache")
+        registry = _emby_registry(tmp_path / "tv")
+        records: list[tuple[str, str]] = []
+        sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="DEBUG")
+        try:
+            with patch(
+                "media_preview_generator.processing.multi_server.generate_images", side_effect=generate
+            ) as mock_generate:
+                result = process_canonical_path(canonical_path=str(source), registry=registry, config=config)
+        finally:
+            logger.remove(sink)
+        return result, records, mock_generate
+
+    @staticmethod
+    def _vanish_then_raise(source: Path, exc: Exception, *, replacement: Path | None = None):
+        def generate(*_args, **_kwargs):
+            source.unlink()
+            if replacement is not None:
+                _video(replacement)
+            raise exc
+
+        return generate
+
+    @pytest.mark.parametrize(
+        "exc",
+        [FileNotFoundError("no such file"), RuntimeError("ffmpeg exited 1")],
+        ids=["file-not-found", "another-error"],
+    )
+    def test_replaced_while_generating_ends_as_replaced_by_a_newer_file(
+        self, mock_config_for_processing, tmp_path, exc
+    ):
+        season = self._season(tmp_path)
+        source = _video(season / self.OLD)
+
+        result, records, mock_generate = self._run(
+            source,
+            mock_config_for_processing,
+            tmp_path,
+            self._vanish_then_raise(source, exc, replacement=season / self.NEW),
+        )
+
+        mock_generate.assert_called_once()
+        assert result.status is MultiServerStatus.SKIPPED_SOURCE_GONE
+        assert result.message == f"Skipped: replaced by a newer file ({self.NEW})"
+        assert result.canonical_path == str(source)
+        assert result.publishers == []
+        assert [message for level, message in records if level in ("WARNING", "ERROR")] == []
+
+    @pytest.mark.parametrize(
+        "exc",
+        [FileNotFoundError("no such file"), RuntimeError("ffmpeg exited 1")],
+        ids=["file-not-found", "another-error"],
+    )
+    def test_gone_while_generating_without_a_replacement_is_retryable_not_found(
+        self, mock_config_for_processing, tmp_path, exc
+    ):
+        season = self._season(tmp_path)
+        _video(season / "The Drop (2026) - S01E03 - Family Matters.mkv")
+        source = _video(season / self.OLD)
+
+        result, records, _ = self._run(
+            source, mock_config_for_processing, tmp_path, self._vanish_then_raise(source, exc)
+        )
+
+        assert result.status is MultiServerStatus.SKIPPED_FILE_NOT_FOUND
+        assert result.message == f"Source file not found: {source}"
+        assert result.publishers == []
+        assert [level for level, _ in records if level == "ERROR"] == []
+        warnings = [message for level, message in records if level == "WARNING"]
+        assert len(warnings) == 1
+        assert warnings[0].startswith(f"Source video file is missing on disk: {source}.")
+
+    @pytest.mark.parametrize("replaced", [True, False], ids=["replaced", "not-replaced"])
+    def test_outcome_matches_a_file_missing_at_the_up_front_check(self, mock_config_for_processing, tmp_path, replaced):
+        season = self._season(tmp_path)
+        _video(season / "The Drop (2026) - S01E03 - Family Matters.mkv")
+        source = _video(season / self.OLD)
+        replacement = season / self.NEW if replaced else None
+
+        during, _, _ = self._run(
+            source,
+            mock_config_for_processing,
+            tmp_path,
+            self._vanish_then_raise(source, FileNotFoundError("no such file"), replacement=replacement),
+        )
+        up_front, _, mock_generate = self._run(source, mock_config_for_processing, tmp_path, AssertionError)
+
+        mock_generate.assert_not_called()
+        assert during == up_front
+
+    @pytest.mark.parametrize(
+        "exc",
+        [RuntimeError("ffmpeg exited 1"), FileNotFoundError("ffmpeg: no such file")],
+        ids=["another-error", "file-not-found-for-something-else"],
+    )
+    def test_failure_with_the_file_still_on_disk_is_still_a_failure(self, mock_config_for_processing, tmp_path, exc):
+        season = self._season(tmp_path)
+        source = _video(season / self.OLD)
+        _video(season / self.NEW)
+
+        def generate(*_args, **_kwargs):
+            raise exc
+
+        result, records, _ = self._run(source, mock_config_for_processing, tmp_path, generate)
+
+        assert result.status is MultiServerStatus.FAILED
+        assert result.message == f"Frame generation failed: {exc}"
+        errors = [message for level, message in records if level == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].startswith(f"Could not extract preview frames from {source} ({type(exc).__name__}: {exc}).")
+
 
 class TestAdapterFactory:
     def test_picks_default_per_server_type(self):
@@ -2078,6 +2338,45 @@ class TestSummariseResults:
             assert "publisher" not in msg.lower(), f"jargon leaked for {ms_status}: {msg!r}"
 
 
+class TestItemIdLookupMissIsNotAWarning:
+    """A server that hasn't indexed a file yet is the expected state right after an import: every lookup of every
+    attempt hits it (1,276 of ~2,000 WARNING lines in 3.6 days on the owner's server). The lookup says so at INFO; the
+    line that ends a retry chain is the one that warns."""
+
+    @staticmethod
+    def _lookup(found: str | None) -> list[tuple[str, str]]:
+        from media_preview_generator.processing.multi_server import _resolve_item_id_for
+
+        server = MagicMock()
+        server.name = "Plex"
+        server.resolve_remote_path_to_item_id.return_value = found
+        records: list[tuple[str, str]] = []
+        sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="DEBUG")
+        try:
+            assert _resolve_item_id_for(server, "/data/tv/Show/Show - S01E01.mkv", None) == found
+        finally:
+            logger.remove(sink)
+        server.resolve_remote_path_to_item_id.assert_called_once_with("/data/tv/Show/Show - S01E01.mkv")
+        return records
+
+    def test_miss_is_logged_at_info_not_warning(self):
+        records = self._lookup(None)
+
+        assert [level for level, _ in records if level not in ("INFO", "DEBUG")] == []
+        misses = [(level, message) for level, message in records if "not found on Plex" in message]
+        assert len(misses) == 1
+        level, message = misses[0]
+        assert level == "INFO"
+        assert message.startswith("'Show - S01E01.mkv' not found on Plex (")
+        assert message.endswith("indexing may be delayed")
+
+    def test_hit_logs_no_miss_line(self):
+        records = self._lookup("12345")
+
+        assert [message for _, message in records if "not found on" in message] == []
+        assert [level for level, _ in records if level not in ("INFO", "DEBUG")] == []
+
+
 class TestItemIdResolverMemoisation:
     """TEST_AUDIT P0.5 — closes commit 1f09c3a "90s gap" bug class.
 
@@ -2106,7 +2405,6 @@ class TestItemIdResolverMemoisation:
         narrows the cache key, or adds a per-call short-circuit before
         the cache check is caught loudly.
         """
-        from unittest.mock import MagicMock
 
         from media_preview_generator.processing import multi_server as ms
 
@@ -2134,7 +2432,6 @@ class TestItemIdResolverMemoisation:
         (e.g. cached only by canonical_path) would return Plex's item-id
         when the dispatcher asked Jellyfin → publish to the wrong item.
         """
-        from unittest.mock import MagicMock
 
         from media_preview_generator.processing import multi_server as ms
 
@@ -2168,7 +2465,6 @@ class TestItemIdResolverMemoisation:
         but Jellyfin doesn't. Without caching the negative, the next
         sub-phase re-asks Jellyfin and pays another 30s. Pin it.
         """
-        from unittest.mock import MagicMock
 
         from media_preview_generator.processing import multi_server as ms
 
@@ -2197,7 +2493,6 @@ class TestItemIdResolverMemoisation:
         Jellyfin library refresh between dispatches would still see
         the cached "not in library" answer and never re-check.
         """
-        from unittest.mock import MagicMock
 
         from media_preview_generator.processing import multi_server as ms
 
@@ -2266,3 +2561,153 @@ class TestGpuHandOffAnnouncementNamesItsCause:
         assert all(fragment in announced for fragment in said) and str(media_file) in announced, announced
         if not_said:
             assert not_said not in announced
+
+
+class TestPlexLocalPublishing:
+    @pytest.mark.parametrize("regenerate", [False, True])
+    @pytest.mark.parametrize("check_only", [False, True])
+    @pytest.mark.parametrize("item_hint", [None, "42"])
+    def test_unindexed_file_needs_no_plex_calls(
+        self, mock_config_for_processing, tmp_path, monkeypatch, regenerate, check_only, item_hint, queued_plex_refresh
+    ):
+        import requests
+
+        from media_preview_generator.output.plex_bundle import PlexBundleAdapter
+        from media_preview_generator.output.plex_hash import calculate_plex_hash
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        destination = tmp_path / "plex"
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="plex-1",
+                    server_type=ServerType.PLEX,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_file.parent),), enabled=True)],
+                    output={"adapter": "plex_bundle", "plex_config_folder": str(destination)},
+                )
+            ]
+        )
+        requests_made = []
+
+        def reject_request(*args, **kwargs):
+            requests_made.append((args, kwargs))
+            raise requests.ConnectionError("Plex offline")
+
+        monkeypatch.setattr(requests.sessions.Session, "request", reject_request)
+
+        def extract(video_file, output_folder, *args, **kwargs):
+            assert video_file == str(media_file)
+            _populate_frames(output_folder, count=3)
+            return (True, 3, "h264", 320, 30.0, None)
+
+        with patch("media_preview_generator.processing.multi_server.generate_images", side_effect=extract) as generate:
+            result = process_canonical_path(
+                canonical_path=str(media_file),
+                registry=registry,
+                config=mock_config_for_processing,
+                regenerate=regenerate,
+                check_only=check_only,
+                item_id_by_server={"plex-1": item_hint} if item_hint else None,
+            )
+        expected = PlexBundleAdapter.bundle_bif_path(str(destination), calculate_plex_hash(str(media_file)))
+        assert requests_made == []
+        if check_only:
+            assert result.status is MultiServerStatus.NEEDS_GENERATION
+            assert not expected.exists()
+            generate.assert_not_called()
+            queued_plex_refresh.assert_not_called()
+        else:
+            from media_preview_generator.output.journal import clear_plex_refresh_pending, get_plex_refresh_pending
+            from media_preview_generator.output.plex_hash import get_source_fingerprint
+
+            fingerprint = get_source_fingerprint(str(media_file))
+            token = get_plex_refresh_pending([expected], str(media_file), "plex-1", source_fingerprint=fingerprint)
+            assert token is not None
+            notification_kwargs = {
+                "output_paths": (expected,),
+                "notification_token": token,
+                "source_fingerprint": fingerprint,
+            }
+            queued_plex_refresh.assert_called_once_with(
+                registry.get("plex-1"),
+                str(media_file),
+                item_hint,
+                **notification_kwargs,
+            )
+            assert result.status is MultiServerStatus.PUBLISHED
+            assert result.publishers[0].status is PublisherStatus.PUBLISHED
+            assert result.publishers[0].output_paths == [expected]
+            assert expected.is_file()
+            assert generate.call_args.args[0] == str(media_file)
+            assert generate.call_args.args[4] is mock_config_for_processing
+            assert generate.call_args.kwargs["cancel_check"] is None
+            queued_plex_refresh.reset_mock()
+            with patch("media_preview_generator.processing.multi_server.generate_images") as second_generate:
+                second = process_canonical_path(
+                    canonical_path=str(media_file),
+                    registry=registry,
+                    config=mock_config_for_processing,
+                    check_only=True,
+                    item_id_by_server={"plex-1": item_hint} if item_hint else None,
+                )
+            assert second.status is MultiServerStatus.SKIPPED
+            second_generate.assert_not_called()
+            queued_plex_refresh.assert_called_once_with(
+                registry.get("plex-1"),
+                str(media_file),
+                item_hint,
+                **notification_kwargs,
+            )
+            clear_plex_refresh_pending([expected], str(media_file), "plex-1", token, source_fingerprint=fingerprint)
+            # Ordinary full-scan preflight and duplicate jobs must not Analyze
+            # already-acknowledged outputs again or fill the bounded queue.
+            for fresh_check_only in (True, False):
+                queued_plex_refresh.reset_mock()
+                with patch("media_preview_generator.processing.multi_server.generate_images") as fresh_generate:
+                    fresh = process_canonical_path(
+                        canonical_path=str(media_file),
+                        registry=registry,
+                        config=mock_config_for_processing,
+                        check_only=fresh_check_only,
+                        item_id_by_server={"plex-1": item_hint} if item_hint else None,
+                    )
+                assert fresh.status is MultiServerStatus.SKIPPED
+                fresh_generate.assert_not_called()
+                queued_plex_refresh.assert_not_called()
+
+    def test_source_replaced_during_extraction_is_not_published(self, mock_config_for_processing, tmp_path):
+        from media_preview_generator.processing.frame_cache import get_frame_cache
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        destination = tmp_path / "plex"
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="plex-1",
+                    server_type=ServerType.PLEX,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_file.parent),), enabled=True)],
+                    output={"adapter": "plex_bundle", "plex_config_folder": str(destination)},
+                )
+            ]
+        )
+
+        def extract(video_file, output_folder, *args, **kwargs):
+            _populate_frames(output_folder, count=3)
+            media_file.write_bytes(b"replacement video contents")
+            return (True, 3, "h264", 320, 30.0, None)
+
+        with patch("media_preview_generator.processing.multi_server.generate_images", side_effect=extract):
+            result = process_canonical_path(
+                canonical_path=str(media_file),
+                registry=registry,
+                config=mock_config_for_processing,
+            )
+        assert result.status is MultiServerStatus.FAILED
+        assert "Source file changed" in result.message
+        assert not list(destination.rglob("*.bif"))
+        from media_preview_generator.processing.multi_server import _frame_extraction_key
+
+        assert (
+            get_frame_cache().get(str(media_file), extraction_key=_frame_extraction_key(mock_config_for_processing))
+            is None
+        )

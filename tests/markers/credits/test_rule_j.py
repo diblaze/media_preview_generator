@@ -922,6 +922,140 @@ class TestTextAllThrough:
         assert rule_j.credits_start(rows, []) == 2.0
 
 
+def caption(t: float, boxes: int, i: int, luma: float = 120.0) -> rule_j.Row:
+    """A lit keyframe with ``boxes`` caption boxes wherever keyframe ``i`` puts them: a variety show's captions wander
+    over the frame, so no place holds them long enough to be an overlay (:func:`rule_j.overlay_boxes`)."""
+    placed = []
+    for k in range(boxes):
+        x, y = (i * 97 + k * 131) % 240 + 10, (i * 53 + k * 71) % 150 + 5
+        placed.append((x, y, x + 60, y + 12))
+    return (float(t), boxes, luma, tuple(placed))
+
+
+def captioned_tail(story_every: int, blank_s: int) -> list[rule_j.Row]:
+    """A 1 s keyframe tail: 200 s of story with a caption on one keyframe in ``story_every``; then 220 s where a
+    three-box caption lands every 10 s (a credit frame each, 10 s apart, so the 24 s join chains them), one-box
+    captions on the keyframes between, and ``blank_s`` of them without any text, in the second half of each 10 s from
+    1220 s on; then 28 s of dark cards."""
+    rows = [caption(t, 1 if i % story_every == 0 else 0, i) for i, t in enumerate(range(1000, 1200))]
+    left = blank_s
+    for i, t in enumerate(range(1200, 1420)):
+        if t % 10 == 0:
+            rows.append(caption(t, 3, i + 500))
+        elif t >= 1220 and t % 10 >= 5 and left > 0:
+            rows.append(caption(t, 0, i))
+            left -= 1
+        else:
+            rows.append(caption(t, 1, i + 900))
+    return rows + [dark(t, 4) for t in range(1420, 1448)]
+
+
+class TestCaptionsAllThrough:
+    """Rule J version 9: a captioned story's own captions chained into a run by the 24 s join are not a roll (the
+    2026-09-29 audit's variety show: 47 of 48 answers wrong, 29 skipping story). No answer when 40 % or more of the
+    keyframes before the start carry text and the run holds more than one join of lit keyframes without any, each
+    counted at most at the run's usual keyframe spacing."""
+
+    @pytest.mark.parametrize(
+        ("story_every", "blank_s", "start"),
+        [
+            (2, 60, None),     # captions on half the story, 60 s of text-free story in the run: its captions
+            (2, 25, None),     # 25 s: more than one join
+            (2, 24, 1210.0),   # 24 s: one join, the run keeps its answer
+            (2, 0, 1210.0),
+            (3, 60, 1210.0),   # captions on a third of the story: credits over closing footage keep theirs
+            (1, 60, None),     # text all through: text_all_through's own refusal
+        ],
+    )  # fmt: skip
+    def test_the_story_share_and_the_story_in_the_run_decide(self, story_every, blank_s, start):
+        rows = captioned_tail(story_every, blank_s)
+        coarse = rule_j.coarse_start(rows)
+        # The anchor steps over the first caption (10 s from the next, more than 1.5 x the dark cards' 1 s cadence).
+        assert coarse is not None and coarse.pts_s == 1210.0 and rule_j.overlay_boxes(rows) == ()
+        assert rule_j.credits_start(rows, []) == start
+
+    @staticmethod
+    def _run(story: list[rule_j.Row], run: list[rule_j.Row]) -> tuple[list[rule_j.Row], Coarse, float]:
+        rows = [*story, *run]
+        return rows, Coarse(index=len(story), end_index=len(rows) - 1, pts_s=run[0][0]), run[-1][0]
+
+    @pytest.mark.parametrize(("texted", "refused"), [(40, True), (39, False)])  # of 100 keyframes before the start
+    def test_the_share_counts_any_box_on_the_keyframes_before_the_start(self, texted, refused):
+        story = [bright(t, 1 if t < texted else 0) for t in range(100)]
+        run = [bright(100, 3), *[bright(t) for t in range(101, 131)], bright(131, 3)]  # 30 s of lit story between
+        rows, coarse, end_s = self._run(story, run)
+        assert rule_j.captions_all_through(rows, rows, coarse, end_s) is refused
+
+    @pytest.mark.parametrize(
+        ("between", "refused"),
+        [
+            ([bright(t) for t in range(101, 125)], False),                    # 24 s of text-free lit keyframes
+            ([bright(t) for t in range(101, 126)], True),                     # 25 s
+            ([dark(t) for t in range(101, 161)], False),                      # black: the roll's own ground
+            ([bright(t, 1) for t in range(101, 161)], False),                 # a name over footage on every keyframe
+            ([bright(t, 0, 30.0) for t in range(101, 126)], True),            # luma 30 is lit, as rule J reads it
+        ],
+    )  # fmt: skip
+    def test_only_lit_keyframes_without_text_count_as_story(self, between, refused):
+        story = [bright(t, 1) for t in range(100)]
+        run = [bright(100, 3), *between, bright(between[-1][0] + 1, 3)]
+        rows, coarse, end_s = self._run(story, run)
+        assert rule_j.captions_all_through(rows, rows, coarse, end_s) is refused
+
+    @pytest.mark.parametrize(
+        ("between", "last_s", "refused"),
+        [
+            # A roll of 4 s cards with 1 s fades between them after a story captioned on every keyframe, keyframes 1 s
+            # apart: 20 fades are 20 s of text-free lit keyframes, within one join, and the roll keeps its answer; 25
+            # fades are more than a join.
+            ([bright(t, 0 if t % 5 == 0 else 2) for t in range(101, 201)], 201, False),
+            ([bright(t, 0 if t % 5 == 0 else 2) for t in range(101, 226)], 226, True),
+            # Keyframes at scene cuts: one text-free keyframe before a 30 s gap counts for the run's usual spacing
+            # (1 s), not for the gap, so a stray fade frame can't refuse the roll by itself.
+            ([*[bright(t, 2) for t in range(101, 121)], bright(121), *[bright(t, 2) for t in range(151, 171)]], 171, False),
+            # The boundary with one long gap among the text-free keyframes: 24 of them are 24 s, one join, however long
+            # the gap after the last (33 s by gap length); 25 are more.
+            ([bright(t) for t in range(101, 125)], 134, False),
+            ([bright(t) for t in range(101, 126)], 135, True),
+            # The variety show's shape: captions every few seconds on lit story, 60 text-free keyframes between them.
+            ([bright(t, 3) if t % 4 == 0 else bright(t) for t in range(101, 181)], 181, True),
+        ],
+    )  # fmt: skip
+    def test_a_text_free_keyframe_counts_for_the_runs_usual_spacing(self, between, last_s, refused):
+        story = [bright(t, 1) for t in range(100)]
+        run = [bright(100, 3), *between, bright(last_s, 3)]
+        rows, coarse, end_s = self._run(story, run)
+        assert rule_j.captions_all_through(rows, rows, coarse, end_s) is refused
+
+    def test_story_after_the_runs_latest_credit_keyframe_is_not_the_runs(self):
+        story = [bright(t, 1) for t in range(100)]
+        run = [
+            bright(100, 3),
+            *[bright(t) for t in range(101, 111)],
+            bright(111, 3),
+            *[bright(t) for t in range(112, 200)],
+        ]
+        rows, coarse, _ = self._run(story, run)
+        assert not rule_j.captions_all_through(rows, rows, coarse, 111.0)
+        assert rule_j.captions_all_through(rows, rows, coarse, 199.0)
+
+    def test_a_keyframe_whose_only_box_is_an_overlay_is_story(self):
+        # Read on the rows without the overlays' boxes: a channel bug boxed on a story keyframe is no text on it. The
+        # share is counted on the rows as decoded, bug included, as text_all_through counts it.
+        bug = (280, 5, 310, 15)
+        story = [(float(t), 1, 120.0, (bug,)) if t % 2 else bright(t) for t in range(100)]
+        run = [bright(100, 3), *[(float(t), 1, 120.0, (bug,)) for t in range(101, 131)], bright(131, 3)]
+        rows, coarse, end_s = self._run(story, run)
+        shown = rule_j.without_overlays(rows, [bug])
+        assert not rule_j.captions_all_through(rows, rows, coarse, end_s)
+        assert rule_j.captions_all_through(rows, shown, coarse, end_s)
+
+    def test_no_keyframe_before_the_start_is_no_refusal(self):
+        run = [bright(100, 3), *[bright(t) for t in range(101, 161)], bright(161, 3)]
+        rows, coarse, end_s = self._run([], run)
+        assert not rule_j.captions_all_through(rows, rows, coarse, end_s)
+
+
 class TestARollThatBeganBeforeTheTail:
     """A run less than 30 s into the tail may be a roll the tail cut into (the lab's Heeramandi episodes: 462 s rolls
     against a 450 s tail). The detector reads before the tail only when nothing lit comes before the run."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -57,10 +58,29 @@ def test_no_report_is_an_error():
         analyze.parse("Error opening input file")
 
 
-def test_silent_stream_is_refused_not_written():
-    report = analyze.parse(REPORT.replace('"-23.23"', '"-inf"'))
-    with pytest.raises(analyze.LoudnessError, match="silent"):
-        analyze.ln_fields(report)
+@pytest.mark.parametrize("peak", ["-inf", "-16.32"])
+def test_silent_and_short_streams_preserve_plexs_verified_sentinels(peak):
+    report = {**analyze.parse(REPORT), "input_i": "-inf", "input_tp": peak, "target_offset": "inf"}
+    fields = analyze.ln_fields(report)
+    assert fields["ln:loudness"] == "-inf"
+    assert fields["ln:peak"] == peak
+    assert fields["ln:gainOffset"] == "inf"
+    assert analyze.valid_measurements(fields)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"input_i": "nan"},
+        {"input_tp": "inf"},
+        {"input_i": "-inf"},
+        {"target_offset": "inf"},
+        {"input_i": "-inf", "target_offset": "inf", "input_lra": "inf"},
+    ],
+)
+def test_other_nonfinite_measurements_are_refused(changes):
+    with pytest.raises(analyze.LoudnessError):
+        analyze.ln_fields({**analyze.parse(REPORT), **changes})
 
 
 def test_timeout_scales_with_length_within_bounds():
@@ -141,3 +161,38 @@ def test_a_job_cancelled_while_paused_never_starts_ffmpeg(tmp_path):
 def test_run_reads_the_report_ffmpeg_prints(tmp_path):
     ffmpeg = _fake_ffmpeg(tmp_path, "cat >&2 <<'EOT'\n" + REPORT + "\nEOT")
     assert analyze.run(ffmpeg, "/m/a.mkv", 1, duration_ms=1000) == PLEX_FIELDS
+
+
+@pytest.mark.parametrize("index", [-1, True, 1.5, "1", None])
+def test_invalid_stream_index_never_becomes_a_stream_map(index):
+    with pytest.raises(analyze.LoudnessError, match="nonnegative integer"):
+        analyze.command("ffmpeg", "/m/a.mkv", index)
+
+
+def test_already_cancelled_unpaused_job_never_launches_ffmpeg(monkeypatch):
+    launch = MagicMock()
+    monkeypatch.setattr(analyze.subprocess, "Popen", launch)
+    with pytest.raises(analyze.LoudnessError, match="cancelled"):
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000, cancel_check=lambda: True)
+    launch.assert_not_called()
+
+
+def test_fast_completion_does_not_return_measurements_after_cancellation(monkeypatch):
+    cancelled = False
+
+    def communicate(**kwargs):
+        nonlocal cancelled
+        cancelled = True
+        return None, REPORT.encode()
+
+    proc = MagicMock(returncode=0)
+    proc.communicate.side_effect = communicate
+    monkeypatch.setattr(analyze.subprocess, "Popen", MagicMock(return_value=proc))
+    with pytest.raises(analyze.LoudnessError, match="cancelled"):
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000, cancel_check=lambda: cancelled)
+
+
+def test_missing_ffmpeg_is_an_item_analysis_error(monkeypatch):
+    monkeypatch.setattr(analyze.subprocess, "Popen", MagicMock(side_effect=FileNotFoundError(2, "No such file")))
+    with pytest.raises(analyze.LoudnessError, match="Could not start ffmpeg"):
+        analyze.run("missing-ffmpeg", "/m/a.mkv", 1, duration_ms=1000)

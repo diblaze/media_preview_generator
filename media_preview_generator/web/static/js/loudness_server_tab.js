@@ -6,7 +6,7 @@
     'use strict';
 
     // Mirrors loudness.settings.DEFAULT_KINDS: movie and TV libraries unless the user chose.
-    const DEFAULT_KINDS = ['movie', 'episode'];
+    const DEFAULT_KINDS = ['movie', 'episode', 'show'];
 
     const $ = (sel, el) => (el || document).querySelector(sel);
     const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
@@ -33,12 +33,6 @@
         return block && typeof block === 'object' ? block : {};
     }
 
-    // The Plex database write is confirmed once, on the Intro & Credits tab; loudness writes the same database.
-    function writeConfirmed(server) {
-        const plex = server && server.markers && server.markers.plex;
-        return !!((plex && plex.db_write_confirmed_at) || (server && server._markersConfirmedAt));
-    }
-
     function libraryDomId(libraryId) {
         return `loudnessLib-${String(libraryId).replace(/[^A-Za-z0-9_-]/g, '_')}`;
     }
@@ -54,10 +48,10 @@
 
     function syncSwitch() {
         const toggle = $('#loudnessEnabled');
-        const confirmed = writeConfirmed(tab.server);
-        if (toggle) toggle.disabled = !confirmed && !toggle.checked;
-        const hint = $('#loudnessConfirmHint');
-        if (hint) hint.classList.toggle('d-none', confirmed);
+        const helper = !!($('#markersAgentEnabled') || {}).checked;
+        if (toggle) toggle.disabled = helper && !toggle.checked;
+        const hint = $('#loudnessHelperHint');
+        if (hint) hint.classList.toggle('d-none', !helper);
     }
 
     // Fills the Loudness cell of every row servers.js rendered. A switch the user flipped keeps its state across a
@@ -70,6 +64,11 @@
             if (!cell) return;
             const id = String(row.dataset.libId);
             const byDefault = selectedByDefault(row.dataset.libKind);
+            const supported = !row.dataset.libKind || byDefault;
+            if (!supported) {
+                cell.innerHTML = '<span class="small text-muted" title="Loudness supports movie and TV libraries only">Not supported</span>';
+                return;
+            }
             const checked = tab.libraryChoices.has(id)
                 ? tab.libraryChoices.get(id)
                 : (chosen === null ? byDefault : chosen.includes(id));
@@ -83,7 +82,10 @@
 
     function readLibraryIds(server) {
         const ids = stored(server).library_ids;
-        const storedIds = Array.isArray(ids) ? ids.map(String) : null;
+        const unsupported = new Set($$('#editLibraryList tr[data-lib-id]')
+            .filter((row) => row.dataset.libKind && !selectedByDefault(row.dataset.libKind))
+            .map((row) => String(row.dataset.libId)));
+        const storedIds = Array.isArray(ids) ? ids.map(String).filter((id) => !unsupported.has(id)) : null;
         const toggles = $$('#editLibraryList .loudness-lib-toggle');
         // Untouched switches keep the stored choice exactly (an explicit list equal to the defaults stays a list).
         if (tab.libraryChoices.size === 0 || !toggles.length) return storedIds;
@@ -102,7 +104,7 @@
         const li = $('#editTabLoudnessLi');
         if (li) li.classList.toggle('d-none', !plex);
         const toggle = $('#loudnessEnabled');
-        if (toggle) toggle.checked = plex && !!stored(server).enabled;
+        if (toggle) toggle.checked = plex && stored(server).enabled === true;
         syncSwitch();
         renderLibraryColumn();
     }
@@ -118,10 +120,9 @@
 
     function wire() {
         const toggle = $('#loudnessEnabled');
-        if (toggle) toggle.addEventListener('change', syncLibraryColumn);
-        // Confirming the database write on the Intro & Credits tab unlocks the switch here.
-        const markersToggle = $('#markersEnabled');
-        if (markersToggle) markersToggle.addEventListener('change', () => setTimeout(syncSwitch, 0));
+        if (toggle) toggle.addEventListener('change', () => { syncSwitch(); syncLibraryColumn(); });
+        const helperToggle = $('#markersAgentEnabled');
+        if (helperToggle) helperToggle.addEventListener('change', syncSwitch);
         const list = $('#editLibraryList');
         if (list) {
             list.addEventListener('change', (event) => {

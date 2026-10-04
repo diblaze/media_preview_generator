@@ -30,11 +30,9 @@ from media_preview_generator.web.app import create_app
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     """Flask test client with a configured Emby + Jellyfin server."""
-    import os
-
-    os.environ["WEB_AUTH_TOKEN"] = "test-token-123"
+    monkeypatch.setenv("WEB_AUTH_TOKEN", "test-token-123")
     app = create_app(config_dir=str(tmp_path))
     app.config["TESTING"] = True
 

@@ -13,7 +13,7 @@ from loguru import logger
 
 from ..job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS
 from ..processing.types import ProcessableItem
-from ..servers.base import ServerConfig
+from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import webhook_path_candidates
 from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
 from ..web.jobs import PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Job, get_job_manager, is_live_retry_chain
@@ -49,7 +49,7 @@ _redetect_lock = threading.Lock()
 _pending_follow_up_lock = threading.Lock()
 _REDETECT_SOURCE = "inspector"
 _SEASON_PUBLISH_SOURCE = "inspector_season"
-DECIDE_AGAIN_JOB_NAME = "Intro & Credits: Needs review and waiting files, decided again"
+DECIDE_AGAIN_JOB_NAME = "Intro & Credits: files the old rules couldn't decide, decided again"
 ONLINE_RECHECK_JOB_NAME = "Intro & Credits: weekly online re-check"
 VERSION_RERUN_JOB_NAME = "Intro & Credits: Re-checking {total} after the app update · batch {batch} of {batches}"
 ONLINE_RECHECK_EVERY = timedelta(days=7)
@@ -226,7 +226,12 @@ def create_intro_credits_job(
 
 
 def _queued_in_waiting_follow_ups(
-    jm, configs: list[ServerConfig] | None = None, server_id: str | None = None, source: str | None = None
+    jm,
+    configs: list[ServerConfig] | None = None,
+    server_id: str | None = None,
+    source: str | None = None,
+    *,
+    kind: str = JOB_KIND_INTRO_CREDITS,
 ) -> set[str]:
     """Local paths (every candidate) of the files webhook follow-ups that have never started list.
 
@@ -241,6 +246,7 @@ def _queued_in_waiting_follow_ups(
         configs: Server configs; read from settings only when a waiting follow-up needs them.
         server_id: The request's pin (``job_runner.server_pin``); None = every server with Intro & Credits on.
         source: The request's source; None (a Season request) = any waiting follow-up covers it.
+        kind: The feature's job kind; jobs of other kinds cannot cover this request.
 
     Returns:
         The covered local paths.
@@ -248,7 +254,7 @@ def _queued_in_waiting_follow_ups(
     queued: set[str] = set()
     for job in jm.get_pending_jobs():
         cfg = job.config or {}
-        if job.kind != JOB_KIND_INTRO_CREDITS or job.started_at is not None:
+        if job.kind != kind or job.started_at is not None:
             continue
         if not cfg.get("follows_job_id") or cfg.get("force"):
             continue
@@ -520,20 +526,20 @@ def _submit_loudness_follow_up(
         configs = _server_configs()
         if not paths or not loudness_enabled_anywhere(configs):
             return
-        # A preview pinned to Jellyfin or Emby says nothing about which Plex has the file: keep only a Plex pin.
-        pinned = next((cfg for cfg in configs if cfg.id == pin), None)
-        if pinned is None or not loudness_enabled_anywhere([pinned]):
-            pin = None
+        # A known non-Plex originator can ask enabled Plex owners. A Plex pin never grants another server access.
+        if pin is not None:
+            pinned = next((cfg for cfg in configs if cfg.id == pin), None)
+            if pinned is None:
+                return
+            if pinned.type is ServerType.PLEX:
+                if not loudness_enabled_anywhere([pinned]):
+                    return
+            else:
+                pin = None
         jm = get_job_manager()
-        # Called again when the preview job's batch grew, or the file came in again: only paths no loudness follow-up
-        # has queued yet.
-        queued = {
-            path
-            for other in [*jm.get_pending_jobs(), *jm.get_running_jobs()]
-            if other.kind == JOB_KIND_LOUDNESS and (other.config or {}).get("follows_job_id")
-            for path in (other.config or {}).get("file_paths") or []
-        }
-        rest = [path for path in paths if path not in queued]
+        # Only a never-started follow-up with sufficient server and retry coverage can cover this arrival.
+        queued = _queued_in_waiting_follow_ups(jm, configs, pin, source, kind=JOB_KIND_LOUDNESS)
+        rest = [path for path in paths if not (_local_candidates(path, configs) & queued)]
         if not rest:
             return
         preview = jm.get_job(preview_job_id)
@@ -683,13 +689,14 @@ def submit_season_publish(episode: str) -> str:
 
 
 def submit_decide_again() -> str | None:
-    """Queue the one job that decides the files in Needs review, those waiting for their item's other versions, those
-    whose intro rests on season audio, and those whose intro or credits rests on an online answer and a server's own
-    marker alone, again.
+    """Queue the one job that decides the files the old rules left in "Needs review" (a status the rules no longer
+    give, ``store.LEGACY_NEEDS_REVIEW``), those waiting for their item's other versions, those whose intro rests on
+    season audio, and those whose intro or credits rests on an online answer and a server's own marker alone, again.
 
     Queued after the settings upgrade that removed the stricter publish rule (``upgrade._migrate_to_v16``), so the files
     it held in Needs review are published now, not only when a later job happens to list them; a file whose last
-    publish waits for its item's other versions is published again with them. Queued again after the one that added
+    publish waits for its item's other versions is published again with them. Queued once more after the one that
+    removed Needs review itself (``upgrade._migrate_to_v20``): every such file ends decided or with nothing found. Queued again after the one that added
     season audio's guards (``upgrade._migrate_to_v17``), so an intro that was only a network ident or cold-open music
     is decided again, and taken off the servers, now; and after the one that reads online times on the file's clock
     (``upgrade._migrate_to_v18``), so a pair of online times from another release and a server's marker made for an
@@ -700,21 +707,22 @@ def submit_decide_again() -> str | None:
     that job is returned instead.
 
     Returns:
-        The job's id; None when Intro & Credits is off on every server or no file is in Needs review, waiting, or has
-        an unlocked intro decided with season audio or an unlocked intro or credits decided by an online answer and a
-        server's marker alone.
+        The job's id; None when Intro & Credits is off on every server or no file is left under the old status,
+        waiting, or has an unlocked intro decided with season audio or an unlocked intro or credits decided by an
+        online answer and a server's marker alone.
     """
     if not markers_enabled_anywhere():
-        logger.info("Intro & Credits is off on every server; no file in Needs review is decided again")
+        logger.info("Intro & Credits is off on every server; no file is decided again")
         return None
     store = get_marker_store()
-    in_review, waiting = set(store.files_in_review()), set(store.files_waiting_for_other_versions())
+    legacy = set(store.files_with_legacy_review_decisions())
+    waiting = set(store.files_waiting_for_other_versions())
     season_audio = set(store.files_with_season_audio_intro())
     online_and_server = set(store.files_decided_by_online_and_server_markers())
-    if not in_review | waiting | season_audio | online_and_server:
+    if not legacy | waiting | season_audio | online_and_server:
         logger.info(
-            "No file is in Needs review, waiting for its item's other versions, or has an intro from season audio or "
-            "from an online answer and a server's marker; nothing to decide again"
+            "No file is left under the old Needs review status, waiting for its item's other versions, or has an "
+            "intro from season audio or from an online answer and a server's marker; nothing to decide again"
         )
         return None
     jm = get_job_manager()
@@ -722,7 +730,7 @@ def submit_decide_again() -> str | None:
         for job in [*jm.get_pending_jobs(), *jm.get_running_jobs()]:
             cfg = job.config or {}
             if job.kind == JOB_KIND_INTRO_CREDITS and cfg.get(DECIDE_AGAIN) and not is_live_retry_chain(cfg):
-                logger.info("The files in Needs review are already queued as job {}", job.id[:8])
+                logger.info("The files to decide again are already queued as job {}", job.id[:8])
                 return job.id
         job = create_intro_credits_job(
             library_name=DECIDE_AGAIN_JOB_NAME,
@@ -731,11 +739,11 @@ def submit_decide_again() -> str | None:
             decide_again=True,
         )
     logger.info(
-        "{} file(s) in Needs review, {} waiting for their item's other versions and {} with an intro from season audio "
-        "are decided again (job {})",
-        len(in_review),
-        len(waiting - in_review),
-        len(season_audio - in_review - waiting),
+        "{} file(s) the old rules couldn't decide, {} waiting for their item's other versions and {} with an intro "
+        "from season audio are decided again (job {})",
+        len(legacy),
+        len(waiting - legacy),
+        len(season_audio - legacy - waiting),
         job.id[:8],
     )
     return job.id
@@ -824,8 +832,8 @@ def submit_version_reruns(delay_s: int = 0, after: Mapping[str, object] | None =
         for detector in taken:
             by_detector[detector] = by_detector.get(detector, 0) + 1
     logger.info(
-        "{} file(s) rest on an answer from an older detector version, were decided under older rules, or show times an "
-        "older publish rule kept ({}); "
+        "{} file(s) rest on an answer from an older detector version, were decided under older rules, show times an "
+        "older publish rule kept, or wait for a Plex item's other versions ({}); "
         "read again {} at a time (job {}: {})",
         len(due),
         ", ".join(f"{detector} {count}" for detector, count in sorted(by_detector.items())),

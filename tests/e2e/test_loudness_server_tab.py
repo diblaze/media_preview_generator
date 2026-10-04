@@ -85,13 +85,34 @@ class TestLoudnessTab:
         expect(_lib(page, "2")).to_be_checked()
         expect(_lib(page, "1")).not_to_be_checked()
 
-    def test_switch_waits_for_the_plex_database_write_confirmation(self, authed_page: Page, app_url: str) -> None:
+    def test_switch_is_independent_of_marker_write_confirmation(self, authed_page: Page, app_url: str) -> None:
         page = authed_page
         server = _plex_server()
         server["loudness"] = {"enabled": False, "library_ids": None}
         _open(page, app_url, server)
-        expect(page.locator("#loudnessEnabled")).to_be_disabled()
-        expect(page.locator("#loudnessConfirmHint")).to_be_visible()
+        expect(page.locator("#loudnessEnabled")).to_be_enabled()
+        page.locator("label[for='loudnessEnabled']").click()
+        body = _save_and_read_put(page, "plex-1")
+        assert body["loudness"] == {"enabled": True, "library_ids": None}
+        assert body["markers"]["enabled"] is False
+        assert not body["markers"]["plex"].get("db_write_confirmed_at")
+
+    def test_switch_explains_unsupported_helper(self, authed_page: Page, app_url: str) -> None:
+        server = _plex_server()
+        server["markers"]["plex"]["agent"] = {"enabled": True, "url": "http://helper:8765", "token": "****"}
+        _open(authed_page, app_url, server)
+        expect(authed_page.locator("#loudnessEnabled")).to_be_disabled()
+        expect(authed_page.locator("#loudnessHelperHint")).to_be_visible()
+        expect(authed_page.locator("#loudnessHelperHint")).to_contain_text("does not support loudness")
+
+    @pytest.mark.parametrize("enabled", ["false", "true", 1, None])
+    def test_invalid_stored_enable_is_displayed_and_saved_as_off(
+        self, authed_page: Page, app_url: str, enabled
+    ) -> None:
+        _open(authed_page, app_url, _confirmed_plex({"enabled": enabled, "library_ids": None}))
+        expect(authed_page.locator("#loudnessEnabled")).not_to_be_checked()
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["loudness"] == {"enabled": False, "library_ids": None}
 
     def test_tab_is_hidden_for_jellyfin(self, authed_page: Page, app_url: str) -> None:
         page = authed_page
@@ -99,3 +120,16 @@ class TestLoudnessTab:
         _mock_server_page(page, server, _status(server, "ready"))
         _open_tab(page, app_url, server, tab="general")
         expect(page.locator("#editTabLoudnessLi")).to_be_hidden()
+
+    def test_music_library_is_not_selectable(self, authed_page: Page, app_url: str) -> None:
+        server = _confirmed_plex({"enabled": True, "library_ids": ["1", "music"]})
+        server["libraries"].append(
+            {"id": "music", "name": "Music", "kind": "track", "enabled": True, "remote_paths": []}
+        )
+        _open(authed_page, app_url, server)
+        _switch_tab(authed_page, "libraries")
+        music = authed_page.locator("#editLibraryList tr[data-lib-id='music'] .loudness-lib-cell")
+        expect(music).to_contain_text("Not supported")
+        expect(music.locator("input")).to_have_count(0)
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["loudness"] == {"enabled": True, "library_ids": ["1"]}

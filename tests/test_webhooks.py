@@ -119,9 +119,11 @@ def _auth_headers(token: str = "test-token-12345678") -> dict:
         (0, 1),  # zero would bypass debouncing → floor
         (1, 1),  # at the floor
         (60, 60),  # the default, untouched
-        (600, 600),  # at the ceiling
-        (601, 600),  # above ceiling → cap
-        (86400, 600),  # 24h foot-gun → cap
+        (600, 600),
+        (601, 601),  # above the former ceiling
+        (3600, 3600),  # at the ceiling
+        (3601, 3600),  # above ceiling → cap
+        (86400, 3600),  # 24h foot-gun → cap
         ("abc", 60),  # non-numeric → fall back to the default 60
         (None, 60),  # missing → fall back to the default 60
     ],
@@ -130,7 +132,7 @@ def test_schedule_webhook_job_clamps_webhook_delay(stored, expected, app):
     """``webhook_delay`` flows into ``threading.Timer(delay, …)``; an out-of-range
     setting (hand-edited settings.json, bogus API call) must not park the timer
     for hours or fire instantly. Server-side belt-and-suspenders clamp to
-    ``[1, 600]`` seconds; non-numeric / missing falls back to the default 60.
+    ``[1, 3600]`` seconds; non-numeric / missing falls back to the default 60.
     """
     import media_preview_generator.web.webhooks as wh
 
@@ -782,7 +784,7 @@ def test_execute_webhook_job_single_file_uses_title_for_library_display(
     mock_job.id = "job-1"
     mock_job_mgr.return_value.create_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: [] if key == "selected_libraries" else default
     mock_settings_mgr.return_value = mock_settings
 
@@ -822,7 +824,7 @@ def test_execute_webhook_job_uses_selected_libraries(
     mock_job.id = "test-job-id"
     mock_job_mgr.return_value.create_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: ["1", "2"] if key == "selected_libraries" else default
     mock_settings_mgr.return_value = mock_settings
 
@@ -849,7 +851,7 @@ def test_execute_webhook_job_includes_retry_settings(mock_start_job, mock_timer_
     mock_job.id = "retry-test-id"
     mock_job_mgr.return_value.create_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: {
         "selected_libraries": [],
         "webhook_retry_count": 5,
@@ -926,7 +928,7 @@ def test_triggered_history_entry_includes_batch_metadata(
     # creating a new one. Configure the lookup to return the same mock.
     mock_job_mgr.return_value.get_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: [] if key == "selected_libraries" else default
     mock_settings_mgr.return_value = mock_settings
 
@@ -1053,7 +1055,7 @@ def test_execute_webhook_job_records_dispatch_before_start(
     mock_job.id = "job-dedup-123"
     mock_job_mgr.return_value.create_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: [] if key == "selected_libraries" else default
     mock_settings_mgr.return_value = mock_settings
 
@@ -1129,7 +1131,7 @@ def test_duplicate_after_dispatch_is_dropped_end_to_end(
     mock_job.id = "job-e2e-1"
     mock_job_mgr.return_value.create_job.return_value = mock_job
 
-    mock_settings = MagicMock()
+    mock_settings = MagicMock(processing_paused=False)
     mock_settings.get.side_effect = lambda key, default=None: [] if key == "selected_libraries" else default
     mock_settings_mgr.return_value = mock_settings
 
@@ -1256,6 +1258,8 @@ def test_create_vendor_webhook_job_regenerate_propagates_force_generate(mock_sta
             item_id_by_server={"plex-1": "12345"},
             regenerate=True,
         )
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
 
     assert job_id, "job should have been created"
     assert mock_start.call_count == 1
@@ -1278,11 +1282,13 @@ def test_create_vendor_webhook_job_carries_hints_keyed_by_path(mock_start, app):
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={"plex-1": "k1"},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     hints = overrides.get("webhook_item_id_hints")
@@ -1303,6 +1309,8 @@ def test_create_vendor_webhook_job_dedupes_within_ttl(mock_start, app):
             item_id_by_server={"plex-1": "k1"},
             server_id="plex-1",
         )
+        assert first is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(first))
         second = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
@@ -1333,11 +1341,15 @@ def test_create_vendor_webhook_job_does_NOT_dedup_across_sources(mock_start, app
             item_id_by_server={"plex-1": "k1"},
             server_id="plex-1",
         )
+        assert plex_job is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(plex_job))
         sonarr_job = wh.create_vendor_webhook_job(
             source="sonarr",
             canonical_path="/data/x.mkv",
             server_id=None,
         )
+        assert sonarr_job is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(sonarr_job))
 
     assert plex_job is not None
     assert sonarr_job is not None
@@ -1494,6 +1506,8 @@ def test_create_vendor_webhook_job_handles_unicode_path(mock_start, app):
             canonical_path=unicode_path,
             item_id_by_server={"plex-1": "12345"},
         )
+        assert job_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
 
     assert job_id, "unicode path must produce a job"
     overrides = mock_start.call_args.args[1]
@@ -1511,11 +1525,13 @@ def test_create_vendor_webhook_job_empty_hint_dict_treated_as_no_hint(mock_start
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     assert "webhook_item_id_hints" not in overrides, "empty hint dict must not produce a hints override"
@@ -1529,11 +1545,13 @@ def test_create_vendor_webhook_job_filters_falsy_hint_keys(mock_start, app):
     import media_preview_generator.web.webhooks as wh
 
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="plex",
             canonical_path="/data/x.mkv",
             item_id_by_server={"": "k1", "plex-1": "", "valid-sid": "valid-id"},
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     hints = overrides.get("webhook_item_id_hints")
@@ -1556,13 +1574,15 @@ def test_create_vendor_webhook_job_server_id_filter_pins_publishers(mock_start, 
     # collapsing the two like the previous test did made it impossible to
     # detect a regression where the wrong kwarg drove the publisher pin.
     with app.app_context():
-        wh.create_vendor_webhook_job(
+        queued_vendor_id = wh.create_vendor_webhook_job(
             source="jellyfin",
             canonical_path="/data/y.mkv",
             item_id_by_server={"jelly-1": "j1"},
             server_id="other-server",
             server_id_filter="jelly-1",
         )
+        assert queued_vendor_id is not None
+        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
 
     overrides = mock_start.call_args.args[1]
     assert overrides.get("server_id") == "jelly-1", (

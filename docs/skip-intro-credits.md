@@ -24,7 +24,7 @@ It looks in four places:
 - **The theme song** a season's episodes share (TV only).
 - **The credit roll itself**, read from the text on screen near the end of the file.
 
-When it isn't sure, it sends nothing. The file waits in **Needs review** instead of getting a guess, because a missing skip button is better than one that skips into the story. From there you can check it, adjust the times, or add a marker yourself.
+If it can't confirm an intro or credits from the file itself, it writes nothing, because a missing skip button is better than one that skips into the story. You can still add or adjust one in the Inspector.
 
 ## When it runs
 
@@ -38,3 +38,4 @@ When it isn't sure, it sends nothing. The file waits in **Needs review** instead
 - **Sports libraries start switched off.** No online source covers sports, and a broadcast's on-screen text is easily taken for credits.
 - **Movies have little online coverage**, so they mostly rely on the credit roll.
 - **Broadcast TV with channel logos or scores on screen is a weak spot.** It sometimes skips into the story.
+- **Shows with burned-in captions through the story** may get no credits marker from on-screen text when the credits run over story footage.

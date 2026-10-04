@@ -14,6 +14,7 @@ import pytest
 from media_preview_generator.jobs.dispatcher import JobDispatcher
 from media_preview_generator.jobs.worker import WorkerPool
 from media_preview_generator.loudness import job
+from media_preview_generator.output.plex_hash import calculate_plex_hash
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
 
@@ -48,6 +49,13 @@ def _cfg(local_path: str) -> ServerConfig:
 
 @pytest.fixture
 def ctx(db, media):  # noqa: F811 - the fixture
+    conn = sqlite3.connect(db._path())
+    conn.execute(
+        "UPDATE media_parts SET hash = ?, size = ? WHERE id = 1",
+        (calculate_plex_hash(media), Path(media).stat().st_size),
+    )
+    conn.commit()
+    conn.close()
     cfg = _cfg(media)
     c = job.LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
     c._dbs[cfg.id], c._ready[cfg.id] = db, ("", time.monotonic())
@@ -159,10 +167,16 @@ def test_runs_through_the_shared_dispatcher(ctx, db, media):  # noqa: F811
 
 
 def test_a_cancel_mid_file_is_not_recorded_as_up_to_date(ctx, media):
-    cancelled = iter([False, True])
-    with patch.object(job.analyze, "run", return_value=FIELDS):
-        outcome = job.process_item(_item(media), ctx=ctx, cancel_check=lambda: next(cancelled))
-    assert outcome.outcome_key == job.FAILED and "cancelled before stream 2" in outcome.message
+    cancelled = False
+
+    def analyse(*args, **kwargs):
+        nonlocal cancelled
+        cancelled = True
+        return FIELDS
+
+    with patch.object(job.analyze, "run", side_effect=analyse):
+        outcome = job.process_item(_item(media), ctx=ctx, cancel_check=lambda: cancelled)
+    assert outcome.outcome_key == job.FAILED and "cancelled" in outcome.message
 
 
 def test_an_unwritable_database_is_asked_again_later_a_writable_one_is_kept(media):
@@ -173,7 +187,10 @@ def test_an_unwritable_database_is_asked_again_later_a_writable_one_is_kept(medi
     def checks(self, *, deadline):
         return SimpleNamespace(state=next(answers), message="Plex is restarting")
 
-    with patch.object(job.LocalPlexDb, "file_checks", checks):
+    with (
+        patch.object(job, "create_loudness_db", return_value=job.LocalPlexDb(lambda: "unused")),
+        patch.object(job.LocalPlexDb, "file_checks", checks),
+    ):
         assert c.db(cfg)[1] == "Plex is restarting"
         assert c.db(cfg)[1] == "Plex is restarting"  # within RECHECK_S: not asked again
         c._ready[cfg.id] = (c._ready[cfg.id][0], time.monotonic() - job.RECHECK_S - 1)
@@ -225,3 +242,130 @@ def test_a_server_with_loudness_off_owns_nothing():
         patch.object(job, "load_server_loudness", return_value=MagicMock(enabled=False)),
     ):
         assert job.owners("/m/a.mkv", None) == []
+
+
+@pytest.mark.parametrize("stage", ["write_stream", "mark_item"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        job.DatabaseBusyError("Plex database busy"),
+        job.PublishError("Plex database is no longer open", state=job.Capability.UNREACHABLE),
+    ],
+)
+def test_temporarily_unavailable_publication_remains_retryable(ctx, media, monkeypatch, stage, error):
+    monkeypatch.setattr(job, stage, MagicMock(side_effect=error))
+    with patch.object(job.analyze, "run", return_value=FIELDS):
+        result = job.process_item(_item(media), ctx=ctx)
+    assert result.outcome_key == job.WAITING
+    assert str(error) in result.message
+
+
+def test_same_size_source_replacement_waits_instead_of_accepting_native_analysis(ctx, db, media):  # noqa: F811
+    for stream_id in (11, 12):
+        job.write_stream(db, stream_id, FIELDS, deadline=1e12)
+    job.mark_item(db, 1, deadline=1e12)
+    assert job.check_item(_item(media), ctx=ctx).outcome_key == job.UP_TO_DATE
+    Path(media).write_bytes(b"y")
+    assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING
+    with patch.object(job.analyze, "run") as run:
+        assert job.process_item(_item(media), ctx=ctx).outcome_key == job.WAITING
+    run.assert_not_called()
+
+
+def test_plex_without_complete_source_fingerprint_waits(ctx, db, media):  # noqa: F811
+    with sqlite3.connect(db._path()) as conn:
+        conn.execute("UPDATE media_parts SET hash = NULL WHERE id = 1")
+    conn.close()
+    assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING
+
+
+def test_source_changed_by_analysis_is_never_published(ctx, db, media):  # noqa: F811
+    def run(*args, **kwargs):
+        Path(media).write_bytes(b"changed while decoding")
+        return FIELDS
+
+    with patch.object(job.analyze, "run", side_effect=run):
+        assert job.process_item(_item(media), ctx=ctx).outcome_key == job.WAITING
+    assert all("ln:loudness" not in (extra or "") for extra in _streams(db).values())
+
+
+def test_mixed_corrupt_track_and_busy_write_preserves_both_failure_and_retry(ctx, db, media, monkeypatch):  # noqa: F811
+    holder = sqlite3.connect(db._path(), isolation_level=None)
+    monkeypatch.setattr(job, "BUSY_TIMEOUT_S", 0.02)
+
+    def analyse(ffmpeg, path, index, **kwargs):
+        if index == 1:
+            raise job.analyze.LoudnessError("corrupt first track")
+        holder.execute("BEGIN IMMEDIATE")
+        return FIELDS
+
+    try:
+        with patch.object(job.analyze, "run", side_effect=analyse):
+            outcome = job.process_item(_item(media), ctx=ctx)
+    finally:
+        holder.rollback()
+        holder.close()
+    assert outcome.outcome_key == job.FAILED
+    assert "corrupt first track" in outcome.message and "busy" in outcome.message
+    assert outcome.publisher_rows[0]["retryable"] is True
+
+
+def test_already_cancelled_marking_only_file_does_not_write(ctx, db, media):  # noqa: F811
+    for stream_id in (11, 12):
+        job.write_stream(db, stream_id, FIELDS, deadline=1e12)
+    with patch.object(job.analyze, "run") as analyse:
+        outcome = job.process_item(_item(media), ctx=ctx, cancel_check=lambda: True)
+    assert outcome.outcome_key == job.FAILED and "cancelled" in outcome.message
+    assert not job.read_streams(db, [FILE], deadline=1e12)[0][0].item_marked
+    analyse.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["check", "worker"])
+@pytest.mark.parametrize("retryable_failure", [False, True])
+def test_dispatcher_preserves_pending_publisher_details_in_callback(ctx, media, stage, retryable_failure):
+    from media_preview_generator.processing.generator import set_file_result_callback
+
+    rows = [
+        {
+            "server_id": "plex1",
+            "server_name": "Plex",
+            "server_type": "plex",
+            "status": job.FAILED,
+            "message": "failed track",
+        }
+    ]
+    if retryable_failure:
+        rows[0]["retryable"] = True
+    else:
+        rows.append(
+            {
+                "server_id": "plex2",
+                "server_name": "Other Plex",
+                "server_type": "plex",
+                "status": job.WAITING,
+                "message": "busy",
+            }
+        )
+    outcome = job._settle(rows)
+    handlers = job.KindHandlers(
+        check_fn=lambda item, **kwargs: outcome if stage == "check" else None,
+        process_fn=lambda item, **kwargs: outcome,
+        outcome_keys=job.OUTCOME_KEYS,
+    )
+    config = MagicMock(cpu_threads=1, gpu_threads=0, scan_workers=1, regenerate_thumbnails=False, server_id_filter=None)
+    dispatcher = JobDispatcher(WorkerPool(cpu_workers=1, gpu_workers=0, selected_gpus=[]))
+    notify = MagicMock()
+    set_file_result_callback(notify, job_id="mixed")
+    try:
+        with patch("media_preview_generator.web.jobs.get_job_manager"):
+            tracker = dispatcher.submit_items(
+                "mixed", [_item(media)], config, MagicMock(), kind=job.JOB_KIND_LOUDNESS, handlers=handlers
+            )
+            assert tracker.wait(timeout=20)
+        notify.assert_called_once()
+        assert notify.call_args.args[0] == media
+        assert notify.call_args.args[1] == job.FAILED
+        assert notify.call_args.args[4] == rows
+    finally:
+        dispatcher.shutdown()
+        set_file_result_callback(None, job_id="mixed")

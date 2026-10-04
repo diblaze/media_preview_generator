@@ -96,9 +96,10 @@ def test_second_write_changes_nothing(db):
 
 def test_each_write_is_logged_for_undo(db, tmp_path):
     plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
-    (line,) = (tmp_path / "loudness-writes.jsonl").read_text().splitlines()
-    record = json.loads(line)
+    record, receipt = [json.loads(line) for line in (tmp_path / "loudness-writes.jsonl").read_text().splitlines()]
     assert (record["stream_id"], record["before"], record["after"]) == (11, BEFORE, PLEX_ANALYSED)
+    assert (record["kind"], receipt["kind"]) == ("intent", "commit")
+    assert record["transaction_id"] == receipt["transaction_id"]
 
 
 def test_trigger_on_media_streams_refuses_the_write(db):
@@ -165,7 +166,7 @@ def test_the_item_is_marked_once_every_audio_stream_is_done_keeping_its_other_fi
     assert _item_extra(db) == encode_extra_data({"ln:loudnessAnalysisVersion": "0.02", "pv:thumbBlurHash": "abc"})
     assert plex_db.read_streams(db, [FILE], deadline=1e12)[0][0].item_marked is True
     assert plex_db.mark_item(db, 1, deadline=1e12) is False
-    record = json.loads((tmp_path / "loudness-writes.jsonl").read_text().splitlines()[-1])
+    record = json.loads((tmp_path / "loudness-writes.jsonl").read_text().splitlines()[-2])
     assert (record["metadata_item_id"], record["before"]) == (1, '{"pv:thumbBlurHash":"abc"}')
 
 
@@ -174,6 +175,7 @@ def test_the_item_is_marked_once_every_audio_stream_is_done_keeping_its_other_fi
     [
         "CREATE TRIGGER t AFTER UPDATE ON metadata_items BEGIN SELECT 1; END",
         "CREATE TRIGGER t AFTER UPDATE OF title, extra_data ON metadata_items BEGIN SELECT 1; END",
+        "CREATE TRIGGER t AFTER UPDATE OF EXTRA_DATA ON metadata_items BEGIN SELECT 1; END",
     ],
 )
 def test_a_trigger_that_could_fire_on_the_items_extra_data_refuses_every_write(db, trigger):
@@ -266,7 +268,147 @@ def test_a_missing_item_is_an_error_and_a_failed_mark_writes_nothing(db, monkeyp
     assert _item_extra(db) is None
 
 
-def test_a_write_whose_undo_record_cant_be_kept_still_stands(db, tmp_path, monkeypatch):
+def test_a_write_whose_undo_record_cant_be_kept_rolls_back(db, tmp_path, monkeypatch):
     monkeypatch.setattr(plex_db, "write_log_path", lambda: str(tmp_path))  # a folder: open() fails
-    assert plex_db.write_stream(db, 11, FIELDS, deadline=1e12) is True
-    assert _extra(db, 11) == PLEX_ANALYSED
+    with pytest.raises(PublishError, match="undo record"):
+        plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
+    assert _extra(db, 11) == BEFORE
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"ln:loudness": "-20"},
+        {**FIELDS, "ln:loudnessAnalysisVersion": "99"},
+        {**FIELDS, "ln:peak": "nan"},
+    ],
+)
+def test_partial_or_unsupported_native_metadata_is_preserved(db, extra):
+    native = encode_extra_data(extra)
+    with sqlite3.connect(db._path()) as conn:
+        conn.execute("UPDATE media_streams SET extra_data = ? WHERE id = 11", (native,))
+    conn.close()
+    with pytest.raises(PublishError, match="incomplete or unsupported"):
+        plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
+    assert _extra(db, 11) == native
+
+
+@pytest.mark.parametrize("peak", ["-inf", "-16.32"])
+def test_native_silent_or_short_measurements_are_complete(db, peak):
+    fields = {**FIELDS, "ln:loudness": "-inf", "ln:gainOffset": "inf", "ln:peak": peak}
+    assert plex_db.write_stream(db, 11, fields, deadline=1e12)
+    assert plex_db.has_analysis(_extra(db, 11))
+    assert not plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE media_parts SET hash = 'replacement' WHERE id = 1",
+        "UPDATE media_parts SET file = '/new/location.mkv' WHERE id = 1",
+        "UPDATE media_streams SET codec = 'eac3' WHERE id = 11",
+        'UPDATE media_streams SET "index" = 7 WHERE id = 11',
+        "UPDATE media_streams SET created_at = 1234 WHERE id = 11",
+        "UPDATE media_parts SET deleted_at = 1234 WHERE id = 1",
+    ],
+)
+def test_write_refuses_a_changed_indexed_audio_target(db, mutation):
+    stream = plex_db.read_streams(db, [FILE], deadline=1e12)[0][0]
+    with sqlite3.connect(db._path()) as conn:
+        conn.execute(mutation)
+    conn.close()
+    with pytest.raises(plex_db.SourceChangedError, match="source changed"):
+        plex_db.write_stream(db, 11, FIELDS, deadline=1e12, expected=stream)
+    assert _extra(db, 11) == BEFORE
+
+
+def test_source_bytes_changed_during_analysis_are_not_written(db, tmp_path):
+    source = tmp_path / "local.mkv"
+    source.write_bytes(b"old")
+    fingerprint = plex_db.SourceFingerprint.read(str(source))
+    source.write_bytes(b"new")
+    with pytest.raises(plex_db.SourceChangedError, match="source changed"):
+        plex_db.write_stream(db, 11, FIELDS, deadline=1e12, source=fingerprint)
+    assert _extra(db, 11) == BEFORE
+
+
+def test_item_mark_refuses_a_version_added_after_analysis_started(db):
+    snapshot = plex_db.read_item_snapshot(db, 1, deadline=1e12)
+    for stream_id in (11, 12):
+        plex_db.write_stream(db, stream_id, FIELDS, deadline=1e12)
+    _add_version(db, 2, "/data/kids/new-version.mkv")
+    plex_db.write_stream(db, 20, FIELDS, deadline=1e12)
+    with pytest.raises(plex_db.SourceChangedError, match="versions changed"):
+        plex_db.mark_item(db, 1, deadline=1e12, expected=snapshot)
+    assert _item_extra(db) is None
+    assert plex_db.mark_item(db, 1, deadline=1e12, expected=plex_db.read_item_snapshot(db, 1, deadline=1e12))
+
+
+def test_item_mark_rolls_back_when_journal_cannot_be_saved(db, tmp_path, monkeypatch):
+    for stream_id in (11, 12):
+        plex_db.write_stream(db, stream_id, FIELDS, deadline=1e12)
+    monkeypatch.setattr(plex_db, "write_log_path", lambda: str(tmp_path))
+    with pytest.raises(PublishError, match="undo record"):
+        plex_db.mark_item(db, 1, deadline=1e12)
+    assert _item_extra(db) is None
+
+
+def test_journal_contains_database_and_row_identity(db, tmp_path):
+    plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
+    record = json.loads((tmp_path / "loudness-writes.jsonl").read_text().splitlines()[0])
+    assert record["format"] == 2
+    assert record["database"] == plex_db.database_identity(db._path())
+    with sqlite3.connect(db._path()) as conn:
+        assert record["target"] == plex_db.undo_target(conn, {"stream_id": 11})
+    conn.close()
+
+
+def test_music_items_are_refused_without_mutation(db):
+    with sqlite3.connect(db._path()) as conn:
+        conn.execute("UPDATE metadata_items SET metadata_type = 10 WHERE id = 1")
+    conn.close()
+    for operation in (
+        lambda: plex_db.read_streams(db, [FILE], deadline=1e12),
+        lambda: plex_db.write_stream(db, 11, FIELDS, deadline=1e12),
+        lambda: plex_db.mark_item(db, 1, deadline=1e12),
+    ):
+        with pytest.raises(PublishError):
+            operation()
+    assert _extra(db, 11) == BEFORE
+    assert _item_extra(db) is None
+
+
+@pytest.mark.parametrize("operation", ["stream", "item"])
+def test_cancellation_after_transaction_admission_prevents_mutation(db, tmp_path, monkeypatch, operation):
+    if operation == "item":
+        for stream_id in (11, 12):
+            plex_db.write_stream(db, stream_id, FIELDS, deadline=1e12)
+    log = tmp_path / "loudness-writes.jsonl"
+    before_log = log.read_text() if log.exists() else ""
+    cancelled = False
+    original_connect = db._connect
+
+    class CancelOnBegin:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, statement, *args):
+            nonlocal cancelled
+            result = self.connection.execute(statement, *args)
+            if statement == "BEGIN IMMEDIATE":
+                cancelled = True
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    monkeypatch.setattr(db, "_connect", lambda **kwargs: CancelOnBegin(original_connect(**kwargs)))
+    with pytest.raises(PublishError, match="cancelled"):
+        if operation == "stream":
+            plex_db.write_stream(db, 11, FIELDS, deadline=1e12, cancel_check=lambda: cancelled)
+        else:
+            plex_db.mark_item(db, 1, deadline=1e12, cancel_check=lambda: cancelled)
+    assert cancelled
+    assert _item_extra(db) is None
+    assert _extra(db, 11) == (BEFORE if operation == "stream" else PLEX_ANALYSED)
+    assert (log.read_text() if log.exists() else "") == before_log

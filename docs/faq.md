@@ -81,7 +81,7 @@ Yes — run the Docker image on Docker Desktop with the WSL2 backend. If you hav
 
 ### Does it make chapter thumbnails too?<a id="does-this-generate-chapter-thumbnails"></a>
 
-No. It makes **video preview thumbnails** (the timeline-scrubbing strip) and, once you turn it on for a server, Skip Intro and Skip Credits markers ([Intro & Credits guide](guides.md#intro--credits)). It doesn't make chapter thumbnails.
+Yes, optionally for Plex Media Server **1.43.4.x**. Chapter generation is off by default and uses CPU, separately from GPU-accelerated scrubber previews. It requires one media version and one part per item; see the [chapter thumbnail guide](guides.md#plex-chapter-thumbnails) for setup and limits.
 
 ### Do I need a GPU to use Media Preview Generator?<a id="can-i-use-this-without-a-gpu"></a>
 
@@ -136,7 +136,7 @@ Yes, on Plex, Emby and Jellyfin, once you turn it on for each server. What each 
 
 ### How does it find intros and credits?
 
-From the file's chapters, online skip databases, the theme song a season's episodes share, or the credit roll itself. It does this once per file and sends the result to every server that has the file. When it isn't sure, the file waits in **Needs review** instead of getting a guess.
+From the file's chapters, online skip databases, the theme song a season's episodes share, or the credit roll itself. It does this once per file and sends the result to every server that has the file. If it can't confirm an intro or credits from the file itself, it writes nothing — you can still add or adjust one in the Inspector.
 
 ### Will it overwrite Plex's or Emby's own markers?
 

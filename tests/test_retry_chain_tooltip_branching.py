@@ -104,7 +104,7 @@ def test_dashboard_retry_chip_uses_picker(app_js: str):
     not hard-code the old unified ``infoRetryChainTpl``."""
     chip_idx = app_js.find("function _renderRetryChip(")
     assert chip_idx >= 0
-    body = app_js[chip_idx : chip_idx + 2000]
+    body = app_js[chip_idx:].split("\nfunction ", 1)[0]
     assert "_pickRetryInfoTpl(job)" in body
     assert 'data-explain-template="infoRetryChainTpl"' not in body
 

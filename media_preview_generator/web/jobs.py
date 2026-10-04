@@ -33,18 +33,20 @@ LOG_RETENTION_CLEARED_MESSAGE = "Log file was cleared due to log retention polic
 
 
 def log_clock(moment: datetime | None = None) -> str:
-    """A job log line's time of day in local time (the container's ``TZ``), as app.log writes it.
+    """A job log line's date and time in local time (the container's ``TZ``), as app.log writes it.
+
+    The date is included because a scan can run for days: a time alone can't be placed.
 
     Args:
         moment: The time (now when None); a naive value is read as UTC, the zone every stored time is written in.
 
     Returns:
-        ``HH:MM:SS``.
+        ``YYYY-MM-DD HH:MM:SS``.
     """
     value = moment or datetime.now(UTC)
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone().strftime("%H:%M:%S")
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # Job config key set while a job's pause came from its schedule's stop time. Only such a pause is resumed by that
@@ -332,6 +334,13 @@ class WorkerStatus:
     # worker is busy with — e.g. "Resolving item id on EmbyTest…"
     # explains a 30s gap that would otherwise look like a hang.
     current_phase: str = ""
+    # GPU→CPU fallback state of the worker's current (or just-finished)
+    # task. fallback_title names the file that fell back: current_title
+    # is blank once the task is done, and a short clip's CPU rerun can
+    # finish inside one poll interval, so the toast needs its own copy.
+    fallback_active: bool = False
+    fallback_reason: str | None = None
+    fallback_title: str = ""
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""
@@ -358,6 +367,8 @@ class JobProgress:
     # Intro & Credits: files per marker type and source group that decided them, {"credits": {"chapters": 40}}
     # (markers.source_counts). None on other jobs.
     marker_sources: dict[str, dict[str, int]] | None = None
+    # Files a GPU worker finished on the CPU because its GPU failed (JobTracker.cpu_fallback_files).
+    cpu_fallback_files: int = 0
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""
@@ -729,6 +740,11 @@ class JobManager:
         self._running_job_ids: set = set()
         self._on_progress_callbacks: list[Callable] = []
 
+        # SocketIO events waiting to be sent, oldest first, and whether a sender thread is draining them.
+        self._pending_events: deque[tuple[str, dict]] = deque()
+        self._pending_events_lock = threading.Lock()
+        self._event_sender_running = False
+
         # Job logs storage (in-memory for running jobs, plus file-backed under _job_logs_dir)
         self._job_logs: dict[str, deque] = {}
         self._max_log_lines = 500
@@ -1062,20 +1078,48 @@ class JobManager:
     def _emit_event(self, event: str, data: dict) -> None:
         """Emit a SocketIO event without blocking the caller.
 
-        Runs the emit in a separate green thread so the processing
-        loop never pauses while data is being sent to clients.
+        Events are queued and sent by one sender thread at a time, so the processing loop never pauses while data
+        is being sent to clients, and clients receive events in the order they were emitted: the page shows the
+        last one it got, so a "3/4" arriving after "4/4" would leave it on 3/4.
         """
         if not self.socketio:
             return
+        with self._pending_events_lock:
+            self._pending_events.append((event, data))
+            if self._event_sender_running:
+                return
+            self._event_sender_running = True
+        try:
+            threading.Thread(target=self._send_pending_events, name="job-events", daemon=True).start()
+        except RuntimeError:
+            # No thread to be had (a process limit, usually brief). The events stay queued; the next one starts
+            # a sender for all of them. Left set, the flag would stop every later event from being sent.
+            with self._pending_events_lock:
+                self._event_sender_running = False
+            logger.debug("Could not start the SocketIO sender thread for {}", event, exc_info=True)
 
-        def _do_emit():
-            try:
-                self.socketio.emit(event, data, namespace="/jobs")
-            except Exception:
-                logger.debug("SocketIO emit failed for {}", event, exc_info=True)
-
-        t = threading.Thread(target=_do_emit, daemon=True)
-        t.start()
+    def _send_pending_events(self) -> None:
+        """Send queued SocketIO events in order; return once the queue is empty."""
+        drained = False
+        try:
+            while True:
+                with self._pending_events_lock:
+                    if not self._pending_events:
+                        # Cleared under the lock that guards the queue, so an event queued after this starts a sender.
+                        self._event_sender_running = False
+                        drained = True
+                        return
+                    event, data = self._pending_events.popleft()
+                try:
+                    self.socketio.emit(event, data, namespace="/jobs")
+                except Exception:
+                    logger.debug("SocketIO emit failed for {}", event, exc_info=True)
+        finally:
+            if not drained:
+                # Ended some other way (an error that isn't an Exception). Left set, the flag would stop every later
+                # event from being sent while the queue grows. Not after a normal end: a new sender may be running.
+                with self._pending_events_lock:
+                    self._event_sender_running = False
 
     def emit_processing_paused_changed(self, paused: bool) -> None:
         """Emit event when global processing pause state changes."""
@@ -1256,8 +1300,13 @@ class JobManager:
             self._jobs[job.id] = job
             self._persist_job(job)
             self._emit_event("job_created", job.to_dict())
-        logger.info(
-            "Created job {} for library {} (server={})",
+        from ..jobs.worker import JOB_LOG_SKIP
+
+        # The app log's one trace of a job that never starts. Kept out of job logs: a job that queues a retry or a
+        # follow-up runs this on its own thread, and its job log is for its user.
+        logger.bind(**{JOB_LOG_SKIP: True}).info(
+            "Created {} job {} for library {} (server={})",
+            job.kind,
             job.id,
             library_name or "(all)",
             server_name or server_id or "(all)",
@@ -1514,6 +1563,7 @@ class JobManager:
         wait_active: int | None = None,
         wait_cap: int | None = None,
         wait_effective_cap: int | None = None,
+        successes: int = 0,
     ) -> Job | None:
         """Mutate the originating dispatch Job to ADD or UPDATE retry-chain state.
 
@@ -1546,8 +1596,11 @@ class JobManager:
                                     (plus ``wait_effective_cap`` to name the
                                     high-priority reservation).
           * ``"running"``         → status=RUNNING, retry_eta cleared (countdown stops)
-          * ``"completed"``       → status=COMPLETED, completed_at set, error cleared
-          * ``"exhausted"``       → status=FAILED with ``reason`` written to ``error``
+          * ``"completed"``       → status=COMPLETED, completed_at set, ``error`` cleared (or set to
+                                    ``reason``, a warning about files no retry covered; then
+                                    status=FAILED when ``successes`` is 0)
+          * ``"exhausted"``       → ``reason`` written to ``error``; status=FAILED when ``successes``
+                                    is 0, else COMPLETED (a partial result, the amber badge)
 
         Args:
             canonical_path: Source media path (stored on the Job's
@@ -1568,7 +1621,11 @@ class JobManager:
             server_id / server_name / server_type: Late-arriving server
                 attribution. Only applied if the originating Job didn't
                 already have it set.
-            reason: Exhaustion reason (written to ``error`` on outcome="exhausted").
+            reason: Exhaustion reason (written to ``error`` on outcome="exhausted"), or on
+                outcome="completed" a warning to keep on the row (None for a clean finish).
+            successes: On outcome="exhausted", and on outcome="completed" with a ``reason``, how many of
+                the chain's files ended with their preview in place. Red "Failed" is only for a chain
+                where nothing succeeded.
             source: Trigger pill ("sonarr"/"radarr"/"plex"/…); set if
                 not already on the Job.
             originating_job_id: **Required.** UUID of the originating
@@ -1725,13 +1782,14 @@ class JobManager:
                 job.completed_at = None
                 job.error = None
             elif outcome == "completed":
-                job.status = JobStatus.COMPLETED
+                # A leftover warning with no success in the chain is a total failure, as an exhausted chain's is.
+                job.status = JobStatus.FAILED if reason and successes == 0 else JobStatus.COMPLETED
                 job.completed_at = now_iso
                 # A pause (a stop time's included) ends with the chain, as complete_job ends it.
                 self.clear_pause_flag(job.id)
                 job.progress.retry_eta = None
                 job.progress.retry_wait_total = None
-                job.error = None
+                job.error = reason
                 # Refresh the chain's publishers snapshot from the
                 # successful firing's result so the modal's per-server
                 # tiles don't keep rendering the originating dispatch's
@@ -1750,7 +1808,7 @@ class JobManager:
                 if publishers is not None:
                     job.publishers = list(publishers)
             elif outcome == "exhausted":
-                job.status = JobStatus.FAILED
+                job.status = JobStatus.COMPLETED if successes > 0 else JobStatus.FAILED
                 job.completed_at = now_iso
                 self.clear_pause_flag(job.id)
                 job.progress.retry_eta = None
@@ -2000,6 +2058,22 @@ class JobManager:
                 job.progress.outcome = outcome
             return job
 
+    def set_job_cpu_fallback_files(self, job_id: str, count: int) -> Optional["Job"]:
+        """Store how many of a job's files ran on the CPU because the GPU failed.
+
+        Args:
+            job_id: Job identifier.
+            count: Files so far (``JobTracker.cpu_fallback_files``).
+
+        Returns:
+            The job, or None when there's no such job.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.progress.cpu_fallback_files = count
+            return job
+
     def set_marker_sources(self, job_id: str, counts: dict[str, dict[str, int]]) -> Optional["Job"]:
         """Store an Intro & Credits job's "Decided by" counts; the next progress event and the finished job carry them.
 
@@ -2098,6 +2172,7 @@ class JobManager:
                         f"Job {job_id} dispatch finished but chain is active; "
                         f"skipping worker completion update (chain drives lifecycle)"
                     )
+                    log_level = "debug"  # bookkeeping: the job's own log already announced the retry
                 else:
                     job.completed_at = datetime.now(UTC).isoformat()
                     if error:
@@ -2160,6 +2235,9 @@ class JobManager:
                 job.status = JobStatus.CANCELLED
                 job.paused = False
                 job.completed_at = datetime.now(UTC).isoformat()
+                job.progress.retry_eta = None
+                job.progress.retry_wait_total = None
+                job.progress.current_item = ""
                 self._running_job_ids.discard(job_id)
                 self.clear_pause_flag(job_id)
                 self.clear_active_worker_pool(job_id)
@@ -2200,6 +2278,9 @@ class JobManager:
                     child.status = JobStatus.CANCELLED
                     child.error = "Parent retry chain was cancelled."
                     child.completed_at = datetime.now(UTC).isoformat()
+                    child.progress.retry_eta = None
+                    child.progress.retry_wait_total = None
+                    child.progress.current_item = ""
                     self._running_job_ids.discard(child.id)
                     self.clear_pause_flag(child.id)
                     self._persist_job(child)
@@ -2441,11 +2522,22 @@ class JobManager:
     #
     # Per-outcome (not a single shared cap) so a 95k-row flood of
     # ``generated`` can't push out the user's 47 ``failed`` rows. With
-    # 9 outcome values and 5000 each, worst-case JSONL is ~22 MB; in
+    # outcome buckets of 5000 each, JSONL stays bounded; in
     # practice rare outcomes (failed, unresolved_vendor, etc.) sit at
     # double-digit row counts while only the noisy happy-path outcomes
     # (generated, skipped_bif_exists) ever hit cap.
     _FILE_RESULTS_PER_OUTCOME_CAP = 5000
+
+    @staticmethod
+    def _file_result_bucket(outcome: str, servers: list[dict] | None) -> str:
+        """Keep incomplete chapter rows independently of routine scrubber successes."""
+        if any(
+            isinstance(server, dict)
+            and server.get("status") in {"published_pending_chapters", "published_chapters_failed"}
+            for server in servers or []
+        ):
+            return "chapter_incomplete"
+        return outcome
 
     def record_file_result(
         self,
@@ -2456,6 +2548,7 @@ class JobManager:
         worker: str = "",
         servers: list[dict] | None = None,
         server_messages: bool = False,
+        uncapped: bool = False,
     ) -> None:
         """Append a per-file processing result to the job's JSONL file.
 
@@ -2475,8 +2568,12 @@ class JobManager:
             server_messages: Keep each server's own message on its entry when the row's reason doesn't already say
                 it (Intro & Credits: "Keeping Plex's credits"). Preview rows leave it out: their per-server
                 "Published" never matches the "Published to N servers" reason and would grow every row.
+            uncapped: Write the row even when its outcome's bucket is full. For a retry's rows on its chain head:
+                they replace a file's earlier row, and a dropped one leaves the stale row as the file's latest
+                result, which the retry scan then retries until the chain runs out (scan 55b098af).
         """
         path = self._file_results_path(job_id)
+        bucket = self._file_result_bucket(outcome, servers)
 
         # Soft-cap check is O(1) via an in-memory per-job, per-outcome
         # counter, lazily seeded from disk on the first call. The naive
@@ -2487,6 +2584,8 @@ class JobManager:
         # ``generated`` rows can't crowd out the rare-but-interesting
         # ``failed`` / ``unresolved_vendor`` rows the user actually
         # filters to in the Files panel.
+        # Incomplete chapters get their own bounded bucket even though
+        # their successful scrubber makes the file's outcome ``generated``.
         with self._file_result_counts_lock:
             if job_id not in self._file_result_counts:
                 seeded: dict[str, int] = {}
@@ -2501,41 +2600,46 @@ class JobManager:
                                     rec = json.loads(line)
                                 except json.JSONDecodeError:
                                     continue
-                                # Truncation markers themselves don't
-                                # count toward any outcome's cap — they
-                                # exist outside the user-supplied space.
+                                # Truncation markers don't count toward
+                                # any outcome's cap: they are counted under
+                                # their own ``truncated:<outcome>`` key,
+                                # which says the marker is already written.
                                 rec_outcome = rec.get("outcome", "")
-                                if not rec_outcome or rec_outcome.startswith("truncated"):
+                                if not rec_outcome:
                                     continue
-                                seeded[rec_outcome] = seeded.get(rec_outcome, 0) + 1
+                                rec_bucket = self._file_result_bucket(rec_outcome, rec.get("servers"))
+                                seeded[rec_bucket] = seeded.get(rec_bucket, 0) + 1
                     except OSError as e:
                         logger.debug("Could not seed file-results counter for {}: {}", path, e)
                 self._file_result_counts[job_id] = seeded
 
             counts = self._file_result_counts[job_id]
-            current = counts.get(outcome, 0)
-            if current >= self._FILE_RESULTS_PER_OUTCOME_CAP:
-                # One-shot per-outcome truncation marker on the boundary
-                # record only; subsequent calls for the same outcome are
-                # silent O(1) returns. Other outcomes keep accepting
-                # rows independently.
-                if current == self._FILE_RESULTS_PER_OUTCOME_CAP:
+            current = counts.get(bucket, 0)
+            if current >= self._FILE_RESULTS_PER_OUTCOME_CAP and not uncapped:
+                # One-shot per-outcome truncation marker on the first
+                # dropped record only; subsequent calls for the same
+                # outcome are silent O(1) returns. Other outcomes keep
+                # accepting rows independently. Its own key, not the row
+                # count, says it is written: uncapped rows take the count
+                # past the cap without dropping anything.
+                marker_key = f"truncated:{bucket}"
+                if not counts.get(marker_key):
                     marker = {
                         "file": "",
-                        "outcome": f"truncated:{outcome}",
+                        "outcome": marker_key,
                         "reason": (
-                            f"per-outcome file-results cap reached for {outcome!r} "
+                            f"per-outcome file-results cap reached for {bucket!r} "
                             f"({self._FILE_RESULTS_PER_OUTCOME_CAP} entries) — later items "
                             "with this outcome processed normally but not listed here. "
                             "Aggregate counts in the job summary remain accurate."
                         ),
                         "worker": "",
-                        "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+                        "ts": log_clock(),
                     }
                     try:
                         with open(path, "a") as f:
                             f.write(json.dumps(marker, separators=(",", ":")) + "\n")
-                        counts[outcome] = current + 1
+                        counts[marker_key] = 1
                     except OSError as e:
                         logger.debug("Could not append truncation marker to {}: {}", path, e)
                 return
@@ -2560,7 +2664,7 @@ class JobManager:
             "outcome": outcome,
             "reason": derived_reason,
             "worker": worker,
-            "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+            "ts": log_clock(),
         }
         # Slim per-server attribution — keep the JSONL compact (no
         # canonical_path duplication, no frame_source unless it differs
@@ -2581,6 +2685,8 @@ class JobManager:
                 fs = s.get("frame_source") or ""
                 if fs and fs != "extracted":
                     entry["frame_source"] = fs
+                if isinstance(s.get("artifacts"), dict) and s["artifacts"]:
+                    entry["artifacts"] = s["artifacts"]
                 # Why a row is waiting (e.g. the server hasn't indexed the file yet); preview rows carry none.
                 if s.get("reason_code"):
                     entry["reason_code"] = s["reason_code"]
@@ -2588,6 +2694,9 @@ class JobManager:
                 # revived after a restart reads it back to still queue that file's later check.
                 if s.get("verify_later"):
                     entry["verify_later"] = True
+                # One loudness stream may fail permanently while another still needs a later attempt.
+                if s.get("retryable") is True:
+                    entry["retryable"] = True
                 message = redact_secrets(s.get("message") or "")
                 if server_messages and message and message != derived_reason:
                     entry["message"] = message
@@ -2619,7 +2728,7 @@ class JobManager:
                 # Counter dict is guaranteed to exist after the
                 # cap-check block above seeded it under the same lock.
                 counts = self._file_result_counts.setdefault(job_id, {})
-                counts[outcome] = counts.get(outcome, 0) + 1
+                counts[bucket] = counts.get(bucket, 0) + 1
         except OSError as e:
             logger.debug("Could not append file result to {}: {}", path, e)
 

@@ -9,13 +9,12 @@ from loguru import logger
 
 from ..servers.base import Library, ServerConfig
 
-# Movie and TV libraries (``Library.kind`` is plexapi's ``METADATA_TYPE``). Music ("track") libraries are chosen by hand
-# for now: Plex keeps more loudness data for music (album gain, fade ramps) than this job writes.
-DEFAULT_KINDS = frozenset({"movie", "episode"})
-CONFIRM_FIRST = "Confirm the Plex database write (Intro & Credits tab) before turning on loudness analysis"
+# Plex uses "episode" for TV sections; older saved configs can call them "show".
+# Music also needs album gain and fades, which this video feature does not generate.
+DEFAULT_KINDS = frozenset({"movie", "episode", "show"})
 NO_AGENT = (
-    "Loudness analysis writes Plex's database directly, so the app must run on the Plex machine; it can't go through "
-    "the Plex marker agent"
+    "Loudness analysis requires a local Plex database on the same machine as this app. "
+    "The Plex helper does not support loudness analysis."
 )
 # Server ids already warned about an invalid stored block: it's read per file, so it's said once per process.
 _warned: set[str] = set()
@@ -44,13 +43,16 @@ def _uses_agent(markers: object) -> bool:
     return bool(isinstance(agent, dict) and agent.get("enabled"))
 
 
-def validate_server_loudness(raw: object, server_type: str, markers: object) -> tuple[dict | None, str]:
+def validate_server_loudness(
+    raw: object, server_type: str, markers: object, *, library_kinds: dict[str, str | None] | None = None
+) -> tuple[dict | None, str]:
     """Validate and normalise a per-server ``loudness`` block.
 
     Args:
         raw: The posted block (None → defaults).
         server_type: ``plex``, ``emby`` or ``jellyfin``.
-        markers: The server's ``markers`` block, which holds the Plex database write confirmation this reuses.
+        markers: The server's ``markers`` block, which holds the shared Plex helper configuration.
+        library_kinds: Known library types, so explicit non-video selections can be refused.
 
     Returns:
         ``(block, "")`` on success, ``(None, message)`` on error.
@@ -65,19 +67,32 @@ def validate_server_loudness(raw: object, server_type: str, markers: object) -> 
         if not isinstance(library_ids_raw, list):
             return None, "loudness.library_ids must be a list or null"
         library_ids = list(dict.fromkeys(str(x) for x in library_ids_raw))
-    enabled = bool(raw.get("enabled", False))
+    enabled = raw.get("enabled", False)
+    if type(enabled) is not bool:
+        return None, "loudness.enabled must be a boolean"
     if enabled and server_type != "plex":
         return None, "Loudness analysis is for Plex servers only"
-    if enabled and not _plex_block(markers).get("db_write_confirmed_at"):
-        return None, CONFIRM_FIRST
     if enabled and _uses_agent(markers):
         return None, NO_AGENT
+    if (
+        enabled
+        and library_ids
+        and any(
+            (library_kinds or {}).get(lid) and (library_kinds or {})[lid] not in DEFAULT_KINDS for lid in library_ids
+        )
+    ):
+        return (
+            None,
+            "Loudness analysis supports movie and TV libraries only; music and other library types are unsupported",
+        )
     return {"enabled": enabled, "library_ids": library_ids}, ""
 
 
 def load_server_loudness(cfg: ServerConfig) -> ServerLoudnessSettings:
     """A server's loudness settings, falling back to off when the stored block is invalid (logged)."""
-    block, err = validate_server_loudness(cfg.loudness or None, cfg.type.value, cfg.markers)
+    block, err = validate_server_loudness(
+        cfg.loudness or None, cfg.type.value, cfg.markers, library_kinds={lib.id: lib.kind for lib in cfg.libraries}
+    )
     if err or block is None:
         if cfg.id not in _warned:
             _warned.add(cfg.id)
@@ -91,6 +106,8 @@ def load_server_loudness(cfg: ServerConfig) -> ServerLoudnessSettings:
 
 def library_chosen(settings: ServerLoudnessSettings, *, library_id: str | None, kind: str | None) -> bool:
     """Whether loudness goes to a library: the explicit choice when there is one, else movie and TV libraries."""
+    if kind and kind not in DEFAULT_KINDS:
+        return False
     if settings.library_ids is not None:
         return library_id is not None and library_id in settings.library_ids
     return kind in DEFAULT_KINDS

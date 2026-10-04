@@ -165,6 +165,15 @@
                                 <div class="valid-feedback small">Path exists</div>
                             </div>
                             <div class="form-text">Where this Plex server's preview bundles will be written. Mirrors the <a href="{{ url_for('main.setup_wizard') }}">Setup wizard</a> &rarr; Step 3 field.</div>
+                            <div class="form-check form-switch mt-3">
+                                <input class="form-check-input" type="checkbox" role="switch" id="editPlexChapterThumbnails" aria-describedby="editPlexChapterThumbnailsHelp">
+                                <label class="form-check-label" for="editPlexChapterThumbnails">Generate chapter thumbnails</label>
+                            </div>
+                            <div class="form-text" id="editPlexChapterThumbnailsHelp">
+                                Adds pictures to Plex's chapter menu and updates Plex's database.
+                                Plex may still show older cached images.
+                                Check <a href="#" id="editPlexChapterHealthLink">Setup Health</a>.
+                            </div>
                         </div>
 
                         <!-- Jellyfin-only: store trickplay off the media drive -->
@@ -564,6 +573,11 @@
                          time). Pre-fix this tab was Plex-only and Emby/Jellyfin users
                          had no place to find the webhook URL. -->
                     <div class="tab-pane fade" id="edit-tab-automation">
+                        <p class="small text-muted mb-3">
+                            Webhook jobs use <strong>Delay before processing</strong> in Automation &rarr; Triggers.
+                            To override it, append <code>?delay=30</code> to the webhook URL, or <code>&amp;delay=30</code>
+                            if it already contains <code>?</code>. Valid values are 1–3600 seconds; each file version waits independently.
+                        </p>
                         <div id="editPlexWebhookServerCaption" class="small text-muted mb-3"></div>
 
                         <!-- Emby / Jellyfin Webhook info card (shown by JS for non-Plex servers). -->
@@ -715,18 +729,23 @@
                             <div>
                                 <label class="fw-semibold" for="loudnessEnabled">Analyse loudness for this server</label>
                                 <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top"
-                                        title="Runs Plex's own loudness analysis of each audio track on this app's workers and stores it in Plex, so Normalize Loudness doesn't wait for Plex's one-at-a-time job."><i class="bi bi-info-circle"></i></button>
+                                        title="Analyses each audio track on this app's workers and stores its loudness measurements in Plex for Normalize Loudness."><i class="bi bi-info-circle"></i></button>
                                 <div class="small text-muted">Viewers on this server get Normalize Loudness sooner</div>
                             </div>
                             <div class="form-check form-switch markers-switch">
                                 <input class="form-check-input" type="checkbox" role="switch" id="loudnessEnabled">
                             </div>
                         </div>
-                        <p class="small text-warning mb-2 d-none" id="loudnessConfirmHint">
-                            Confirm the Plex database write on the Intro &amp; Credits tab first: loudness is written to the same database.
+                        <p class="small text-muted mb-2">
+                            Requires this app and Plex on the same machine, with Plex's config folder mounted locally.
+                            Enabling this writes loudness measurements to Plex's database. Intro &amp; Credits can stay off.
+                        </p>
+                        <p class="small text-warning mb-2 d-none" id="loudnessHelperHint">
+                            The Plex helper does not support loudness analysis. Use a local Plex database to enable it.
                         </p>
                         <p class="small text-muted mb-3" id="loudnessLibrariesPointer">
-                            Choose which libraries get loudness on the <a href="#" class="loudness-libraries-link">Libraries</a> tab once this is on.
+                            Choose movie and TV libraries on the <a href="#" class="loudness-libraries-link">Libraries</a> tab once this is on.
+                            Music libraries are not supported.
                         </p>
                     </div>
 
@@ -776,8 +795,8 @@
                             <div>
                                 <label class="fw-semibold" for="markersAgentEnabled">Plex marker agent</label>
                                 <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top"
-                                        title="A small container you run next to Plex. It is the only supported way to write markers to a Plex on another machine."><i class="bi bi-info-circle"></i></button>
-                                <div class="small text-muted">Only needed when this app and Plex are on different machines</div>
+                                        title="Runs next to Plex on another machine. Writes chapter image references and intro or credits markers. Each feature is enabled separately."><i class="bi bi-info-circle"></i></button>
+                                <div class="small text-muted">Shared by chapter thumbnails and Intro &amp; Credits when Plex runs on another machine. Intro &amp; Credits can stay off.</div>
                             </div>
                             <div class="form-check form-switch markers-switch">
                                 <input class="form-check-input" type="checkbox" role="switch" id="markersAgentEnabled">

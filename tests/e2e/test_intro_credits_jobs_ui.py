@@ -140,7 +140,7 @@ def _markers_job(job_id: str = "7c1f09aa-0000-4000-8000-000000000002", **overrid
                 "server_id": "plex-1",
                 "server_name": "Home Plex",
                 "server_type": "plex",
-                "counts": {"markers_written": 8, "markers_needs_review": 3},
+                "counts": {"markers_written": 8, "markers_none": 3},
             },
             {
                 "server_id": "jf-1",
@@ -156,7 +156,7 @@ def _markers_job(job_id: str = "7c1f09aa-0000-4000-8000-000000000002", **overrid
                 "messages": {"markers_skipped": "Emby plugin not installed"},
             },
         ],
-        "progress": {"outcome": {"markers_published": 8, "markers_needs_review": 3}},
+        "progress": {"outcome": {"markers_published": 8, "markers_none": 3}},
     }
     base.update(overrides)
     return _job(job_id, **base)
@@ -236,6 +236,99 @@ def _open_start_modal(page: Page) -> None:
 
 def _start_button(page: Page):
     return page.locator('#newJobModal .modal-footer button:has-text("Start Job")')
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("status", ["pending", "running", "completed", "failed", "cancelled"])
+def test_loudness_retry_row_explains_automatic_retry_without_preview_instructions(dashboard, status):
+    eta = (datetime.now(UTC) + timedelta(seconds=45)).isoformat()
+    active = status in {"pending", "running"}
+    chain = _job(
+        "loudness-status-proof",
+        kind="loudness",
+        library_name="Plex loudness: Movies",
+        status=status,
+        config={
+            "is_retry_chain": True,
+            "retry_attempt": 1,
+            "max_retries": 3,
+            "retry_max_attempts": 3,
+            "last_outcome": "running",
+        },
+        # Old persisted terminal rows can still carry an ETA; the UI must not promise another attempt.
+        progress={"retry_eta": eta, "outcome": {"loudness_waiting": 1}},
+        error="Plex is still unavailable after 3 retries. See the Files panel." if status == "failed" else None,
+    )
+    page = dashboard([chain])
+    row = page.locator(f"#job-row-{chain['id']}")
+    expect(row).to_be_visible()
+    expect(row.locator(".status-dot")).to_have_text(status.title())
+    expect(row.locator("[data-explain-template]")).to_have_count(0)
+    expect(row.locator('[aria-label="Pause job"]')).to_have_count(0)
+    chip = row.locator(".markers-chain-retry-chip")
+    if active:
+        expect(chip).to_have_text("Retry 1/3")
+        assert "Automatically checks loudness again" in _tooltip(chip)
+        expect(row.locator('[aria-label="Retry now"]')).to_be_visible()
+    else:
+        expect(chip).to_have_count(0)
+        expect(row.locator('[aria-label="Retry now"]')).to_have_count(0)
+        expect(row.locator("[data-scheduled-at]")).to_have_count(0)
+    # A historical result must not promise a retry after the job has exhausted its attempts.
+    for outcome in ["loudness_not_in_library", "loudness_waiting"]:
+        tip = page.evaluate("key => window.STATUS_META[key].tip", outcome)
+        assert "whether another attempt is scheduled" in tip
+        assert "a retry job checks it again" not in tip
+    page.evaluate("id => _renderChainStateChip(id)", chain["id"])
+    modal_chip = page.locator("#attemptsHint")
+    expect(modal_chip.locator("[data-explain-template]")).to_have_count(0)
+    if status == "pending":
+        expect(modal_chip).to_contain_text("attempt 1/3")
+    elif not active:
+        expect(modal_chip).not_to_contain_text("Next attempt")
+
+
+@pytest.mark.e2e
+def test_loudness_partial_completion_warning_is_amber_in_attempts_modal(dashboard):
+    job = _job("partial-proof", kind="loudness", status="completed", error="One file still needs loudness")
+    page = dashboard([job])
+    expect(page.locator(f"#job-row-{job['id']}")).to_be_visible()
+    page.evaluate("id => _renderChainStateChip(id)", job["id"])
+    chip = page.locator("#attemptsHint")
+    expect(chip).to_have_text("Completed with warnings")
+    expect(chip).to_have_class(re.compile(r"\bbg-warning\b"))
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("kind", ["previews", "intro_credits", "loudness"])
+@pytest.mark.parametrize(
+    "config,visible",
+    [
+        ({"is_retry": True, "parent_job_id": "parent"}, False),
+        ({"is_retry_attempt": True, "parent_chain_id": "parent"}, False),
+        ({"is_retry": True, "is_retry_chain": True}, True),
+        ({}, True),
+    ],
+)
+def test_hidden_retry_attempt_events_do_not_announce_a_finished_job(dashboard, kind, config, visible):
+    page = dashboard([])
+    page.wait_for_function("socket !== null && socket.listeners('job_completed').length === 1")
+    payload = _job("notification-proof", kind=kind, config=config)
+    for event in ["job_created", "job_completed", "job_failed", "job_cancelled"]:
+        calls = page.evaluate(
+            """({event, payload}) => {
+                const calls = {toasts: [], notifications: []};
+                window.showToast = (...args) => calls.toasts.push(args);
+                window.showNotification = (...args) => calls.notifications.push(args);
+                const listeners = socket.listeners(event);
+                if (listeners.length !== 1) throw new Error('Missing real dashboard event handler');
+                listeners[0](payload);
+                return calls;
+            }""",
+            {"event": event, "payload": payload},
+        )
+        assert len(calls["toasts"]) == int(visible), (kind, event, calls)
+        assert len(calls["notifications"]) == int(visible and event in {"job_completed", "job_failed"})
 
 
 @pytest.mark.e2e
@@ -336,7 +429,7 @@ class TestStartJobModalIntroCredits:
         assert posts[0]["priority"] == 1
         assert posts[0]["library_name"] == "Intro & Credits: All Libraries"
 
-    def test_previews_still_post_the_old_body_to_the_jobs_endpoint(self, dashboard) -> None:
+    def test_previews_post_to_jobs_with_unrestricted_filters_and_server_order(self, dashboard) -> None:
         page = dashboard()
         markers_posts = _capture_posts(page, "**/api/markers/jobs", {"id": "ic-1"})
         preview_posts = _capture_posts(page, "**/api/jobs", {"id": "job-1"})
@@ -354,7 +447,7 @@ class TestStartJobModalIntroCredits:
                 "library_ids": ["2"],
                 "library_name": "TV Shows",
                 "priority": 2,
-                "config": {"force_generate": True},
+                "config": {"force_generate": True, "sort_by": "default", "added_filter": "all"},
                 "server_id": "plex-1",
             }
         ]
@@ -558,13 +651,13 @@ class TestQueueRows:
         detail = page.locator(f"#job-detail-{follower['id']}")
         expect(detail).to_be_visible()
         expect(detail).to_contain_text("Markers written × 8")
-        expect(detail).to_contain_text("Needs review × 3")
+        expect(detail).to_contain_text("No markers found × 3")
         expect(detail).to_contain_text("Up to date × 3")
         expect(detail).to_contain_text("Skipped × 11 · Emby plugin not installed")
         expect(detail).not_to_contain_text("Generated")
         expect(detail).not_to_contain_text("Reused")
         plex_line = detail.locator("div", has_text="Home Plex").last
-        expect(plex_line).to_contain_text(re.compile(r"Markers written × 8\s*Needs review × 3"))
+        expect(plex_line).to_contain_text(re.compile(r"Markers written × 8\s*No markers found × 3"))
 
     def test_a_quote_in_a_webhook_file_name_stays_inside_the_name_cell_title(self, dashboard) -> None:
         # The row's title lists the webhook's file names; a Sonarr import can name a file with '"' in it.
@@ -1154,7 +1247,7 @@ class TestFilesPanel:
         expect(page.locator("#fileResultsBody")).not_to_contain_text("Click to load", timeout=3000)
         return requests
 
-    def test_needs_review_filter_sends_its_outcome_key(self, dashboard) -> None:
+    def test_an_outcome_filter_sends_its_outcome_key(self, dashboard) -> None:
         job = _markers_job(config={"kind": "intro_credits", "source": "manual", "libraries": [], "file_paths": []})
         page = dashboard([job])
         requests = self._open_files(page, job, [])
@@ -1162,10 +1255,10 @@ class TestFilesPanel:
 
         expect(page.locator("#logsModalHeader")).to_contain_text("Intro & Credits")
         with page.expect_request(re.compile(r".*/api/jobs/.*/files\?.*")) as filtered:
-            page.locator("#fileOutcomeFilter").select_option(label="Needs review")
+            page.locator("#fileOutcomeFilter").select_option(label="No markers found")
 
         assert f"/api/jobs/{job['id']}/files?" in filtered.value.url
-        assert "outcome=markers_needs_review" in filtered.value.url
+        assert "outcome=markers_none" in filtered.value.url
 
     def test_filter_lists_only_the_outcomes_of_the_job_kind(self, dashboard) -> None:
         markers = _markers_job(config={"kind": "intro_credits", "source": "manual", "libraries": [], "file_paths": []})
@@ -1180,7 +1273,6 @@ class TestFilesPanel:
             "",
             "markers_published",
             "markers_up_to_date",
-            "markers_needs_review",
             "markers_waiting",
             "markers_skipped",
             "markers_none",

@@ -21,6 +21,7 @@ import urllib.parse
 
 from ..markers.publishers.base import PublishError
 from ..markers.publishers.plex_db import decode_extra_data, encode_extra_data, shm_lock_held_elsewhere
+from .plex_db import check_schema, database_identity, undo_target
 
 
 def restored(before: str | None, after: str, current: str | None) -> str | None | bool:
@@ -42,7 +43,9 @@ def restored(before: str | None, after: str, current: str | None) -> str | None 
         return False
     if not added or any(now.get(k) != v for k, v in added.items()):
         return False
-    return encode_extra_data({k: v for k, v in now.items() if k not in added}, url_form=url_form)
+    updated = {k: v for k, v in now.items() if k not in added}
+    updated.update({k: old[k] for k in added if k in old})
+    return encode_extra_data(updated, url_form=url_form)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,14 +71,51 @@ def main(argv: list[str] | None = None) -> int:
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     count = skipped = 0
     try:
+        identity = database_identity(args.db)
+        if any(
+            not isinstance(record, dict)
+            or record.get("format") != 2
+            or not isinstance(record.get("database"), dict)
+            or not isinstance(record.get("transaction_id"), str)
+            or record.get("kind") not in ("intent", "commit")
+            or (
+                record.get("kind") == "intent"
+                and (
+                    not isinstance(record.get("target"), list)
+                    or not all(key in record for key in ("before", "after"))
+                    or (("stream_id" in record) == ("metadata_item_id" in record))
+                )
+            )
+            for record in records
+        ):
+            print(
+                "Unscoped or malformed undo records: refusing to guess which Plex database they belong to.",
+                file=sys.stderr,
+            )
+            return 2
+        matching = [record for record in records if record["database"] == identity]
+        if records and not matching:
+            print("No undo records belong to this exact Plex database file; nothing changed.", file=sys.stderr)
+            return 2
+        committed = {record["transaction_id"] for record in matching if record["kind"] == "commit"}
+        intents = [record for record in matching if record["kind"] == "intent"]
+        skipped = sum(record["kind"] == "intent" and record["database"] != identity for record in records)
+        unconfirmed = sum(record["transaction_id"] not in committed for record in intents)
+        skipped += unconfirmed
         conn.execute("BEGIN IMMEDIATE")
-        for record in reversed(records):
+        check_schema(conn)
+        for record in reversed(intents):
+            if record["transaction_id"] not in committed:
+                continue
             # Only extra_data is set, so Plex's title-search triggers on metadata_items don't fire.
             table, row_id = (
                 ("metadata_items", record["metadata_item_id"])
                 if "metadata_item_id" in record
                 else ("media_streams", record["stream_id"])
             )
+            if undo_target(conn, record) != record["target"]:
+                skipped += 1
+                continue
             row = conn.execute(f"SELECT extra_data FROM {table} WHERE id = ?", (row_id,)).fetchone()  # noqa: S608
             back = restored(record["before"], record["after"], row[0]) if row is not None else False
             if back is False:
@@ -92,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
         conn.close()
     verb = "Would restore" if args.dry_run else "Restored"
     print(f"{verb} {count} track(s) and item mark(s); left {skipped} that changed since or were already restored.")
+    if unconfirmed:
+        print(
+            f"Left {unconfirmed} unconfirmed write intent(s) unchanged; preserve the journal for recovery.",
+            file=sys.stderr,
+        )
     if unreadable:
         print(f"Skipped {unreadable} unreadable line(s) in {args.log}.", file=sys.stderr)
     return 0

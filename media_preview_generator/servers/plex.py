@@ -20,6 +20,7 @@ import urllib3
 from loguru import logger
 
 from ..config import resolve_frame_interval
+from ..scan_filters import metadata_id, metadata_integer, parse_added_at
 from .base import (
     ConnectionResult,
     FlagTarget,
@@ -1085,6 +1086,18 @@ class PlexServer(MediaServer):
             except Exception as exc:
                 logger.debug("Plex prefs probe failed for {!r}: {}", self.name, exc)
 
+        from .chapter_readiness import chapter_readiness_section
+
+        chapter_section = chapter_readiness_section(self, self._server_config, current_by_id)
+        if chapter_section is not None:
+            sections.append(chapter_section)
+
+        from .loudness_readiness import loudness_readiness_section
+
+        loudness_section = loudness_readiness_section(self, self._server_config)
+        if loudness_section is not None:
+            sections.append(loudness_section)
+
         for pref_id, label, recommended, severity, rationale in self._PLEX_RECOMMENDED_PREFS:
             current = current_by_id.get(pref_id)
             row_ok = current == recommended
@@ -1509,7 +1522,7 @@ class PlexServer(MediaServer):
             "sections": sections,
         }
 
-    def list_items(self, library_id: str) -> Iterator[MediaItem]:
+    def list_items(self, library_id: str, *, sort_by: str | None = None) -> Iterator[MediaItem]:
         """Yield :class:`MediaItem` objects for a single library by id.
 
         Wraps the per-library scan logic from
@@ -1547,6 +1560,11 @@ class PlexServer(MediaServer):
             )
             return
 
+        search_kwargs = {}
+        if sort_by == "newest":
+            search_kwargs["sort"] = "addedAt:desc"
+        elif sort_by == "oldest":
+            search_kwargs["sort"] = "addedAt:asc"
         try:
             # ``plexapi.LibrarySection.search()`` handles HTTP pagination
             # internally (default container_size=100) and returns the
@@ -1562,7 +1580,7 @@ class PlexServer(MediaServer):
                     "(plexapi paginates internally; this can take a while for large libraries)…",
                     target.title,
                 )
-                results = retry_plex_call(target.search, libtype="episode")
+                results = retry_plex_call(target.search, libtype="episode", **search_kwargs)
                 logger.info(
                     "Plex library {!r}: received {} episode(s) from server, starting to yield items.",
                     target.title,
@@ -1588,6 +1606,11 @@ class PlexServer(MediaServer):
                             title=title,
                             remote_path=str(location),
                             bundle_metadata=bundle_md,
+                            added_at=parse_added_at(getattr(m, "addedAt", None), naive_is_utc=False),
+                            media_type=target.METADATA_TYPE,
+                            series_id=metadata_id(getattr(m, "grandparentRatingKey", None)),
+                            season_number=metadata_integer(getattr(m, "parentIndex", None)),
+                            year=metadata_integer(getattr(m, "year", None), minimum=1),
                         )
             elif target.METADATA_TYPE == "movie":
                 logger.info(
@@ -1595,7 +1618,7 @@ class PlexServer(MediaServer):
                     "(plexapi paginates internally; this can take a while for large libraries)…",
                     target.title,
                 )
-                results = retry_plex_call(target.search)
+                results = retry_plex_call(target.search, **search_kwargs)
                 logger.info(
                     "Plex library {!r}: received {} movie(s) from server, starting to yield items.",
                     target.title,
@@ -1616,6 +1639,11 @@ class PlexServer(MediaServer):
                             title=title,
                             remote_path=str(location),
                             bundle_metadata=bundle_md,
+                            added_at=parse_added_at(getattr(m, "addedAt", None), naive_is_utc=False),
+                            media_type=target.METADATA_TYPE,
+                            series_id=metadata_id(getattr(m, "grandparentRatingKey", None)),
+                            season_number=metadata_integer(getattr(m, "parentIndex", None)),
+                            year=metadata_integer(getattr(m, "year", None), minimum=1),
                         )
             else:
                 logger.info(
@@ -2095,13 +2123,39 @@ class PlexServer(MediaServer):
             server_display_name=getattr(self._config, "server_display_name", None) or self.name,
         )
 
+    def refresh_preview_metadata(self, canonical_path: str, item_id: str | None = None) -> bool:
+        """Ask Plex to advertise a saved BIF, from the background notification queue.
+
+        A BIF is readable immediately at the part endpoint, but an already
+        indexed item's ``indexes`` flag can remain unset until Analyze runs.
+        Paths without an item hint get a best-effort scan and lookup first;
+        failure here never prevents local generation or publication.
+        Return True only after Plex accepts Analyze; unresolved items remain pending.
+        """
+        if not item_id:
+            self.trigger_refresh(item_id=None, remote_path=canonical_path)
+            item_id = self.resolve_remote_path_to_item_id(canonical_path)
+        if not item_id:
+            logger.info(
+                "Previews saved for {}. {} has not indexed the file yet; a later Plex scan/analyze will activate them.",
+                canonical_path,
+                self.name,
+            )
+            return False
+        bare_id = str(item_id).rsplit("/", 1)[-1]
+        if not bare_id.isdecimal():
+            raise ValueError("Plex preview notification requires a numeric item ID")
+        plex = self._connect()
+        plex.query(f"/library/metadata/{bare_id}/analyze", method=plex._session.put)
+        return True
+
     def get_bundle_metadata(self, item_id: str) -> list[tuple[str, str]]:
         """Return ``(bundle_hash, remote_path)`` for every MediaPart of an item.
 
-        Plex-specific helper (not part of the abstract :class:`MediaServer`
-        interface) used by :class:`PlexBundleAdapter` to compute the BIF output
-        location. Plex's ``/library/metadata/{id}/tree`` endpoint returns XML;
-        we surface the relevant attributes as plain tuples.
+        Retained Plex metadata API for diagnostics and compatibility, outside
+        the abstract :class:`MediaServer` interface. The ``/tree`` endpoint
+        returns XML; we surface the relevant attributes as plain tuples.
+        Preview publishing calculates its bundle hash from local media instead.
 
         ``item_id`` may be either a bare ratingKey (``"557676"``) or a full
         Plex API path (``"/library/metadata/557676"``); we normalise both so
@@ -2111,9 +2165,7 @@ class PlexServer(MediaServer):
         used to be the silent root cause of every Sonarr/Radarr → Plex
         webhook returning ``skipped_not_indexed`` — see D31.
 
-        Returns an empty list when the lookup fails or the item has no parts —
-        the adapter translates that into a
-        :class:`~media_preview_generator.servers.LibraryNotYetIndexedError`.
+        Returns an empty list when the lookup fails or the item has no parts.
         Failures now WARN (not DEBUG) so the next time we malform a URL it
         shows up in logs without users having to grep at debug level.
         """
@@ -2131,9 +2183,7 @@ class PlexServer(MediaServer):
             data = retry_plex_call(self._connect().query, f"/library/metadata/{bare_id}/tree")
         except Exception as exc:
             logger.warning(
-                "Plex /tree query failed for item {!r} ({}: {}). The publisher "
-                "will be reported as 'not indexed yet' and retried, but the underlying "
-                "cause is this query — not Plex's analyzer.",
+                "Plex /tree query failed for item {!r} ({}: {}). Bundle metadata is unavailable.",
                 bare_id,
                 type(exc).__name__,
                 exc,

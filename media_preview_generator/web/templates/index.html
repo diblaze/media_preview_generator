@@ -310,7 +310,7 @@
 
 <!-- New Job Modal -->
 <div class="modal fade" id="newJobModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-play-fill me-2"></i>Start New Job</h5>
@@ -375,6 +375,7 @@
                              a multi-server fan-out message instead. -->
                         <div id="jobScopeBadge" class="mt-2 small"></div>
                     </div>
+                    {% with filter_prefix='job' %}{% include '_scan_filters.html' %}{% endwith %}
                     <div class="mb-3" id="jobMarkersForceGroup" hidden>
                         <div class="form-check d-flex align-items-center">
                             <input class="form-check-input" type="checkbox" id="jobMarkersForce">
@@ -411,14 +412,15 @@
                     </div>
                     <div class="mb-3" id="jobSortByGroup">
                         <label for="jobSortBy" class="form-label">Processing Order
-                            <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="What order workers pick files in. Random helps when your media is spread across several disks."><i class="bi bi-info-circle"></i></button>
+                            <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Orders items within each library by date added. Default uses server order. Parallel workers may finish out of order."><i class="bi bi-info-circle"></i></button>
                         </label>
                         <select class="form-select" id="jobSortBy">
-                            <option value="" selected>Default (server order)</option>
-                            <option value="newest">Newest first</option>
-                            <option value="oldest">Oldest first</option>
+                            <option value="default" selected>Default (server order)</option>
+                            <option value="newest">Newest added first</option>
+                            <option value="oldest">Oldest added first</option>
                             <option value="random">Random</option>
                         </select>
+                        <div class="form-text">Newest and oldest use the date added to the library. Date ordering applies within each library; parallel workers may finish out of order.</div>
                         <div class="form-text">Pick <strong>Random</strong> if your media is split across multiple disks, so workers don't all hit one disk at the same time.</div>
                     </div>
                 </form>
@@ -641,7 +643,6 @@
                                 <option value="skipped_not_indexed" data-kind="previews">Not indexed</option>
                                 <option value="markers_published" data-kind="intro_credits">Markers written</option>
                                 <option value="markers_up_to_date" data-kind="intro_credits">Up to date</option>
-                                <option value="markers_needs_review" data-kind="intro_credits">Needs review</option>
                                 <option value="markers_waiting" data-kind="intro_credits">Waiting</option>
                                 <option value="markers_skipped" data-kind="intro_credits">Skipped</option>
                                 <option value="markers_none" data-kind="intro_credits">No markers found</option>

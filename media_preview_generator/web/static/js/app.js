@@ -279,6 +279,7 @@ function connectSocket() {
         console.log('Job created:', job);
         loadJobs();
         loadJobStats();
+        if (!_isUserVisibleJob(job)) return;
         showToast('Job Created', `Job ${job.id.substring(0, 8)} created`, 'info');
     });
 
@@ -311,6 +312,7 @@ function connectSocket() {
         loadJobStats();
         loadWorkerStatuses();
         removeActiveJob(job.id);
+        if (!_isUserVisibleJob(job)) return;
         if (job.error) {
             showToast('Job completed with warnings', job.error, 'warning');
             showNotification('Job completed with warnings', job.error, 'warning');
@@ -326,6 +328,7 @@ function connectSocket() {
         loadJobStats();
         loadWorkerStatuses();
         removeActiveJob(job.id);
+        if (!_isUserVisibleJob(job)) return;
         showToast('Job Failed', `Job ${job.id.substring(0, 8)} failed: ${job.error}`, 'danger');
         showNotification('Job Failed', job.error || 'Unknown error', 'error');
     });
@@ -336,6 +339,7 @@ function connectSocket() {
         loadJobStats();
         loadWorkerStatuses();
         removeActiveJob(job.id);
+        if (!_isUserVisibleJob(job)) return;
         showToast('Job Cancelled', `Job ${job.id.substring(0, 8)} cancelled`, 'warning');
     });
 
@@ -652,6 +656,10 @@ async function loadLibraries() {
         libraries = data.libraries || [];
         librariesLoadError = null;
         await updateLibraryList();
+        if (document.getElementById('newJobModal')?.classList.contains('show')) {
+            _renderJobLibraryList(libraries);
+            _updateJobScopeBadge();
+        }
         updateMediaServersStatus();
     } catch (error) {
         console.error('Failed to load libraries:', error);
@@ -864,8 +872,8 @@ async function loadPendingWebhooks() {
         const n = pending.length;
         chipText.textContent = `${n} waiting`;
         chip.title = n === 1
-            ? 'One webhook is debouncing — click to jump to its row in the queue'
-            : `${n} webhooks debouncing — click to jump to the next one in the queue`;
+            ? 'One webhook is waiting — click to jump to its row in the queue'
+            : `${n} webhooks waiting — click to jump to the next one in the queue`;
     } catch (error) {
         // Network blip: hide rather than show a stale count.
         chip.classList.add('d-none');
@@ -906,7 +914,7 @@ async function fireWebhookNow(jobId) {
     if (!jobId) return;
     try {
         await apiPost('/api/jobs/' + encodeURIComponent(jobId) + '/fire-webhook-now', {});
-        showToast('Webhook Fired', 'Skipped the debounce — dispatching now.', 'success');
+        showToast('Webhook Fired', 'Skipped the initial wait — dispatching now.', 'success');
         await Promise.all([loadJobs(), loadPendingWebhooks()]);
     } catch (error) {
         showToast('Error', 'Could not fire webhook: ' + (error && error.message || error), 'danger');
@@ -1260,16 +1268,24 @@ async function onScheduleServerChange() {
     const sel = document.getElementById('scheduleServer');
     if (!sel) return;
     const serverId = sel.value;
+    MediaScanFilters.setLoading('schedule', true);
+    const listEl = document.getElementById('scheduleLibraryList');
+    if (listEl) listEl.innerHTML = '<div class="text-muted small">Loading libraries…</div>';
     try {
         const url = serverId
             ? `/api/libraries?server_id=${encodeURIComponent(serverId)}`
             : '/api/libraries';
         const data = await apiGet(url);
+        if (sel.value !== serverId) return;
         libraries = data.libraries || [];
         _renderScheduleLibraryList(libraries, serverId || null);
     } catch (e) {
+        if (sel.value !== serverId) return;
         console.warn('Failed to refresh libraries for server change:', e);
+        if (listEl) listEl.innerHTML = '<div class="text-warning small">Could not load libraries.</div>';
         showToast('Schedules', 'Could not load libraries for the selected server', 'warning');
+    } finally {
+        if (sel.value === serverId) MediaScanFilters.setLoading('schedule', false);
     }
 }
 
@@ -1281,13 +1297,16 @@ function _renderScheduleLibraryList(libs, filterServerId) {
     if (!listEl) return;
     if (!libs || libs.length === 0) {
         listEl.innerHTML = '<div class="text-muted small">No libraries available for this selection.</div>';
+        MediaScanFilters.refresh('schedule');
         return;
     }
     const allDisabled = document.getElementById('scheduleLibraryAll').checked;
     const renderRow = (lib, indent) => `
         <div class="form-check ${indent ? 'ms-2' : ''}">
             <input class="form-check-input schedule-library-checkbox" type="checkbox"
-                   value="${lib.id}" id="schedLib_${lib.id}" ${allDisabled ? 'disabled' : ''}>
+                   value="${lib.id}" id="schedLib_${lib.id}" ${allDisabled ? 'disabled' : ''}
+                   data-library-kind="${escapeHtml(lib.type || lib.kind || '')}"
+                   onchange="MediaScanFilters.refresh('schedule')">
             <label class="form-check-label" for="schedLib_${lib.id}">
                 ${escapeHtml(lib.name)} <span class="text-muted small">(${libraryTypeLabel(lib)})</span>
             </label>
@@ -1295,6 +1314,7 @@ function _renderScheduleLibraryList(libs, filterServerId) {
     `;
     if (filterServerId) {
         listEl.innerHTML = libs.map(l => renderRow(l, false)).join('');
+        MediaScanFilters.refresh('schedule');
         return;
     }
     const groups = new Map();
@@ -1313,6 +1333,7 @@ function _renderScheduleLibraryList(libs, filterServerId) {
         sections.push(head + grp.libs.map(l => renderRow(l, true)).join(''));
     }
     listEl.innerHTML = sections.join('');
+    MediaScanFilters.refresh('schedule');
 }
 
 function onScheduleLibraryAllChange(checkbox) {
@@ -1320,6 +1341,7 @@ function onScheduleLibraryAllChange(checkbox) {
         cb.disabled = checkbox.checked;
         if (checkbox.checked) cb.checked = false;
     });
+    MediaScanFilters.refresh('schedule');
 }
 
 function setScheduleLibrariesChecked(checked) {
@@ -1332,6 +1354,7 @@ function setScheduleLibrariesChecked(checked) {
         cb.disabled = false;
         cb.checked = checked;
     });
+    MediaScanFilters.refresh('schedule');
 }
 
 // Populate the Schedules modal's "Media Server" dropdown from /api/servers.
@@ -1508,6 +1531,8 @@ const STATUS_META = {
     // Success — file generated this run OR successfully published to a server.
     generated:              { label: 'Generated',     cls: 'bg-success', tip: 'Preview was generated' },
     published:              { label: 'Generated',     cls: 'bg-success', tip: 'Preview was published to this server' },
+    published_pending_chapters: { label: 'Chapters pending', cls: 'bg-warning text-dark', tip: 'Scrubber previews are ready; chapter thumbnails still need work. The job retries according to your retry policy; see the file details.' },
+    published_chapters_failed: { label: 'Chapters failed', cls: 'bg-warning text-dark', tip: 'Scrubber previews are ready, but chapter thumbnails could not be completed. See the file details for the reason.' },
     // Tiles / sidecar are on disk, but the server hadn't indexed the file at publish
     // time so the per-item registration call (Jellyfin Media Preview Bridge plugin or
     // /Items/{id}/Refresh) was skipped. The retry queue picks this back up — once the
@@ -1546,30 +1571,35 @@ const STATUS_META = {
 
     // Intro & Credits — file outcomes (markers.outcomes.FileOutcome) and per-server row statuses (ServerStatus).
     // markers_up_to_date / _none / _skipped / _waiting are both, with one label each.
-    markers_published:      { label: 'Markers written', cls: 'bg-success', tip: 'The job changed what at least one server shows; the reason names any other marker that still needs review' },
+    markers_published:      { label: 'Markers written', cls: 'bg-success', tip: 'The job changed what at least one server shows; the reason names any other marker that wasn\'t found' },
     markers_written:        { label: 'Markers written', cls: 'bg-success', tip: 'Markers were written to this server' },
     markers_up_to_date:     { label: 'Up to date', cls: 'bg-secondary', tip: 'The server already shows these markers' },
-    markers_needs_review:   { label: 'Needs review', cls: 'bg-warning text-dark', tip: 'A marker wasn\'t sent (the sources disagree, or the only answer can\'t decide on its own), and the job wrote nothing else for this file' },
     markers_none:           { label: 'No markers found', cls: 'bg-secondary', tip: 'No source found an intro or credits for this file' },
     markers_no_owners:      { label: 'No server with Intro & Credits on', cls: 'bg-secondary', tip: 'No server with Intro & Credits turned on has this file' },
     markers_skipped:        { label: 'Skipped', cls: 'bg-secondary', tip: 'The server can\'t take markers right now (for example, a plugin is missing), or the file is a trailer or other extra' },
-    markers_waiting:        { label: 'Waiting', cls: 'bg-info text-dark', tip: 'The server hasn\'t added the file yet (the job tries it again later), or the item\'s versions don\'t agree yet' },
+    markers_waiting:        { label: 'Waiting', cls: 'bg-info text-dark', tip: 'The server hasn\'t added the file yet (the job tries it again later)' },
+
 
     // Plex loudness: file outcomes and per-server row statuses (loudness/job.py).
     loudness_written:        { label: 'Loudness written', cls: 'bg-success', tip: 'Plex\'s loudness analysis was stored for at least one audio track, or its item marked analysed' },
     loudness_up_to_date:     { label: 'Up to date', cls: 'bg-secondary', tip: 'Plex already has loudness for every audio track, or the file has none' },
     loudness_no_owners:      { label: 'No server with Loudness on', cls: 'bg-secondary', tip: 'No Plex server with Loudness turned on has this file' },
-    loudness_not_in_library: { label: 'Not in Plex yet', cls: 'bg-info text-dark', tip: 'Plex hadn\'t added this file yet; a retry job checks it again later (up to 3 times)' },
-    loudness_waiting:        { label: 'Waiting for Plex', cls: 'bg-info text-dark', tip: 'Plex\'s database couldn\'t be written just then (restarting or busy); a retry job checks it again later' },
+    loudness_not_in_library: { label: 'Not in Plex yet', cls: 'bg-info text-dark', tip: 'Plex had not added this file when it was checked. The job status shows whether another attempt is scheduled.' },
+    loudness_waiting:        { label: 'Waiting for Plex', cls: 'bg-info text-dark', tip: 'Plex or the source file was temporarily unavailable or changed. The job status shows whether another attempt is scheduled.' },
 };
 
 const JOB_KIND_INTRO_CREDITS = 'intro_credits';
 const JOB_KIND_LOUDNESS = 'loudness';
+// Match web.jobs.is_user_visible_job: retry attempts belong to their visible chain's lifecycle.
+function _isUserVisibleJob(job) {
+    const cfg = job && job.config || {};
+    return !cfg.is_retry_attempt && !(cfg.is_retry && !cfg.is_retry_chain);
+}
 // Waiting rows whose server hasn't indexed the file yet (markers.outcomes.NOT_IN_LIBRARY); a "Retry: …" job follows.
 const MARKERS_NOT_IN_LIBRARY = 'not_in_library';
 const MARKERS_NOT_IN_LIBRARY_LABEL = 'Not in the server\'s library yet — will retry';
 // Server messages that only repeat the pill or the file's reason (markers/pipeline.py); the Files panel lists the rest.
-// "Sources don't agree yet" is what rows recorded before a Needs review row said why (2026-09-24).
+// "Sources don't agree yet" is what rows recorded before 2026-09-24 said when nothing was written.
 const MARKERS_ROUTINE_MESSAGE = /^(Up to date|No markers found|Sources don't agree yet|\d+ marker\(s\))$/;
 
 function _isMarkersJob(job) {
@@ -1832,6 +1862,16 @@ function _renderMarkerSources(sources) {
         + `<div class="small text-muted mt-1">${lines.join('')}</div></div>`;
 }
 
+// "N files ran on the CPU because the GPU failed" (progress.cpu_fallback_files, JobTracker.cpu_fallback_files):
+// files a GPU worker reran on the CPU. Nothing when none did.
+function _renderCpuFallbackLine(count) {
+    const n = Number(count) || 0;
+    if (n <= 0) return '';
+    const files = n === 1 ? '1 file ran' : `${n.toLocaleString()} files ran`;
+    return `<div class="mt-1 small text-warning-emphasis cpu-fallback-line"><i class="bi bi-arrow-down-circle me-1"></i>`
+        + `${files} on the CPU because the GPU failed</div>`;
+}
+
 function _renderPublishersBlock(job) {
     // D12 — per-server aggregate (one row per registered server with
     // status counts), NOT per-file. Per-file × per-server attribution
@@ -1848,7 +1888,8 @@ function _renderPublishersBlock(job) {
     const fileIssues = _renderJobFileIssues(outcome);
     const isMarkers = _isMarkersJob(job);
     const sourcesBlock = isMarkers ? _renderMarkerSources(job.progress && job.progress.marker_sources) : '';
-    if (!rows.length && !fileIssues && !sourcesBlock) return '';
+    const cpuLine = _renderCpuFallbackLine(job && job.progress && job.progress.cpu_fallback_files);
+    if (!rows.length && !fileIssues && !sourcesBlock && !cpuLine) return '';
     const lines = rows.map(function (entry) {
         const stype = (entry.server_type || '').toLowerCase();
         const logo = _vendorLogo(stype, 12) || '';
@@ -1858,7 +1899,7 @@ function _renderPublishersBlock(job) {
         const badgeSpecs = [];
         if (isMarkers) {
             // Intro & Credits: no frame provenance; per-server marker statuses in a fixed order.
-            const order = ['markers_written', 'markers_up_to_date', 'markers_needs_review', 'markers_waiting',
+            const order = ['markers_written', 'markers_up_to_date', 'markers_waiting',
                            'markers_skipped', 'markers_none', 'failed'];
             const present = Object.keys(counts).filter(function (k) { return counts[k] > 0; });
             order.concat(present.filter(function (k) { return order.indexOf(k) === -1; }))
@@ -1883,11 +1924,11 @@ function _renderPublishersBlock(job) {
                 .forEach(function (s) { if (fs[s[0]] > 0) badgeSpecs.push({label: s[1], cls: s[2], count: fs[s[0]], tip: s[3]}); });
             // Plus attention-worthy statuses NOT captured by frame provenance
             // (failures, pending registration, index issues).
-            ['failed', 'published_pending_registration', 'skipped_not_indexed', 'not_indexed', 'skipped_not_in_library', 'no_owners', 'no_frames']
+            ['failed', 'published_pending_registration', 'published_pending_chapters', 'published_chapters_failed', 'skipped_not_indexed', 'not_indexed', 'skipped_not_in_library', 'no_owners', 'no_frames']
                 .forEach(function (k) { if (counts[k] > 0) { const m = _statusMeta(k); badgeSpecs.push({label: m.label, cls: m.cls, count: counts[k], tip: m.tip}); } });
         } else {
             // Fallback for jobs recorded before per-server frame_sources existed.
-            const statusOrder = ['published', 'published_pending_registration', 'skipped_output_exists', 'skipped_not_indexed', 'not_indexed', 'skipped_not_in_library', 'skipped', 'no_owners', 'no_frames', 'failed'];
+            const statusOrder = ['published', 'published_pending_registration', 'published_pending_chapters', 'published_chapters_failed', 'skipped_output_exists', 'skipped_not_indexed', 'not_indexed', 'skipped_not_in_library', 'skipped', 'no_owners', 'no_frames', 'failed'];
             const seen = new Set();
             statusOrder.filter(function (k) { seen.add(k); return counts[k] > 0; })
                 .concat(Object.keys(counts).filter(function (k) { return !seen.has(k) && counts[k] > 0; }))
@@ -1913,7 +1954,7 @@ function _renderPublishersBlock(job) {
             `</div>`
         );
     }).filter(Boolean).join('');
-    if (!lines && !sourcesBlock) return '';
+    if (!lines && !sourcesBlock && !cpuLine) return '';
     // The verbose "Auto-retrying — Tiles are on disk… backs off 30s →
     // 2m → 5m → 15m → 1h…" alert previously rendered here was
     // redundant with (a) the per-server badge tooltip on "Generated
@@ -1945,7 +1986,7 @@ function _renderPublishersBlock(job) {
           `<span class="badge bg-light text-dark border"><i class="bi bi-exclamation-triangle me-1"></i>Files</span>` +
           `<span class="text-muted small" aria-hidden="true">→</span>${fileIssues}</div>`
         : '';
-    return `<div class="mt-3 pt-2 border-top">${header}${noteLine}${sourcesBlock}</div>`;
+    return `<div class="mt-3 pt-2 border-top">${header}${noteLine}${cpuLine}${sourcesBlock}</div>`;
 }
 
 // Pick the retry-chain info-modal template matching the Job's server
@@ -1986,9 +2027,12 @@ function _renderRetryChip(job) {
     const attempt = typeof cfg.retry_attempt === 'number' ? cfg.retry_attempt : 0;
     // An Intro & Credits chain retries files a server hadn't added to its library yet; the info templates below
     // explain preview tiles, so its chip goes without them.
-    if (_isMarkersJob(job)) {
+    if (_hasOwnRunner(job)) {
+        const retryTip = job.kind === JOB_KIND_LOUDNESS
+            ? 'Automatically checks loudness again when Plex or the source file becomes available; no review is needed'
+            : 'Checks these files again: a server hadn\'t added them to its library yet';
         return ' <span class="badge bg-warning text-dark ms-1 markers-chain-retry-chip" '
-            + 'title="Checks these files again: a server hadn\'t added them to its library yet">'
+            + 'title="' + escapeHtmlAttr(retryTip) + '">'
             + '<i class="bi bi-arrow-clockwise me-1"></i>Retry ' + attempt + '/' + max + '</span>';
     }
     // Trailing info-icon opens the shared #globalInfoModal with the
@@ -2030,6 +2074,8 @@ function _markersPauseNote(state) {
 // Intro & Credits jobs pause on their own; preview jobs only have the global Pause Processing button.
 function _markersPauseButton(job) {
     if (!_hasOwnRunner(job) || job.status !== 'running') return '';
+    if (job.config && job.config.is_retry_chain
+        && ['scheduled', 'queued_for_slot', 'running'].includes(job.config.last_outcome)) return '';
     const jid = escapeHtml(job.id);
     if (job.paused) {
         return `<button class="btn btn-outline-success" onclick="resumeJob('${jid}')" title="Resume this job" aria-label="Resume job">
@@ -2123,7 +2169,8 @@ function updateJobQueue(force) {
         // countdown is visible).
         const _scheduledAtPre = job.config && job.config.scheduled_at;
         const _retryEtaPre = job.progress && job.progress.retry_eta;
-        const _inWorkerRetryWaitPre = !!_retryEtaPre && new Date(_retryEtaPre).getTime() > Date.now() - 1500;
+        const _inWorkerRetryWaitPre = ['pending', 'running'].includes(job.status)
+            && !!_retryEtaPre && new Date(_retryEtaPre).getTime() > Date.now() - 1500;
         const _isRetryRowPre = !!(job.config && (job.config.is_retry || job.config.is_retry_chain));
         const isWaitingRetryRow =
             (job.status === 'pending' && _isRetryRowPre && _scheduledAtPre) || _inWorkerRetryWaitPre;
@@ -2158,7 +2205,7 @@ function updateJobQueue(force) {
             // map to different upstream actions, even though both feel
             // like "do it now" from the user's seat.
             const fireWebhookBtn = isWaitingWebhookRow
-                ? `<button class="btn btn-outline-warning" onclick="fireWebhookNow('${escapeHtml(job.id)}')" title="Skip the webhook debounce — dispatch now" aria-label="Fire webhook now">
+                ? `<button class="btn btn-outline-warning" onclick="fireWebhookNow('${escapeHtml(job.id)}')" title="Skip the webhook wait — dispatch now" aria-label="Fire webhook now">
                     <i class="bi bi-lightning-fill"></i>
                 </button>`
                 : '';
@@ -2760,7 +2807,7 @@ function updateWorkerStatuses(workers, options = {}) {
         const prev = _fallbackStateByWorker.get(w.worker_id) || false;
         const now = !!w.fallback_active;
         if (now && !prev) {
-            const title = w.current_title || 'this file';
+            const title = w.fallback_title || w.current_title || 'this file';
             const reason = w.fallback_reason || 'GPU processing failed';
             showToast(
                 'Switched to CPU',
@@ -3050,8 +3097,9 @@ function showNotification(title, body, type = 'info') {
 // Action Functions
 function showNewJobModal() {
     document.getElementById('jobLibraryAll').checked = true;
+    MediaScanFilters.reset('job');
     const sortByEl = document.getElementById('jobSortBy');
-    if (sortByEl) sortByEl.value = '';
+    if (sortByEl) sortByEl.value = 'default';
     // Back to Previews; the priority is only reset when the last open left it on the Intro & Credits default.
     const wasOwnRunner = _jobKindIsMarkers() || _jobKindIsLoudness();
     const previewsKind = document.getElementById('jobKindPreviews');
@@ -3134,7 +3182,8 @@ function _renderJobLibraryList(libs) {
                 <input class="form-check-input job-library-checkbox" type="checkbox"
                        value="${lib.id}" id="jobLib_${lib.id}"
                        data-server-id="${escapeHtml(lib.server_id || '')}"
-                       data-server-name="${escapeHtml(lib.server_name || '')}" disabled>
+                       data-server-name="${escapeHtml(lib.server_name || '')}"
+                       data-library-kind="${escapeHtml(lib.type || lib.kind || '')}" disabled>
                 <label class="form-check-label" for="jobLib_${lib.id}">
                     ${escapeHtml(lib.name)} <span class="text-muted small">(${libraryTypeLabel(lib)})</span>
                 </label>
@@ -3158,6 +3207,7 @@ function _renderJobLibraryList(libs) {
 // ``_infer_server_from_library_ids`` is a refusing fallback for clients
 // that don't send server_id (see issue #244).
 function _updateJobScopeBadge() {
+    MediaScanFilters.refresh('job');
     const badge = document.getElementById('jobScopeBadge');
     if (!badge) return;
 
@@ -3440,7 +3490,9 @@ async function startNewJob() {
     const sortByEl = document.getElementById('jobSortBy');
     const sortBy = sortByEl ? sortByEl.value : '';
 
-    const jobConfig = { force_generate: forceRegenerate };
+    const scanFilters = MediaScanFilters.read('job');
+    if (scanFilters === null) return;
+    const jobConfig = { force_generate: forceRegenerate, ...scanFilters };
     if (sortBy) {
         jobConfig.sort_by = sortBy;
     }
@@ -4010,7 +4062,7 @@ function _buildOutcomeTooltip(outcome) {
     // D14 — pull labels from the unified STATUS_META so the tooltip
     // matches the file-outcome chip and the per-server pill.
     var keys = ['generated', 'skipped_bif_exists', 'skipped_not_indexed',
-                'markers_published', 'markers_up_to_date', 'markers_needs_review', 'markers_waiting',
+                'markers_published', 'markers_up_to_date', 'markers_waiting',
                 'markers_skipped', 'markers_none', 'markers_no_owners',
                 'skipped_file_not_found', 'skipped_source_gone', 'skipped_excluded',
                 'skipped_invalid_hash', 'failed', 'no_media_parts'];

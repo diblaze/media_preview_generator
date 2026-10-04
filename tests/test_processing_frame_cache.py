@@ -5,12 +5,14 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from media_preview_generator.bif_reader import read_bif_metadata
+from media_preview_generator.output.plex_hash import get_source_fingerprint
 from media_preview_generator.processing.frame_cache import (
     FrameCache,
     get_frame_cache,
@@ -162,57 +164,58 @@ class TestCacheValidity:
         media.unlink()
         assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
 
-    def test_sub_second_mtime_drift_still_hits(self, tmp_path):
-        """A 0.5s mtime drift counts as the SAME file — within the 1.0s
-        tolerance window in :meth:`get`.
-
-        Why this matters: NFS, SMB, and FAT filesystems all round mtime
-        to whole seconds. Without the ``> 1.0`` slack at frame_cache.py
-        line ~177, every NFS-backed library would see false invalidations
-        whenever any non-rounded code path touched the file. A regression
-        tightening the comparison to strict equality would silently
-        thrash the cache for the whole NFS user base.
-        """
+    @pytest.mark.parametrize("change", ["replace_preserving_mtime", "grow_preserving_mtime", "sub_second_mtime"])
+    def test_source_changes_invalidate_even_with_matching_or_similar_mtime(self, tmp_path, change):
         cache = FrameCache(tmp_path / "cache")
-        media = tmp_path / "nfs_like.mkv"
+        media = tmp_path / "media.mkv"
         media.write_bytes(b"x")
         slot = cache.frame_dir_for(str(media))
         _populate_real_jpgs(slot, count=1)
-
-        # Put with the actual mtime, then nudge the cached mtime by 0.5s
-        # to simulate the cross-filesystem drift the tolerance protects.
         cache.put(str(media), frame_dir=slot, frame_count=1, extraction_key=_EXTRACTION_KEY)
-        key = list(cache._entries.keys())[0]
-        original = cache._entries[key]
-        cache._entries[key] = type(original)(
-            canonical_path=original.canonical_path,
-            frame_dir=original.frame_dir,
-            frame_count=original.frame_count,
-            source_mtime=original.source_mtime - 0.5,  # 0.5s off — within tolerance
-            cached_at=original.cached_at,
-            extraction_key=original.extraction_key,
-        )
+        before = media.stat()
 
-        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is not None, (
-            "0.5s mtime drift should be tolerated — NFS rounding would otherwise thrash the cache"
-        )
+        if change == "replace_preserving_mtime":
+            replacement = tmp_path / "replacement.mkv"
+            replacement.write_bytes(b"y")
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.replace(replacement, media)
+        elif change == "grow_preserving_mtime":
+            media.write_bytes(b"larger source")
+            os.utime(media, ns=(before.st_atime_ns, before.st_mtime_ns))
+        else:
+            os.utime(media, ns=(before.st_atime_ns, before.st_mtime_ns + 500_000_000))
 
-        # And confirm the boundary: a 1.5s drift IS treated as a real change.
-        cache._entries[key] = type(original)(
-            canonical_path=original.canonical_path,
-            frame_dir=original.frame_dir,
-            frame_count=original.frame_count,
-            source_mtime=original.source_mtime - 1.5,  # past tolerance
-            cached_at=original.cached_at,
-            extraction_key=original.extraction_key,
-        )
-        # Re-populate slot since the previous get() may have evicted it
-        # (it shouldn't have, but be defensive — the boundary check is
-        # the assertion that matters).
+        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
+        assert not slot.exists()
+
+    def test_old_entry_without_fingerprint_is_not_reused(self, tmp_path):
+        cache = FrameCache(tmp_path / "cache")
+        media = tmp_path / "media.mkv"
+        media.write_bytes(b"x")
+        slot = cache.frame_dir_for(str(media))
         _populate_real_jpgs(slot, count=1)
-        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None, (
-            "1.5s drift should be treated as a real source change"
+        entry = cache.put(str(media), frame_dir=slot, frame_count=1, extraction_key=_EXTRACTION_KEY)
+        cache._entries[cache._key(str(media))] = replace(entry, source_fingerprint=None)
+
+        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
+
+    def test_put_preserves_extraction_fingerprint_when_source_was_replaced(self, tmp_path):
+        cache = FrameCache(tmp_path / "cache")
+        media = tmp_path / "media.mkv"
+        media.write_bytes(b"x")
+        expected = get_source_fingerprint(media)
+        slot = cache.frame_dir_for(str(media))
+        _populate_real_jpgs(slot, count=1)
+        replacement = tmp_path / "replacement.mkv"
+        replacement.write_bytes(b"y")
+        os.replace(replacement, media)
+
+        entry = cache.put(
+            str(media), frame_dir=slot, frame_count=1, extraction_key=_EXTRACTION_KEY, source_fingerprint=expected
         )
+
+        assert entry.source_fingerprint == expected
+        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
 
 
 class TestExtractionSettings:
@@ -451,6 +454,90 @@ class TestLruEviction:
                 "thread B blocked even though it asked for a different path — locks aren't per-path"
             )
             tb.join(timeout=2)
+
+
+def _store_frames(cache: FrameCache, media: Path, *, frame_bytes: int = 3) -> Path:
+    """Extract "frames" for ``media`` into its slot and record them, as the dispatcher does."""
+    media.write_bytes(b"x")
+    slot = cache.frame_dir_for(str(media))
+    slot.mkdir(parents=True, exist_ok=True)
+    (slot / "0000000000.jpg").write_bytes(b"\xff" * frame_bytes)
+    cache.put(str(media), frame_dir=slot, frame_count=1, extraction_key=_EXTRACTION_KEY)
+    return slot
+
+
+class TestCapEvictionSparesSlotsInUse:
+    """A dispatcher holds a slot's generation lock while it writes or publishes from it; the caps must not delete it.
+
+    Both caps (entry count, disk bytes) pick the oldest entries first, so a slot still being published from — or an
+    old entry a regenerate is re-extracting into — is exactly what they would reach for.
+    """
+
+    def test_entry_cap_skips_the_slot_in_use_and_evicts_the_next_oldest(self, tmp_path):
+        cache = FrameCache(tmp_path / "cache", max_entries=2)
+        in_use = tmp_path / "in_use.mkv"
+        in_use_slot = _store_frames(cache, in_use)
+        idle_slot = _store_frames(cache, tmp_path / "idle.mkv")
+
+        publishing = cache.generation_lock(str(in_use))
+        publishing.acquire()
+        try:
+            newest_slot = _store_frames(cache, tmp_path / "newest.mkv")
+
+            assert (in_use_slot / "0000000000.jpg").is_file()
+            assert not idle_slot.exists(), "the oldest slot nobody is using goes instead"
+            assert newest_slot.is_dir()
+            assert len(cache) == 2
+        finally:
+            publishing.release()
+        assert publishing.acquire(blocking=False), "eviction must release every lock it took"
+
+    def test_disk_cap_skips_the_slot_in_use_and_evicts_the_next_oldest(self, tmp_path):
+        cache = FrameCache(tmp_path / "cache", max_disk_mb=1)
+        cache._max_disk_bytes = 250  # room for two 100-byte slots, not three
+        in_use = tmp_path / "in_use.mkv"
+        in_use_slot = _store_frames(cache, in_use, frame_bytes=100)
+        idle_slot = _store_frames(cache, tmp_path / "idle.mkv", frame_bytes=100)
+
+        publishing = cache.generation_lock(str(in_use))
+        publishing.acquire()
+        try:
+            newest_slot = _store_frames(cache, tmp_path / "newest.mkv", frame_bytes=100)
+
+            assert (in_use_slot / "0000000000.jpg").is_file()
+            assert not idle_slot.exists(), "the oldest slot nobody is using goes instead"
+            assert newest_slot.is_dir()
+            assert len(cache) == 2
+        finally:
+            publishing.release()
+        assert publishing.acquire(blocking=False), "eviction must release every lock it took"
+
+    @pytest.mark.parametrize("cap", ["entries", "disk"])
+    def test_cap_is_exceeded_rather_than_deleting_slots_in_use_then_enforced_once_they_are_free(self, tmp_path, cap):
+        cache = FrameCache(tmp_path / "cache", max_entries=1 if cap == "entries" else 1024, max_disk_mb=1)
+        if cap == "disk":
+            cache._max_disk_bytes = 150  # room for one 100-byte slot
+        first, second = tmp_path / "first.mkv", tmp_path / "second.mkv"
+        first_slot = _store_frames(cache, first, frame_bytes=100)
+        first_lock = cache.generation_lock(str(first))
+        first_lock.acquire()
+        second_lock = cache.generation_lock(str(second))
+        second_lock.acquire()  # held across put, as the dispatcher does
+        try:
+            second_slot = _store_frames(cache, second, frame_bytes=100)
+            assert (first_slot / "0000000000.jpg").is_file()
+            assert second_slot.is_dir()
+            assert len(cache) == 2, "over the cap while both slots are in use"
+        finally:
+            first_lock.release()
+            second_lock.release()
+
+        third_slot = _store_frames(cache, tmp_path / "third.mkv", frame_bytes=100)
+
+        assert not first_slot.exists()
+        assert not second_slot.exists()
+        assert third_slot.is_dir()
+        assert len(cache) == 1
 
 
 class TestSingletonAccessor:
@@ -790,6 +877,7 @@ class TestConfigurableFrameReuse:
             source_mtime=old_entry.source_mtime,
             cached_at=time.time() - (45 * 60),
             extraction_key=old_entry.extraction_key,
+            source_fingerprint=old_entry.source_fingerprint,
         )
 
         # 45 min < 60 min default TTL → still a hit.

@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from loguru import logger
 
 from ..servers import (
@@ -47,7 +47,7 @@ from ..servers import (
 )
 from ..servers.ownership import apply_path_mappings
 from .settings_manager import get_settings_manager
-from .webhooks import _authenticate_webhook, create_vendor_webhook_job, webhooks_bp
+from .webhooks import _authenticate_webhook, _validate_webhook_delay, create_vendor_webhook_job, webhooks_bp
 
 
 def _build_registry_from_settings() -> ServerRegistry:
@@ -362,6 +362,7 @@ def _webhooks_disabled_response(kind: str) -> tuple[Response, int] | None:
 
 @webhooks_bp.route("/incoming", methods=["POST"])
 @_authenticate_webhook
+@_validate_webhook_delay
 def webhook_incoming():
     """Universal webhook entry point with auto-detected vendor routing.
 
@@ -414,6 +415,8 @@ def webhook_incoming():
     disabled = _webhooks_disabled_response(kind)
     if disabled is not None:
         return disabled
+    if str(payload.get("eventType", "")).lower() == "test":
+        return jsonify({"status": "ignored", "kind": kind, "reason": "Test event"}), 202
 
     registry = _build_registry_from_settings()
     resolved, error = _resolve_to_canonical_paths(
@@ -437,11 +440,12 @@ def webhook_incoming():
         len(resolved),
         [c for c, _ in resolved],
     )
-    return _dispatch_resolved(resolved, kind=kind, regenerate=_extract_regenerate_flag(payload))
+    return _dispatch_resolved(resolved, kind=kind, regenerate=_extract_regenerate_flag(payload), delay=g.webhook_delay)
 
 
 @webhooks_bp.route("/server/<server_id>", methods=["POST"])
 @_authenticate_webhook
+@_validate_webhook_delay
 def webhook_per_server(server_id: str):
     """Per-server URL — disambiguates the source AND pins dispatch.
 
@@ -483,6 +487,8 @@ def webhook_per_server(server_id: str):
             server_id,
         )
         return jsonify({"status": "ignored", "reason": "server is disabled"}), 202
+    if str(payload.get("eventType", "")).lower() == "test":
+        return jsonify({"status": "ignored", "kind": kind, "reason": "Test event"}), 202
 
     resolved, error = _resolve_to_canonical_paths(
         kind=kind,
@@ -498,6 +504,7 @@ def webhook_per_server(server_id: str):
         kind=kind,
         server_id_filter=server_id,
         regenerate=_extract_regenerate_flag(payload),
+        delay=g.webhook_delay,
     )
 
 
@@ -529,6 +536,7 @@ def _dispatch_resolved(
     kind: str,
     server_id_filter: str | None = None,
     regenerate: bool = False,
+    delay: int | None = None,
 ):
     """Dispatch one-or-more resolved (path, hints) pairs.
 
@@ -540,11 +548,13 @@ def _dispatch_resolved(
     if len(resolved) == 1:
         canonical, hints = resolved[0]
         return _dispatch_canonical_path(
-            canonical, hints, kind=kind, server_id_filter=server_id_filter, regenerate=regenerate
+            canonical, hints, kind=kind, server_id_filter=server_id_filter, regenerate=regenerate, delay=delay
         )
 
     jobs = [
-        _create_webhook_job(canonical, hints, kind=kind, server_id_filter=server_id_filter, regenerate=regenerate)
+        _create_webhook_job(
+            canonical, hints, kind=kind, server_id_filter=server_id_filter, regenerate=regenerate, delay=delay
+        )
         for canonical, hints in resolved
     ]
     queued = [j for j in jobs if j.get("status") == "queued"]
@@ -569,6 +579,7 @@ def _create_webhook_job(
     kind: str,
     server_id_filter: str | None = None,
     regenerate: bool = False,
+    delay: int | None = None,
 ) -> dict[str, Any]:
     """Create one vendor-webhook Job and return a result dict (no Flask response).
 
@@ -584,6 +595,7 @@ def _create_webhook_job(
         server_id=owner_sid,
         server_id_filter=server_id_filter,
         regenerate=regenerate,
+        delay=delay,
     )
     if job_id is None:
         return {
@@ -608,6 +620,7 @@ def _dispatch_canonical_path(
     kind: str,
     server_id_filter: str | None = None,
     regenerate: bool = False,
+    delay: int | None = None,
 ):
     """Create a Job for this vendor webhook and return ``{job_id, status}``.
 
@@ -635,6 +648,7 @@ def _dispatch_canonical_path(
         kind=kind,
         server_id_filter=server_id_filter,
         regenerate=regenerate,
+        delay=delay,
     )
     return (
         jsonify(result),

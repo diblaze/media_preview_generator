@@ -1062,7 +1062,8 @@ function _renderChainStateChip(chainId) {
     const _tplId = (typeof _pickRetryInfoTpl === 'function')
         ? _pickRetryInfoTpl(job)
         : 'infoRetryChainJellyfinTpl';
-    const _infoIcon = ' <button type="button" class="info-icon btn btn-link p-0 ms-1 align-baseline"'
+    const isLoudness = job.kind === 'loudness';
+    const _infoIcon = isLoudness ? '' : ' <button type="button" class="info-icon btn btn-link p-0 ms-1 align-baseline"'
         + ' data-explain-template="' + _tplId + '"'
         + ' data-explain-title="Why this file is auto-retrying"'
         + ' title="Why this file is being tried again."'
@@ -1070,8 +1071,11 @@ function _renderChainStateChip(chainId) {
         + ' style="color: inherit;">'
         + '<i class="bi bi-info-circle"></i></button>';
     if (status === 'completed') {
-        chip.classList.add('bg-success');
-        _setChainChipHtml(chip, '<i class="bi bi-check2-circle me-1"></i>Chain completed' + _infoIcon);
+        const hasWarning = isLoudness && !!job.error;
+        chip.classList.add(hasWarning ? 'bg-warning' : 'bg-success');
+        if (hasWarning) chip.classList.add('text-dark');
+        _setChainChipHtml(chip, '<i class="bi bi-check2-circle me-1"></i>'
+            + (hasWarning ? 'Completed with warnings' : 'Chain completed') + _infoIcon);
     } else if (status === 'failed') {
         chip.classList.add('bg-danger');
         _setChainChipHtml(chip, '<i class="bi bi-exclamation-circle me-1"></i>Chain failed' + _infoIcon);
@@ -1089,7 +1093,7 @@ function _renderChainStateChip(chainId) {
         const tick = () => {
             const remaining = Math.max(0, Math.ceil((new Date(retryEta).getTime() - Date.now()) / 1000));
             const label = _formatRetryRemaining(remaining);
-            const ofMax = (attempt && max) ? ` (attempt ${attempt + 1}/${max})` : '';
+            const ofMax = (attempt && max) ? ` (attempt ${isLoudness ? attempt : attempt + 1}/${max})` : '';
             _setChainChipHtml(chip, `<i class="bi bi-hourglass-split me-1"></i>Next attempt in ${label}${ofMax}${_infoIcon}`);
             if (remaining === 0) {
                 clearInterval(_chainStateTickInterval);
@@ -1586,8 +1590,8 @@ function renderFileResultsTable(files) {
         // multi-server fan-out it's one per target.
         var serversHtml = _renderFileServerPills(f.servers || [], showServerStatus);
         // Every row whose file is a full path opens the Inspector on that file: its preview frames and its intro
-        // & credits on one page, so a preview job's rows and an Intro & Credits job's rows (the Needs review filter
-        // included) both link there. A row without a full path but with a BIF opens just that preview's frames.
+        // & credits on one page, so a preview job's rows and an Intro & Credits job's rows both link there. A row
+        // without a full path but with a BIF opens just that preview's frames.
         //
         // The button sits in a flex row with `flex-shrink-0` so a long file name truncates around it instead of
         // pushing it off-screen (Bootstrap text-truncate sets white-space:nowrap + overflow: hidden).
@@ -1628,6 +1632,28 @@ function renderFileResultsTable(files) {
 function _renderFileServerNotes(servers, showMessages) {
     return servers.map(function (s) {
         if (!s) return '';
+        var artifacts = s.artifacts || {};
+        if (artifacts.chapters) {
+            var chapter = artifacts.chapters;
+            var bifStatus = (artifacts.bif || {}).status;
+            var bifReady = bifStatus === 'published' || bifStatus === 'skipped_output_exists';
+            var labels = { ready: 'ready', pending: 'pending', failed: 'failed', none: 'no chapters' };
+            var chapterText = labels[chapter.status] || 'checking';
+            if (Number.isFinite(chapter.total) && chapter.total > 0 && Number.isFinite(chapter.completed)) {
+                chapterText += ' (' + Math.max(0, Math.floor(chapter.completed))
+                    + '/' + Math.floor(chapter.total) + ')';
+            }
+            var artifactText = (s.name || 'Server') + ': Scrubber: '
+                + (bifReady ? 'ready' : (_fileOutcomeMeta(bifStatus).label || 'pending'))
+                + '; Chapters: ' + chapterText;
+            if (chapter.message && (chapter.status === 'pending' || chapter.status === 'failed')) {
+                artifactText += ' — ' + chapter.message;
+            }
+            var artifactCls = chapter.status === 'pending' || chapter.status === 'failed'
+                ? 'text-warning-emphasis' : 'text-muted';
+            return '<div class="small chapter-server-note ' + artifactCls + '">'
+                + escapeHtml(artifactText) + '</div>';
+        }
         var text;
         var cls = 'text-muted';
         if (s.reason_code === MARKERS_NOT_IN_LIBRARY) {

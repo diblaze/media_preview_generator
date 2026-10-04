@@ -277,6 +277,8 @@ def _validate_plex_output(output: dict) -> str:
     """
     if not isinstance(output, dict):
         return "output must be an object"
+    if "chapter_thumbnails" in output and not isinstance(output["chapter_thumbnails"], bool):
+        return "output.chapter_thumbnails must be a boolean"
     folder = str(output.get("plex_config_folder") or "").strip()
     if not folder:
         return ""  # caller may save without populating output yet
@@ -453,18 +455,28 @@ def _validate_server_payload(
     loudness_block = None
     if type_value == "plex":
         stored_loudness = base.get("loudness")
+        library_kinds = {str(lib.get("id")): lib.get("kind") for lib in libraries or [] if isinstance(lib, dict)}
         if "loudness" in data:
             # Patch semantics like markers: a field the client leaves out keeps its stored value.
             posted = data.get("loudness")
             both_dicts = isinstance(stored_loudness, dict) and isinstance(posted, dict)
             loudness_block, err = validate_server_loudness(
-                {**stored_loudness, **posted} if both_dicts else posted, type_value, markers_block
+                {**stored_loudness, **posted} if both_dicts else posted,
+                type_value,
+                markers_block,
+                library_kinds=library_kinds,
             )
             if err:
                 return None, err
         elif isinstance(stored_loudness, dict):
-            # Carried forward unvalidated, like markers: readers fall back to off for a block that no longer validates.
             loudness_block = copy.deepcopy(stored_loudness)
+            if "markers" in data or "libraries" in data:
+                # The shared helper can change without posting loudness; do not save an unsupported combination.
+                loudness_block, err = validate_server_loudness(
+                    loudness_block, type_value, markers_block, library_kinds=library_kinds
+                )
+                if err:
+                    return None, err
         else:
             loudness_block = default_server_loudness()
 
@@ -1977,9 +1989,7 @@ def get_output_status(server_id: str):
     if adapter is None:
         return jsonify({"error": f"no adapter wired for server type {cfg.type.value}"}), 400
 
-    # Most adapters need only the canonical path to compute outputs;
-    # Plex needs an item_id (bundle hash). The endpoint accepts an
-    # optional item_id query param for that case.
+    # Output paths are local. Only off-media Jellyfin requires an item ID.
     from ...output import BifBundle
 
     bundle = BifBundle(
@@ -1993,60 +2003,26 @@ def get_output_status(server_id: str):
     )
     item_id = request.args.get("item_id") or None
 
-    if cfg.type is ServerType.PLEX:
-        # Plex: we need the live server to compute the bundle path.
-        # Without an item_id we can't go further; report the limitation.
-        if not item_id:
-            return jsonify(
-                {
-                    "server_id": server_id,
-                    "server_type": cfg.type.value,
-                    "adapter": adapter.name,
-                    "paths": [],
-                    "exists": False,
-                    "missing_paths": [],
-                    "needs_item_id": True,
-                    "message": (
-                        "Plex bundle adapter requires an item_id query param to look up the per-item bundle hash."
-                    ),
-                }
-            )
-        # Build a live PlexServer to query the bundle hash.
-        try:
-            from ...config import load_config
-
-            registry = ServerRegistry.from_settings(raw_servers, legacy_config=load_config())
-            live = registry.get(server_id)
-            if live is None:
-                return jsonify({"error": "could not instantiate Plex server"}), 500
-            paths = adapter.compute_output_paths(bundle, live, item_id)
-        except Exception as exc:
-            return jsonify({"error": f"compute_output_paths failed: {exc}"}), 502
-    else:
-        # Emby / Jellyfin: pure path computation. Jellyfin's adapter
-        # advertises needs_server_metadata=True because it requires an
-        # item_id, but it doesn't need a live server — the item_id
-        # comes from the query string. Pass server=None.
-        try:
-            paths = adapter.compute_output_paths(bundle, server=None, item_id=item_id)
-        except ValueError as exc:
-            # Adapter rejected — typically means item_id was missing for
-            # an adapter that requires it. Surface the reason in the
-            # response shape so the UI can prompt the user.
-            return jsonify(
-                {
-                    "server_id": server_id,
-                    "server_type": cfg.type.value,
-                    "adapter": adapter.name,
-                    "paths": [],
-                    "exists": False,
-                    "missing_paths": [],
-                    "needs_item_id": "item_id" in str(exc).lower(),
-                    "message": str(exc),
-                }
-            )
-        except Exception as exc:
-            return jsonify({"error": f"compute_output_paths failed: {exc}"}), 400
+    try:
+        paths = adapter.compute_output_paths(bundle, server=None, item_id=item_id)
+    except ValueError as exc:
+        # Adapter rejected — typically means item_id was missing for
+        # an adapter that requires it. Surface the reason in the
+        # response shape so the UI can prompt the user.
+        return jsonify(
+            {
+                "server_id": server_id,
+                "server_type": cfg.type.value,
+                "adapter": adapter.name,
+                "paths": [],
+                "exists": False,
+                "missing_paths": [],
+                "needs_item_id": "item_id" in str(exc).lower(),
+                "message": str(exc),
+            }
+        )
+    except Exception as exc:
+        return jsonify({"error": f"compute_output_paths failed: {exc}"}), 400
 
     str_paths = [str(p) for p in paths]
     missing = [str(p) for p in paths if not p.exists()]

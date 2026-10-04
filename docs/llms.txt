@@ -28,7 +28,7 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 2. **Resolve.** Each path is mapped to what the container sees, then every configured server whose enabled libraries hold the file is found.
 3. **Extract.** One FFmpeg run per file on a GPU worker: hardware decode, key-frame-only decoding when the file allows it, GPU scaling, HDR-to-SDR tone mapping. If the GPU can't decode the file, the same worker retries on the CPU.
 4. **Publish.** Plex: `index-sd.bif` in Plex's data folder. Emby: `<video>-<width>-<interval>.bif` next to the video. Jellyfin 10.10+: trickplay tiles next to the video, or in Jellyfin's data folder with the companion plugin. Each server is then asked to pick them up.
-5. **Retry and skip.** A server that hasn't indexed a new file yet is retried after 1, 2 and 5 minutes by default. A small companion file records each source's size and date, so later triggers skip current previews and redo replaced files.
+5. **Retry and skip.** A server that hasn't indexed a new file yet is retried after 1, 2, 5, 15 and 60 minutes by default. A small companion file records each source's size and date, so later triggers skip current previews and redo replaced files.
 
 ## Key facts
 
@@ -53,7 +53,7 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 - [Previews on Sonarr or Radarr import](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/): webhooks, the 60 s quiet period, retries
 - [HDR and Dolby Vision previews](https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/): tone mapping and the Profile 5 caveat
 - [Skip Intro and Skip Credits](https://mediapreviewgenerator.dev/skip-intro-credits/): what each server needs, how intros and credits are found, Needs review, limits
-- [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/): Plex's loudness analysis on this app's workers, for Normalize Loudness
+- [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/): Audio loudness analysis on this app's workers for local Plex 1.43.4.x; independent opt-in and scoped undo
 - [Guides and troubleshooting](https://mediapreviewgenerator.dev/guides/): web UI, webhooks, schedules, HDR, CPU fallback
 - [Setup Health](https://mediapreviewgenerator.dev/guides/previews-readiness/): every server setting that decides whether previews show up
 - [Multi-server](https://mediapreviewgenerator.dev/multi-server/): output formats, webhook routing, retries, the Jellyfin plugin

@@ -62,6 +62,13 @@
                     </div>
                 </div>
 
+                <p class="small text-muted mb-3">
+                    Every webhook URL supports <code>delay=1</code> through <code>delay=3600</code> (seconds).
+                    Append <code>&amp;delay=30</code> to a URL with a token, or <code>?delay=30</code> to a bare URL.
+                    Omit it to use <strong>Delay before processing</strong> below.
+                    Universal and per-server URLs now wait too, with a separate timer for each file version.
+                </p>
+
                 <div class="upgrade-caveat">
                     <strong><i class="bi bi-exclamation-triangle me-1"></i>Note about file upgrades:</strong>
                     The server-side webhook options (Plex Direct + Recently Added Scanner; Emby Webhooks; Jellyfin's Webhook plugin) only fire on <em>brand-new</em> library items. When Sonarr or Radarr <em>upgrades</em> an existing file in place, the media server keeps the same library item and the new file isn't seen as "added", so the server-side webhooks don't fire. Use the Sonarr/Radarr <strong>"On Upgrade"</strong> webhook event for those replacements &mdash; it works regardless of which media server you use.
@@ -94,6 +101,14 @@
                         Use this when the same library exists on more than one server (e.g. both Plex and Emby
                         have <em>Movies</em>) and you want this webhook to publish previews to one specific server only.
                     </div>
+                </div>
+
+                <div class="form-text mb-3">
+                    <strong>Different delays for each app:</strong> append <code>?delay=30</code> to the Radarr URL
+                    or <code>?delay=300</code> to the Sonarr URL after copying it.
+                    If the URL already contains <code>?</code>, use <code>&amp;delay=30</code> instead.
+                    Set 1–3600 seconds (up to one hour) after the latest new file, subject to the batch age limit below.
+                    Omit it to use the default delay below.
                 </div>
 
                 <ul class="nav nav-tabs mb-3" role="tablist">
@@ -217,6 +232,8 @@
                     <a href="#section-webhooks-sonarr-radarr">Publish to which server?</a>
                     picker in the <em>arr apps</em> section above — it appends
                     <code>?server_id=&lt;id&gt;</code> to every URL on this tab.
+                    You can also set a delay with <code>?delay=30</code> (or <code>&amp;delay=30</code>
+                    if the URL already contains <code>?</code>); omit it to use the default below.
                 </div>
 
                 <h6 class="small text-muted">Payload — single file</h6>
@@ -313,27 +330,36 @@
                         Delay before processing: <strong><span id="delayValue">60</span>s</strong>
                         <button type="button" class="info-icon info-icon-more ms-1" tabindex="0"
                                 data-bs-toggle="tooltip" data-bs-placement="top"
-                                title="How long to wait for more imports before processing them as one batch."
-                                data-explain-title="Webhook batching delay"
+                                title="Initial wait for every webhook URL; source-specific URLs batch imports during this wait."
+                                data-explain-title="Webhook processing delay"
                                 data-explain-template="infoBatchDelayTpl"
-                                aria-label="Explain batching delay">
+                                aria-label="Explain processing delay">
                             <i class="bi bi-info-circle"></i>
                         </button>
                     </label>
                     <input type="range" class="form-range" id="webhookDelay" min="10" max="300" step="10" value="60">
                     <div class="form-text">
-                        Imports are queued and processed in batches once this much time passes without new imports.
+                        Default initial wait for all webhook URLs. A URL's <code>delay</code> parameter overrides this value.
+                        Source-specific URLs restart the batch wait when a new file arrives.
                     </div>
                 </div>
 
                 <!-- Inline <template> for the batching-delay ⓘ modal. Rendered
                      into the shared #globalInfoModal via data-explain-template. -->
                 <template id="infoBatchDelayTpl">
-                    <p><strong>What it does:</strong> when a webhook arrives, this app
-                    doesn't process the file immediately — it waits this many seconds.
-                    If another webhook arrives during the wait, its file joins the same
-                    batch AND the timer restarts from zero. Processing only begins
-                    once the timer ticks all the way down with no new webhooks.</p>
+                    <p><strong>What it does:</strong> every webhook URL waits before processing.
+                    Universal and per-server URLs keep a separate timer for each file version.
+                    On the source-specific Radarr, Sonarr, Sportarr, Custom, and legacy Plex URLs,
+                    imports from the same app and server selection share a batch. Each new file restarts the timer
+                    using that request's <code>delay</code> parameter, or the default
+                    above when omitted. The batch is ready when the timer expires;
+                    processing still honors pause and worker availability.</p>
+
+                    <p><strong>Batch age limit:</strong> to keep a steady stream of
+                    imports moving, a batch becomes ready at most ten minutes after
+                    its first file. A longer delay extends that limit to the longest
+                    delay accepted into the batch, up to one hour. Files joining near
+                    the limit can receive less than their full delay.</p>
 
                     <p><strong>Why the wait exists:</strong> Sonarr / Radarr / Tdarr
                     fire webhooks the moment they finish writing a file, but your
@@ -343,11 +369,11 @@
                     lets the media server catch up, so the first attempt succeeds.</p>
 
                     <p><strong>Why the timer restarts:</strong> Sonarr imports a
-                    whole season in a burst — 10 webhooks in 5 seconds. Without the
-                    restart, this app would kick off processing 30 seconds after the
-                    FIRST webhook arrived, missing episodes 9 and 10 that came in
-                    during that window. Restarting the timer means the whole season
-                    ends up in one batch, which is both correct and more efficient.</p>
+                    whole season in a burst. Restarting the timer lets later episodes
+                    join the batch and gives the last arrival time to be indexed.
+                    With <code>delay=300</code> on the Sonarr URL, the batch becomes
+                    ready five minutes after the latest new episode, or when its
+                    age limit is reached.</p>
 
                     <p><strong>Tuning guidance:</strong></p>
                     <ul>
@@ -362,11 +388,9 @@
                             after a Sonarr/Radarr import.</li>
                     </ul>
 
-                    <p><strong>Race with retries:</strong> if the file IS still
-                    indexing when the batch runs, the app's slow-backoff retry
-                    queue takes over — so there's no data loss at any setting.
-                    Lower values just mean more retries; higher values mean fewer
-                    retries but longer time-to-visible.</p>
+                    <p><strong>Retries:</strong> if a file is still indexing when
+                    the batch runs, the app uses its retry policy. The initial
+                    batching delay does not change the wait between retries.</p>
                 </template>
 
                 <div class="mb-3">

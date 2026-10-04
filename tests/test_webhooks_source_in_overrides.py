@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from media_preview_generator.web import webhooks as wh
 from media_preview_generator.web.webhooks import (
     create_vendor_webhook_job,
 )
@@ -68,15 +69,17 @@ def _isolate_settings(tmp_path, monkeypatch):
 def _isolate_jobs(tmp_path):
     import media_preview_generator.web.jobs as jobs_mod
 
+    wh.reset_webhook_debounce()
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
     yield
+    wh.reset_webhook_debounce()
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
 
 
 class TestVendorWebhookJobCarriesSourceInOverrides:
-    """``create_vendor_webhook_job`` is the immediate-dispatch path
+    """``create_vendor_webhook_job`` is the delayed vendor-dispatch path
     (Plex / Emby / Jellyfin direct webhook receivers). It must put
     ``source`` in BOTH ``job.config`` (UI badge) AND the overrides
     dict (Config plumbing for retry-chain rows).
@@ -94,6 +97,8 @@ class TestVendorWebhookJobCarriesSourceInOverrides:
                 canonical_path="/data/Movies/Foo (2024)/Foo (2024).mkv",
                 server_id=None,
             )
+            assert job_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
         assert job_id, "Webhook job creation should not be deduped under a fresh state"
         assert captured_overrides, "create_vendor_webhook_job MUST hand the job to _start_job_async"
         last = captured_overrides[-1]
@@ -131,13 +136,8 @@ class TestSchedulesWebhookJobCarriesSourceInOverrides:
 
     @pytest.mark.parametrize("source", ["sonarr", "radarr", "sportarr", "custom"])
     def test_source_appears_in_overrides_for_debounced_dispatch(self, source, captured_overrides):
-        # _schedule_webhook_job uses a debounce timer — for the test we
-        # synchronously fire the batch by patching the timer.
         from media_preview_generator.web import webhooks as wh
 
-        # Monkey-patch the debounce delay to 0 so the batch fires immediately.
-        # _check_and_record_dedup returns None for "fresh" / int age for "duplicate".
-        # Force fresh.
         with (
             patch.object(wh, "_check_and_record_dedup", return_value=None),
             patch("media_preview_generator.web.webhooks.threading.Timer") as TimerMock,
@@ -162,10 +162,8 @@ class TestSchedulesWebhookJobCarriesSourceInOverrides:
             )
             assert queued is True, "Webhook should be queued under a fresh dedup state"
 
-            # Fire the captured timer callback synchronously.
             assert captured_fns, "Timer callback should have been scheduled"
-            fn, fn_args, fn_kwargs = captured_fns[-1]
-            fn(*fn_args, **fn_kwargs)
+            assert wh._fire_pending_batch_now(wh._debounce_key(source))
 
         assert captured_overrides, "_schedule_webhook_job MUST hand the job to _start_job_async"
         last = captured_overrides[-1]
@@ -191,7 +189,7 @@ class TestWebhookJobsUseIncomingPriority:
 
     @staticmethod
     def _fire_debounced(source: str, path: str, before_fire=None) -> None:
-        """Run ``_schedule_webhook_job`` and its debounce callback inline.
+        """Queue a batch and explicitly fire it without waiting for the deadline.
 
         ``before_fire`` runs between the two, i.e. during the window where
         the batch is open but the timer has not yet fired.
@@ -214,8 +212,7 @@ class TestWebhookJobsUseIncomingPriority:
             if before_fire is not None:
                 before_fire()
             assert captured_fns, "Timer callback should have been scheduled"
-            fn, fn_args, fn_kwargs = captured_fns[-1]
-            fn(*fn_args, **fn_kwargs)
+            wh._fire_pending_batch_now(wh._debounce_key(source))
 
     @pytest.mark.parametrize(
         ("configured", "expected"),
@@ -275,16 +272,8 @@ class TestWebhookJobsUseIncomingPriority:
         )
 
     @pytest.mark.parametrize(("configured", "expected"), [(None, 1), (3, 3)])
-    def test_recreated_batch_job_gets_configured_priority(self, configured, expected, captured_overrides):
-        """The third ``create_job`` site: the batch's Job was deleted from
-        the UI before the debounce timer fired, so ``_execute_webhook_job``
-        rebuilds it.
-
-        It is a separate ``create_job`` call from the batch-open one, and
-        the rarely-exercised branch is exactly where a forgotten kwarg
-        survives review. A user who tidies the queue mid-debounce should
-        not silently get a Normal-priority job back.
-        """
+    def test_deleted_batch_job_is_not_recreated_at_any_priority(self, configured, expected, captured_overrides):
+        """Deleting a queued job is final regardless of its incoming priority."""
         from media_preview_generator.web import webhooks as wh
         from media_preview_generator.web.jobs import get_job_manager
         from media_preview_generator.web.settings_manager import get_settings_manager
@@ -295,6 +284,7 @@ class TestWebhookJobsUseIncomingPriority:
         def delete_the_batch_job():
             key = wh._debounce_key("sonarr")
             batch_job_id = wh._pending_batches[key]["job_id"]
+            assert get_job_manager().get_job(batch_job_id).priority == expected
             assert get_job_manager().delete_job(batch_job_id) is True
 
         self._fire_debounced(
@@ -303,12 +293,8 @@ class TestWebhookJobsUseIncomingPriority:
             before_fire=delete_the_batch_job,
         )
 
-        assert captured_overrides, "the recreated job must still be handed to _start_job_async"
-        job = get_job_manager().get_job(captured_overrides[-1]["job_id"])
-        assert job is not None, "the recreate branch must produce a live Job"
-        assert job.priority == expected, (
-            f"recreated batch job must carry incoming_job_priority={configured!r} as {expected}; got {job.priority}"
-        )
+        assert not captured_overrides
+        assert not get_job_manager().get_all_jobs()
 
 
 class TestWebhookJobsUseTheGlobalRetryPolicy:
@@ -316,10 +302,10 @@ class TestWebhookJobsUseTheGlobalRetryPolicy:
     Intro & Credits retries so the bounds can't drift apart."""
 
     CASES = [
-        ({}, (3, 30)),
+        ({}, (5, 30)),
         ({"webhook_retry_count": 5, "webhook_retry_delay": 120}, (5, 120)),
         ({"webhook_retry_count": 99, "webhook_retry_delay": 1}, (10, 10)),
-        ({"webhook_retry_count": "junk", "webhook_retry_delay": "later"}, (3, 30)),  # hand-edited settings.json
+        ({"webhook_retry_count": "junk", "webhook_retry_delay": "later"}, (5, 30)),  # hand-edited settings.json
     ]
     IDS = ["defaults", "in-range", "clamped", "unreadable"]
 
@@ -338,9 +324,11 @@ class TestWebhookJobsUseTheGlobalRetryPolicy:
     def test_vendor_webhook_job(self, values, expected, captured_overrides):
         self._configure(values)
         with patch("media_preview_generator.web.webhooks._check_and_record_dedup", return_value=None):
-            create_vendor_webhook_job(
+            queued_vendor_id = create_vendor_webhook_job(
                 source="jellyfin", title="Test", canonical_path="/data/Movies/Q (2024)/Q (2024).mkv", server_id=None
             )
+            assert queued_vendor_id is not None
+            assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(queued_vendor_id))
         assert self._retry(captured_overrides[-1]["overrides"]) == expected
 
     @pytest.mark.parametrize(("values", "expected"), CASES, ids=IDS)

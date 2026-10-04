@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from collections.abc import Callable
@@ -48,7 +49,12 @@ def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
 
     Returns:
         The argument list.
+
+    Raises:
+        LoudnessError: The stream index is not a nonnegative integer.
     """
+    if type(index) is not int or index < 0:
+        raise LoudnessError("The audio stream index must be a nonnegative integer")
     return [
         ffmpeg,
         "-hide_banner",
@@ -92,7 +98,7 @@ def ln_fields(report: dict[str, str]) -> dict[str, str]:
     """Plex's ``ln:*`` fields from a loudnorm report: its values as printed (two decimals), as Plex stores them.
 
     Raises:
-        LoudnessError: A value is missing or not a finite number (silence reports ``-inf``).
+        LoudnessError: A value is missing or differs from Plex's measured numeric/silence representation.
     """
     fields = {"ln:loudnessAnalysisVersion": ANALYSIS_VERSION}
     for key, name in _FIELDS.items():
@@ -100,10 +106,34 @@ def ln_fields(report: dict[str, str]) -> dict[str, str]:
             value = float(report[key])
         except (KeyError, TypeError, ValueError) as exc:
             raise LoudnessError(f"loudnorm report lacks a usable {key}") from exc
-        if value != value or value in (float("inf"), float("-inf")):
-            raise LoudnessError(f"loudnorm measured no usable {key} ({report[key]}); the stream may be silent")
+        if math.isnan(value):
+            raise LoudnessError(f"loudnorm measured no usable {key}")
         fields[name] = str(report[key])
+    if not valid_measurements(fields):
+        raise LoudnessError("loudnorm reported unsupported loudness measurements")
     return fields
+
+
+def valid_measurements(fields: dict[str, str]) -> bool:
+    """Recognize finite measurements and Plex's verified silent/very-short stream values.
+
+    Plex 1.43.4 stores negative-infinite integrated loudness with positive-infinite
+    gain offset for silence and audio too short for integrated measurement. A
+    silent stream also has negative-infinite peak; its range and threshold stay finite.
+    """
+    try:
+        values = {name: float(fields[name]) for name in _FIELDS.values()}
+    except (KeyError, TypeError, ValueError):
+        return False
+    if all(math.isfinite(value) for value in values.values()):
+        return True
+    return (
+        values["ln:loudness"] == -math.inf
+        and values["ln:gainOffset"] == math.inf
+        and (math.isfinite(values["ln:peak"]) or values["ln:peak"] == -math.inf)
+        and math.isfinite(values["ln:lra"])
+        and math.isfinite(values["ln:threshold"])
+    )
 
 
 def run(
@@ -133,12 +163,21 @@ def run(
     name = os.path.basename(path)
     timeout_s = timeout_for(duration_ms)
     freeze = Freeze.of(pause_check)
-    if freeze.hold(cancel_check=cancel_check, name=name) and cancel_check and cancel_check():
+    if cancel_check and cancel_check():
+        raise LoudnessError(f"Loudness analysis of {name} cancelled")
+    freeze.hold(cancel_check=cancel_check, name=name)
+    if cancel_check and cancel_check():
         raise LoudnessError(f"Loudness analysis of {name} cancelled")
     # Its own session, so a pause stops ffmpeg's whole group and never the app's.
-    proc = subprocess.Popen(
-        command(ffmpeg, path, index, codec), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
-    )
+    try:
+        proc = subprocess.Popen(
+            command(ffmpeg, path, index, codec),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise LoudnessError(f"Could not start ffmpeg analysing {name}: {exc.strerror or type(exc).__name__}") from exc
     deadline = freeze.clock() + timeout_s
     try:
         while True:
@@ -154,6 +193,8 @@ def run(
     except BaseException:
         kill_and_collect(proc, what=f"ffmpeg analysing loudness of {name}", reaper_name=REAPER, wait_s=KILL_WAIT_S)
         raise
+    if cancel_check and cancel_check():
+        raise LoudnessError(f"Loudness analysis of {name} cancelled")
     text = (err or b"").decode("utf-8", errors="replace")
     if proc.returncode != 0:
         raise LoudnessError(f"ffmpeg exited {proc.returncode} analysing {name} stream {index}: {text.strip()[-200:]}")
