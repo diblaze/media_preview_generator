@@ -85,10 +85,18 @@ without changing it or starting a job. The job banner identifies **Plex loudness
 & Credits, and the results refresh when the job finishes.
 
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
-publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item. Setup
-Health shows Plex's own **Analyze audio tracks for loudness** setting and recommends Never, with a **Set to Never**
-button. That setting covers every library, music included, which this app doesn't analyse: keep it on if you use
-loudness leveling or smart transitions for music.
+publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item.
+
+Setup Health shows Plex's own **Analyze audio tracks for loudness** setting as information. Keeping native analysis
+enabled is valid: Plex can serve music and video libraries this app does not cover. Native video analysis also
+depends on each library's **Enable Loudness Analysis** setting; a server-wide schedule alone does not mean both
+applications are analysing the same videos.
+
+When this app has eligible video libraries selected and its writer is ready, **Set to Never** is an optional,
+separately confirmed action. It changes Plex's server-wide schedule, including music and unselected video libraries;
+it does not enable this app, extend its library selection or erase existing measurements. Keep native analysis on
+if those other libraries need it. The app checks its selection and writer readiness again when the action runs.
+The control is excluded from bulk fixes, and installing or upgrading the app never changes this Plex preference.
 
 ## Undoing it
 

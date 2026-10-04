@@ -1635,18 +1635,41 @@ def set_plex_marker_detection_never(server_id: str):
 def set_plex_loudness_analysis_never(server_id: str):
     """Set Plex's server-wide loudness analysis to Never (Setup Health's "Set to Never" on the Plex loudness row).
 
-    Only for a Plex server with loudness on. Returns ``{"ok": bool, "error": str}`` like the other readiness actions.
+    Only for an enabled Plex server with selected loudness libraries and a currently ready local writer. Returns ``{"ok": bool, "error": str}`` like the other readiness actions.
     """
-    from ...loudness.settings import load_server_loudness
+    from ...loudness.guard import loudness_capability
+    from ...loudness.settings import load_server_loudness, loudness_libraries
+    from ...utils import redact_secrets
 
     cfg, refused = _plex_marker_target(server_id)
     if refused is not None:
         return refused
     if not load_server_loudness(cfg).enabled:
         return jsonify({"ok": False, "error": "Loudness is off for this server"}), 400
+    if not loudness_libraries(cfg):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Choose at least one movie or TV library for this app's loudness analysis first",
+            }
+        ), 409
     live = _instantiate_for_probe(cfg)
     if live is None or not hasattr(live, "set_loudness_analysis_never"):
         return jsonify({"ok": False, "error": "could not instantiate server client"}), 400
+    # Setup Health may have been opened before a settings, mount or Plex change. Reuse the writer's current
+    # capability check immediately before disabling the server-wide native fallback.
+    try:
+        report = loudness_capability(live, cfg)
+    except Exception as exc:
+        logger.debug("Loudness readiness probe failed for {} ({})", cfg.id, type(exc).__name__)
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Could not check loudness analysis. Check the Plex connection and try Setup Health again.",
+            }
+        ), 409
+    if not report.ready:
+        return jsonify({"ok": False, "error": redact_secrets(report.message)}), 409
     error = live.set_loudness_analysis_never()
     return jsonify({"ok": not error, "error": error or ""}), 200
 

@@ -57,46 +57,70 @@ def test_stored_unsupported_music_selection_is_not_reported_as_ready():
     assert "movie and TV" in section["checks"][0]["reason"]
 
 
-@pytest.mark.parametrize(
-    ("mode", "row", "ok"),
-    [
-        ("never", "Plex's own loudness analysis is off", True),
-        ("scheduled", "Plex also analyses loudness itself", False),
-        ("asap", "Plex also analyses loudness itself", False),
-        (None, None, True),
-        ("new-value", None, True),
-        ([], None, True),
-    ],
-)
-def test_plexs_own_loudness_analysis_gets_a_row_when_its_setting_is_known(mode, row, ok):
-    prefs = {} if mode is None else {"LoudnessAnalysisBehavior": mode}
+@pytest.mark.parametrize("mode", ["never", "scheduled", "asap", None, "new-value", []])
+def test_native_schedule_is_information_not_a_required_fix(mode):
+    prefs = {"LoudnessAnalysisBehavior": mode}
+    server = MagicMock()
+    cfg = _cfg({"enabled": True})
     with patch(
         "media_preview_generator.loudness.guard.loudness_capability", return_value=MagicMock(ready=True, message="")
-    ):
-        section = loudness_readiness_section(MagicMock(), _cfg({"enabled": True}), prefs)
+    ) as capability:
+        section = loudness_readiness_section(server, cfg, prefs)
+    capability.assert_called_once_with(server, cfg)
+    assert section["ok"] is True
     rows = {check["id"]: check for check in section["checks"]}
-    assert section["ok"] is ok
-    if row is None:
+    if mode not in ("never", "scheduled", "asap"):
         assert "loudness_plex_analysis" not in rows
         return
-    check = rows["loudness_plex_analysis"]
-    assert (check["label"], check["ok"], check["recommended"], check["severity"]) == (row, ok, "Never", "recommended")
-    assert (check["reason"] is None) is ok
-    if ok:
-        assert check["actions"] == {}
+    row = rows["loudness_plex_analysis"]
+    assert row["ok"] is True and row["severity"] == "info" and row["informational"] is True
+    assert "recommended" not in row and "fix_action" not in row
+    assert row["bulk"] is False
+    if mode == "never":
+        assert row["actions"] == {}
     else:
-        action = check["actions"][check["fix_action"]]
-        assert (action["action"], check["fix_label"], check["bulk"]) == (
-            "set_plex_loudness_never",
-            "Set to Never",
-            False,
-        )
-        assert "music" in action["confirm"]["body"]
+        assert row["optional_action"] == "disable"
+        assert row["optional_label"] == "Set to Never"
+        action = row["actions"]["disable"]
+        assert action["action"] == "set_plex_loudness_never"
+        assert all(term in action["confirm"]["body"] for term in ["music", "unselected", "Existing measurements"])
 
 
-def test_plexs_setting_is_left_out_while_loudness_cant_be_stored_or_is_off():
-    prefs = {"LoudnessAnalysisBehavior": "scheduled"}
+@pytest.mark.parametrize(
+    "library_ids,ready,action",
+    [
+        (None, True, True),
+        (["1"], True, True),
+        ([], True, False),
+        (["missing"], True, False),
+        (None, False, False),
+        ([], False, False),
+    ],
+)
+def test_optional_control_requires_current_writer_and_nonempty_video_selection(library_ids, ready, action):
+    cfg = _cfg({"enabled": True, "library_ids": library_ids})
+    server = MagicMock()
+    with patch(
+        "media_preview_generator.loudness.guard.loudness_capability",
+        return_value=MagicMock(ready=ready, message="Writer not ready"),
+    ) as capability:
+        section = loudness_readiness_section(server, cfg, {"LoudnessAnalysisBehavior": "scheduled"})
+    capability.assert_called_once_with(server, cfg)
+    row = next(row for row in section["checks"] if row["id"] == "loudness_plex_analysis")
+    assert section["ok"] is ready
+    assert bool(row["actions"]) is action
+    assert row["ok"] is True and row["informational"] is True
+    if not action:
+        assert row["reason"]
+
+
+def test_native_information_remains_visible_when_probe_fails():
     with patch("media_preview_generator.loudness.guard.loudness_capability", side_effect=RuntimeError("offline")):
-        section = loudness_readiness_section(MagicMock(), _cfg({"enabled": True}), prefs)
-    assert [c["id"] for c in section["checks"]] == ["loudness_registration"] and section["severity"] == "critical"
-    assert loudness_readiness_section(MagicMock(), _cfg({"enabled": False}), prefs) is None
+        section = loudness_readiness_section(
+            MagicMock(), _cfg({"enabled": True}), {"LoudnessAnalysisBehavior": "scheduled"}
+        )
+    assert section["ok"] is False and section["severity"] == "critical"
+    row = section["checks"][1]
+    assert row["id"] == "loudness_plex_analysis" and row["actions"] == {}
+    assert row["ok"] is True
+    assert loudness_readiness_section(MagicMock(), _cfg({"enabled": False})) is None

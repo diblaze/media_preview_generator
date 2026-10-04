@@ -1474,10 +1474,18 @@ without changing it or starting a job. The job banner identifies **Plex loudness
 & Credits, and the results refresh when the job finishes.
 
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
-publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item. Setup
-Health shows Plex's own **Analyze audio tracks for loudness** setting and recommends Never, with a **Set to Never**
-button. That setting covers every library, music included, which this app doesn't analyse: keep it on if you use
-loudness leveling or smart transitions for music.
+publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item.
+
+Setup Health shows Plex's own **Analyze audio tracks for loudness** setting as information. Keeping native analysis
+enabled is valid: Plex can serve music and video libraries this app does not cover. Native video analysis also
+depends on each library's **Enable Loudness Analysis** setting; a server-wide schedule alone does not mean both
+applications are analysing the same videos.
+
+When this app has eligible video libraries selected and its writer is ready, **Set to Never** is an optional,
+separately confirmed action. It changes Plex's server-wide schedule, including music and unselected video libraries;
+it does not enable this app, extend its library selection or erase existing measurements. Keep native analysis on
+if those other libraries need it. The app checks its selection and writer readiness again when the action runs.
+The control is excluded from bulk fixes, and installing or upgrading the app never changes this Plex preference.
 
 ## Undoing it
 
@@ -3209,6 +3217,8 @@ A server with **Intro & Credits** switched on also gets an
 [Intro & Credits section](https://mediapreviewgenerator.dev/guides/previews-readiness/#intro-credits) (Plex) or plugin rows (Jellyfin, Emby).
 A Plex server with **Generate chapter thumbnails** switched on also gets a
 [Chapter thumbnails section](https://mediapreviewgenerator.dev/guides/previews-readiness/#chapter-thumbnails).
+A Plex server with this app's loudness analysis switched on also gets a
+[Plex loudness section](https://mediapreviewgenerator.dev/guides/previews-readiness/#plex-loudness).
 
 Every row carries an ⓘ tooltip (the one-liner), a direct link to
 **this page** anchored at the relevant check, and — where applicable —
@@ -3283,6 +3293,26 @@ including when Plex generates the replacements itself. See the [cache limitation
 
 Turning this app's chapter option off removes these checks and preserves previously generated images.
 See [Plex chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails) for job behavior.
+
+---
+
+## Plex loudness
+*Plex only — shown when this app's loudness analysis is on*
+
+**Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
+Select the movie and TV libraries this app should analyse in the server's loudness settings.
+
+**Plex's own analysis:** shows the current server-wide **Analyze audio tracks for loudness** schedule. This is
+informational: native analysis can remain enabled for music, unselected video libraries and excluded files.
+The schedule alone does not prove duplicate video work; Plex also has a per-library loudness setting.
+
+**Set to Never:** an optional action when this app's writer is ready and eligible video libraries are selected.
+The confirmation explains that it stops Plex's native loudness analysis in every library, including music.
+It does not turn on this app or expand its coverage, and existing measurements remain available. Selection
+and writer readiness are checked again before the change is sent to Plex. This action is excluded from bulk fixes.
+
+Installing or upgrading this app does not change Plex's loudness schedule.
+See [Plex loudness analysis](https://mediapreviewgenerator.dev/plex-loudness-normalization/) for the supported libraries and job behavior.
 
 ---
 
@@ -5524,10 +5554,17 @@ For full design and per-vendor details see [Multi-Media-Server](https://mediapre
 | POST | `/api/servers/<id>/install-plugin` | Jellyfin and Emby (400 for Plex). Jellyfin: adds the Media Preview Bridge manifest URL to Jellyfin's plugin repos, queues the package install, and restarts Jellyfin. Returns `{ok, steps: [{step, ok, detail}], error}`. Emby: installs Media Preview Bridge for Emby from Emby's own plugin catalog and restarts Emby; when the catalog doesn't list it, answers `ok: false, manual: true` (install the DLL by hand). Returns `{ok, steps, error, manual}`. |
 | POST | `/api/servers/<id>/plex-library-markers` | Plex only. Setup Health's **Turn on** for a library whose own *Intro markers* / *Credits markers* setting is off (Plex then hides every skip marker of that type there, ours included). Body `{"library_id": "2", "prefs": ["enableIntroMarkerGeneration", "enableCreditsMarkerGeneration"]}` (one or both); sets them on with `PUT /library/sections/{id}/prefs` for that library only. 400 for any other pref, a library outside the server's Intro & Credits selection, or a non-Plex server. Returns `{ok, library_id, prefs}` or `{ok: false, error}`. |
 | POST | `/api/servers/<id>/plex-marker-detection` | Plex only. Setup Health's **Set server-wide to Never**. Body `{"types": ["intro", "credits"]}` (one or both); sends `PUT /:/prefs?GenerateIntroMarkerBehavior=never&GenerateCreditsMarkerBehavior=never` for the types given, which stops Plex's own detection without hiding any marker. 400 for any other type, a non-Plex server, or a server with Intro & Credits off. Returns `{ok, types}` or `{ok: false, error}`. |
+| POST | `/api/servers/<id>/plex-loudness-analysis` | Plex only. Optional **Set to Never** action, with a confirmation dialog in Setup Health. Body `{}`; sends `PUT /:/prefs?LoudnessAnalysisBehavior=never`. Requires app loudness opt-in, eligible selected video libraries and a fresh successful writer-readiness check. Returns 409 if the server is disabled, selection is empty or the writer is unavailable; 400 for a non-Plex server or loudness opt-in off; 404 for an unknown server. Response is `{ok, error}`; inspect `ok` even for HTTP 200 because Plex can refuse the preference update. Affects native analysis in every library, including music; existing measurements are retained. |
 | POST | `/api/servers/<id>/uninstall-plugin` | Jellyfin only. Removes the Media Preview Bridge plugin (`DELETE /Packages/{GUID}`; 404 treated as success — already gone) and restarts Jellyfin. Repo URL stays in place for possible re-install. Same response shape as `/install-plugin`. |
 | GET | `/api/bif/servers/<id>/search?q=<query>` | One server's preview search; returns `preview_kind` (`bif` or `trickplay`) per result. The Inspector searches every server through `GET /api/media/search` instead |
 | GET | `/api/bif/trickplay/info?server_id=...&path=...` | Parse a Jellyfin trickplay manifest + report sheet metadata |
 | GET | `/api/bif/trickplay/frame?server_id=...&sheets_dir=...&index=N&tile_width=10&tile_height=10` | Slice and serve a single thumbnail JPEG from a trickplay tile sheet |
+
+The readiness response can include checks marked `informational: true`. These remain visible when their severity
+is `info`, without becoming recommendations or making the section unhealthy. An `optional_action` names an action
+in the existing `actions` map, with `optional_label` supplying its button text. Plex's native loudness schedule uses
+this form; its optional action is excluded from bulk fixes and is absent when no eligible libraries are selected or
+the writer is unavailable.
 
 ### Inspector Endpoints
 

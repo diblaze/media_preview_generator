@@ -22,6 +22,8 @@ A server with **Intro & Credits** switched on also gets an
 [Intro & Credits section](#intro-credits) (Plex) or plugin rows (Jellyfin, Emby).
 A Plex server with **Generate chapter thumbnails** switched on also gets a
 [Chapter thumbnails section](#chapter-thumbnails).
+A Plex server with this app's loudness analysis switched on also gets a
+[Plex loudness section](#plex-loudness).
 
 Every row carries an ⓘ tooltip (the one-liner), a direct link to
 **this page** anchored at the relevant check, and — where applicable —
@@ -96,6 +98,26 @@ including when Plex generates the replacements itself. See the [cache limitation
 
 Turning this app's chapter option off removes these checks and preserves previously generated images.
 See [Plex chapter thumbnails](../guides.md#plex-chapter-thumbnails) for job behavior.
+
+---
+
+## Plex loudness  <a id="plex-loudness"></a>
+*Plex only — shown when this app's loudness analysis is on*
+
+**Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
+Select the movie and TV libraries this app should analyse in the server's loudness settings.
+
+**Plex's own analysis:** shows the current server-wide **Analyze audio tracks for loudness** schedule. This is
+informational: native analysis can remain enabled for music, unselected video libraries and excluded files.
+The schedule alone does not prove duplicate video work; Plex also has a per-library loudness setting.
+
+**Set to Never:** an optional action when this app's writer is ready and eligible video libraries are selected.
+The confirmation explains that it stops Plex's native loudness analysis in every library, including music.
+It does not turn on this app or expand its coverage, and existing measurements remain available. Selection
+and writer readiness are checked again before the change is sent to Plex. This action is excluded from bulk fixes.
+
+Installing or upgrading this app does not change Plex's loudness schedule.
+See [Plex loudness analysis](../plex-loudness-normalization.md) for the supported libraries and job behavior.
 
 ---
 

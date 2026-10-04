@@ -2431,14 +2431,16 @@ class PlexServer(MediaServer):
 
     def set_loudness_analysis_never(self) -> str | None:
         """Set Plex's server-wide loudness analysis to Never (``PUT /:/prefs``); None on success, else why not."""
+        from ..utils import redact_secrets
         from .loudness_readiness import PLEX_LOUDNESS_PREF
 
         try:
             plex = self._connect()
             plex.query(f"/:/prefs?{PLEX_LOUDNESS_PREF}=never", method=plex._session.put)
         except Exception as exc:
-            logger.warning("Could not set Plex's own loudness analysis to Never on {!r}: {}", self.name, exc)
-            return str(exc)
+            error = redact_secrets(str(exc))
+            logger.warning("Could not set Plex's own loudness analysis to Never on {!r}: {}", self.name, error)
+            return error
         logger.info("Set {} to never on {!r}", PLEX_LOUDNESS_PREF, self.name)
         return None
 

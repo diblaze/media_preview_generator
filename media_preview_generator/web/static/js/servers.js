@@ -2163,17 +2163,9 @@
         const allGood = [];
         for (const section of sections || []) {
             for (const check of (section.checks || [])) {
-                // Drop pure-info rows entirely — they have no
-                // recommendation to apply and no failure to fix, so
-                // they're decorative noise on a card whose whole job
-                // is to surface checks the user should act on. Things
-                // that NEED to surface (skipped custom-agent libraries,
-                // probe failures, plugin-required-but-absent) must be
-                // emitted by the backend as severity="recommended" or
-                // "critical" — not "info". This filter is the safety
-                // net so any stray info row never sneaks back into the
-                // user's eyeline.
-                if ((check.severity || 'info') === 'info') continue;
+                // Optional server controls are explicitly visible without implying a
+                // recommendation. Other informational diagnostics stay hidden.
+                if ((check.severity || 'info') === 'info' && check.informational !== true) continue;
                 const item = {
                     check,
                     sectionTitle: section.title || section.id || '',
@@ -2297,8 +2289,8 @@
 
         const ok = check.ok !== false;
         const sev = check.severity || 'info';
-        // Info severity is filtered out upstream in _partitionChecks —
-        // it never reaches a rendered row. ALL passing rows get a
+        const informational = sev === 'info' && check.informational === true;
+        // Passing health checks get a
         // green filled check; pre-fix passing recommended rows got a
         // grey outlined check and users complained that a row "off
         // when recommended off" didn't show as passing.
@@ -2323,7 +2315,10 @@
             : `This app can't toggle this for you — open ${vendorLabel}'s admin UI and follow the instructions below.`;
         let icon;
         let tierBadge;
-        if (ok && sev === 'critical') {
+        if (informational) {
+            icon = '<i class="bi bi-info-circle text-muted mt-1"></i>';
+            tierBadge = '';
+        } else if (ok && sev === 'critical') {
             icon = '<i class="bi bi-check-circle-fill text-success mt-1"></i>';
             tierBadge = '<span class="badge bg-success-subtle text-success-emphasis border border-success-subtle ms-1" title="Required check — currently passing.">Required</span>';
         } else if (ok) {
@@ -2430,7 +2425,7 @@
         //                    opposite of the recommendation, on
         //                    purpose". Tooltip restates the target
         //                    state in full.
-        if (!ok && fixAction) {
+        if (!informational && !ok && fixAction) {
             const targetOn = fixDir === 'enable';
             const icon = targetOn ? 'bi-toggle-on' : 'bi-toggle-off';
             // ``check.fix_label`` names the fix where "Apply recommended"
@@ -2444,7 +2439,7 @@
             btn.addEventListener('click', () => _runCheckAction(serverId, serverType, check, fixDir, btn));
             btnWrap.appendChild(btn);
         }
-        if (breakAction) {
+        if (!informational && breakAction) {
             const targetOn = breakDir === 'enable';
             const verb = targetOn ? 'Enable' : 'Disable';
             const icon = targetOn ? 'bi-toggle-on' : 'bi-toggle-off';
@@ -2457,6 +2452,18 @@
             );
             btn.title = `Override the recommendation — set ${check.label || check.id || 'this'} to ${targetOn ? 'On' : 'Off'}`;
             btn.addEventListener('click', () => _runCheckAction(serverId, serverType, check, breakDir, btn));
+            btnWrap.appendChild(btn);
+        }
+        const optionalDir = check.optional_action;
+        if (informational && (optionalDir === 'enable' || optionalDir === 'disable')
+            && actions[optionalDir] && typeof check.optional_label === 'string' && check.optional_label) {
+            const icon = optionalDir === 'enable' ? 'bi-toggle-on' : 'bi-toggle-off';
+            const btn = _makeActionButton(
+                'btn-outline-secondary text-body', icon, escapeHtml(check.optional_label), check, optionalDir,
+            );
+            btn.querySelector('i').setAttribute('aria-hidden', 'true');
+            btn.title = check.optional_label;
+            btn.addEventListener('click', () => _runCheckAction(serverId, serverType, check, optionalDir, btn));
             btnWrap.appendChild(btn);
         }
         if (btnWrap.children.length > 0) {

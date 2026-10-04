@@ -753,10 +753,12 @@ class MediaServer(ABC):
 
         Two rules the card's frontend imposes on every emitted check:
 
-        * ``severity`` is never ``"info"`` on a row that must be seen.
-          ``servers.js _partitionChecks`` drops info rows on purpose, so
-          a row with nothing to fix is ``"recommended"`` with
-          ``ok: True`` and lands in "All good".
+        * Info rows are hidden unless ``informational: True`` explicitly
+          makes a current server setting visible in "All good". Such a row
+          can expose an optional action with ``optional_action`` (an actions
+          key) and ``optional_label``, without recommending a different value.
+          Other passing health checks use ``severity: "recommended"`` and
+          ``ok: True``.
         * The plugin install controls key on ``section.id == "plugin"``
           and read that section's FIRST check's ``current``, which is
           ``"not installed"`` or a version string. A vendor adding
