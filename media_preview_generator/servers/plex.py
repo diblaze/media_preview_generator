@@ -2429,6 +2429,19 @@ class PlexServer(MediaServer):
         logger.info("Set {} to never on {!r}", ", ".join(prefs), self.name)
         return None
 
+    def set_loudness_analysis_never(self) -> str | None:
+        """Set Plex's server-wide loudness analysis to Never (``PUT /:/prefs``); None on success, else why not."""
+        from .loudness_readiness import PLEX_LOUDNESS_PREF
+
+        try:
+            plex = self._connect()
+            plex.query(f"/:/prefs?{PLEX_LOUDNESS_PREF}=never", method=plex._session.put)
+        except Exception as exc:
+            logger.warning("Could not set Plex's own loudness analysis to Never on {!r}: {}", self.name, exc)
+            return str(exc)
+        logger.info("Set {} to never on {!r}", PLEX_LOUDNESS_PREF, self.name)
+        return None
+
     def hidden_marker_types(self, library_id: str) -> frozenset[str] | None:
         """The marker types Plex hides in one library: those whose own setting (Edit library → Advanced) is off.
 

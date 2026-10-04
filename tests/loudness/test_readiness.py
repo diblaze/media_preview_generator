@@ -82,6 +82,16 @@ def test_plexs_own_loudness_analysis_gets_a_row_when_its_setting_is_known(mode, 
     check = rows["loudness_plex_analysis"]
     assert (check["label"], check["ok"], check["recommended"], check["severity"]) == (row, ok, "Never", "recommended")
     assert (check["reason"] is None) is ok
+    if ok:
+        assert check["actions"] == {}
+    else:
+        action = check["actions"][check["fix_action"]]
+        assert (action["action"], check["fix_label"], check["bulk"]) == (
+            "set_plex_loudness_never",
+            "Set to Never",
+            False,
+        )
+        assert "music" in action["confirm"]["body"]
 
 
 def test_plexs_setting_is_left_out_while_loudness_cant_be_stored_or_is_off():

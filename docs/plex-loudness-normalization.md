@@ -71,9 +71,10 @@ panel gives the reason. These retries are automatic and do not require review or
 Jobs share the workers, priorities, pause and cancel of every other job.
 
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
-publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item. Setup Health
-shows Plex's own **Analyze audio tracks for loudness** setting and recommends Never. That setting covers every
-library, music included, which this app doesn't analyse: keep it on if you use loudness leveling for music.
+publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item. Setup
+Health shows Plex's own **Analyze audio tracks for loudness** setting and recommends Never, with a **Set to Never**
+button. That setting covers every library, music included, which this app doesn't analyse: keep it on if you use
+loudness leveling or smart transitions for music.
 
 ## Undoing it
 

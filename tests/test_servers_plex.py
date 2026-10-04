@@ -2219,6 +2219,13 @@ class TestPlexMarkerHelpers:
             plex_server_under_test.set_marker_detection_never(types)
         plex_server_under_test._connect.return_value.query.assert_not_called()
 
+    def test_loudness_never_puts_only_the_loudness_pref(self, plex_server_under_test):
+        conn = plex_server_under_test._connect.return_value
+        assert plex_server_under_test.set_loudness_analysis_never() is None
+        conn.query.assert_called_once_with("/:/prefs?LoudnessAnalysisBehavior=never", method=conn._session.put)
+        conn.query.side_effect = RuntimeError("(401) unauthorized")
+        assert plex_server_under_test.set_loudness_analysis_never() == "(401) unauthorized"
+
     def test_server_wide_never_reports_plexs_refusal(self, plex_server_under_test):
         plex_server_under_test._connect.return_value.query.side_effect = RuntimeError("(401) unauthorized")
         assert plex_server_under_test.set_marker_detection_never(["intro"]) == "(401) unauthorized"

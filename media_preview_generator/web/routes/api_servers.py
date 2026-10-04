@@ -1630,6 +1630,27 @@ def set_plex_marker_detection_never(server_id: str):
     return jsonify({"ok": True, "types": list(dict.fromkeys(types))})
 
 
+@api.route("/servers/<server_id>/plex-loudness-analysis", methods=["POST"])
+@setup_or_auth_required
+def set_plex_loudness_analysis_never(server_id: str):
+    """Set Plex's server-wide loudness analysis to Never (Setup Health's "Set to Never" on the Plex loudness row).
+
+    Only for a Plex server with loudness on. Returns ``{"ok": bool, "error": str}`` like the other readiness actions.
+    """
+    from ...loudness.settings import load_server_loudness
+
+    cfg, refused = _plex_marker_target(server_id)
+    if refused is not None:
+        return refused
+    if not load_server_loudness(cfg).enabled:
+        return jsonify({"ok": False, "error": "Loudness is off for this server"}), 400
+    live = _instantiate_for_probe(cfg)
+    if live is None or not hasattr(live, "set_loudness_analysis_never"):
+        return jsonify({"ok": False, "error": "could not instantiate server client"}), 400
+    error = live.set_loudness_analysis_never()
+    return jsonify({"ok": not error, "error": error or ""}), 200
+
+
 @api.route("/servers/<server_id>/scheduled-trickplay", methods=["POST"])
 @setup_or_auth_required
 def set_scheduled_trickplay(server_id: str):

@@ -11,6 +11,20 @@ from .chapter_readiness import NATIVE_MODES
 
 # Plex's own server-wide "Analyze audio tracks for loudness": one setting for every library, music included.
 PLEX_LOUDNESS_PREF = "LoudnessAnalysisBehavior"
+_NEVER_ACTION = {
+    "action": "set_plex_loudness_never",
+    "args": {},
+    "confirm": {
+        "kind": "button",
+        "phrase": "",
+        "body": (
+            "Sets Plex's server-wide <em>Analyze audio tracks for loudness</em> to Never (Plex Settings → Library). "
+            "Plex stops analysing loudness itself in every library, music included. This app analyses only the movie "
+            "and TV libraries you chose, so keep Plex's analysis on if you rely on loudness leveling or smart transitions "
+            "for music."
+        ),
+    },
+}
 
 
 def loudness_readiness_section(
@@ -91,7 +105,11 @@ def loudness_readiness_section(
                 "reason": None
                 if plex_off
                 else "Plex analyses the same tracks one at a time. Set it to Never unless music libraries need it.",
-                "actions": {},
+                "actions": {} if plex_off else {"disable": _NEVER_ACTION},
+                "fix_action": "disable",
+                "fix_label": "Set to Never",
+                # Server-wide, music included: never part of a bulk fix.
+                "bulk": False,
                 "meta": {"flag": PLEX_LOUDNESS_PREF},
             }
         )
