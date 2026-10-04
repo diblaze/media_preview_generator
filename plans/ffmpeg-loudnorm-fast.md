@@ -61,3 +61,9 @@ Spike first (local only, `plans/ffmpeg-loudnorm-fast/`, never committed, E16); i
 - CPU stock/patched: median **7.7×** (min 3.9× on a 7 s synthetic clip, max 15×; real 10 min 5.1 tracks 11–15×: e.g. eac3/6 480 s → 43 s, ac3/6 415 s → 28 s, dca/6 387 s → 26 s).
 - Tarball `ffmpeg-8.1.3.tar.xz` sha256 `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`.
 - Patch: `plans/ffmpeg-loudnorm-fast/0001-avfilter-ebur128-cache-100ms-block-energies.patch` (block-energy cache invalidated on write; whole blocks from cache, partial edges summed).
+
+## Execution notes (2026-10-04)
+- Deviation (user: "same parity as jellyfin-ffmpeg that is used"): the image binary is built from jellyfin-ffmpeg's own source tag v8.1.3-1 (all 100 debian/patches + ours), every native component, `--enable-gpl --enable-version3 --disable-unstable` like jellyfin; audio decoders identical except external libfdk_aac/libopus/libvorbis (never auto-picked). Re-parity of that binary vs jellyfin-ffmpeg: 12/12 identical, median 7.3x.
+- Deviation: binary choice in `analyze.measure()` (job.py calls it), not `run()`: fast build only when the configured ffmpeg is jellyfin-ffmpeg and `dpkg-query jellyfin-ffmpeg8` equals the release in `/usr/local/lib/ffmpeg-loudnorm/jellyfin-release`; failure retried with jellyfin-ffmpeg (not timeouts, not cancels). Stage amd64-only.
+- Local commits on feat/fast-loudnorm-ffmpeg: e9f3adb build(docker), 9f4209f feat(loudness). Not pushed; no PR (user).
+- Live test: thevault plex-generate-previews on local image `media_preview_generator:fast-loudnorm` (first build of the jellyfin-source binary, `/usr/local/bin/ffmpeg-loudnorm`, version-string twin check) since 22:55; anime loudness job 0c8964ce; spot checks `spotcheck.py` -> `spotcheck.jsonl`. The reviewed final image is `media_preview_generator:fast-loudnorm-2`.
