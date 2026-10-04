@@ -55,3 +55,9 @@ Spike first (local only, `plans/ffmpeg-loudnorm-fast/`, never committed, E16); i
 - Parity budget: 10 min cap on long tracks (`-t 600`).
 - Deploy on thevault: ask again after the proof passes.
 - FFmpeg route: decide later.
+
+## Spike result (2026-10-04): Check passed
+- `parity.py`: **19/19 identical** (4 synthetic stereo/5.1 WAVs, odd lengths, bursts + silence; 15 tracks eac3/6 ×3, eac3/2 ×2, ac3/6 ×2, ac3/2, dca/6 ×2, truehd/8, aac/2 ×2, opus/2, mp3/2; `-t 600` on long tracks): all five fields string-equal across jellyfin-ffmpeg 8.1.3, stock 8.1.3 and patched 8.1.3. Stock minimal build decodes identically to jellyfin-ffmpeg.
+- CPU stock/patched: median **7.7×** (min 3.9× on a 7 s synthetic clip, max 15×; real 10 min 5.1 tracks 11–15×: e.g. eac3/6 480 s → 43 s, ac3/6 415 s → 28 s, dca/6 387 s → 26 s).
+- Tarball `ffmpeg-8.1.3.tar.xz` sha256 `7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`.
+- Patch: `plans/ffmpeg-loudnorm-fast/0001-avfilter-ebur128-cache-100ms-block-energies.patch` (block-energy cache invalidated on write; whole blocks from cache, partial edges summed).
