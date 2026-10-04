@@ -21,7 +21,7 @@ from ..markers.probe import ProbeError, ProbeStalledError, ProbeTimeoutError, ff
 from ..markers.publishers.base import Capability, PublishError
 from ..output.plex_bundle import PlexBundleAdapter
 from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, calculate_plex_hash, get_source_fingerprint
-from .ffmpeg_runner import create_ffmpeg_runner
+from .ffmpeg_runner import STALL_WATCHDOG_LINE, create_ffmpeg_runner
 from .generator import CancellationError, MediaInfo
 from .hdr_detection import is_dv_no_backward_compat, is_hdr_transfer
 
@@ -37,6 +37,32 @@ class UnsupportedChapterFormatError(RuntimeError):
     """No safe chapter color conversion is available for this source."""
 
     code = "unsupported"
+
+
+class ChapterExtractionStalledError(TimeoutError):
+    """The managed runner stopped a seek; defer the rest of this source."""
+
+
+class ChapterSourceCorruptionError(RuntimeError):
+    """The demuxer identified malformed container data while extracting."""
+
+
+def _check_fatal_extraction(returncode: int, stderr: list[str], start_ms: int) -> None:
+    """Stop a chapter set only for explicit container corruption or a watchdog stop."""
+    if returncode == 0:
+        return
+    if any(
+        "[matroska" in line.lower() and "invalid as first byte of an ebml number" in line.lower() for line in stderr
+    ):
+        raise ChapterSourceCorruptionError(
+            f"Chapter extraction failed at {start_ms}ms: malformed Matroska container data; "
+            "remaining chapter attempts stopped. Completed images are preserved."
+        )
+    if STALL_WATCHDOG_LINE in stderr:
+        raise ChapterExtractionStalledError(
+            f"Chapter extraction stalled at {start_ms}ms and was stopped by the watchdog; "
+            "remaining chapter attempts stopped. Completed images are preserved."
+        )
 
 
 @dataclass(frozen=True)
@@ -325,6 +351,7 @@ def extract_chapter_frame(
     )
     runner = create_ffmpeg_runner(**runner_options, chapter_start_ms=start_ms)
     rc, _, _, stderr = runner(use_skip=False)
+    _check_fatal_extraction(rc, stderr, start_ms)
     stderr_text = "\n".join(stderr).lower()
     premature_end = "file ended prematurely" in stderr_text
     no_frame = "no filtered frames" in stderr_text or (rc == 0 and not output.exists())
@@ -341,6 +368,7 @@ def extract_chapter_frame(
                 raise CancellationError("Chapter extraction cancelled")
             runner = create_ffmpeg_runner(**runner_options, chapter_start_ms=fallback_ms)
             rc, _, _, stderr = runner(use_skip=False)
+            _check_fatal_extraction(rc, stderr, fallback_ms)
             premature_end = "file ended prematurely" in "\n".join(stderr).lower()
     if rc != 0:
         detail = "; source ended prematurely" if premature_end else ""
@@ -420,6 +448,10 @@ def publish_chapters(
                     }
                     _write_manifest(plan, images)
             except CancellationError:
+                raise
+            except (ChapterExtractionStalledError, ChapterSourceCorruptionError):
+                failed += 1
+                processed += 1
                 raise
             except (OSError, ValueError, RuntimeError) as exc:
                 errors.append(exc)

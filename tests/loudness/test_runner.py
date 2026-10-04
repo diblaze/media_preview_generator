@@ -88,6 +88,53 @@ def test_completes_releases_the_slot_and_retries_files_plex_hadnt_added(run):
     assert retry["retry_delay_s"] == scaled_backoff_delay(1, 30)
 
 
+def test_loudness_callback_preserves_shared_preview_chapter_progress(run, tmp_path, monkeypatch):
+    from media_preview_generator.jobs.dispatcher import JobDispatcher
+    from media_preview_generator.jobs.worker import WorkerPool
+    from media_preview_generator.web.jobs import JobManager
+
+    emitted = []
+    delivered = threading.Event()
+
+    def capture(event, data, namespace):
+        if event == "worker_update":
+            assert namespace == "/jobs"
+            emitted.append(data)
+            delivered.set()
+
+    manager = JobManager(str(tmp_path), socketio=SimpleNamespace(emit=capture))
+    pool = WorkerPool(cpu_workers=1, gpu_workers=0, selected_gpus=[])
+    dispatcher = JobDispatcher(pool)
+    for method in ("update_worker_status", "prune_worker_statuses", "emit_worker_statuses"):
+        monkeypatch.setattr(run["jm"], method, getattr(manager, method))
+    try:
+        job.run_loudness_job("j1")
+        callback = run["dispatcher"].submit_items.call_args.kwargs["callbacks"]["worker_callback"]
+        worker = pool._snapshot_workers()[0]
+        worker.is_busy = True
+        worker.current_job_id = "preview-job"
+        worker.current_phase = "Chapter thumbnails for Plex…"
+        for title, processed in (("Movie A", 2), ("Movie A", 3), ("Movie B", 0)):
+            worker.media_title = title
+            snapshot = {"stage": "extracting", "processed": processed, "total": 6, "ready": processed, "failed": 0}
+            worker.chapter_progress = snapshot
+            delivered.clear()
+            callback(dispatcher._build_worker_statuses())
+            assert delivered.wait(2)
+            assert emitted[-1]["workers"][0]["current_title"] == title
+            assert emitted[-1]["workers"][0]["chapter_progress"] == snapshot
+        worker.is_busy = False
+        delivered.clear()
+        callback(dispatcher._build_worker_statuses())
+        assert delivered.wait(2)
+        assert emitted[-1]["workers"][0]["chapter_progress"] is None
+        assert emitted[-1]["workers"][0]["current_title"] == ""
+    finally:
+        pool._snapshot_workers()[0].is_busy = False
+        pool.shutdown()
+        manager.close()
+
+
 def test_a_last_retry_queues_no_more(run):
     run["jm"].get_job.return_value.config["retry_attempt"] = 3
     run["outcomes"] = {"/m/b.mkv": job.NOT_IN_LIBRARY}

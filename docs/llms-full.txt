@@ -1737,6 +1737,9 @@ It can appear beside **Scrubber already existed**, but does not identify which p
 The job's retry details show whether another attempt is actually scheduled. Retry eligibility depends on the failure
 and your retry policy. Chapter retries reuse completed output, so they do not need to regenerate a current scrubber
 preview.
+If chapter extraction stops making progress or reports an invalid Matroska container, the app stops the remaining
+chapter attempts for that file and keeps completed images. A stalled attempt can be retried under your retry policy;
+an invalid container needs a repaired or replaced source. Partial chapter sets are not registered with Plex.
 Plex's normal file checks can rewrite chapter image references even when its own generation is set to **Never**.
 A later Previews job reconciles those references without decoding current images again. This is separate from
 Plex generating and replacing the images itself.
