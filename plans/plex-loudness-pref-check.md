@@ -77,3 +77,11 @@ Fails if: the row is missing/mislabeled for any mode, the wiring stops passing `
 - Review fixes: row + button only when the writer is ready (Never without a working writer would leave no loudness analysis); route gate = `load_server_loudness(cfg).enabled` (same as the row); "smart transitions" wording unified; docs rewrapped.
 - Live: Plex accepted `PUT /:/prefs?LoudnessAnalysisBehavior=never` (200, value unchanged: already never); `/:/prefs` JSON contains the key.
 - Known: tests/test_plex_hash.py same-size-replacement[False] and tests/loudness/test_plex_db.py source-bytes-changed fail here on clean upstream/dev too (filesystem mtime on /mnt/black), not this change.
+
+## Upstream outcome (2026-10-04)
+- Merged as stevezau/media_preview_generator#362 (merge d70bcbe) with the maintainer's commit `d70bcbe fix(loudness): guard optional native analysis control`.
+- He reframed the row as **informational** (`severity: info`, `informational: True`, always ok, label "Plex's own loudness schedule"): keeping Plex's schedule on is supported; Set to Never is an **optional action** (`optional_action`/`optional_label`, new row type in servers.js/base.py), not a recommendation.
+- Button only when the writer is ready **and** at least one movie/TV library is selected; otherwise the row explains why it's unavailable. Route gate matches (enabled Plex, selected libraries, ready writer).
+- Confirm text broadened (unselected movie/TV libraries and exclusions too, existing measurements stay, how to restore in Plex). Setter errors go through `redact_secrets`.
+- Added e2e `tests/e2e/test_loudness_native_setting.py`, live evidence doc, docs in `docs/guides/previews-readiness.md` + `reference.md`.
+- Lesson for next PRs: upstream prefers informational rows + optional actions over "Recommended" fixes for Plex settings users may legitimately keep; redact secrets in surfaced errors.
