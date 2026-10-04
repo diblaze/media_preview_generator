@@ -674,6 +674,8 @@ def _dispatch_processable_items(
     total = len(plain_items)
     if not plain_items:
         return empty
+    if job_id and not (cancel_check and cancel_check()):
+        _queue_loudness_follow_up(job_id, plain_items, server_id_filter)
 
     # Reuse the shared dispatcher's pool when one already exists (e.g. a
     # concurrent webhook created it); otherwise build one sized from the
@@ -1225,9 +1227,45 @@ def _queue_intro_credits_follow_ups(job_id: str, items: list, pin: str | None) -
         from ..markers.job_runner import RECENTLY_ADDED_SOURCE
         from ..markers.triggers import submit_follow_ups
 
-        submit_follow_ups(preview_job_id=job_id, items=list(items), source=RECENTLY_ADDED_SOURCE, pin=pin)
+        intro_jobs = submit_follow_ups(preview_job_id=job_id, items=list(items), source=RECENTLY_ADDED_SOURCE, pin=pin)
+        _queue_loudness_follow_up(job_id, items, pin, source=RECENTLY_ADDED_SOURCE, intro_job_ids=intro_jobs)
     except Exception:
         logger.exception("Could not queue the Intro & Credits jobs for the files Recently Added scan {} listed", job_id)
+
+
+def _queue_loudness_follow_up(
+    job_id: str,
+    items: list,
+    pin: str | None,
+    *,
+    source: str | None = None,
+    intro_job_ids: list[str] | None = None,
+) -> None:
+    """Queue opted-in loudness for this preview's enumerated files, without another library scan.
+
+    Retry attempts never spawn new feature jobs. Existing dependencies identify this preview's own follow-ups across
+    restart, deduplicating this preview's upfront webhook or Recently Added follow-up at dispatch time.
+    """
+    try:
+        from ..job_kinds import JOB_KIND_PREVIEWS
+        from ..markers.triggers import _submit_loudness_follow_up
+        from ..web.jobs import get_job_manager
+
+        preview = get_job_manager().get_job(job_id)
+        if preview is None or preview.kind != JOB_KIND_PREVIEWS:
+            return
+        cfg = preview.config or {}
+        if cfg.get("is_retry") or cfg.get("is_retry_attempt") or cfg.get("retry_attempt"):
+            return
+        _submit_loudness_follow_up(
+            job_id,
+            list(intro_job_ids or []),
+            [item.canonical_path for item in items],
+            source or str(cfg.get("source") or "manual"),
+            pin,
+        )
+    except Exception:
+        logger.exception("Could not queue loudness for the files preview job {} listed", job_id)
 
 
 def _resolve_pinned_server(sid_filter: str | None) -> tuple[dict | None, str]:
@@ -2027,6 +2065,8 @@ def run_processing(
         def _dispatch_items(items, library_name):
             """Dispatch items via shared dispatcher or local pool."""
             nonlocal worker_pool, _dispatch_started
+            if job_id and not (cancel_check and cancel_check()):
+                _queue_loudness_follow_up(job_id, items, getattr(config, "server_id_filter", None))
             if job_id:
                 from .dispatcher import get_dispatcher
 

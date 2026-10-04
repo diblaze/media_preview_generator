@@ -177,6 +177,7 @@ def _under_any(path: str, roots: list[str]) -> bool:
 
 def _worker_files(job: Any) -> list[str]:
     files = [getattr(job.progress, "current_file", "") or ""]
+    files.extend(getattr(job.progress, "current_files", None) or [])
     for worker in getattr(job.progress, "workers", None) or []:
         files.append(
             worker.get("current_file", "") if isinstance(worker, dict) else getattr(worker, "current_file", "")
@@ -246,9 +247,12 @@ def inspector_file():
         library: ``duration_ms`` (markers.db's, else the preview's), ``previews`` (one row per owning server,
         ``inspector.previews.server_preview``), ``preview`` (the one the frames come from, with ``interval_ms``
         checked against the length, or null), ``versions`` (a server item's other versions on disk, when it has
-        several) and ``job`` (the queued or running job that has this file, or null). 400 when the path isn't an
+        several), ``loudness`` (each server's native audio stream measurements and availability, read from Plex
+        independently of the app's analysis opt-in), and ``job`` (the queued or running job that has this file,
+        or null). 400 when the path isn't an
         absolute path inside the media folder.
     """
+    from ...inspector.loudness import file_loudness
     from ...inspector.previews import chosen_preview, file_previews, interval_for
     from ...inspector.statuses import file_kind, file_title, quality_from_name
     from ...markers.ownership import owning_servers
@@ -273,6 +277,7 @@ def inspector_file():
         "quality": quality_from_name(path),
         "duration_ms": rec.duration_ms if rec is not None else None,
         "previews": [],
+        "loudness": [],
         "preview": None,
         "versions": [],
         "job": None,
@@ -286,6 +291,7 @@ def inspector_file():
     owners = owning_servers(path, registry)
     previews = file_previews(path, owners, plex_config_folder=_get_plex_config_folder())
     payload["previews"] = previews
+    payload["loudness"] = file_loudness(path, owners, previews)
     payload["versions"] = _versions(path, previews)
     chosen = chosen_preview(previews)
     if chosen is not None:

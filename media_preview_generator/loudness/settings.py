@@ -7,7 +7,9 @@ from typing import Any
 
 from loguru import logger
 
-from ..servers.base import Library, ServerConfig
+from ..config.paths import is_path_excluded
+from ..servers.base import Library, ServerConfig, ServerType
+from ..servers.ownership import OwnershipMatch, find_library_matches
 
 # Plex uses "episode" for TV sections; older saved configs can call them "show".
 # Music also needs album gain and fades, which this video feature does not generate.
@@ -124,3 +126,26 @@ def loudness_libraries(cfg: ServerConfig) -> list[Library]:
 def loudness_enabled_anywhere(configs: list[ServerConfig]) -> bool:
     """Whether any enabled server has loudness on."""
     return any(cfg.enabled and load_server_loudness(cfg).enabled for cfg in configs)
+
+
+def loudness_matches(canonical_path: str, configs: list[ServerConfig]) -> dict[str, list[OwnershipMatch]]:
+    """Return opted-in video libraries owning a local path, applying each server's exclusions.
+
+    This settings-only lookup does not contact Plex or require the media file to exist yet.
+    Preview library selection is independent of the loudness opt-in.
+    """
+    configs = [cfg for cfg in configs if cfg.enabled and cfg.type is ServerType.PLEX]
+    by_id = {cfg.id: cfg for cfg in configs}
+    settings = {cfg.id: load_server_loudness(cfg) for cfg in configs}
+    matches: dict[str, list[OwnershipMatch]] = {}
+    for match in find_library_matches(canonical_path, configs):
+        cfg = by_id[match.server_id]
+        selected = settings[cfg.id]
+        kind = next((lib.kind for lib in cfg.libraries if lib.id == match.library_id), None)
+        if (
+            selected.enabled
+            and not is_path_excluded(canonical_path, cfg.exclude_paths)
+            and library_chosen(selected, library_id=match.library_id, kind=kind)
+        ):
+            matches.setdefault(cfg.id, []).append(match)
+    return matches

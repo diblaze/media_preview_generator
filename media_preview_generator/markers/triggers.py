@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -16,7 +16,15 @@ from ..processing.types import ProcessableItem
 from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import webhook_path_candidates
 from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
-from ..web.jobs import PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL, Job, get_job_manager, is_live_retry_chain
+from ..web.jobs import (
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
+    PRIORITY_NORMAL,
+    Job,
+    JobManager,
+    get_job_manager,
+    is_live_retry_chain,
+)
 from ..web.settings_manager import get_settings_manager
 from .audio.season import season_group, season_videos
 from .external_ids import ids_from_path, is_season_folder
@@ -47,6 +55,7 @@ _redetect_lock = threading.Lock()
 # Serialises taking a preview job's request for its follow-up (``submit_pending_follow_up``), so two starts of one
 # preview job queue it once.
 _pending_follow_up_lock = threading.Lock()
+_loudness_follow_up_lock = threading.Lock()
 _REDETECT_SOURCE = "inspector"
 _SEASON_PUBLISH_SOURCE = "inspector_season"
 DECIDE_AGAIN_JOB_NAME = "Intro & Credits: files the old rules couldn't decide, decided again"
@@ -500,7 +509,12 @@ def submit_pending_follow_up(preview_job_id: str, overrides: dict | None = None)
                 pin=server_pin(request),
             )
             _submit_loudness_follow_up(
-                preview_job_id, queued, paths, str(request.get("source") or "webhook"), server_pin(request)
+                preview_job_id,
+                queued,
+                paths,
+                str(request.get("source") or "webhook"),
+                server_pin(request),
+                defer_directories=True,
             )
             return queued
         finally:
@@ -511,20 +525,31 @@ def submit_pending_follow_up(preview_job_id: str, overrides: dict | None = None)
 
 
 def _submit_loudness_follow_up(
-    preview_job_id: str, intro_job_ids: list[str], paths: list[str], source: str, pin: str | None
+    preview_job_id: str,
+    intro_job_ids: list[str],
+    paths: list[str],
+    source: str,
+    pin: str | None,
+    *,
+    defer_directories: bool = False,
 ) -> None:
-    """Queue the Plex loudness job for a webhook preview job's files, when any server has loudness on. Never raises:
+    """Queue Plex loudness for eligible files enumerated by a preview run. Never raises:
     a failure here must not cost the files their Intro & Credits follow-up.
 
-    It waits for the files' Intro & Credits follow-up when one was queued (``intro_job_ids``), else for the preview
-    job: previews, then Intro & Credits, then loudness, at the same priority.
+    Each bounded job waits for its own preview and all overlapping Intro & Credits first attempts.
     """
     try:
         from ..loudness.job import create_loudness_job
-        from ..loudness.settings import loudness_enabled_anywhere
+        from ..loudness.settings import loudness_enabled_anywhere, loudness_matches
 
         configs = _server_configs()
         if not paths or not loudness_enabled_anywhere(configs):
+            return
+        if defer_directories:
+            # Use only a type check, never traversal: the preview's existing expansion selects the children.
+            # Missing explicit files stay intact for sender retries; dispatch then deduplicates actual files.
+            paths = [path for path in paths if not any(os.path.isdir(p) for p in _local_candidates(path, configs))]
+        if not paths:
             return
         # A known non-Plex originator can ask enabled Plex owners. A Plex pin never grants another server access.
         if pin is not None:
@@ -537,29 +562,102 @@ def _submit_loudness_follow_up(
             else:
                 pin = None
         jm = get_job_manager()
-        # Only a never-started follow-up with sufficient server and retry coverage can cover this arrival.
-        queued = _queued_in_waiting_follow_ups(jm, configs, pin, source, kind=JOB_KIND_LOUDNESS)
-        rest = [path for path in paths if not (_local_candidates(path, configs) & queued)]
-        if not rest:
-            return
-        preview = jm.get_job(preview_job_id)
-        if len(rest) == len(paths) and preview is not None and preview.library_name:
-            name = f"Plex loudness · {preview.library_name}"
-        elif len(rest) == 1:
-            name = f"Plex loudness · {os.path.basename(rest[0])}"
-        else:
-            name = f"Plex loudness · {len(rest)} files"
-        create_loudness_job(
-            library_name=name,
-            # As Intro & Credits: Normal (ahead of a Low library backfill), Low only when the preview job is Low.
-            priority=max(PRIORITY_NORMAL, preview.priority) if preview is not None else PRIORITY_NORMAL,
-            source=source,
-            file_paths=rest,
-            follows_job_id=next(iter(intro_job_ids), preview_job_id),
-            server_id=pin,
+        eligible = [cfg for cfg in configs if pin in (None, cfg.id)]
+        paths = list(
+            dict.fromkeys(
+                path
+                for path in paths
+                if any(loudness_matches(candidate, eligible) for candidate in _local_candidates(path, configs))
+            )
         )
+        if not paths:
+            return
+        with _loudness_follow_up_lock:
+            _queue_loudness_paths(jm, configs, preview_job_id, intro_job_ids, paths, source, pin, create_loudness_job)
     except Exception as exc:
         logger.warning("Couldn't queue the Plex loudness job for preview job {}: {}", preview_job_id[:8], exc)
+
+
+def _queue_loudness_paths(
+    jm: JobManager,
+    configs: list[ServerConfig],
+    preview_job_id: str,
+    intro_job_ids: list[str],
+    paths: list[str],
+    source: str,
+    pin: str | None,
+    create_job: Callable[..., Job],
+) -> None:
+    """Persist bounded follow-ups, deduplicating only this preview's own work under the creation lock."""
+    from ..loudness.job import MAX_FOLLOW_UP_DEPENDENCIES
+
+    queued: set[str] = set()
+    for earlier in jm.get_all_jobs():
+        cfg = earlier.config or {}
+        dependencies = [cfg.get("follows_job_id"), *(cfg.get("follows_job_ids") or [])]
+        if earlier.kind == JOB_KIND_LOUDNESS and preview_job_id in dependencies and server_pin(cfg) in (None, pin):
+            for path in cfg.get("file_paths") or []:
+                queued |= _local_candidates(path, configs)
+    # Different previews need their own barriers: a prior pending job could start before this preview finishes.
+    rest = [path for path in paths if not (_local_candidates(path, configs) & queued)]
+    if not rest:
+        return
+    preview = jm.get_job(preview_job_id)
+    if len(rest) == len(paths) and preview is not None and preview.library_name:
+        name = f"Plex loudness · {preview.library_name}"
+    elif len(rest) == 1:
+        name = f"Plex loudness · {os.path.basename(rest[0])}"
+    else:
+        name = f"Plex loudness · {len(rest)} files"
+    markers = {
+        entry.id: entry
+        for entry in [*jm.get_pending_jobs(), *jm.get_running_jobs()]
+        if entry.kind == JOB_KIND_INTRO_CREDITS
+    }
+    # Index once, not a marker-jobs scan per file or batch. Include joined jobs omitted by submit_follow_ups.
+    by_path: dict[str, set[str]] = {}
+    for marker in markers.values():
+        for path in (marker.config or {}).get("file_paths") or []:
+            for candidate in _local_candidates(path, configs):
+                by_path.setdefault(candidate, set()).add(marker.id)
+    # A caller-supplied job without file metadata still has to finish; known jobs are scoped per batch below.
+    common = {preview_job_id, *(mid for mid in intro_job_ids if mid not in markers)}
+    batches: list[tuple[list[str], set[str]]] = []
+    batch: list[str] = []
+    dependencies = set(common)
+    for path in rest:
+        needed = set(common)
+        for candidate in _local_candidates(path, configs):
+            # A marker job can still hold the original directory request. Walk path components, not a string
+            # prefix: /Movies must cover /Movies/a.mkv, never /Movies-other/a.mkv. No filesystem walk is needed.
+            while candidate:
+                needed.update(by_path.get(candidate, ()))
+                parent = os.path.dirname(candidate)
+                if parent == candidate:
+                    break
+                candidate = parent
+        if len(needed) > MAX_FOLLOW_UP_DEPENDENCIES:
+            # Never drop a barrier to force work through an overloaded queue.
+            logger.warning("Too many preceding jobs to queue loudness for preview {}", preview_job_id[:8])
+            continue
+        if batch and (len(batch) == MAX_RETRY_FILES or len(dependencies | needed) > MAX_FOLLOW_UP_DEPENDENCIES):
+            batches.append((batch, dependencies))
+            batch, dependencies = [], set(common)
+        batch.append(path)
+        dependencies.update(needed)
+    if batch:
+        batches.append((batch, dependencies))
+    for index, (batch, dependencies) in enumerate(batches, 1):
+        ordered = [preview_job_id, *sorted(dependencies - {preview_job_id})]
+        create_job(
+            library_name=f"{name} · batch {index}/{len(batches)}" if len(batches) > 1 else name,
+            priority=max(PRIORITY_NORMAL, preview.priority) if preview is not None else PRIORITY_NORMAL,
+            source=source,
+            file_paths=batch,
+            follows_job_id=next((mid for mid in intro_job_ids if mid in dependencies), preview_job_id),
+            follows_job_ids=ordered,
+            server_id=pin,
+        )
 
 
 def submit_redetect(path: str) -> str:

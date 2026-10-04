@@ -334,8 +334,8 @@ The legacy `/webhooks` and `/schedules` URLs still work — they 302-redirect to
 
 ### Inspector
 
-**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, and where its intro
-and credits are on each server.
+**Tools → Inspector** (`/inspector`) shows one film or episode on one page: its preview frames, where its intro
+and credits are on each server, and the loudness measurements Plex reports for its audio tracks.
 
 - **Search.** Type a title and results appear as you type, from every server (or the one picked in the dropdown). A
   film several servers have is one row. Each row says whether the preview is ready (and how many frames it has) and
@@ -355,6 +355,10 @@ and credits are on each server.
 - **How it was decided** lists every source, what it found and whether it was used. **On your servers** says, per
   server, what it shows, its intro & credits state and its preview; **File locations** opens to each preview's path
   (Plex's bundle BIF, Emby's BIF next to the video, Jellyfin's trickplay folder).
+- **Loudness** shows each Plex audio track's integrated loudness, true peak, loudness range, threshold and gain
+  offset, together with whether Plex can normalize the track. These are the measurements reported by Plex, including
+  native results when this app's loudness feature is off. Missing, incomplete or unavailable results are labelled;
+  opening the Inspector does not start analysis. Use **New job → Plex loudness** to run it for enabled libraries.
 - **A file not checked yet** is the same page: the rows show what each server has today, and **Check intro & credits
   now** checks it.
 - **Regenerate preview** rebuilds the preview for every server that has the file (a job on the Dashboard);

@@ -61,14 +61,28 @@ backfill. The app compares Plex's live identity with the mounted config, checks 
 matches the file's size and Plex bundle hash before analysis. Inside the write transaction it checks the file and
 stream snapshot again. A changed source is left unwritten and checked again later.
 
-New files get it after their previews (and their Intro & Credits, when that's on), when Sonarr, Radarr or Plex sends
-a webhook. For the files you already have,
+Enabled files get a loudness follow-up after their previews and any relevant Intro & Credits jobs, including
+webhooks, manual library runs and scheduled preview scans. Recently Added processing uses the same follow-up flow.
+Chapter thumbnails remain part of the Previews job; Intro & Credits and loudness are separate jobs. Follow-ups can
+appear in the queue together while waiting for the preceding jobs' first passes; they do not wait through every
+retry of those jobs. For a loudness-only backfill,
 start a **Plex loudness** job from the dashboard (**New job**), for chosen libraries or all of them. A file Plex
 hasn't added to its library yet, or met while Plex was restarting or its database busy, is checked again according to
 your retry settings. The same job row shows the countdown and attempt count; **Retry now** skips the wait.
 After retries end, unresolved files leave a failure or a completion warning when other files succeeded. The Files
 panel gives the reason. These retries are automatic and do not require review or approval.
 Jobs share the workers, priorities, pause and cancel of every other job.
+
+### Checking the results
+
+Open a file in **Tools → Inspector**. Its **Loudness** section shows the measurements Plex reports for each audio
+track and whether normalization is available. It also displays complete native Plex results when this app's
+automatic loudness analysis is off. Availability means Plex can normalize the track; the player's **Normalize
+Loudness** setting is separate.
+
+The Inspector distinguishes missing measurements, incomplete results and a server it cannot reach. It reads metadata
+without changing it or starting a job. The job banner identifies **Plex loudness** separately from Previews and Intro
+& Credits, and the results refresh when the job finishes.
 
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
 publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item.

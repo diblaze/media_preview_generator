@@ -2160,6 +2160,67 @@ button.insp-frame:focus-visible {
     overflow-wrap: anywhere;
 }
 
+/* Loudness uses a separate measurement list for each audio track. */
+.insp-loudness-server {
+    border-top: 1px solid var(--insp-line);
+    padding: 16px 0 4px;
+}
+
+.insp-loudness-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px 16px;
+}
+
+.insp-loudness-name,
+.insp-loudness-track-name {
+    margin: 0;
+    color: var(--insp-text);
+    overflow-wrap: anywhere;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.insp-loudness-status,
+.insp-loudness-note {
+    font-size: 14px;
+    color: var(--insp-muted);
+    overflow-wrap: anywhere;
+}
+
+.insp-loudness-note {
+    margin: 6px 0 12px;
+    max-width: 75ch;
+}
+
+.insp-loudness-track {
+    margin: 16px 0;
+}
+
+.insp-loudness-track-name {
+    font-weight: 500;
+}
+
+.insp-loudness-values {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(128px, 100%), 1fr));
+    gap: 12px 24px;
+    margin: 12px 0;
+}
+
+.insp-loudness-values dt {
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--insp-muted);
+}
+
+.insp-loudness-values dd {
+    margin: 4px 0 0;
+    font-size: 16px;
+    font-variant-numeric: tabular-nums;
+}
+
 /* --- Whole season (board 6) ----------------------------------------------- */
 
 .insp-season-card {

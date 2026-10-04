@@ -21,6 +21,27 @@ Music is excluded because complete native music analysis includes additional
 album and fade data. The remote helper needs a separate loudness capability and
 typed operations before it can support this feature.
 
+## Inspector and automatic entry points
+
+Inspector reads each owning Plex server's metadata for the exact item and part matching the selected file. It
+reports per-stream measurements and normalization capability without requiring the app's analysis opt-in or a local
+Plex database mount. This is a read-only view of Plex's reported data, not proof that a same-size replacement has
+already been reanalysed. Source size and fingerprint mismatches are reported instead of presenting known-stale
+measurements as current. Unsupported or incomplete data stays distinguishable from a server that cannot be reached.
+Non-finite native sentinel values use valid JSON strings; malformed values never become JSON NaN or Infinity.
+
+Automatic loudness follow-ups use the actual paths selected by preview processing for webhook, manual/library and
+scheduled runs, including Recently Added. Eligibility is shared with library opt-in and path ownership; preview
+retry children do not create another workflow. A loudness follow-up waits for its own preview and all relevant
+Intro & Credits jobs using the existing first-pass dependency semantics. The single dependency field remains
+compatible with persisted jobs, while the complete dependency list prevents a joined marker job from letting
+loudness start before its own preview has finished. Chapter thumbnails remain in the Previews job.
+
+Follow-ups are bounded to 500 files and 500 dependency IDs per job. Repeated submission for the same preview
+does not queue the same file again, including after a restart. Separate preview jobs retain their own follow-ups
+so an earlier runnable job cannot bypass a later preview's dependency. Existing native results make a repeated
+loudness check inexpensive.
+
 ## Detection and measurement
 
 For each owning, enabled Plex server, resolve the canonical path using the
@@ -102,9 +123,10 @@ so restart recovery is idempotent. The initial Files history remains capped;
 only the bounded retry results bypass that cap. Neither aggregate accuracy nor
 the final per-server status depends on which initial history rows were retained.
 
-Webhook deduplication follows the current marker model: only never-started
-pending jobs with a compatible source and covering server scope can suppress a
-new event. A running job may already have processed the old bytes at that path.
+Automatic loudness deduplication is scoped to the originating preview job and
+covering server scope. It recognizes persisted follow-ups in every state so
+replaying enumeration does not create duplicates. A separate preview retains
+its own dependency and follow-up, even when an earlier job covers the same file.
 
 Cancellation is checked before analysis and again inside each write transaction,
 including an item that needs only its completion mark. Pause and process cleanup
@@ -126,3 +148,5 @@ proofs use the claimed Plex lab and dedicated test items, retaining native
 baselines, codec comparisons, playback measurements and rollback evidence in
 [`evidence/`](evidence/). The read-only comparison harness is
 [`verify_plex_loudness.py`](../../../tests/integration/verify_plex_loudness.py).
+The [Inspector and automatic follow-up proof](evidence/inspector-automation-live-2026-10-04.md)
+records real Plex metadata, browser rendering, completion refresh and preview-skip coverage.
