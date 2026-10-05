@@ -11,7 +11,7 @@ from flask import Response, current_app, jsonify, request, session
 from loguru import logger
 
 from ...config import MAX_CPU_THREADS
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS
+from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KINDS
 from ...scan_filters import FILTER_CONFIG_KEYS, normalize_scan_filter_config
 from ..auth import (
     api_token_required,
@@ -43,6 +43,7 @@ from .job_runner import _start_job_async
 
 if TYPE_CHECKING:
     from ...markers.reconcile import ReconcileQueued
+    from ..jobs import Job
 
 
 def _parse_worker_request(data: dict) -> tuple[str, int] | tuple[None, tuple]:
@@ -277,23 +278,86 @@ def api_set_token():
 # ============================================================================
 
 
-def _job_rows(jobs: list) -> list[dict]:
+def _job_rows(
+    jobs: list, configs: list | None = None, scopes: dict | None = None, path_cache: dict | None = None
+) -> list[dict]:
     """The jobs as the Jobs page reads them: each job's fields plus ``library_names``, the libraries it covers
     (``job_details.job_library_names``; empty where its config names none)."""
     rows = [j.to_dict() for j in jobs]
     try:
-        from ..job_details import job_library_names, saved_server_configs
+        from ..job_details import job_library_names, job_library_scope, saved_server_configs
         from ..settings_manager import get_settings_manager
 
-        configs = saved_server_configs(get_settings_manager().get("media_servers"))
+        if configs is None:
+            configs = saved_server_configs(get_settings_manager().get("media_servers"))
         names = [job_library_names(j, configs) for j in jobs]
+        associations = [
+            scopes[j.id] if scopes is not None and j.id in scopes else job_library_scope(j, configs, path_cache)
+            for j in jobs
+        ]
     except Exception as exc:
         # A library tag is a label: an unreadable server config must not empty the queue.
         logger.debug("Couldn't work out the jobs' libraries: {}: {}", type(exc).__name__, exc)
         names = [[] for _ in jobs]
-    for row, library_names in zip(rows, names, strict=True):
+        associations = [[] for _ in jobs]
+    for row, library_names, library_scope in zip(rows, names, associations, strict=True):
         row["library_names"] = library_names
+        row["library_scope"] = library_scope
     return rows
+
+
+def _filter_jobs_by_query(
+    jobs: list, query: str, configs: list | None = None, scopes: dict | None = None, path_cache: dict | None = None
+) -> list:
+    """Match queue labels across all pages without consulting media servers."""
+    from ..job_details import job_library_names, job_library_scope, saved_server_configs
+    from ..settings_manager import get_settings_manager
+
+    if configs is None:
+        try:
+            configs = saved_server_configs(get_settings_manager().get("media_servers"))
+        except Exception as exc:
+            logger.debug("Couldn't load server labels for job search: {}", type(exc).__name__)
+            configs = []
+    server_names = {cfg.id: cfg.name for cfg in configs}
+    if scopes is None:
+        scopes = {}
+    if path_cache is None:
+        path_cache = {}
+    source_labels = {
+        "plex": "Plex Direct",
+        "emby": "Emby Webhook",
+        "jellyfin": "Jellyfin Webhook",
+        "custom": "Custom Webhook",
+        "scheduled": "Scheduled",
+        "schedule": "Scheduled",
+        "recently_added": "Recently Added",
+        "scheduled_recently_added": "Scheduled scan",
+        "theintrodb_recheck": "TheIntroDB recheck",
+        "version_rerun": "App update",
+    }
+    kind_labels = {"previews": "Video previews", "intro_credits": "Intro & Credits", "loudness": "Plex loudness"}
+    matched = []
+    for job in jobs:
+        cfg = job.config or {}
+        labels = [job.id, job.library_name, job.server_name, job.server_type, job.kind]
+        labels.extend((kind_labels.get(job.kind, ""), source_labels.get(cfg.get("source"), "")))
+        labels.extend(job_library_names(job, configs))
+        if job.id not in scopes:
+            scopes[job.id] = job_library_scope(job, configs, path_cache)
+        for pair in scopes[job.id]:
+            labels.extend((pair["server_name"], pair["library_name"]))
+        labels.append(server_names.get(job.server_id, ""))
+        labels.extend(cfg.get(key, "") for key in ("source", "webhook_source", "title"))
+        for pair in cfg.get("libraries") or []:
+            if isinstance(pair, dict):
+                labels.append(server_names.get(str(pair.get("server_id") or ""), ""))
+        for publisher in job.publishers or []:
+            if isinstance(publisher, dict):
+                labels.extend(publisher.get(key, "") for key in ("server_name", "server_type"))
+        if any(query in str(label or "").casefold() for label in labels):
+            matched.append(job)
+    return matched
 
 
 @api.route("/jobs")
@@ -304,6 +368,11 @@ def get_jobs():
     Query params:
         page: Page number (default 1). Use 0 to return all jobs unpaginated.
         per_page: Items per page (default 50, max 200).
+        status: Optional running, pending, completed, failed, cancelled, or paused filter.
+        q: Optional case-insensitive search of job, library, source and server labels.
+        kind: Optional previews, intro_credits, or loudness filter.
+        server_id: Originating or selected/path-associated server, not publication success.
+        library_server_id, library_id: An exact server/library pair; both are required.
         include_retry_attempts: Set to ``1`` to include per-attempt retry
             Jobs (``config.is_retry_attempt``) in the response. Default
             is to hide them so the dashboard shows ONE row per file
@@ -318,6 +387,38 @@ def get_jobs():
     try:
         job_manager = get_job_manager()
         all_jobs = job_manager.get_all_jobs()
+        from ..job_details import job_library_scope, saved_server_configs
+        from ..settings_manager import get_settings_manager
+
+        try:
+            configs = saved_server_configs(get_settings_manager().get("media_servers"))
+        except Exception as exc:
+            logger.debug("Couldn't load saved job filter labels: {}", type(exc).__name__)
+            configs = []
+        scopes: dict[str, list[dict]] = {}
+        path_cache: dict = {}
+
+        def scope(job: "Job") -> list[dict]:
+            if job.id not in scopes:
+                scopes[job.id] = job_library_scope(job, configs, path_cache)
+            return scopes[job.id]
+
+        server_options = {cfg.id: {"id": cfg.id, "name": cfg.name, "type": cfg.type.value} for cfg in configs}
+        for job in all_jobs:
+            if job.server_id and job.server_id not in server_options:
+                server_options[job.server_id] = {
+                    "id": job.server_id,
+                    "name": job.server_name or job.server_id,
+                    "type": job.server_type or "",
+                }
+        filter_options = {
+            "servers": list(server_options.values()),
+            "libraries": [
+                {"id": str(lib.id), "name": lib.name, "server_id": cfg.id, "server_name": cfg.name}
+                for cfg in configs
+                for lib in cfg.libraries
+            ],
+        }
 
         include_attempts = request.args.get("include_retry_attempts") == "1"
         if not include_attempts:
@@ -328,6 +429,45 @@ def get_jobs():
             # otherwise discussion #239 repeats — the queue collapses
             # children but the KPI keeps counting them.
             all_jobs = [j for j in all_jobs if is_user_visible_job(j)]
+
+        status_filter = (request.args.get("status") or "").strip().lower()
+        if status_filter and status_filter != "all":
+            if status_filter == "paused":
+                all_jobs = [j for j in all_jobs if j.status in (JobStatus.PENDING, JobStatus.RUNNING) and j.paused]
+            elif status_filter in {status.value for status in JobStatus}:
+                all_jobs = [j for j in all_jobs if j.status.value == status_filter]
+            else:
+                return jsonify({"error": "Invalid job status filter"}), 400
+        query = (request.args.get("q") or "").strip().casefold()
+        if query:
+            all_jobs = _filter_jobs_by_query(all_jobs, query, configs, scopes, path_cache)
+
+        kind = (request.args.get("kind") or "").strip()
+        if kind:
+            if kind not in JOB_KINDS:
+                return jsonify({"error": "Invalid job type filter"}), 400
+            all_jobs = [job for job in all_jobs if job.kind == kind]
+        server_id = (request.args.get("server_id") or "").strip()
+        library_server_id = (request.args.get("library_server_id") or "").strip()
+        library_id = (request.args.get("library_id") or "").strip()
+        if bool(library_server_id) != bool(library_id):
+            return jsonify({"error": "Library filtering requires both library_server_id and library_id"}), 400
+        if server_id:
+            all_jobs = [
+                job
+                for job in all_jobs
+                if job.server_id == server_id
+                or str(job.config.get("server_id") or "") == server_id
+                or any(pair["server_id"] == server_id for pair in scope(job))
+            ]
+        if library_id:
+            all_jobs = [
+                job
+                for job in all_jobs
+                if any(
+                    pair["server_id"] == library_server_id and pair["library_id"] == library_id for pair in scope(job)
+                )
+            ]
 
         running = [j for j in all_jobs if j.status == JobStatus.RUNNING]
         pending = sorted(
@@ -350,7 +490,8 @@ def get_jobs():
         if page == 0:
             return jsonify(
                 {
-                    "jobs": _job_rows(sorted_jobs),
+                    "jobs": _job_rows(sorted_jobs, configs, scopes, path_cache),
+                    "filter_options": filter_options,
                     "total": total,
                     "page": 0,
                     "per_page": total,
@@ -365,7 +506,8 @@ def get_jobs():
 
         return jsonify(
             {
-                "jobs": _job_rows(page_jobs),
+                "jobs": _job_rows(page_jobs, configs, scopes, path_cache),
+                "filter_options": filter_options,
                 "total": total,
                 "page": page,
                 "per_page": per_page,
@@ -1781,6 +1923,8 @@ def _build_idle_workers_from_config():
     # the UI between rendering modes when the dispatcher takes over.
     idle_entry = {
         "status": "idle",
+        "job_id": None,
+        "current_file": "",
         "current_title": "",
         "library_name": "",
         "progress_percent": 0,
