@@ -3136,7 +3136,8 @@ function _patchWorkerCard(col, worker) {
     const progressPercent = isChapterWork
         ? (chapterTotal ? chapterProcessed / chapterTotal * 100 : 0)
         : (isProcessing ? (worker.progress_percent || 0) : 0);
-    const indeterminate = isLoudnessWork || isChapterWork && !chapterDeterminate || isProcessing && !ffmpegStarted && !isChapterWork;
+    // Loudness is striped until its ffmpeg reports a position, then a real percent across the file's streams.
+    const indeterminate = isChapterWork && !chapterDeterminate || isProcessing && !ffmpegStarted && !isChapterWork;
     const showProgress = isChapterWork ? chapterDeterminate : isProcessing && ffmpegStarted;
     const desiredWidth = indeterminate ? '35%' : (showProgress ? `${progressPercent.toFixed(1)}%` : '0%');
     if (progress.style.width !== desiredWidth) {
@@ -3194,7 +3195,7 @@ function _patchWorkerCard(col, worker) {
         percent.style.minWidth = '';
         speed.parentElement.style.display = 'none';
         if (etaWrap) etaWrap.style.display = 'none';
-    } else if (isLoudnessWork || isProcessing && !ffmpegStarted) {
+    } else if (isProcessing && !ffmpegStarted) {
         const phaseRaw = (worker.current_phase || '').trim();
         const isReusePhase = phaseRaw && _PHASE_REUSE_RE.test(phaseRaw);
         const phaseLabel = loudnessStream ? `Analyzing audio · stream ${loudnessStream[1]}/${loudnessStream[2]}` : phaseRaw || (isLoudnessWork ? 'Analyzing audio…' : 'Working…');
@@ -3219,7 +3220,7 @@ function _patchWorkerCard(col, worker) {
         percent.style.minWidth = '';
         speed.parentElement.style.display = '';
         if (etaWrap) etaWrap.style.display = '';
-        const percentText = `${progressPercent.toFixed(1)}%`;
+        const percentText = loudnessStream ? `${progressPercent.toFixed(1)}% · stream ${loudnessStream[1]}/${loudnessStream[2]}` : `${progressPercent.toFixed(1)}%`;
         if (percent.textContent !== percentText) percent.textContent = percentText;
         const speedText = paused ? '—' : isProcessing ? (worker.speed || '0.0x') : '—';
         if (speed.textContent !== speedText) speed.textContent = speedText;

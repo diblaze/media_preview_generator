@@ -38,7 +38,7 @@ class LoudnessError(Exception):
     """ffmpeg failed, timed out, was cancelled, or printed no loudnorm report."""
 
 
-def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
+def command(ffmpeg: str, path: str, index: int, codec: str = "", progress: str = "") -> list[str]:
     """The ffmpeg command for one stream: Plex's own, on the CPU (audio decoding gains nothing from a GPU).
 
     Args:
@@ -46,6 +46,7 @@ def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
         path: The media file.
         index: The stream's index in the file (Plex's ``media_streams.index``).
         codec: The stream's codec (``media_streams.codec``); EAC3 is decoded without DRC, as Plex's decoder does.
+        progress: Where ffmpeg writes its ``-progress`` blocks (``pipe:N``); empty: no progress output.
 
     Returns:
         The argument list.
@@ -59,6 +60,7 @@ def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
         ffmpeg,
         "-hide_banner",
         "-nostats",
+        *(["-progress", progress] if progress else []),
         *(["-drc_scale", "0"] if codec in NO_DRC_CODECS else []),
         "-i",
         path,
@@ -136,6 +138,26 @@ def valid_measurements(fields: dict[str, str]) -> bool:
     )
 
 
+def _report_progress(
+    rfd: int, pending: bytes, duration_ms: int | None, progress: Callable[[float, str], None] | None
+) -> bytes:
+    """Read the -progress lines ffmpeg wrote so far; report the last complete position. Returns the unfinished line."""
+    while True:
+        try:
+            chunk = os.read(rfd, 65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        pending += chunk
+    *lines, pending = pending.split(b"\n")
+    values = dict(line.decode("ascii", "replace").partition("=")[::2] for line in lines if b"=" in line)
+    out_us = values.get("out_time_us", "")
+    if progress and out_us.isdigit():
+        progress(min(1.0, int(out_us) / (duration_ms * 1000)) if duration_ms else 0.0, values.get("speed", "").strip())
+    return pending
+
+
 def run(
     ffmpeg: str,
     path: str,
@@ -145,6 +167,7 @@ def run(
     codec: str = "",
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
+    progress: Callable[[float, str], None] | None = None,
 ) -> dict[str, str]:
     """Analyse one stream and return its ``ln:*`` fields.
 
@@ -152,10 +175,12 @@ def run(
         ffmpeg: The ffmpeg binary.
         path: The media file (read only).
         index: The stream's index in the file.
-        duration_ms: The file's length, for the time limit.
+        duration_ms: The file's length, for the time limit and the progress fraction.
         codec: The stream's codec (see ``command``).
         cancel_check: True once the job is cancelled; ffmpeg is killed.
         pause_check: True while everything is paused: ffmpeg is stopped where it is and the time limit moves out.
+        progress: Called with the fraction of the stream analysed (0 to 1; 0 without a duration) and ffmpeg's speed
+            (``17.5x``), as ffmpeg reports them.
 
     Raises:
         LoudnessError: ffmpeg failed, timed out, was cancelled, or its report was unusable.
@@ -168,31 +193,47 @@ def run(
     freeze.hold(cancel_check=cancel_check, name=name)
     if cancel_check and cancel_check():
         raise LoudnessError(f"Loudness analysis of {name} cancelled")
+    # ffmpeg's -progress blocks (key=value lines) arrive on a pipe of their own; stderr keeps the loudnorm report.
+    rfd, wfd = os.pipe()
+    os.set_blocking(rfd, False)
     # Its own session, so a pause stops ffmpeg's whole group and never the app's.
     try:
         proc = subprocess.Popen(
-            command(ffmpeg, path, index, codec),
+            command(ffmpeg, path, index, codec, progress=f"pipe:{wfd}"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=(wfd,),
         )
-    except OSError as exc:
-        raise LoudnessError(f"Could not start ffmpeg analysing {name}: {exc.strerror or type(exc).__name__}") from exc
+    except BaseException as exc:
+        os.close(rfd)
+        if isinstance(exc, OSError):
+            raise LoudnessError(
+                f"Could not start ffmpeg analysing {name}: {exc.strerror or type(exc).__name__}"
+            ) from exc
+        raise
+    finally:
+        os.close(wfd)
     deadline = freeze.clock() + timeout_s
+    pending = b""
     try:
         while True:
             try:
                 _out, err = proc.communicate(timeout=_POLL_S)
                 break
             except subprocess.TimeoutExpired:
+                pending = _report_progress(rfd, pending, duration_ms, progress)
                 freeze.hold(proc, cancel_check=cancel_check, name=name)
                 cancelled = bool(cancel_check and cancel_check())
                 if cancelled or freeze.clock() > deadline:
                     why = "cancelled" if cancelled else f"timed out after {timeout_s:.0f} s"
                     raise LoudnessError(f"Loudness analysis of {name} {why}") from None
+        _report_progress(rfd, pending, duration_ms, progress)  # what ffmpeg wrote after the last poll
     except BaseException:
         kill_and_collect(proc, what=f"ffmpeg analysing loudness of {name}", reaper_name=REAPER, wait_s=KILL_WAIT_S)
         raise
+    finally:
+        os.close(rfd)
     if cancel_check and cancel_check():
         raise LoudnessError(f"Loudness analysis of {name} cancelled")
     text = (err or b"").decode("utf-8", errors="replace")
