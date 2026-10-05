@@ -222,7 +222,7 @@ def get_system_status():
             "gpus": gpus,
             "gpu_stats": [],
             "running_job": running_job.to_dict() if running_job else None,
-            "pending_jobs": len(job_manager.get_pending_jobs()),
+            "pending_jobs": job_manager.get_stats()["pending"],
         }
         return jsonify(resp)
     except Exception:

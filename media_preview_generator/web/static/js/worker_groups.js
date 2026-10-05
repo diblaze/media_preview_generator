@@ -15,6 +15,7 @@
     let editing = null;
     let saving = false;
     let loading = null;
+    let requestedEditor = new URLSearchParams(window.location.search).get('worker_group');
     const pending = new Set();
     const settings = () => document.getElementById('workerGroupSettings');
     const dashboard = () => document.getElementById('workerGroupDashboard');
@@ -81,8 +82,23 @@
             && Date.parse(row.next_available_at) > Date.now() ? row.next_available_at : null;
         return {
             ...row, next_available_at: nextOpening, available: row.available ?? 0, busy: row.busy ?? 0, finishing: row.finishing ?? 0,
-            label: snapshot.processing_paused ? 'Globally paused' : !group.enabled ? 'Disabled' : row.state === 'draining' && nextOpening ? 'Outside hours' : labels[row.state] || 'Configured',
+            label: !group.enabled ? 'Disabled' : row.state === 'draining' && nextOpening ? 'Outside hours' : labels[row.state] || 'Configured',
         };
+    }
+
+    function activity(state) {
+        const parts = [];
+        if (!snapshot.processing_paused && state.available) parts.push(`${state.available} available`);
+        if (state.busy) parts.push(`${state.busy} ${snapshot.processing_paused ? 'paused' : 'running'}`);
+        if (state.finishing) parts.push(`${state.finishing} finishing${snapshot.processing_paused ? ' after resume' : ''}`);
+        return parts;
+    }
+
+    function resourceDescription(group) {
+        if (group.resource === 'cpu') return '<span>CPU</span>';
+        const hardware = resourceName(group);
+        if (group.name === hardware) return '<span>GPU</span>';
+        return `<details class="worker-group-hardware"><summary>GPU hardware</summary><span>${escape(hardware)}</span></details>`;
     }
 
     function renderRows(container, live) {
@@ -91,14 +107,17 @@
             const state = status(group);
             const busy = pending.has(group.id);
             const controls = live ? `
-                <div class="worker-group-scale" role="group" aria-label="Scale ${escape(group.name)}">
+                <div class="worker-group-capacity"><span class="worker-group-control-label">Workers</span><div class="worker-group-scale" role="group" aria-label="Scale ${escape(group.name)}">
                     <button type="button" class="btn btn-sm btn-outline-secondary" data-scale="-1" data-id="${escape(group.id)}" aria-label="Remove worker from ${escape(group.name)}" ${!group.enabled || busy ? 'disabled' : ''}><i class="bi bi-dash-lg" aria-hidden="true"></i></button>
                     <output aria-label="Desired workers" class="worker-group-count">${group.enabled ? group.count : 0}</output>
                     <button type="button" class="btn btn-sm btn-outline-secondary" data-scale="1" data-id="${escape(group.id)}" aria-label="Add worker to ${escape(group.name)}" ${busy || group.enabled && group.count >= (snapshot.limits?.[group.resource] || 32) ? 'disabled' : ''}><i class="bi bi-plus-lg" aria-hidden="true"></i></button>
-                </div>` : `<span class="small">${group.count} desired</span><button type="button" class="btn btn-sm btn-outline-secondary" data-edit="${escape(group.id)}" ${saving ? 'disabled' : ''}>Edit<span class="visually-hidden"> ${escape(group.name)}</span></button>`;
+                </div></div><a class="btn btn-sm btn-outline-secondary worker-group-edit" href="/settings?worker_group=${encodeURIComponent(group.id)}#section-workers">Edit<span class="visually-hidden"> ${escape(group.name)}</span></a>` : `<div class="worker-group-capacity"><span class="worker-group-control-label">Workers</span><span class="worker-group-count" aria-label="Configured workers">${group.count}</span></div><button type="button" class="btn btn-sm btn-outline-secondary worker-group-edit" data-edit="${escape(group.id)}" ${saving ? 'disabled' : ''}>Edit<span class="visually-hidden"> ${escape(group.name)}</span></button>`;
+            const showState = live && !['Within group hours', 'Available', 'Workers busy', 'Configured'].includes(state.label);
+            const counts = live ? activity(state) : [];
+            const availability = !group.enabled && live ? `${group.count} saved worker${group.count === 1 ? '' : 's'}` : hours(group);
             return `<div class="worker-group-row" data-group-id="${escape(group.id)}">
-                <div class="worker-group-description"><strong>${escape(group.name)}</strong><div class="small text-body-secondary">${escape(resourceName(group))} · ${group.job_types.map(kind => escape(JOBS[kind] || kind)).join(' · ')}</div><div class="small text-body-secondary">${escape(hours(group))}</div>
-                ${live ? `<div class="worker-group-state small">${escape(state.label)}${state.next_available_at ? ' · Next ' + escape(nextTime(state.next_available_at)) : ''}</div><div class="worker-group-counts small"><span>${state.available} available</span><span>${state.busy} ${snapshot.processing_paused ? 'paused' : 'running'}</span><span>${state.finishing} finishing${snapshot.processing_paused ? ' (paused)' : ''}</span></div>` : ''}</div>
+                <div class="worker-group-description"><strong>${escape(group.name)}</strong><div class="worker-group-meta small text-body-secondary">${resourceDescription(group)}<span>${group.job_types.map(kind => escape(JOBS[kind] || kind)).join(' · ')}</span></div>
+                <div class="worker-group-availability small text-body-secondary"><span>${escape(availability)}</span>${live ? `<span class="worker-group-state" ${showState ? '' : 'hidden'}>${escape(state.label)}${state.next_available_at ? ' · Next ' + escape(nextTime(state.next_available_at)) : ''}</span>${counts.length ? `<span class="worker-group-counts">${counts.map(count => `<span>${escape(count)}</span>`).join('')}</span>` : ''}` : ''}</div></div>
                 <div class="worker-group-actions">${controls}<label class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" role="switch" data-enable="${escape(group.id)}" aria-label="Enable ${escape(group.name)}" ${group.enabled ? 'checked' : ''} ${busy || saving ? 'disabled' : ''}><span class="small">Enabled</span></label></div>
             </div>`;
         }).join('');
@@ -122,11 +141,14 @@
     function renderDashboard() {
         const mount = dashboard();
         if (!mount || !snapshot) return;
-        if (!document.getElementById('workerGroupLiveRows')) mount.innerHTML = '<p id="workerGroupHold" class="small text-warning-emphasis mb-2" hidden></p><div id="workerGroupLiveRows"></div><div id="workerGroupLiveWarnings" class="small text-warning-emphasis mt-2"></div><div id="workerGroupLiveMessage" role="status" aria-live="polite"></div><p class="small text-body-secondary mt-2 mb-0">Counts limit simultaneous tasks, not CPU cores. Reducing a group lets its current files finish.</p><a href="/settings#section-workers" class="small d-inline-block mt-2">Edit groups and availability</a>';
+        if (!document.getElementById('workerGroupLiveRows')) mount.innerHTML = '<p id="workerGroupHold" class="worker-group-hold small text-warning-emphasis mb-2" role="status" hidden></p><div id="workerGroupLiveRows"></div><div id="workerGroupLiveWarnings" class="small text-warning-emphasis mt-2"></div><div id="workerGroupLiveMessage" role="status" aria-live="polite"></div><p class="small text-body-secondary mt-2 mb-0">Worker counts set simultaneous tasks, not CPU cores. Current files finish when a group is reduced.</p><a href="/settings#section-workers" class="small d-inline-block mt-2">Manage groups and availability</a>';
         const hold = document.getElementById('workerGroupHold');
         hold.hidden = !snapshot.processing_paused;
         const owners = (snapshot.pause_reasons || []).map(reason => reason === 'quiet_hours' ? 'global pause schedule' : 'manual pause');
-        hold.textContent = 'Processing paused' + (owners.length ? ': ' + owners.join(' and ') : '') + '. Group hours do not clear a pause.';
+        const resumeHint = owners.includes('global pause schedule')
+            ? owners.includes('manual pause') ? 'Resume processing and wait for the pause schedule to end.' : 'Processing resumes when the pause schedule ends.'
+            : 'Resume processing to use available groups.';
+        hold.textContent = 'Processing paused' + (owners.length ? ': ' + owners.join(' and ') : '') + '. ' + resumeHint;
         renderRows(document.getElementById('workerGroupLiveRows'), true);
         document.getElementById('workerGroupLiveWarnings').textContent = warnings().join(' ');
     }
@@ -151,6 +173,8 @@
         warning.hidden = !warning.textContent;
         document.getElementById('workerGroupApplyRow').hidden = !dirty;
         document.getElementById('workerGroupApply').disabled = saving;
+        const editorApply = document.getElementById('workerGroupEditorApply');
+        if (editorApply) editorApply.disabled = saving || !dirty;
         document.getElementById('workerGroupCancel').disabled = saving;
         document.getElementById('workerGroupAdd').disabled = saving;
         document.getElementById('workerGroupAddCpu').disabled = saving;
@@ -181,7 +205,8 @@
         const devices = (snapshot.hardware || []).filter(gpu => gpu.device);
         if (group.device && !devices.some(gpu => gpu.device === group.device)) devices.push({ device: group.device, name: group.device + ' (unavailable)' });
         container.innerHTML = `
-            <div class="d-flex align-items-center justify-content-between gap-2 mb-3"><h4 class="h6 mb-0">Edit group</h4><button type="button" class="btn btn-sm btn-outline-secondary" id="workerGroupClose">Done editing</button></div>
+            <div class="d-flex align-items-center justify-content-between gap-2"><h4 class="h6 mb-0">Edit group</h4><button type="button" class="btn btn-sm btn-outline-secondary" id="workerGroupClose">Close editor</button></div>
+            <div class="d-flex flex-wrap align-items-center gap-2 mt-2 mb-3"><button type="button" class="btn btn-sm btn-primary" id="workerGroupEditorApply" ${saving || !dirty ? 'disabled' : ''}>Apply group changes</button><span class="small text-body-secondary">Save all group edits. Closing keeps your draft.</span></div>
             <div class="row g-3"><div class="col-12"><label class="form-label" for="workerGroupName">Name</label><input id="workerGroupName" class="form-control" maxlength="100" value="${escape(group.name)}"></div>
             <div class="col-sm-8"><label class="form-label" for="workerGroupResource">Resource</label><select id="workerGroupResource" class="form-select"><option value="cpu">CPU</option>${devices.map(gpu => `<option value="${escape(gpu.device)}" ${group.resource === 'gpu' && group.device === gpu.device ? 'selected' : ''}>${escape(gpu.name || gpu.device)}${gpu.status === 'failed' ? ' (unavailable)' : ''}</option>`).join('')}</select></div>
             <div class="col-sm-4"><label class="form-label" for="workerGroupCount">Workers</label><input id="workerGroupCount" type="number" min="1" max="${snapshot.limits?.[group.resource] || 32}" value="${group.count}" class="form-control"><div class="form-text">Simultaneous tasks, not CPU cores.</div></div></div>
@@ -190,6 +215,7 @@
             <div id="workerGroupWindows" ${group.availability.mode === 'always' ? 'hidden' : ''}>${group.availability.windows.map((window, index) => windowEditor(window, index)).join('')}<button type="button" id="workerGroupAddWindow" class="btn btn-outline-secondary btn-sm mt-2">Add time window</button><p class="form-text">${escape(snapshot.timezone || 'App timezone')}. Days select when the window starts: Mon 23:00–07:00 ends Tuesday. Overlapping windows in this group count once.</p></div>
             <div class="d-flex flex-wrap gap-2 mt-3"><button type="button" class="btn btn-sm btn-outline-secondary" id="workerGroupDuplicate">Duplicate group</button><button type="button" class="btn btn-sm btn-outline-danger" id="workerGroupRemove">Remove group</button></div>`;
         const changed = () => { dirty = true; renderSettings(); message('Group changes are not saved until you apply them.'); };
+        document.getElementById('workerGroupEditorApply').onclick = () => save().catch(() => {});
         document.getElementById('workerGroupName').oninput = event => { group.name = event.target.value; changed(); };
         document.getElementById('workerGroupCount').oninput = event => { group.count = Number(event.target.value); changed(); };
         document.getElementById('workerGroupResource').onchange = event => {
@@ -286,6 +312,13 @@
                 else if (draft && snapshot) { snapshot.capacity = data.capacity; }
                 else snapshot = data;
                 renderSettings(); renderDashboard();
+                if (requestedEditor && settings()) {
+                    const id = requestedEditor; requestedEditor = null;
+                    if (snapshot.groups.some(group => group.id === id)) {
+                        edit(id);
+                        document.getElementById('workerGroupEditor').scrollIntoView({ block: 'nearest' });
+                    } else message('That worker group no longer exists. Choose a group below or add one.', true);
+                }
             } catch (error) {
                 for (const mount of [settings(), dashboard()]) if (mount && !snapshot) mount.innerHTML = '<p class="text-danger small">Could not load worker groups. Reload the page to try again.</p>';
                 message(error.message, true);

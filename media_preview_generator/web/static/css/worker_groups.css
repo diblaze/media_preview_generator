@@ -1,24 +1,28 @@
-.worker-group-row { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:1rem 0; border-bottom:1px solid var(--bs-border-color); }
+.worker-group-row { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:1rem; padding:.875rem 0; border-bottom:1px solid var(--bs-border-color); }
 .worker-group-description { min-width:0; overflow-wrap:anywhere; }
-.worker-group-description strong { display:block; margin-bottom:.25rem; }
-.worker-group-actions { display:flex; align-items:center; flex-wrap:wrap; justify-content:flex-end; gap:.75rem; flex-shrink:0; max-width:15rem; }
-.worker-group-scale { display:flex; align-items:center; gap:.4rem; }
-.worker-group-count { min-width:1.5rem; text-align:center; font-variant-numeric:tabular-nums; font-weight:600; }
-.worker-group-counts { display:flex; gap:.75rem; flex-wrap:wrap; margin-top:.4rem; font-variant-numeric:tabular-nums; }
-.worker-group-state { margin-top:.25rem; color:var(--bs-secondary-color); }
+.worker-group-description strong { display:block; margin-bottom:.25rem; font-size:1rem; line-height:1.4; }
+.worker-group-meta, .worker-group-availability { display:flex; flex-wrap:wrap; align-items:baseline; gap:.25rem .625rem; line-height:1.5; }
+.worker-group-meta > :not(:first-child)::before, .worker-group-availability > :not(:first-child)::before { content:'·'; margin-right:.625rem; }
+.worker-group-availability { margin-top:.25rem; }
+.worker-group-hardware { min-width:0; }
+.worker-group-hardware summary { cursor:pointer; width:max-content; text-decoration:underline; text-underline-offset:.2em; }
+.worker-group-hardware[open] { flex-basis:100%; }
+.worker-group-hardware[open] > span { display:block; padding:.25rem 0; }
+.worker-group-hardware summary:focus-visible { outline:2px solid var(--bs-primary); outline-offset:3px; }
+.worker-group-actions { display:grid; grid-template-columns:auto auto; align-items:end; gap:.5rem .625rem; flex-shrink:0; }
+.worker-group-actions .form-switch { grid-column:1 / -1; justify-self:end; }
+.worker-group-capacity { display:flex; flex-direction:column; gap:.25rem; align-items:center; }
+.worker-group-control-label { font-size:.75rem; color:var(--bs-secondary-color); }
+.worker-group-scale { display:flex; align-items:center; gap:.375rem; }
+.worker-group-count { min-width:1.5rem; text-align:center; font-variant-numeric:tabular-nums; font-weight:600; line-height:1.5; }
+.worker-group-counts { display:inline-flex; gap:.625rem; flex-wrap:wrap; font-variant-numeric:tabular-nums; color:var(--bs-body-color); }
+.worker-group-state { color:var(--bs-body-color); }
+.worker-group-hold { padding:.5rem .75rem; background:var(--bs-warning-bg-subtle); border-radius:var(--bs-border-radius); }
 .worker-group-editor { padding:1.25rem 0; margin-top:1rem; border-top:1px solid var(--bs-border-color); }
 .worker-group-editor legend { float:none; width:auto; }
 .worker-group-window { border-top:1px solid var(--bs-border-color); padding-top:1rem; }
 .worker-group-day { display:flex; align-items:center; gap:.3rem; font-size:.875rem; cursor:pointer; }
-#workerGroupApplyRow[hidden],#workerGroupEditor[hidden],#workerGroupWarnings[hidden],#workerGroupWindows[hidden] { display:none!important; }
-#workerGroupDashboard .worker-group-actions { max-width:9rem; }
-@media(max-width:575px) {
- .worker-group-row { align-items:flex-start; gap:.75rem; }
- .worker-group-actions { max-width:7.75rem; gap:.5rem; }
- .worker-group-counts { gap:.4rem .7rem; }
- #workerGroupApplyRow { flex-wrap:wrap; }
-}
-
+#workerGroupApplyRow[hidden],#workerGroupEditor[hidden],#workerGroupWarnings[hidden],#workerGroupWindows[hidden],.worker-group-state[hidden] { display:none!important; }
 #workerGroupSettings .btn-outline-secondary,
 #workerGroupDashboard .btn-outline-secondary { color:var(--bs-body-color); }
 .worker-group-editor legend.form-label { font-size:1rem; font-weight:500; }
@@ -29,6 +33,13 @@
  .dashboard-system-card .system-card-body > :nth-child(4) { grid-column:1 / -1; grid-row:3; }
 }
 @media(max-width:575px) {
+ .worker-group-row { grid-template-columns:minmax(0,1fr); gap:.625rem; }
+ .worker-group-actions { grid-template-columns:auto auto 1fr; align-items:center; justify-items:start; gap:.5rem; }
+ .worker-group-actions .form-switch { grid-column:auto; justify-self:end; }
+ .worker-group-capacity { align-items:center; }
+ .worker-group-edit { align-self:end; }
+ .worker-group-counts { gap:.4rem .7rem; }
+ #workerGroupApplyRow { flex-wrap:wrap; }
  #workerGroupSettings .btn, #workerGroupDashboard .btn { min-height:40px; }
  .worker-group-actions .form-switch { min-height:40px; display:flex; align-items:center; gap:.4rem; }
 }

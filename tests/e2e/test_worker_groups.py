@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -138,8 +139,10 @@ def test_settings_draft_apply_payload_and_no_legacy_counts(authed_page: Page, ap
     page.locator("#workerGroupCount").fill("3")
     page.locator('[data-day="1"]').check()
     assert group_api["writes"] == []
-    page.locator("#workerGroupApply").click()
+    expect(page.locator("#workerGroupEditorApply")).to_be_enabled()
+    page.locator("#workerGroupEditorApply").click()
     expect(page.locator("#workerGroupMessage")).to_contain_text("saved")
+    assert len(group_api["writes"]) == 1
     method, _, payload = group_api["writes"][0]
     assert method == "PUT"
     assert payload["revision"] == 7
@@ -188,7 +191,7 @@ def test_revision_conflict_preserves_draft_and_discard_reloads(
     expect(page.locator("#workerGroupName")).to_have_value("My draft")
     assert group_api["writes"][0][2]["revision"] == 7
     page.locator("#workerGroupCancel").click()
-    expect(page.locator('#workerGroupRows [data-group-id="cpu-night"]')).to_contain_text("5 desired")
+    expect(page.locator('#workerGroupRows [data-group-id="cpu-night"] .worker-group-count')).to_have_text("5")
     page.locator('[data-edit="cpu-night"]').click()
     expect(page.locator("#workerGroupName")).to_have_value("Overnight loudness")
 
@@ -270,6 +273,9 @@ def test_global_pause_and_removed_draining_group_remain_visible(
     )
     authed_page.goto(app_url + "/")
     expect(authed_page.locator("#workerGroupHold")).to_contain_text("manual pause and global pause schedule")
+    expect(authed_page.locator("#workerGroupHold")).to_contain_text(
+        "Resume processing and wait for the pause schedule to end."
+    )
     expect(authed_page.locator('[data-group-id="cpu-night"]')).to_contain_text("2 paused")
     expect(authed_page.locator('[data-retired-group="removed"]')).to_contain_text("1 finishing (paused)")
     expect(authed_page.locator('[data-retired-group="removed"] button')).to_have_count(0)
@@ -397,7 +403,17 @@ def test_worker_group_editor_and_dashboard_fit_supported_sizes(
 
     page = authed_page
     page.set_viewport_size({"width": width, "height": 1000})
-    group_api["state"]["groups"][1]["name"] = "NVIDIA previews"
+    group_api["state"]["groups"][1]["name"] = "NVIDIA TITAN RTX"
+    group_api["state"]["hardware"][0]["name"] = "NVIDIA TITAN RTX"
+    intel = copy.deepcopy(group_api["state"]["groups"][1])
+    intel.update(
+        id="intel-video", name="Intel Corporation Raptor Lake-S GT1 [UHD Graphics 770] (rev 04)", device="intel0"
+    )
+    group_api["state"]["groups"].append(intel)
+    group_api["state"]["hardware"].append({"device": "intel0", "name": intel["name"], "status": "ok"})
+    group_api["state"]["capacity"]["groups"].append(
+        {"id": "intel-video", "desired": 2, "available": 2, "busy": 0, "finishing": 0, "state": "active"}
+    )
     screenshots = os.environ.get("WORKER_GROUP_SCREENSHOTS")
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
@@ -415,7 +431,11 @@ def test_worker_group_editor_and_dashboard_fit_supported_sizes(
     expect(page.locator("#workerGroupWindows")).to_contain_text("ends Tuesday")
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     if screenshots:
-        page.locator("#section-workers").screenshot(path=str(Path(screenshots) / f"editor-{width}-{theme}.png"))
+        if width < 576:
+            # A viewport capture preserves the real sticky header while the focused editor is in view.
+            page.screenshot(path=str(Path(screenshots) / f"editor-{width}-{theme}.png"))
+        else:
+            page.locator("#section-workers").screenshot(path=str(Path(screenshots) / f"editor-{width}-{theme}.png"))
     page.locator("#workerGroupClose").click()
     mock_dashboard_defaults(page)
     page.goto(app_url + "/")
@@ -426,4 +446,110 @@ def test_worker_group_editor_and_dashboard_fit_supported_sizes(
         page.locator(".dashboard-system-card").screenshot(
             path=str(Path(screenshots) / f"dashboard-{width}-{theme}.png")
         )
+    group_api["state"].update(processing_paused=True, pause_reasons=["manual"])
+    for row in group_api["state"]["capacity"]["groups"]:
+        row.update(busy=0, finishing=0, available=0, state="active")
+    page.evaluate("WorkerGroups.load()")
+    expect(page.locator("#workerGroupHold")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    if screenshots:
+        page.locator(".dashboard-system-card").screenshot(
+            path=str(Path(screenshots) / f"dashboard-paused-{width}-{theme}.png")
+        )
     assert errors == []
+
+
+def test_paused_idle_groups_show_one_hold_and_no_redundant_zero_activity(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    mock_dashboard_defaults(authed_page)
+    state = group_api["state"]
+    state.update(processing_paused=True, pause_reasons=["manual"])
+    for row in state["capacity"]["groups"]:
+        row.update(busy=0, finishing=0, available=0, state="active")
+    state["groups"][1]["name"] = state["hardware"][0]["name"]
+    authed_page.goto(app_url + "/")
+    expect(authed_page.locator("#workerGroupHold")).to_be_visible()
+    expect(authed_page.locator("#workerGroupHold")).to_have_text(
+        "Processing paused: manual pause. Resume processing to use available groups."
+    )
+    expect(authed_page.locator("#workerGroupDashboard .worker-group-counts")).to_have_count(0)
+    expect(authed_page.locator("#workerGroupDashboard")).not_to_contain_text("Globally paused")
+    gpu = authed_page.locator('[data-group-id="gpu-video"]')
+    assert gpu.locator(".worker-group-description").inner_text().count("NVIDIA card") == 1
+    expect(gpu.locator(".worker-group-control-label")).to_have_text("Workers")
+    expect(gpu.get_by_role("link", name="Edit NVIDIA card", exact=True)).to_have_attribute(
+        "href", "/settings?worker_group=gpu-video#section-workers"
+    )
+
+
+def test_named_gpu_keeps_full_hardware_accessible_on_demand(authed_page: Page, app_url: str, group_api: dict) -> None:
+    mock_dashboard_defaults(authed_page)
+    group_api["state"]["groups"][1]["name"] = "Video work"
+    authed_page.goto(app_url + "/")
+    gpu = authed_page.locator('[data-group-id="gpu-video"]')
+    expect(gpu.locator(".worker-group-hardware > span")).not_to_be_visible()
+    gpu.locator("summary").click()
+    expect(gpu.locator(".worker-group-hardware > span")).to_be_visible()
+    expect(gpu.locator(".worker-group-hardware > span")).to_have_text("NVIDIA card")
+
+
+@pytest.mark.parametrize("group_id", ["cpu-night", "gpu-video", "deleted-group"])
+def test_dashboard_edit_target_survives_reload_and_handles_deleted_group(
+    authed_page: Page, app_url: str, group_api: dict, group_id: str
+) -> None:
+    page = authed_page
+    mock_settings_get(page)
+    mock_setup_status(page, complete=True)
+    mock_system_status(page)
+    mock_settings_backups(page)
+    page.goto(app_url + "/settings?worker_group=" + group_id + "#section-workers")
+    for reload in (False, True):
+        if reload:
+            page.reload()
+        if group_id == "deleted-group":
+            expect(page.locator("#workerGroupEditor")).to_be_hidden()
+            expect(page.locator("#workerGroupMessage")).to_contain_text("no longer exists")
+        else:
+            expected = next(group["name"] for group in group_api["state"]["groups"] if group["id"] == group_id)
+            expect(page.locator("#workerGroupEditor")).to_be_visible()
+            expect(page.locator("#workerGroupName")).to_have_value(expected)
+            expect(page.locator("#workerGroupName")).to_be_focused()
+            expect(page.locator("#workerGroupEditorApply")).to_be_disabled()
+        assert group_api["writes"] == []
+
+
+def test_live_loudness_worker_shows_audio_activity_without_fabricated_progress(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    mock_dashboard_defaults(authed_page)
+    worker = {
+        "worker_id": "CPU-audio",
+        "worker_type": "CPU",
+        "worker_name": "CPU Worker 1",
+        "group_name": "CPU loudness",
+        "status": "processing",
+        "current_title": "Two audio tracks",
+        "current_phase": "Loudness 1/2",
+        "ffmpeg_started": False,
+        "progress_percent": 0,
+        "speed": "0.0x",
+        "eta": "-",
+    }
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [worker]}))
+    authed_page.goto(app_url + "/")
+    expect(authed_page.locator("[data-percent]")).to_have_text("Analyzing audio · stream 1/2")
+    bar = authed_page.get_by_role("progressbar", name="Loudness analysis", exact=True)
+    expect(bar).to_be_visible()
+    assert bar.get_attribute("aria-valuenow") is None
+    expect(bar.locator(".progress-bar")).to_have_class(re.compile("progress-bar-striped"))
+    expect(authed_page.locator("[data-speed]")).not_to_be_visible()
+    expect(authed_page.locator("[data-eta]")).not_to_be_visible()
+    worker["current_phase"] = "Loudness 2/2"
+    authed_page.evaluate("loadWorkerStatuses()")
+    expect(authed_page.locator("[data-percent]")).to_have_text("Analyzing audio · stream 2/2")
+    worker.update(status="idle", current_phase="")
+    authed_page.evaluate("loadWorkerStatuses()")
+    idle_bar = authed_page.locator('[data-worker-key="CPU_CPU-audio"] [role="progressbar"]')
+    expect(idle_bar).to_have_count(1)
+    expect(idle_bar).not_to_be_visible()

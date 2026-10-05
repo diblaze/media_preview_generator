@@ -2901,6 +2901,7 @@ function _patchWorkerCard(col, worker) {
     const chapterProgress = isProcessing ? worker.chapter_progress : null;
     // Older running workers only report a phase, so keep their activity indeterminate.
     const isChapterWork = isProcessing && (!!chapterProgress || /^Chapter thumbnails for /i.test(worker.current_phase || ''));
+    const loudnessStream = isProcessing && /^Loudness\s+(\d+)\/(\d+)$/i.exec((worker.current_phase || '').trim());
 
     // Attribute on the card itself so the .workers-panel-card[data-status]
     // CSS rule can flip the row's accent without re-rendering anything.
@@ -2918,7 +2919,7 @@ function _patchWorkerCard(col, worker) {
     card.classList.toggle('border-warning', fallbackActive);
 
     // Icon (gpu-card vs cpu, fallback flips to cpu)
-    const iconClass = (fallbackActive || isChapterWork)
+    const iconClass = (fallbackActive || isChapterWork || loudnessStream)
         ? 'bi-cpu'
         : (worker.worker_type === 'GPU' ? 'bi-gpu-card' : 'bi-cpu');
     if (!icon.classList.contains(iconClass)) {
@@ -2992,7 +2993,7 @@ function _patchWorkerCard(col, worker) {
     const progressPercent = isChapterWork
         ? (chapterTotal ? chapterProcessed / chapterTotal * 100 : 0)
         : (isProcessing ? (worker.progress_percent || 0) : 0);
-    const indeterminate = isChapterWork && !chapterDeterminate;
+    const indeterminate = !!loudnessStream || isChapterWork && !chapterDeterminate;
     const showProgress = isChapterWork ? chapterDeterminate : isProcessing && ffmpegStarted;
     const desiredWidth = indeterminate ? '100%' : (showProgress ? `${progressPercent.toFixed(1)}%` : '0%');
     if (progress.style.width !== desiredWidth) {
@@ -3002,7 +3003,7 @@ function _patchWorkerCard(col, worker) {
     progress.classList.toggle('progress-bar-striped', indeterminate);
     progress.classList.toggle('progress-bar-animated', indeterminate);
     progressWrap.setAttribute('role', 'progressbar');
-    progressWrap.setAttribute('aria-label', isChapterWork ? 'Chapter thumbnails' : 'Video previews');
+    progressWrap.setAttribute('aria-label', loudnessStream ? 'Loudness analysis' : isChapterWork ? 'Chapter thumbnails' : 'Video previews');
     progressWrap.setAttribute('aria-valuemin', '0');
     progressWrap.setAttribute('aria-valuemax', '100');
     if (indeterminate) progressWrap.removeAttribute('aria-valuenow');
@@ -3048,10 +3049,10 @@ function _patchWorkerCard(col, worker) {
         percent.style.minWidth = '';
         speed.style.display = 'none';
         if (etaWrap) etaWrap.style.display = 'none';
-    } else if (isProcessing && !ffmpegStarted) {
+    } else if (loudnessStream || isProcessing && !ffmpegStarted) {
         const phaseRaw = (worker.current_phase || '').trim();
         const isReusePhase = phaseRaw && _PHASE_REUSE_RE.test(phaseRaw);
-        const phaseLabel = phaseRaw || 'Working…';
+        const phaseLabel = loudnessStream ? `Analyzing audio · stream ${loudnessStream[1]}/${loudnessStream[2]}` : phaseRaw || 'Working…';
         const phaseDisplay = isReusePhase ? `✓ ${phaseLabel}` : phaseLabel;
         if (percent.textContent !== phaseDisplay) percent.textContent = phaseDisplay;
         if (percent.title !== phaseLabel) percent.title = phaseLabel;

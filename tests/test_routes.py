@@ -2964,6 +2964,27 @@ class TestSchedulesAPI:
 class TestSystemAPI:
     """Test /api/system/* endpoints."""
 
+    @pytest.mark.parametrize("kind", ["previews", "intro_credits", "loudness"])
+    def test_pending_status_matches_visible_stats_with_retry_children(self, client, kind):
+        """Retry attempts belong to their visible head, while active work still appears in system status."""
+        from media_preview_generator.web.jobs import get_job_manager
+
+        manager = get_job_manager()
+        manager.create_job(kind=kind)
+        head = manager.create_job(kind=kind, config={"is_retry": True, "is_retry_chain": True})
+        manager.create_job(kind=kind, config={"is_retry": True, "parent_job_id": head.id})
+        manager.create_job(kind=kind, config={"is_retry_attempt": True, "parent_chain_id": head.id})
+        running = manager.create_job(kind=kind, config={"is_retry": True, "parent_job_id": head.id})
+        manager.start_job(running.id)
+
+        with patch("media_preview_generator.gpu.detect.detect_all_gpus", return_value=[]):
+            response = client.get("/api/system/status", headers=_api_headers())
+        stats = client.get("/api/jobs/stats", headers=_api_headers())
+
+        assert response.status_code == stats.status_code == 200
+        assert response.get_json()["pending_jobs"] == stats.get_json()["pending"] == 2
+        assert response.get_json()["running_job"]["id"] == running.id
+
     def test_get_system_status(self, client):
         with patch("media_preview_generator.gpu.detect.detect_all_gpus", return_value=[]):
             resp = client.get("/api/system/status", headers=_api_headers())
