@@ -221,6 +221,8 @@ jobs:
         # action handles fork PRs gracefully — without a token it uses
         # tokenless OIDC; with one, same-repo PRs still authenticate.
         uses: codecov/codecov-action@v4
+        # Bootstrap/TLS failures can escape fail_ci_if_error; the upload is optional.
+        continue-on-error: true
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
