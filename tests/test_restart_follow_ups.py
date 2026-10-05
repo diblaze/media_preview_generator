@@ -101,7 +101,8 @@ class TestFollowUpsStayWithTheirPreviewJob:
 
         assert jm.get_job(preview_id).status is JobStatus.PENDING
         assert jm.get_job(follow_up_id).status is JobStatus.PENDING
-        assert started_at_boot == [follow_up_id]  # its runner waits for the pause and the preview job
+        # Both watchers are restored; the preview still waits for the global hold and its follower for both.
+        assert started_at_boot == [preview_id, follow_up_id]
         assert set(self._resume()) == {preview_id, follow_up_id}
 
     def test_a_follow_up_older_than_its_running_preview_jobs_start_is_revived_with_it(self, tmp_path):
@@ -209,7 +210,10 @@ class TestRestartWhilePausedThenResume:
         get_settings_manager().processing_paused = False
         resume_running_and_drain_pending()
 
-    def test_a_webhook_job_saved_in_its_debounce_queues_its_follow_up_once_across_the_restart_and_resume(self, app):
+    @pytest.mark.parametrize("age_hours", [1, 20], ids=["recent", "older-than-recovery-window"])
+    def test_a_webhook_job_saved_in_its_debounce_queues_its_follow_up_once_across_the_restart_and_resume(
+        self, app, age_hours
+    ):
         from media_preview_generator.web.settings_manager import get_settings_manager
 
         jm = jobs_mod.get_job_manager()
@@ -228,7 +232,7 @@ class TestRestartWhilePausedThenResume:
             patch(SUBMIT, return_value=["ic-1"]) as submit,
             patch("media_preview_generator.jobs.orchestrator.run_processing", return_value={"outcome": {}}) as run,
         ):
-            after = self._restart(app, age_hours=1)
+            after = self._restart(app, age_hours=age_hours)
             assert after.get_job(job.id).status is JobStatus.PENDING  # held by the pause
             run.assert_not_called()
             self._resume()

@@ -41,6 +41,20 @@ os.environ["CONFIG_DIR"] = _TEST_CONFIG_DIR
 atexit.register(shutil.rmtree, _TEST_CONFIG_DIR, ignore_errors=True)
 
 
+@pytest.fixture(autouse=True)
+def _reset_gpu_fallback_history():
+    """Keep process-wide GPU failure streaks inside the test that produces them.
+
+    Worker tests feed the real tracker. Without a shared reset, five unrelated
+    fallback cases can create a notification in a later API test on that worker.
+    """
+    from media_preview_generator.jobs.gpu_fallback import get_gpu_fallback_tracker
+
+    get_gpu_fallback_tracker().reset()
+    yield
+    get_gpu_fallback_tracker().reset()
+
+
 def _grouped_by_folder(args: list[str], invocation_dir: Path) -> list[str]:
     """The command line's test paths with each folder's paths together, folders and paths in first-seen order.
 
