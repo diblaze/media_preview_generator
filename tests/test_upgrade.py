@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION
+from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION, _USER_FACING_NOTES
 
 #: "the config key is absent entirely", distinct from ``config: null``.
 _MISSING = object()
@@ -1877,10 +1877,8 @@ class TestMigrationNoticeUserFacingSplit:
         notice = settings_manager.get("_pending_migration_notice")
         assert isinstance(notice, dict)
         notes = notice.get("notes") or []
-        # Exactly 2 entries — one each from v7 and v11 (v20 says nothing on an install that never turned Intro &
-        # Credits on). Pinning the count catches a regression where extra raw dev strings get appended on top of
-        # the friendly ones.
-        assert len(notes) == 2, f"expected 2 user notes (v7+v11), got {len(notes)}: {notes}"
+        # Exact friendly notes catch raw developer strings or duplicate notes.
+        assert notes == [_USER_FACING_NOTES[v] for v in (7, 11, 21)]
         joined = " ".join(notes)
         assert "multi-server format" in joined, f"v7 user-facing note missing: {notes}"
         assert "Frame-reuse" in joined, f"v11 user-facing note missing: {notes}"
@@ -1923,7 +1921,7 @@ class TestMigrationNoticeUserFacingSplit:
 
         notice = settings_manager.get("_pending_migration_notice") or {}
         notes = notice.get("notes") or []
-        assert len(notes) == 1, f"expected 1 user note (v13), got {len(notes)}: {notes}"
+        assert notes == [_USER_FACING_NOTES[13], _USER_FACING_NOTES[21]]
         joined = notes[0]
         assert "every server consistently" in joined, (
             f"v13 user-facing note missing the expected friendly copy: {notes}"
@@ -2581,7 +2579,7 @@ class TestMigrateToV14:
         _migrate_schema(settings_manager)
 
         notes = (settings_manager.get("_pending_migration_notice") or {}).get("notes") or []
-        assert len(notes) == 1, f"expected 1 user note (v14), got {notes}"
+        assert notes == [_USER_FACING_NOTES[14], _USER_FACING_NOTES[21]]
         assert "Incoming job priority" in notes[0], notes
         assert not notes[0].startswith("v14:"), f"dev prefix leaked into the user notice: {notes}"
         assert "unpinned" not in notes[0], f"dev wording leaked into the user notice: {notes}"
@@ -2824,7 +2822,9 @@ class TestMigrationNoticeBackupAndDismissal:
         _migrate_schema(sm)
 
         notice = sm.get("_pending_migration_notice")
-        this_upgrades_notes = [_USER_FACING_NOTES[14]]  # v20 says nothing: no server has Intro & Credits on
+        this_upgrades_notes = [_USER_FACING_NOTES[14]]
+        if kind == "version_move":
+            this_upgrades_notes.append(_USER_FACING_NOTES[21])
         if earlier_notice == "unread":
             assert notice["notes"] == ["An earlier note.", *this_upgrades_notes]
             assert notice["from"] == 11
@@ -2911,7 +2911,7 @@ class TestMigrateToV15:
         assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION
         assert "publish_when" not in settings_manager.get("markers")
         notice = settings_manager.get("_pending_migration_notice") or {}
-        assert notice.get("notes", []) == []  # v20 says nothing either: no server has Intro & Credits on
+        assert notice.get("notes", []) == [_USER_FACING_NOTES[21]]
 
 
 class TestMigrateToV16:
@@ -2965,9 +2965,12 @@ class TestMigrateToV16:
             updates={"_schema_version": 15, "markers": {**self.BLOCK, "publish_when": "high"}}
         )
         _migrate_schema(settings_manager)
-        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 20
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 21
         assert settings_manager.get("markers") == self.BLOCK
-        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[16]]
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [
+            _USER_FACING_NOTES[16],
+            _USER_FACING_NOTES[21],
+        ]
         assert settings_manager.get(DECIDE_AGAIN_KEY) is True
 
         # The app clears the request once it queued the job; a later start doesn't ask again (the version gate).
@@ -3001,9 +3004,9 @@ class TestMigrateToV17:
 
         settings_manager.apply_changes(updates={"_schema_version": start})
         _migrate_schema(settings_manager)
-        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 20
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 21
         assert settings_manager.get(DECIDE_AGAIN_KEY) is True
-        assert settings_manager.get("_pending_migration_notice") is None  # v20 too: Intro & Credits is on nowhere
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[21]]
 
         # The completed job clears the request; a later start at the current version doesn't ask again.
         settings_manager.delete(DECIDE_AGAIN_KEY)
@@ -3034,9 +3037,9 @@ class TestMigrateToV18:
 
         settings_manager.apply_changes(updates={"_schema_version": 17})
         _migrate_schema(settings_manager)
-        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 20
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 21
         assert settings_manager.get(DECIDE_AGAIN_KEY) is True
-        assert settings_manager.get("_pending_migration_notice") is None  # v20 too: Intro & Credits is on nowhere
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[21]]
         settings_manager.delete(DECIDE_AGAIN_KEY)
         _migrate_schema(settings_manager)
         assert settings_manager.get(DECIDE_AGAIN_KEY) is None
@@ -3091,9 +3094,12 @@ class TestMigrateToV20:
 
         settings_manager.apply_changes(updates={"_schema_version": 19, "media_servers": [self.PLEX_WITH_MARKERS_ON]})
         _migrate_schema(settings_manager)
-        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 20
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 21
         assert settings_manager.get(DECIDE_AGAIN_KEY) is True
-        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[20]]
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [
+            _USER_FACING_NOTES[20],
+            _USER_FACING_NOTES[21],
+        ]
         # The job this queues is named for what it does now; the status it clears up is gone.
         assert "Needs review" not in DECIDE_AGAIN_JOB_NAME
 
@@ -3214,17 +3220,18 @@ class TestMigrateToV19:
             }
         )
         _migrate_schema(settings_manager)
-        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 20
-        assert settings_manager.processing_auto_paused is True
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 21
+        assert settings_manager.processing_auto_paused is False
+        assert settings_manager.processing_pause_reasons == ["manual"]
 
-        # Pause all takes the pause over (and drops the flag); a later start doesn't mark it again (the version gate).
+        # An ambiguous pause stays manual through the full upgrade chain.
         settings_manager.processing_paused = True
         _migrate_schema(settings_manager)
         assert settings_manager.get(_AUTO_PAUSED_KEY) is None
 
 
 class TestUpgradedAutoPauseResumes:
-    """The v19 flag is what the settings save's real ``_auto_resume_if_needed`` path reads."""
+    """A proven no-workers pause becomes capacity waiting after upgrading."""
 
     TOKEN = "test-token-12345678"
     DRAIN = "media_preview_generator.web.routes.job_runner.resume_running_and_drain_pending"
@@ -3257,6 +3264,7 @@ class TestUpgradedAutoPauseResumes:
                     "_schema_version": 18,
                     "_env_migrated": True,
                     "processing_paused": True,
+                    "processing_auto_paused": True,
                     "cpu_threads": 0,
                     "gpu_config": _GPU_NO_WORKERS,
                 }
@@ -3272,4 +3280,6 @@ class TestUpgradedAutoPauseResumes:
         assert response.status_code == 200, response.get_data(as_text=True)
         with app.app_context():
             assert get_settings_manager().processing_paused is False
-        drain.assert_called_once_with()
+        drain.assert_not_called()
+        assert get_settings_manager().cpu_threads == 2
+        assert any(g["resource"] == "cpu" and g["count"] == 2 for g in get_settings_manager().worker_groups)

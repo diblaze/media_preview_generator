@@ -43,7 +43,7 @@ class TestEveryStepper:
     @pytest.mark.parametrize(
         "input_id",
         [
-            "cpuThreads",
+            "scanWorkers",
             "thumbnailInterval",
             "logRotationSize",
             "logRetentionCount",

@@ -16,6 +16,9 @@ from ..processing.generator import ProcessingResult, clear_failures, log_failure
 from ..processing.retry_queue import CHAPTER_PUBLISHER_STATUSES, publisher_needs_retry
 from ..scan_filters import ScanFilters
 from ..servers.ownership import find_owning_servers, webhook_path_candidates
+from .checkpoints import checkpoint_items
+from .group_runtime import refresh_worker_groups
+from .parking import JobParked
 from .worker import JOB_LOG_SKIP, WorkerPool
 
 
@@ -640,6 +643,10 @@ def _dispatch_processable_items(
     on_dispatch_start=None,
     worker_pool_callback=None,
     priority: int | None = None,
+    tracker_wait=None,
+    carried_state=None,
+    continuation_context=None,
+    return_result=False,
 ) -> dict:
     """Submit ``(server_config, ProcessableItem)`` pairs to the shared dispatcher.
 
@@ -706,6 +713,7 @@ def _dispatch_processable_items(
     # Another job may have created the dispatcher since the check above; its pool is the one that runs, so it's
     # the one to register (an unused pool registered here would be what Settings saves resize).
     worker_pool = dispatcher.worker_pool
+    refresh_worker_groups(worker_pool, config, selected_gpus, force=True)
 
     # Reconcile the (possibly reused/stale) pool to the current GPU config —
     # the same hook the webhook/single-Plex path uses so worker counts track
@@ -724,7 +732,8 @@ def _dispatch_processable_items(
 
     if progress_callback:
         try:
-            progress_callback(0, total, f"Dispatching {total} item(s)…")
+            carried = sum(int((carried_state or {}).get(key, 0)) for key in ("successful", "failed"))
+            progress_callback(carried, total + carried, f"Dispatching {total} item(s)…")
         except Exception as exc:
             logger.debug("progress_callback raised on dispatch banner: {}", exc)
 
@@ -747,10 +756,16 @@ def _dispatch_processable_items(
             "pause_check": pause_check,
         },
         priority=priority if priority is not None else PRIORITY_NORMAL,
+        carried_state=carried_state,
+        continuation_context=continuation_context,
     )
-    tracker.wait()
+    if tracker_wait:
+        while not tracker.wait(timeout=0.5):
+            tracker_wait(dispatcher, tracker)
+    else:
+        tracker.wait()
     logger.info("Multi-server {} complete: {} item(s) processed.", label, tracker.completed)
-    return tracker.get_result()["outcome"]
+    return tracker.get_result() if return_result else tracker.get_result()["outcome"]
 
 
 def _enumerate_items_for_servers(
@@ -921,6 +936,7 @@ def _run_full_scan_multi_server(
     worker_pool_callback=None,
     warnings_out: list[str] | None = None,
     priority: int | None = None,
+    tracker_wait=None,
 ) -> dict:
     """Multi-server full-library scan via the per-vendor :class:`VendorProcessor`.
 
@@ -1049,7 +1065,9 @@ def _run_full_scan_multi_server(
         worker_callback=worker_callback,
         on_dispatch_start=on_dispatch_start,
         worker_pool_callback=worker_pool_callback,
+        continuation_context={"warning": " | ".join(warnings_out or [])},
         priority=priority,
+        **({"tracker_wait": tracker_wait} if tracker_wait else {}),
     )
 
 
@@ -1069,6 +1087,7 @@ def _run_recently_added_multi_server(
     worker_pool_callback=None,
     warnings_out: list[str] | None = None,
     priority: int | None = None,
+    tracker_wait=None,
 ) -> dict:
     """Recently-added scan for any vendor via :class:`VendorProcessor`.
 
@@ -1159,7 +1178,9 @@ def _run_recently_added_multi_server(
         worker_callback=worker_callback,
         on_dispatch_start=on_dispatch_start,
         worker_pool_callback=worker_pool_callback,
+        continuation_context={"warning": " | ".join(warnings_out or [])},
         priority=priority,
+        **({"tracker_wait": tracker_wait} if tracker_wait else {}),
     )
 
 
@@ -1576,6 +1597,7 @@ def _run_webhook_paths_phase(
     job_id: str | None,
     totals: dict,
     aggregate_outcome: dict,
+    continuation_context=None,
 ) -> dict:
     """Dispatch every webhook path through the unified peer-equal fan-out.
 
@@ -1747,6 +1769,15 @@ def _run_webhook_paths_phase(
         path_hint_map.update(_build_path_mapping_mismatch_hints(no_owners, server_configs))
 
     if webhook_items:
+        if continuation_context is not None:
+            continuation_context["webhook_resolution"] = {
+                "unresolved_paths": list(unresolved),
+                "skipped_paths": [],
+                "total_paths": total_paths,
+                "input_by_canonical": dict(canonical_to_input),
+                "path_hint_map": dict(path_hint_map),
+                "path_hints": list(dict.fromkeys(path_hint_map.values())),
+            }
         result = dispatch_items(webhook_items, "Webhook Targets")
         totals["successful"] += result["completed"]
         totals["failed"] += result["failed"]
@@ -1874,6 +1905,8 @@ def run_processing(
     job_id=None,
     on_dispatch_start=None,
     priority=None,
+    tracker_wait=None,
+    continuation=None,
 ):
     """Run the main processing workflow.
 
@@ -1905,7 +1938,44 @@ def run_processing(
     """
     return_data = None
     worker_pool = None
+    work_context = {}
     try:
+        if continuation is not None:
+            registry = _build_multi_server_registry(config)
+            if registry is None:
+                raise RuntimeError("Could not restore media server configuration")
+            context = continuation.get("context") or {}
+            resumed = _dispatch_processable_items(
+                [(None, item) for item in checkpoint_items(continuation)],
+                config=config,
+                registry=registry,
+                selected_gpus=selected_gpus,
+                server_id_filter=getattr(config, "server_id_filter", None),
+                progress_callback=progress_callback,
+                worker_callback=worker_callback,
+                cancel_check=cancel_check,
+                pause_check=pause_check,
+                job_id=job_id,
+                on_dispatch_start=on_dispatch_start,
+                worker_pool_callback=worker_pool_callback,
+                priority=priority,
+                tracker_wait=tracker_wait,
+                carried_state=continuation["state"],
+                continuation_context=context,
+                return_result=True,
+            )
+            result = {"outcome": resumed["outcome"]}
+            if context.get("warning"):
+                result["warning"] = context["warning"]
+            if "webhook_resolution" in context:
+                resolution = dict(context["webhook_resolution"])
+                inputs = resolution.get("input_by_canonical", {})
+                unresolved = list(resolution.get("unresolved_paths", []))
+                unresolved.extend(inputs.get(path, path) for path in resumed.get("failed_paths", []))
+                resolution["unresolved_paths"] = list(dict.fromkeys(unresolved))
+                resolution["resolved_count"] = max(0, resolution["total_paths"] - len(resolution["unresolved_paths"]))
+                result["webhook_resolution"] = resolution
+            return result
         # Multi-server guard: when this job is pinned to a non-Plex server, or
         # when no Plex is configured at all, the legacy Plex orchestrator can't
         # do anything useful — full-library enumeration uses the Plex API.
@@ -1933,6 +2003,7 @@ def run_processing(
                 worker_pool_callback=worker_pool_callback,
                 warnings_out=scan_warnings,
                 priority=priority,
+                **({"tracker_wait": tracker_wait} if tracker_wait else {}),
             )
             result: dict = {"outcome": outcome_counts}
             if scan_warnings:
@@ -1988,6 +2059,7 @@ def run_processing(
                 worker_pool_callback=worker_pool_callback,
                 warnings_out=scan_warnings,
                 priority=priority,
+                **({"tracker_wait": tracker_wait} if tracker_wait else {}),
             )
             result: dict = {"outcome": outcome_counts}
             if scan_warnings:
@@ -2045,6 +2117,7 @@ def run_processing(
                 cpu_workers=config.cpu_threads,
                 selected_gpus=selected_gpus,
             )
+            refresh_worker_groups(pool, config, selected_gpus, force=True)
             if worker_pool_callback:
                 worker_pool_callback(pool)
             return pool
@@ -2093,6 +2166,7 @@ def run_processing(
                 # Another job may have created the dispatcher since the check above; its pool is the one that runs,
                 # so it's the one to register (an unused pool registered here would be what Settings saves resize).
                 worker_pool = dispatcher.worker_pool
+                refresh_worker_groups(worker_pool, config, selected_gpus, force=True)
 
                 # Reconcile the pool with the latest settings.  The pool
                 # may have been created minutes ago with stale config
@@ -2130,8 +2204,13 @@ def run_processing(
                     library_name=library_name,
                     callbacks=callbacks,
                     priority=priority if priority is not None else PRIORITY_NORMAL,
+                    continuation_context=work_context,
                 )
-                tracker.wait()
+                if tracker_wait:
+                    while not tracker.wait(timeout=0.5):
+                        tracker_wait(dispatcher, tracker)
+                else:
+                    tracker.wait()
                 # D12 — Dispatcher._merge_worker_outcome maintains a
                 # per-server publisher aggregate on the tracker and
                 # mirrors it onto the Job (set_publishers) every task.
@@ -2179,6 +2258,7 @@ def run_processing(
                 job_id=job_id,
                 totals=totals,
                 aggregate_outcome=aggregate_outcome,
+                continuation_context=work_context,
             )
             return_data = {"webhook_resolution": webhook_resolution_payload}
         elif mode == "full_scan":
@@ -2216,6 +2296,8 @@ def run_processing(
 
         return return_data
 
+    except JobParked:
+        raise
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down gracefully...")
     except ConnectionError as e:

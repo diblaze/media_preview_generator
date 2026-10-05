@@ -38,12 +38,15 @@ class TestSettingsSaveAndReloadPersists:
         # so a regression where the form falls back to the JS default of 2
         # would be visible).
         expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("5", timeout=5000)
-        expect(backend_real_page.locator("#cpuThreads")).to_have_value("0")
+        expect(backend_real_page.locator("#workerGroupRows")).to_be_visible()
         expect(backend_real_page.locator("#tonemapAlgorithm")).to_have_value("hable")
 
         # Change three different settings to NEW values.
         backend_real_page.locator("#thumbnailInterval").fill("7")
-        backend_real_page.locator("#cpuThreads").fill("3")
+        backend_real_page.locator("#workerGroupAddCpu").click()
+        backend_real_page.locator("#workerGroupCount").fill("3")
+        backend_real_page.locator("#workerGroupApply").click()
+        expect(backend_real_page.locator("#workerGroupMessage")).to_contain_text("saved")
         backend_real_page.locator("#tonemapAlgorithm").select_option("mobius")
 
         # The Save button is in the page action bar — submit by invoking
@@ -64,7 +67,10 @@ class TestSettingsSaveAndReloadPersists:
                     on_disk = {}
                 if (
                     on_disk.get("thumbnail_interval") == 7
-                    and on_disk.get("cpu_threads") == 3
+                    and any(
+                        g.get("count") == 3 and g.get("job_types") == ["loudness"]
+                        for g in on_disk.get("worker_groups", [])
+                    )
                     and on_disk.get("tonemap_algorithm") == "mobius"
                 ):
                     deadline_check = 1
@@ -83,7 +89,7 @@ class TestSettingsSaveAndReloadPersists:
         backend_real_page.wait_for_load_state("domcontentloaded")
 
         expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("7", timeout=5000)
-        expect(backend_real_page.locator("#cpuThreads")).to_have_value("3")
+        expect(backend_real_page.locator("#workerGroupRows")).to_contain_text("3 desired")
         expect(backend_real_page.locator("#tonemapAlgorithm")).to_have_value("mobius")
 
     def test_log_level_change_persists_via_dedicated_endpoint(

@@ -24,6 +24,7 @@ def test_paused_loudness_job_is_queued_and_cancellable_without_review(
     response = requests.post(f"{url}/api/processing/pause", headers=_HEADERS, timeout=15)
     assert response.ok, response.text
     page.goto(url + "/")
+    expect(page.locator("#globalPauseResumeQueue")).to_contain_text("Resume Processing")
     response = requests.post(
         f"{url}/api/loudness/jobs",
         headers=_HEADERS,
@@ -35,10 +36,10 @@ def test_paused_loudness_job_is_queued_and_cancellable_without_review(
     row = page.locator(f"#job-row-{job_id}")
     expect(row).to_be_visible(timeout=10000)
     expect(row.locator(".job-kind-badge")).to_have_text("Plex loudness")
-    expect(row.locator(".status-dot")).to_have_text("Pending")
+    expect(row.locator(".status-dot")).to_have_text("Paused")
     expect(row).not_to_contain_text("Review")
     expect(row.locator('[aria-label="Cancel job"]')).to_be_enabled()
-    row.screenshot(path=str(tmp_path / "loudness-pending.png"))
+    row.screenshot(path=str(tmp_path / "loudness-paused.png"))
     current = requests.get(f"{url}/api/jobs/{job_id}", headers=_HEADERS, timeout=15).json()
     assert current["status"] == "pending" and current["started_at"] is None
     with sqlite3.connect(Path(config_dir) / "jobs.db") as db:

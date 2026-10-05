@@ -490,7 +490,7 @@ function updateScheduleList() {
 const _QH_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
 async function loadQuietHours() {
-    if (!document.getElementById('quietHoursSaveBtn')) return; // not on this page
+    if (!document.getElementById('quietHoursSaveBtn') && !document.getElementById('scheduleList')) return;
     try {
         const data = await apiGet('/api/quiet-hours');
         window._quietHoursConfig = data || null;
@@ -503,6 +503,14 @@ async function loadQuietHours() {
     if (typeof updateScheduleList === 'function') updateScheduleList();
 }
 window.loadQuietHours = loadQuietHours;
+window.refreshQuietHoursState = async function () {
+    if (!document.getElementById('quietHoursStateBadge')) return;
+    try {
+        const data = await apiGet('/api/quiet-hours');
+        window._quietHoursConfig = data;
+        _refreshQuietHoursBadge();
+    } catch (_) { /* Keep the last known state without replacing an unsaved editor. */ }
+};
 
 function _renderQuietHoursCard() {
     const qh = window._quietHoursConfig || {};
@@ -574,8 +582,7 @@ function _refreshQuietHoursBadge() {
             : 'Quiet hours are disabled';
         return;
     }
-    const pausedNow = !!(qh.currently_in_quiet_window
-        || (typeof processingPaused !== 'undefined' && processingPaused));
+    const pausedNow = !!qh.currently_in_quiet_window;
     if (pausedNow) {
         badge.textContent = 'paused now';
         badge.className = 'badge bg-warning text-dark';
@@ -646,8 +653,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('quietHoursSaveBtn');
     if (btn) {
         btn.addEventListener('click', saveQuietHours);
-        loadQuietHours();
     }
+    loadQuietHours();
     const addBtn = document.getElementById('quietHoursAddWindowBtn');
     if (addBtn) addBtn.addEventListener('click', _addQuietHoursWindowRow);
 });

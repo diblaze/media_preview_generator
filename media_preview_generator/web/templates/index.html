@@ -60,20 +60,9 @@
                 <!-- Dynamic Status (GPU info + processing state, replaced by app.js) -->
                 <div id="systemStatus" class="system-section"></div>
 
-                <!-- Per-GPU + CPU Worker Config (populated by app.js) -->
                 <section class="system-section">
-                    <h6 class="system-section-title">Worker Pool</h6>
-                    <div id="gpuWorkerConfig">
-                        <div class="text-muted small">Loading GPU config&hellip;</div>
-                    </div>
-                    <div class="d-flex justify-content-between align-items-center mt-2">
-                        <span class="small text-muted"><i class="bi bi-cpu me-1"></i>CPU workers</span>
-                        <span class="d-flex align-items-center gap-1">
-                            <button type="button" class="btn btn-sm btn-outline-secondary worker-scale-btn" data-worker-type="CPU" data-direction="-1" onclick="scaleWorkersGlobal('CPU', -1)" title="Remove one CPU worker"><i class="bi bi-dash-lg"></i></button>
-                            <span id="cpuWorkers" class="badge bg-secondary" style="min-width: 1.5rem;">-</span>
-                            <button type="button" class="btn btn-sm btn-outline-success worker-scale-btn" data-worker-type="CPU" data-direction="1" onclick="scaleWorkersGlobal('CPU', 1)" title="Add one CPU worker"><i class="bi bi-plus-lg"></i></button>
-                        </span>
-                    </div>
+                    <h6 class="system-section-title">Worker groups</h6>
+                    <div id="workerGroupDashboard"><p class="small text-body-secondary">Loading worker groups…</p></div>
                 </section>
 
                 <!-- Version Info -->
@@ -764,7 +753,7 @@
 <!-- ⓘ details: each opens in #globalInfoModal from the ⓘ whose data-explain-template names it. -->
 <template id="infoJobKindMarkersTpl">
     <p>Finds Skip Intro / Skip Credits markers for the chosen libraries and sends them to every server with Intro &amp; Credits turned on.</p>
-    <p>Runs at low priority by default (change it under Priority below) on the same workers as previews.</p>
+    <p>Runs at low priority by default (change it under Priority below) on worker groups that allow Intro &amp; Credits.</p>
 </template>
 <template id="infoJobCheckServersTpl">
     <p>Checks that every server with Intro &amp; Credits on still shows the markers this app sent, and sends them again where they're missing or changed (unless that server is set to keep its own).</p>

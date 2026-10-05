@@ -4,7 +4,7 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime, tzinfo
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -546,9 +546,11 @@ class TestQuietHoursMultiWindow:
 
         out = normalise_quiet_hours({"enabled": True, "start": "08:00", "end": "01:00"})
         assert out["enabled"] is True
-        assert len(out["windows"]) == 1
-        assert out["windows"][0]["start"] == "08:00"
+        assert len(out["windows"]) == 2
+        assert out["windows"][0]["start"] == "00:00"
         assert out["windows"][0]["end"] == "01:00"
+        assert out["windows"][1]["start"] == "08:00"
+        assert out["windows"][1]["end"] == "00:00"
         # Legacy form has no day filter — should default to all 7 days.
         assert set(out["windows"][0]["days"]) == {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
@@ -563,7 +565,7 @@ class TestQuietHoursMultiWindow:
             ],
         }
         out = normalise_quiet_hours(raw)
-        assert len(out["windows"]) == 2
+        assert len(out["windows"]) == 3
         assert out["windows"][0]["days"] == ["mon", "tue", "wed", "thu", "fri"]
         assert out["windows"][1]["days"] == ["sat", "sun"]
 
@@ -584,7 +586,7 @@ class TestQuietHoursMultiWindow:
         from media_preview_generator.web.scheduler import normalise_quiet_hours
 
         out = normalise_quiet_hours(None)
-        assert out == {"enabled": False, "windows": []}
+        assert out == {"enabled": False, "windows": [], "day_basis": "start"}
 
     def test_is_now_in_any_quiet_window_respects_day_of_week(self):
         from datetime import datetime as _dt
@@ -667,7 +669,7 @@ class TestQuietHoursMultiWindow:
         )
         ids = {j.id for j in scheduler_manager.scheduler.get_jobs()}
         qh_ids = {jid for jid in ids if jid.startswith("__qh_")}
-        assert qh_ids == {"__qh_pause_0", "__qh_resume_0"}
+        assert qh_ids == {"__qh_pause_0", "__qh_resume_0", "__qh_recheck"}
 
     def test_apply_quiet_hours_window_with_no_valid_days_skipped(self, scheduler_manager):
         scheduler_manager.apply_quiet_hours(
@@ -731,10 +733,12 @@ class TestExecuteScheduleStop:
 
         sched_mod.execute_schedule_stop(sid)
 
-        fake_jm.request_pause.assert_called_once_with("job-1", by_schedule=True)
-        # Sibling-schedule and already-paused jobs MUST NOT be touched.
+        assert fake_jm.request_pause.call_args_list == [
+            call("job-1", by_schedule=True),
+            call("job-3", by_schedule=True),
+        ]
+        # Adding a schedule hold must also cover an independently manual-paused job.
         assert all(call.args[0] != "job-2" for call in fake_jm.request_pause.call_args_list)
-        assert all(call.args[0] != "job-3" for call in fake_jm.request_pause.call_args_list)
 
 
 # ========================================================================
@@ -813,7 +817,7 @@ class TestScheduleRunNow:
         mock_callback.assert_called_once_with(
             library_id="123",
             library_name="Movies",
-            config={},
+            config={"schedule_scope": '{"config":{},"libraries":["123"],"priority":null,"server_id":null}'},
             parent_schedule_id=schedule["id"],
         )
 
@@ -1671,7 +1675,13 @@ class TestExecuteScheduledIntroCreditsJob:
             # A preview schedule starts its next scan beside the job paused by hand, as before.
             env["create"].assert_not_called()
             env["callback"].assert_called_once_with(
-                library_id=None, library_name="", config={"job_type": "full_library"}, parent_schedule_id=schedule["id"]
+                library_id=None,
+                library_name="",
+                config={
+                    "job_type": "full_library",
+                    "schedule_scope": '{"config":{"job_type":"full_library"},"libraries":[],"priority":null,"server_id":null}',
+                },
+                parent_schedule_id=schedule["id"],
             )
 
     @pytest.mark.parametrize(
@@ -2007,23 +2017,16 @@ class TestPausedIntroCreditsJobsAfterAScheduleChanges:
         assert [job.id for job in jm.get_all_jobs()] == [manual.job_id]
         assert scheduler_manager.get_schedule(schedule["id"])["last_run"] is None
 
-    def test_the_pause_record_follows_the_last_pause_and_any_resume_clears_it(self, jm):
+    def test_pause_causes_are_independent_and_each_resume_clears_only_its_owner(self, jm):
         job = jm.create_job(library_name="x", config={"libraries": []}, kind="intro_credits")
         jm.start_job(job.id)
-
         assert jm.request_pause(job.id, by_schedule=True)
-        assert jm.get_job(job.id).config == {"libraries": [], "paused_by_schedule": True}
         assert jm.request_pause(job.id)
-        assert jm.get_job(job.id).config == {"libraries": []}
-        # A stop time never turns a pause by hand into its own.
-        assert jm.request_pause(job.id, by_schedule=True) is False
-        assert jm.get_job(job.id).config == {"libraries": []} and jm.get_job(job.id).paused
-        assert jm.request_resume(job.id, only_paused_by_schedule=True) is False
-        assert jm.get_job(job.id).paused
+        assert job.config["pause_reasons"] == ["manual", "schedule"]
         assert jm.request_resume(job.id)
-        assert jm.request_pause(job.id, by_schedule=True)
+        assert job.paused and job.config["pause_reasons"] == ["schedule"]
         assert jm.request_resume(job.id, only_paused_by_schedule=True)
-        assert jm.get_job(job.id).config == {"libraries": []} and not jm.get_job(job.id).paused
+        assert job.config == {"libraries": []} and not job.paused
 
     @pytest.mark.parametrize("ending", ["completed", "cancelled"])
     def test_the_pause_record_goes_when_a_job_paused_by_its_stop_time_ends(self, scheduler_manager, jm, ending):
@@ -2061,7 +2064,7 @@ class TestPausedIntroCreditsJobsAfterAScheduleChanges:
         monkeypatch.setattr(jm, "get_all_jobs", listed_then_paused_by_hand)
         execute_schedule_stop(schedule["id"])
         monkeypatch.setattr(jm, "get_all_jobs", listed)
-        assert jm.get_job(job.id).paused and "paused_by_schedule" not in jm.get_job(job.id).config
+        assert jm.get_job(job.id).paused and jm.get_job(job.id).config["pause_reasons"] == ["manual", "schedule"]
 
         self._tick(schedule["id"], self.FIND)
         assert jm.get_job(job.id).paused  # the start tick doesn't resume a pause by hand
@@ -2292,6 +2295,14 @@ class TestQuietHoursRecomputeDrainsPending:
         sm = MagicMock()
         sm.processing_paused = currently_paused
         sm.get.return_value = {"enabled": True, "windows": []}
+
+        def set_reason(reason, value):
+            assert reason == "quiet_hours"
+            changed = sm.processing_paused != value
+            sm.processing_paused = value
+            return changed
+
+        sm.set_processing_pause_reason.side_effect = set_reason
         with (
             patch.object(sched, "is_now_in_any_quiet_window", return_value=in_window),
             patch("media_preview_generator.web.settings_manager.get_settings_manager", return_value=sm),

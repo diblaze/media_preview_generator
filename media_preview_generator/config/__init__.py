@@ -157,6 +157,8 @@ class Config:
     # Per-GPU configuration: list of dicts with keys
     # device, name, type, enabled, workers, ffmpeg_threads
     gpu_config: list[dict[str, Any]] = field(default_factory=list)
+    # None supports legacy callers; [] deliberately configures no processing slots.
+    worker_groups: list[dict[str, Any]] | None = None
 
     # Library-scanning concurrency for full scans: how many items the
     # high-throughput "does a fresh preview already exist?" sweep checks in
@@ -598,6 +600,12 @@ def load_config(*, log_validation_errors: bool = True) -> Config:
         ffmpeg_threads = get_value("ffmpeg_threads", "FFMPEG_THREADS", 2, int)
 
     cpu_threads = get_value("cpu_threads", "CPU_THREADS", 1, int)
+    worker_groups = None
+    if "worker_groups" in ui_settings:
+        from ..worker_groups import configured_group_totals, validate_worker_groups
+
+        worker_groups = validate_worker_groups(ui_settings["worker_groups"])
+        gpu_threads, cpu_threads = configured_group_totals(worker_groups)
 
     # Library-scanning concurrency. 0 = Auto (resolved by the orchestrator).
     # A positive value is clamped to [1, 256] so a typo can't spawn an absurd
@@ -765,6 +773,7 @@ def load_config(*, log_validation_errors: bool = True) -> Config:
         cpu_threads=cpu_threads,
         ffmpeg_threads=ffmpeg_threads,
         gpu_config=gpu_config,
+        worker_groups=worker_groups,
         scan_workers=scan_workers,
         tmp_folder=tmp_folder,
         tmp_folder_created_by_us=tmp_folder_created_by_us,

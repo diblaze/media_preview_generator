@@ -182,6 +182,11 @@ class Worker:
         self.gpu_name = gpu_name
         self.ffmpeg_threads = ffmpeg_threads
         self.display_name = f"{worker_type} {worker_id}"
+        # Ownership outlives edits: a busy slot never moves to a different group.
+        self.group_id: str | None = None
+        self.group_name: str | None = None
+        self.group_resource: str = "cpu" if worker_type == "CPU" else f"gpu:{gpu_device}"
+        self.allowed_job_types: frozenset[str] | None = None
 
         # Task state
         self.is_busy = False
@@ -966,6 +971,10 @@ class Worker:
             "total_duration": self.total_duration,
             "remaining_time": self.remaining_time,
             "worker_id": self.worker_id,
+            "group_id": self.group_id,
+            "group_name": self.group_name,
+            "group_resource": self.group_resource,
+            "retiring": self._pending_removal,
             "worker_type": self.worker_type,
             "library_name": self.library_name,
             "frame": self.frame,
@@ -1039,6 +1048,10 @@ class WorkerPool:
         # Optional event set by worker threads on task completion to wake
         # the dispatch loop immediately (set by JobDispatcher).
         self._worker_done_event: threading.Event | None = None
+        self._groups: dict[str, dict] | None = None
+        self._group_targets: dict[str, int] = {}
+        self._group_revision: int | None = None
+        self._resource_targets: dict[str, int] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
 
@@ -1064,6 +1077,215 @@ class WorkerPool:
         """Return a stable snapshot of workers for safe iteration."""
         with self._workers_lock:
             return list(self.workers)
+
+    def reconcile_groups(
+        self, groups: list[dict], selected_gpus: list | None, *, now=None, revision: int | None = None
+    ) -> dict:
+        """Apply saved group targets, retaining exact busy slots until they finish.
+
+        Closed and removed groups contribute no target. Their in-flight tasks
+        still consume the resource's assignment budget until reaped. Creating
+        idle replacement slots therefore cannot oversubscribe a handover.
+        """
+        from copy import deepcopy
+
+        from ..worker_groups import group_is_available, group_resource_key
+
+        by_id = {g["id"]: deepcopy(g) for g in groups}
+        added = removed = 0
+        with self._workers_lock:
+            if revision is not None and self._group_revision is not None and revision < self._group_revision:
+                return {"added": 0, "removed": 0, "retiring": sum(w._pending_removal for w in self.workers)}
+            if revision is not None:
+                self._group_revision = revision
+            # Periodic time reevaluation must use hardware from the latest
+            # locked refresh, never overwrite a concurrent detection update.
+            selected_gpus = list(self.selected_gpus if selected_gpus is None else selected_gpus)
+            devices = {device: (gpu, device, info) for gpu, device, info in selected_gpus}
+            targets = {
+                gid: g["count"]
+                if group_is_available(g, now=now) and (g["resource"] == "cpu" or g.get("device") in devices)
+                else 0
+                for gid, g in by_id.items()
+            }
+            resources: dict[str, int] = {}
+            for gid, group in by_id.items():
+                key = group_resource_key(group)
+                resources[key] = resources.get(key, 0) + targets[gid]
+            self._groups = by_id
+            self._group_targets = targets
+            self._resource_targets = resources
+            self.selected_gpus = list(selected_gpus)
+            self._pending_removals.clear()
+            # Legacy/unowned slots and changed resources may finish, never
+            # become another group's slot while holding an assigned task.
+            for worker in list(self.workers):
+                group = by_id.get(worker.group_id)
+                if group is None or worker.group_resource != group_resource_key(group):
+                    if worker.is_busy:
+                        worker._pending_removal = True
+                    else:
+                        self.workers.remove(worker)
+                        removed += 1
+            for gid, group in by_id.items():
+                resource = group_resource_key(group)
+                owned = [w for w in self.workers if w.group_id == gid and w.group_resource == resource]
+                # Prefer existing non-retiring slots, then revive compatible
+                # draining slots before allocating any replacements.
+                owned.sort(key=lambda w: (w._pending_removal, not w.is_busy))
+                desired = targets[gid]
+                for index, worker in enumerate(owned):
+                    worker.group_name = group["name"]
+                    worker.allowed_job_types = frozenset(group["job_types"])
+                    worker.display_name = f"{group['name']} · {worker.worker_id + 1}"
+                    if index < desired:
+                        worker._pending_removal = False
+                        if worker.worker_type == "GPU":
+                            worker.ffmpeg_threads = devices[group["device"]][2].get("ffmpeg_threads", 2)
+                    elif worker.is_busy:
+                        worker._pending_removal = True
+                    else:
+                        self.workers.remove(worker)
+                        removed += 1
+                for _ in range(max(0, desired - len(owned))):
+                    if group["resource"] == "gpu":
+                        self._next_gpu_assignment_index = next(
+                            i for i, (_, device, _) in enumerate(self.selected_gpus) if device == group["device"]
+                        )
+                    worker = self._create_worker("CPU" if group["resource"] == "cpu" else "GPU")
+                    worker.group_id = gid
+                    worker.group_name = group["name"]
+                    worker.group_resource = resource
+                    worker.allowed_job_types = frozenset(group["job_types"])
+                    worker.display_name = f"{group['name']} · {worker.worker_id + 1}"
+                    self.workers.append(worker)
+                    added += 1
+            retiring = sum(w._pending_removal for w in self.workers)
+        if self._worker_done_event is not None:
+            self._worker_done_event.set()
+        return {"added": added, "removed": removed, "retiring": retiring}
+
+    def _worker_supports_kind(self, worker: "Worker", kind: str) -> bool:
+        """Check intrinsic capability, group policy and shared draining budget.
+
+        Caller holds ``_workers_lock`` through assignment reservation.
+        """
+        if kind == "loudness" and worker.worker_type != "CPU":
+            return False
+        if worker.allowed_job_types is not None and kind not in worker.allowed_job_types:
+            return False
+        if self._groups is None:
+            return True
+        if not worker.group_id or self._group_targets.get(worker.group_id, 0) <= 0:
+            return False
+        from ..worker_groups import group_is_available
+
+        if not group_is_available(self._groups[worker.group_id]):
+            return False
+        busy = sum(w.is_busy and w.group_resource == worker.group_resource for w in self.workers)
+        return busy < self._resource_targets.get(worker.group_resource, 0)
+
+    def capacity_for(self, kind: str) -> dict:
+        """Describe configured and available capacity without treating busy as disabled."""
+        from .group_runtime import capacity_for_groups
+
+        with self._workers_lock:
+            if self._groups is None:
+                compatible = [w for w in self.workers if kind != "loudness" or w.worker_type == "CPU"]
+                opened = len([w for w in compatible if not w._pending_removal])
+                return {
+                    "configured": opened,
+                    "open": opened,
+                    "available": sum(w.is_available() for w in compatible),
+                    "busy": sum(w.is_busy for w in compatible),
+                    "reason": "ready" if opened else "configuration",
+                    "next_opening": None,
+                }
+            result = capacity_for_groups(list(self._groups.values()), self.selected_gpus, kind)
+            result["available"] = 0
+            for resource, target in self._resource_targets.items():
+                resource_workers = [w for w in self.workers if w.group_resource == resource]
+                free_budget = max(0, target - sum(w.is_busy for w in resource_workers))
+                idle = sum(w.is_available() and self._worker_supports_kind(w, kind) for w in resource_workers)
+                result["available"] += min(free_budget, idle)
+            result["busy"] = sum(
+                w.is_busy
+                and (kind != "loudness" or w.worker_type == "CPU")
+                and (w.allowed_job_types is None or kind in w.allowed_job_types)
+                for w in self.workers
+            )
+            return result
+
+    def has_capacity_for(self, kind: str) -> bool:
+        """Whether configured slots can run this kind now, even when all are busy."""
+        from ..worker_groups import group_is_available, supports_job
+
+        with self._workers_lock:
+            if self._groups is None:
+                return True  # Legacy callers retain their independent checking stage.
+            return any(
+                self._group_targets.get(gid, 0) > 0 and supports_job(group, kind) and group_is_available(group)
+                for gid, group in self._groups.items()
+            )
+
+    def group_snapshots(self) -> list[dict]:
+        """Return saved targets and live slots, including removed groups still draining."""
+        from ..worker_groups import next_group_opening
+
+        with self._workers_lock:
+            groups = dict(self._groups or {})
+            for worker in self.workers:
+                if worker.group_id and worker.group_id not in groups:
+                    groups[worker.group_id] = {
+                        "id": worker.group_id,
+                        "name": worker.group_name,
+                        "enabled": False,
+                        "resource": "cpu" if worker.worker_type == "CPU" else "gpu",
+                        "device": worker.gpu_device,
+                        "count": 0,
+                        "job_types": list(worker.allowed_job_types or ()),
+                        "availability": {"mode": "always", "windows": []},
+                    }
+            rows = []
+            devices = {device for _, device, _ in self.selected_gpus}
+            for gid, group in groups.items():
+                workers = [w for w in self.workers if w.group_id == gid]
+                target = self._group_targets.get(gid, 0)
+                finishing = sum(w.is_busy and w._pending_removal for w in workers)
+                state = "active"
+                if not group["enabled"]:
+                    state = "disabled"
+                elif group["resource"] == "gpu" and group.get("device") not in devices:
+                    state = "hardware_unavailable"
+                elif not target:
+                    state = "off_hours"
+                if finishing and not target:
+                    state = "draining"
+                opening = next_group_opening(group)
+                resource = "cpu" if group["resource"] == "cpu" else f"gpu:{group.get('device')}"
+                free_budget = max(
+                    0,
+                    self._resource_targets.get(resource, 0)
+                    - sum(w.is_busy and w.group_resource == resource for w in self.workers),
+                )
+                rows.append(
+                    {
+                        **group,
+                        "target": target,
+                        "running": sum(w.is_busy for w in workers),
+                        "available": min(
+                            free_budget,
+                            sum(
+                                w.is_available() and any(self._worker_supports_kind(w, k) for k in group["job_types"])
+                                for w in workers
+                            ),
+                        ),
+                        "finishing": finishing,
+                        "state": state,
+                        "next_opening": opening.isoformat() if opening is not None else None,
+                    }
+                )
+            return rows
 
     def _create_worker(self, worker_type: str) -> "Worker":
         """Create a worker with a unique ID and display name, wired to wake the dispatch loop when it finishes."""
@@ -1103,6 +1325,8 @@ class WorkerPool:
 
     def add_workers(self, worker_type: str, count: int) -> int:
         """Add workers of a specific type and return added count."""
+        if self._groups is not None:
+            raise ValueError("Update a worker group's saved count instead of the shared pool")
         if count <= 0:
             return 0
 
@@ -1125,6 +1349,8 @@ class WorkerPool:
             {"removed": int, "scheduled": int, "unavailable": int}
 
         """
+        if self._groups is not None:
+            raise ValueError("Update a worker group's saved count instead of the shared pool")
         if count <= 0:
             return {"removed": 0, "scheduled": 0, "unavailable": 0}
 
@@ -1228,6 +1454,14 @@ class WorkerPool:
             Summary dict with keys ``added``, ``removed``, and ``deferred``.
 
         """
+        if self._groups is not None:
+            from .group_runtime import current_group_policy
+
+            groups, revision = current_group_policy()
+            summary = self.reconcile_groups(
+                list(self._groups.values()) if groups is None else groups, new_selected_gpus
+            )
+            return {**summary, "deferred": summary["retiring"]}
         new_by_device: dict[str, tuple] = {
             device: (gpu_type, device, info) for gpu_type, device, info in new_selected_gpus
         }
@@ -1342,6 +1576,14 @@ class WorkerPool:
             CPU worker still due to retire, including earlier calls' ones).
 
         """
+        if self._groups is not None:
+            from .group_runtime import current_group_policy
+
+            groups, revision = current_group_policy()
+            summary = self.reconcile_groups(
+                list(self._groups.values()) if groups is None else groups, self.selected_gpus
+            )
+            return {**summary, "deferred": summary["retiring"]}
         desired = max(0, desired)
         added = 0
         removed = 0
@@ -1367,7 +1609,9 @@ class WorkerPool:
             logger.info("Kept {} busy CPU worker(s) that were due to retire", cancelled)
         return {"added": added, "removed": removed, "deferred": deferred, "retiring": retiring}
 
-    def _find_available_worker(self, cpu_only: bool = False, *, claim: bool = False) -> Optional["Worker"]:
+    def _find_available_worker(
+        self, cpu_only: bool = False, *, claim: bool = False, kind: str = "previews"
+    ) -> Optional["Worker"]:
         """Find an available worker.
 
         Args:
@@ -1386,7 +1630,7 @@ class WorkerPool:
             for worker in self.workers:
                 if cpu_only and worker.worker_type != "CPU":
                     continue
-                if worker.is_available():
+                if worker.is_available() and self._worker_supports_kind(worker, kind):
                     if claim:
                         worker.is_busy = True
                     return worker

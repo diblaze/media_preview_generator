@@ -858,7 +858,7 @@
                             </div>
                         </div>
                         <p class="small text-muted mb-2">
-                            Requires Plex 1.43.4.x on the same machine, with Plex's config folder mounted locally. Network-mounted databases are not supported. Analysis runs on CPU, including on GPU workers, and does not rewrite source media.
+                            Requires Plex 1.43.4.x on the same machine, with Plex's config folder mounted locally. Network-mounted databases are not supported. Analysis requires a CPU worker group that allows Plex loudness; configure it in <a href="/settings#section-workers">Settings → Workers</a>. It does not use GPU workers or rewrite source media.
                             Enabling this writes loudness measurements to Plex's database. Intro &amp; Credits can stay off.
                         </p>
                         <p class="small text-warning mb-2 d-none" id="loudnessHelperHint">

@@ -25,7 +25,7 @@ from .config.validation import MAX_CPU_THREADS, validate_processing_thread_total
 # -------------------------------------------------------------------------
 # Schema version — bump when adding new migrations
 # -------------------------------------------------------------------------
-_CURRENT_SCHEMA_VERSION = 20
+_CURRENT_SCHEMA_VERSION = 21
 
 #: Set by v16, v17, v18 and v20: once the job manager runs, the app queues the one job that decides the files Intro &
 #: Credits' old rules left in Needs review, those waiting for their item's other versions, those whose intro rests on
@@ -107,6 +107,7 @@ def _v14_record_failure(sm) -> None:
 # backup; that's enough on its own.
 # -------------------------------------------------------------------------
 _USER_FACING_NOTES: dict[int, str] = {
+    21: "Your worker counts are now worker groups. Existing availability and pauses are preserved.",
     7: (
         "Your Plex configuration was upgraded to the new multi-server format. "
         "You can now add Jellyfin or Emby alongside Plex from Settings → Servers — "
@@ -517,10 +518,14 @@ def _migrate_schema(sm) -> None:
         _run(17, _migrate_to_v17)
     if current < 18:
         _run(18, _migrate_to_v18)
-    if current < 19:
+    # Only clean up an auto-pause flag that was already persisted. Inferring one
+    # here would make v21 mistake an ambiguous manual pause for a proven auto-pause.
+    if current < 19 and sm.get("processing_auto_paused") is True:
         _run(19, _migrate_to_v19)
     if current < 20:
         _run(20, _migrate_to_v20)
+    if current < 21:
+        _run(21, _migrate_to_v21)
 
     sm.set("_schema_version", _CURRENT_SCHEMA_VERSION)
 
@@ -1702,6 +1707,34 @@ def _migrate_to_v20(sm) -> list:
     if not _intro_credits_on_any_server(sm):
         return []
     return ["v20: removed Needs review; the files it held are decided again by one Intro & Credits job"]
+
+
+def _migrate_to_v21(sm) -> list[str]:
+    """Introduce authoritative worker groups and separately owned global pauses."""
+    from .quiet_hours import migrate_quiet_hours
+    from .worker_groups import groups_from_legacy, validate_worker_groups
+
+    stored = sm.get_all()
+    groups = (
+        validate_worker_groups(stored["worker_groups"]) if "worker_groups" in stored else groups_from_legacy(stored)
+    )
+    reasons = stored.get("processing_pause_reasons")
+    ambiguous_pause = reasons is None and stored.get("processing_paused") and not stored.get("processing_auto_paused")
+    if not isinstance(reasons, list):
+        reasons = ["manual"] if ambiguous_pause else []
+    reasons = sorted(set(reasons) & {"manual", "quiet_hours"})
+    updates = {
+        "worker_groups": groups,
+        "worker_groups_revision": int(stored.get("worker_groups_revision", 0)),
+        "processing_pause_reasons": reasons,
+        "processing_paused": bool(reasons),
+    }
+    if "quiet_hours" in stored:
+        updates["quiet_hours"] = migrate_quiet_hours(stored["quiet_hours"])
+    if ambiguous_pause:
+        updates["processing_pause_preserved"] = True
+    sm.apply_changes(updates=updates, deletes=["processing_auto_paused"])
+    return ["v21: migrated worker groups and preserved independently owned pauses"]
 
 
 def _intro_credits_on_any_server(sm) -> bool:

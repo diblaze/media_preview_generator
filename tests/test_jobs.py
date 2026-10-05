@@ -1299,7 +1299,12 @@ class TestMergeJobConfig:
 
         assert jm.merge_job_config(job.id, {"check_servers_listing": {"files": ["/a"]}}) is True
 
-        expected = {"reconcile": True, "paused_by_schedule": True, "check_servers_listing": {"files": ["/a"]}}
+        expected = {
+            "reconcile": True,
+            "paused_by_schedule": True,
+            "pause_reasons": ["schedule"],
+            "check_servers_listing": {"files": ["/a"]},
+        }
         assert jm.get_job(job.id).config == expected
         assert JobManager(config_dir=config_dir).get_job(job.id).config == expected
 

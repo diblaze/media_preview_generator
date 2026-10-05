@@ -2411,6 +2411,14 @@
 
         const labelHtml = escapeHtml(check.label || check.id || '');
         row.innerHTML = `${icon}<div class="flex-grow-1">${labelHtml}${tierBadge}${manualChip}${infoIcon}${reasonStr}${valuesHtml}</div>`;
+        if (check.help_url === '/settings#section-workers') {
+            const help = document.createElement('a');
+            help.href = check.help_url;
+            help.className = 'd-inline-block mt-1';
+            help.textContent = check.help_label || 'Configure CPU workers';
+            row.querySelector('.flex-grow-1').appendChild(help);
+        }
+
 
         // Attach the rich explanation HTML to the info-icon button as
         // a DOM property — can't round-trip multi-paragraph HTML through

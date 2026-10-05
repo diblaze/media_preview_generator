@@ -37,6 +37,7 @@
     <script src="{{ url_for('static', filename='js/csrf_fetch.js') }}"></script>
 
     {% block head %}{% endblock %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/worker_groups.css') }}">
 </head>
 <body>
     {% if request.endpoint != 'main.login' %}
@@ -126,13 +127,6 @@
                                     <i class="bi bi-calendar-event me-2" aria-hidden="true"></i>Schedules
                                 </a>
                             </li>
-                            <li>
-                                <a class="dropdown-item" data-anchor="section-schedules-quiet-hours"
-                                   href="{{ url_for('main.automation_page') }}#section-schedules-quiet-hours"
-                                   aria-label="Quiet Hours: times of day when processing pauses">
-                                    <i class="bi bi-moon-stars me-2" aria-hidden="true"></i>Quiet Hours
-                                </a>
-                            </li>
                         </ul>
                     </li>
                     <li class="nav-item dropdown nav-hover-menu">
@@ -143,10 +137,12 @@
                         </a>
                         {# The Settings page's sidebar sections, in its order (settings.html). #}
                         <ul class="dropdown-menu" id="navSettingsMenu" aria-labelledby="navSettingsDropdown">
+                            <li><a class="dropdown-item" data-anchor="section-workers" href="{{ url_for('main.settings') }}#section-workers" aria-label="Workers: groups, job permissions and availability"><i class="bi bi-cpu me-2" aria-hidden="true"></i>Workers</a></li>
+                            <li><a class="dropdown-item" data-anchor="section-worker-quiet-hours" href="{{ url_for('main.settings') }}#section-worker-quiet-hours" aria-label="Global pause schedule: times when all processing pauses"><i class="bi bi-moon-stars me-2" aria-hidden="true"></i>Global pause schedule</a></li>
                             <li>
                                 <a class="dropdown-item" data-anchor="section-processing"
                                    href="{{ url_for('main.settings') }}#section-processing"
-                                   aria-label="Processing Options: jobs, GPUs, CPU workers and thumbnails">
+                                   aria-label="Processing Options: job limits, device tuning and thumbnails">
                                     <i class="bi bi-speedometer2 me-2" aria-hidden="true"></i>Processing Options
                                 </a>
                             </li>
@@ -512,6 +508,7 @@
     <script src="{{ url_for('static', filename='js/job_modal.js') }}"></script>
     <script src="{{ url_for('static', filename='js/schedule_modal.js') }}"></script>
     <script src="{{ url_for('static', filename='js/schedules.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/worker_groups.js') }}"></script>
     <script src="{{ url_for('static', filename='js/autosave.js') }}"></script>
     <script src="{{ url_for('static', filename='js/folder_picker.js') }}"></script>
     <script src="{{ url_for('static', filename='js/stepper.js') }}"></script>

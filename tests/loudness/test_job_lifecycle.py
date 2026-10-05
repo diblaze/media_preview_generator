@@ -423,3 +423,85 @@ def test_bounded_retry_keeps_omitted_waiting_files_in_parent_summary(
     assert parent.progress.outcome[job.UP_TO_DATE] == 1
     assert parent.progress.outcome[job.WAITING] == 1
     assert lifecycle.rows(parent)[paths[1]]["outcome"] == job.WAITING
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["same-process", "restart"])
+def test_capacity_closure_parks_same_job_and_resumes_only_unfinished_work(lifecycle, monkeypatch, restart):
+    import threading
+    import time
+
+    from media_preview_generator.jobs import group_runtime
+
+    groups = [
+        {
+            "id": "cpu",
+            "name": "Loudness",
+            "resource": "cpu",
+            "device": None,
+            "count": 1,
+            "enabled": True,
+            "job_types": ["loudness"],
+            "availability": {"mode": "always"},
+        }
+    ]
+    monkeypatch.setattr(group_runtime, "current_groups", lambda config=None: groups)
+    monkeypatch.setattr(group_runtime, "current_group_policy", lambda config=None: (groups, None))
+    monkeypatch.setattr(
+        group_runtime, "runtime_capacity", lambda kind: group_runtime.capacity_for_groups(groups, [], kind)
+    )
+    monkeypatch.setattr(job, "runtime_capacity", group_runtime.runtime_capacity)
+    lifecycle.dispatcher.worker_pool.reconcile_groups(groups, [])
+    lifecycle.api_ready = True
+    paths = [lifecycle.add_file("first.mkv"), lifecycle.add_file("second.mkv")]
+    original = lifecycle.popen
+
+    def analyze(command, **kwargs):
+        answer = original(command, **kwargs)
+        if len(lifecycle.analyses) == 1:
+            groups[0]["enabled"] = False
+            lifecycle.dispatcher.worker_pool.reconcile_groups(groups, [])
+            group_runtime.wake_group_runtime()
+        return answer
+
+    monkeypatch.setattr(job.analyze.subprocess, "Popen", analyze)
+    parent = lifecycle.manager.create_job(
+        kind="loudness", config={"kind": "loudness", "source": "manual", "file_paths": paths}
+    )
+    runner = threading.Thread(target=job._run_loudness_pass if restart else job.run_loudness_job, args=(parent.id,))
+    runner.start()
+    try:
+        deadline = time.monotonic() + 8
+        while not parent.config.get("parked_checkpoint") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert parent.config.get("parked_checkpoint"), parent.to_dict()
+        assert parent.status is JobStatus.PENDING
+        assert parent.progress.processed_items == 1
+        assert lifecycle.manager.get_running_jobs() == []
+        assert parent.id not in lifecycle.dispatcher._trackers
+        assert len(lifecycle.analyses) == 1
+        assert lifecycle.children(parent) == []
+        if restart:
+            runner.join(3)
+            assert not runner.is_alive()
+            old_manager = lifecycle.manager
+            old_manager.close()
+            lifecycle.manager = JobManager(old_manager.config_dir)
+            for module in (job, shared_runner, jobs):
+                monkeypatch.setattr(module, "get_job_manager", lambda: lifecycle.manager)
+            assert [item.id for item in lifecycle.manager.requeue_interrupted_jobs()] == [parent.id]
+            parent = lifecycle.manager.get_job(parent.id)
+        groups[0]["enabled"] = True
+        group_runtime.wake_group_runtime()
+        if restart:
+            runner = threading.Thread(target=job.run_loudness_job, args=(parent.id,))
+            runner.start()
+        runner.join(8)
+        assert not runner.is_alive()
+        assert parent.status is JobStatus.COMPLETED, parent.error
+        assert {key: value for key, value in parent.progress.outcome.items() if value} == {job.WRITTEN: 2}
+        assert sorted(lifecycle.analyses) == [(path, 1) for path in sorted(paths)]
+        assert "parked_checkpoint" not in parent.config and "resource_wait" not in parent.config
+    finally:
+        lifecycle.manager.request_cancellation(parent.id)
+        group_runtime.wake_group_runtime()
+        runner.join(3)

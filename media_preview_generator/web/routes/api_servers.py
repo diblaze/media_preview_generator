@@ -1653,6 +1653,16 @@ def set_plex_loudness_analysis_never(server_id: str):
                 "error": "Choose at least one movie or TV library for this app's loudness analysis first",
             }
         ), 409
+    from ..settings_manager import get_settings_manager
+    from .api_worker_groups import future_job_capacity
+
+    if not future_job_capacity(get_settings_manager(), "loudness"):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Configure a CPU worker group for Loudness with hours outside global quiet hours first",
+            }
+        ), 409
     live = _instantiate_for_probe(cfg)
     if live is None or not hasattr(live, "set_loudness_analysis_never"):
         return jsonify({"ok": False, "error": "could not instantiate server client"}), 400

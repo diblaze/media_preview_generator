@@ -318,19 +318,34 @@ class TestGpuFailures:
         ],
     )
     def test_a_failing_gpu_helper_hands_that_request_to_the_cpu_and_the_gpu_is_tried_after_the_back_off(
-        self, envs, clock, loguru_caplog, mode, timeouts, self_tested
+        self, envs, monkeypatch, loguru_caplog, mode, timeouts, self_tested
     ):
         env = envs(modes={"webgpu": [mode, "ok"]}, **timeouts)
+        failure_windows = []
+        real_failed = env.pool._gpu_failed
+
+        def gpu_failed(key, exc):
+            before = time.monotonic()
+            result = real_failed(key, exc)
+            failure_windows.append((key, before, env.pool._gpus[key].retry_at, time.monotonic()))
+            return result
+
+        monkeypatch.setattr(env.pool, "_gpu_failed", gpu_failed)
         assert self._detect(env) == ANSWER
+        ((key, before, retry_at, after),) = failure_windows
+        assert key == "cuda:0"
+        assert before + th.GPU_RETRY_BASE_S <= retry_at <= after + th.GPU_RETRY_BASE_S
         assert env.backends() == [("cuda:0", "webgpu", True), ("cpu", "cpu", False)]
         assert env.procs[0].wait(timeout=10) is not None  # killed, not left running
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "cpu"
         # Inside the first back-off the next request stays on the CPU: one file's back-to-back requests don't each pay
         # a failing helper's start, hang or crash.
-        clock.advance(th.GPU_RETRY_BASE_S - 0.5)
+        # Place the recorded deadline clearly before/after real time. Advancing a real-clock offset to within
+        # 0.5 s of it makes slow helper IPC expire the back-off under load. Subprocess timeout clocks stay untouched.
+        env.pool._gpus["cuda:0"].retry_at = time.monotonic() + 60
         assert self._detect(env) == ANSWER
         assert len(env.gpu_starts()) == 1
-        clock.advance(1)
+        env.pool._gpus["cuda:0"].retry_at = time.monotonic() - 1
         assert self._detect(env) == ANSWER
         # A helper whose self-test had answered restarts without one; one that never got that far self-tests again.
         assert env.backends()[-1] == ("cuda:0", "webgpu", not self_tested)
@@ -1801,7 +1816,9 @@ def test_get_textdet_pool_is_one_pool_for_the_process_closed_at_exit(monkeypatch
 def test_the_app_reads_the_saved_cpu_worker_count(monkeypatch, saved, expected):
     from media_preview_generator.web import settings_manager
 
-    monkeypatch.setattr(settings_manager, "peek_settings_manager", lambda: SimpleNamespace(cpu_threads=saved))
+    monkeypatch.setattr(
+        settings_manager, "peek_settings_manager", lambda: SimpleNamespace(cpu_threads=saved, get=lambda _: None)
+    )
     assert th._configured_cpu_workers() == expected
 
 

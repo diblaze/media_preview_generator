@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from ..job_kinds import JOB_KIND_PREVIEWS, SELF_PAUSED_KINDS, parse_job_kind
+from ..job_kinds import JOB_KIND_PREVIEWS, parse_job_kind
 from ..utils import redact_secrets
 
 # Message shown in UI when a job's log file was removed by retention policy.
@@ -49,10 +49,20 @@ def log_clock(moment: datetime | None = None) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# Job config key set while a job's pause came from its schedule's stop time. Only such a pause is resumed by that
-# schedule's next start (or Run now); a pause by hand, or Pause all, overwrites it, and any resume or the job's end
-# clears it.
+# Compatibility flag for the schedule-owned member of the independently persisted pause causes.
 PAUSED_BY_SCHEDULE = "paused_by_schedule"
+JOB_PAUSE_REASONS = "pause_reasons"
+
+
+def job_pause_reasons(job: "Job") -> set[str]:
+    """Read explicit owners, falling back to a legacy paused job's recorded owner."""
+    raw = (job.config or {}).get(JOB_PAUSE_REASONS)
+    if isinstance(raw, list):
+        return {reason for reason in raw if isinstance(reason, str) and reason in {"manual", "schedule"}}
+    if job.paused:
+        return {"schedule" if (job.config or {}).get(PAUSED_BY_SCHEDULE) else "manual"}
+    return set()
+
 
 # Every key ``upsert_retry_chain_job`` and ``_spawn_retry_job`` write
 # onto a Job's config to mark it as part of a retry chain. Single
@@ -80,6 +90,10 @@ RETRY_STATE_CONFIG_KEYS: tuple[str, ...] = (
     "webhook_basenames",
     "resolution_summary",
     "scheduled_at",
+    "parked_checkpoint",
+    "resource_wait",
+    "pause_reasons",
+    "paused_by_schedule",
 )
 
 # ``last_outcome`` values that mean a retry chain is actively firing
@@ -313,6 +327,10 @@ class WorkerStatus:
     worker_id: int = 0
     worker_type: str = "CPU"  # "GPU" or "CPU"
     worker_name: str = "CPU Worker"
+    group_id: str | None = None
+    group_name: str | None = None
+    group_resource: str | None = None
+    retiring: bool = False
     status: str = "idle"  # "idle", "processing"
     current_file: str = ""
     current_title: str = ""
@@ -781,6 +799,7 @@ class JobManager:
         self._retention_timer: threading.Timer | None = None
         self._closed = False
         self._interrupted_jobs: list[Job] = []
+        self._restored_capacity_chain_ids: set[str] = set()
         # Chain Jobs that were in PENDING/RUNNING at load time. The
         # retry children that drive the chain are real Jobs and are
         # revived by the generic ``_requeue_interrupted_on_startup``
@@ -1052,9 +1071,29 @@ class JobManager:
         """
         if self._storage is None:
             return
+        previous_config = job.config
+        reference = None
+        if (
+            job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+            and job.error != "Job was interrupted by server restart"
+        ):
+            reference = (job.config or {}).get("parked_checkpoint")
+            job.config = {
+                key: value
+                for key, value in (job.config or {}).items()
+                if key not in ("parked_checkpoint", "resource_wait")
+            }
         try:
             self._storage.upsert(job)
+            if reference:
+                from ..jobs.checkpoints import delete_checkpoint
+
+                try:
+                    delete_checkpoint(self.config_dir, job.id, reference)
+                except (OSError, ValueError):
+                    logger.warning("Could not remove an ended job's checkpoint: {}", job.id)
         except sqlite3.Error as e:
+            job.config = previous_config
             logger.error(
                 "Could not persist job {} to {} ({}: {}). Job state will be lost on restart.",
                 job.id,
@@ -1316,6 +1355,59 @@ class JobManager:
         )
         return job
 
+    def restore_capacity_waits(self) -> list[Job]:
+        """Restore planned pending waits independently of crashed-work recovery.
+
+        A committed resource park is an intentional queue state, not an
+        interrupted run. Keep its checkpoint, counters, pause owners and
+        dependent pending jobs unchanged, regardless of downtime or the
+        user's preference for retrying interrupted work.
+        """
+        with self._lock:
+            pending = {job.id: job for job in self._interrupted_jobs if job.status is JobStatus.PENDING}
+            restored = {
+                job.id: job
+                for job in pending.values()
+                if (job.config or {}).get("resource_wait") or (job.config or {}).get("parked_checkpoint")
+            }
+            followers: dict[str, list[Job]] = {}
+            for job in pending.values():
+                cfg = job.config or {}
+                dependencies = cfg.get("follows_job_ids")
+                dependencies = list(dependencies) if isinstance(dependencies, list) else []
+                dependencies.append(cfg.get("follows_job_id"))
+                for parent in dependencies:
+                    if isinstance(parent, str) and parent in pending:
+                        followers.setdefault(parent, []).append(job)
+            queue = deque(restored)
+            while queue:
+                for follower in followers.get(queue.popleft(), []):
+                    if follower.id not in restored:
+                        restored[follower.id] = follower
+                        queue.append(follower.id)
+            self._interrupted_jobs = [job for job in self._interrupted_jobs if job.id not in restored]
+            self._restored_capacity_chain_ids.update(
+                parent
+                for job in restored.values()
+                if (job.config or {}).get("is_retry")
+                and isinstance(parent := (job.config or {}).get("parent_job_id"), str)
+            )
+        for job in restored.values():
+            self.add_log(job.id, "INFO - Restored intentional capacity wait after restart; existing holds still apply")
+        return list(restored.values())
+
+    def consume_restored_capacity_chain_ids(self) -> frozenset[str]:
+        """Take restored retry-chain identities, even if their attempts changed.
+
+        Retry-head reconciliation follows watcher startup. Keep this transient
+        evidence until it can distinguish an intentional old wait from an
+        abandoned chain, without relying on mutable attempts or history retention.
+        """
+        with self._lock:
+            restored = frozenset(self._restored_capacity_chain_ids)
+            self._restored_capacity_chain_ids.clear()
+            return restored
+
     def requeue_interrupted_jobs(self, max_age_minutes: int = 720) -> list[Job]:
         """Revive jobs that were interrupted by the last restart.
 
@@ -1361,7 +1453,7 @@ class JobManager:
                 # A job waiting for a gate slot is as old as the last time it was seen waiting (the runners refresh it
                 # while they wait), so a job queued behind a long scan is aged by the downtime only.
                 ref_time = max(ref_time, _parse_utc((job.config or {}).get(SLOT_WAIT_SINCE)) or ref_time)
-                if ref_time < cutoff:
+                if ref_time < cutoff and not (job.config or {}).get("resource_wait"):
                     logger.debug("Skipping revive of job {} — too old (ref={})", job.id[:8], ref_str)
                     not_revived.append(job)
                     continue
@@ -1394,11 +1486,9 @@ class JobManager:
             job.status = JobStatus.PENDING
             job.error = None
             job.completed_at = None
-            # An Intro & Credits or loudness job's own pause is the user's (or its schedule's stop time's) intent and
-            # outlives the restart like the global pause does; its runner re-applies it. The preview runner
-            # can't hold a revived job paused, so a preview job's pause is dropped as before.
-            job.paused = job.paused and job.kind in SELF_PAUSED_KINDS
-            job.progress = JobProgress()
+            self._set_pause_reasons(job, job_pause_reasons(job))
+            if not (job.config or {}).get("parked_checkpoint"):
+                job.progress = JobProgress()
 
         self.add_log(
             job.id,
@@ -1727,6 +1817,7 @@ class JobManager:
             job.config["retry_attempt"] = int(attempt)
             job.config["retry_max_attempts"] = int(max_attempts)
             job.config["last_outcome"] = outcome
+            job.config.pop("resource_wait", None)
             # Aliases the existing app.js retry badge reads (chip
             # renders on ``is_retry: true && max_retries > 0``).
             job.config["is_retry"] = True
@@ -1948,18 +2039,85 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job and job.status != JobStatus.RUNNING:
                 job.status = JobStatus.RUNNING
-                job.paused = False
-                job.started_at = datetime.now(UTC).isoformat()
+                self._set_pause_reasons(job, job_pause_reasons(job))
+                job.started_at = job.started_at or datetime.now(UTC).isoformat()
                 self._running_job_ids.add(job_id)
-                self._pause_flags[job_id] = False
-                self._pause_events[job_id] = threading.Event()
-                self._pause_events[job_id].set()
                 self._persist_job(job)
                 self._emit_event("job_started", job.to_dict())
                 started = True
         if started:
             logger.info("Started job {}", job_id)
         return job
+
+    def _mirror_chain_resource_wait(self, job: Job, wait: dict) -> None:
+        """A hidden attempt's capacity wait belongs on its visible chain head too (manager lock held)."""
+        parent = self._jobs.get((job.config or {}).get("parent_job_id"))
+        if parent is None or not is_live_retry_chain(parent.config) or parent.status is JobStatus.CANCELLED:
+            return
+        parent.status = JobStatus.PENDING
+        parent.config = {**parent.config, "resource_wait": dict(wait)}
+        parent.progress.current_item = wait["reason"]
+        parent.progress.retry_eta = None
+        parent.progress.retry_wait_total = None
+        self._running_job_ids.discard(parent.id)
+        self._persist_job(parent)
+        self._emit_event("job_updated", parent.to_dict())
+
+    def mark_resource_wait(self, job_id: str, reason: str, next_eligible: str | None = None) -> bool:
+        """Persist an intentional capacity wait without changing attempts or pause ownership."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                return False
+            wait = {"reason": reason, "next_eligible": next_eligible}
+            if (job.config or {}).get("resource_wait") == wait:
+                return True
+            job.config = {**(job.config or {}), "resource_wait": wait}
+            job.progress.current_item = reason
+            self._mirror_chain_resource_wait(job, wait)
+            self._persist_job(job)
+            self._emit_event("job_updated", job.to_dict())
+            return True
+
+    def park_job(self, job_id: str, checkpoint_ref: str, reason: str, next_eligible: str | None = None) -> bool:
+        """Durably park a drained job before its dispatcher state or admission slot can be released.
+
+        Raises:
+            RuntimeError: Persistent job storage is unavailable.
+            sqlite3.Error: The checkpoint reference could not be committed. The live job remains intact.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                return False
+            if not self._storage:
+                raise RuntimeError("Cannot park safely without persistent job storage")
+            old_status, old_config = job.status, job.config
+            job.config = {
+                **(job.config or {}),
+                "parked_checkpoint": checkpoint_ref,
+                "resource_wait": {"reason": reason, "next_eligible": next_eligible},
+            }
+            job.status = JobStatus.PENDING
+            try:
+                self._storage.upsert(job)
+            except Exception:
+                job.status, job.config = old_status, old_config
+                raise
+            self._running_job_ids.discard(job_id)
+            self._mirror_chain_resource_wait(job, job.config["resource_wait"])
+            self._emit_event("job_updated", job.to_dict())
+            return True
+
+    def resume_parked_job(self, job_id: str) -> Job | None:
+        """Resume the same job with its committed checkpoint, counters, start time and holds intact."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                return None
+            job.config = dict(job.config or {})
+            job.config.pop("resource_wait", None)
+            return self.start_job(job_id)
 
     def append_publishers(self, job_id: str, publisher_rows: list[dict]) -> None:
         """Append per-publisher outcome rows to a job (Phase H5).
@@ -2888,92 +3046,63 @@ class JobManager:
     # Pause / Resume Management
     # ========================================================================
 
+    def _set_pause_reasons(self, job: Job, reasons: set[str]) -> None:
+        """Update persisted compatibility fields and the in-memory wake event under the manager lock."""
+        job.config = dict(job.config or {})
+        if reasons:
+            job.config[JOB_PAUSE_REASONS] = sorted(reasons)
+        else:
+            job.config.pop(JOB_PAUSE_REASONS, None)
+        if "schedule" in reasons:
+            job.config[PAUSED_BY_SCHEDULE] = True
+        else:
+            job.config.pop(PAUSED_BY_SCHEDULE, None)
+        job.paused = bool(reasons)
+        self._pause_flags[job.id] = job.paused
+        event = self._pause_events.setdefault(job.id, threading.Event())
+        event.clear() if job.paused else event.set()
+
     def request_pause(self, job_id: str, *, by_schedule: bool = False) -> bool:
-        """Request pause for a running job.
-
-        Args:
-            job_id: Job identifier.
-            by_schedule: The pause comes from the job's schedule's stop time (``PAUSED_BY_SCHEDULE``), so that
-                schedule's next start resumes it. It only pauses a job that isn't paused yet (checked under the lock,
-                so a pause by hand just before it stays one); any other pause replaces that record.
-
-        Returns:
-            True when the job was running and is now paused.
-        """
-        paused = False
-        status_val = ""
+        """Add a manual or schedule hold to a pending/running job without replacing another owner's hold."""
         with self._lock:
             job = self._jobs.get(job_id)
-            if not job or job.status != JobStatus.RUNNING:
+            if not job or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
                 return False
-            # A chain head shows its hidden retry's run; nothing would ever resume a pause held on the head itself.
             if is_live_retry_chain(job.config):
                 return False
-            if by_schedule and job.paused:
+            reasons = job_pause_reasons(job)
+            reason = "schedule" if by_schedule else "manual"
+            if reason in reasons:
                 return False
-            self._pause_flags[job_id] = True
-            event = self._pause_events.get(job_id)
-            if event is None:
-                event = threading.Event()
-                self._pause_events[job_id] = event
-            event.clear()
-            job.paused = True
-            job.config = {key: value for key, value in (job.config or {}).items() if key != PAUSED_BY_SCHEDULE}
-            if by_schedule:
-                job.config[PAUSED_BY_SCHEDULE] = True
-            status_val = job.status.value
+            reasons.add(reason)
+            self._set_pause_reasons(job, reasons)
             self._persist_job(job)
             self._emit_event("job_paused", {"job_id": job_id, "paused": True})
-            paused = True
-        if paused:
-            logger.info("Pause audit: job_id={}, status={}, paused=True", job_id, status_val)
-            self.add_log(
-                job_id,
-                "INFO - Pause requested; no new tasks will be dispatched until resume.",
-            )
-        return paused
+        self.add_log(job_id, f"INFO - {reason.title()} pause requested; no new tasks will start.")
+        return True
 
     def request_resume(self, job_id: str, *, only_paused_by_schedule: bool = False) -> bool:
-        """Request resume for a paused job.
-
-        Args:
-            job_id: Job identifier.
-            only_paused_by_schedule: Resume only while the job's pause is its schedule's stop time's
-                (``PAUSED_BY_SCHEDULE``), checked under the lock: a schedule's start tick never resumes a pause by hand,
-                even one made just after the tick looked.
-
-        Returns:
-            True when the job was running and is now resumed.
-        """
-        resumed = False
-        status_val = ""
+        """Remove only this caller's pause cause; a remaining owner keeps the job held."""
         with self._lock:
             job = self._jobs.get(job_id)
-            if not job or job.status != JobStatus.RUNNING:
+            if not job or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
                 return False
-            if only_paused_by_schedule and not (job.paused and (job.config or {}).get(PAUSED_BY_SCHEDULE)):
+            reasons = job_pause_reasons(job)
+            reason = "schedule" if only_paused_by_schedule else "manual"
+            if reason not in reasons:
                 return False
-            self._pause_flags[job_id] = False
-            event = self._pause_events.get(job_id)
-            if event is None:
-                event = threading.Event()
-                self._pause_events[job_id] = event
-            event.set()
-            job.paused = False
-            job.config = {key: value for key, value in (job.config or {}).items() if key != PAUSED_BY_SCHEDULE}
-            status_val = job.status.value
+            reasons.remove(reason)
+            self._set_pause_reasons(job, reasons)
             self._persist_job(job)
-            self._emit_event("job_resumed", {"job_id": job_id, "paused": False})
-            resumed = True
-        if resumed:
-            logger.info("Resume audit: job_id={}, status={}, paused=False", job_id, status_val)
-            self.add_log(job_id, "INFO - Resume requested; dispatch will continue.")
-        return resumed
+            self._emit_event("job_paused" if job.paused else "job_resumed", {"job_id": job_id, "paused": job.paused})
+        self.add_log(job_id, f"INFO - {reason.title()} pause cleared.")
+        return True
 
     def is_pause_requested(self, job_id: str) -> bool:
-        """Check if pause has been requested for a job."""
+        """Read persistent ownership too, including a job revived before it has a runner."""
         with self._lock:
-            return self._pause_flags.get(job_id, False)
+            job = self._jobs.get(job_id)
+            return bool(job_pause_reasons(job)) if job is not None else self._pause_flags.get(job_id, False)
 
     def clear_pause_flag(self, job_id: str) -> None:
         """Clear pause state for a job, including where the pause came from (``PAUSED_BY_SCHEDULE``).
@@ -2985,10 +3114,13 @@ class JobManager:
             self._pause_flags.pop(job_id, None)
             self._pause_events.pop(job_id, None)
             job = self._jobs.get(job_id)
-            if job:
+            if job and job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 job.paused = False
-                if PAUSED_BY_SCHEDULE in (job.config or {}):
-                    job.config = {key: value for key, value in job.config.items() if key != PAUSED_BY_SCHEDULE}
+                job.config = {
+                    key: value
+                    for key, value in (job.config or {}).items()
+                    if key not in (PAUSED_BY_SCHEDULE, JOB_PAUSE_REASONS)
+                }
 
     # ========================================================================
     # Active Worker Pool Management

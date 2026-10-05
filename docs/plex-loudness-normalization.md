@@ -13,7 +13,7 @@ description: Analyses audio tracks on this app's workers and stores loudness mea
 </nav>
 
 Plex's **Normalize Loudness** needs each audio track analysed first. This app runs FFmpeg's loudness analysis on its
-workers, alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats
+CPU worker groups, alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats
 the completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
@@ -33,6 +33,8 @@ unlock the playback feature. See Plex's [Audio Track Enhancements for Video](htt
 2. On the server's **Processing → Loudness** section, switch on **Analyse loudness for this server**.
 3. On the **Libraries** tab, choose movie and TV libraries in the **Loudness** column. Both start on; music and other
    non-video libraries cannot be selected.
+4. In **Settings → Workers**, enable a CPU group that allows **Plex loudness**, with hours outside global quiet hours.
+   One worker allows one simultaneous audio analysis. GPU-only setups must add CPU capacity explicitly.
 
 Loudness has its own opt-in; **Intro & Credits** can stay off, and its database-write confirmation is not required.
 Run **Setup Health** to check the connection, server identity, database and supported Plex version before starting a
@@ -50,7 +52,9 @@ hasn't added to its library yet, or met while Plex was restarting or its databas
 your retry settings. The same job row shows the countdown and attempt count; **Retry now** skips the wait.
 After retries end, unresolved files leave a failure or a completion warning when other files succeeded. The Files
 panel gives the reason. These retries are automatic and do not require review or approval.
-Jobs share the workers, priorities, pause and cancel of every other job.
+Jobs use eligible CPU workers and the shared priorities, job limit, pause and cancel controls. Without eligible CPU
+capacity a job waits, keeping its identity and work; it does not run audio analysis in a GPU worker slot. See
+[Worker groups and availability](guides.md#worker-groups-and-availability).
 
 ### Checking the results
 
@@ -71,10 +75,11 @@ enabled is valid: Plex can serve music and video libraries this app does not cov
 depends on each library's **Enable Loudness Analysis** setting; a server-wide schedule alone does not mean both
 applications are analysing the same videos.
 
-When this app has eligible video libraries selected and its writer is ready, **Set to Never** is an optional,
+When this app has eligible video libraries selected, its writer is ready, and a CPU group has usable loudness hours, **Set to Never** is an optional,
 separately confirmed action. It changes Plex's server-wide schedule, including music and unselected video libraries;
 it does not enable this app, extend its library selection or erase existing measurements. Keep native analysis on
-if those other libraries need it. The app checks its selection and writer readiness again when the action runs.
+if those other libraries need it. The app checks its selection, writer readiness and configured CPU eligibility again when the action runs. Busy
+workers do not prevent this action; absent or unusable CPU hours do.
 The control is excluded from bulk fixes, and installing or upgrading the app never changes this Plex preference.
 
 ## What it runs
@@ -89,7 +94,7 @@ ffmpeg -i FILE -map 0:TRACK -af loudnorm=I=-16:TP=-1:LRA=9:print_format=json -f 
 and stores loudnorm's measurements in the track's `extra_data`, under the names Plex uses: `ln:loudness`, `ln:peak`,
 `ln:lra`, `ln:threshold`, `ln:gainOffset` and `ln:loudnessAnalysisVersion`. The values are the ones loudnorm prints,
 as Plex stores them, and the rest of the track's data is kept. Decoding audio gains nothing from a GPU, so the
-analysis runs on the CPU even on a GPU worker. The entire audio track is measured; the source media is never rewritten.
+analysis runs only in CPU worker groups. The entire audio track is measured; the source media is never rewritten.
 Silent tracks and audio too short for an integrated measurement use Plex's observed `-inf` loudness and `inf` gain
 values, with the remaining fields validated. Invalid or incomplete reports are not stored.
 

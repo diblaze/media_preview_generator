@@ -4,8 +4,7 @@
 # its text) under the body.
 - title: GPU first, CPU when needed
   body: >-
-    NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Every GPU passed in gets its own
-    workers, and a file the GPU can't decode is retried on the CPU by the same worker.
+    NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed in, and a file the GPU can't decode is retried on the CPU by the same worker.
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>
 - title: Starts per file
   body: >-

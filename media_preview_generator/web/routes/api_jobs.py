@@ -11,7 +11,7 @@ from flask import Response, current_app, jsonify, request, session
 from loguru import logger
 
 from ...config import MAX_CPU_THREADS
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, SELF_PAUSED_KINDS
+from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS
 from ...scan_filters import FILTER_CONFIG_KEYS, normalize_scan_filter_config
 from ..auth import (
     api_token_required,
@@ -1147,36 +1147,35 @@ def fire_webhook_now(job_id):
 @api.route("/jobs/<job_id>/pause", methods=["POST"])
 @api_token_required
 def pause_job(job_id):
-    """Pause a job. Intro & Credits and loudness jobs pause on their own; preview jobs pause all processing (legacy)."""
+    """Add this job's manual hold without changing global or schedule holds."""
     job_manager = get_job_manager()
     job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if job.kind in SELF_PAUSED_KINDS:
-        if not job_manager.request_pause(job_id):
-            return jsonify({"error": "Only running jobs can be paused"}), 409
-        return jsonify(job_manager.get_job(job_id).to_dict())
-    return pause_processing()
+    if not job_manager.request_pause(job_id):
+        return jsonify({"error": "Only pending or running jobs can be paused"}), 409
+    return jsonify(job_manager.get_job(job_id).to_dict())
 
 
 @api.route("/jobs/<job_id>/resume", methods=["POST"])
 @api_token_required
 def resume_job(job_id):
-    """Resume a job. Intro & Credits and loudness jobs resume on their own; preview jobs resume all processing (legacy)."""
+    """Clear this job's manual hold, retaining its schedule and global holds."""
     job_manager = get_job_manager()
     job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if job.kind in SELF_PAUSED_KINDS:
-        from ..settings_manager import get_settings_manager
+    from ..settings_manager import get_settings_manager
 
-        if not job_manager.request_resume(job_id):
-            return jsonify({"error": "Only running jobs can be resumed"}), 409
-        # Pause all still holds the job while the global flag is set; the UI says so.
-        body = job_manager.get_job(job_id).to_dict()
-        body["processing_paused"] = bool(get_settings_manager().processing_paused)
-        return jsonify(body)
-    return resume_processing()
+    if not job_manager.request_resume(job_id):
+        return jsonify({"error": "Only pending or running jobs can be resumed"}), 409
+    global_paused = bool(get_settings_manager().processing_paused)
+    current = job_manager.get_job(job_id)
+    if current.status == JobStatus.PENDING and not global_paused and not job_manager.is_pause_requested(job_id):
+        _start_job_async(job_id, current.config)
+    body = current.to_dict()
+    body["processing_paused"] = global_paused
+    return jsonify(body)
 
 
 @api.route("/jobs/<job_id>/priority", methods=["POST"])
@@ -1219,24 +1218,18 @@ def get_processing_state():
     from ..settings_manager import get_settings_manager
 
     sm = get_settings_manager()
-    return jsonify({"paused": sm.processing_paused})
+    return jsonify({"paused": sm.processing_paused, "reasons": sm.processing_pause_reasons})
 
 
 @api.route("/processing/pause", methods=["POST"])
 @api_token_required
 def pause_processing():
-    """Set global processing pause (all running jobs pause dispatch after current tasks)."""
+    """Add a manual global processing hold, independent of each job's holds."""
     from ..settings_manager import get_settings_manager
 
     sm = get_settings_manager()
     job_manager = get_job_manager()
     sm.processing_paused = True
-    for running in job_manager.get_running_jobs():
-        # Intro & Credits and loudness jobs are held by the global flag itself; their per-job flag is the user's own
-        # pause.
-        if running.kind in SELF_PAUSED_KINDS:
-            continue
-        job_manager.request_pause(running.id)
     job_manager.emit_processing_paused_changed(True)
     logger.info("Global processing paused")
     return jsonify({"paused": True})
@@ -1245,17 +1238,18 @@ def pause_processing():
 @api.route("/processing/resume", methods=["POST"])
 @api_token_required
 def resume_processing():
-    """Clear the global pause and resume running preview jobs (Intro & Credits jobs keep their own pause)."""
+    """Clear only the manual global hold and wake pending jobs when no global hold remains."""
     from ..settings_manager import get_settings_manager
     from .job_runner import resume_running_and_drain_pending
 
     sm = get_settings_manager()
     job_manager = get_job_manager()
     sm.processing_paused = False
-    job_manager.emit_processing_paused_changed(False)
-    logger.info("Global processing resumed")
-    resume_running_and_drain_pending()
-    return jsonify({"paused": False})
+    job_manager.emit_processing_paused_changed(sm.processing_paused)
+    if not sm.processing_paused:
+        logger.info("Manual global pause cleared")
+        resume_running_and_drain_pending()
+    return jsonify({"paused": sm.processing_paused, "reasons": sm.processing_pause_reasons})
 
 
 def _change_saved_cpu_worker_count(worker_pool, delta: int) -> tuple[dict, int, int] | tuple[None, int, int]:
@@ -1288,6 +1282,56 @@ def _change_saved_cpu_worker_count(worker_pool, delta: int) -> tuple[dict, int, 
         return worker_pool.reconcile_cpu_workers(target), previous, target
 
 
+def _scale_group_for_legacy_request(data: dict, worker_type: str, delta: int):
+    """Keep old scaling endpoints useful when their resource identifies one group."""
+    from ..settings_manager import get_settings_manager
+    from .api_worker_groups import reconcile_group_settings, scale_saved_group
+
+    settings = get_settings_manager()
+    if not isinstance(settings.get("worker_groups"), list):
+        return None
+
+    def finishing(group_id: str) -> int:
+        pool = _get_shared_worker_pool()
+        return sum(
+            row.get("finishing", 0)
+            for row in (pool.group_snapshots() if pool is not None else [])
+            if row["id"] == group_id
+        )
+
+    with settings.locked():
+        groups = [group for group in settings.worker_groups if group["resource"] == worker_type.lower()]
+        requested_id = data.get("group_id")
+        if requested_id:
+            groups = [group for group in groups if group["id"] == requested_id]
+        if len(groups) != 1:
+            return jsonify(
+                {"error": "Choose a named worker group to scale under Workers", "groups": [g["id"] for g in groups]}
+            ), 409
+        before = groups[0]["count"] if groups[0]["enabled"] else 0
+        prior_finishing = finishing(groups[0]["id"])
+        try:
+            scale_saved_group(groups[0]["id"], delta=delta)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    warning = reconcile_group_settings(settings)
+    response = {"success": True, "group_id": groups[0]["id"], "worker_type": worker_type, "requested": abs(delta)}
+    if delta > 0:
+        response["added"] = delta
+    else:
+        scheduled = min(before, -delta, max(0, finishing(groups[0]["id"]) - prior_finishing))
+        response.update(
+            {
+                "removed": min(before, -delta) - scheduled,
+                "scheduled_removal": scheduled,
+                "unavailable": max(0, -delta - before),
+            }
+        )
+    if warning:
+        response["warning"] = warning
+    return jsonify(response)
+
+
 @api.route("/workers/add", methods=["POST"])
 @api_token_required
 def add_workers_global():
@@ -1298,6 +1342,9 @@ def add_workers_global():
         body, status = parsed_count
         return jsonify(body), status
     worker_type, count = parsed_type, parsed_count
+    grouped = _scale_group_for_legacy_request(data, worker_type, count)
+    if grouped is not None:
+        return grouped
 
     worker_pool = _get_shared_worker_pool()
     if worker_pool is None:
@@ -1339,6 +1386,9 @@ def remove_workers_global():
         body, status = parsed_count
         return jsonify(body), status
     worker_type, count = parsed_type, parsed_count
+    grouped = _scale_group_for_legacy_request(data, worker_type, -count)
+    if grouped is not None:
+        return grouped
 
     worker_pool = _get_shared_worker_pool()
     if worker_pool is None:
@@ -1404,6 +1454,9 @@ def add_job_workers(job_id):
         body, status = parsed_count
         return jsonify(body), status
     worker_type, count = parsed_type, parsed_count
+    grouped = _scale_group_for_legacy_request(data, worker_type, count)
+    if grouped is not None:
+        return grouped
 
     worker_pool = job_manager.get_active_worker_pool()
     if worker_pool is None:
@@ -1439,6 +1492,9 @@ def remove_job_workers(job_id):
         body, status = parsed_count
         return jsonify(body), status
     worker_type, count = parsed_type, parsed_count
+    grouped = _scale_group_for_legacy_request(data, worker_type, -count)
+    if grouped is not None:
+        return grouped
 
     worker_pool = job_manager.get_active_worker_pool()
     if worker_pool is None:
@@ -1754,6 +1810,29 @@ def _build_idle_workers_from_config():
     gpu_seq = 0
     cpu_seq = 0
 
+    if isinstance(settings.get("worker_groups"), list):
+        from ...worker_groups import group_is_available
+
+        devices = {info.get("device") for info in gpu_infos if info.get("status") != "failed"}
+        for group in settings.worker_groups:
+            if not group_is_available(group) or (group["resource"] == "gpu" and group["device"] not in devices):
+                continue
+            for index in range(group["count"]):
+                worker_id += 1
+                statuses.append(
+                    {
+                        **idle_entry,
+                        "worker_id": worker_id,
+                        "worker_type": group["resource"].upper(),
+                        "worker_name": f"{group['name']} {index + 1}",
+                        "group_id": group["id"],
+                        "group_name": group["name"],
+                        "group_resource": group["resource"],
+                        "retiring": False,
+                    }
+                )
+        return statuses
+
     config_by_device = {
         entry["device"]: entry for entry in gpu_config if isinstance(entry, dict) and entry.get("device")
     }
@@ -1923,8 +2002,8 @@ def _clear_pause_all_for_rerun() -> bool:
     if not sm.processing_paused:
         return False
     sm.processing_paused = False
-    get_job_manager().emit_processing_paused_changed(False)
-    logger.info("Processing auto-resumed — user requested reprocess")
+    get_job_manager().emit_processing_paused_changed(sm.processing_paused)
+    logger.info("Manual processing pause cleared — user requested reprocess")
     resume_running_and_drain_pending()
     return True
 

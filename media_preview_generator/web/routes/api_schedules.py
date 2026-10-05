@@ -265,6 +265,7 @@ def _quiet_hours_payload(qh: dict | None) -> dict:
     return {
         "enabled": normalised["enabled"],
         "windows": normalised["windows"],
+        "day_basis": "start",
         "currently_in_quiet_window": is_now_in_any_quiet_window(normalised),
     }
 
@@ -340,7 +341,7 @@ def update_quiet_hours():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    qh = {"enabled": enabled, "windows": windows}
+    qh = {"enabled": enabled, "windows": windows, "day_basis": "start"}
     sm = get_settings_manager()
     sm.set("quiet_hours", qh)
 

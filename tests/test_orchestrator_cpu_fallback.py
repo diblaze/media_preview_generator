@@ -28,6 +28,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from media_preview_generator.jobs.orchestrator import _run_full_scan_multi_server
 from media_preview_generator.processing import ProcessingResult
 from media_preview_generator.processing.generator import CodecNotSupportedError
@@ -98,6 +100,24 @@ class TestOrchestratorCpuFallback:
     Pre-fix only cell 1 worked; cells 2 and 3 collapsed into the bare
     ``except Exception`` and never tried CPU.
     """
+
+    @pytest.fixture(autouse=True)
+    def gpu_group(self, monkeypatch):
+        # A GPU-only group still runs codec fallback within its own slot;
+        # there need not be any configured CPU group.
+        group = {
+            "id": "gpu",
+            "name": "GPU",
+            "enabled": True,
+            "resource": "gpu",
+            "device": "/dev/nvidia0",
+            "count": 1,
+            "job_types": ["previews"],
+            "availability": {"mode": "always", "windows": []},
+        }
+        monkeypatch.setattr(
+            "media_preview_generator.jobs.group_runtime.current_group_policy", lambda config=None: ([group], 0)
+        )
 
     def _setup_one_item_dispatch(self):
         """Common scaffolding: 1 server, 1 item, mocked enumeration."""

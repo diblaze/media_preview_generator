@@ -85,7 +85,13 @@ def loudness_readiness_section(
     known = isinstance(mode, str) and mode in NATIVE_MODES
     plex_off = mode == "never"
     selected = loudness_libraries(server_config) if ready else []
-    can_disable = ready and bool(selected) and not plex_off
+    from ..web.settings_manager import peek_settings_manager
+    from ..worker_groups import effective_worker_groups, future_capacity
+
+    settings = peek_settings_manager()
+    saved = settings.get_all() if settings is not None else {}
+    workers_ready = bool(future_capacity(effective_worker_groups(saved), saved.get("quiet_hours"), "loudness"))
+    can_disable = ready and bool(selected) and workers_ready and not plex_off
     if known:
         unavailable = None
         if not plex_off and not ready:
@@ -93,6 +99,10 @@ def loudness_readiness_section(
         elif not plex_off and not selected:
             unavailable = (
                 "Choose at least one movie or TV library for this app's loudness analysis to use Set to Never."
+            )
+        elif not plex_off and not workers_ready:
+            unavailable = (
+                "Configure CPU workers for Loudness with hours outside global quiet hours before using Set to Never."
             )
         checks.append(
             {
@@ -113,6 +123,8 @@ def loudness_readiness_section(
                 "informational": True,
                 "current": NATIVE_MODES[mode],
                 "reason": unavailable,
+                "help_url": "/settings#section-workers" if not workers_ready else None,
+                "help_label": "Configure CPU workers" if not workers_ready else None,
                 "actions": {"disable": _NEVER_ACTION} if can_disable else {},
                 "optional_action": "disable",
                 "optional_label": "Set to Never",

@@ -14,6 +14,7 @@ from ._mocks import (
     mock_system_status,
     mock_token_regenerate,
     mock_token_set,
+    mock_worker_groups,
 )
 from .conftest import accept_app_confirm
 
@@ -26,6 +27,7 @@ def _complete_setup(complete_setup) -> None:
 @pytest.fixture
 def settings_page(authed_page: Page, app_url: str) -> Page:
     mock_settings_get(authed_page)
+    mock_worker_groups(authed_page)
     mock_setup_status(authed_page, complete=True, plex_authenticated=True)
     mock_system_status(authed_page)
     mock_settings_backups(authed_page)
@@ -50,27 +52,28 @@ class TestSettingsLayout:
     def test_per_gpu_panel_renders_cards(self, settings_page: Page) -> None:
         # mock_system_status renders 2 GPUs by default.
         expect(settings_page.locator("#gpuDetecting")).to_be_hidden(timeout=3000)
-        expect(settings_page.locator("#gpuConfigList .card")).to_have_count(2)
+        expect(settings_page.locator("#gpuConfigList .gpu-tuning-threads")).to_have_count(2)
 
-    def test_disabling_gpu_greys_settings(self, settings_page: Page) -> None:
+    def test_gpu_tuning_does_not_edit_worker_allocation(self, settings_page: Page) -> None:
         expect(settings_page.locator("#gpuDetecting")).to_be_hidden(timeout=3000)
-        toggle = settings_page.locator(".gpu-enable-toggle").first
-        device_id = toggle.get_attribute("data-device") or ""
-        safe_id = "".join(c if c.isalnum() else "_" for c in device_id)
-        toggle.uncheck()
-        first_settings = settings_page.locator(f".gpu-settings-{safe_id}").first
-        opacity = first_settings.evaluate("el => el.style.opacity")
-        assert opacity == "0.5"
+        expect(settings_page.locator(".gpu-workers, .gpu-enable-toggle")).to_have_count(0)
+        tuning = settings_page.locator(".gpu-tuning-threads").first
+        tuning.fill("4")
+        config = settings_page.evaluate("collectGpuConfig()")
+        assert config[0]["ffmpeg_threads"] == 4
+        assert all("workers" not in gpu and "enabled" not in gpu for gpu in config)
 
 
 @pytest.mark.e2e
 class TestSettingsSteppers:
-    def test_cpu_workers_stepper_increments(self, settings_page: Page) -> None:
-        cpu = settings_page.locator("#cpuThreads")
-        expect(cpu).to_have_value("1")
-        plus = cpu.locator(".. >> .stepper-plus").first
-        plus.click()
-        expect(cpu).to_have_value("2")
+    def test_cpu_group_count_is_staged_until_apply(self, settings_page: Page) -> None:
+        settings_page.locator('[data-edit="cpu"]').click()
+        count = settings_page.locator("#workerGroupCount")
+        expect(count).to_have_value("1")
+        count.fill("2")
+        expect(settings_page.locator("#workerGroupApplyRow")).to_be_visible()
+        settings_page.locator("#workerGroupApply").click()
+        expect(settings_page.locator('[data-group-id="cpu"]')).to_contain_text("2 desired")
 
     def test_thumbnail_interval_stepper_works(self, settings_page: Page) -> None:
         interval = settings_page.locator("#thumbnailInterval")

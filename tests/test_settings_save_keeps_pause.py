@@ -1,9 +1,4 @@
-"""A settings save keeps the pause state; only the zero-workers auto-pause is undone by one.
-
-Saving settings with no workers pauses processing, and the save that adds
-workers back resumes it. Any other save used to resume too, so a Pause all or
-a quiet-hours pause ended the moment the user saved an unrelated setting.
-"""
+"""Worker availability changes preserve independent manual and quiet-hour holds."""
 
 from __future__ import annotations
 
@@ -70,7 +65,7 @@ class TestSettingsSaveKeepsPause:
 
     def test_quiet_hours_pause_kept_when_unrelated_setting_saved(self, app):
         with app.app_context():
-            get_settings_manager().processing_paused = True  # what the quiet-hours cron does
+            get_settings_manager().set_processing_pause_reason("quiet_hours", True)
 
         with patch(DRAIN) as drain:
             _post(app, "/api/settings", {"thumbnail_quality": 3, "cpu_threads": 2})
@@ -78,23 +73,23 @@ class TestSettingsSaveKeepsPause:
         assert _paused(app) is True
         drain.assert_not_called()
 
-    def test_zero_workers_save_pauses_and_restoring_save_resumes(self, app):
+    def test_zero_workers_wait_without_global_pause_and_restoring_keeps_it_clear(self, app):
         _post(app, "/api/settings", {"cpu_threads": 0})
-        assert _paused(app) is True
+        assert _paused(app) is False
 
         with patch(DRAIN) as drain:
             _post(app, "/api/settings", {"cpu_threads": 2})
 
         assert _paused(app) is False
-        drain.assert_called_once_with()
+        drain.assert_not_called()
 
-    def test_auto_pause_not_undone_by_save_that_keeps_zero_workers(self, app):
+    def test_zero_workers_stay_a_resource_wait_after_unrelated_save(self, app):
         _post(app, "/api/settings", {"cpu_threads": 0})
 
         with patch(DRAIN) as drain:
             _post(app, "/api/settings", {"thumbnail_quality": 3, "cpu_threads": 0})
 
-        assert _paused(app) is True
+        assert _paused(app) is False
         drain.assert_not_called()
 
     def test_manual_pause_kept_when_workers_go_to_zero_and_back(self, app):
@@ -117,8 +112,10 @@ class TestSettingsSaveKeepsPause:
         assert _paused(app) is True
         drain.assert_not_called()
 
-    def test_auto_pause_stays_while_quiet_hours_active_when_workers_restored(self, app):
+    def test_quiet_hours_hold_stays_when_workers_restored(self, app):
         _post(app, "/api/settings", {"cpu_threads": 0})
+        with app.app_context():
+            get_settings_manager().set_processing_pause_reason("quiet_hours", True)
 
         with (
             patch("media_preview_generator.web.scheduler.is_now_in_any_quiet_window", return_value=True),
@@ -129,7 +126,7 @@ class TestSettingsSaveKeepsPause:
         assert _paused(app) is True
         drain.assert_not_called()
 
-    def test_auto_pause_survives_restart_and_restoring_save_resumes(self, app, tmp_path):
+    def test_zero_workers_remain_a_resource_wait_after_restart(self, app, tmp_path):
         _post(app, "/api/settings", {"cpu_threads": 0})
         reset_settings_manager()
         restarted = create_app(config_dir=str(tmp_path))
@@ -138,4 +135,4 @@ class TestSettingsSaveKeepsPause:
             _post(restarted, "/api/settings", {"cpu_threads": 2})
 
         assert _paused(restarted) is False
-        drain.assert_called_once_with()
+        drain.assert_not_called()

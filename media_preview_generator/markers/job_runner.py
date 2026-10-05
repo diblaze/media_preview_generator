@@ -14,8 +14,11 @@ from loguru import logger
 
 from ..config import load_config
 from ..job_kinds import JOB_KIND_INTRO_CREDITS
+from ..jobs.checkpoints import checkpoint_items, read_checkpoint
 from ..jobs.dispatcher import get_or_create_dispatcher
+from ..jobs.group_runtime import refresh_worker_groups, runtime_capacity, wait_for_capacity
 from ..jobs.orchestrator import _build_multi_server_registry
+from ..jobs.parking import JobParked, park_if_unavailable
 from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
 from ..processing.retry_queue import retry_policy, scaled_backoff_delay
@@ -63,6 +66,7 @@ from .outcomes import (
     ServerStatus,
 )
 from .ownership import marker_libraries
+from .park_state import restore_context, snapshot_context
 from .pipeline import (
     PipelineContext,
     budget_exhausted_warnings,
@@ -1307,15 +1311,14 @@ def wait_for_preceding_job(job_id: str, follows_job_id: str | None, cancel_check
 def hold_pause_from_before_restart(job_id: str, cancel_check: Callable[[], bool]) -> bool:
     """Keep a job paused before a restart paused, holding no slot, until it is resumed.
 
-    The pause and resume routes only act on running jobs, so the job is marked running and paused again. A pause from
-    the schedule's stop time is held as one, so that schedule's next start still resumes it.
+    The pending job keeps its existing pause owners. A schedule's next start
+    clears its own stop-time hold; any independent manual hold remains.
 
     Returns:
         False if the job was cancelled while paused.
     """
     jm = get_job_manager()
     job = jm.get_job(job_id)
-    jm.start_job(job_id)
     jm.request_pause(job_id, by_schedule=bool(job and (job.config or {}).get(PAUSED_BY_SCHEDULE)))
     jm.add_log(job_id, "INFO - Still paused from before the restart; resume the job to continue")
     jm.update_progress(job_id, current_item="Paused — resume this job to continue")
@@ -1561,6 +1564,7 @@ def wait_releasing_slot_while_paused(
     live_priority: Callable[[], int],
     cancel_check: Callable[[], bool],
     on_wait: Callable[[int, int, int], None],
+    park_check: Callable[[], None] | None = None,
 ) -> None:
     """Wait for the tracker; while this job is paused on its own, give its gate slot back.
 
@@ -1573,6 +1577,8 @@ def wait_releasing_slot_while_paused(
     while not tracker.wait(timeout=_POLL_S):
         if cancel_check():
             continue
+        if park_check is not None:
+            park_check()
         paused = jm.is_pause_requested(job_id)
         if paused and slot["held"]:
             gate.release(slot["priority"])
@@ -1680,6 +1686,10 @@ def worker_cards(jm) -> Callable[[list], None]:
                     worker_id=w["worker_id"],
                     worker_type=w["worker_type"],
                     worker_name=w["worker_name"],
+                    group_id=w.get("group_id"),
+                    group_name=w.get("group_name"),
+                    group_resource=w.get("group_resource"),
+                    retiring=bool(w.get("retiring", False)),
                     status=w["status"],
                     current_title=w.get("current_title", ""),
                     library_name=w.get("library_name", ""),
@@ -1701,6 +1711,12 @@ def worker_cards(jm) -> Callable[[list], None]:
 
 
 def run_intro_credits_job(job_id: str) -> None:
+    """Run the same job across availability windows without retaining parked queues."""
+    while _run_intro_credits_pass(job_id):
+        pass
+
+
+def _run_intro_credits_pass(job_id: str) -> bool | None:
     """Run one Intro & Credits job to completion (called on its own thread).
 
     Args:
@@ -1747,6 +1763,7 @@ def run_intro_credits_job(job_id: str) -> None:
     # A Season job's requests from other jobs, passed on where it completes; the teardown passes on the rest whatever
     # ended the job (``_pass_on_late_requests``).
     requests_passed_on = False
+    parked = False
 
     def cancel_check() -> bool:
         return jm.is_cancellation_requested(job_id)
@@ -1758,9 +1775,6 @@ def run_intro_credits_job(job_id: str) -> None:
     def on_wait(active: int, cap: int, effective_cap: int) -> None:
         jm.update_progress(
             job_id,
-            percent=0,
-            processed_items=0,
-            total_items=0,
             current_item=format_wait_message(active, cap, effective_cap),
         )
         jm.note_slot_wait(job_id)  # JobManager.requeue_interrupted_jobs ages a waiting job by the downtime only
@@ -1784,18 +1798,38 @@ def run_intro_credits_job(job_id: str) -> None:
                 # detection check), so they run before the job holds a slot; build_context reads the answers they keep.
                 # None: the ffmpeg load_config picks is one of the same candidates (``fingerprint._ffmpeg_candidates``).
                 run_detector_checks(None)
-                slot["priority"] = live_priority()
-                # A restart ages a job waiting for its slot from here and from each wait tick (on_wait), not from when
-                # it was queued: a follow-up has waited for its preview job, a retry for its due time.
-                jm.note_slot_wait(job_id)
-                if not get_job_gate().acquire(priority=slot["priority"], cancel_check=cancel_check, on_wait=on_wait):
-                    jm.add_log(job_id, "WARNING - Job cancelled while waiting for active slot")
-                    jm.cancel_job(job_id)
-                    return
-                slot["held"] = True
+                while True:
+                    if not wait_for_capacity(
+                        jm,
+                        job_id,
+                        JOB_KIND_INTRO_CREDITS,
+                        cancel_check,
+                        lambda: jm.is_pause_requested(job_id) or get_settings_manager().processing_paused,
+                    ):
+                        jm.cancel_job(job_id)
+                        return
+                    slot["priority"] = live_priority()
+                    jm.note_slot_wait(job_id)
+                    if not get_job_gate().acquire(
+                        priority=slot["priority"], cancel_check=cancel_check, on_wait=on_wait
+                    ):
+                        jm.cancel_job(job_id)
+                        return
+                    slot["held"] = True
+                    if (
+                        runtime_capacity(JOB_KIND_INTRO_CREDITS)["open"]
+                        and not jm.is_pause_requested(job_id)
+                        and not get_settings_manager().processing_paused
+                    ):
+                        break
+                    get_job_gate().release(slot["priority"])
+                    slot["held"] = False
                 # The job's own start line (start_line) follows once its files are listed.
                 with logger.contextualize(**{JOB_LOG_SKIP: True}):
-                    jm.start_job(job_id)
+                    if cfg.get("parked_checkpoint") or job.config.get("resource_wait"):
+                        jm.resume_parked_job(job_id)
+                    else:
+                        jm.start_job(job_id)
                 # A retry in a chain shows its run on the chain head's row, and records its files there (below).
                 chain_head = cfg.get("parent_job_id")
                 if chain_head:
@@ -1844,8 +1878,25 @@ def run_intro_credits_job(job_id: str) -> None:
                 ctx.retry_file_cap = MAX_RETRY_FILES
                 ctx.freeze_check = job_freeze_check(jm, job_id)
                 sweep_configs = list(registry.configs())
+                checkpoint = (
+                    read_checkpoint(jm.config_dir, job_id, cfg["parked_checkpoint"])
+                    if cfg.get("parked_checkpoint")
+                    else None
+                )
+                saved = checkpoint.get("bookkeeping", {}) if checkpoint else {}
                 listing = None
-                if cfg.get("reconcile"):
+                if checkpoint:
+                    restore_context(ctx, saved.get("context", {}))
+                    items, warnings, sender_paths = (
+                        checkpoint_items(checkpoint),
+                        saved.get("warnings", []),
+                        saved.get("sender_paths", {}),
+                    )
+                    listing = (
+                        CheckServersListing.from_config(cfg.get(LISTING_CONFIG_KEY)) if cfg.get("reconcile") else None
+                    )
+                    rerun_batch = saved.get("rerun_batch", {})
+                elif cfg.get("reconcile"):
                     from .reconcile import check_servers_listing
 
                     # A run revived after a restart checks the files its first run listed, without reading every
@@ -1926,12 +1977,15 @@ def run_intro_credits_job(job_id: str) -> None:
                 # Only files just sent were just replaced: a listing's replaced file may have changed days ago, and
                 # servers rescanned it long since. A verify chain checks once.
                 checks_replaced_later = sent_files and not (cfg.get("verify") or cfg.get("verify_chain"))
-                listed = {item.canonical_path for item in items}
+                listed = set(saved["listed"]) if checkpoint else {item.canonical_path for item in items}
                 # A revived job still owes the later check of the replaced files it published before the restart.
                 # A retry's rows are its chain head's.
-                items, carried, replaced_before_restart, carried_outcomes = _skip_finished_before_restart(
-                    jm, chain_head or job_id, items, ctx.store
-                )
+                if checkpoint:
+                    carried, replaced_before_restart, carried_outcomes = {}, set(), {}
+                else:
+                    items, carried, replaced_before_restart, carried_outcomes = _skip_finished_before_restart(
+                        jm, chain_head or job_id, items, ctx.store
+                    )
                 carried_reruns = {path: rerun_batch[path] for path in carried_outcomes if path in rerun_batch}
                 if carried_reruns:
                     # Finished before a restart: its row was kept, but the restart may have come before its record.
@@ -1958,10 +2012,12 @@ def run_intro_credits_job(job_id: str) -> None:
                         requests_passed_on = True
                     sweep_store = ctx.store
                     return
-                waiting: dict[str, set[str]] = {}
-                replaced: set[str] = set(replaced_before_restart)
-                unchecked: dict[str, set[str]] = {}
-                gone_items: dict[str, set[tuple[str, str]]] = {}
+                waiting = {key: set(values) for key, values in saved.get("waiting", {}).items()}
+                replaced = set(saved.get("replaced", replaced_before_restart))
+                unchecked = {key: set(values) for key, values in saved.get("unchecked", {}).items()}
+                gone_items = {
+                    key: {tuple(value) for value in values} for key, values in saved.get("gone_items", {}).items()
+                }
 
                 def on_file_result(file_path, outcome, reason, worker, servers=None):
                     # Any server that can take the file later, even when another server was written. Check servers
@@ -2013,9 +2069,10 @@ def run_intro_credits_job(job_id: str) -> None:
                 try:
                     with settings.locked():
                         selected_gpus = _build_selected_gpus(settings, detected=detected_gpus)
-                        if selected_gpus:
-                            dispatcher.worker_pool.reconcile_gpu_workers(selected_gpus)
-                        dispatcher.worker_pool.reconcile_cpu_workers(settings.cpu_threads)
+                        if not refresh_worker_groups(dispatcher.worker_pool, config, selected_gpus):
+                            if selected_gpus:
+                                dispatcher.worker_pool.reconcile_gpu_workers(selected_gpus)
+                            dispatcher.worker_pool.reconcile_cpu_workers(settings.cpu_threads)
                 except Exception as exc:
                     logger.debug("Could not reconcile the worker pool with the saved settings: {}", exc)
                 tracker = dispatcher.submit_items(
@@ -2038,13 +2095,34 @@ def run_intro_credits_job(job_id: str) -> None:
                     priority=live_priority(),
                     kind=JOB_KIND_INTRO_CREDITS,
                     handlers=kind_handlers(ctx),
-                    carried_outcome=carried,
+                    **({"carried_state": checkpoint["state"]} if checkpoint else {"carried_outcome": carried}),
                 )
                 # The priority route skips the dispatcher while this job has no tracker yet; a change that landed
                 # between reading the priority and registering the tracker would otherwise be lost.
                 current = live_priority()
                 if tracker.priority != current:
                     dispatcher.update_job_priority(job_id, current)
+
+                def park_check():
+                    park_if_unavailable(
+                        dispatcher,
+                        tracker,
+                        jm,
+                        job_id,
+                        JOB_KIND_INTRO_CREDITS,
+                        lambda: {
+                            "context": snapshot_context(ctx),
+                            "warnings": warnings,
+                            "sender_paths": sender_paths,
+                            "listed": sorted(listed),
+                            "rerun_batch": rerun_batch,
+                            "waiting": {key: sorted(values) for key, values in waiting.items()},
+                            "replaced": sorted(replaced),
+                            "unchecked": {key: sorted(values) for key, values in unchecked.items()},
+                            "gone_items": {key: sorted(values) for key, values in gone_items.items()},
+                        },
+                    )
+
                 wait_releasing_slot_while_paused(
                     tracker,
                     job_id=job_id,
@@ -2054,6 +2132,7 @@ def run_intro_credits_job(job_id: str) -> None:
                     on_wait=lambda active, cap, eff: jm.update_progress(
                         job_id, current_item=format_wait_message(active, cap, eff)
                     ),
+                    park_check=park_check,
                 )
                 result = tracker.get_result()
                 _log_missing(ctx)
@@ -2098,6 +2177,9 @@ def run_intro_credits_job(job_id: str) -> None:
                 sweep_store = ctx.store
             finally:
                 clear_failures()
+    except JobParked:
+        parked = True
+        return True
     except Exception as exc:
         # The job's error is served by GET /api/jobs, and exception text can carry a server URL with its token.
         detail = redact_secrets(f"{type(exc).__name__}: {exc}")
@@ -2128,12 +2210,12 @@ def run_intro_credits_job(job_id: str) -> None:
         jm.clear_pause_flag(job_id)
         jm.clear_cancellation_flag(job_id)
         jm.clear_active_worker_pool(job_id)
-        if listing_on_job:
+        if listing_on_job and not parked:
             try:
                 jm.merge_job_config(job_id, {}, remove=(LISTING_CONFIG_KEY,))
             except Exception as exc:
                 logger.debug("Could not drop the Check servers listing of {}: {}", job_id, exc)
-        if rerun_batch:
+        if rerun_batch and not parked:
             try:
                 jm.merge_job_config(job_id, {}, remove=(VERSION_RERUN_FILES,))
             except Exception as exc:
@@ -2143,7 +2225,7 @@ def run_intro_credits_job(job_id: str) -> None:
                 jm.clear_worker_statuses()
         except Exception as exc:
             logger.debug("Could not clear worker statuses after {}: {}", job_id, exc)
-        if cfg.get("source") == SEASON_SOURCE and not requests_passed_on:
+        if cfg.get("source") == SEASON_SOURCE and not requests_passed_on and not parked:
             # Cancelled or failed before it completed: what other jobs handed over still needs a Season job.
             _pass_on_late_requests(job, None)
         unregister_job_thread()
@@ -2179,7 +2261,9 @@ def start_intro_credits_job_async(job_id: str, config_overrides: dict | None = N
                 updates = {
                     key: value
                     for key, value in config_overrides.items()
-                    if not (key in _JOINED_KEYS and key in live) and (key not in live or live[key] != value)
+                    if key not in {"pause_reasons", "paused_by_schedule", "resource_wait", "parked_checkpoint"}
+                    and not (key in _JOINED_KEYS and key in live)
+                    and (key not in live or live[key] != value)
                 }
                 if updates:
                     jm.merge_job_config(job_id, updates)

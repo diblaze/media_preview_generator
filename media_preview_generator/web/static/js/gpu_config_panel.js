@@ -14,7 +14,7 @@ function _gpuPanelEscapeHtml(str) {
     if (str == null) return '';
     const div = document.createElement('div');
     div.textContent = str;
-    return div.innerHTML;
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // Vendor mark for the small caption under the GPU name. Uses the shared
@@ -30,6 +30,10 @@ function _gpuPanelVendorMark(type) {
 }
 
 function renderGpuConfigPanel(detectedGpus, savedConfig) {
+    if (document.getElementById('workerGroupSettings')) {
+        renderGpuTuningPanel(detectedGpus, savedConfig);
+        return;
+    }
     const configByDevice = {};
     (savedConfig || []).forEach(c => { if (c.device) configByDevice[c.device] = c; });
 
@@ -171,6 +175,12 @@ function onGpuWorkersChange(input, deviceId) {
 }
 
 function collectGpuConfig() {
+    if (document.getElementById('workerGroupSettings')) {
+        return [...document.querySelectorAll('.gpu-tuning-threads')].map(input => ({
+            device: input.dataset.device, name: input.dataset.name, type: input.dataset.type,
+            ffmpeg_threads: Number(input.value),
+        }));
+    }
     const config = [];
     document.querySelectorAll('.gpu-enable-toggle').forEach(toggle => {
         const device = toggle.dataset.device;
@@ -193,4 +203,23 @@ function collectGpuConfig() {
         });
     });
     return config;
+}
+
+function renderGpuTuningPanel(detectedGpus, savedConfig) {
+    const container = document.getElementById('gpuConfigList');
+    const saved = new Map((savedConfig || []).map(gpu => [gpu.device, gpu]));
+    container.innerHTML = detectedGpus.map((gpu, index) => {
+        const esc = _gpuPanelEscapeHtml;
+        const config = saved.get(gpu.device) || {};
+        return `<div class="row align-items-center g-3 py-3 border-bottom">
+            <div class="col-md-7"><strong>${esc(gpu.name || 'GPU')}</strong><div class="small text-body-secondary">${esc(gpu.device || '')}</div>
+            ${gpu.status === 'failed' ? `<div class="text-danger small">${esc(gpu.error || 'Hardware unavailable')}</div>` : ''}</div>
+            <div class="col-md-5"><label class="form-label small" for="gpuTuning${index}">FFmpeg threads per worker</label>
+            <input id="gpuTuning${index}" type="number" min="0" max="32" class="form-control form-control-sm gpu-tuning-threads"
+                data-device="${esc(gpu.device)}" data-name="${esc(gpu.name)}" data-type="${esc(gpu.type)}" value="${config.ffmpeg_threads ?? 2}">
+            <div class="form-text">0 = automatic. Worker counts and jobs are configured in groups.</div></div></div>`;
+    }).join('');
+    container.querySelectorAll('input').forEach(input => input.addEventListener('change', () => {
+        if (typeof markDirty === 'function') markDirty();
+    }));
 }

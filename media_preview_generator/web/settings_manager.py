@@ -21,6 +21,10 @@ from loguru import logger
 _AUTO_PAUSED_KEY = "processing_auto_paused"
 
 
+class WorkerGroupsConflict(ValueError):
+    """A group editor attempted to overwrite a newer saved configuration."""
+
+
 def _distribute_gpu_threads_into_dict(settings: dict[str, Any], value: int) -> None:
     """Distribute a total GPU worker count across enabled GPUs in ``gpu_config``.
 
@@ -246,11 +250,16 @@ class SettingsManager:
         The caller's dict is not modified.
         """
         with self._lock:
+            previous = copy.deepcopy(self._settings)
             to_apply = {k: v for k, v in settings.items() if k != "gpu_threads"}
             self._settings.update(to_apply)
             if "gpu_threads" in settings:
                 self._distribute_gpu_threads(int(settings["gpu_threads"]))
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._settings = previous
+                raise
 
     def delete(self, key: str) -> None:
         """Delete a setting."""
@@ -275,12 +284,54 @@ class SettingsManager:
 
         """
         with self._lock:
+            previous = copy.deepcopy(self._settings)
             if updates:
                 self._settings.update(updates)
             if deletes:
                 for key in deletes:
                     self._settings.pop(key, None)
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._settings = previous
+                raise
+
+    @property
+    def worker_groups(self) -> list[dict[str, Any]]:
+        """Return an independent current group policy, including intentional zero capacity."""
+        from ..worker_groups import effective_worker_groups
+
+        with self._lock:
+            return effective_worker_groups(self._settings)
+
+    @property
+    def worker_groups_revision(self) -> int:
+        """Revision used to protect staged edits from concurrent quick scaling."""
+        return int(self.get("worker_groups_revision", 0))
+
+    def update_worker_groups(self, groups: list[dict], expected_revision: int | None = None) -> int:
+        """Validate and persist one policy atomically before any runtime reconciliation.
+
+        Args:
+            groups: Complete desired group list.
+            expected_revision: Revision loaded by a staged editor, or None for a locked quick change.
+
+        Returns:
+            The newly persisted revision.
+
+        Raises:
+            WorkerGroupsConflict: The staged configuration is out of date.
+            ValueError: Group policy is invalid.
+        """
+        from ..worker_groups import validate_worker_groups
+
+        clean = validate_worker_groups(groups)
+        with self._lock:
+            revision = self.worker_groups_revision
+            if expected_revision is not None and expected_revision != revision:
+                raise WorkerGroupsConflict("Worker groups changed elsewhere. Reload them before applying your edits.")
+            self.apply_changes(updates={"worker_groups": clean, "worker_groups_revision": revision + 1})
+            return revision + 1
 
     # =========================================================================
     # Convenience properties (settings.json is the sole source)
@@ -388,7 +439,11 @@ class SettingsManager:
 
     @property
     def gpu_threads(self) -> int:
-        """Total GPU worker threads (computed from gpu_config)."""
+        """Peak configured GPU slots, using legacy device counts before migration."""
+        if self.get("worker_groups") is not None:
+            from ..worker_groups import configured_group_totals
+
+            return configured_group_totals(self.worker_groups)[0]
         config = self.gpu_config
         if not config:
             return 0
@@ -410,7 +465,11 @@ class SettingsManager:
 
     @property
     def cpu_threads(self) -> int:
-        """Number of CPU worker threads."""
+        """Peak configured CPU slots, independent of which groups are open now."""
+        if self.get("worker_groups") is not None:
+            from ..worker_groups import configured_group_totals
+
+            return configured_group_totals(self.worker_groups)[1]
         val = self.get("cpu_threads")
         return int(val) if val is not None else 1
 
@@ -459,14 +518,42 @@ class SettingsManager:
 
     @property
     def processing_paused(self) -> bool:
-        """Global processing pause: when True, no new jobs start and dispatch stops (soft)."""
+        """Whether a manual or quiet-hours global hold pauses processing."""
+        reasons = self.get("processing_pause_reasons")
+        if isinstance(reasons, list):
+            return bool(set(reasons) & {"manual", "quiet_hours"})
         return bool(self.get("processing_paused", False))
 
     @processing_paused.setter
     def processing_paused(self, value: bool) -> None:
-        # Any pause or resume set here (Pause all, quiet hours, a resume) takes the pause over from the
-        # zero-workers auto-pause, so a later settings save leaves it alone.
-        self.apply_changes(updates={"processing_paused": bool(value)}, deletes=[_AUTO_PAUSED_KEY])
+        self.set_processing_pause_reason("manual", bool(value))
+
+    @property
+    def processing_pause_reasons(self) -> list[str]:
+        """Pause owners; resource availability is deliberately not a global pause."""
+        reasons = self.get("processing_pause_reasons")
+        if isinstance(reasons, list):
+            return sorted(set(reasons) & {"manual", "quiet_hours"})
+        if self.get("processing_paused", False) and not self.processing_auto_paused:
+            return ["manual"]
+        return []
+
+    def set_processing_pause_reason(self, reason: str, active: bool) -> bool:
+        """Change only one owner's pause, returning whether effective pause changed."""
+        if reason not in {"manual", "quiet_hours"}:
+            raise ValueError("Unknown processing pause reason")
+        with self._lock:
+            previous = self.processing_paused
+            reasons = set(self.processing_pause_reasons)
+            if active:
+                reasons.add(reason)
+            else:
+                reasons.discard(reason)
+            self.apply_changes(
+                updates={"processing_pause_reasons": sorted(reasons), "processing_paused": bool(reasons)},
+                deletes=[_AUTO_PAUSED_KEY],
+            )
+            return previous != bool(reasons)
 
     @property
     def processing_auto_paused(self) -> bool:
@@ -474,7 +561,9 @@ class SettingsManager:
         return bool(self.get(_AUTO_PAUSED_KEY, False))
 
     def pause_for_no_workers(self) -> None:
-        """Pause processing because no workers are configured; the save that adds workers back resumes it."""
+        """Retain legacy auto-pause only for callers without migrated group settings."""
+        if self.get("worker_groups") is not None:
+            return
         self.apply_changes(updates={"processing_paused": True, _AUTO_PAUSED_KEY: True})
 
     @property

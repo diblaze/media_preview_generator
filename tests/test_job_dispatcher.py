@@ -1258,7 +1258,10 @@ class TestGetOrCreateDispatcher:
     """The shared dispatcher for callers that don't build their own pool (Intro & Credits jobs)."""
 
     @pytest.fixture(autouse=True)
-    def _reset(self):
+    def _reset(self, monkeypatch):
+        # This class verifies the legacy embedded-caller fallback, independent
+        # of any application SettingsManager another test initialized.
+        monkeypatch.setattr("media_preview_generator.web.settings_manager.peek_settings_manager", lambda: None)
         reset_dispatcher()
         yield
         reset_dispatcher()

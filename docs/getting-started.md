@@ -396,7 +396,7 @@ In **Settings** → **Processing Options**, the GPU panel lists all detected GPU
 | 1 GPU × 8 workers, CPU: 4 | High-end systems |
 | 0 GPU, CPU: 8 | CPU-only |
 
-Configure per-GPU workers and FFmpeg threads in **Settings** → **Processing Options**. Start with the defaults and increase gradually; monitor system load to find the best balance.
+Configure worker counts, allowed jobs and hours in **Settings → Workers**; per-device FFmpeg tuning remains in **Processing Options**. Start with the defaults and increase gradually; monitor system load to find the best balance.
 
 ---
 

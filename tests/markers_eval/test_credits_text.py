@@ -492,7 +492,7 @@ def test_the_detector_digest_follows_every_source_file_it_names(tmp_path):
 # runner, read only for the decoder's "can't decode" line that ends a doomed GPU run sooner (the CPU reads it either way).
 NOT_ANSWER_CODE = {"markers.models", "markers.locks", "markers.pipeline", "markers.store", "markers.speed",
                    "processing.generator", "gpu.vulkan_probe", "web.settings_manager", "markers.freeze",
-                   "markers.job_log", "processing.ffmpeg_runner"}  # fmt: skip
+                   "markers.job_log", "processing.ffmpeg_runner", "worker_groups"}  # fmt: skip
 
 
 def _package_imports(path, root):

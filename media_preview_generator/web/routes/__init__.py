@@ -31,6 +31,7 @@ from . import (  # noqa: E402
     api_system,  # noqa: F401
     api_vendor_webhook,  # noqa: F401
     api_vulkan,  # noqa: F401
+    api_worker_groups,  # noqa: F401
     pages,  # noqa: F401
 )
 

@@ -74,7 +74,7 @@ Then open `http://YOUR_IP:8080`, log in with the token saved in `auth.json` in y
 2. Start a job and watch the dashboard. Each worker has its own card. A yellow **CPU fallback** badge means that file failed on the GPU and was redone on the CPU. The job log says why ([CPU fallback](guides.md#automatic-gpu--cpu-fallback)).
 3. On the host, while a job runs, look for FFmpeg processes. On NVIDIA, `nvidia-smi` lists processes using the GPU. On Intel, `intel_gpu_top` (from `intel-gpu-tools`) shows video engine load.
 
-If many of your files always fall back, raise **CPU Workers** above 0. Those files then go straight to CPU workers instead of tying up a GPU worker first.
+If many of your files always fall back, add an enabled CPU group allowing previews in **Settings → Workers**. Those files then go straight to CPU workers instead of tying up a GPU worker first.
 
 ## Verify one file before a full library
 

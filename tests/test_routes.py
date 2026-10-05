@@ -23,6 +23,24 @@ from media_preview_generator.web.settings_manager import reset_settings_manager
 # ---------------------------------------------------------------------------
 
 
+def _save_test_worker_group(resource="cpu", count=1):
+    """Save one unambiguous group using the same validated policy as the UI."""
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    group = {
+        "id": "test-group",
+        "name": "Test workers",
+        "resource": resource,
+        "device": "cuda:0" if resource == "gpu" else None,
+        "enabled": True,
+        "count": count,
+        "job_types": ["previews", "intro_credits"] if resource == "gpu" else ["previews", "intro_credits", "loudness"],
+        "availability": {"mode": "always"},
+    }
+    get_settings_manager().update_worker_groups([group])
+    return group
+
+
 @pytest.fixture(autouse=True)
 def _reset_singletons():
     """Reset web singletons between tests to avoid cross-contamination."""
@@ -162,14 +180,17 @@ class TestPageRoutes:
         assert resp.status_code == 302
         assert "/login" in resp.headers.get("Location", "")
 
-    def test_settings_cpu_input_max_comes_from_max_cpu_threads(self, authed_client):
-        # Patched to a value the template can't have hard-coded, so the rendered max must come from the constant.
-        with patch("media_preview_generator.web.routes.pages.MAX_CPU_THREADS", 7):
-            resp = authed_client.get("/settings")
+    def test_settings_uses_group_editor_and_api_capacity_limits(self, authed_client):
+        resp = authed_client.get("/settings")
         assert resp.status_code == 200
-        body = resp.data.decode()
-        cpu_input = body[body.index('id="cpuThreads"') :].split(">", 1)[0]
-        assert 'max="7"' in cpu_input
+        assert b'id="workerGroupSettings"' in resp.data
+        assert b"worker_groups.js" in resp.data
+        assert b'id="cpuThreads"' not in resp.data
+        # The shared editor consumes API limits; it has no independent legacy count input.
+        with patch("media_preview_generator.web.routes.api_worker_groups.MAX_CPU_WORKERS", 7):
+            snapshot = authed_client.get("/api/worker-groups")
+        assert snapshot.status_code == 200
+        assert snapshot.get_json()["limits"]["cpu"] == 7
 
     def test_settings_accessible_when_authenticated(self, authed_client):
         resp = authed_client.get("/settings")
@@ -261,14 +282,20 @@ class TestPageRoutes:
         assert b"gpu_config_panel.js" in body
         assert b"servers.js" in body
 
-    def test_setup_cpu_input_max_comes_from_max_cpu_threads(self, client):
-        # Patched to a value the template can't have hard-coded, so the rendered max must come from the constant.
-        with patch("media_preview_generator.web.routes.pages.MAX_CPU_THREADS", 7):
-            resp = client.get("/setup")
+    def test_setup_uses_group_editor_and_api_capacity_limits(self, client):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        get_settings_manager().update({"setup_complete": False})
+        resp = client.get("/setup")
         assert resp.status_code == 200
-        body = resp.data.decode()
-        cpu_input = body[body.index('id="cpuThreads"') :].split(">", 1)[0]
-        assert 'max="7"' in cpu_input
+        assert b'id="workerGroupSettings"' in resp.data
+        assert b"worker_groups.js" in resp.data
+        assert b'id="cpuThreads"' not in resp.data
+        # The shared editor consumes API limits; it has no independent legacy count input.
+        with patch("media_preview_generator.web.routes.api_worker_groups.MAX_CPU_WORKERS", 7):
+            snapshot = client.get("/api/worker-groups")
+        assert snapshot.status_code == 200
+        assert snapshot.get_json()["limits"]["cpu"] == 7
 
     def test_setup_page_inlines_connection_form_partial(self, client):
         """The Emby/Jellyfin connection form is rendered inline inside the
@@ -1179,7 +1206,7 @@ class TestJobsAPI:
 
         sm = get_settings_manager()
         # Force a known CPU thread count so we can pin the idle worker count.
-        sm.set("cpu_threads", 3)
+        _save_test_worker_group(count=3)
         sm.set("gpu_config", [])
 
         resp = client.get("/api/jobs/workers", headers=_api_headers())
@@ -1261,7 +1288,7 @@ class TestJobsAPI:
 
         # Pin a known worker count so the assertion is deterministic.
         sm = get_settings_manager()
-        sm.set("cpu_threads", 3)
+        _save_test_worker_group(count=3)
         sm.set("gpu_config", [])
 
         jm = get_job_manager()
@@ -1367,7 +1394,7 @@ class TestJobsAPI:
         assert data["logs"] == ["Log file was cleared due to log retention policy."]
 
     def test_pause_resume_job(self, client):
-        """Per-job pause/resume routes delegate to global processing pause/resume."""
+        """A preview pause belongs to that job and leaves the global pause alone."""
         from media_preview_generator.web.settings_manager import get_settings_manager
 
         sm = get_settings_manager()
@@ -1386,18 +1413,18 @@ class TestJobsAPI:
         pause_resp = client.post(f"/api/jobs/{job_id}/pause", headers=_api_headers())
         assert pause_resp.status_code == 200
         assert pause_resp.get_json().get("paused") is True
-        # Verify the pause actually persisted to settings (the response payload
-        # alone could lie — the real bug surface is the settings-side state).
-        assert sm.processing_paused is True
+        # Verify the job owns the pause and unrelated jobs can continue.
+        assert jm.is_pause_requested(job_id)
+        assert sm.processing_paused is False
 
         resume_resp = client.post(f"/api/jobs/{job_id}/resume", headers=_api_headers())
         assert resume_resp.status_code == 200
         assert resume_resp.get_json().get("paused") is False
         assert sm.processing_paused is False
 
-    @pytest.mark.parametrize("kind", ["previews", "intro_credits"])
+    @pytest.mark.parametrize("kind", ["previews", "intro_credits", "loudness"])
     def test_pause_resume_job_matrix_by_kind(self, client, kind):
-        """Intro & Credits jobs pause on their own; preview jobs keep the global pause (spec §6.4 item 8)."""
+        """Every job kind has an independent manual pause."""
         from media_preview_generator.web.jobs import get_job_manager
         from media_preview_generator.web.settings_manager import get_settings_manager
 
@@ -1409,24 +1436,23 @@ class TestJobsAPI:
 
         resp = client.post(f"/api/jobs/{job.id}/pause", headers=_api_headers())
         assert resp.status_code == 200
-        if kind == "previews":
-            assert sm.processing_paused is True
-        else:
-            assert sm.processing_paused is False
-            assert jm.is_pause_requested(job.id) is True
-            assert resp.get_json()["paused"] is True
+        assert sm.processing_paused is False
+        assert jm.is_pause_requested(job.id) is True
+        assert resp.get_json()["paused"] is True
 
         resp = client.post(f"/api/jobs/{job.id}/resume", headers=_api_headers())
         assert resp.status_code == 200
         assert sm.processing_paused is False
         assert jm.is_pause_requested(job.id) is False
 
-    def test_pause_pending_intro_credits_job_is_409(self, client):
+    def test_pause_pending_intro_credits_job_holds_it_before_admission(self, client):
         from media_preview_generator.web.jobs import get_job_manager
 
         job = get_job_manager().create_job(library_name="x", kind="intro_credits")
         resp = client.post(f"/api/jobs/{job.id}/pause", headers=_api_headers())
-        assert resp.status_code == 409
+        assert resp.status_code == 200
+        assert get_job_manager().is_pause_requested(job.id)
+        assert get_job_manager().get_job(job.id).status.value == "pending"
 
     def test_resume_pending_intro_credits_job_is_409(self, client):
         from media_preview_generator.web.jobs import get_job_manager
@@ -1435,7 +1461,7 @@ class TestJobsAPI:
         resp = client.post(f"/api/jobs/{job.id}/resume", headers=_api_headers())
         assert resp.status_code == 409
 
-    def test_global_pause_sets_preview_job_flags_but_not_intro_credits_flags(self, client):
+    def test_global_pause_preserves_all_per_job_pause_flags(self, client):
         """Pause all holds Intro & Credits jobs through the global flag; their per-job flag is the user's own."""
         from media_preview_generator.web.jobs import get_job_manager
         from media_preview_generator.web.settings_manager import get_settings_manager
@@ -1451,7 +1477,7 @@ class TestJobsAPI:
             resp = client.post("/api/processing/pause", headers=_api_headers())
             assert resp.status_code == 200
             assert sm.processing_paused is True
-            assert jm.is_pause_requested(prev.id) is True
+            assert jm.is_pause_requested(prev.id) is False
             assert jm.is_pause_requested(ic.id) is False
             assert jm.get_job(ic.id).paused is False
         finally:
@@ -1459,7 +1485,7 @@ class TestJobsAPI:
 
     @pytest.mark.parametrize("resume_via", ["global_resume", "preview_job_resume"])
     def test_global_resume_keeps_an_intro_credits_jobs_own_pause(self, client, resume_via):
-        """Every global resume path (Resume all, a preview job's Resume) shares resume_running_and_drain_pending."""
+        """Global and individual Resume only clear the pause each one owns."""
         from media_preview_generator.web.jobs import get_job_manager
         from media_preview_generator.web.settings_manager import get_settings_manager
 
@@ -1477,8 +1503,8 @@ class TestJobsAPI:
             with patch("media_preview_generator.web.routes.job_runner._start_job_async"):
                 resp = client.post(url, headers=_api_headers())
             assert resp.status_code == 200
-            assert sm.processing_paused is False
-            assert jm.is_pause_requested(prev.id) is False
+            assert sm.processing_paused is (resume_via == "preview_job_resume")
+            assert jm.is_pause_requested(prev.id) is (resume_via == "global_resume")
             assert jm.is_pause_requested(ic.id) is True
             assert jm.get_job(ic.id).paused is True
         finally:
@@ -1564,74 +1590,53 @@ class TestJobsAPI:
             get_settings_manager().processing_paused = False
 
     def test_scale_workers_add_remove(self, client):
-        with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):
-            create_resp = client.post("/api/jobs", headers=_api_headers(), json={})
-        job_id = create_resp.get_json()["id"]
-
         from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.settings_manager import get_settings_manager
 
-        jm = get_job_manager()
-        jm.start_job(job_id)
-        pool = MagicMock()
-        pool.add_workers.return_value = 2
-        pool.remove_workers.return_value = {
-            "removed": 1,
-            "scheduled": 1,
-            "unavailable": 0,
-        }
-        jm.set_active_worker_pool(job_id, pool)
-
-        add_resp = client.post(
-            f"/api/jobs/{job_id}/workers/add",
-            headers=_api_headers(),
-            json={"worker_type": "CPU", "count": 2},
-        )
-        assert add_resp.status_code == 200
-        assert add_resp.get_json()["added"] == 2
-        pool.add_workers.assert_called_once_with("CPU", 2)
-
-        remove_resp = client.post(
-            f"/api/jobs/{job_id}/workers/remove",
-            headers=_api_headers(),
-            json={"worker_type": "CPU", "count": 2},
-        )
-        assert remove_resp.status_code == 200
-        data = remove_resp.get_json()
-        assert data["removed"] == 1
-        assert data["scheduled_removal"] == 1
-        assert data["unavailable"] == 0
-        pool.remove_workers.assert_called_once_with("CPU", 2)
+        group = _save_test_worker_group()
+        job = get_job_manager().create_job(library_name="x")
+        get_job_manager().start_job(job.id)
+        with patch("media_preview_generator.web.routes.api_worker_groups.reconcile_group_settings") as reconcile:
+            reconcile.return_value = None
+            for action, expected in (("add", 3), ("remove", 1)):
+                response = client.post(
+                    f"/api/jobs/{job.id}/workers/{action}",
+                    headers=_api_headers(),
+                    json={"worker_type": "CPU", "count": 2},
+                )
+                assert response.status_code == 200
+                assert response.get_json()["group_id"] == group["id"]
+                assert get_settings_manager().worker_groups[0]["count"] == expected
+            assert reconcile.call_count == 2
+            assert all(call.args == (get_settings_manager(),) for call in reconcile.call_args_list)
 
     def test_scale_workers_remove_busy_workers_returns_scheduled_removal(self, client):
-        """Remove endpoint returns scheduled_removal when workers are busy (deferred removal)."""
-        with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):
-            create_resp = client.post("/api/jobs", headers=_api_headers(), json={})
-        job_id = create_resp.get_json()["id"]
-
+        """The route reports newly draining slots while saving the reduced group."""
         from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.settings_manager import get_settings_manager
 
-        jm = get_job_manager()
-        jm.start_job(job_id)
+        group = _save_test_worker_group(resource="gpu", count=2)
+        job = get_job_manager().create_job(library_name="x")
+        get_job_manager().start_job(job.id)
         pool = MagicMock()
-        pool.remove_workers.return_value = {
-            "removed": 0,
-            "scheduled": 2,
-            "unavailable": 0,
-        }
-        jm.set_active_worker_pool(job_id, pool)
-
-        remove_resp = client.post(
-            f"/api/jobs/{job_id}/workers/remove",
-            headers=_api_headers(),
-            json={"worker_type": "GPU", "count": 2},
-        )
-        assert remove_resp.status_code == 200
-        data = remove_resp.get_json()
-        assert data["success"] is True
-        assert data["removed"] == 0
-        assert data["scheduled_removal"] == 2
-        assert data["unavailable"] == 0
-        pool.remove_workers.assert_called_once_with("GPU", 2)
+        pool.group_snapshots.side_effect = [
+            [{"id": group["id"], "finishing": 0}],
+            [{"id": group["id"], "finishing": 2}],
+        ]
+        with (
+            patch("media_preview_generator.web.routes.api_jobs._get_shared_worker_pool", return_value=pool),
+            patch("media_preview_generator.web.routes.api_worker_groups.reconcile_group_settings", return_value=None),
+        ):
+            response = client.post(
+                f"/api/jobs/{job.id}/workers/remove",
+                headers=_api_headers(),
+                json={"worker_type": "GPU", "count": 2},
+            )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert (data["removed"], data["scheduled_removal"], data["unavailable"]) == (0, 2, 0)
+        assert get_settings_manager().worker_groups[0]["enabled"] is False
+        assert get_settings_manager().worker_groups[0]["count"] == 2
 
     def test_scale_workers_remove_returns_unavailable_when_fewer_workers_exist(self, client):
         """Remove endpoint returns unavailable when requesting more than existing workers."""
@@ -1662,79 +1667,66 @@ class TestJobsAPI:
         assert data["scheduled_removal"] == 0
         assert data["unavailable"] == 1
 
-    def test_workers_add_global_no_pool_returns_409(self, client):
-        """POST /api/workers/add returns 409 when no worker pool exists."""
+    def test_workers_add_global_no_pool_updates_saved_group(self, client):
+        """POST /api/workers/add persists the group even before a pool exists."""
         resp = client.post(
             "/api/workers/add",
             headers=_api_headers(),
             json={"worker_type": "CPU", "count": 1},
         )
-        assert resp.status_code == 409
-        assert "not available" in resp.get_json().get("error", "").lower()
-
-    def test_workers_remove_global_no_pool_returns_409(self, client):
-        """POST /api/workers/remove returns 409 when no worker pool exists."""
-        resp = client.post(
-            "/api/workers/remove",
-            headers=_api_headers(),
-            json={"worker_type": "CPU", "count": 1},
-        )
-        assert resp.status_code == 409
-        assert "not available" in resp.get_json().get("error", "").lower()
-
-    def test_workers_add_global_success(self, client):
-        """POST /api/workers/add delegates to running job pool."""
-        with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):
-            create_resp = client.post("/api/jobs", headers=_api_headers(), json={})
-        job_id = create_resp.get_json()["id"]
-
-        from media_preview_generator.web.jobs import get_job_manager
-
-        jm = get_job_manager()
-        jm.start_job(job_id)
-        pool = MagicMock()
-        pool.add_workers.return_value = 2
-        jm.set_active_worker_pool(job_id, pool)
-
-        add_resp = client.post(
-            "/api/workers/add",
-            headers=_api_headers(),
-            json={"worker_type": "GPU", "count": 2},
-        )
-        assert add_resp.status_code == 200
-        data = add_resp.get_json()
-        assert data["added"] == 2
-        assert data["worker_type"] == "GPU"
-        pool.add_workers.assert_called_once_with("GPU", 2)
-
-    def test_workers_remove_global_success(self, client):
-        """POST /api/workers/remove saves the lower CPU count and resizes the running job's pool to it."""
-        with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):
-            create_resp = client.post("/api/jobs", headers=_api_headers(), json={})
-        job_id = create_resp.get_json()["id"]
-
-        from media_preview_generator.web.jobs import get_job_manager
+        assert resp.status_code == 200
         from media_preview_generator.web.settings_manager import get_settings_manager
 
-        get_settings_manager().cpu_threads = 3
-        jm = get_job_manager()
-        jm.start_job(job_id)
-        pool = MagicMock()
-        pool.reconcile_cpu_workers.return_value = {"added": 0, "removed": 1, "deferred": 0, "retiring": 0}
-        jm.set_active_worker_pool(job_id, pool)
+        group = get_settings_manager().worker_groups[0]
+        assert group["enabled"] is True
+        assert group["count"] == 2
 
-        remove_resp = client.post(
+    def test_workers_remove_global_no_pool_updates_saved_group(self, client):
+        """POST /api/workers/remove persists the group even before a pool exists."""
+        resp = client.post(
             "/api/workers/remove",
             headers=_api_headers(),
             json={"worker_type": "CPU", "count": 1},
         )
-        assert remove_resp.status_code == 200
-        data = remove_resp.get_json()
-        assert data["removed"] == 1
-        assert data["worker_type"] == "CPU"
-        pool.reconcile_cpu_workers.assert_called_once_with(2)
-        pool.remove_workers.assert_not_called()
+        assert resp.status_code == 200
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        group = get_settings_manager().worker_groups[0]
+        assert group["enabled"] is False
+        assert group["count"] == 1
+
+    def test_workers_add_global_success(self, client):
+        """GPU scaling persists the chosen group and applies it to the shared pool."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        group = _save_test_worker_group(resource="gpu", count=1)
+        with patch(
+            "media_preview_generator.web.routes.api_worker_groups.reconcile_group_settings", return_value=None
+        ) as reconcile:
+            response = client.post("/api/workers/add", headers=_api_headers(), json={"worker_type": "GPU", "count": 2})
+        assert response.status_code == 200
+        assert response.get_json()["added"] == 2
+        assert response.get_json()["group_id"] == group["id"]
+        assert get_settings_manager().worker_groups[0]["count"] == 3
+        reconcile.assert_called_once_with(get_settings_manager())
+
+    def test_workers_remove_global_success(self, client):
+        """CPU scaling persists the lower group count and requests reconciliation."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        group = _save_test_worker_group(count=3)
+        with patch(
+            "media_preview_generator.web.routes.api_worker_groups.reconcile_group_settings", return_value=None
+        ) as reconcile:
+            response = client.post(
+                "/api/workers/remove", headers=_api_headers(), json={"worker_type": "CPU", "count": 1}
+            )
+        assert response.status_code == 200
+        assert response.get_json()["removed"] == 1
+        assert response.get_json()["group_id"] == group["id"]
+        assert get_settings_manager().worker_groups[0]["count"] == 2
         assert get_settings_manager().cpu_threads == 2
+        reconcile.assert_called_once_with(get_settings_manager())
 
 
 # ---------------------------------------------------------------------------
@@ -2153,7 +2145,6 @@ class TestSettingsAPI:
             "/api/settings",
             headers=_api_headers(),
             json={
-                "gpu_threads": 1,
                 "unknown_field": "ignored",
                 "plex_verify_ssl": False,
             },
@@ -2191,7 +2182,7 @@ class TestSettingsAPI:
         data = resp.get_json()
         assert data["success"] is True
         assert "warning" in data
-        assert "pending" in data["warning"].lower()
+        assert "wait" in data["warning"].lower()
 
     def test_save_gpu_config_validates_list(self, client):
         """gpu_config must be a list; non-list values are rejected."""
@@ -3838,7 +3829,7 @@ class TestWorkerScalingValidation:
         assert resp.status_code == 400
         assert "Invalid worker_type" in resp.get_json()["error"]
 
-    def test_add_workers_no_pool_returns_409(self, client):
+    def test_add_workers_no_pool_updates_saved_group(self, client):
         with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):
             create_resp = client.post("/api/jobs", headers=_api_headers(), json={})
         job_id = create_resp.get_json()["id"]
@@ -3853,9 +3844,12 @@ class TestWorkerScalingValidation:
             headers=_api_headers(),
             json={"worker_type": "CPU", "count": 1},
         )
-        assert resp.status_code == 409
-        # Pin reason — production says "Worker pool not available for this job".
-        assert "not available" in resp.get_json()["error"].lower()
+        assert resp.status_code == 200
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        group = get_settings_manager().worker_groups[0]
+        assert group["enabled"] is True
+        assert group["count"] == 2
 
     def test_remove_workers_zero_count_rejected(self, client):
         with patch("media_preview_generator.web.routes.api_jobs._start_job_async"):

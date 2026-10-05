@@ -300,6 +300,11 @@ def thread_totals_from_ui_settings(ui_settings: dict[str, Any]) -> tuple[int, in
 
     """
 
+    if "worker_groups" in ui_settings:
+        from ..worker_groups import configured_group_totals, validate_worker_groups
+
+        return configured_group_totals(validate_worker_groups(ui_settings["worker_groups"]))
+
     def get_value(settings_key, env_key, default, value_type=str):
         if settings_key in ui_settings and ui_settings[settings_key] not in (None, ""):
             val = ui_settings[settings_key]

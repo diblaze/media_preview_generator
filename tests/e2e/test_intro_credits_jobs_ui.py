@@ -354,8 +354,9 @@ class TestStartJobModalIntroCredits:
             "Click for more."
         )
         detail = page.locator("#infoJobKindMarkersTpl").evaluate("tpl => tpl.content.textContent")
-        assert "Runs at low priority by default (change it under Priority below) on the same workers as previews." in (
-            " ".join(detail.split())
+        assert (
+            "Runs at low priority by default (change it under Priority below) on worker groups that allow Intro & Credits."
+            in (" ".join(detail.split()))
         )
 
         page.locator("#jobKindPreviews").check()
@@ -1722,7 +1723,7 @@ class TestPerJobPause:
         tooltip = row.locator(".status-dot").get_attribute("data-bs-original-title") or row.locator(
             ".status-dot"
         ).get_attribute("title")
-        assert "not using a job slot" in (tooltip or "")
+        assert "Resume clears its manual pause; other pause settings still apply" in (tooltip or "")
 
     def test_resume_posts_to_the_job_resume_endpoint(self, dashboard) -> None:
         job = _running(_markers_job(config={"kind": "intro_credits", "source": "manual", "file_paths": []}), True)
@@ -1742,12 +1743,12 @@ class TestPerJobPause:
         assert req.value.method == "POST"
         expect(page.locator(f"#job-row-{job['id']} .status-dot")).to_have_text("Running", timeout=3000)
 
-    def test_preview_rows_get_no_per_job_pause_button(self, dashboard) -> None:
+    def test_preview_rows_offer_independent_per_job_pause(self, dashboard) -> None:
         job = _running(_preview_job())
         page = dashboard([job])
         expect(page.locator(f"#job-row-{job['id']}")).to_be_visible(timeout=5000)
 
-        expect(page.locator(f'#job-row-{job["id"]} button[aria-label="Pause job"]')).to_have_count(0)
+        expect(page.locator(f'#job-row-{job["id"]} button[aria-label="Pause job"]')).to_be_visible()
         expect(page.locator(f"#active-job-{job['id']}")).to_be_visible()
 
     def test_pause_all_shows_a_running_markers_job_as_held(self, dashboard) -> None:

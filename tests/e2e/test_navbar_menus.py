@@ -31,7 +31,6 @@ MENUS = {
         "items": [
             ("Triggers", "section-webhooks-overview", "Triggers: webhooks that start jobs as new media arrives"),
             ("Schedules", "section-schedules-list", "Schedules: recurring library scans"),
-            ("Quiet Hours", "section-schedules-quiet-hours", "Quiet Hours: times of day when processing pauses"),
         ],
     },
     "settings": {
@@ -39,7 +38,17 @@ MENUS = {
         "list": "#navSettingsMenu",
         "page": "/settings",
         "items": [
-            ("Processing Options", "section-processing", "Processing Options: jobs, GPUs, CPU workers and thumbnails"),
+            ("Workers", "section-workers", "Workers: groups, job permissions and availability"),
+            (
+                "Global pause schedule",
+                "section-worker-quiet-hours",
+                "Global pause schedule: times when all processing pauses",
+            ),
+            (
+                "Processing Options",
+                "section-processing",
+                "Processing Options: job limits, device tuning and thumbnails",
+            ),
             ("Intro & Credits", "section-markers", "Intro & Credits: skip-intro and credits markers"),
             ("Logging", "section-logging", "Logging: log level, log files and job history"),
             ("Authentication", "section-auth", "Authentication: the token that signs in to this web app"),
@@ -85,9 +94,22 @@ def _complete_setup(complete_setup) -> None:
 def nav_page(authed_page: Page) -> Generator[Page, None, None]:
     """The signed-in page, failing the test on any uncaught script error (a key reaching Bootstrap's handler throws)."""
     errors: list[str] = []
+    script_network: list[str] = []
     authed_page.on("pageerror", lambda error: errors.append(str(error)))
+    authed_page.on(
+        "requestfailed",
+        lambda request: (
+            script_network.append(f"{request.url}: {request.failure}") if request.resource_type == "script" else None
+        ),
+    )
+    authed_page.on(
+        "response",
+        lambda response: (
+            script_network.append(f"{response.status} {response.url}") if "socket.io" in response.url else None
+        ),
+    )
     yield authed_page
-    assert errors == []
+    assert errors == [], {"page_errors": errors, "script_network": script_network}
 
 
 def _open(page: Page, app_url: str, path: str = "/", viewport: dict = DESKTOP, font: str = "page-font") -> None:
@@ -346,10 +368,12 @@ class TestKeyboard:
         _open(nav_page, app_url)
         nav_page.locator(MENUS["settings"]["toggle"]).focus()
 
-        for key in ("ArrowDown", "ArrowDown", "ArrowDown", "Enter"):
-            nav_page.keyboard.press(key)
+        logging_index = next(i for i, item in enumerate(MENUS["settings"]["items"]) if item[1] == "section-logging")
+        for _ in range(logging_index + 1):
+            nav_page.keyboard.press("ArrowDown")
+        nav_page.keyboard.press("Enter")
 
-        nav_page.wait_for_url(f"{app_url}/settings#section-logging")
+        nav_page.wait_for_url(f"{app_url}/settings#section-logging", timeout=10000)
         _expect_landed(nav_page, "section-logging")
 
     def test_enter_on_a_tools_item_opens_its_page(self, nav_page: Page, app_url: str) -> None:
@@ -509,7 +533,7 @@ class TestPhoneMenu:
         "name,text,anchor",
         [
             ("settings", "Authentication", "section-auth"),
-            ("automation", "Quiet Hours", "section-schedules-quiet-hours"),
+            ("settings", "Global pause schedule", "section-worker-quiet-hours"),
         ],
         ids=["settings", "automation"],
     )

@@ -384,6 +384,51 @@ class TestOneWaitingScanPerSchedule:
         assert [j.id for j in self._recently_added_jobs()] == [first]
         assert [c.args[0] for c in start.call_args_list] == [first]
 
+    @pytest.mark.parametrize(
+        "change", ["same", "library-order", "libraries", "server", "schedule", "priority", "parked"]
+    )
+    def test_coalescing_requires_same_unstarted_scope_and_priority(self, app, change):
+        params = {"server_id": "plex-1", "library_ids": ["2", "1"], "priority": 2}
+        with patch(self.START) as start:
+            first = _start(**params)
+            original = _jm().get_job(first)
+            original_config = dict(original.config)
+            if change == "library-order":
+                params["library_ids"] = ["1", "2"]
+            elif change == "libraries":
+                params["library_ids"] = ["1"]
+            elif change == "server":
+                params["server_id"] = "jf-1"
+            elif change == "schedule":
+                params["schedule_id"] = "sched-2"
+            elif change == "priority":
+                params["priority"] = 1
+            elif change == "parked":
+                _jm().merge_job_config(first, {"parked_checkpoint": "saved-continuation"})
+            second = _start(**params)
+        reused = change in {"same", "library-order"}
+        assert (second == first) is reused
+        assert [call.args[0] for call in start.call_args_list] == ([first] if reused else [first, second])
+        result = _jm().get_job(second)
+        assert result.parent_schedule_id == params.get("schedule_id", "sched-1")
+        assert result.server_id == params["server_id"]
+        assert sorted(result.config["library_ids"]) == sorted(params["library_ids"])
+        assert result.priority == params["priority"]
+        assert original.config["server_id"] == original_config["server_id"]
+        assert original.config["library_ids"] == original_config["library_ids"]
+        assert original.config["lookback_hours"] == original_config["lookback_hours"]
+
+    def test_changed_incoming_priority_does_not_reuse_old_default(self, app):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        with patch(self.START) as start:
+            first = _start()
+            get_settings_manager().set("incoming_job_priority", 3)
+            second = _start()
+        assert first != second
+        assert (_jm().get_job(first).priority, _jm().get_job(second).priority) == (1, 3)
+        assert [call.args[0] for call in start.call_args_list] == [first, second]
+
     def test_a_longer_lookback_widens_the_waiting_scans_window(self, app):
         with patch(self.START):
             first = _start(lookback_hours=1.0)

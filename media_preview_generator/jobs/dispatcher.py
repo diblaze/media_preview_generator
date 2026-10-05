@@ -69,6 +69,8 @@ class JobTracker:
         kind: str = JOB_KIND_PREVIEWS,
         handlers: KindHandlers | None = None,
         carried_outcome: dict[str, int] | None = None,
+        carried_state: dict | None = None,
+        continuation_context: dict | None = None,
     ):
         """Initialize tracker for a single job."""
         self.job_id = job_id
@@ -91,6 +93,11 @@ class JobTracker:
         # appended to ``item_queue``, which the processing workers drain
         # exactly as before. ``total_items`` counts every submitted item;
         # each one is recorded exactly once (check-skip OR processing).
+        self.continuation_context = dict(continuation_context or {})
+        self.park_requested = False
+        self.detached = False
+        self.active_checks = 0
+        self.active_processing = 0
         self.check_queue: deque = deque(items)
         self.item_queue: deque = deque()
         self.total_items = len(items)
@@ -155,6 +162,16 @@ class JobTracker:
         self._last_logged_progress: tuple[int, int] | None = None
         # Set when all items are done; used by _cleanup_done_trackers
         self._done_at: float | None = None
+        if carried_state is not None:
+            if carried_outcome:
+                raise ValueError("Choose carried_state or carried_outcome, not both")
+            self.successful = int(carried_state.get("successful", 0))
+            self.failed = int(carried_state.get("failed", 0))
+            self.failed_paths = list(carried_state.get("failed_paths", []))
+            self.outcome_counts = dict(carried_state.get("outcome_counts", {}))
+            self.publishers_aggregate = dict(carried_state.get("publishers_aggregate", {}))
+            self.cpu_fallback_files = int(carried_state.get("cpu_fallback_files", 0))
+            self.total_items = len(items) + self.successful + self.failed
 
     @property
     def completed(self) -> int:
@@ -565,6 +582,8 @@ class JobDispatcher:
         kind: str = JOB_KIND_PREVIEWS,
         handlers: KindHandlers | None = None,
         carried_outcome: dict[str, int] | None = None,
+        carried_state: dict | None = None,
+        continuation_context: dict | None = None,
     ) -> JobTracker:
         """Submit items for a job to the shared dispatch queue.
 
@@ -597,6 +616,8 @@ class JobDispatcher:
             kind=kind,
             handlers=handlers,
             carried_outcome=carried_outcome,
+            carried_state=carried_state,
+            continuation_context=continuation_context,
         )
         # Wire the in-flight fraction getter so JobTracker.record_completion
         # emits the same percent the dispatcher's periodic _emit_progress_updates
@@ -604,6 +625,9 @@ class JobDispatcher:
         # bounced between the two paths' divergent values.
         tracker.in_progress_fraction_getter = lambda jid=job_id: self._get_in_progress_fraction(jid)
         with self._trackers_lock:
+            previous = self._trackers.get(job_id)
+            if previous is not None and not previous.done_event.is_set():
+                raise RuntimeError("A job already has an attached dispatcher tracker")
             self._trackers[job_id] = tracker
         # A kind whose job log starts with its own line keeps this one to the app log.
         logger.bind(**{JOB_LOG_SKIP: kind != JOB_KIND_PREVIEWS}).info(
@@ -648,6 +672,83 @@ class JobDispatcher:
         if tracker:
             tracker.cancel()
             logger.info("Dispatcher: cancelled job {}", job_id[:8])
+
+    def wake(self) -> None:
+        """Reevaluate current groups and queues after a settings change."""
+        self.worker_pool._group_refresh_at = -10.0
+        self._has_work.set()
+        self._worker_done.set()
+
+    def request_park(self, job_id: str) -> bool:
+        """Stop picking this job's work without cancelling or freezing active files."""
+        with self._trackers_lock:
+            tracker = self._trackers.get(job_id)
+            if tracker is None or tracker.detached or tracker.done_event.is_set():
+                return False
+            tracker.park_requested = True
+        self._has_work.set()
+        return True
+
+    def park_snapshot(self, job_id: str) -> dict | None:
+        """Snapshot unfinished work after every checker and worker callback drains.
+
+        Commit the continuation before detaching. None means the fence has not
+        been reached, or normal completion won the race.
+        """
+        from copy import deepcopy
+
+        from .checkpoints import item_descriptor
+
+        with self._trackers_lock:
+            tracker = self._trackers.get(job_id)
+            if (
+                tracker is None
+                or not tracker.park_requested
+                or tracker.detached
+                or tracker.active_checks
+                or tracker.active_processing
+                or tracker.done_event.is_set()
+            ):
+                return None
+            with tracker._counts_lock:
+                return {
+                    "kind": tracker.kind,
+                    "context": deepcopy(tracker.continuation_context),
+                    "items": [item_descriptor(item) for item in (*tracker.item_queue, *tracker.check_queue)],
+                    "state": deepcopy(
+                        {
+                            "successful": tracker.successful,
+                            "failed": tracker.failed,
+                            "failed_paths": tracker.failed_paths,
+                            "outcome_counts": tracker.outcome_counts,
+                            "publishers_aggregate": tracker.publishers_aggregate,
+                            "cpu_fallback_files": tracker.cpu_fallback_files,
+                            "total_items": tracker.total_items,
+                        }
+                    ),
+                }
+
+    def detach_parked(self, job_id: str) -> bool:
+        """Drop a quiescent tracker after its durable continuation was committed."""
+        with self._trackers_lock:
+            tracker = self._trackers.get(job_id)
+            if tracker is None:
+                return False
+            if not tracker.park_requested or tracker.active_checks or tracker.active_processing:
+                raise RuntimeError("Cannot detach a tracker before its work drains")
+            if tracker.done_event.is_set():
+                return False
+            del self._trackers[job_id]
+            tracker.detached = True
+            tracker.check_queue.clear()
+            tracker.item_queue.clear()
+            tracker.registry = None
+            tracker.handlers = None
+            tracker.progress_callback = None
+            tracker.worker_callback = None
+            tracker.on_item_complete = None
+            tracker.in_progress_fraction_getter = None
+            return True
 
     def shutdown(self) -> None:
         """Stop the dispatch loop + checking executor and shut down the pool."""
@@ -694,6 +795,9 @@ class JobDispatcher:
             # the next tick retries. Per-item failures are already isolated in
             # the worker/check threads, so this only catches engine-level slips.
             try:
+                from .group_runtime import refresh_worker_groups
+
+                refresh_worker_groups(self.worker_pool)
                 # 1. Handle cancelled jobs
                 self._handle_cancellations()
 
@@ -790,6 +894,8 @@ class JobDispatcher:
                     )
                 finally:
                     tracker.record_completion(success, worker.display_name, title, canonical_path=canonical_path)
+                    with self._trackers_lock:
+                        tracker.active_processing = max(0, tracker.active_processing - 1)
             else:
                 # No tracker for this item — just log
                 success = worker.last_task_succeeded()
@@ -861,64 +967,68 @@ class JobDispatcher:
                 )
 
     def _assign_tasks(self) -> None:
-        """Assign items from active jobs to available workers."""
+        """Reserve a compatible job and slot together under a fixed lock order."""
         self.worker_pool._apply_deferred_removals()
-
         while True:
-            # Atomic claim closes the race vs. _process_items_loop
-            # (the worker pool's own consumer) — both used to find the
-            # same idle worker and the loser tripped "already busy".
-            worker = self.worker_pool._find_available_worker(claim=True)
-            if not worker:
-                break
-
-            # Pull next item (highest priority, then oldest submission).
-            picked = self._get_next_item()
-            if not picked:
-                # Nothing to do — release the pre-claim.
-                worker.is_busy = False
-                break
-
-            job_id, item, library_name = picked
+            # Pause/cancel callbacks may read settings or job-manager state.
+            # Never call them under the pool lock: settings saves reconcile in
+            # the opposite order. Workers recheck holds before doing work.
             with self._trackers_lock:
-                tracker = self._trackers.get(job_id)
-            if not tracker:
-                # Tracker disappeared between pick and lookup — release the
-                # pre-claim and try again with the next available worker.
-                worker.is_busy = False
-                continue
-
-            # First item of this job to reach a generation worker — flip the
-            # progress label off "Checking existing previews…".
-            tracker.generation_started = True
-
-            progress_callback = partial(self.worker_pool._update_worker_progress, worker)
-            try:
-                worker.assign_task(
-                    item,
-                    tracker.config,
-                    tracker.registry,
-                    progress_callback=progress_callback,
-                    title_max_width=tracker.title_max_width,
-                    job_id=job_id,
-                    library_name=library_name,
-                    cancel_check=tracker.is_cancelled,
-                    pause_check=tracker.pause_check,
-                    process_fn=tracker.handlers.process_fn if tracker.handlers else None,
-                    outcome_keys=tracker.handlers.outcome_keys if tracker.handlers else None,
-                    pickup_fn=tracker.handlers.pickup_fn if tracker.handlers else None,
+                candidates = list(self._trackers.values())
+            candidates = [t for t in candidates if not t.is_paused() and not t.is_cancelled()]
+            # Keep compatible selection and reservation atomic with policy
+            # edits and parking, revalidating the detached tracker snapshot.
+            with self._trackers_lock, self.worker_pool._workers_lock:
+                eligible = sorted(
+                    (
+                        t
+                        for t in candidates
+                        if self._trackers.get(t.job_id) is t
+                        and not t.done_event.is_set()
+                        and not t.park_requested
+                        and not t.cancelled
+                        and t.item_queue
+                    ),
+                    key=lambda t: (t.priority, t.submission_order),
                 )
-            except Exception as exc:
-                self._fail_unstarted_item(worker, tracker, item, exc)
-                # The next tick tries again: while threads can't start (a process limit, usually brief), one tick
-                # would otherwise fail every queued item.
-                break
-            logger.debug(
-                "Dispatch: assigned canonical item {!r} (job {}) to {}",
-                item.canonical_path,
-                job_id[:8],
-                worker.display_name,
-            )
+                chosen = None
+                for tracker in eligible:
+                    worker = self.worker_pool._find_available_worker(claim=True, kind=tracker.kind)
+                    if worker is not None:
+                        chosen = (tracker, worker)
+                        break
+                if chosen is None:
+                    return
+                tracker, worker = chosen
+                item = tracker.item_queue.popleft()
+                tracker.active_processing += 1
+                tracker.generation_started = True
+                progress_callback = partial(self.worker_pool._update_worker_progress, worker)
+                try:
+                    worker.assign_task(
+                        item,
+                        tracker.config,
+                        tracker.registry,
+                        progress_callback=progress_callback,
+                        title_max_width=tracker.title_max_width,
+                        job_id=tracker.job_id,
+                        library_name="",
+                        cancel_check=tracker.is_cancelled,
+                        pause_check=tracker.pause_check,
+                        process_fn=tracker.handlers.process_fn if tracker.handlers else None,
+                        outcome_keys=tracker.handlers.outcome_keys if tracker.handlers else None,
+                        pickup_fn=tracker.handlers.pickup_fn if tracker.handlers else None,
+                    )
+                except Exception as exc:
+                    tracker.active_processing -= 1
+                    self._fail_unstarted_item(worker, tracker, item, exc)
+                    return
+                logger.debug(
+                    "Dispatch: assigned canonical item {!r} (job {}) to {}",
+                    item.canonical_path,
+                    tracker.job_id[:8],
+                    worker.display_name,
+                )
 
     def _fail_unstarted_item(self, worker: Worker, tracker: JobTracker, item, exc: Exception) -> None:
         """Count an item its worker couldn't start as failed, with its Files-panel row, and give the worker back.
@@ -982,13 +1092,20 @@ class JobDispatcher:
             eligible = [
                 t
                 for t in self._trackers.values()
-                if not t.done_event.is_set() and not t.is_paused() and not t.is_cancelled() and t.check_queue
+                if not t.done_event.is_set()
+                and not t.park_requested
+                and not t.is_paused()
+                and not t.is_cancelled()
+                and t.check_queue
             ]
             eligible.sort(key=lambda t: (t.priority, t.submission_order))
             for tracker in eligible:
+                if not self.worker_pool.has_capacity_for(tracker.kind):
+                    continue
                 if (cap := self._kind_check_cap(tracker)) is not None and by_kind.get(tracker.kind, 0) >= cap:
                     continue
                 item = tracker.check_queue.popleft()
+                tracker.active_checks += 1
                 return (tracker, item)
         return None
 
@@ -1039,7 +1156,9 @@ class JobDispatcher:
                 # Nothing will run _run_check_and_release, so release the slots here and keep the item for the
                 # next tick — a leaked slot shrinks the checking pool (and a kind's share) for the process lifetime.
                 self._on_check_done(tracker.kind)
-                tracker.check_queue.appendleft(item)
+                with self._trackers_lock:
+                    tracker.active_checks -= 1
+                    tracker.check_queue.appendleft(item)
                 logger.warning("Dispatcher: could not start a check thread for {!r}; will retry", item.canonical_path)
                 raise
 
@@ -1055,6 +1174,8 @@ class JobDispatcher:
             # log-routing map after it exits.
             unregister_job_thread()
             self._on_check_done(tracker.kind)
+            with self._trackers_lock:
+                tracker.active_checks = max(0, tracker.active_checks - 1)
 
     def _on_check_done(self, kind: str = JOB_KIND_PREVIEWS) -> None:
         """Release one in-flight check slot (global and per-kind) and wake the dispatch loop.
@@ -1204,7 +1325,11 @@ class JobDispatcher:
             eligible = [
                 t
                 for t in self._trackers.values()
-                if not t.done_event.is_set() and not t.is_paused() and not t.is_cancelled() and t.item_queue
+                if not t.done_event.is_set()
+                and not t.park_requested
+                and not t.is_paused()
+                and not t.is_cancelled()
+                and t.item_queue
             ]
             eligible.sort(key=lambda t: (t.priority, t.submission_order))
             for tracker in eligible:
@@ -1312,6 +1437,10 @@ class JobDispatcher:
                 {
                     "worker_id": worker.worker_id,
                     "worker_type": worker.worker_type,
+                    "group_id": worker.group_id,
+                    "group_name": worker.group_name,
+                    "group_resource": worker.group_resource,
+                    "retiring": worker._pending_removal,
                     "worker_name": display_name,
                     "status": "processing" if is_busy else "idle",
                     "current_title": worker.media_title if is_busy else "",
@@ -1427,9 +1556,9 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
         The process-wide :class:`JobDispatcher`.
     """
     global _dispatcher
+    from .group_runtime import refresh_worker_groups
+
     selected = list(selected_gpus or [])
-    # Check and create under one lock: two jobs starting together must not both see "no dispatcher" and build a
-    # pool each (the loser's pool would be dropped while its workers are already counted in the logs).
     with _dispatcher_lock:
         if _dispatcher is None:
             pool = WorkerPool(
@@ -1438,10 +1567,8 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
                 selected_gpus=selected,
             )
             _dispatcher = JobDispatcher(pool)
-            logger.info("Created global JobDispatcher")
-            return _dispatcher
         existing = _dispatcher
-    if selected:
+    if not refresh_worker_groups(existing.worker_pool, config, selected, force=True) and selected:
         try:
             existing.worker_pool.reconcile_gpu_workers(selected)
         except Exception as exc:

@@ -59,6 +59,7 @@ _QUIET_HOURS_PAUSE_JOB_ID = "__quiet_hours_pause"  # legacy D21 single-window id
 _QUIET_HOURS_RESUME_JOB_ID = "__quiet_hours_resume"  # legacy D21 single-window id
 _QUIET_HOURS_PAUSE_PREFIX = "__qh_pause_"
 _QUIET_HOURS_RESUME_PREFIX = "__qh_resume_"
+_QUIET_HOURS_RECHECK = "__qh_recheck"
 
 # APScheduler day_of_week names (Mon-first). Order matters for cron
 # strings — keep these literal so a typo in the JS payload can't slip
@@ -90,85 +91,23 @@ def is_in_quiet_window(
 
 
 def normalise_quiet_hours(raw: dict | None) -> dict:
-    """Normalise the persisted quiet_hours shape (D26).
+    """Read or migrate quiet hours to explicit start-day intervals."""
+    from ..quiet_hours import migrate_quiet_hours
 
-    Accepts the legacy D21 single-window form
-    ``{"enabled": bool, "start": "HH:MM", "end": "HH:MM"}`` and migrates
-    it to the multi-window form
-    ``{"enabled": bool, "windows": [{"start", "end", "days"}]}``.
-    Legacy entries map to one window covering all 7 days.
-
-    Per-window ``days`` defaults to all 7 when missing. Invalid /
-    out-of-range day names are silently dropped — never raises so a
-    bad on-disk shape can't crash the boot path.
-    """
-    raw = raw if isinstance(raw, dict) else {}
-    enabled = bool(raw.get("enabled"))
-    raw_windows = raw.get("windows")
-    if isinstance(raw_windows, list) and raw_windows:
-        windows = []
-        for w in raw_windows:
-            if not isinstance(w, dict):
-                continue
-            start = str(w.get("start") or "")
-            end = str(w.get("end") or "")
-            if not start or not end:
-                continue
-            days = w.get("days")
-            if not isinstance(days, list) or not days:
-                days = list(_QUIET_HOURS_DAYS)
-            else:
-                days = [d for d in (str(x).strip().lower() for x in days) if d in _QUIET_HOURS_DAYS]
-                if not days:
-                    days = list(_QUIET_HOURS_DAYS)
-            windows.append({"start": start, "end": end, "days": days})
-        return {"enabled": enabled, "windows": windows}
-    # Legacy single-window migration.
-    start = str(raw.get("start") or "")
-    end = str(raw.get("end") or "")
-    if start and end:
-        return {
-            "enabled": enabled,
-            "windows": [{"start": start, "end": end, "days": list(_QUIET_HOURS_DAYS)}],
-        }
-    return {"enabled": enabled, "windows": []}
+    return migrate_quiet_hours(raw)
 
 
-def is_now_in_any_quiet_window(
-    quiet_hours: dict | None,
-    now: datetime | None = None,
-) -> bool:
-    """Return True if ``now`` falls inside ANY enabled quiet-hours window.
+def is_now_in_any_quiet_window(quiet_hours: dict | None, now: datetime | None = None) -> bool:
+    """Evaluate current local wall time, including exact legacy weekday migration."""
+    from ..quiet_hours import quiet_hours_weekly_mask
+    from ..worker_groups import local_now
 
-    Considers both the time-of-day (via :func:`is_in_quiet_window`) AND
-    the per-window day-of-week filter. Used by the boot-time gate, the
-    `currently_in_quiet_window` API field, and the pause/resume cron
-    callbacks (which need to recompute state to handle overlapping
-    windows correctly — resume of window A must NOT un-pause when
-    window B is still active).
-    """
-    qh = normalise_quiet_hours(quiet_hours)
-    if not qh.get("enabled"):
-        return False
-    n = now or datetime.now()
-    today = _QUIET_HOURS_DAYS[n.weekday()]
-    now_hm = (n.hour, n.minute)
-    for w in qh.get("windows", []):
-        if today not in (w.get("days") or _QUIET_HOURS_DAYS):
-            continue
-        try:
-            shm = _parse_hhmm(w["start"])
-            ehm = _parse_hhmm(w["end"])
-        except (KeyError, ValueError):
-            continue
-        if shm is None or ehm is None:
-            continue
-        if is_in_quiet_window(now_hm, shm, ehm):
-            return True
-    return False
+    moment = local_now(now)
+    minute = moment.weekday() * 1440 + moment.hour * 60 + moment.minute
+    return bool(quiet_hours_weekly_mask(quiet_hours) & (1 << minute))
 
 
-def _quiet_hours_recompute_and_apply() -> None:
+def _quiet_hours_recompute_and_apply(*, drain: bool = True) -> None:
     """Idempotent state flip — set processing_paused to whether ANY window is active.
 
     Called from BOTH the pause-boundary and resume-boundary crons so
@@ -182,19 +121,19 @@ def _quiet_hours_recompute_and_apply() -> None:
 
         sm = get_settings_manager()
         target = is_now_in_any_quiet_window(sm.get("quiet_hours"))
-        if sm.processing_paused == target:
+        if not sm.set_processing_pause_reason("quiet_hours", target):
             return
-        sm.processing_paused = target
+        effective = sm.processing_paused
         try:
-            get_job_manager().emit_processing_paused_changed(target)
+            get_job_manager().emit_processing_paused_changed(effective)
         except Exception:
             logger.debug(
                 "Could not emit processing_paused_changed on quiet-hours flip",
                 exc_info=True,
             )
-        if target:
+        if effective:
             logger.info("Quiet hours: processing paused (queue will fill until resume time)")
-        else:
+        elif drain:
             # Start the PENDING backlog the same way the manual/auto resume
             # paths do — otherwise jobs revived PENDING-while-paused at boot
             # (pause now survives restarts) sit forever when a quiet window
@@ -219,13 +158,13 @@ def _quiet_hours_resume() -> None:
 
 
 def execute_schedule_stop(schedule_id: str) -> None:
-    """Module-level stop handler — pauses every running job spawned by ``schedule_id``.
+    """Add this schedule's hold to its pending and running jobs.
 
     Pickled by APScheduler's SQLAlchemy jobstore alongside the start
     cron, so it must live at module scope. Looks up the JobManager
-    singleton, finds RUNNING jobs whose ``parent_schedule_id`` matches,
-    and calls ``request_pause`` on each. Cooperative — in-flight
-    FFmpeg processes finish their current task naturally.
+    singleton and calls ``request_pause`` for matching ``parent_schedule_id``
+    values. The normal job pause mechanism freezes active processing;
+    unlike worker-group reductions, this is not a drain operation.
     """
     from .jobs import JobStatus, get_job_manager
 
@@ -239,7 +178,7 @@ def execute_schedule_stop(schedule_id: str) -> None:
     for job in job_manager.get_all_jobs():
         if job.parent_schedule_id != schedule_id:
             continue
-        if job.status is not JobStatus.RUNNING or job.paused:
+        if job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
             continue
         if job_manager.request_pause(job.id, by_schedule=True):
             job_manager.add_log(
@@ -250,14 +189,14 @@ def execute_schedule_stop(schedule_id: str) -> None:
 
     if paused_count:
         logger.info(
-            "Schedule {!r} ({}): stop-time fired, paused {} running job(s)",
+            "Schedule {!r} ({}): stop-time fired, paused {} pending or running job(s)",
             name,
             schedule_id,
             paused_count,
         )
     else:
         logger.info(
-            "Schedule {!r} ({}): stop-time fired, no running jobs from this schedule to pause",
+            "Schedule {!r} ({}): stop-time fired, no unheld pending or running jobs from this schedule",
             name,
             schedule_id,
         )
@@ -265,19 +204,18 @@ def execute_schedule_stop(schedule_id: str) -> None:
 
 # Serialises a Find markers tick's "unfinished job?" check with its job's creation (Run now beside a start tick).
 _FIND_MARKERS_TICK_LOCK = threading.Lock()
+_FULL_LIBRARY_TICK_LOCK = threading.Lock()
 
 
 def _resumed_kind(config: dict | None) -> str | None:
     """The job kind a schedule's start tick resumes after its stop time paused it (``execute_scheduled_job``).
 
     Returns:
-        ``intro_credits`` or ``previews``; None for a Recently Added schedule, which resumes nothing.
+        ``intro_credits`` or ``previews`` (including Recently Added).
     """
     from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_PREVIEWS
 
     job_type = str((config or {}).get("job_type", "full_library"))
-    if job_type == "recently_added":
-        return None
     return JOB_KIND_INTRO_CREDITS if job_type == "intro_credits" else JOB_KIND_PREVIEWS
 
 
@@ -293,6 +231,7 @@ def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict
         config: Its config after the change.
     """
     from .jobs import PAUSED_BY_SCHEDULE, JobStatus, get_job_manager
+    from .routes.job_runner import RECENTLY_ADDED_JOB_SOURCE
 
     kind = _resumed_kind(config)
     try:
@@ -301,7 +240,10 @@ def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict
         logger.exception("Schedule {} changed, but its paused jobs couldn't be listed", schedule_id)
         return
     for job in jobs:
-        if job.parent_schedule_id != schedule_id or job.kind == kind:
+        same_mode = ((job.config or {}).get("source") == RECENTLY_ADDED_JOB_SOURCE) == (
+            (config or {}).get("job_type") == "recently_added"
+        )
+        if job.parent_schedule_id != schedule_id or (job.kind == kind and same_mode):
             continue
         if not (job.paused and job.status is JobStatus.RUNNING and (job.config or {}).get(PAUSED_BY_SCHEDULE)):
             continue
@@ -576,13 +518,13 @@ def execute_scheduled_job(
     # D20 — auto-resume the jobs this schedule's stop time paused
     # instead of spawning a fresh one. Lets a multi-night library scan
     # span across stop_time pauses with the same Job ID and progress.
-    # Applies to every job type except recently_added (a fast, idempotent
-    # scan that can re-run cheaply), matched by job kind. A job paused by
-    # hand (or by Pause all) isn't this schedule's to resume.
+    # Match kind and scan mode; clear only this schedule's hold so manual
+    # pauses remain independent.
     schedule_kind = _resumed_kind(cfg)
     if schedule_kind is not None:
         try:
             from .jobs import PAUSED_BY_SCHEDULE, JobStatus, get_job_manager
+            from .routes.job_runner import RECENTLY_ADDED_JOB_SOURCE
 
             # A schedule switched between previews and Intro & Credits must not resume the other kind's job (the
             # switch logs a WARNING naming it). Between finding markers and checking servers it does: nothing else
@@ -592,7 +534,9 @@ def execute_scheduled_job(
             for job in job_manager.get_all_jobs():
                 if job.parent_schedule_id != schedule_id or job.kind != schedule_kind:
                     continue
-                if not job.paused or job.status is not JobStatus.RUNNING:
+                if ((job.config or {}).get("source") == RECENTLY_ADDED_JOB_SOURCE) != (job_type == "recently_added"):
+                    continue
+                if not job.paused or job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
                     continue
                 if not (job.config or {}).get(PAUSED_BY_SCHEDULE):
                     continue
@@ -600,9 +544,17 @@ def execute_scheduled_job(
                 if job_manager.request_resume(job.id, only_paused_by_schedule=True):
                     job_manager.add_log(
                         job.id,
-                        f"INFO - Resumed by schedule {schedule_id!r} start tick",
+                        (
+                            f"INFO - Schedule {schedule_id!r} pause cleared; manual pause remains"
+                            if job.paused
+                            else f"INFO - Resumed by schedule {schedule_id!r} start tick"
+                        ),
                     )
                     resumed.append(job.id[:8])
+                    if job.status is JobStatus.PENDING and not job.paused:
+                        from .routes.job_runner import _start_job_async
+
+                        _start_job_async(job.id, job.config or {})
             if resumed:
                 # Nothing else is queued on this tick, whatever the schedule's mode now: a new job would compete with
                 # the resumed ones for a slot and could run past the stop time. It queues on a later tick.
@@ -684,7 +636,7 @@ def execute_scheduled_job(
             # library_id when there's exactly one (keeps existing behaviour).
             if len(library_ids) > 1:
                 cfg = dict(cfg)
-                cfg["selected_library_ids"] = library_ids
+                cfg["selected_library_ids"] = sorted(set(library_ids))
             kwargs = {
                 "library_id": primary_library_id,
                 "library_name": library_name,
@@ -695,8 +647,33 @@ def execute_scheduled_job(
                 kwargs["priority"] = priority
             if server_id:
                 kwargs["server_id"] = server_id
-            manager.run_job_callback(**kwargs)
-            manager._update_last_run(schedule_id)
+            # Only identical, never-enumerated requests coalesce. A closed
+            # worker group must not create an unbounded copy on every tick.
+            signature = json.dumps(
+                {"config": cfg, "libraries": sorted(set(library_ids)), "server_id": server_id, "priority": priority},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            cfg["schedule_scope"] = signature
+            from .jobs import JobStatus, get_job_manager
+
+            with _FULL_LIBRARY_TICK_LOCK:
+                existing = next(
+                    (
+                        job
+                        for job in get_job_manager().get_all_jobs()
+                        if job.parent_schedule_id == schedule_id
+                        and job.kind == "previews"
+                        and job.status is JobStatus.PENDING
+                        and not job.started_at
+                        and not (job.config or {}).get("parked_checkpoint")
+                        and (job.config or {}).get("schedule_scope") == signature
+                    ),
+                    None,
+                )
+                if existing is None:
+                    manager.run_job_callback(**kwargs)
+                manager._update_last_run(schedule_id)
         except Exception:
             logger.exception(
                 "Scheduled job {} for library {!r} could not start. "
@@ -1237,7 +1214,7 @@ class ScheduleManager:
             self.scheduler.start()
             logger.info("Scheduler started")
 
-    def apply_quiet_hours(self, settings_dict: dict | None) -> None:
+    def apply_quiet_hours(self, settings_dict: dict | None, *, drain: bool = True) -> None:
         """Register / refresh the per-window quiet-hours crons (D21 + D26).
 
         ``settings_dict`` is the value of ``settings["quiet_hours"]``.
@@ -1257,7 +1234,8 @@ class ScheduleManager:
         # is simpler than reconciling adds/removes individually.
         for job in self.scheduler.get_jobs():
             if (
-                job.id == _QUIET_HOURS_PAUSE_JOB_ID
+                job.id == _QUIET_HOURS_RECHECK
+                or job.id == _QUIET_HOURS_PAUSE_JOB_ID
                 or job.id == _QUIET_HOURS_RESUME_JOB_ID
                 or job.id.startswith(_QUIET_HOURS_PAUSE_PREFIX)
                 or job.id.startswith(_QUIET_HOURS_RESUME_PREFIX)
@@ -1268,12 +1246,21 @@ class ScheduleManager:
                     pass
 
         qh = normalise_quiet_hours(settings_dict)
+        _quiet_hours_recompute_and_apply(drain=drain)
         if not qh.get("enabled") or not qh.get("windows"):
             return
 
         if not self.scheduler.running:
             self.start()
 
+        # Startup, edits and minute reevaluation recover missed boundaries/DST;
+        # crons supply prompt edges rather than owning a latched pause flag.
+        self.scheduler.add_job(
+            _quiet_hours_recompute_and_apply,
+            trigger=IntervalTrigger(minutes=1),
+            id=_QUIET_HOURS_RECHECK,
+            replace_existing=True,
+        )
         registered = 0
         for idx, w in enumerate(qh["windows"]):
             try:
@@ -1298,9 +1285,14 @@ class ScheduleManager:
                 id=f"{_QUIET_HOURS_PAUSE_PREFIX}{idx}",
                 replace_existing=True,
             )
+            end_days = (
+                days
+                if start_hm < end_hm
+                else [_QUIET_HOURS_DAYS[(_QUIET_HOURS_DAYS.index(day) + 1) % 7] for day in days]
+            )
             self.scheduler.add_job(
                 _quiet_hours_resume,
-                trigger=CronTrigger(day_of_week=day_filter, hour=end_hm[0], minute=end_hm[1]),
+                trigger=CronTrigger(day_of_week=",".join(end_days), hour=end_hm[0], minute=end_hm[1]),
                 id=f"{_QUIET_HOURS_RESUME_PREFIX}{idx}",
                 replace_existing=True,
             )
@@ -1518,7 +1510,11 @@ class ScheduleManager:
             schedule["library_ids"] = [str(library_id)] if library_id else []
         if library_name is not None:
             schedule["library_name"] = library_name
-        resumes_other_jobs = config is not None and _resumed_kind(config) != _resumed_kind(schedule.get("config"))
+        resumes_other_jobs = config is not None and (
+            _resumed_kind(config) != _resumed_kind(schedule.get("config"))
+            or (config.get("job_type") == "recently_added")
+            != ((schedule.get("config") or {}).get("job_type") == "recently_added")
+        )
         if config is not None:
             schedule["config"] = config
         if enabled is not None:

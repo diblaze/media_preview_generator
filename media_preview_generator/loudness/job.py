@@ -19,8 +19,11 @@ from loguru import logger
 
 from ..config import load_config
 from ..job_kinds import JOB_KIND_LOUDNESS, ItemOutcome, KindHandlers
+from ..jobs.checkpoints import checkpoint_items, read_checkpoint
 from ..jobs.dispatcher import get_or_create_dispatcher
+from ..jobs.group_runtime import runtime_capacity, wait_for_capacity
 from ..jobs.orchestrator import _build_multi_server_registry
+from ..jobs.parking import JobParked, park_if_unavailable
 from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
 from ..markers.job_runner import (
     build_items,
@@ -365,6 +368,12 @@ def kind_handlers(
 
 
 def run_loudness_job(job_id: str) -> None:
+    """Run or resume one job, releasing each parked pass's queues and registry."""
+    while _run_loudness_pass(job_id):
+        pass
+
+
+def _run_loudness_pass(job_id: str) -> bool | None:
     """Run one loudness job to completion (on its own thread)."""
     jm = get_job_manager()
     job = jm.get_job(job_id)
@@ -402,9 +411,6 @@ def run_loudness_job(job_id: str) -> None:
     def on_wait(active: int, cap: int, effective_cap: int) -> None:
         jm.update_progress(
             job_id,
-            percent=0,
-            processed_items=0,
-            total_items=0,
             current_item=format_wait_message(active, cap, effective_cap),
         )
         jm.note_slot_wait(job_id)
@@ -449,15 +455,37 @@ def run_loudness_job(job_id: str) -> None:
                 if job.paused and not hold_pause_from_before_restart(job_id, cancel_check):
                     jm.cancel_job(job_id)
                     return
-                slot["priority"] = live_priority()
-                jm.note_slot_wait(job_id)
-                if not get_job_gate().acquire(priority=slot["priority"], cancel_check=cancel_check, on_wait=on_wait):
-                    jm.add_log(job_id, "WARNING - Job cancelled while waiting for active slot")
-                    jm.cancel_job(job_id)
-                    return
-                slot["held"] = True
+                while True:
+                    if not wait_for_capacity(
+                        jm,
+                        job_id,
+                        JOB_KIND_LOUDNESS,
+                        cancel_check,
+                        lambda: jm.is_pause_requested(job_id) or get_settings_manager().processing_paused,
+                    ):
+                        jm.cancel_job(job_id)
+                        return
+                    slot["priority"] = live_priority()
+                    jm.note_slot_wait(job_id)
+                    if not get_job_gate().acquire(
+                        priority=slot["priority"], cancel_check=cancel_check, on_wait=on_wait
+                    ):
+                        jm.cancel_job(job_id)
+                        return
+                    slot["held"] = True
+                    if (
+                        runtime_capacity(JOB_KIND_LOUDNESS)["open"]
+                        and not jm.is_pause_requested(job_id)
+                        and not get_settings_manager().processing_paused
+                    ):
+                        break
+                    get_job_gate().release(slot["priority"])
+                    slot["held"] = False
                 with logger.contextualize(**{JOB_LOG_SKIP: True}):
-                    jm.start_job(job_id)
+                    if cfg.get("parked_checkpoint") or job.config.get("resource_wait"):
+                        jm.resume_parked_job(job_id)
+                    else:
+                        jm.start_job(job_id)
                 if chain_head:
                     _chain_state(jm, chain_head, cfg, "running")
                 config = load_config()
@@ -465,15 +493,25 @@ def run_loudness_job(job_id: str) -> None:
                 registry = _build_multi_server_registry(config)
                 if registry is None:
                     raise RuntimeError("Couldn't load the media servers configuration")
-                items, warnings, sender_paths = build_items(
-                    cfg,
-                    registry=registry,
-                    cancel_check=cancel_check,
-                    progress_callback=progress_callback,
-                    enabled=lambda server: server.type is ServerType.PLEX and load_server_loudness(server).enabled,
-                    libraries=loudness_libraries,
-                    label=LABEL,
+                checkpoint = (
+                    read_checkpoint(jm.config_dir, job_id, cfg["parked_checkpoint"])
+                    if cfg.get("parked_checkpoint")
+                    else None
                 )
+                saved = checkpoint.get("bookkeeping", {}) if checkpoint else {}
+                if checkpoint:
+                    items = checkpoint_items(checkpoint)
+                    warnings, sender_paths = saved.get("warnings", []), saved.get("sender_paths", {})
+                else:
+                    items, warnings, sender_paths = build_items(
+                        cfg,
+                        registry=registry,
+                        cancel_check=cancel_check,
+                        progress_callback=progress_callback,
+                        enabled=lambda server: server.type is ServerType.PLEX and load_server_loudness(server).enabled,
+                        libraries=loudness_libraries,
+                        label=LABEL,
+                    )
                 if chain_head:
                     cfg["retry_sender_paths"] = {**cfg.get("retry_sender_paths", {}), **sender_paths}
                     jm.merge_job_config(job_id, {"retry_sender_paths": cfg["retry_sender_paths"]})
@@ -486,7 +524,10 @@ def run_loudness_job(job_id: str) -> None:
                     if chain_head:
                         _finish_chain(jm, chain_head, cfg, warnings, attempt_id=job_id)
                     return
-                items, carried = _carry_finished(jm, job_id, items)
+                if checkpoint:
+                    carried = saved.get("carried", {})
+                else:
+                    items, carried = _carry_finished(jm, job_id, items)
                 ctx = LoudnessContext(
                     registry=registry,
                     ffmpeg=getattr(config, "ffmpeg_path", None) or "ffmpeg",
@@ -495,8 +536,8 @@ def run_loudness_job(job_id: str) -> None:
                 )
                 # A sender's files (a webhook, its retries) can reach the disk after the job starts; a listing's won't.
                 retry_missing = bool(cfg.get("file_paths")) and sent_by_a_sender(cfg.get("source"))
-                to_retry: list[str] = []
-                retry_previous: dict[str, dict] = {}
+                to_retry: list[str] = saved.get("to_retry", [])
+                retry_previous: dict[str, dict] = saved.get("retry_previous", {})
                 retry_lock = threading.Lock()
 
                 def on_file_result(file_path, outcome, reason, worker, servers=None):
@@ -564,10 +605,28 @@ def run_loudness_job(job_id: str) -> None:
                     priority=live_priority(),
                     kind=JOB_KIND_LOUDNESS,
                     handlers=kind_handlers(ctx, active_files_callback=active_files_callback),
+                    **({"carried_state": checkpoint["state"]} if checkpoint else {}),
                 )
                 current = live_priority()
                 if tracker.priority != current:
                     dispatcher.update_job_priority(job_id, current)
+
+                def park_check():
+                    park_if_unavailable(
+                        dispatcher,
+                        tracker,
+                        jm,
+                        job_id,
+                        JOB_KIND_LOUDNESS,
+                        lambda: {
+                            "warnings": warnings,
+                            "sender_paths": sender_paths,
+                            "carried": carried,
+                            "to_retry": to_retry,
+                            "retry_previous": retry_previous,
+                        },
+                    )
+
                 wait_releasing_slot_while_paused(
                     tracker,
                     job_id=job_id,
@@ -577,6 +636,7 @@ def run_loudness_job(job_id: str) -> None:
                     on_wait=lambda active, cap, eff: jm.update_progress(
                         job_id, current_item=format_wait_message(active, cap, eff)
                     ),
+                    park_check=park_check,
                 )
                 result = tracker.get_result()
                 outcome = dict(result["outcome"])
@@ -597,6 +657,8 @@ def run_loudness_job(job_id: str) -> None:
                         _finish_chain(jm, chain_head, cfg, warnings, attempt_id=job_id)
             finally:
                 clear_failures()
+    except JobParked:
+        return True
     except Exception as exc:
         detail = redact_secrets(f"{type(exc).__name__}: {exc}")
         logger.error("Loudness job {} failed: {}", job_id, detail)
@@ -643,7 +705,12 @@ def start_loudness_job_async(job_id: str, config_overrides: dict | None = None) 
         jm = get_job_manager()
         job = jm.get_job(job_id)
         live = (job.config or {}) if job is not None else {}
-        updates = {k: v for k, v in config_overrides.items() if live.get(k) != v}
+        updates = {
+            k: v
+            for k, v in config_overrides.items()
+            if k not in {"pause_reasons", "paused_by_schedule", "resource_wait", "parked_checkpoint"}
+            and live.get(k) != v
+        }
         if job is not None and updates:
             jm.merge_job_config(job_id, updates)
     with _inflight_lock:

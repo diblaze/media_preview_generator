@@ -206,3 +206,22 @@ def test_optional_setting_and_warning_fit_desktop_and_mobile(page: Page, native_
         page.screenshot(path=str(Path(screenshot_dir) / f"confirm-{width}-{theme}.png"))
     modal.get_by_role("button", name="Cancel", exact=True).click()
     assert native_server.puts == []
+
+
+def test_no_cpu_loudness_group_keeps_native_schedule_and_links_to_workers(page: Page, native_server):
+    get_settings_manager().update_worker_groups([])
+    body = _open(page, native_server)
+    expect(body).to_contain_text("As a scheduled task")
+    expect(body.get_by_role("button", name="Set to Never", exact=True)).to_have_count(0)
+    link = body.get_by_role("link", name="Configure CPU workers", exact=True)
+    expect(link).to_have_attribute("href", "/settings#section-workers")
+    assert native_server.puts == []
+
+
+def test_cpu_capacity_removed_after_confirmation_open_is_rechecked(page: Page, native_server):
+    body = _open(page, native_server)
+    body.get_by_role("button", name="Set to Never", exact=True).click()
+    get_settings_manager().update_worker_groups([])
+    page.locator("#readinessConfirmSubmit").click()
+    expect(page.locator(".toast", has_text="Action failed")).to_contain_text("CPU")
+    assert native_server.puts == [] and native_server.mode == "scheduled"

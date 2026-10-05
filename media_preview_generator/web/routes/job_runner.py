@@ -13,8 +13,9 @@ from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, SELF_PAUSED_KINDS
+from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
 from ...jobs.orchestrator import SUCCESS_OUTCOME_KEYS, count_successes
+from ...jobs.parking import JobParked
 from ...scan_filters import FILTER_CONFIG_KEYS
 from ..job_gate import format_wait_message
 from ..jobs import (
@@ -25,6 +26,11 @@ from ..jobs import (
     incoming_job_priority,
     parse_priority,
 )
+
+_RUNNER_STATE_KEYS = frozenset(
+    {"pause_reasons", "paused", "paused_by_schedule", "_paused_by_schedule", "resource_wait", "parked_checkpoint"}
+)
+_recently_added_creation_lock = threading.RLock()
 
 # The source of a scheduled "Recently added" scan's job: its lookback and libraries are read only from such a job.
 RECENTLY_ADDED_JOB_SOURCE = "scheduled_recently_added"
@@ -439,6 +445,21 @@ def _build_selected_gpus(settings, detected: list[dict] | None = None) -> list:
     }
 
     selected = []
+    groups = settings.get("worker_groups")
+    if isinstance(groups, list):
+        from ...worker_groups import configured_group_totals
+
+        grouped_devices = {group["device"] for group in groups if group["resource"] == "gpu" and group["enabled"]}
+        for g in cached_gpus:
+            device = g.get("device", "")
+            if device not in grouped_devices or g.get("status") == "failed":
+                continue
+            entry = config_by_device.get(device, {})
+            info = dict(g)
+            info["ffmpeg_threads"] = entry.get("ffmpeg_threads", 2)
+            info["workers"] = configured_group_totals([group for group in groups if group.get("device") == device])[0]
+            selected.append((g["type"], device, info))
+        return selected
     for g in cached_gpus:
         if g.get("status") == "failed":
             continue
@@ -484,34 +505,17 @@ def _is_force_fire_now_set(job_manager, job_id: str) -> bool:
 
 
 def resume_running_and_drain_pending() -> None:
-    """Resume paused running preview jobs and start every PENDING job, in priority order.
-
-    Intro & Credits jobs keep their own per-job pause; "Pause all" holds them through the global flag instead.
-
-    The shared body for ALL resume paths — manual resume
-    (``api_jobs.resume_processing``), worker-availability auto-resume
-    (``api_settings._auto_resume_if_needed``) and quiet-hours window end
-    (``scheduler._quiet_hours_recompute_and_apply``). Factored into one place
-    because a path that flips ``processing_paused`` False but forgets to start
-    the PENDING jobs strands them forever — exactly what happened to jobs
-    revived PENDING-while-paused at boot once pause began surviving restarts.
-
-    Callers own the ``processing_paused`` flag flip + the
-    ``processing_paused_changed`` emit (their logging/semantics differ); this
-    only performs the running-resume + pending-start fan-out.
-    """
+    """Wake eligible pending jobs without clearing any job's own pause causes."""
     from ..jobs import get_job_manager
+    from ..settings_manager import get_settings_manager
 
+    if get_settings_manager().processing_paused:
+        return
     jm = get_job_manager()
-    for running in jm.get_running_jobs():
-        # A global resume must not clear an Intro & Credits or loudness job's own pause; Pause all holds those jobs
-        # through the global flag, which the caller has already cleared.
-        if running.kind in SELF_PAUSED_KINDS:
-            continue
-        jm.request_resume(running.id)
     pending = sorted(jm.get_pending_jobs(), key=lambda j: (j.priority, j.created_at or ""))
     for pj in pending:
-        _start_job_async(pj.id, pj.config or {})
+        if not jm.is_pause_requested(pj.id):
+            _start_job_async(pj.id, pj.config or {})
 
 
 def _start_job_async(job_id: str, config_overrides: dict | None = None):
@@ -528,6 +532,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
     Intro & Credits jobs are handed to their own runner, so every start path (manual resume, pending drain,
     restart requeue, reprocess) runs them with the marker pipeline.
     """
+    if config_overrides:
+        config_overrides = {key: value for key, value in config_overrides.items() if key not in _RUNNER_STATE_KEYS}
     try:
         queued = get_job_manager().get_job(job_id)
     except Exception as exc:
@@ -590,7 +596,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
         _queue_intro_credits_follow_up(job_id, config_overrides)
         return
 
-    def run_job():
+    def run_job_once():
         log_handler_id = None
         job_manager = None
         # Tracks whether this thread holds a JobGate slot. The outer
@@ -634,6 +640,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
             job = job_manager.get_job(job_id)
             if not job:
                 return
+            parked_reference = (job.config or {}).get("parked_checkpoint")
+            continuation = None
 
             if get_settings_manager().processing_paused:
                 merged = {**(job.config or {}), **(config_overrides or {})}
@@ -710,13 +718,14 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
             # ``current_item`` regardless of job status, so this shows
             # in the progress strip without claiming the job is
             # actually running yet.
-            job_manager.update_progress(
-                job_id,
-                percent=0,
-                processed_items=0,
-                total_items=0,
-                current_item="Starting — loading configuration...",
-            )
+            if not parked_reference:
+                job_manager.update_progress(
+                    job_id,
+                    percent=0,
+                    processed_items=0,
+                    total_items=0,
+                    current_item="Starting — loading configuration...",
+                )
 
             try:
                 config = load_config()
@@ -922,6 +931,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         fallback_active=bool(worker_data.get("fallback_active", False)),
                         fallback_reason=worker_data.get("fallback_reason"),
                         fallback_title=worker_data.get("fallback_title", "") or "",
+                        group_id=worker_data.get("group_id"),
+                        group_name=worker_data.get("group_name"),
+                        group_resource=worker_data.get("group_resource"),
+                        retiring=bool(worker_data.get("retiring", False)),
                     )
                     job_manager.update_worker_status(worker_key, status)
                 job_manager.prune_worker_statuses(active_worker_keys)
@@ -929,7 +942,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
             _retry_cancelled = False
             run_job_config = job_manager.get_job(job_id)
-            if run_job_config and run_job_config.config.get("is_retry"):
+            if run_job_config and run_job_config.config.get("is_retry") and not parked_reference:
                 import time as _time
 
                 delay_sec = max(1, int(run_job_config.config.get("retry_delay", 30)))
@@ -1023,21 +1036,39 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         # job_manager codepath acquires the gate's lock.
                         job_manager.update_progress(
                             job_id,
-                            percent=0,
-                            processed_items=0,
-                            total_items=0,
                             current_item=format_wait_message(active, cap, effective_cap),
                         )
                         # A restart ages a job waiting here by the downtime only (JobManager.requeue_interrupted_jobs).
                         job_manager.note_slot_wait(job_id)
 
-                    _slot_priority = job.priority
-                    job_manager.note_slot_wait(job_id)
-                    admitted = get_job_gate().acquire(
-                        priority=_slot_priority,
-                        cancel_check=lambda: job_manager.is_cancellation_requested(job_id),
-                        on_wait=_on_wait,
-                    )
+                    from ...jobs.group_runtime import runtime_capacity, wait_for_capacity
+
+                    def held_by_pause():
+                        return job_manager.is_pause_requested(job_id) or get_settings_manager().processing_paused
+
+                    while True:
+                        if not wait_for_capacity(
+                            job_manager,
+                            job_id,
+                            JOB_KIND_PREVIEWS,
+                            lambda: job_manager.is_cancellation_requested(job_id),
+                            held_by_pause,
+                        ):
+                            return
+                        _slot_priority = job.priority
+                        job_manager.note_slot_wait(job_id)
+                        admitted = get_job_gate().acquire(
+                            priority=_slot_priority,
+                            cancel_check=lambda: job_manager.is_cancellation_requested(job_id),
+                            on_wait=_on_wait,
+                        )
+                        if not admitted:
+                            break
+                        _slot_held = True
+                        if runtime_capacity(JOB_KIND_PREVIEWS)["open"] and not held_by_pause():
+                            break
+                        get_job_gate().release(_slot_priority)
+                        _slot_held = False
                     if not admitted:
                         # User cancelled while the job was waiting for a
                         # slot. Transition to CANCELLED and exit — the
@@ -1050,6 +1081,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         job_manager.cancel_job(job_id)
                         return
                     _slot_held = True
+                    if parked_reference:
+                        from ...jobs.checkpoints import read_checkpoint
+
+                        continuation = read_checkpoint(job_manager.config_dir, job_id, parked_reference)
                     if isinstance(getattr(config, "recently_added_since", None), datetime):
                         # Read the window again now: a schedule tick while this scan waited for its slot widens the
                         # waiting scan's saved lookback instead of queueing another (_widen_recently_added_window).
@@ -1069,7 +1104,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # still called later when items start flowing, but
                     # it becomes a no-op after this first transition
                     # because start_job is idempotent.
-                    job_manager.start_job(job_id)
+                    if parked_reference or (job.config or {}).get("resource_wait"):
+                        job_manager.resume_parked_job(job_id)
+                    else:
+                        job_manager.start_job(job_id)
                     # Retry Jobs: also flip the PARENT into chain RUNNING
                     # state so the user-visible row reflects "currently
                     # re-running" instead of "waiting in countdown". The
@@ -1111,13 +1149,14 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # Clear the "Queued —" message the moment we enter
                     # so the UI shows the regular startup progress as
                     # soon as the slot is acquired.
-                    job_manager.update_progress(
-                        job_id,
-                        percent=0,
-                        processed_items=0,
-                        total_items=0,
-                        current_item="Starting — loading configuration...",
-                    )
+                    if not parked_reference:
+                        job_manager.update_progress(
+                            job_id,
+                            percent=0,
+                            processed_items=0,
+                            total_items=0,
+                            current_item="Starting — loading configuration...",
+                        )
                     clear_failures()
 
                     # Retry Jobs (is_retry=True) write their per-file
@@ -1184,14 +1223,30 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             # order as the save hook: settings, then the pool's own lock).
                             with fresh_settings.locked():
                                 fresh_gpus = _build_selected_gpus(fresh_settings, detected=detected_gpus)
-                                if fresh_gpus:
-                                    pool.reconcile_gpu_workers(fresh_gpus)
-                                pool.reconcile_cpu_workers(fresh_settings.cpu_threads)
+                                from ...jobs.group_runtime import refresh_worker_groups
+
+                                if not refresh_worker_groups(pool, config, fresh_gpus, force=True):
+                                    if fresh_gpus:
+                                        pool.reconcile_gpu_workers(fresh_gpus)
+                                    pool.reconcile_cpu_workers(fresh_settings.cpu_threads)
                         except Exception:
                             logger.debug(
                                 "Could not reconcile pool on dispatch",
                                 exc_info=True,
                             )
+
+                    def _tracker_wait(dispatcher, tracker):
+                        from ...jobs.parking import park_if_unavailable
+
+                        previous_failures = (continuation or {}).get("bookkeeping", {}).get("failures", [])
+                        park_if_unavailable(
+                            dispatcher,
+                            tracker,
+                            job_manager,
+                            job_id,
+                            JOB_KIND_PREVIEWS,
+                            lambda: {"failures": previous_failures + get_failures()},
+                        )
 
                     result = run_processing(
                         config,
@@ -1207,6 +1262,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         job_id=job_id,
                         on_dispatch_start=_on_dispatch_start,
                         priority=job.priority,
+                        tracker_wait=_tracker_wait,
+                        continuation=continuation,
                     )
                     set_file_result_callback(None, job_id=job_id)
 
@@ -1233,7 +1290,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         return
 
                     result = result or {}
-                    failures = get_failures()
+                    failures = (continuation or {}).get("bookkeeping", {}).get("failures", []) + get_failures()
 
                     outcome = result.get("outcome")
                     if outcome:
@@ -1956,8 +2013,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                 # so the dict entry doesn't linger after the job ends.
                 clear_failures()
                 _job_scope.close()
-                job_manager.clear_pause_flag(job_id)
-                job_manager.clear_cancellation_flag(job_id)
+                settled_job = job_manager.get_job(job_id)
+                if settled_job and settled_job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                    job_manager.clear_pause_flag(job_id)
+                    job_manager.clear_cancellation_flag(job_id)
                 job_manager.clear_active_worker_pool(job_id)
                 if not job_manager.get_running_jobs():
                     job_manager.clear_worker_statuses()
@@ -1980,6 +2039,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                 elif config.working_tmp_folder:
                     logger.debug("Working temp folder already absent, skipping cleanup: {}", config.working_tmp_folder)
 
+        except JobParked:
+            return True
         except Exception as e:
             logger.exception(
                 "Job {} failed with an unexpected error. "
@@ -2014,8 +2075,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
             from ...jobs.worker import unregister_job_thread
 
             unregister_job_thread()
-            with _inflight_lock:
-                _inflight_jobs.discard(job_id)
             if log_handler_id is not None:
                 try:
                     from loguru import logger as loguru_logger
@@ -2024,6 +2083,20 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     loguru_logger.remove(log_handler_id)
                 except (ValueError, TypeError):
                     logger.debug("Could not remove job log handler", exc_info=True)
+
+    def run_job():
+        nonlocal config_overrides
+        try:
+            while run_job_once():
+                current = get_job_manager().get_job(job_id)
+                if current is None or current.status != JobStatus.PENDING:
+                    break
+                config_overrides = {
+                    key: value for key, value in (current.config or {}).items() if key not in _RUNNER_STATE_KEYS
+                }
+        finally:
+            with _inflight_lock:
+                _inflight_jobs.discard(job_id)
 
     thread = threading.Thread(target=run_job, daemon=True)
     thread.start()
@@ -2083,6 +2156,27 @@ def _start_recently_added_job_async(
     library_name: str,
     priority: int | None = None,
 ) -> str:
+    """Coalesce only never-started requests for the same schedule and scope."""
+    with _recently_added_creation_lock:
+        return _create_recently_added_job(
+            schedule_id=schedule_id,
+            server_id=server_id,
+            library_ids=library_ids,
+            lookback_hours=lookback_hours,
+            library_name=library_name,
+            priority=priority,
+        )
+
+
+def _create_recently_added_job(
+    *,
+    schedule_id: str,
+    server_id: str | None,
+    library_ids: list[str] | None,
+    lookback_hours: float,
+    library_name: str,
+    priority: int | None = None,
+) -> str:
     """Create the Job for a scheduled "Recently Added" scan and start it through the preview runner.
 
     The scan is a preview job like any other (:func:`_start_job_async`): it waits for a JobGate slot, shows in the
@@ -2101,7 +2195,10 @@ def _start_recently_added_job_async(
     Returns the new Job's UUID, or the waiting one's.
     """
     job_manager = get_job_manager()
-    waiting = _waiting_recently_added_job(job_manager, schedule_id)
+    resolved_priority = parse_priority(priority) if priority is not None else incoming_job_priority()
+    waiting = _waiting_recently_added_job(
+        job_manager, schedule_id, server_id=server_id, library_ids=library_ids, priority=resolved_priority
+    )
     if waiting is not None:
         _widen_recently_added_window(job_manager, waiting, lookback_hours)
         logger.info(
@@ -2126,20 +2223,34 @@ def _start_recently_added_job_async(
             "lookback_hours": lookback_hours,
         },
         server_id=server_id,
-        priority=parse_priority(priority) if priority is not None else incoming_job_priority(),
+        parent_schedule_id=schedule_id,
+        priority=resolved_priority,
     )
     _start_job_async(job.id, dict(job.config))
     return job.id
 
 
-def _waiting_recently_added_job(job_manager, schedule_id: str):
+def _waiting_recently_added_job(
+    job_manager,
+    schedule_id: str,
+    *,
+    server_id: str | None = None,
+    library_ids: list[str] | None = None,
+    priority: int | None = None,
+):
     """The schedule's Recently Added scan that is queued and hasn't started (a revived one that had started isn't)."""
     for job in job_manager.get_pending_jobs():
         cfg = job.config or {}
         if (
             not job.started_at
+            and job.kind == JOB_KIND_PREVIEWS
+            and not cfg.get("parked_checkpoint")
             and cfg.get("source") == RECENTLY_ADDED_JOB_SOURCE
             and cfg.get("parent_schedule_id") == schedule_id
+            and (priority is None or job.priority == priority)
+            and (cfg.get("server_id") or None) == (server_id or None)
+            and sorted(str(value) for value in (cfg.get("library_ids") or []))
+            == sorted(str(value) for value in (library_ids or []))
         ):
             return job
     return None

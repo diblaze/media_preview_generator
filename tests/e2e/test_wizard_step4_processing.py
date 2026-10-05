@@ -22,10 +22,12 @@ from ._mocks import (
     mock_system_rescan_gpus,
     mock_system_status,
     mock_validate_plex_config_folder,
+    mock_worker_groups,
 )
 
 
 def _drive_to_step4(page: Page, app_url: str) -> None:
+    mock_worker_groups(page)
     page.goto(f"{app_url}/setup")
     page.wait_for_load_state("domcontentloaded")
     page.locator('.wizard-vendor-btn[data-vendor="plex"]').click()
@@ -66,10 +68,10 @@ class TestPerGpuPanel:
         _drive_to_step4(wizard_page, app_url_wizard)
         # Wait for the "Detecting GPUs..." spinner to be hidden.
         expect(wizard_page.locator("#gpuDetecting")).to_be_hidden()
-        cards = wizard_page.locator("#gpuConfigList .card")
+        cards = wizard_page.locator("#gpuConfigList .gpu-tuning-threads")
         expect(cards).to_have_count(2)
 
-    def test_workers_stepper_increments_value(self, wizard_page: Page, app_url_wizard: str) -> None:
+    def test_device_tuning_changes_threads(self, wizard_page: Page, app_url_wizard: str) -> None:
         mock_plex_libraries(wizard_page)
         capture_settings_save(wizard_page)
         mock_setup_status(wizard_page, complete=False)
@@ -79,16 +81,12 @@ class TestPerGpuPanel:
         _drive_to_step4(wizard_page, app_url_wizard)
         expect(wizard_page.locator("#gpuDetecting")).to_be_hidden()
 
-        first_workers = wizard_page.locator("#gpuConfigList .gpu-workers").first
-        expect(first_workers).to_have_value("1")
-        # The stepper's + button is the next sibling button.
-        plus = first_workers.locator(".. >> .stepper-plus").first
-        plus.click()
-        expect(first_workers).to_have_value("2")
-        plus.click()
-        expect(first_workers).to_have_value("3")
+        tuning = wizard_page.locator(".gpu-tuning-threads").first
+        expect(tuning).to_have_value("2")
+        tuning.fill("3")
+        assert wizard_page.evaluate("collectGpuConfig()[0].ffmpeg_threads") == 3
 
-    def test_workers_stepper_minus_clamps_at_one(self, wizard_page: Page, app_url_wizard: str) -> None:
+    def test_zero_group_count_is_rejected(self, wizard_page: Page, app_url_wizard: str) -> None:
         mock_plex_libraries(wizard_page)
         capture_settings_save(wizard_page)
         mock_setup_status(wizard_page, complete=False)
@@ -98,12 +96,12 @@ class TestPerGpuPanel:
         _drive_to_step4(wizard_page, app_url_wizard)
         expect(wizard_page.locator("#gpuDetecting")).to_be_hidden()
 
-        workers = wizard_page.locator("#gpuConfigList .gpu-workers").first
-        minus = workers.locator(".. >> .stepper-minus").first
-        # Default value is 1 = min; minus button should be disabled.
-        expect(minus).to_be_disabled()
+        wizard_page.locator('[data-edit="cpu"]').click()
+        wizard_page.locator("#workerGroupCount").fill("0")
+        wizard_page.locator("#workerGroupApply").click()
+        expect(wizard_page.locator("#workerGroupMessage")).to_contain_text("Disable a group")
 
-    def test_disabling_gpu_greys_out_workers(self, wizard_page: Page, app_url_wizard: str) -> None:
+    def test_disabling_gpu_group_keeps_tuning_editable(self, wizard_page: Page, app_url_wizard: str) -> None:
         mock_plex_libraries(wizard_page)
         capture_settings_save(wizard_page)
         mock_setup_status(wizard_page, complete=False)
@@ -113,17 +111,11 @@ class TestPerGpuPanel:
         _drive_to_step4(wizard_page, app_url_wizard)
         expect(wizard_page.locator("#gpuDetecting")).to_be_hidden()
 
-        toggle = wizard_page.locator(".gpu-enable-toggle").first
-        device_id = toggle.get_attribute("data-device") or ""
-        # Sanitised id: replace non-alphanumeric with underscore (matches
-        # the panel JS).
-        safe_id = "".join(c if c.isalnum() else "_" for c in device_id)
-        # Untick — should grey out .gpu-settings-{safe_id} cells.
-        toggle.uncheck()
-        # Settings cells get inline styles opacity:0.5 + pointer-events:none.
-        first_settings = wizard_page.locator(f".gpu-settings-{safe_id}").first
-        opacity = first_settings.evaluate("el => el.style.opacity")
-        assert opacity == "0.5"
+        wizard_page.locator('[data-enable="gpu"]').uncheck()
+        expect(wizard_page.locator("#workerGroupApplyRow")).to_be_visible()
+        expect(wizard_page.locator(".gpu-tuning-threads").first).to_be_enabled()
+        wizard_page.locator("#workerGroupApply").click()
+        expect(wizard_page.locator('[data-enable="gpu"]')).not_to_be_checked()
 
     def test_rescan_gpus_button_calls_endpoint(self, wizard_page: Page, app_url_wizard: str) -> None:
         mock_plex_libraries(wizard_page)
@@ -144,7 +136,7 @@ class TestPerGpuPanel:
 
 @pytest.mark.e2e
 class TestCpuWorkersStepper:
-    def test_cpu_workers_stepper_present_and_increments(self, wizard_page: Page, app_url_wizard: str) -> None:
+    def test_cpu_group_draft_saves_before_wizard_advances(self, wizard_page: Page, app_url_wizard: str) -> None:
         mock_plex_libraries(wizard_page)
         capture_settings_save(wizard_page)
         mock_setup_status(wizard_page, complete=False)
@@ -153,11 +145,12 @@ class TestCpuWorkersStepper:
         mock_system_status(wizard_page)
         _drive_to_step4(wizard_page, app_url_wizard)
 
-        cpu = wizard_page.locator("#cpuThreads")
+        wizard_page.locator('[data-edit="cpu"]').click()
+        cpu = wizard_page.locator("#workerGroupCount")
         expect(cpu).to_have_value("1")
-        plus = cpu.locator(".. >> .stepper-plus").first
-        plus.click()
-        expect(cpu).to_have_value("2")
+        cpu.fill("2")
+        wizard_page.locator("#step4Next").click()
+        expect(wizard_page.locator('div.setup-step[data-step="5"]')).to_have_class("setup-step active")
 
 
 @pytest.mark.e2e

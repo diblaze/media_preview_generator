@@ -357,18 +357,8 @@ function connectSocket() {
         processingPaused = !!data.paused;
         renderGlobalPauseResume();
         loadJobs();
-        // D21 — keep the Quiet Hours card badge ("on" vs "paused now")
-        // in sync the moment the global pause flag flips, whether from
-        // a quiet-hours boundary cron or the manual Pause All button.
-        if (typeof window._refreshQuietHoursBadge === 'function') {
-            // Update the cached config too so the badge has the latest value
-            // before re-rendering.
-            if (window._quietHoursConfig) {
-                window._quietHoursConfig.currently_in_quiet_window = !!data.paused
-                    && !!window._quietHoursConfig.enabled;
-            }
-            window._refreshQuietHoursBadge();
-        }
+        if (window.refreshQuietHoursState) window.refreshQuietHoursState();
+        if (window.WorkerGroups) window.WorkerGroups.load();
     });
 
 }
@@ -937,13 +927,13 @@ async function retryNowFromRow(jobId) {
 }
 
 function renderGlobalPauseResume() {
-    const pauseTitle = 'Pause all processing. No new jobs will start; active job will stop dispatching new tasks after current ones finish.';
-    const resumeTitle = 'Resume processing. New jobs can start and dispatch will continue.';
+    const pauseTitle = 'Pause all processing, including current files. Worker-group reductions instead let current files finish.';
+    const resumeTitle = 'Clear the manual pause. Global pause schedules and job-specific pauses still apply.';
     // Hide the verbose "Pause Processing" / "Resume Processing" label on
     // mobile (xs <576px) — keep the icon. Title attr + aria-label keep
     // it accessible and tooltip-discoverable. On desktop the full label
     // returns via .d-sm-inline.
-    const pauseBtn = `<button class="btn btn-sm btn-outline-warning text-nowrap" onclick="pauseProcessing()" title="${escapeHtml(pauseTitle)}" aria-label="Pause all processing after current tasks finish">
+    const pauseBtn = `<button class="btn btn-sm btn-outline-warning text-nowrap" onclick="pauseProcessing()" title="${escapeHtml(pauseTitle)}" aria-label="Pause all processing, including current files">
         <i class="bi bi-pause-fill"></i><span class="d-none d-sm-inline ms-1">Pause Processing</span>
     </button>`;
     const resumeBtn = `<button class="btn btn-sm btn-outline-success text-nowrap" onclick="resumeProcessing()" title="${escapeHtml(resumeTitle)}" aria-label="Resume all processing">
@@ -960,7 +950,8 @@ async function pauseProcessing() {
         processingPaused = true;
         renderGlobalPauseResume();
         await loadJobs();
-        showToast('Processing Paused', 'No new jobs will start; active job will finish current tasks then idle.', 'warning');
+        showToast('Processing Paused', 'Processing is paused, including current files.', 'warning');
+        if (window.WorkerGroups) window.WorkerGroups.load();
     } catch (error) {
         showToast('Error', 'Failed to pause processing: ' + error.message, 'danger');
     }
@@ -968,11 +959,12 @@ async function pauseProcessing() {
 
 async function resumeProcessing() {
     try {
-        await apiPost('/api/processing/resume');
-        processingPaused = false;
+        const result = await apiPost('/api/processing/resume');
+        processingPaused = !!result.paused;
         renderGlobalPauseResume();
         await loadJobs();
-        showToast('Processing Resumed', 'New jobs can start and dispatch will continue.', 'success');
+        showToast(processingPaused ? 'Manual Pause Cleared' : 'Processing Resumed', processingPaused ? 'The global pause schedule is still active. Work continues when it ends.' : 'Eligible jobs can continue; job-specific pauses still apply.', processingPaused ? 'warning' : 'success');
+        if (window.WorkerGroups) window.WorkerGroups.load();
     } catch (error) {
         showToast('Error', 'Failed to resume processing: ' + error.message, 'danger');
     }
@@ -1631,7 +1623,7 @@ window._jobKindBadgeHtml = _jobKindBadgeHtml;
 // Pause all doesn't set an Intro & Credits job's own flag, so the global flag is read here; a job paused before a
 // restart comes back running + paused without a slot, which reads as 'own' too.
 function _markersPauseState(job) {
-    if (!_hasOwnRunner(job) || job.status !== 'running') return '';
+    if (!['pending', 'running'].includes(job.status)) return '';
     if (job.paused) return 'own';
     return processingPaused ? 'all' : '';
 }
@@ -2067,15 +2059,16 @@ function _renderMarkersRetryChip(job) {
         + '<i class="bi bi-arrow-clockwise me-1"></i>Retry ' + attempt + '</span>';
 }
 
-function _markersPauseNote(state) {
-    if (state === 'own') return 'Paused on its own and not using a job slot, so other jobs can run. Resume it to continue.';
+function _markersPauseNote(state, job) {
+    if (state === 'own' && job?.config?.pause_reasons?.includes('schedule')) return 'Paused by its job schedule. The next scheduled start clears that hold; other pause settings still apply.';
+    if (state === 'own') return 'This job is paused. Resume clears its manual pause; other pause settings still apply.';
     if (state === 'all') return 'Held by Pause all processing. It continues when processing resumes.';
     return '';
 }
 
-// Intro & Credits jobs pause on their own; preview jobs only have the global Pause Processing button.
+// Each job owns its pause independently from the global controls.
 function _markersPauseButton(job) {
-    if (!_hasOwnRunner(job) || job.status !== 'running') return '';
+    if (!['pending', 'running'].includes(job.status)) return '';
     if (job.config && job.config.is_retry_chain
         && ['scheduled', 'queued_for_slot', 'running'].includes(job.config.last_outcome)) return '';
     const jid = escapeHtml(job.id);
@@ -2159,7 +2152,7 @@ function updateJobQueue(force) {
         const markersPause = _markersPauseState(job);
         const statusBadge = getStatusBadge(
             job.status, job.paused || markersPause === 'all', job.error, job.progress && job.progress.outcome,
-            _markersPauseNote(markersPause),
+            _markersPauseNote(markersPause, job),
         );
         const progress = job.progress.percent.toFixed(1);
         const created = formatRelativeTime(job.created_at);
@@ -2512,7 +2505,7 @@ function updateActiveJobs(runningJobs, force) {
         const maxRetries = job.config && job.config.max_retries;
         let statusBadge;
         if (isPaused) {
-            const note = _markersPauseNote(markersPause);
+            const note = _markersPauseNote(markersPause, job);
             statusBadge = `<span class="badge bg-warning text-dark"${note ? ` title="${escapeHtmlAttr(note)}"` : ''}>Paused</span>`;
         } else if (isRetryWaiting) {
             const waitText = _isMarkersVerifyJob(job) ? 'Waiting to check again' : 'Waiting to retry';
@@ -2855,6 +2848,7 @@ function updateWorkerStatuses(workers, options = {}) {
                         <div class="small text-warning text-truncate mb-1 d-none" data-fallback-note>
                             <i class="bi bi-exclamation-triangle me-1"></i><span data-fallback-reason></span>
                         </div>
+                        <div class="small text-body-secondary mb-1 d-none" data-worker-group></div>
                         <div class="small text-truncate mb-1" data-title></div>
                         <div class="progress" data-progress-wrap style="height: 6px;">
                             <div class="progress-bar" data-progress style="width: 0%"></div>
@@ -2936,6 +2930,12 @@ function _patchWorkerCard(col, worker) {
         nameEl.textContent = worker.worker_name;
     }
 
+    const groupEl = col.querySelector('[data-worker-group]');
+    if (groupEl) {
+        groupEl.classList.toggle('d-none', !worker.group_name);
+        groupEl.textContent = worker.group_name || '';
+    }
+
     // Fallback badge + note
     fallbackBadge.classList.toggle('d-none', !fallbackActive);
     if (fallbackActive) {
@@ -2949,12 +2949,13 @@ function _patchWorkerCard(col, worker) {
     }
 
     // Status badge — colour AND text
-    const statusColor = isProcessing ? 'bg-primary' : 'bg-secondary';
-    if (!statusEl.classList.contains(statusColor)) {
+    const statusColor = worker.retiring ? 'bg-warning text-dark' : (isProcessing ? 'bg-primary' : 'bg-secondary');
+    if (statusEl.className !== `badge ${statusColor}`) {
         statusEl.className = `badge ${statusColor}`;
     }
-    if (statusEl.textContent !== worker.status) {
-        statusEl.textContent = worker.status;
+    const workerStatus = worker.retiring ? 'Finishing current file' : worker.status;
+    if (statusEl.textContent !== workerStatus) {
+        statusEl.textContent = workerStatus;
     }
 
     // Title row — render the SAME DOM whether idle or processing so
@@ -3897,16 +3898,11 @@ async function cancelJob(jobId) {
     }
 }
 
-// The server decides the scope by job kind: an Intro & Credits job pauses on its own, a preview job pauses all
-// processing (legacy). The message follows what actually happened.
 async function pauseJob(jobId) {
-    const markers = _hasOwnRunner(jobs.find(j => j.id === jobId));
     try {
         await apiPost(`/api/jobs/${jobId}/pause`);
         await loadJobs({ force: true });
-        showToast('Paused', markers
-            ? 'Job paused. Files already in progress finish; other jobs can use its slot until you resume it.'
-            : 'Job paused. Running tasks will finish before dispatch continues.', 'warning');
+        showToast('Paused', 'Job pause requested. Other pause settings still apply.', 'warning');
     } catch (error) {
         showToast('Error', 'Failed to pause job: ' + error.message, 'danger');
     }
@@ -3917,7 +3913,9 @@ async function resumeJob(jobId) {
         const result = await apiPost(`/api/jobs/${jobId}/resume`);
         await loadJobs({ force: true });
         if (result && result.processing_paused === true) {
-            showToast('Resumed', 'Job resumed, but all processing is paused. It continues when you resume processing.', 'warning');
+            showToast('Manual Pause Cleared', 'Global processing remains paused. Its other pause settings still apply.', 'warning');
+        } else if (result && result.paused) {
+            showToast('Manual Pause Cleared', 'This job is still paused by its schedule. It can continue at the next scheduled start.', 'warning');
         } else {
             showToast('Resumed', 'Job resumed', 'success');
         }
@@ -4145,7 +4143,7 @@ function getStatusBadge(status, paused, error, outcome, pauseNote) {
         return '<span class="status-dot ' + cls + '"' + tooltipAttrs + '>' + label + '</span>';
     }
 
-    if (status === 'running' && paused) return dot('status-warning', 'Paused');
+    if ((status === 'running' || status === 'pending') && paused) return dot('status-warning', 'Paused');
     if (status === 'completed' && error) return dot('status-warning', 'Completed with warnings');
 
     var clsMap = {

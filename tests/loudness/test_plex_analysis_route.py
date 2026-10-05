@@ -34,6 +34,33 @@ def test_needs_authentication(app, seed, conn):  # noqa: F811
     conn.query.assert_not_called()
 
 
+def test_no_cpu_capacity_refuses_native_disable(client, seed, conn):
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    seed(_loudness_plex())
+    get_settings_manager().update_worker_groups([])
+    response = client.post(URL)
+    assert response.status_code == 409
+    assert "CPU worker group" in response.get_json()["error"]
+    conn.query.assert_not_called()
+
+
+def test_cpu_hours_fully_blocked_by_global_quiet_hours_refuse_native_disable(client, seed, conn):
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    from ..test_worker_group_policy import cpu_group, window
+
+    seed(_loudness_plex())
+    settings = get_settings_manager()
+    settings.update_worker_groups([cpu_group(availability=window([0]))])
+    settings.set(
+        "quiet_hours",
+        {"enabled": True, "day_basis": "start", "windows": [{"days": ["mon"], "start": "23:00", "end": "07:00"}]},
+    )
+    assert client.post(URL).status_code == 409
+    conn.query.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "library_ids", [None, ["1"], ["1", "2"]], ids=["default-libraries", "partial-selection", "all-video"]
 )

@@ -32,7 +32,7 @@
                 </button>
                 <div id="sidebar-schedules-links" class="d-none">
                     <a class="nav-link" href="#section-schedules-overview"><i class="bi bi-info-circle me-2"></i>Overview</a>
-                    <a class="nav-link" href="#section-schedules-quiet-hours"><i class="bi bi-moon-stars me-2"></i>Quiet Hours</a>
+                    <a class="nav-link" href="/settings#section-worker-quiet-hours"><i class="bi bi-moon-stars me-2"></i>Global pause schedule</a>
                     <a class="nav-link" href="#section-schedules-list"><i class="bi bi-calendar-event me-2"></i>All Schedules</a>
                 </div>
             </div>
@@ -44,7 +44,7 @@
         <nav id="automationMobileNav" class="automation-mobile-nav" aria-label="Automation sections">
             <button type="button" data-automation-mobile-target="triggers" aria-current="page">Triggers</button>
             <button type="button" data-automation-mobile-target="schedules">Schedules</button>
-            <button type="button" data-automation-mobile-target="quiet-hours">Quiet hours</button>
+            <button type="button" data-automation-mobile-target="quiet-hours">Global pause</button>
         </nav>
         <div id="automationMobileFeedback" class="automation-mobile-feedback form-text" aria-live="polite">Showing Triggers</div>
         <header class="page-header">
@@ -89,7 +89,7 @@
         if (which === 'schedules') {
             icon.className = 'bi bi-calendar-event me-2';
             text.textContent = 'Schedules';
-            if (subtitle) subtitle.textContent = 'Recurring scans on a timer + Quiet Hours.';
+            if (subtitle) subtitle.textContent = 'Schedule job starts and optional stops. Configure worker availability in Settings.';
         } else {
             icon.className = 'bi bi-broadcast me-2';
             text.textContent = 'Triggers';
@@ -144,6 +144,7 @@
     document.querySelectorAll('[data-automation-mobile-target]').forEach(function (button) {
         button.addEventListener('click', function () {
             var target = button.dataset.automationMobileTarget;
+            if (target === 'quiet-hours') { window.location.href = '/settings#section-worker-quiet-hours'; return; }
             var which = target === 'triggers' ? 'triggers' : 'schedules';
             showAutomationTab(which);
             if (target === 'quiet-hours' && window.history && history.replaceState) {

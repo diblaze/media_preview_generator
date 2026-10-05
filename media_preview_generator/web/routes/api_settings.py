@@ -366,6 +366,8 @@ def get_settings():
             "gpu_config": settings.gpu_config,
             "gpu_threads": settings.gpu_threads,
             "cpu_threads": settings.cpu_threads,
+            "worker_groups": settings.worker_groups,
+            "worker_groups_revision": settings.worker_groups_revision,
             # Library-scanning concurrency for full scans. 0 = Auto. Clamped
             # to [0, 256] so a manually-edited settings.json can't surface an
             # absurd value in the UI. See issue #243.
@@ -751,14 +753,32 @@ def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str
         configured, and ``cpu_workers_retiring`` when ``cpu_threads`` was saved.
     """
     response_fields: dict = {}
-    if "gpu_config" in updates:
+    grouped = isinstance(settings.get("worker_groups"), list)
+    if grouped and {"worker_groups", "gpu_config"} & updates.keys():
+        from .api_worker_groups import reconcile_group_settings
+
+        error = reconcile_group_settings(settings)
+        if error:
+            response_fields["warning"] = error
+    if grouped and "cpu_threads" in incoming_field_keys:
+        from .api_jobs import _get_shared_worker_pool
+
+        pool = _get_shared_worker_pool()
+        response_fields["cpu_workers_retiring"] = sum(
+            row.get("finishing", 0)
+            for row in (pool.group_snapshots() if pool is not None else [])
+            if row.get("resource") == "cpu"
+        )
+    if not grouped and "gpu_config" in updates:
         _reconcile_live_gpu_workers(settings)
-    if "cpu_threads" in updates:
+    if not grouped and "cpu_threads" in updates:
         response_fields["cpu_workers_retiring"] = _reconcile_live_cpu_workers(settings)
         _resize_text_detection_cpu_helpers()
 
     ok, thread_warning = validate_processing_thread_totals(settings.get_all())
-    if not ok:
+    if grouped and not ok:
+        thread_warning = "No workers are enabled. Jobs will wait until you enable a worker group."
+    if not ok and not grouped:
         logger.warning(
             "Worker count check: {}. "
             "Processing has been auto-paused so no new jobs run until you increase a worker count. "
@@ -766,7 +786,7 @@ def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str
             thread_warning,
         )
         _auto_pause_if_needed(settings)
-    elif settings.processing_paused:
+    elif not grouped and settings.processing_paused:
         _auto_resume_if_needed(settings)
 
     # Invalidate the Plex library cache when connection details change so
@@ -821,6 +841,84 @@ def _apply_post_save_hooks(settings, updates: dict, incoming_field_keys: set[str
     return response_fields
 
 
+def _translate_legacy_worker_updates(settings, updates: dict) -> dict:
+    """Map unambiguous old count controls to the authoritative groups.
+
+    Hardware tuning is merged independently. Multiple groups on the same resource
+    require the group endpoint rather than silently changing an arbitrary group.
+    Caller holds the settings lock through persistence.
+    """
+    from ...job_kinds import JOB_KINDS
+    from ...worker_groups import validate_worker_groups
+
+    if not isinstance(settings.get("worker_groups"), list):
+        return updates
+    updates = dict(updates)
+    groups = settings.worker_groups
+    changed = False
+
+    def change_count(resource: str, count: int | None, device: str | None = None, enabled: bool | None = None) -> None:
+        nonlocal changed
+        matches = [g for g in groups if g["resource"] == resource and (device is None or g["device"] == device)]
+        if len(matches) > 1:
+            raise ValueError("Several worker groups use this resource. Adjust the named group under Workers.")
+        if not matches:
+            if count in (None, 0) and not enabled:
+                return
+            if resource == "gpu" and not device:
+                raise ValueError("Choose a GPU device in a worker group before setting its count")
+            import uuid
+
+            group = {
+                "id": str(uuid.uuid4()),
+                "name": "CPU workers" if resource == "cpu" else "GPU workers",
+                "resource": resource,
+                "device": device,
+                "enabled": True,
+                "count": max(1, count or 1),
+                "job_types": [kind for kind in JOB_KINDS if resource == "cpu" or kind != "loudness"],
+                "availability": {"mode": "always", "windows": []},
+            }
+            groups.append(group)
+        else:
+            group = matches[0]
+        if count is not None:
+            if type(count) is not int or count < 0:
+                raise ValueError("Worker counts must be nonnegative integers")
+            group["enabled"] = count > 0
+            if count > 0:
+                group["count"] = count
+        if enabled is not None:
+            if not isinstance(enabled, bool):
+                raise ValueError("Worker enabled must be true or false")
+            group["enabled"] = enabled and count != 0
+        changed = True
+
+    if "cpu_threads" in updates:
+        change_count("cpu", updates.pop("cpu_threads"))
+    if "gpu_threads" in updates:
+        change_count("gpu", updates.pop("gpu_threads"))
+    if "gpu_config" in updates:
+        tuning = {entry["device"]: dict(entry) for entry in settings.gpu_config if entry.get("device")}
+        for entry in updates["gpu_config"]:
+            if "workers" in entry or "enabled" in entry:
+                change_count("gpu", entry.get("workers"), entry["device"], entry.get("enabled"))
+            if "ffmpeg_threads" in entry and (
+                type(entry["ffmpeg_threads"]) is not int or not 0 <= entry["ffmpeg_threads"] <= 32
+            ):
+                raise ValueError("GPU FFmpeg threads must be between 0 and 32")
+            tuning.setdefault(entry["device"], {"device": entry["device"]}).update(
+                {key: value for key, value in entry.items() if key not in {"workers", "enabled"}}
+            )
+        updates["gpu_config"] = list(tuning.values())
+    if changed:
+        clean = validate_worker_groups(groups)
+        if clean != settings.worker_groups:
+            updates["worker_groups"] = clean
+            updates["worker_groups_revision"] = settings.worker_groups_revision + 1
+    return updates
+
+
 @api.route("/settings", methods=["POST"])
 @setup_or_auth_required
 def save_settings():
@@ -848,7 +946,12 @@ def save_settings():
 
     result = {"success": True}
     if updates:
-        settings.update(updates)
+        with settings.locked():
+            try:
+                updates = _translate_legacy_worker_updates(settings, updates)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            settings.update(updates)
         logger.info("Settings updated: {}", list(updates.keys()))
         result.update(_apply_post_save_hooks(settings, updates, incoming_field_keys))
     return jsonify(result)

@@ -29,6 +29,7 @@ def run(monkeypatch):
         config={"source": "sonarr", "file_paths": ["/m"]},
     )
     jm.is_cancellation_requested.return_value = False
+    jm.is_pause_requested.return_value = False
     jm.get_running_jobs.return_value = []
     jm.get_file_results.return_value = []
     jm.set_job_outcome.side_effect = lambda job_id, counts: setattr(jm.get_job.return_value.progress, "outcome", counts)

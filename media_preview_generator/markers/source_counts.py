@@ -97,6 +97,11 @@ class DecidedByTally:
                 per_type = self._counts.setdefault(mtype, {})
                 per_type[group] = per_type.get(group, 0) + 1
 
+    def restore(self, counts: dict[str, dict[str, int]]) -> None:
+        """Seed settled counts before resubmitting a parked job's remaining files."""
+        with self._lock:
+            self._counts = {MarkerType(kind): dict(values) for kind, values in counts.items()}
+
     def snapshot(self) -> dict[str, dict[str, int]]:
         """The counts so far, as stored on the job (``JobProgress.marker_sources``).
 

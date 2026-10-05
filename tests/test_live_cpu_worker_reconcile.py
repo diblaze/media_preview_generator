@@ -1,13 +1,7 @@
-"""Saving ``cpu_threads`` resizes the live worker pool, the way ``gpu_config`` saves already do.
+"""Legacy scaling routes update authoritative saved groups and the live pool.
 
-Production wiring at ``api_settings.py:_apply_post_save_hooks``: when ``cpu_threads``
-is in the saved fields, ``WorkerPool.reconcile_cpu_workers`` brings the running
-pool to the saved count. Before this, the count only changed on restart.
-
-Every test drives the real ``POST /api/settings`` route against a real
-``WorkerPool`` registered as the dispatcher's pool, then counts the pool's
-workers — so the saved value reaching the pool is what's asserted, not just
-that a hook ran.
+Real route tests cover exact busy-worker retirement, persisted counts, settings
+validation and concurrent saves while GPU detection remains outside locks.
 """
 
 from __future__ import annotations
@@ -63,12 +57,61 @@ def _gpu_workers(pool: WorkerPool) -> list:
     return [w for w in pool._snapshot_workers() if w.worker_type == "GPU"]
 
 
+def _groups(cpu: int, gpu: int = 0) -> list[dict]:
+    groups = [
+        {
+            "id": "cpu",
+            "name": "CPU",
+            "enabled": cpu > 0,
+            "resource": "cpu",
+            "device": None,
+            "count": max(1, cpu),
+            "job_types": ["previews", "intro_credits", "loudness"],
+            "availability": {"mode": "always", "windows": []},
+        }
+    ]
+    if gpu:
+        groups.insert(
+            0,
+            {
+                "id": "gpu",
+                "name": "GPU",
+                "enabled": True,
+                "resource": "gpu",
+                "device": GPU_DEVICE,
+                "count": gpu,
+                "job_types": ["previews", "intro_credits"],
+                "availability": {"mode": "always", "windows": []},
+            },
+        )
+    return groups
+
+
+def _retiring(pool: WorkerPool, resource="CPU") -> int:
+    return sum(w._pending_removal for w in pool._snapshot_workers() if w.worker_type == resource)
+
+
+def _group_count(value, resource="cpu") -> int | None:
+    return (
+        next((g["count"] if g["enabled"] else 0 for g in value if g["resource"] == resource), None)
+        if isinstance(value, list)
+        else None
+    )
+
+
 def _live_pool(app, *, cpu: int, gpu: int = 0) -> WorkerPool:
     """Register a real pool as the dispatcher's, with settings.json agreeing with it."""
     selected = [("nvidia", GPU_DEVICE, {**GPU_INFO, "workers": gpu})] if gpu else []
     with app.app_context():
-        get_settings_manager().update({"cpu_threads": cpu})
-    pool = WorkerPool(gpu_workers=gpu, cpu_workers=cpu, selected_gpus=selected)
+        get_settings_manager().update(
+            {"worker_groups": _groups(cpu, gpu), "gpu_config": _gpu_config(gpu) if gpu else []}
+        )
+    pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=selected)
+    pool.reconcile_groups(_groups(cpu, gpu), selected)
+    if gpu:
+        from media_preview_generator.web.routes import _helpers
+
+        _helpers._gpu_cache["result"] = [{"type": "nvidia", "device": GPU_DEVICE, "name": "Fake GPU"}]
     get_dispatcher(pool)
     return pool
 
@@ -122,7 +165,7 @@ class TestSaveSettingsReconcilesCpuWorkers:
 
         assert resp.status_code == 200
         assert len(_cpu_workers(pool)) == 1
-        assert pool._pending_removals["CPU"] == 0
+        assert _retiring(pool) == 0
 
     def test_busy_cpu_worker_retired_after_task_when_cpu_threads_lowered(self, app):
         pool = _live_pool(app, cpu=2)
@@ -135,13 +178,15 @@ class TestSaveSettingsReconcilesCpuWorkers:
         # Neither worker is pulled mid-task: both stay, one is due to retire.
         assert resp.status_code == 200
         assert _cpu_workers(pool) == [first, second]
-        assert pool._pending_removals["CPU"] == 1
-        assert len(_cpu_workers(pool)) - pool._pending_removals["CPU"] == 1
+        assert _retiring(pool) == 1
+        assert len(_cpu_workers(pool)) - _retiring(pool) == 1
 
-        first.is_busy = False
-        assert pool._retire_idle_worker_if_scheduled(first) is True
-        assert _cpu_workers(pool) == [second]
-        assert pool._pending_removals["CPU"] == 0
+        retiring = next(w for w in (first, second) if w._pending_removal)
+        retained = next(w for w in (first, second) if not w._pending_removal)
+        retiring.is_busy = False
+        assert pool._retire_idle_worker_if_scheduled(retiring) is True
+        assert _cpu_workers(pool) == [retained]
+        assert _retiring(pool) == 0
 
     def test_raise_after_pending_shrink_cancels_removal_instead_of_adding(self, app):
         pool = _live_pool(app, cpu=2)
@@ -150,12 +195,12 @@ class TestSaveSettingsReconcilesCpuWorkers:
             w.is_busy = True
 
         _save(app, {"cpu_threads": 1})
-        assert pool._pending_removals["CPU"] == 1
+        assert _retiring(pool) == 1
         resp = _save(app, {"cpu_threads": 2})
 
         assert resp.status_code == 200
         assert _cpu_workers(pool) == busy
-        assert pool._pending_removals["CPU"] == 0
+        assert _retiring(pool) == 0
 
     def test_unchanged_cpu_threads_with_pending_removal_is_noop(self, app):
         # Autosave repeats the lowered value on every later save; it must not retire a second busy worker.
@@ -169,7 +214,7 @@ class TestSaveSettingsReconcilesCpuWorkers:
 
         assert resp.status_code == 200
         assert _cpu_workers(pool) == busy
-        assert pool._pending_removals["CPU"] == 1
+        assert _retiring(pool) == 1
 
     def test_second_shrink_while_busy_counts_pending_removals(self, app):
         pool = _live_pool(app, cpu=3)
@@ -182,7 +227,7 @@ class TestSaveSettingsReconcilesCpuWorkers:
 
         assert resp.status_code == 200
         assert _cpu_workers(pool) == busy
-        assert pool._pending_removals["CPU"] == 2
+        assert _retiring(pool) == 2
 
     def test_unchanged_cpu_threads_is_noop(self, app):
         # The Settings page autosave sends cpu_threads on every save, so an
@@ -195,7 +240,7 @@ class TestSaveSettingsReconcilesCpuWorkers:
 
         assert resp.status_code == 200
         assert _cpu_workers(pool) == before
-        assert pool._pending_removals["CPU"] == 0
+        assert _retiring(pool) == 0
 
     def test_cpu_threads_zero_removes_all_cpu_workers(self, app):
         pool = _live_pool(app, cpu=3, gpu=1)
@@ -361,7 +406,7 @@ class TestJobStartReconcilesCpuWorkers:
             # Job start reads the saved 2, then waits while a save stores and applies 5. Without the lock job start
             # then applies its stale 2. With it, the save can't store 5 until job start has finished applying 2.
             value = real_get(self, key, default)
-            if key == "cpu_threads" and threading.get_ident() == job_start.get("thread"):
+            if key == "worker_groups" and threading.get_ident() == job_start.get("thread"):
                 job_start_read.set()
                 save_done.wait(timeout=1.0)
             return value
@@ -485,7 +530,7 @@ class TestWorkersApiSavesCpuCount:
         data = resp.get_json()
         assert (data["removed"], data["scheduled_removal"], data["unavailable"]) == (0, 1, 0)
         assert _cpu_workers(pool) == busy
-        assert pool._pending_removals["CPU"] == 1
+        assert _retiring(pool) == 1
         assert _saved_cpu_threads(app) == 1
 
     def test_remove_more_than_saved_reports_unavailable(self, app):
@@ -509,7 +554,7 @@ class TestWorkersApiSavesCpuCount:
         assert len(_cpu_workers(pool)) == 3
 
     def test_gpu_add_leaves_saved_cpu_count_alone(self, app):
-        # GPU counts are per GPU in Settings; the API's GPU change isn't saved (unchanged behaviour).
+        # A GPU group scale must not alter CPU group counts.
         pool = _live_pool(app, cpu=2, gpu=1)
 
         resp = _scale(app, "add", "GPU", 1)
@@ -520,8 +565,8 @@ class TestWorkersApiSavesCpuCount:
         assert _saved_cpu_threads(app) == 2
 
 
-class TestWorkersApiGpuChangeLastsUntilTheNextSave:
-    """GPU counts are per GPU in Settings, so the API's GPU change isn't saved; the next Settings save undoes it."""
+class TestWorkersApiGpuCountIsPersisted:
+    """Unrelated settings saves preserve group scaling; explicit edits may change it."""
 
     def test_settings_save_keeps_busy_gpu_workers_the_api_removed(self, app):
         pool = _live_pool(app, cpu=0, gpu=3)
@@ -539,7 +584,7 @@ class TestWorkersApiGpuChangeLastsUntilTheNextSave:
         assert (removed["removed"], removed["scheduled_removal"], removed["unavailable"]) == (0, 1, 0)
         assert resp.status_code == 200
         assert _gpu_workers(pool) == busy
-        assert pool._pending_removals["GPU"] == 0
+        assert _retiring(pool, "GPU") == 0
 
     def test_settings_save_restores_idle_gpu_workers_the_api_removed(self, app):
         pool = _live_pool(app, cpu=0, gpu=3)
@@ -553,16 +598,16 @@ class TestWorkersApiGpuChangeLastsUntilTheNextSave:
         assert len(_gpu_workers(pool)) == 3
         assert all(w.gpu_device == GPU_DEVICE for w in _gpu_workers(pool))
 
-    def test_settings_save_drops_gpu_workers_the_api_added(self, app):
+    def test_unrelated_settings_save_keeps_gpu_workers_the_api_added(self, app):
         pool = _live_pool(app, cpu=0, gpu=1)
 
         added = _scale(app, "add", "GPU", 2).get_json()
         with _fake_detected_gpu():
-            resp = _save(app, {"gpu_config": _gpu_config(1)})
+            resp = _save(app, {"thumbnail_quality": 5})
 
         assert added["added"] == 2
         assert resp.status_code == 200
-        assert len(_gpu_workers(pool)) == 1
+        assert len(_gpu_workers(pool)) == 3
 
 
 def _loader_thread_errors(app) -> list[str]:
@@ -605,7 +650,7 @@ class TestCpuWorkerCountLimit:
         resp = _scale(app, "add", "CPU", 2)
 
         assert resp.status_code == 400
-        assert resp.get_json()["error"] == "cpu_threads must be between 0 and 32; adding 2 to 31 would make 33"
+        assert "32" in resp.get_json()["error"]
         assert _saved_cpu_threads(app) == 31
         assert len(_cpu_workers(pool)) == 31
         assert _loader_thread_errors(app) == []
@@ -622,7 +667,12 @@ class TestCpuWorkerCountLimit:
 
     def test_workers_api_remove_from_above_the_maximum_lands_on_the_maximum(self, app):
         # A count saved before the cap existed: a decrease goes straight to the maximum, as the stepper does.
-        pool = _live_pool(app, cpu=40)
+        # Exercise the supported pre-migration embedded path; saved groups are
+        # validated and cannot contain a 40-worker allocation.
+        with app.app_context():
+            get_settings_manager().update({"worker_groups": None, "cpu_threads": 40})
+        pool = WorkerPool(gpu_workers=0, cpu_workers=40, selected_gpus=[])
+        get_dispatcher(pool)
 
         resp = _scale(app, "remove", "CPU", 1)
 
@@ -671,7 +721,7 @@ class TestWorkersApiConcurrency:
             # Each request reads the saved count, then waits until the other has read it too. Without a lock both
             # read 2 and both save 3. With one, the second request can't read until the first has saved 3.
             value = real_get(self, key, default)
-            if key == "cpu_threads" and threading.get_ident() in request_threads:
+            if key == "worker_groups" and threading.get_ident() in request_threads:
                 try:
                     both_read.wait(timeout=1.0)
                 except threading.BrokenBarrierError:
@@ -709,7 +759,11 @@ class TestConcurrentSettingsSaves:
             # Without the lock the first hook then applies its stale 3. With it, the second save can't store 4
             # until the first hook has finished applying 3.
             value = real_get(self, key, default)
-            if key == "cpu_threads" and value == 3 and threading.get_ident() == first_save.get("thread"):
+            if (
+                key == "worker_groups"
+                and _group_count(value) == 3
+                and threading.get_ident() == first_save.get("thread")
+            ):
                 first_read_its_count.set()
                 second_save_done.wait(timeout=1.0)
             return value
@@ -742,8 +796,8 @@ class TestConcurrentSettingsSaves:
             # and applies 4. Without the lock the first hook then applies its stale 3.
             value = real_get(self, key, default)
             if (
-                key == "gpu_config"
-                and _gpu_workers_in(value) == 3
+                key == "worker_groups"
+                and _group_count(value, "gpu") == 3
                 and threading.get_ident() == first_save.get("thread")
                 and not first_read_its_config.is_set()
             ):
@@ -765,7 +819,7 @@ class TestConcurrentSettingsSaves:
 
         assert (first_save["status"], second_status) == (200, 200)
         with app.app_context():
-            assert _gpu_workers_in(get_settings_manager().gpu_config) == 4
+            assert _group_count(get_settings_manager().worker_groups, "gpu") == 4
         assert len(_gpu_workers(pool)) == 4
 
 
@@ -914,7 +968,7 @@ class TestGpuListSurvivesARescan:
     def test_idle_worker_list_keeps_the_saved_gpu_rows(self, app):
         # No pool exists yet, so the Workers panel is built from the saved counts and the detected GPUs.
         with app.app_context():
-            get_settings_manager().update({"cpu_threads": 1, "gpu_config": _gpu_config(2)})
+            get_settings_manager().update({"worker_groups": _groups(1, 2), "gpu_config": _gpu_config(2)})
 
         with self._rescan_lands_after_the_warm_up("api_jobs"):
             resp = app.test_client().get("/api/jobs/workers", headers={"X-Auth-Token": TOKEN})

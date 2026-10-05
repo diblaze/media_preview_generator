@@ -111,24 +111,48 @@ writes should use `media_servers[]` via `/api/servers`.
 
 ## Processing Options
 
+### Worker groups (`worker_groups`)
+
+Named groups are the authoritative worker allocation, edited in **Settings → Workers** and the setup wizard.
+The dashboard's group controls change the same saved configuration. See the [worker guide](guides.md#worker-groups-and-availability)
+for scheduling, scaling and migration behavior.
+
+Each group contains `id` (unique stable identifier), `name` (1–80 characters), `enabled`, `resource` (`cpu` or `gpu`),
+`device` (GPU device identifier, `null` for CPU), a positive `count` (1–32), `job_types`, and `availability`.
+Job types are `previews`, `intro_credits` and `loudness`; GPU groups cannot allow `loudness`. At least one job type is
+required. Availability is `{"mode":"always","windows":[]}` or `{"mode":"scheduled","windows":[...]}`. Each window
+has `days` (0 = Monday through 6 = Sunday), `start` and `end` (`HH:MM`, different times). Days identify the start of
+a window, including overnight intervals, in the app timezone. Scheduled groups need at least one window.
+
+Up to 64 groups and 32 windows per group are supported. Disabled groups retain their positive saved count but
+provide no capacity. An empty group list is valid. Overlapping windows in one group form a union; different groups
+add their counts. Validation rejects weekly peaks above 32 CPU or 32 GPU workers across the corresponding family,
+including when an existing disabled group is re-enabled. These are worker-slot limits, not limits on CPU cores.
+
+Settings schema 21 migrates legacy allocations only when `worker_groups` is absent. Existing groups, including an
+empty list, remain authoritative. CPU zero remains zero, so loudness waits until a CPU group is explicitly added.
+Old allocations become Always groups; device tuning is retained. Known automatic zero-worker pauses are cleared
+in favor of resource waiting, while ambiguous saved pauses remain manual. Quiet-hours migration preserves old
+weekly wall times by splitting overnight intervals; new intervals use start days.
+
 ### Per-GPU Configuration (gpu_config)
 
-GPU settings are configured per-GPU in **Settings** → **Processing Options**. Each entry in `gpu_config` has:
+Device tuning remains in **Settings → Processing Options**. Worker allocation belongs to groups. Each entry in `gpu_config` has:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `device` | string | GPU device identifier (e.g. `/dev/dri/renderD128`) |
 | `name` | string | Display name (e.g. "Intel UHD Graphics 630") |
 | `type` | string | `nvidia`, `intel`, `amd`, `apple` |
-| `enabled` | boolean | Whether this GPU is used for processing |
-| `workers` | int | Number of worker threads for this GPU (0–32) |
+| `enabled` | boolean | Legacy compatibility value; groups control allocation |
+| `workers` | int | Legacy compatibility count; edit groups to change allocation |
 | `ffmpeg_threads` | int | CPU threads per FFmpeg job on this GPU (0–32, 0 = no limit). Recommended: 2 |
 
 ### Other Processing Settings
 
 | Setting | Web UI | Default | Description |
 |---------|--------|---------|-------------|
-| `cpu_threads` | Yes | `1` | Number of CPU worker threads (0–32) |
+| `cpu_threads` | Legacy | `1` | Compatibility count derived from configured CPU groups; use the worker-groups API to change allocation |
 | `scan_workers` | Yes | `0` (Auto) | Full-scan only: how many files are checked **in parallel** for an existing preview, independent of the FFmpeg-generation cap (GPU + CPU workers). Checking is light disk I/O and does NOT add FFmpeg/GPU load. `0` = Auto (`max(32, generators)`); an explicit value is bounded to 1–256. Raise it to speed the "skip already-done files" sweep on large libraries; lower it on a single spinning HDD. |
 | `thumbnail_quality` | Yes | `4` | Preview quality 1-10, lower = better quality (2 = highest) |
 | `thumbnail_interval` | Yes | `10` | Interval between preview images (1–60 s). Matches Plex/BIF community convention (see sidecar `-{width}-10.bif` files). |
@@ -259,7 +283,7 @@ These env vars are deprecated and silently ignored at startup with a warning log
 | Variable | Replacement |
 |----------|--------------|
 | `GPU_SELECTION` | Per-GPU enable/disable in Settings → Processing Options |
-| `GPU_THREADS` | Per-GPU workers in `gpu_config` |
+| `GPU_THREADS` | Initial legacy GPU allocation, migrated into groups; does not override saved groups |
 | `FFMPEG_THREADS` | Per-GPU `ffmpeg_threads` in `gpu_config` |
 | `PLEX_LIBRARIES` | Per-server library toggles (Settings → Media Servers → Libraries) |
 | `REGENERATE_THUMBNAILS` | Tick "Regenerate" when starting a job from the UI |
@@ -834,7 +858,7 @@ or low"}`. `503` when the config directory isn't writable (checked before the bo
 
 ## Plex loudness
 
-Audio loudness analysis on this app's workers ([Plex loudness](plex-loudness-normalization.md)). Plex servers only;
+Audio loudness analysis on this app's eligible CPU worker groups ([Plex loudness](plex-loudness-normalization.md)). Plex servers only;
 off until turned on per server.
 
 ### Per-server settings (`media_servers[].loudness`)
@@ -1151,16 +1175,17 @@ Update settings. Send only the fields to change.
 
 ```json
 {
-  "gpu_config": [{"device": "/dev/dri/renderD128", "enabled": true, "workers": 4, "ffmpeg_threads": 2}],
-  "cpu_threads": 2,
+  "gpu_config": [{"device": "/dev/dri/renderD128", "ffmpeg_threads": 2}],
   "thumbnail_interval": 10,
   "plex_url": "http://192.168.1.100:32400"
 }
 ```
 
-A save that leaves no GPU or CPU workers pauses processing, and the save that adds workers back resumes it. Any other
-pause (Pause all, quiet hours) stays in place when settings are saved. An install that was paused with no workers
-before this rule counts as paused by it (settings schema 19), so adding workers back resumes it too.
+Use the dedicated [worker-groups API](#worker-group-endpoints) for allocation. Once groups exist, posting legacy
+`cpu_threads` or GPU `enabled`/`workers` allocation fields returns `409` with guidance instead of overwriting groups.
+GPU tuning-only entries merge into stored device settings. `GET /api/settings` also returns `worker_groups` and
+`worker_groups_revision`. Zero workers cause resource waiting, not a global pause; saving capacity never clears a
+manual or quiet-hours hold.
 
 `markers` (the Intro & Credits block) may be partial: posted keys merge over the stored block — `detect` key by key,
 `sources` by `id` (a list naming every source sets their order; a shorter one updates those sources where they are;
@@ -1222,19 +1247,69 @@ Get libraries from connected Plex server. Optional query parameters: `url`, `tok
 
 Test Plex connection. Request: `{"url": "...", "token": "..."}`. Returns `{"success": true, "server_name": "...", "version": "..."}`.
 
+### Worker group endpoints
+
+All endpoints use the normal session/API authentication and are also available during initial setup.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, current `capacity`, `warnings` and global pause state |
+| PUT | `/api/worker-groups` | Replace the complete group list with `{"groups":[...],"revision":N}`. `400` rejects invalid configuration; `409` means another change advanced the revision. Reload and reconcile before resubmitting. |
+| POST | `/api/worker-groups/{id}/scale` | Atomic saved adjustment: exactly `{"delta":1}`, `{"delta":-1}` or `{"enabled":true/false}`. `404` for an unknown group, `400` for an invalid action or capacity limit. |
+
+For example, after loading revision 3, replace the configuration with one CPU loudness group:
+
+```json
+{
+  "revision": 3,
+  "groups": [{
+    "id": "cpu-loudness",
+    "name": "Overnight audio",
+    "enabled": true,
+    "resource": "cpu",
+    "device": null,
+    "count": 1,
+    "job_types": ["loudness"],
+    "availability": {
+      "mode": "scheduled",
+      "windows": [{"days": [0,1,2,3,4,5,6], "start": "23:00", "end": "07:00"}]
+    }
+  }]
+}
+```
+
+A `PUT` replaces all groups, so include every group you want to keep. Use scale for a single immediate count or
+Enabled change. A decrease to zero disables the group while retaining its saved positive count; an Enabled action
+restores that count. Successful mutations return the updated GET snapshot plus `success: true`. An optional
+`warning` means settings were saved but live reconciliation failed; inspect logs rather than assuming the save failed.
+
+`capacity.groups` includes `id`, `name`, `resource`, `device`, `desired`, `target`, `available`, `busy`, `finishing`,
+`state` and `next_available_at` (ISO timestamp or null). Desired is the enabled saved count; target reflects current
+hours and hardware. Busy excludes retiring work, which is counted as finishing. Available is zero during global
+pause. States include `active`, `disabled`, `off_hours`, `hardware_unavailable` and `draining`. Removed groups may
+remain in this snapshot while files finish. `capacity.current` sums current targets by CPU/GPU and `capacity.peak`
+gives the configured weekly peaks; neither is a CPU utilization percentage. Warnings identify unavailable hardware
+or job types with no compatible hours outside global quiet hours. `processing_paused` and `pause_reasons` describe
+the separate master hold.
+
+Persisted pending capacity waits and their saved checkpoints are restored independently of
+`auto_requeue_on_restart`. Pending dependency followers also retain their waiting state. This does not clear manual,
+schedule or global holds. Ordinary interrupted running jobs continue to follow the automatic crash-requeue setting.
+
 ### Processing state (global pause)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/processing/state` | Get global processing pause state |
-| POST | `/api/processing/pause` | Set global pause (no new jobs start; active job stops dispatch after current tasks) |
-| POST | `/api/processing/resume` | Clear global pause |
+| POST | `/api/processing/pause` | Add the manual global hold; pause active processing and new starts |
+| POST | `/api/processing/resume` | Clear only the manual global hold; quiet hours can still hold processing |
 
-**GET /api/processing/state** — Response: `{"paused": true}` or `{"paused": false}`. State is persisted and survives restarts.
+**GET /api/processing/state** — Response includes `paused` and `reasons`, for example
+`{"paused":true,"reasons":["manual","quiet_hours"]}`. Manual holds survive restarts.
 
-**POST /api/processing/pause** — Response: `{"paused": true}`.
-
-**POST /api/processing/resume** — Response: `{"paused": false}`.
+**POST /api/processing/pause** returns `{"paused":true}`. **POST /api/processing/resume** returns the effective
+`paused` state and its `reasons`; a successful resume can return `paused: true` while quiet hours remain active.
+Worker availability never clears these holds.
 
 ### Jobs Endpoints
 
@@ -1245,8 +1320,8 @@ Test Plex connection. Request: `{"url": "...", "token": "..."}`. Returns `{"succ
 | GET | `/api/jobs/{id}` | Get job details |
 | GET | `/api/jobs/{id}/file-list` | The job's first files for its row on the Jobs page (`?limit=`, default 10, max 50): `{"files": [{"title", "name", "path"}], "total": N}`, the files it was given first, then the files it has run. `404` for an unknown id. |
 | POST | `/api/jobs/{id}/cancel` | Cancel job |
-| POST | `/api/jobs/{id}/pause` | Intro & Credits job: pauses that job only (`200` with the job; `409` `{"error": "Only running jobs can be paused"}` when it isn't running). Preview job: global pause (delegates to `/api/processing/pause`). `404` for an unknown id. |
-| POST | `/api/jobs/{id}/resume` | Intro & Credits job: resumes that job only (`200` with the job plus `processing_paused`, true while **Pause all** still holds it; `409` `{"error": "Only running jobs can be resumed"}` when it isn't running). Preview job: global resume (delegates to `/api/processing/resume`). `404` for an unknown id. |
+| POST | `/api/jobs/{id}/pause` | Add a manual hold to this pending or running job, for all job kinds. Returns the job; `409` for a terminal job, `404` for an unknown ID. Does not change global pause. |
+| POST | `/api/jobs/{id}/resume` | Remove this job's manual hold. Returns the job plus `processing_paused`; a schedule hold can keep `paused` true. `409` for a terminal job, `404` for an unknown ID. |
 | DELETE | `/api/jobs/{id}` | Delete job |
 
 #### GET /api/jobs
@@ -1392,11 +1467,16 @@ explicit `null` clears it.
 
 - `"full_library"` *(default — optional, omit to get the same behaviour)* — schedule runs a full library scan via the standard job pipeline, processing matching items in `library_id` that are missing previews. Its `config` accepts the same [media filters](#per-job-media-filters) as `POST /api/jobs`.
 - `"recently_added"` — schedule runs a Recently Added scan instead. Requires `config.lookback_hours` (float, clamped to 0.25–720). Scans only items added within the lookback window (Plex `addedAt`, Emby/Jellyfin `DateCreated`), counted back from when the job was created (a job that waited for a slot, or was revived after a restart, still covers that window; a tick while the schedule's last scan hasn't started queues nothing, widening that scan's window when this tick looks further back), as one preview job with a Files-panel row per file, the usual retry for files a server hasn't indexed yet, and revival after a restart. Its files also get an Intro & Credits follow-up (`source: "recently_added"`) when a server with Intro & Credits on holds them. When `library_id` is `null`, the scan falls back to the globally selected libraries in Settings (or every supported library when no global filter is set); when set, only that section is scanned. Works for Plex, Emby, and Jellyfin — each vendor's processor implements `scan_recently_added` against its native API.
-- `"intro_credits"` — schedule creates an [Intro & Credits](#intro--credits) job (`kind=intro_credits`) instead of a preview job, for the schedule's libraries (every library Intro & Credits goes to when none are chosen). LOW priority unless the schedule sets one. A schedule with a `server_id` publishes to that server only (the job's `server_id`), as a scheduled preview job does. Skipped while an earlier Find markers job from the same schedule is still pending or running. With `config.reconcile: true` it queues Intro & Credits · Check servers instead (every server; libraries and server don't apply; the UI shows it as "All servers"), skipped while any Check servers job is still pending or running. A start tick (or `POST /api/schedules/{id}/run`) first resumes every Intro & Credits job of the schedule that its stop time paused, whichever of the two it is (the schedule may have been switched since), and then queues nothing that tick; the check above applies only when it resumed nothing. A job paused by hand (`POST /api/jobs/{id}/pause`) is never resumed by a tick, and a stop tick doesn't take over a pause made by hand; the job's config carries `paused_by_schedule: true` from a stop-time pause until the next resume, pause by hand, or the job's end. Deleting a schedule leaves its paused jobs paused and logs a WARNING naming each; so does a `PUT` that switches `config.job_type` to a kind its start ticks don't resume (`intro_credits` ↔ `full_library`, or either to `recently_added`), for each job its stop time paused. While a Check servers job runs, its config also carries `check_servers_listing` (the files it listed), so a run revived after a restart checks those same files; the key is dropped when the job ends.
+- `"intro_credits"` — schedule creates an [Intro & Credits](#intro--credits) job (`kind=intro_credits`) instead of a preview job, for the schedule's libraries (every library Intro & Credits goes to when none are chosen). LOW priority unless the schedule sets one. A schedule with a `server_id` publishes to that server only (the job's `server_id`), as a scheduled preview job does. Skipped while an earlier Find markers job from the same schedule is still pending or running. With `config.reconcile: true` it queues Intro & Credits · Check servers instead (every server; libraries and server don't apply; the UI shows it as "All servers"), skipped while any Check servers job is still pending or running. A start tick (or `POST /api/schedules/{id}/run`) first resumes every Intro & Credits job of the schedule that its stop time paused, whichever of the two it is (the schedule may have been switched since), and then queues nothing that tick; the check above applies only when it resumed nothing. Manual and schedule holds are independent in `config.pause_reasons`: a start tick removes only the schedule hold, and a manual resume removes only the manual hold. A stop tick adds its schedule hold even when the job is already manually paused. The compatibility `paused_by_schedule` flag reflects the schedule hold. Deleting a schedule leaves its paused jobs paused and logs a WARNING naming each; so does a `PUT` that switches `config.job_type` to a kind its start ticks don't resume (`intro_credits` ↔ `full_library`, or either to `recently_added`), for each job its stop time paused. While a Check servers job runs, its config also carries `check_servers_listing` (the files it listed), so a run revived after a restart checks those same files; the key is dropped when the job ends.
 
 Full-scan media filters are cleared when saving a Recently Added or Intro & Credits schedule. Filter
 validation also runs before creating or updating a full-library schedule; invalid
 values return HTTP 400 without changing the saved schedule.
+
+Scheduled ticks during global pause are skipped rather than saved for a catch-up run. Repeated starts for an
+unchanged scope can reuse an unstarted pending request; Recently Added can widen its pending lookback. Started
+passes and their parked remaining work are not expanded by later ticks. Worker availability does not create jobs
+and does not change a schedule's start/stop times.
 
 ### System Endpoints
 
@@ -1433,7 +1513,7 @@ For full design and per-vendor details see [Multi-Media-Server](multi-server.md)
 | POST | `/api/servers/<id>/install-plugin` | Jellyfin and Emby (400 for Plex). Jellyfin: adds the Media Preview Bridge manifest URL to Jellyfin's plugin repos, queues the package install, and restarts Jellyfin. Returns `{ok, steps: [{step, ok, detail}], error}`. Emby: installs Media Preview Bridge for Emby from Emby's own plugin catalog and restarts Emby; when the catalog doesn't list it, answers `ok: false, manual: true` (install the DLL by hand). Returns `{ok, steps, error, manual}`. |
 | POST | `/api/servers/<id>/plex-library-markers` | Plex only. Setup Health's **Turn on** for a library whose own *Intro markers* / *Credits markers* setting is off (Plex then hides every skip marker of that type there, ours included). Body `{"library_id": "2", "prefs": ["enableIntroMarkerGeneration", "enableCreditsMarkerGeneration"]}` (one or both); sets them on with `PUT /library/sections/{id}/prefs` for that library only. 400 for any other pref, a library outside the server's Intro & Credits selection, or a non-Plex server. Returns `{ok, library_id, prefs}` or `{ok: false, error}`. |
 | POST | `/api/servers/<id>/plex-marker-detection` | Plex only. Setup Health's **Set server-wide to Never**. Body `{"types": ["intro", "credits"]}` (one or both); sends `PUT /:/prefs?GenerateIntroMarkerBehavior=never&GenerateCreditsMarkerBehavior=never` for the types given, which stops Plex's own detection without hiding any marker. 400 for any other type, a non-Plex server, or a server with Intro & Credits off. Returns `{ok, types}` or `{ok: false, error}`. |
-| POST | `/api/servers/<id>/plex-loudness-analysis` | Plex only. Optional **Set to Never** action, with a confirmation dialog in Setup Health. Body `{}`; sends `PUT /:/prefs?LoudnessAnalysisBehavior=never`. Requires app loudness opt-in, eligible selected video libraries and a fresh successful writer-readiness check. Returns 409 if the server is disabled, selection is empty or the writer is unavailable; 400 for a non-Plex server or loudness opt-in off; 404 for an unknown server. Response is `{ok, error}`; inspect `ok` even for HTTP 200 because Plex can refuse the preference update. Affects native analysis in every library, including music; existing measurements are retained. |
+| POST | `/api/servers/<id>/plex-loudness-analysis` | Plex only. Optional **Set to Never** action, with a confirmation dialog in Setup Health. Body `{}`; sends `PUT /:/prefs?LoudnessAnalysisBehavior=never`. Requires app loudness opt-in, eligible selected video libraries, configured CPU loudness hours outside global quiet hours and a fresh successful writer-readiness check. Returns 409 if the server is disabled, selection is empty, eligible CPU hours are absent or the writer is unavailable; 400 for a non-Plex server or loudness opt-in off; 404 for an unknown server. Response is `{ok, error}`; inspect `ok` even for HTTP 200 because Plex can refuse the preference update. Affects native analysis in every library, including music; existing measurements are retained. |
 | POST | `/api/servers/<id>/uninstall-plugin` | Jellyfin only. Removes the Media Preview Bridge plugin (`DELETE /Packages/{GUID}`; 404 treated as success — already gone) and restarts Jellyfin. Repo URL stays in place for possible re-install. Same response shape as `/install-plugin`. |
 | GET | `/api/bif/servers/<id>/search?q=<query>` | One server's preview search; returns `preview_kind` (`bif` or `trickplay`) per result. The Inspector searches every server through `GET /api/media/search` instead |
 | GET | `/api/bif/trickplay/info?server_id=...&path=...` | Parse a Jellyfin trickplay manifest + report sheet metadata |
@@ -1835,23 +1915,23 @@ unless noted.
 | POST | `/api/jobs/manual` | Submit one or more absolute paths — `{"file_paths": ["/a.mkv", "/tv/Show"], "force_regenerate": false, "priority": 2, "server_id": "..."}`. Directories are expanded to the video files inside; bypasses library scan. |
 | GET | `/api/media/search` | Backs the Manual Generation typeahead. `?q=` (min 2 chars), optional `?server_id=` to scope to one server. Fans across enabled servers and returns `{results: [{kind: "show"\|"movie"\|"episode", title, year, paths: [local container paths], child_count, servers: [{id, name, type}]}]}`. Shows resolve to their folder(s); the same item reported by several servers is merged into one row (union of paths + servers). |
 | POST | `/api/jobs/{id}/priority` | Change a pending/running job's priority (`{"priority": 1\|2\|3}`; 1 = high) |
-| POST | `/api/jobs/{id}/reprocess` | Re-run a finished job with the same config: `201` with the new job (an Intro & Credits job keeps its schedule), `409` while it's pending or running. A Check servers job is queued like `POST /api/markers/reconcile` and answers the same way (`202` `{"job_id", "already_queued"}`, reusing one already queued or running). A Re-run clears the global pause. |
+| POST | `/api/jobs/{id}/reprocess` | Re-run a finished job with the same config: `201` with the new job (an Intro & Credits job keeps its schedule), `409` while it's pending or running. A Check servers job is queued like `POST /api/markers/reconcile` and answers the same way (`202` `{"job_id", "already_queued"}`, reusing one already queued or running). A Re-run clears the manual global hold; quiet hours still apply. |
 | POST | `/api/jobs/{id}/retry-now` | Skip the retry back-off on a chain-head job whose next attempt is currently in the back-off countdown. Returns 200 + `{"fired": true, ...}` on success, 409 when no retry is pending, 400 if the job isn't a chain head. |
 | POST | `/api/jobs/{id}/fire-webhook-now` | Skip the initial wait on a pending webhook job, including source-specific batches and universal/per-server jobs. Returns 202 when dispatched, or 404 when no pending webhook timer exists for the job. Automatic restart recovery restores pending timers from saved job deadlines. |
 | GET | `/api/jobs/{id}/logs` | Paginated log stream — `?offset=&limit=` (limit capped at 5000); or legacy `?last=N` for the tail |
 | GET | `/api/jobs/{id}/files` | Per-file outcomes — paginated `?page=&per_page=` (per_page capped at 500), plus optional `?outcome=` and `?search=` filters. The underlying per-job JSONL is itself soft-capped at 5000 rows; past that, a `truncated` marker row appears and aggregate counts remain in `progress.outcome`. |
 | POST | `/api/jobs/clear` | Delete completed/failed jobs from the queue |
 | GET | `/api/jobs/stats` | Totals grouped by status |
-| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item) |
-| POST | `/api/workers/add` · `/api/workers/remove` | Add or remove pool workers live (`{"worker_type": "CPU"\|"GPU", "count": N}`). A CPU change is also saved as the **CPU workers** setting, just like the dashboard's +/- buttons. That setting goes from 0 to 32: an add that would pass 32 gets a `400` with nothing changed, and a remove from a count saved above 32 lands on 32. A busy worker that's removed finishes its current file first. GPU changes aren't saved; they last until the next Settings save, job start or restart. |
-| POST | `/api/jobs/{id}/workers/add` · `/api/jobs/{id}/workers/remove` | Per-job worker adjustment while the job runs. Not saved; lasts until the next Settings save, job start or restart. |
+| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`) |
+| POST | `/api/workers/add` · `/api/workers/remove` | Compatibility scaling: `{"worker_type":"CPU"\|"GPU","count":N,"group_id":"..."}`. Changes a saved group; omit `group_id` only when exactly one group matches the resource. Ambiguous selection returns `409`. Busy removed workers finish their current file. |
+| POST | `/api/jobs/{id}/workers/add` · `/api/jobs/{id}/workers/remove` | Compatibility aliases for a running job; select the group as above. Changes the shared saved group, not a temporary allocation exclusive to that job. |
 
 ### Schedules
 
 | Method | Endpoint | Description |
 |---|---|---|
 | POST | `/api/schedules/{id}/enable` · `/api/schedules/{id}/disable` | Toggle a schedule without deleting it |
-| GET · POST | `/api/quiet-hours` | Read / write the multi-window quiet-hours policy (days of week + start/stop times) |
+| GET · POST | `/api/quiet-hours` | Read/write the global quiet-hours policy, now edited under Settings → Global pause. `day_basis: "start"` identifies start-day windows: Monday 23:00–07:00 ends Tuesday morning. Existing legacy windows are split during migration to retain their previous effective weekdays. |
 
 ### Settings & setup
 

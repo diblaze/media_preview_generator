@@ -49,7 +49,7 @@ When you first access the web interface, you'll be guided through a **Setup Wiza
    - **Jellyfin** — enter the URL and run a **Quick Connect** ceremony (or paste an API key).
 2. **Server & libraries** — finish the selected server's connection. Plex includes server and library selection; Emby/Jellyfin manage libraries later from **Servers → Configure → Libraries**.
 3. **Paths** — confirm the server's output location and media path mappings. Plex needs a writable data folder for BIFs; Emby and Jellyfin's default layout need writable media. Jellyfin off-media output has its own config-mount and plugin requirements.
-4. **Processing Options** — per-GPU enable/workers/FFmpeg threads, CPU workers, thumbnail interval, and quality.
+4. **Processing Options** — named CPU/GPU worker groups, allowed jobs and availability, per-device FFmpeg tuning, thumbnail interval, and quality.
 5. **Security** — view or replace your access token (optional).
 
 After setup completes, you'll land on the dashboard. You can add additional servers (any vendor, any number) at any time from **Servers → Add Server** without re-running the wizard.
@@ -186,12 +186,12 @@ The full worker grid remains above the list, including idle workers.
 **Pause / Resume (global):**
 
 - **Pause Processing** — Stops all processing system-wide: no new jobs will start (manual, scheduled, or webhook), and the current job stops dispatching new tasks. Files already mid-process stop where they are and carry on from there when you resume (nothing is killed or lost). Use this to cap bandwidth or pause overnight.
-- **Resume Processing** — Clears the global pause; new jobs can start and the current job resumes dispatching.
+- **Resume Processing** — Clears your manual global pause. Quiet hours can still hold processing until their window ends.
 - One global control appears beside **Clear Jobs** in **All jobs**. State is persisted and survives restarts.
-- An **Intro & Credits** job also has its own **Pause** button on its row: files already in progress finish, the job
-  hands its slot back so other jobs can run, and it waits until you click its **Resume**. **Pause Processing**, quiet
-  hours and a schedule's stop time hold it too, and stop its files in progress where they are, as they do previews.
-  **Resume Processing** doesn't resume a job you paused on its own.
+- Each pending or running job has its own **Pause** and **Resume**, including Previews, Intro & Credits and loudness.
+  Pausing one job does not pause other jobs. Manual and schedule holds are independent: resuming by hand cannot
+  clear a schedule stop, and a schedule start cannot clear a manual pause. Global **Resume Processing** does not
+  resume a job you paused on its own.
 
 **Scheduling:**
 
@@ -226,14 +226,74 @@ Access settings at `/settings` to manage:
 - **Plex Connection** — re-authenticate, test connection
 - **Libraries** — select which libraries to process
 - **Path Mappings** — media path, Plex videos path, local videos path
-- **Processing Options** — per-GPU settings (enable/disable, workers, FFmpeg threads), CPU threads, thumbnail interval and quality
+- **Workers** — named groups, job permissions, counts and availability
+- **Global pause** — optional quiet hours that pause all processing
+- **Processing Options** — per-device FFmpeg tuning, job limits, thumbnail interval and quality
 
 > For per-server settings audits (Plex FSEvent flags, Jellyfin trickplay flags,
 > Media Preview Bridge plugin presence, Plex config folder writability, path
 > mappings), open **Servers → Configure → Setup Health**. Full per-check reference:
 > [Setup Health guide](guides/previews-readiness.md).
 
-The Settings page and the Automation page's **Triggers** tab **save automatically as you edit** — there's no Save button. Toggles, sliders, and dropdowns commit immediately; text fields commit on blur (or ~1 s after you stop typing). A small status indicator in the page header shows `Saving…` / `Saved at HH:MM` so you can tell the change landed. If a save fails (e.g. the backend is down), the indicator shows an error and you can click it to retry.
+Most Settings controls and the Automation page's **Triggers** tab **save automatically as you edit**. Worker group edits use **Apply changes**, and global quiet hours have their own **Save** button. Toggles, sliders, and dropdowns commit immediately; text fields commit on blur (or ~1 s after you stop typing). A small status indicator in the page header shows `Saving…` / `Saved at HH:MM` so you can tell the change landed. If a save fails (e.g. the backend is down), the indicator shows an error and you can click it to retry.
+
+### Worker groups and availability
+
+Open **Settings → Workers** to choose which jobs can use your hardware. A group has a name, a CPU or detected GPU,
+its number of workers, allowed job types, and either **Always** or weekly availability. Start with one group per
+resource; add groups when different jobs need different counts or hours. Use **Edit** for the details, then
+**Apply changes** to save the whole group configuration. An edit in another browser or a dashboard count change
+causes a conflict instead of silently overwriting the newer settings; discard and reload before applying again.
+
+CPU groups can run **Video previews**, **Intro & Credits** and **Plex loudness**. GPU groups can run previews and
+Intro & Credits; loudness requires CPU workers. Chapters stay part of Previews. These permissions select jobs:
+a GPU video job can still use CPU stages or CPU fallback. Per-device FFmpeg tuning stays in Processing Options.
+A worker is a simultaneous file operation, not a CPU core or a fixed percentage of CPU usage.
+
+For example, keep four GPU workers for video jobs and add one CPU worker allowing only loudness. That permits one
+audio analysis at a time without assigning video jobs to that CPU group. The normal concurrent-job limit still
+applies. A GPU-only installation keeps working for video, but loudness waits until you add an eligible CPU group.
+Existing native Plex loudness measurements remain visible in the Inspector while it waits.
+
+The dashboard changes saved capacity immediately:
+
+- **+ / −** change one named group. A decrease retires workers from that group after their current files finish;
+  an increase can restore compatible workers that were about to retire. At one worker, **−** disables the group
+  and remembers its count. The Enabled switch restores that saved count.
+- **Desired** is the enabled group's saved count. **Available**, **Busy** and **Finishing** show its current
+  activity; they can differ while hours close or capacity shrinks. Disabled and outside-hours groups are distinct.
+  No workers means waiting for capacity, not a global pause: current files can still finish.
+- Counts from different open groups add, including groups on the same device. Overlapping windows within one group
+  do not multiply its workers. Finishing files still use the shared resource budget, so a newly opened group may
+  wait for them. The weekly peak is limited to 32 CPU and 32 GPU workers across groups.
+
+There are three separate timing controls:
+
+1. **Job schedules**, on **Automation → Schedules**, create or resume jobs. Their optional stop time holds that
+   schedule's jobs and pauses active processing for those jobs. It does not disable a worker group.
+2. **Worker availability**, on **Settings → Workers**, controls new file starts. Closing a window lets current
+   files finish; it does not create jobs or promise silence at the closing time. Select the days a window starts:
+   Monday 23:00–07:00 means Monday night through Tuesday morning, in the displayed app timezone.
+3. **Global quiet hours**, on **Settings → Global pause**, pause all processing, including active files. Scheduled
+   ticks during global pause are skipped, with no catch-up promise; manual and webhook requests can queue.
+   Opening a worker window or ending quiet hours never clears a manual **Pause all**.
+
+A job distinguishes no compatible configured workers, workers outside their hours, busy workers, and a full job
+limit. Resource waiting does not spend retries. A waiting job keeps its ID and saved remaining work; when capacity
+returns it rechecks unfinished files and continues with its settled counts and force settings. These intentional
+capacity waits survive restart even when automatic requeue after a crash is off; manual and schedule holds remain
+in place. The automatic requeue setting still controls ordinary work interrupted while running. Recovery can
+recheck a file whose final result was not saved; it does not promise byte-level FFmpeg continuation.
+Repeated schedule ticks can share an unstarted pending request for the same scope; Recently Added also widens its
+lookback when needed. A started or parked pass is not silently expanded. Manual runs remain separate, and webhook
+batching keeps its existing rules.
+
+**Upgrading:** existing CPU/GPU allocations become Always groups, preserving an explicit CPU count of zero. Newly
+detected GPUs are offered for selection; they do not silently add capacity. An explicitly empty group list stays
+empty. The old automatic pause for zero workers is replaced by resource waiting. A known automatic hold is cleared;
+a saved pause of uncertain origin is kept as manual. Existing overnight quiet hours are split where necessary to
+preserve their previous effective weekdays; new windows use start days. Review the migrated groups and quiet hours
+in Settings. No Plex preference or job schedule is enabled by this migration.
 
 ### Plex chapter thumbnails
 
@@ -351,7 +411,7 @@ Settings are saved to `/config/settings.json` and persist across restarts.
 The **Automation** page (`/automation`) hosts two tabs:
 
 - **Triggers** — incoming webhooks from Radarr, Sonarr, Tdarr / custom scripts, and Plex Direct. Also houses the Recently Added Scanner shortcut. This is where you wire the app up to whatever puts media into Plex.
-- **Schedules** — full CRUD for recurring scans (cron / interval / specific time). Both Full library and Recently-Added scanners live here.
+- **Schedules** — recurring job starts and optional stops (cron / interval / specific time). Worker hours and global quiet hours live in Settings; see [Worker groups and availability](#worker-groups-and-availability).
 
 The Triggers tab includes:
 
@@ -1621,14 +1681,15 @@ Use this table to diagnose common failures quickly.
 | `GPU permission denied` | Container user cannot access GPU device files | Set `PUID`/`PGID` to a user with GPU access; on Unraid use `PUID=99`, `PGID=100`. |
 | `Plex config folder does not exist` / unwritable | Incorrect mount or wrong `plex_config_folder` | Confirm the mounted `/plex` path contains `Cache`, `Media`, and `Metadata`. Setup Health surfaces this per-Plex-server. |
 | `Connection failed` on a server card | Bad URL, unreachable host, or invalid token | Use server IP (not `localhost` in Docker), verify the server is running, and test the URL + token with curl. |
-| Webhook job sits in **Pending** for a long time | The concurrent-job gate is full — active jobs are running at capacity | Check **Settings → Processing Options → Incoming job priority** is **High** (the default) so webhook jobs take the reserved slot instead of queueing. Otherwise wait for a slot to free up (priority-ordered), raise the cap, or check the global **Pause Processing** toggle isn't on. Pausing ≠ cancelling — paused jobs stay in Pending. |
+| Job waits for workers | No compatible enabled group, outside group hours, unavailable GPU, or compatible workers busy | Read the waiting reason. In **Settings → Workers**, check job permissions, hours and hardware. Loudness needs a CPU group. Outside hours normally resolves at the next opening; busy workers finish their current files. |
+| Job waits for a job slot | The concurrent-job gate is full | Check **Settings → Processing Options → Incoming job priority** and the concurrent-job limit. Available workers do not bypass that limit. Check global and per-job pause holds too. |
 | Webhook returns `401` | Invalid or missing authentication | In Sonarr/Radarr webhook settings, leave **Username** empty and set **Password** to your API token or webhook secret. |
 | Webhook test passes but imports do not trigger jobs | Wrong webhook events or webhooks disabled | Enable **On Import** in Radarr/Sonarr and verify `webhook_enabled=true`. |
 | Log warns `Webhook from sonarr: ignored '…' — the payload didn't carry a file path` | The sender's payload has no file path anywhere: no `episodeFile`, no `episodeFiles[]`, no `filePath` (Sonarr's own "On Import Complete" event lists its files, so it never causes this) | Check the sender posts Sonarr's standard webhook body; a custom template or a proxy that rewrites the body must keep `episodeFile.path` (or `series.path` + `episodeFile.relativePath`). |
 | New files are imported but previews are not generated | Plex indexing delay or wrong library mapping | Increase webhook delay and verify Radarr/Sonarr library mapping in Webhooks settings. |
 | Job warning: "N file(s) still weren't indexed by the media server after N retries, so no more retries are queued. The next scheduled scan will pick them up." | The media server hadn't added the file to its library by the last retry | Nothing, if you have a scheduled scan: it picks the file up once the server has it. Otherwise raise **Retry count** or **Initial retry delay** (Settings → Retry policy), or check the file is under a library folder the server scans. |
 | Radarr/Sonarr cannot reach webhook URL | Network routing or hostname issue | Use host IP or reachable Docker hostname (not `localhost`), then verify firewall and port `8080`. |
-| New job starts after I paused | Global pause not set or UI not refreshed | Use **Pause Processing** (Current Job or Job Queue header). Pause is global and persisted; in-flight files finish before workers idle. |
+| New job starts after I paused | Global pause not set or UI not refreshed | Use **Pause Processing** (Current Job or Job Queue header). Global pause is persisted and pauses in-flight processing. Group reductions and closing worker hours instead let current files finish. |
 | DV Profile 5 thumbnails have a green and purple tint, and the log warns that no working Vulkan device was found | The container can't reach a hardware Vulkan device, so the app skips Profile 5 tone mapping and extracts plain frames instead | Pass an iGPU to the container with `--device /dev/dri:/dev/dri` (Intel/AMD), or for NVIDIA set `NVIDIA_DRIVER_CAPABILITIES=all` so the NVIDIA Vulkan driver gets injected. Most users already pass `/dev/dri` for hardware video acceleration, which brings the Vulkan driver along for free. |
 
 ### Validate Plex Config Path

@@ -300,69 +300,81 @@ def _resume_interrupted_retry_chains_on_startup(config_dir: str) -> None:
     the user can re-trigger via the source webhook or the manual
     ``/reprocess`` endpoint.
 
-    Age cap: chains older than 24h aren't auto-recovered. Re-firing
-    days-old webhook context risks publishing against media that has
-    been moved or deleted upstream.
+    Age cap: abandoned chains older than 24h aren't auto-recovered.
+    An intentional capacity wait with a living restored child keeps its
+    visible head, even when worker availability spans multiple days.
     """
     try:
         job_manager = get_job_manager()
         chains = job_manager.consume_interrupted_retry_chains()
+        restored_chain_ids = job_manager.consume_restored_capacity_chain_ids()
         if not chains:
             return
 
         now = datetime.now(UTC)
         max_chain_age = _MAX_CHAIN_AGE_FOR_RESUME
-        all_jobs = job_manager.get_all_jobs()
         revived = 0
         orphaned = 0
         for chain in chains:
-            # Age check — chains older than 24h shouldn't suddenly spring
-            # back to life. The original webhook context is likely stale;
-            # better to surface the failure than re-fire against
-            # potentially-deleted media.
-            try:
-                started_str = chain.config.get("retry_started_at") or chain.created_at
-                started = datetime.fromisoformat(started_str.replace("Z", "+00:00")) if started_str else now
-                if started.tzinfo is None:
-                    started = started.replace(tzinfo=UTC)
-            except (ValueError, AttributeError):
-                started = now
-            if now - started > max_chain_age:
+            # Completion/cancel and child creation share this lock. Read the
+            # current child set and settle the head in the same critical section.
+            with job_manager._lock:  # noqa: SLF001
+                all_jobs = job_manager.get_all_jobs()
+                # A restored watcher may finish before this later boot phase.
+                if chain.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                    continue
+                living_children = [
+                    job
+                    for job in all_jobs
+                    if job.config.get("is_retry")
+                    and job.config.get("parent_job_id") == chain.id
+                    and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
+                ]
+                # A restored attempt may already have queued its successor.
+                # Keep the chain's restoration identity, not just the identity
+                # of whichever child is currently waiting or running.
+                durable_wait = bool(living_children) and chain.id in restored_chain_ids
+                # Age check — chains older than 24h shouldn't suddenly spring
+                # back to life. The original webhook context is likely stale;
+                # better to surface the failure than re-fire against
+                # potentially-deleted media.
+                try:
+                    started_str = chain.config.get("retry_started_at") or chain.created_at
+                    started = datetime.fromisoformat(started_str.replace("Z", "+00:00")) if started_str else now
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=UTC)
+                except (ValueError, AttributeError):
+                    started = now
+                if now - started > max_chain_age and not durable_wait:
+                    chain.status = JobStatus.FAILED
+                    chain.error = (
+                        "Chain resume: skipped — chain has been pending for >24h. "
+                        "Re-trigger the source webhook if you still want these files processed."
+                    )
+                    chain.completed_at = now.isoformat()
+                    job_manager._persist_job(chain)  # noqa: SLF001
+                    orphaned += 1
+                    continue
+
+                # Look for a living retry child. PENDING children will be
+                # revived by the generic requeue; RUNNING children… well,
+                # the generic load path marks RUNNING jobs FAILED, so by
+                # the time we get here a "running at restart" retry child
+                # has already been demoted to FAILED — its status here
+                # would be FAILED, not RUNNING.
+                if living_children:
+                    revived += 1
+                    continue
+
                 chain.status = JobStatus.FAILED
                 chain.error = (
-                    "Chain resume: skipped — chain has been pending for >24h. "
-                    "Re-trigger the source webhook if you still want these files processed."
+                    "Retry chain interrupted by restart — no pending child Job survived. "
+                    "Re-trigger the source webhook (or use the Reprocess action) to "
+                    "resume processing of the remaining files."
                 )
                 chain.completed_at = now.isoformat()
                 job_manager._persist_job(chain)  # noqa: SLF001
                 orphaned += 1
-                continue
-
-            # Look for a living retry child. PENDING children will be
-            # revived by the generic requeue; RUNNING children… well,
-            # the generic load path marks RUNNING jobs FAILED, so by
-            # the time we get here a "running at restart" retry child
-            # has already been demoted to FAILED — its status here
-            # would be FAILED, not RUNNING.
-            has_living_child = any(
-                (j.config.get("is_retry"))
-                and (j.config.get("parent_job_id") == chain.id)
-                and (j.status in (JobStatus.PENDING, JobStatus.RUNNING))
-                for j in all_jobs
-            )
-            if has_living_child:
-                revived += 1
-                continue
-
-            chain.status = JobStatus.FAILED
-            chain.error = (
-                "Retry chain interrupted by restart — no pending child Job survived. "
-                "Re-trigger the source webhook (or use the Reprocess action) to "
-                "resume processing of the remaining files."
-            )
-            chain.completed_at = now.isoformat()
-            job_manager._persist_job(chain)  # noqa: SLF001
-            orphaned += 1
 
         if revived:
             logger.info(
@@ -484,7 +496,9 @@ def _requeue_interrupted_on_startup(config_dir: str) -> None:
     """Revive jobs that were running or pending when the server last stopped.
 
     Reads the ``auto_requeue_on_restart`` and ``requeue_max_age_minutes``
-    settings to decide whether and which jobs to revive.  Revived jobs
+    settings to decide whether and which interrupted jobs to revive.
+    Committed pending capacity waits and their pending followers are
+    restored independently: no active work was interrupted. Revived jobs
     keep their original ID and ``created_at`` and are started via the
     normal async path.
     """
@@ -496,39 +510,33 @@ def _requeue_interrupted_on_startup(config_dir: str) -> None:
         auto_requeue_enabled = (
             raw_enabled if isinstance(raw_enabled, bool) else str(raw_enabled).strip().lower() in ("true", "1", "yes")
         )
+        job_manager = get_job_manager()
+        waiting = job_manager.restore_capacity_waits()
+        paused = settings.processing_paused
         if not auto_requeue_enabled:
             logger.info("Auto-requeue on restart is disabled")
             _fail_unrevived_own_runner_jobs()
             _fail_unrevived_preview_jobs()
-            return
-
-        # A pause from the previous session is honored across the restart —
-        # an explicit pause is intent that outlives a container bounce (the
-        # operator may have paused to stop GPU load, then restarted for an
-        # unrelated reason). Interrupted jobs are still revived, but the start
-        # path leaves them PENDING while paused (job_runner.py); resuming
-        # processing starts every pending job (api_jobs.resume_processing).
-        paused = settings.processing_paused
-
-        max_age = int(settings.get("requeue_max_age_minutes", 720))
-        job_manager = get_job_manager()
-        revived = job_manager.requeue_interrupted_jobs(max_age_minutes=max_age)
-        # A follow-up waits for its preview job. One whose preview job the restart keeps (revived, or held by the pause
-        # below) stays with it whatever its own age, so a restart never keeps a file's previews and drops its markers;
-        # one whose preview job had finished was aged from that job's end above (requeue_interrupted_jobs).
-        kept = {job.id for job in revived}
-        if paused:
-            kept |= {
-                job.id
-                for job in job_manager.unrevived_interrupted_jobs()
-                if job.kind == JOB_KIND_PREVIEWS and job.status is JobStatus.PENDING
-            }
-        revived = [*revived, *job_manager.requeue_interrupted_followers(kept)]
-        _fail_unrevived_own_runner_jobs()
-        if not paused:
-            # While paused, the older ones are jobs the pause is holding (a webhook queued during a long pause
-            # isn't re-sent), so they stay PENDING and Resume starts them, as it would have without the restart.
-            _fail_unrevived_preview_jobs()
+            revived = list(waiting)
+        else:
+            # The normal start path honors global and per-job holds. A pause
+            # remains intent across restarts; restoring a watcher cannot clear it.
+            max_age = int(settings.get("requeue_max_age_minutes", 720))
+            revived = [*waiting, *job_manager.requeue_interrupted_jobs(max_age_minutes=max_age)]
+            # Keep followers with the preview jobs retained by recovery or an
+            # existing pause, regardless of their own age.
+            kept = {job.id for job in revived}
+            if paused:
+                kept |= {
+                    job.id
+                    for job in job_manager.unrevived_interrupted_jobs()
+                    if job.kind == JOB_KIND_PREVIEWS and job.status is JobStatus.PENDING
+                }
+            revived = [*revived, *job_manager.requeue_interrupted_followers(kept)]
+            _fail_unrevived_own_runner_jobs()
+            if not paused:
+                # Old requests held by a global pause remain queued until Resume.
+                _fail_unrevived_preview_jobs()
 
         if not revived:
             return
@@ -886,21 +894,9 @@ def create_app(config_dir: str | None = None) -> Flask:
     # startup so a restart that lands inside any active window is paused
     # immediately, not silently active until the next boundary cron fires.
     try:
-        from .scheduler import is_now_in_any_quiet_window
-
-        qh = sm.get("quiet_hours") or {}
-        schedule_manager.apply_quiet_hours(qh)
-        if is_now_in_any_quiet_window(qh) and not sm.processing_paused:
-            sm.processing_paused = True
-            from .jobs import get_job_manager as _gjm
-
-            try:
-                _gjm().emit_processing_paused_changed(True)
-            except Exception:
-                pass
-            from loguru import logger as _qh_logger
-
-            _qh_logger.info("Quiet hours: started inside an active window — processing paused on startup")
+        # Applying settings recomputes only quiet-hours ownership, preserving
+        # an independent manual hold and correcting missed boundaries.
+        schedule_manager.apply_quiet_hours(sm.get("quiet_hours") or {}, drain=False)
     except Exception:
         from loguru import logger as _qh_logger
 

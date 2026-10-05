@@ -39,7 +39,7 @@ def settings_page(authed_page: Page, app_url: str) -> Page:
     mock_system_status(authed_page)
     capture_settings_save(authed_page)
     authed_page.goto(f"{app_url}/settings")
-    expect(authed_page.locator("#gpuConfigList .card")).to_have_count(2)
+    expect(authed_page.locator("#gpuConfigList .gpu-tuning-threads")).to_have_count(2)
     return authed_page
 
 
@@ -103,22 +103,9 @@ def test_mobile_automation_jumps_switch_panes_and_follow_hash(authed_page: Page,
     page.set_viewport_size(PHONE)
     page.goto(f"{app_url}/automation")
     page.locator('[data-automation-mobile-target="quiet-hours"]').click()
-    expect(page.locator('[data-automation-mobile-target="quiet-hours"]')).to_have_attribute(
-        "aria-current", re.compile("^(page|location|true)$")
-    )
-    expect(page.locator("#pane-schedules")).to_be_visible()
-    expect(page.locator("#pane-triggers")).to_be_hidden()
-    expect(page).to_have_url(re.compile(r"#section-schedules-quiet-hours$"))
-    _expect_landed(page, "section-schedules-quiet-hours")
-    destination = page.locator("#section-schedules-quiet-hours").bounding_box()
-    navigation = page.locator("#automationMobileNav").bounding_box()
-    assert destination and navigation
-    assert destination["y"] >= navigation["y"] + navigation["height"]
-    expect(page.locator("#automationMobileFeedback")).to_contain_text(re.compile("Quiet hours", re.I))
-
-    page.locator('[data-automation-mobile-target="triggers"]').click()
-    expect(page.locator("#pane-triggers")).to_be_visible()
-    expect(page.locator("#pane-schedules")).to_be_hidden()
+    expect(page).to_have_url(re.compile(r"/settings#section-worker-quiet-hours$"))
+    _expect_landed(page, "section-worker-quiet-hours")
+    expect(page.locator("#quietHoursSaveBtn")).to_be_visible()
     page.goto(f"{app_url}/automation#section-schedules-list")
     expect(page.locator("#pane-schedules")).to_be_visible()
     expect(page.locator("#automationMobileFeedback")).to_contain_text("Schedules")

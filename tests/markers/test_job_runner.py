@@ -286,6 +286,11 @@ def _item(path="/m/a.mkv"):
 
 @pytest.fixture
 def env(monkeypatch):
+    # These unit cases exercise marker lifecycle after capacity admission. Real
+    # group waiting/parking is covered by the dedicated dispatcher lifecycle tests.
+    monkeypatch.setattr(job_runner, "wait_for_capacity", MagicMock(return_value=True))
+    monkeypatch.setattr(job_runner, "runtime_capacity", lambda kind: {"open": 1})
+    monkeypatch.setattr(job_runner, "refresh_worker_groups", MagicMock(return_value=False))
     jm = MagicMock()
     job = MagicMock(id="j1", kind=JOB_KIND_INTRO_CREDITS, priority=3, paused=False, config={"libraries": []})
     jm.get_job.return_value = job
@@ -1381,7 +1386,6 @@ class TestRun:
         env.job.config = {"reconcile": True, "source": "reconcile"}
         env.job.priority = 2
         paused = iter([True, True, False])
-        env.jm.is_pause_requested.side_effect = lambda job_id: next(paused, False)
         sleeps = []
 
         def sleep(seconds):
@@ -1392,6 +1396,7 @@ class TestRun:
         seen = []
 
         def listing(**kwargs):
+            env.jm.is_pause_requested.side_effect = lambda job_id: next(paused, False)
             seen.append((kwargs["cancel_check"](), env.gate.release.call_args_list[:], env.gate.acquire.call_count))
             from media_preview_generator.markers import reconcile
 
@@ -1435,15 +1440,15 @@ class TestRun:
 
     def test_a_cancel_while_paused_during_the_read_back_ends_the_wait(self, env, monkeypatch):
         env.job.config = {"reconcile": True, "source": "reconcile"}
-        env.jm.is_pause_requested.return_value = True
         cancels = iter([False, False, True])
-        env.jm.is_cancellation_requested.side_effect = lambda job_id: next(cancels, True)
         monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=lambda s: None))
         from media_preview_generator.markers import reconcile
 
         answers = []
 
         def listing(**kwargs):
+            env.jm.is_pause_requested.return_value = True
+            env.jm.is_cancellation_requested.side_effect = lambda job_id: next(cancels, True)
             answers.append(kwargs["cancel_check"]())
             return reconcile.CheckServersListing([], [])
 
@@ -1458,7 +1463,7 @@ class TestRun:
         from media_preview_generator.markers import reconcile
 
         env.job.config = {"reconcile": True, "source": "reconcile"}
-        state = {"paused": True}
+        state = {"paused": False}
         env.jm.is_pause_requested.side_effect = lambda job_id: state["paused"]
         sleeps = []
 
@@ -1478,6 +1483,7 @@ class TestRun:
         seen = []
 
         def listing(**kwargs):
+            state["paused"] = True
             seen.append((kwargs["cancel_check"](), env.gate.release.call_args_list[:], env.gate.acquire.call_count))
             return reconcile.CheckServersListing([], [])
 
@@ -1533,9 +1539,6 @@ class TestRun:
         job_runner.run_intro_credits_job("j1")
         env.jm.update_progress.assert_any_call(
             "j1",
-            percent=0,
-            processed_items=0,
-            total_items=0,
             current_item="Queued — waiting for active slot (3 of 3 busy)",
         )
         env.jm.cancel_job.assert_called_once_with("j1")
@@ -1817,7 +1820,7 @@ class TestRestart:
         monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
         with patch.object(job_runner, "build_items", return_value=([_item()], [], {})):
             job_runner.run_intro_credits_job("j1")
-        assert order[:2] == ["start", "pause"]
+        assert order[:2] == ["pause", "start"]
         # A stop-time pause is held as one, so the schedule's next start still resumes it; a pause by hand isn't.
         env.jm.request_pause.assert_called_once_with("j1", by_schedule=by_schedule)
         assert len(sleeps) == 2
@@ -1838,11 +1841,9 @@ class TestRestart:
         env.jm.cancel_job.assert_called_once_with("j1")
         env.dispatcher.submit_items.assert_not_called()
 
-    @pytest.mark.parametrize(("kind", "keeps_pause"), [(JOB_KIND_INTRO_CREDITS, True), (JOB_KIND_PREVIEWS, False)])
+    @pytest.mark.parametrize(("kind", "keeps_pause"), [(JOB_KIND_INTRO_CREDITS, True), (JOB_KIND_PREVIEWS, True)])
     @pytest.mark.parametrize("by_schedule", [False, True], ids=["by-hand", "by-stop-time"])
-    def test_requeue_after_restart_keeps_only_an_intro_credits_jobs_own_pause(
-        self, tmp_path, kind, keeps_pause, by_schedule
-    ):
+    def test_requeue_after_restart_keeps_each_kinds_owned_pause(self, tmp_path, kind, keeps_pause, by_schedule):
         from media_preview_generator.web.jobs import JobManager, JobStatus
 
         config_dir = str(tmp_path)
@@ -1882,7 +1883,7 @@ class TestRestart:
 
         monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
         assert job_runner.hold_pause_from_before_restart(job.id, lambda: False) is True
-        assert held == [(JobStatus.RUNNING, True, True)]
+        assert held == [(JobStatus.PENDING, True, True)]
         assert not after.get_job(job.id).paused
 
     def test_startup_revival_runs_each_intro_credits_job_once_and_creates_no_jobs(self, tmp_path, monkeypatch):
@@ -3909,7 +3910,12 @@ class TestStartAsync:
         monkeypatch.setattr(job_runner, "get_job_manager", lambda: jm)
         monkeypatch.setattr(job_runner, "run_intro_credits_job", lambda jid: None)
         job_runner.start_intro_credits_job_async(job.id, {"libraries": [], "force": True})
-        assert jm.get_job(job.id).config == {"libraries": [], "force": True, PAUSED_BY_SCHEDULE: True}
+        assert jm.get_job(job.id).config == {
+            "libraries": [],
+            "force": True,
+            PAUSED_BY_SCHEDULE: True,
+            "pause_reasons": ["schedule"],
+        }
 
 
 @pytest.mark.parametrize(("kind", "delegated"), [(JOB_KIND_INTRO_CREDITS, True), (JOB_KIND_PREVIEWS, False)])

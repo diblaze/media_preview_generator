@@ -84,7 +84,8 @@ a marker in the Inspector.
 ## Features
 
 **GPU first, CPU when needed**
-- **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Each GPU passed to the container gets its own workers.
+- **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed to the container.
+- **Named worker groups.** Choose each group's job types, worker count and weekly hours. Dashboard +/− changes are saved; reducing capacity lets current files finish. [Worker guide](docs/guides.md#worker-groups-and-availability).
 - **CPU fallback built in.** A file the GPU can't decode is retried on the CPU by the same worker.
 - **Key-frame skipping.** Jumps between key frames when a file's key-frame spacing allows it.
 
@@ -115,7 +116,7 @@ range. Combine filters while keeping existing previews. See the
 - **Emby.** Emby 4.9 or 4.10, with the Media Preview Bridge for Emby plugin. Skip Intro needs Emby Premiere; Skip Credits doesn't.
 
 **Plex loudness**
-- **Normalize Loudness sooner.** Analyses audio tracks on the same workers and stores loudness measurements in Plex. Off until you [turn it on](docs/plex-loudness-normalization.md) for a local Plex 1.43.4.x server; independent of Intro & Credits.
+- **Normalize Loudness sooner.** Analyses audio tracks on CPU worker groups and stores loudness measurements in Plex. Off until you [turn it on](docs/plex-loudness-normalization.md) for a local Plex 1.43.4.x server; independent of Intro & Credits.
 
 ## Where it fits
 

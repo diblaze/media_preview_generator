@@ -40,8 +40,8 @@ def _open(page: Page, app_url: str, path: str) -> list[dict]:
     page.goto(f"{app_url}{path}")
     page.wait_for_load_state("domcontentloaded")
     if path == "/settings":
-        # The per-GPU cards (and their ⓘs) render once /api/system/status answers.
-        expect(page.locator("#gpuConfigList .card").first).to_be_visible(timeout=5000)
+        # Device tuning renders once /api/system/status answers. Group allocation is a separate editor.
+        expect(page.locator("#gpuConfigList .gpu-tuning-threads").first).to_be_visible(timeout=5000)
     return page.evaluate(_AUDIT_JS)
 
 
@@ -93,13 +93,9 @@ class TestInfoIconRule:
         icon.click()
         expect(authed_page.locator("#globalInfoModal")).to_be_hidden()
 
-    def test_gpu_panel_icons_follow_the_rule(self, authed_page: Page, app_url: str) -> None:
-        # Formerly bare <i data-bs-toggle="tooltip"> icons rendered by gpu_config_panel.js.
+    def test_gpu_tuning_explains_where_worker_allocation_lives(self, authed_page: Page, app_url: str) -> None:
         _open(authed_page, app_url, "/settings")
-        icons = authed_page.locator("#gpuConfigList .info-icon")
-        expect(icons.first).to_be_visible()
-        assert icons.count() >= 2
-        expect(icons.first).to_have_attribute(
-            "data-bs-original-title",
-            "How many files this GPU works on at once. Each one uses GPU memory, so start with 1.",
-        )
+        panel = authed_page.locator("#gpuConfigList")
+        expect(panel.get_by_label("FFmpeg threads per worker").first).to_be_visible()
+        expect(panel).to_contain_text("0 = automatic. Worker counts and jobs are configured in groups.")
+        expect(panel.locator(".gpu-workers, .gpu-enable-toggle")).to_have_count(0)

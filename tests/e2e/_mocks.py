@@ -850,3 +850,68 @@ def mock_media_servers_status(page: Page, servers: list[dict] | None = None) -> 
             }
         ]
     page.route("**/api/system/media-servers", lambda r: _fulfill_json(r, {"servers": servers}))
+
+
+def mock_worker_groups(page: Page, *, cpu_count: int = 1) -> dict:
+    """Stateful group settings/scaling API, with writes exposed for assertions."""
+    state = {
+        "groups": [
+            {
+                "id": "cpu",
+                "name": "CPU workers",
+                "resource": "cpu",
+                "device": None,
+                "count": max(1, cpu_count),
+                "enabled": cpu_count > 0,
+                "job_types": ["previews", "intro_credits", "loudness"],
+                "availability": {"mode": "always", "windows": []},
+            },
+            {
+                "id": "gpu",
+                "name": "GPU video",
+                "resource": "gpu",
+                "device": "/dev/nvidia0",
+                "count": 1,
+                "enabled": True,
+                "job_types": ["previews", "intro_credits"],
+                "availability": {"mode": "always", "windows": []},
+            },
+        ],
+        "revision": 1,
+        "timezone": "Australia/Sydney",
+        "limits": {"cpu": 32, "gpu": 32},
+        "hardware": [{"device": "/dev/nvidia0", "name": "GPU 0", "type": "nvidia", "status": "ok"}],
+        "capacity": {"groups": []},
+        "warnings": [],
+    }
+    result = {"state": state, "writes": [], "error": None}
+
+    def handler(route: Route) -> None:
+        if route.request.method == "GET":
+            _fulfill_json(route, state)
+            return
+        body = route.request.post_data_json
+        result["writes"].append({"url": route.request.url, "method": route.request.method, "body": body})
+        if result["error"]:
+            route.fulfill(status=400, json={"error": result["error"]})
+            return
+        if route.request.method == "PUT":
+            if body["revision"] != state["revision"]:
+                route.fulfill(status=409, json={"error": "Worker groups changed"})
+                return
+            state["groups"] = body["groups"]
+        else:
+            group_id = route.request.url.split("/")[-2]
+            group = next(group for group in state["groups"] if group["id"] == group_id)
+            if "enabled" in body:
+                group["enabled"] = body["enabled"]
+            else:
+                count = (group["count"] if group["enabled"] else 0) + body["delta"]
+                group["enabled"] = count > 0
+                if count > 0:
+                    group["count"] = min(32, count)
+        state["revision"] += 1
+        _fulfill_json(route, state)
+
+    page.route("**/api/worker-groups**", handler)
+    return result
