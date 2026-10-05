@@ -481,7 +481,9 @@ class TestRequeueInterruptedOnStartup:
 
         _requeue_interrupted_on_startup("/tmp/config")
 
-        mock_get_job_manager.return_value.requeue_interrupted_jobs.assert_called_once_with(max_age_minutes=45)
+        mock_get_job_manager.return_value.requeue_interrupted_jobs.assert_called_once_with(
+            max_age_minutes=45, processing_paused=False
+        )
         assert [c.args for c in mock_get_job_manager.return_value.fail_unrevived_interrupted_jobs.call_args_list] == [
             ("intro_credits",),
             ("loudness",),
@@ -575,7 +577,7 @@ class TestRequeueInterruptedOnStartup:
 
         _requeue_interrupted_on_startup("/tmp/config")
 
-        jm.requeue_interrupted_jobs.assert_called_once_with(max_age_minutes=30)
+        jm.requeue_interrupted_jobs.assert_called_once_with(max_age_minutes=30, processing_paused=False)
         assert [c.args for c in jm.fail_unrevived_interrupted_jobs.call_args_list] == [
             ("intro_credits",),
             ("loudness",),

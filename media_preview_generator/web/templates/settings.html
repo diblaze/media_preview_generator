@@ -185,9 +185,10 @@
                     </div>
                     <div class="form-text">
                         When the server restarts, automatically re-queue any jobs that were running or waiting.
-                        Only jobs created within the configured time window are requeued; older ones are marked failed,
-                        unless processing is paused, when they wait for Resume. With this off, interrupted jobs are
-                        marked failed. Use Reprocess to run one again.
+                        The age limit applies to unpaused interrupted work. Jobs held by a global or per-job pause
+                        keep their place regardless of age and wait for their holds to clear. With this off,
+                        interrupted runs are marked failed; saved worker-capacity waits still survive.
+                        Use Reprocess to run a failed job again.
                     </div>
                 </div>
 
@@ -197,7 +198,7 @@
                     </label>
                     <input type="range" class="form-range" id="requeueMaxAge" min="5" max="1440" step="5" value="720">
                     <div class="form-text">
-                        How old a job can be to qualify for automatic requeue after restart (5 minutes – 24 hours).
+                        How old the last activity of unpaused interrupted work can be (5 minutes – 24 hours). Paused jobs are exempt.
                     </div>
                 </div>
 

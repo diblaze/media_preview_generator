@@ -1400,15 +1400,15 @@ class JobManager:
         """Take restored retry-chain identities, even if their attempts changed.
 
         Retry-head reconciliation follows watcher startup. Keep this transient
-        evidence until it can distinguish an intentional old wait from an
-        abandoned chain, without relying on mutable attempts or history retention.
+        evidence until it can distinguish an intentional capacity or pause wait
+        from an abandoned chain, without relying on mutable attempts or history retention.
         """
         with self._lock:
             restored = frozenset(self._restored_capacity_chain_ids)
             self._restored_capacity_chain_ids.clear()
             return restored
 
-    def requeue_interrupted_jobs(self, max_age_minutes: int = 720) -> list[Job]:
+    def requeue_interrupted_jobs(self, max_age_minutes: int = 720, *, processing_paused: bool = False) -> list[Job]:
         """Revive jobs that were interrupted by the last restart.
 
         Each interrupted job is restored to ``PENDING`` in place (same
@@ -1422,7 +1422,10 @@ class JobManager:
                 the due time of a job queued to wait when that is later)
                 is within this many minutes of the current time.  Older
                 jobs are considered stale and left as-is.
-                Range: 5 – 1440 (1 day).
+                Range: 5 – 1440 (1 day). Global and per-job holds exempt
+                valid timestamps from this age limit; pausing is intentional.
+            processing_paused: Whether a saved global pause currently holds
+                processing. This method is only used when crash recovery is enabled.
 
         Returns:
             List of revived ``Job`` objects ready to be started.
@@ -1453,7 +1456,8 @@ class JobManager:
                 # A job waiting for a gate slot is as old as the last time it was seen waiting (the runners refresh it
                 # while they wait), so a job queued behind a long scan is aged by the downtime only.
                 ref_time = max(ref_time, _parse_utc((job.config or {}).get(SLOT_WAIT_SINCE)) or ref_time)
-                if ref_time < cutoff and not (job.config or {}).get("resource_wait"):
+                held = processing_paused or bool(job_pause_reasons(job))
+                if ref_time < cutoff and not held and not (job.config or {}).get("resource_wait"):
                     logger.debug("Skipping revive of job {} — too old (ref={})", job.id[:8], ref_str)
                     not_revived.append(job)
                     continue
@@ -1469,6 +1473,15 @@ class JobManager:
             with self._lock:
                 for job in revived:
                     self._persist_job(job)
+                    # Capture held-chain intent before watchers can finish/replace a retry child.
+                    cfg = job.config or {}
+                    parent = cfg.get("parent_job_id")
+                    if (
+                        (processing_paused or job_pause_reasons(job))
+                        and cfg.get("is_retry")
+                        and isinstance(parent, str)
+                    ):
+                        self._restored_capacity_chain_ids.add(parent)
 
         # Revived jobs leave the list; the ones left behind stay for fail_unrevived_interrupted_jobs.
         self._interrupted_jobs = not_revived

@@ -522,7 +522,10 @@ def _requeue_interrupted_on_startup(config_dir: str) -> None:
             # The normal start path honors global and per-job holds. A pause
             # remains intent across restarts; restoring a watcher cannot clear it.
             max_age = int(settings.get("requeue_max_age_minutes", 720))
-            revived = [*waiting, *job_manager.requeue_interrupted_jobs(max_age_minutes=max_age)]
+            revived = [
+                *waiting,
+                *job_manager.requeue_interrupted_jobs(max_age_minutes=max_age, processing_paused=paused),
+            ]
             # Keep followers with the preview jobs retained by recovery or an
             # existing pause, regardless of their own age.
             kept = {job.id for job in revived}
