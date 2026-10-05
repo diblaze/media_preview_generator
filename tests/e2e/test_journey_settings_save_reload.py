@@ -162,6 +162,7 @@ class TestSettingsSaveAndReloadPersists:
 
         backend_real_page.goto(f"{app_url}/settings")
         backend_real_page.wait_for_load_state("domcontentloaded")
+        expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("5", timeout=5000)
         expect(backend_real_page.locator("#markersHowItDecides")).to_be_visible(timeout=5000)
         expect(backend_real_page.locator("input[name='markersPublishWhen']")).to_have_count(0)
 
@@ -201,10 +202,11 @@ class TestSettingsSaveAndReloadPersists:
         backend_real_page.reload()
         backend_real_page.wait_for_load_state("domcontentloaded")
         expect(backend_real_page.locator("#markersHowItDecides")).to_be_visible(timeout=5000)
-        order = backend_real_page.locator("#markersSourceList .markers-source").evaluate_all(
-            "els => els.map((el) => el.dataset.id)"
-        )
-        assert order == expected_order
+        # The static help and default rows render before the saved settings GET completes.
+        sources = backend_real_page.locator("#markersSourceList .markers-source")
+        expect(sources).to_have_count(len(expected_order))
+        for index, source_id in enumerate(expected_order):
+            expect(sources.nth(index)).to_have_attribute("data-id", source_id)
 
     def test_retries_switched_off_stay_off_across_a_reload_and_the_next_save(
         self,
