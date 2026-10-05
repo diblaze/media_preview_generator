@@ -98,6 +98,32 @@ def test_worker_analyses_each_stream_once_and_writes_it(ctx, db, media):  # noqa
     assert job.check_item(_item(media), ctx=ctx).outcome_key == job.UP_TO_DATE
 
 
+def test_the_worker_percent_spans_the_files_streams(ctx, media):
+    def run(*args, progress, **kwargs):
+        progress(0.5, "10x")
+        return FIELDS
+
+    calls = []
+    with patch.object(job.analyze, "run", side_effect=run):
+        job.process_item(_item(media), ctx=ctx, progress_callback=lambda *a: calls.append(a))
+    # two streams: each starts at its share (0 %, 50 %) and reports halfway through (25 %, 75 %), with ffmpeg's speed
+    length = 424.0  # the fixture's stream length in seconds
+    assert calls == [
+        (0.0, 0.0, length, "0.0x"),
+        (25.0, length / 2, length, "10x"),
+        (50.0, 0.0, length, "0.0x"),
+        (75.0, length / 2, length, "10x"),
+    ]
+
+
+def test_a_failing_progress_display_never_fails_the_file(ctx, media):
+    def broken(*args):
+        raise RuntimeError("card gone")
+
+    with patch.object(job.analyze, "run", return_value=FIELDS):
+        assert job.process_item(_item(media), ctx=ctx, progress_callback=broken).outcome_key == job.WRITTEN
+
+
 def test_a_failed_stream_fails_the_file_but_keeps_the_others(ctx, db, media):  # noqa: F811
     def run(ffmpeg, path, index, **kwargs):
         if index == 2:

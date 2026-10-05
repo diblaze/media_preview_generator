@@ -213,9 +213,10 @@ def process_item(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
     phase_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     **_ignored,
 ) -> ItemOutcome:
-    """Worker stage: analyse each stream Plex lacks loudness for and write it. A GPU worker runs it on the CPU too."""
+    """Worker stage: analyse each stream Plex lacks loudness for and write it; the worker's percent follows ffmpeg."""
     if cancel_check and cancel_check():
         return ItemOutcome(FAILED, "Loudness analysis cancelled")
     path = item.canonical_path
@@ -256,6 +257,21 @@ def process_item(
                 break
             if phase_callback:
                 phase_callback(f"Loudness {n}/{len(todo)}")
+            length_s = (same[0].duration_ms or 0) / 1000
+
+            # The worker card's percent covers the file's streams on this server (a file two servers own runs 0-100 % per
+            # server): streams weigh equally, the current one by its position. Display only: a failing callback is logged.
+            def report(
+                fraction: float, speed: str, n: int = n, total: int = len(todo), length_s: float = length_s
+            ) -> None:
+                if not progress_callback:
+                    return
+                try:
+                    progress_callback(round((n - 1 + fraction) / total * 100, 1), fraction * length_s, length_s, speed)
+                except Exception as exc:
+                    logger.debug("Loudness progress update failed: {}", exc)
+
+            report(0.0, "0.0x")
             try:
                 fields = analyze.measure(
                     ctx.ffmpeg,
@@ -265,6 +281,7 @@ def process_item(
                     codec=same[0].codec,
                     cancel_check=cancel_check,
                     pause_check=ctx.freeze_check or pause_check,
+                    progress=report,
                 )
                 with cancellable_waits(cancel_check):
                     for stream in same:

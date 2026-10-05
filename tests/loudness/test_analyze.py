@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from unittest.mock import MagicMock
@@ -156,6 +157,36 @@ def test_a_job_cancelled_while_paused_never_starts_ffmpeg(tmp_path):
             cancel_check=lambda: True,
             pause_check=lambda: True,
         )
+
+
+def test_command_adds_the_progress_pipe_only_when_asked():
+    assert "-progress" not in analyze.command("ffmpeg", "/m/a.mkv", 3)
+    assert analyze.command("ffmpeg", "/m/a.mkv", 3, progress="pipe:7")[3:5] == ["-progress", "pipe:7"]
+
+
+def test_run_reports_progress_from_ffmpegs_progress_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(analyze, "_POLL_S", 0.05)
+    # writes one -progress block to the fd it was given, then the report on stderr
+    ffmpeg = _fake_ffmpeg(
+        tmp_path,
+        'for a; do case "$a" in pipe:*) fd=${a#pipe:};; esac; done\n'
+        "printf 'out_time_us=212000000\\nspeed=10x\\nprogress=continue\\n' > /dev/fd/$fd\n"
+        "sleep 0.3\ncat >&2 <<'EOT'\n" + REPORT + "\nEOT",
+    )
+    calls = []
+    fields = analyze.run(ffmpeg, "/m/a.mkv", 1, duration_ms=424000, progress=lambda f, s: calls.append((f, s)))
+    assert fields == PLEX_FIELDS
+    assert calls and calls[-1] == (0.5, "10x")
+
+
+def test_run_leaves_no_pipe_open_when_ffmpeg_never_starts():
+    fds = len(os.listdir("/proc/self/fd"))
+    for index in (-1, 1.5):
+        with pytest.raises(analyze.LoudnessError):
+            analyze.run("ffmpeg", "/m/a.mkv", index, duration_ms=1000)
+    with pytest.raises(ValueError):
+        analyze.run("ffmpeg", "/m/a\0.mkv", 1, duration_ms=1000)
+    assert len(os.listdir("/proc/self/fd")) == fds
 
 
 def test_run_reads_the_report_ffmpeg_prints(tmp_path):
