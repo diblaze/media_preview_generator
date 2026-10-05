@@ -67,3 +67,8 @@ Spike first (local only, `plans/ffmpeg-loudnorm-fast/`, never committed, E16); i
 - Deviation: binary choice in `analyze.measure()` (job.py calls it), not `run()`: fast build only when the configured ffmpeg is jellyfin-ffmpeg and `dpkg-query jellyfin-ffmpeg8` equals the release in `/usr/local/lib/ffmpeg-loudnorm/jellyfin-release`; failure retried with jellyfin-ffmpeg (not timeouts, not cancels). Stage amd64-only.
 - Local commits on feat/fast-loudnorm-ffmpeg: e9f3adb build(docker), 9f4209f feat(loudness). Not pushed; no PR (user).
 - Live test: thevault plex-generate-previews on local image `media_preview_generator:fast-loudnorm` (first build of the jellyfin-source binary, `/usr/local/bin/ffmpeg-loudnorm`, version-string twin check) since 22:55; anime loudness job 0c8964ce; spot checks `spotcheck.py` -> `spotcheck.jsonl`. The reviewed final image is `media_preview_generator:fast-loudnorm-2`.
+
+## Live result (2026-10-05)
+- Anime library (job 0c8964ce + resume): 596 streams written, 0 failed; spot checks vs official jellyfin-ffmpeg (full-length re-measure, random new streams): **39/39 identical** (opus 22, eac3 10, aac 7). Before the patch: 12 streams in 8 h; after: 496 in ~3 h.
+- Filmer 4K (job 5148dfcc, image fast-loudnorm-2): 25/25 written, 0 failed, 08:07-10:57; spot checks **6/6 identical** (truehd F1 2025, ac3 John Wick / Baby Driver, eac3 Harry Potter x2 / Glass Onion); stock jellyfin re-measure took 32-105 min per track.
+- Incident: Komodo's nightly image prune removed the unused local tag fast-loudnorm-2; rebuilt. A container restart at 02:00 (cause unknown, not investigated per user) revived the job under quiet hours.
