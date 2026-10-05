@@ -1728,7 +1728,7 @@ def _run_intro_credits_pass(job_id: str) -> bool | None:
     job = jm.get_job(job_id)
     if job is None:
         return
-    if is_live_retry_chain(job.config):
+    if (job.config or {}).get("is_retry_chain"):
         # Its hidden retry job runs the files still waiting; a resume that starts every pending job mustn't run the
         # whole job again.
         logger.info("Intro & Credits job {} not started — its retry runs the files still waiting", job_id)
@@ -2247,6 +2247,9 @@ def start_intro_credits_job_async(job_id: str, config_overrides: dict | None = N
         config_overrides: Keys merged into the job's config first (resume paths pass a snapshot of the job's own
             config); files that joined the job since the snapshot are kept.
     """
+    queued = get_job_manager().get_job(job_id)
+    if queued is None or (queued.config or {}).get("is_retry_chain"):
+        return
     if config_overrides:
         jm = get_job_manager()
         # Resume paths pass a snapshot of the job's config; files that joined it since (webhook episodes, Season

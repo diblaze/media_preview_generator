@@ -514,7 +514,7 @@ def resume_running_and_drain_pending() -> None:
     jm = get_job_manager()
     pending = sorted(jm.get_pending_jobs(), key=lambda j: (j.priority, j.created_at or ""))
     for pj in pending:
-        if not jm.is_pause_requested(pj.id):
+        if not (pj.config or {}).get("is_retry_chain") and not jm.is_pause_requested(pj.id):
             _start_job_async(pj.id, pj.config or {})
 
 
@@ -542,6 +542,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
         logger.error("Could not read job {} before starting; leaving it unchanged: {}", job_id, exc)
         return
     if queued is None:
+        return
+    # A retry head summarizes its children; its original scope must never run again.
+    # Check identity, not last_outcome, which changes while a child finishes.
+    if (queued.config or {}).get("is_retry_chain"):
         return
     if queued.kind == JOB_KIND_INTRO_CREDITS:
         from ...markers.job_runner import start_intro_credits_job_async
@@ -638,7 +642,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
             job_manager = get_job_manager()
             job = job_manager.get_job(job_id)
-            if not job:
+            if not job or (job.config or {}).get("is_retry_chain"):
                 return
             parked_reference = (job.config or {}).get("parked_checkpoint")
             continuation = None

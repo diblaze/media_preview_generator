@@ -3586,6 +3586,58 @@ class TestSchedulesCRUD:
 class TestReprocessJob:
     """Test /api/jobs/<id>/reprocess endpoint."""
 
+    @pytest.mark.parametrize("kind", ["previews", "intro_credits", "loudness"])
+    @pytest.mark.parametrize("outcome", ["completed", "exhausted"])
+    def test_explicit_head_rerun_dispatches_new_job_while_generic_resume_skips_head(self, client, kind, outcome):
+        from media_preview_generator.loudness import job as loudness_runner
+        from media_preview_generator.markers import job_runner as marker_runner
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes import job_runner as preview_runner
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        jm = get_job_manager()
+        get_settings_manager().processing_paused = False
+        head = jm.create_job(kind=kind, config={"file_paths": ["/test/original.mkv"]})
+        chain = dict(
+            canonical_path="",
+            basename="Original",
+            attempt=1,
+            max_attempts=3,
+            next_run_at=None,
+            wait_seconds=None,
+            originating_job_id=head.id,
+        )
+        jm.upsert_retry_chain_job(**chain, outcome="scheduled")
+        child = jm.create_job(kind=kind, config={"is_retry": True, "parent_job_id": head.id})
+        assert jm.request_pause(child.id)
+        with (
+            patch.object(preview_runner, "threading") as previews,
+            patch.object(marker_runner, "threading") as markers,
+            patch.object(loudness_runner, "threading") as loudness,
+        ):
+            preview_runner.resume_running_and_drain_pending()
+            for runner in (previews, markers, loudness):
+                runner.Thread.assert_not_called()
+            jm.complete_job(child.id)
+            jm.upsert_retry_chain_job(**chain, outcome=outcome)
+            response = client.post(f"/api/jobs/{head.id}/reprocess", headers=_api_headers())
+            assert response.status_code == 201
+            new_id = response.get_json()["id"]
+            new_job = jm.get_job(new_id)
+            assert new_id != head.id
+            assert new_job.kind == kind
+            assert new_job.config["file_paths"] == ["/test/original.mkv"]
+            assert "is_retry_chain" not in new_job.config
+            expected = {"previews": previews, "intro_credits": markers, "loudness": loudness}[kind]
+            expected.Thread.assert_called_once()
+            expected.Thread.return_value.start.assert_called_once()
+            for runner in (previews, markers, loudness):
+                if runner is not expected:
+                    runner.Thread.assert_not_called()
+        preview_runner._inflight_jobs.discard(new_id)
+        marker_runner._inflight_jobs.discard(new_id)
+        loudness_runner._inflight_jobs.discard(new_id)
+
     def test_reprocess_completed_job(self, client):
         from media_preview_generator.web.jobs import get_job_manager
 

@@ -48,7 +48,7 @@ from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import apply_inverse_path_mappings
 from ..utils import redact_secrets
 from ..web.job_gate import format_wait_message, get_job_gate
-from ..web.jobs import JobStatus, get_job_manager, is_live_retry_chain
+from ..web.jobs import JobStatus, get_job_manager
 from ..web.routes._helpers import _ensure_gpu_cache
 from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _inflight_lock
 from ..web.settings_manager import get_settings_manager
@@ -377,7 +377,7 @@ def _run_loudness_pass(job_id: str) -> bool | None:
     """Run one loudness job to completion (on its own thread)."""
     jm = get_job_manager()
     job = jm.get_job(job_id)
-    if job is None or job.status is JobStatus.CANCELLED or is_live_retry_chain(job.config):
+    if job is None or job.status is JobStatus.CANCELLED or (job.config or {}).get("is_retry_chain"):
         return
     settings = get_settings_manager()
     if settings.processing_paused:
@@ -701,6 +701,9 @@ def _run_loudness_pass(job_id: str) -> bool | None:
 
 def start_loudness_job_async(job_id: str, config_overrides: dict | None = None) -> None:
     """Start the job on a daemon thread (a second start for a job already in flight is ignored)."""
+    queued = get_job_manager().get_job(job_id)
+    if queued is None or (queued.config or {}).get("is_retry_chain"):
+        return
     if config_overrides:
         jm = get_job_manager()
         job = jm.get_job(job_id)
