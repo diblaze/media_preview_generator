@@ -8,7 +8,6 @@ import os
 import re
 from datetime import UTC, datetime, timedelta, tzinfo
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,9 +35,8 @@ def _timezone_for_name(name: str) -> tzinfo:
         except (ValueError, ZoneInfoNotFoundError):
             pass
     try:
-        resolved = str(Path("/etc/localtime").resolve())
-        if "/zoneinfo/" in resolved:
-            return ZoneInfo(resolved.split("/zoneinfo/", 1)[1])
+        # A container bind mount can replace a symlink target's contents without
+        # changing its name. Read the mounted rules rather than infer an IANA name.
         with open("/etc/localtime", "rb") as stream:
             return ZoneInfo.from_file(stream, key="Local time")
     except (OSError, ValueError, ZoneInfoNotFoundError):

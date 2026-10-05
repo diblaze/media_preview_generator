@@ -263,6 +263,58 @@ def test_worker_wait_states_remain_distinct(
         expect(row.locator(".worker-group-state")).not_to_contain_text("Next")
 
 
+@pytest.mark.parametrize(
+    ("zone", "opening", "expected"),
+    [
+        ("Local time", "2099-01-05T23:00:00+11:00", "Mon 23:00 · Local time (UTC+11:00)"),
+        # The current label says summer +11; this future opening uses winter +10.
+        ("Local time", "2099-07-06T23:00:00+10:00", "Mon 23:00 · Local time (UTC+10:00)"),
+        ("Unknown/Server", "2099-07-06T23:00:00-04:00", "Mon 23:00 · Local time (UTC-04:00)"),
+        ("Local time", "2099-07-06T23:00:00Z", "Mon 23:00 · Local time (UTC+00:00)"),
+    ],
+)
+def test_local_server_opening_uses_encoded_wall_time_not_browser_zone(
+    authed_page: Page, app_url: str, group_api: dict, zone: str, opening: str, expected: str
+) -> None:
+    session = authed_page.context.new_cdp_session(authed_page)
+    session.send("Emulation.setTimezoneOverride", {"timezoneId": "America/Los_Angeles"})
+    mock_dashboard_defaults(authed_page)
+    group_api["state"].update(timezone=zone, timezone_label="Local time (UTC+11:00)")
+    group_api["state"]["capacity"]["groups"][0].update(state="off_hours", next_available_at=opening)
+    authed_page.goto(app_url + "/")
+    assert authed_page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == "America/Los_Angeles"
+    expect(authed_page.locator('[data-group-id="cpu-night"] .worker-group-state')).to_have_text(
+        "Outside hours · Next " + expected
+    )
+
+
+def test_worker_timezone_label_is_visible_and_escaped_in_settings(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    label = 'Local time (UTC+11:00) <img src=x onerror="window.injected=1">'
+    group_api["state"].update(timezone="Local time", timezone_label=label)
+    group_api["state"]["capacity"].update(current={"cpu": 0, "gpu": 2}, peak={"cpu": 2, "gpu": 2})
+    settings_page(authed_page, app_url)
+    expect(authed_page.locator("#workerGroupCapacity")).to_contain_text(label)
+    authed_page.locator('[data-edit="cpu-night"]').click()
+    expect(authed_page.locator("#workerGroupWindows .form-text")).to_contain_text(label)
+    expect(authed_page.locator("#workerGroupSettings img")).to_have_count(0)
+    assert authed_page.evaluate("window.injected") is None
+
+
+def test_named_server_timezone_still_converts_opening_from_utc(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    session = authed_page.context.new_cdp_session(authed_page)
+    session.send("Emulation.setTimezoneOverride", {"timezoneId": "America/Los_Angeles"})
+    mock_dashboard_defaults(authed_page)
+    group_api["state"]["capacity"]["groups"][0].update(state="off_hours", next_available_at="2099-07-06T13:00:00Z")
+    authed_page.goto(app_url + "/")
+    expect(authed_page.locator('[data-group-id="cpu-night"] .worker-group-state')).to_have_text(
+        re.compile(r"Outside hours · Next Mon.*11:00.*PM · Australia/Sydney")
+    )
+
+
 def test_global_pause_and_removed_draining_group_remain_visible(
     authed_page: Page, app_url: str, group_api: dict
 ) -> None:

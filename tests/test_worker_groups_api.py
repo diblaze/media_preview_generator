@@ -115,3 +115,48 @@ def test_configuration_warning_accounts_for_global_quiet_hours(client):
     )
     payload = client.get("/api/worker-groups").get_json()
     assert any(w["code"] == "no_eligible_workers" and w["job_type"] == "previews" for w in payload["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("tz_value", "month", "expected_zone", "expected_label"),
+    [
+        (None, 10, "Local time", "Local time (UTC+11:00)"),
+        (None, 7, "Local time", "Local time (UTC+10:00)"),
+        ("UTC", 10, "UTC", "UTC"),
+        ("Australia/Sydney", 10, "Australia/Sydney", "Australia/Sydney"),
+    ],
+)
+def test_timezone_payload_labels_actual_mounted_offset(
+    client, monkeypatch, tz_value, month, expected_zone, expected_label
+):
+    import io
+    from datetime import UTC, datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from media_preview_generator import worker_groups as policy
+    from media_preview_generator.web.routes import api_worker_groups
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, month, 5, tzinfo=UTC).astimezone(tz)
+
+    sydney_bytes = Path("/usr/share/zoneinfo/Australia/Sydney").read_bytes()
+    monkeypatch.setattr(policy, "open", lambda *args, **kwargs: io.BytesIO(sydney_bytes), raising=False)
+    monkeypatch.setattr(
+        policy, "Path", lambda _: SimpleNamespace(resolve=lambda: Path("/usr/share/zoneinfo/Etc/UTC")), raising=False
+    )
+    monkeypatch.setattr(api_worker_groups, "datetime", FixedClock, raising=False)
+    if tz_value is None:
+        monkeypatch.delenv("TZ", raising=False)
+    else:
+        monkeypatch.setenv("TZ", tz_value)
+    policy._timezone_for_name.cache_clear()
+    try:
+        response = client.get("/api/worker-groups")
+        assert response.status_code == 200
+        assert response.json["timezone"] == expected_zone
+        assert response.json["timezone_label"] == expected_label
+    finally:
+        policy._timezone_for_name.cache_clear()

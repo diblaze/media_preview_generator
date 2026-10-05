@@ -189,3 +189,73 @@ def test_fully_skipped_dst_window_opens_the_following_week():
     # exist when clocks advance. The next real window is two Sundays away.
     opening = next_group_opening(group, datetime(2026, 9, 27, 3, 0, tzinfo=zone))
     assert opening == datetime(2026, 10, 11, 2, 15, tzinfo=zone)
+
+
+@pytest.fixture
+def mounted_sydney_localtime(monkeypatch):
+    """Model a Sydney bind mount over an image's Etc/UTC symlink target."""
+    import io
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from media_preview_generator import worker_groups as policy
+
+    sydney_bytes = Path("/usr/share/zoneinfo/Australia/Sydney").read_bytes()
+    monkeypatch.setattr(policy, "open", lambda *args, **kwargs: io.BytesIO(sydney_bytes), raising=False)
+    monkeypatch.setattr(
+        policy, "Path", lambda _: SimpleNamespace(resolve=lambda: Path("/usr/share/zoneinfo/Etc/UTC")), raising=False
+    )
+    policy._timezone_for_name.cache_clear()
+    yield policy
+    policy._timezone_for_name.cache_clear()
+
+
+@pytest.mark.parametrize("tz_value", [None, "", "Not/A_Real_Zone"])
+def test_mounted_localtime_bytes_override_misleading_symlink_name(mounted_sydney_localtime, monkeypatch, tz_value):
+    from datetime import timedelta
+
+    if tz_value is None:
+        monkeypatch.delenv("TZ", raising=False)
+    else:
+        monkeypatch.setenv("TZ", tz_value)
+    zone = mounted_sydney_localtime.application_timezone()
+    assert datetime(2026, 10, 5, 12, tzinfo=zone).utcoffset() == timedelta(hours=11)
+    assert datetime(2026, 7, 5, 12, tzinfo=zone).utcoffset() == timedelta(hours=10)
+    assert str(zone) == "Local time"
+    group = cpu_group(availability=window([6], "02:15", "02:30"))
+    assert next_group_opening(group, datetime(2026, 9, 27, 3, tzinfo=zone)).isoformat() == "2026-10-11T02:15:00+11:00"
+
+
+@pytest.mark.parametrize(
+    ("tz_value", "key", "offset"), [("UTC", "UTC", 0), (":Australia/Sydney", "Australia/Sydney", 11)]
+)
+def test_explicit_timezone_overrides_mounted_localtime(mounted_sydney_localtime, monkeypatch, tz_value, key, offset):
+    from datetime import timedelta
+
+    monkeypatch.setenv("TZ", tz_value)
+    zone = mounted_sydney_localtime.application_timezone()
+    assert str(zone) == key
+    assert datetime(2026, 10, 5, 12, tzinfo=zone).utcoffset() == timedelta(hours=offset)
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt"])
+def test_unreadable_localtime_falls_back_to_utc(monkeypatch, failure):
+    import io
+    from datetime import UTC
+    from types import SimpleNamespace
+
+    from media_preview_generator import worker_groups as policy
+
+    def read_localtime(*args, **kwargs):
+        if failure == "missing":
+            raise OSError("No localtime")
+        return io.BytesIO(b"not a timezone file")
+
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(policy, "open", read_localtime, raising=False)
+    monkeypatch.setattr(policy, "Path", lambda _: SimpleNamespace(resolve=lambda: "/etc/localtime"), raising=False)
+    policy._timezone_for_name.cache_clear()
+    try:
+        assert policy.application_timezone() is UTC
+    finally:
+        policy._timezone_for_name.cache_clear()

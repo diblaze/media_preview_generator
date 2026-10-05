@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from flask import jsonify, request
 from loguru import logger
 
@@ -145,10 +147,17 @@ def worker_group_payload(settings=None) -> dict:
                 }
             )
     gpu_peak, cpu_peak = configured_group_totals(groups)
+    timezone = application_timezone()
+    timezone_name = str(timezone)
+    timezone_label = timezone_name
+    if timezone_name == "Local time":
+        offset = datetime.now(timezone).strftime("%z")
+        timezone_label = f"Local time (UTC{offset[:3]}:{offset[3:]})"
     return {
         "groups": groups,
         "revision": revision,
-        "timezone": str(application_timezone()),
+        "timezone": timezone_name,
+        "timezone_label": timezone_label,
         "limits": {"cpu": MAX_CPU_WORKERS, "gpu": MAX_GPU_WORKERS},
         "hardware": hardware,
         "capacity": {

@@ -73,7 +73,11 @@ class TestSettingsSteppers:
         count.fill("2")
         expect(settings_page.locator("#workerGroupApplyRow")).to_be_visible()
         settings_page.locator("#workerGroupApply").click()
-        expect(settings_page.locator('[data-group-id="cpu"]')).to_contain_text("2 desired")
+        row = settings_page.locator('[data-group-id="cpu"]')
+        expect(row.locator(".worker-group-control-label")).to_have_text("Workers")
+        expect(row.locator('[aria-label="Configured workers"]')).to_have_text("2")
+        settings_page.reload()
+        expect(row.locator('[aria-label="Configured workers"]')).to_have_text("2")
 
     def test_thumbnail_interval_stepper_works(self, settings_page: Page) -> None:
         interval = settings_page.locator("#thumbnailInterval")

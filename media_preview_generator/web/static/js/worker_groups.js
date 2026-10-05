@@ -57,15 +57,25 @@
         }).join('; ');
     }
 
+    const timezoneLabel = () => snapshot.timezone_label || snapshot.timezone || 'App timezone';
+
     function nextTime(value) {
         if (!value) return '';
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return '';
         try {
+            if (!snapshot.timezone || snapshot.timezone === 'Local time') throw new RangeError('Local timezone');
             return new Intl.DateTimeFormat(undefined, {
                 weekday: 'short', hour: '2-digit', minute: '2-digit', timeZone: snapshot.timezone,
-            }).format(date) + ' · ' + snapshot.timezone;
-        } catch (_) { return date.toLocaleString(); }
+            }).format(date) + ' · ' + timezoneLabel();
+        } catch (_) {
+            // The server's local zone may have no IANA name. Keep this opening's wall time and DST offset.
+            const parts = String(value).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/);
+            if (!parts) return String(value);
+            const weekday = new Intl.DateTimeFormat(undefined, { weekday: 'short', timeZone: 'UTC' })
+                .format(new Date(`${parts[1]}T${parts[2]}:00Z`));
+            return `${weekday} ${parts[2]} · Local time (UTC${parts[3] === 'Z' ? '+00:00' : parts[3]})`;
+        }
     }
 
     function status(group) {
@@ -166,7 +176,7 @@
             <div id="workerGroupMessage" role="status" aria-live="polite"></div>
             <p class="form-text mt-3 mb-0">Current files finish when a group closes or is reduced. GPU jobs may still use CPU stages or fallback. Chapter thumbnails are part of Video previews. The global job limit still applies.</p>`;
         const capacity = snapshot.capacity || {};
-        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}. ${snapshot.timezone}.` : '';
+        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}. ${timezoneLabel()}.` : '';
         renderRows(document.getElementById('workerGroupRows'), false);
         const warning = document.getElementById('workerGroupWarnings');
         warning.textContent = warnings().join(' ');
@@ -212,7 +222,7 @@
             <div class="col-sm-4"><label class="form-label" for="workerGroupCount">Workers</label><input id="workerGroupCount" type="number" min="1" max="${snapshot.limits?.[group.resource] || 32}" value="${group.count}" class="form-control"><div class="form-text">Simultaneous tasks, not CPU cores.</div></div></div>
             <fieldset class="mt-3"><legend class="form-label">Jobs allowed on this group</legend><div class="d-flex flex-wrap gap-3">${Object.entries(JOBS).map(([kind, label]) => `<label class="form-check mb-0"><input type="checkbox" class="form-check-input" data-kind="${kind}" ${group.job_types.includes(kind) ? 'checked' : ''} ${kind === 'loudness' && group.resource !== 'cpu' ? 'disabled' : ''}><span>${label}</span></label>`).join('')}</div>${group.resource !== 'cpu' ? '<p class="form-text mb-0">Plex loudness requires CPU workers.</p>' : ''}</fieldset>
             <div class="mt-3"><label class="form-label" for="workerGroupAvailability">Availability</label><select class="form-select" id="workerGroupAvailability"><option value="always">Always available</option><option value="scheduled" ${group.availability.mode === 'scheduled' ? 'selected' : ''}>Weekly hours</option></select></div>
-            <div id="workerGroupWindows" ${group.availability.mode === 'always' ? 'hidden' : ''}>${group.availability.windows.map((window, index) => windowEditor(window, index)).join('')}<button type="button" id="workerGroupAddWindow" class="btn btn-outline-secondary btn-sm mt-2">Add time window</button><p class="form-text">${escape(snapshot.timezone || 'App timezone')}. Days select when the window starts: Mon 23:00–07:00 ends Tuesday. Overlapping windows in this group count once.</p></div>
+            <div id="workerGroupWindows" ${group.availability.mode === 'always' ? 'hidden' : ''}>${group.availability.windows.map((window, index) => windowEditor(window, index)).join('')}<button type="button" id="workerGroupAddWindow" class="btn btn-outline-secondary btn-sm mt-2">Add time window</button><p class="form-text">${escape(timezoneLabel())}. Days select when the window starts: Mon 23:00–07:00 ends Tuesday. Overlapping windows in this group count once.</p></div>
             <div class="d-flex flex-wrap gap-2 mt-3"><button type="button" class="btn btn-sm btn-outline-secondary" id="workerGroupDuplicate">Duplicate group</button><button type="button" class="btn btn-sm btn-outline-danger" id="workerGroupRemove">Remove group</button></div>`;
         const changed = () => { dirty = true; renderSettings(); message('Group changes are not saved until you apply them.'); };
         document.getElementById('workerGroupEditorApply').onclick = () => save().catch(() => {});

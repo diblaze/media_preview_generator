@@ -89,7 +89,10 @@ class TestSettingsSaveAndReloadPersists:
         backend_real_page.wait_for_load_state("domcontentloaded")
 
         expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("7", timeout=5000)
-        expect(backend_real_page.locator("#workerGroupRows")).to_contain_text("3 desired")
+        saved_group = next(g for g in on_disk["worker_groups"] if g["count"] == 3 and g["job_types"] == ["loudness"])
+        row = backend_real_page.locator(f'[data-group-id="{saved_group["id"]}"]')
+        expect(row.locator(".worker-group-control-label")).to_have_text("Workers")
+        expect(row.locator('[aria-label="Configured workers"]')).to_have_text("3")
         expect(backend_real_page.locator("#tonemapAlgorithm")).to_have_value("mobius")
 
     def test_log_level_change_persists_via_dedicated_endpoint(
