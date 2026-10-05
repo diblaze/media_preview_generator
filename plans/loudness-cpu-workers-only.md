@@ -1,5 +1,5 @@
 # Loudness runs on CPU workers only: GPU workers never pick up its items
-Status: approved (on hold: loudnorm speed work first)
+Status: closed (resolved upstream in stevezau/media_preview_generator@a21a70b before execution)
 Issue: diblaze/media_preview_generator#4 (upstream-bound later, no PR without approval)
 Base: upstream/dev d70bcbe (all cited lines are identical on upstream/dev and the working tree unless noted)
 

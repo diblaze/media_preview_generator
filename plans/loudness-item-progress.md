@@ -1,5 +1,5 @@
 # Loudness worker card moves: per-stream ffmpeg progress reaches the worker's progress bar
-Status: approved (on hold: loudnorm speed work first)
+Status: done (local commit on feat/loudness-item-progress; no PR until the user approves)
 Issue: diblaze/media_preview_generator#5
 Base: upstream/dev d70bcbe. Cited lines are upstream/dev; `jobs/`, `web/` and tests are identical in the working tree.
 
@@ -49,3 +49,8 @@ Live assert after deploy: start a loudness job on one long file; within 10 s the
 
 ## Answers (2026-10-05)
 - Approved, on hold. Bars: worker card = per file (all its tracks), job row = total incl. in-flight files (existing dispatcher fold). Bar shows at 0% as soon as a stream starts (default, like previews).
+
+## Execution notes (2026-10-05)
+- Base moved to upstream/dev 0cc6a60: upstream cca7221 made the loudness card deliberately indeterminate (striped, "Analyzing audio · stream n/N"); app.js now keeps it striped only until ffmpeg_started, then shows "<pct>% · stream n/N" with speed; e2e test renamed/extended (mutation-checked against the old app.js).
+- Review fixes: rfd closed on any Popen failure (fd-leak test), progress callback failures logged not fatal (test), final -progress read after exit, exact-value job test, per-server percent documented.
+- Verified with jellyfin-ffmpeg 8 in the prod image: 166 progress callbacks on a 10 min tone, report parsed.
