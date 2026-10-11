@@ -9,6 +9,7 @@ from flask import jsonify, request
 from loguru import logger
 
 from ...config import MAX_CPU_THREADS, VALID_TONEMAP_ALGORITHMS, validate_processing_thread_totals
+from ...job_kinds import parse_kind_ranks, safe_kind_ranks
 from ...markers.settings import mask_global
 from ...processing.retry_queue import DEFAULT_RETRY_COUNT
 from ...utils import is_docker_environment
@@ -394,6 +395,7 @@ def get_settings():
             # so newly-imported media overtakes a running full scan
             # without the user having to demote the scan by hand.
             "incoming_job_priority": parse_priority(settings.get("incoming_job_priority", PRIORITY_HIGH)),
+            "job_kind_priority": safe_kind_ranks(settings.get("job_kind_priority")),
             # backup retention (count + max-age days). 0 max_age_days
             # disables age-based pruning so existing installs keep behaving
             # exactly as before until the user opts in.
@@ -444,6 +446,7 @@ _SAVE_SETTINGS_ALLOWED_FIELDS = (
     "auto_requeue_on_restart",
     "requeue_max_age_minutes",
     "incoming_job_priority",
+    "job_kind_priority",
     "frame_reuse",
     "config_backup_keep",
     "config_backup_max_age_days",
@@ -638,6 +641,17 @@ def _validate_and_coerce_settings_updates(
                 400,
             )
         updates["incoming_job_priority"] = parse_priority(raw)
+
+    if "job_kind_priority" in updates:
+        try:
+            # Merge into the stored ranks so a partial POST changes only the kinds it names.
+            sent = updates["job_kind_priority"]
+            from ..settings_manager import get_settings_manager
+
+            stored = safe_kind_ranks(get_settings_manager().get("job_kind_priority"))
+            updates["job_kind_priority"] = parse_kind_ranks({**stored, **sent} if isinstance(sent, dict) else sent)
+        except ValueError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
 
     # Library-scanning concurrency. 0 = Auto; an explicit value is bounded
     # to [1, 256]. Reject out-of-range rather than silently clamping so Save

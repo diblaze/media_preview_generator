@@ -14,7 +14,8 @@ description: Analyses audio tracks on this app's workers and stores loudness mea
 
 Plex's **Normalize Loudness** needs each audio track analysed first. This app runs FFmpeg's loudness analysis on its
 CPU worker groups, alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats
-the completed tracks as analysed.
+the completed tracks as analysed. Its FFmpeg runs at `nice 10`, so previews and Intro & Credits get the CPU first; to hold
+loudness back entirely while they have files queued, rank it lower under **Processing options → Job kind priority**.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
 supported: Plex's music analysis includes album gain and fades that this video feature does not produce.

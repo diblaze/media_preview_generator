@@ -16,7 +16,7 @@ from typing import Any, cast, overload
 from loguru import logger
 
 from ..config import Config
-from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_outcome, outcome_value
+from ..job_kinds import JOB_KIND_PREVIEWS, KIND_RANKS, ItemOutcome, KindHandlers, normalize_outcome, outcome_value
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
 from .worker import JOB_LOG_SKIP, Worker, WorkerPool
@@ -568,6 +568,8 @@ class JobDispatcher:
         # bypass the 1Hz throttle when needed (so sub-second tasks
         # don't flicker invisibly).
         self._last_worker_busy_snapshot: dict[int, bool] = {}
+        # Kinds the job_kind_priority rule held back on the last pass, so the hold and its release are logged once.
+        self._held_kinds: set[str] = set()
 
         # Checking stage (issue #243): a bounded pool of lightweight
         # "checking workers" that run process_canonical_path(check_only=True)
@@ -993,6 +995,46 @@ class JobDispatcher:
                     exc,
                 )
 
+    def _best_pending_rank(self, candidates: list[JobTracker]) -> tuple[int, dict[str, int]]:
+        """The best ``job_kind_priority`` rank among kinds with runnable work, and every kind's rank.
+
+        A kind counts while a job of it has files queued for a worker and some worker open now may run it, so a kind no
+        open worker can run holds nobody back. Files still being checked need no worker and count for nothing, or a
+        mostly up-to-date scan would hold the worse kind for its whole sweep. Logs when a kind is held and released.
+
+        Args:
+            candidates: Trackers that are neither paused nor cancelled.
+
+        Returns:
+            ``(best_rank, ranks)``: trackers whose kind ranks worse than ``best_rank`` get no new file this pass.
+        """
+        from .group_runtime import current_kind_ranks
+
+        ranks = current_kind_ranks()
+        if len(set(ranks.values())) == 1:
+            # Equal ranks (the default) hold nobody: skip the capacity lookups and keep today's dispatch untouched.
+            for kind in self._held_kinds:
+                logger.info("{} jobs resume: job kinds share the same priority", kind)
+            self._held_kinds = set()
+            return KIND_RANKS[-1], ranks
+        pending = {
+            t.kind
+            for t in candidates
+            if not t.done_event.is_set()
+            and not t.park_requested
+            and t.item_queue
+            and self.worker_pool.capacity_for(t.kind)["open"] > 0
+        }
+        best_rank = min((ranks[kind] for kind in pending), default=KIND_RANKS[-1])
+        held = {kind for kind in pending if ranks[kind] > best_rank}
+        for kind in held - self._held_kinds:
+            logger.info("Holding {} jobs: a job kind with a higher priority has files waiting", kind)
+        # A held kind that left pending was paused, cancelled or finished; only one still waiting has resumed.
+        for kind in (self._held_kinds - held) & pending:
+            logger.info("{} jobs resume: no higher-priority job kind has files waiting", kind)
+        self._held_kinds = held
+        return best_rank, ranks
+
     def _assign_tasks(self) -> None:
         """Reserve a compatible job and slot together under a fixed lock order."""
         self.worker_pool._apply_deferred_removals()
@@ -1003,6 +1045,7 @@ class JobDispatcher:
             with self._trackers_lock:
                 candidates = list(self._trackers.values())
             candidates = [t for t in candidates if not t.is_paused() and not t.is_cancelled()]
+            best_rank, ranks = self._best_pending_rank(candidates)
             # Keep compatible selection and reservation atomic with policy
             # edits and parking, revalidating the detached tracker snapshot.
             with self._trackers_lock:
@@ -1017,6 +1060,7 @@ class JobDispatcher:
                             and not t.park_requested
                             and not t.cancelled
                             and t.item_queue
+                            and ranks[t.kind] <= best_rank
                         ),
                         key=_pick_order,
                     )

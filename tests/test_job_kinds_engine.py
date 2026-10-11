@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -921,3 +922,167 @@ def test_the_periodic_banner_says_what_each_completion_says(handlers, checking):
         dispatcher._emit_progress_updates()
     assert messages == ["Waiting for a free worker", checking, checking, "1/3 completed"]
     dispatcher.shutdown()
+
+
+class TestJobKindPriority:
+    """``job_kind_priority``: a worse-ranked kind starts no new file while a better-ranked kind has runnable work."""
+
+    @staticmethod
+    def _split_pool():
+        # The live split: one worker that only runs Intro & Credits, one that only runs loudness, so the loudness
+        # worker is always free and the rank rule is the only thing that can hold it.
+        pool = WorkerPool(cpu_workers=2, gpu_workers=0, selected_gpus=[])
+        pool.workers[0].allowed_job_types = frozenset({"intro_credits"})
+        pool.workers[1].allowed_job_types = frozenset({"loudness"})
+        return pool
+
+    @staticmethod
+    def _handlers(ran, *, release=None, check_gate=None):
+        def check(item, *, cancel_check):
+            if check_gate is not None and item.canonical_path == "/m/i1":
+                check_gate.wait(timeout=10)
+            return None
+
+        def process(item, **kw):
+            ran.append(item.canonical_path)
+            if release is not None and item.canonical_path == "/m/i1":
+                release.wait(timeout=10)
+            return ItemOutcome("markers_published")
+
+        return KindHandlers(check_fn=check, process_fn=process, outcome_keys=KEYS)
+
+    @contextmanager
+    def _run(self, monkeypatch, ranks, *, intro_callbacks=None, release=None, check_gate=None, capacity=None):
+        monkeypatch.setattr("media_preview_generator.jobs.group_runtime.current_kind_ranks", lambda: ranks)
+        pool = self._split_pool()
+        if capacity is not None:
+            monkeypatch.setattr(pool, "has_capacity_for", capacity)
+        dispatcher = JobDispatcher(pool)
+        ran: list[str] = []
+        with (
+            patch("media_preview_generator.processing.generator._notify_file_result"),
+            patch("media_preview_generator.web.jobs.get_job_manager"),
+        ):
+            try:
+                t_intro = dispatcher.submit_items(
+                    "intro",
+                    _items("/m/i1", "/m/i2"),
+                    _config(),
+                    MagicMock(),
+                    kind="intro_credits",
+                    handlers=self._handlers(ran, release=release, check_gate=check_gate),
+                    callbacks=intro_callbacks or {},
+                )
+                t_loud = dispatcher.submit_items(
+                    "loud", _items("/m/l"), _config(), MagicMock(), kind="loudness", handlers=self._handlers(ran)
+                )
+                yield t_intro, t_loud, ran
+            finally:
+                for gate in (release, check_gate):
+                    if gate is not None:
+                        gate.set()
+                dispatcher.shutdown()
+
+    def test_equal_ranks_keep_todays_dispatch_when_all_kinds_rank_1(self, monkeypatch):
+        release = threading.Event()
+        with self._run(monkeypatch, {"previews": 1, "intro_credits": 1, "loudness": 1}, release=release) as (
+            t_intro,
+            t_loud,
+            ran,
+        ):
+            assert t_loud.wait(timeout=10)
+            assert "/m/i2" not in ran
+            release.set()
+            assert t_intro.wait(timeout=10)
+
+    def test_worse_rank_waits_then_resumes_when_better_kind_has_files_queued(self, monkeypatch):
+        release = threading.Event()
+        with self._run(monkeypatch, {"previews": 1, "intro_credits": 1, "loudness": 2}, release=release) as (
+            t_intro,
+            t_loud,
+            ran,
+        ):
+            assert not t_loud.wait(timeout=0.5)
+            assert ran == ["/m/i1"]
+            release.set()
+            assert t_intro.wait(timeout=10)
+            assert t_loud.wait(timeout=10)
+            assert ran == ["/m/i1", "/m/i2", "/m/l"]
+
+    def test_worse_rank_runs_when_better_ranked_job_is_paused(self, monkeypatch):
+        with self._run(
+            monkeypatch,
+            {"previews": 1, "intro_credits": 1, "loudness": 2},
+            intro_callbacks={"pause_check": lambda: True},
+        ) as (t_intro, t_loud, ran):
+            assert t_loud.wait(timeout=10)
+            assert ran == ["/m/l"]
+
+    def test_worse_rank_runs_when_no_worker_group_can_run_the_better_kind(self, monkeypatch):
+        with self._run(
+            monkeypatch,
+            {"previews": 1, "intro_credits": 1, "loudness": 2},
+            capacity=lambda kind: kind == "loudness",
+        ) as (t_intro, t_loud, ran):
+            assert t_loud.wait(timeout=10)
+            assert "/m/l" in ran
+
+    def test_worse_rank_runs_while_better_kind_is_only_being_checked(self, monkeypatch):
+        gate = threading.Event()
+        with self._run(monkeypatch, {"previews": 1, "intro_credits": 1, "loudness": 2}, check_gate=gate) as (
+            t_intro,
+            t_loud,
+            ran,
+        ):
+            # /m/i1's check is still in flight and needs no worker, so it must not hold loudness.
+            assert t_loud.wait(timeout=10)
+            assert "/m/i1" not in ran
+            gate.set()
+            assert t_intro.wait(timeout=10)
+
+    def test_better_kind_no_worker_can_run_does_not_hold_a_worse_kind(self, monkeypatch):
+        """Loudness only runs on CPU workers; on a GPU-only pool its queued files must not hold Intro & Credits."""
+        monkeypatch.setattr(
+            "media_preview_generator.jobs.group_runtime.current_kind_ranks",
+            lambda: {"previews": 1, "intro_credits": 2, "loudness": 1},
+        )
+        pool = WorkerPool(cpu_workers=0, gpu_workers=1, selected_gpus=[("nvidia", "/dev/nvidia0", {})])
+        dispatcher = JobDispatcher(pool)
+        ran: list[str] = []
+        with (
+            patch("media_preview_generator.processing.generator._notify_file_result"),
+            patch("media_preview_generator.web.jobs.get_job_manager"),
+        ):
+            try:
+                dispatcher.submit_items(
+                    "loud", _items("/m/l"), _config(), MagicMock(), kind="loudness", handlers=self._handlers(ran)
+                )
+                t_intro = dispatcher.submit_items(
+                    "intro", _items("/m/i"), _config(), MagicMock(), kind="intro_credits", handlers=self._handlers(ran)
+                )
+                assert t_intro.wait(timeout=10)
+                assert ran == ["/m/i"]
+            finally:
+                dispatcher.shutdown()
+
+    def test_hold_and_release_are_logged_once(self, monkeypatch):
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(m.record["message"]), level="INFO")
+        release = threading.Event()
+        try:
+            with self._run(monkeypatch, {"previews": 1, "intro_credits": 1, "loudness": 2}, release=release) as (
+                t_intro,
+                t_loud,
+                ran,
+            ):
+                assert not t_loud.wait(timeout=0.5)
+                release.set()
+                assert t_loud.wait(timeout=10)
+        finally:
+            logger.remove(sink)
+        assert [line for line in lines if "loudness jobs" in line] == [
+            "Holding loudness jobs: a job kind with a higher priority has files waiting",
+            "loudness jobs resume: no higher-priority job kind has files waiting",
+        ]

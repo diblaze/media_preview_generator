@@ -1475,7 +1475,8 @@ Analyses audio tracks on this app's workers and stores loudness measurements in 
 
 Plex's **Normalize Loudness** needs each audio track analysed first. This app runs FFmpeg's loudness analysis on its
 CPU worker groups, alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats
-the completed tracks as analysed.
+the completed tracks as analysed. Its FFmpeg runs at `nice 10`, so previews and Intro & Credits get the CPU first; to hold
+loudness back entirely while they have files queued, rank it lower under **Processing options → Job kind priority**.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
 supported: Plex's music analysis includes album gain and fades that this video feature does not produce.
@@ -1762,6 +1763,10 @@ A schedule only follows the incoming setting while its own **Job Priority** is
 **Default (from Settings)** — the value new schedules start on. Pick High,
 Normal, or Low there to pin that schedule instead, and the global setting stops
 applying to it.
+
+Job priority orders jobs of the same kind. **Job kind priority** (Previews, Intro & Credits,
+Loudness, all **1** by default) ranks the kinds themselves: a kind with a higher number waits while a
+lower-numbered kind has files queued for a worker, whatever priority its own jobs carry.
 
 Set the global setting to **Normal** to go back to strict
 first-come-first-served ordering. A job you pin to High by hand can still
@@ -4566,6 +4571,7 @@ These are the top-level keys `POST /api/settings` accepts, besides `frame_reuse`
 |---------|---------------|---------|-------------|
 | `cpu_threads` | none | `1` | Legacy CPU count. Once groups exist, posting it returns `409`; use the worker-groups API. |
 | `incoming_job_priority` | Processing → Job execution → Incoming job priority | `high` | Priority of jobs the app creates itself from webhooks and Recently Added scans. `high`, `normal`, `low` (or `1`, `2`, `3`). |
+| `job_kind_priority` | Processing → Job execution → Previews / Intro & Credits / Loudness priority | `{"previews": 1, "intro_credits": 1, "loudness": 1}` | Dispatch rank per job kind, 1–3 (1 = first). Kinds with the same rank share workers as before. A partial value changes only the kinds it names. A kind with a higher number starts no new file while a lower-numbered kind has files queued for a worker (job not paused) and a worker open now that may run them — files still being checked do not count; files already running finish, and the held kind resumes on its own. |
 | `webhook_retry_count` | Processing → Retry policy → Retry count | `5` | Attempts for files a server hasn't indexed yet. The page allows 0–10; `0` turns retries off. |
 | `webhook_retry_delay` | Processing → Retry policy → Initial retry delay | `30` | Base delay in seconds (the page allows 10–300). At 30, retries wait 1 min, 2 min, 5 min, 15 min, then 1 h. |
 | `auto_requeue_on_restart` | Processing → Restart recovery | `true` | Re-queue jobs a restart interrupted. |

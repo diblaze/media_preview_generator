@@ -23,6 +23,8 @@ SELF_PAUSED_KINDS: frozenset[str] = frozenset({JOB_KIND_INTRO_CREDITS, JOB_KIND_
 # sets it when it opens, so a job revived after a restart during the debounce still asks; the preview runner queues the
 # follow-up once and takes the key off (``markers.triggers.submit_pending_follow_up``).
 INTRO_CREDITS_FOLLOW_UP = "intro_credits_follow_up"
+# A kind's dispatch rank (``job_kind_priority`` setting): 1 goes first; a worse rank waits while a better one has work.
+KIND_RANKS: tuple[int, ...] = (1, 2, 3)
 
 
 def parse_job_kind(value: object) -> str:
@@ -35,6 +37,44 @@ def parse_job_kind(value: object) -> str:
         ``value`` when it names a known kind, else :data:`JOB_KIND_PREVIEWS`.
     """
     return value if isinstance(value, str) and value in JOB_KINDS else JOB_KIND_PREVIEWS
+
+
+def parse_kind_ranks(value: object) -> dict[str, int]:
+    """Validate a ``job_kind_priority`` value; kinds it leaves out rank 1.
+
+    Args:
+        value: Raw setting (API payload or stored value); ``None`` means every kind ranks 1.
+
+    Returns:
+        Every job kind mapped to its rank.
+
+    Raises:
+        ValueError: ``value`` is not a mapping of known kinds to 1, 2 or 3.
+    """
+    ranks = dict.fromkeys(JOB_KINDS, KIND_RANKS[0])
+    if value is None:
+        return ranks
+    if not isinstance(value, dict) or any(
+        kind not in JOB_KINDS or type(rank) is not int or rank not in KIND_RANKS for kind, rank in value.items()
+    ):
+        raise ValueError("job_kind_priority must map previews, intro_credits and loudness to 1, 2 or 3")
+    ranks.update(value)
+    return ranks
+
+
+def safe_kind_ranks(value: object) -> dict[str, int]:
+    """Like :func:`parse_kind_ranks`, but a hand-edited bad value ranks every kind 1 instead of stopping dispatch.
+
+    Args:
+        value: Stored ``job_kind_priority``.
+
+    Returns:
+        Every job kind mapped to its rank.
+    """
+    try:
+        return parse_kind_ranks(value)
+    except ValueError:
+        return dict.fromkeys(JOB_KINDS, KIND_RANKS[0])
 
 
 @dataclass
