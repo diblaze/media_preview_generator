@@ -16,7 +16,7 @@ from loguru import logger
 from ..markers.freeze import Freeze
 from ..markers.probe import _count_stuck, kill_and_collect
 from ..markers.progress import read_progress
-from ..utils import dies_with_node
+from ..utils import dies_with_node, niced
 
 # The filter Plex Media Server 1.43 runs for each audio stream (``Plex Transcoder -i FILE -map 0:N -af ... -f null -``).
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1:LRA=9:print_format=json"
@@ -306,7 +306,8 @@ def _run_command(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded ``timeout_s``.
         LoudnessNoDecoder: ffmpeg has no decoder for the stream.
-        LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero.
+        LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero (behind ``nice``, a missing
+            ffmpeg is ``nice``'s exit 127).
     """
     name = os.path.basename(path)
     freeze = Freeze.of(pause_check)
@@ -315,8 +316,9 @@ def _run_command(
     freeze.hold(cancel_check=cancel_check, name=name)
     if cancel_check and cancel_check():
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
-    # Its own session, so a pause stops ffmpeg's whole group and never the app's.
-    run_args, preexec = dies_with_node(args)  # a node's FFmpeg dies with the node
+    # Its own session, so a pause stops ffmpeg's whole group and never the app's. Niced below previews; a node's
+    # FFmpeg dies with the node.
+    run_args, preexec = dies_with_node(niced(args))
     try:
         proc = subprocess.Popen(
             run_args,
