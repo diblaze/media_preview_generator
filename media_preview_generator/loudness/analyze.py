@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -41,6 +42,8 @@ KILL_WAIT_S = 5.0
 REAPER = "loudness-reaper"
 # Built with the CPU loudness patch; video previews keep the GPU-capable FFmpeg.
 _BUNDLED_FFMPEG = "/opt/ffmpeg-loudness/bin/ffmpeg"
+# Below preview and Intro & Credits ffmpeg (nice 0), so they win the CPU while loudness backfills.
+_NICE_LEVEL = "10"
 
 
 def resolve_ffmpeg(fallback: str) -> str:
@@ -305,10 +308,11 @@ def _run_command(
     freeze.hold(cancel_check=cancel_check, name=name)
     if cancel_check and cancel_check():
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
-    # Its own session, so a pause stops ffmpeg's whole group and never the app's.
+    # Its own session, so a pause stops ffmpeg's whole group and never the app's. nice execs ffmpeg in place.
+    nice = shutil.which("nice")
     try:
         proc = subprocess.Popen(
-            args,
+            [*([nice, "-n", _NICE_LEVEL] if nice else []), *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,

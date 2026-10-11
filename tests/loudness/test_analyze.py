@@ -291,3 +291,19 @@ def test_a_kill_is_time_bound_when_a_child_keeps_the_pipes_open(tmp_path, monkey
     with pytest.raises(analyze.LoudnessError, match="cancelled"):
         analyze.run(ffmpeg, "/m/a.mkv", 1, duration_ms=None, cancel_check=lambda: len(calls) > 2 or calls.append(1))
     assert time.monotonic() - started < 2.0
+
+
+@pytest.mark.parametrize(("nice", "prefix"), [("/usr/bin/nice", ["/usr/bin/nice", "-n", "10"]), (None, [])])
+def test_analysis_runs_under_nice_when_nice_is_found(monkeypatch, nice, prefix):
+    """Previews and Intro & Credits ffmpeg run at nice 0, so they win the CPU over a loudness backfill."""
+    started = []
+
+    def popen(args, **kwargs):
+        started.append(args)
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(analyze.shutil, "which", {"nice": nice}.get)
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessError):
+        analyze._run_command(["ffmpeg", "-i", "/m/a.mkv"], "/m/a.mkv", timeout_s=1, description="stream 1")
+    assert started == [[*prefix, "ffmpeg", "-i", "/m/a.mkv"]]
