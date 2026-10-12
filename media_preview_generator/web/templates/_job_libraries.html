@@ -1,0 +1,28 @@
+{# Libraries box shared by Start new job (prefix 'job') and the schedule dialog (prefix 'schedule').
+   Needs `prefix` and `libraries_tip` (what the pick applies to). #}
+<section class="ov-sec" id="{{ prefix }}LibrariesGroup">
+    <div class="ov-sec-h"><span class="ov-n" aria-hidden="true"></span>Libraries
+        <button type="button" class="info-modal-link ms-auto" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="{{ libraries_tip }}" data-explain-title="Run against these libraries" data-explain-template="infoJobLibrariesTpl" aria-label="{{ libraries_tip }}">What does this pick?</button>
+    </div>
+    <div class="ov-libbox">
+        <div class="ov-libtop">
+            <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="{{ prefix }}LibraryAll" checked onchange="toggleAllLibraries(this, '{{ prefix }}')">
+                <label class="form-check-label fw-bold" for="{{ prefix }}LibraryAll">All Libraries</label>
+            </div>
+            <div id="{{ prefix }}LibraryListCaption" class="ov-hint"></div>
+            <span class="ov-sp"></span>
+            <button type="button" class="ov-link" onclick="setAllLibrariesChecked(true, '{{ prefix }}')">Select all</button>
+            <button type="button" class="ov-link" onclick="setAllLibrariesChecked(false, '{{ prefix }}')">None</button>
+        </div>
+        <div id="{{ prefix }}LibraryList" class="ov-liblist">
+            <div class="ov-skel" aria-hidden="true"></div><div class="ov-skel" aria-hidden="true"></div><div class="ov-skel" aria-hidden="true"></div>
+            <span class="visually-hidden">Loading libraries...</span>
+        </div>
+    </div>
+    {# Live scope summary: computed from the current tick state. When every ticked library
+       lives on one server it names that server, so the user can confirm the implicit pin
+       before submit; a mixed selection shows the multi-server fan-out message instead. #}
+    <div id="{{ prefix }}ScopeBadge" class="ov-scope" data-scope="all"></div>
+    <div class="ov-err" id="{{ prefix }}LibrariesError" role="alert" hidden><i class="bi bi-exclamation-circle" aria-hidden="true"></i><span>Pick at least one library, or turn on All Libraries.</span></div>
+</section>

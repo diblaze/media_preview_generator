@@ -10,6 +10,7 @@ from typing import Any, cast
 from flask import jsonify, request
 from loguru import logger
 
+from ...scan_filters import FILTER_CONFIG_KEYS, normalize_scan_filter_config, pick_filter_config
 from ..auth import api_token_required
 from ..jobs import PRIORITY_FROM_LABEL, PRIORITY_LABELS, PRIORITY_LOW
 from . import api
@@ -109,6 +110,27 @@ def parse_job_request():
     return (libraries, resolved_paths, priority, library_name, data), None
 
 
+def parse_scan_filters(data: dict) -> tuple[dict | None, Any]:
+    """Read the optional ``scan_filters`` object of a "start a job" body.
+
+    Returns:
+        ``(filters, None)`` with the validated filter keys (empty when none were sent), or ``(None, response)`` for
+        an invalid object.
+    """
+    raw = data.get("scan_filters")
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, (jsonify({"error": "scan_filters must be an object"}), 400)
+    unknown = sorted(set(raw) - FILTER_CONFIG_KEYS)
+    if unknown:
+        return None, (jsonify({"error": f"Unknown scan_filters keys: {', '.join(unknown)}"}), 400)
+    try:
+        return pick_filter_config(normalize_scan_filter_config(raw, full_scan=True)), None
+    except ValueError as exc:
+        return None, (jsonify({"error": str(exc)}), 400)
+
+
 @api.route("/markers/jobs", methods=["POST"])
 @api_token_required
 def create_marker_job():
@@ -116,7 +138,8 @@ def create_marker_job():
 
     Body: ``libraries`` (``[{"server_id", "library_id"}]``) or ``file_paths`` (files or folders inside
     ``MEDIA_ROOT``) — neither means every library Intro & Credits goes to; ``priority`` (1-3 or high/normal/low,
-    default low); ``force`` (re-detect files already done); ``library_name`` (job title).
+    default low); ``force`` (re-detect files already done); ``library_name`` (job title); ``scan_filters`` (added
+    date, seasons, release year: which library files to list).
 
     Returns:
         201 with the job, 400 for an invalid body, 503 when the config directory isn't writable.
@@ -127,6 +150,9 @@ def create_marker_job():
     if error is not None:
         return error
     libraries, resolved_paths, priority, library_name, data = parsed
+    scan_filters, bad_filters = parse_scan_filters(data)
+    if bad_filters is not None:
+        return bad_filters
     job = create_intro_credits_job(
         library_name=job_title("Intro & Credits", library_name, libraries, resolved_paths),
         priority=priority,
@@ -134,6 +160,7 @@ def create_marker_job():
         libraries=libraries,
         file_paths=resolved_paths,
         force=_param_to_bool(data.get("force"), False),
+        scan_filters=scan_filters,
     )
     return jsonify(job.to_dict()), 201
 

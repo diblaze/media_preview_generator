@@ -7,15 +7,16 @@
 // delete). Previously lived inline in app.js (lines 2631-2980).
 //
 // Functions exported on window:
-//   - onScheduleTypeChange / onScanModeChange — radio-group change handlers
+//   - onScheduleTypeChange / onScheduleFilesChange — radio-group change handlers
 //   - showNewScheduleModal / showEditScheduleModal — modal open
 //   - saveSchedule — form submit (POST /api/schedules or PUT /<id>)
 //   - toggleSchedule, runScheduleNow, deleteSchedule — row actions
 //   plus three private helpers: _getSelectedScheduleType, _resetScheduleForm
 //
 // External dependencies (defined in app.js, available as window globals):
-//   showToast, escapeHtml, _renderScheduleLibraryList, updateScheduleList,
-//   plus bootstrap.Modal. Loaded AFTER app.js in base.html so those refs
+//   showToast, escapeHtml, updateScheduleList, plus bootstrap.Modal and the
+//   prefix-keyed dialog helpers shared with Start new job (_jobKinds,
+//   _renderJobLibraryList, _libraryCheckboxes, _showJobKindControls, ...). Loaded AFTER app.js in base.html so those refs
 //   resolve.
 // =========================================================================
 
@@ -95,50 +96,33 @@ function onScheduleTypeChange() {
     _updateScheduleSummary();
 }
 
-// Intro & Credits · Check servers reads back every server, so the server and library pickers don't apply.
-function _scheduleChecksServers() {
-    const markers = document.getElementById('scanModeMarkers');
-    const checkServers = document.getElementById('scheduleMarkersCheckServers');
-    return !!(markers && markers.checked && checkServers && checkServers.checked);
+// Look-back picker, and what the Files choice means for the ticked job types.
+function refreshScheduleFilesUi() {
+    const recentlyAdded = !!document.getElementById('scheduleFilesRecent')?.checked;
+    const lookbackGroup = document.getElementById('scheduleLookbackGroup');
+    if (lookbackGroup) lookbackGroup.hidden = !recentlyAdded;
+    const hint = document.getElementById('scheduleFilesHint');
+    if (!hint) return;
+    const kinds = _jobKinds('schedule');
+    const previews = kinds.includes('previews');
+    if (!recentlyAdded) {
+        hint.textContent = 'Checks every file in the chosen libraries. Files already done are skipped. The filters below apply to every ticked job.';
+    } else if (!previews) {
+        hint.textContent = 'Finds what each server added in the look-back window and runs the ticked jobs on just those files. No previews are made.';
+    } else if (kinds.length > 1) {
+        hint.textContent = 'Finds what each server added in the look-back window, makes previews for it, then runs the other ticked jobs on the same files.';
+    } else {
+        hint.textContent = 'Finds what each server added in the look-back window and makes previews for it.';
+    }
 }
 
-function onScanModeChange() {
-    const selected = document.querySelector('input[name="scanMode"]:checked').value;
-    const markersMode = document.getElementById('scheduleMarkersModeGroup');
-    if (markersMode) markersMode.hidden = selected !== 'intro_credits';
-    const checksServers = _scheduleChecksServers();
-    const modeHint = document.getElementById('scheduleMarkersModeHint');
-    if (modeHint) {
-        modeHint.hidden = selected !== 'intro_credits';
-        modeHint.textContent = checksServers
-            ? "Doesn't scan files. Quickly checks every server still has the markers this app added, and puts back any it lost."
-            : "Finds skip markers for new or changed files in the libraries below, and puts back any a server has lost.";
-    }
-    ['scheduleServerGroup', 'scheduleLibrariesGroup', 'scheduleScopeSection'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.hidden = checksServers;
-    });
-    const checkNote = document.getElementById('scheduleCheckServersNote');
-    if (checkNote) checkNote.hidden = !checksServers;
-    const dialog = document.getElementById('newScheduleModal');
-    if (dialog) dialog.dataset.kind = selected === 'intro_credits' ? (checksServers ? 'check' : 'intro_credits') : 'previews';
-    const lookbackGroup = document.getElementById('scheduleLookbackGroup');
-    if (lookbackGroup) {
-        lookbackGroup.style.display = selected === 'recently_added' ? '' : 'none';
-    }
-    // Processing order only affects full-library scans — recently-added scans
-    // touch a small, time-bounded set where shuffle is essentially a no-op.
-    // Intro & Credits checks every file of the chosen libraries (files already done are skipped), so it has no
-    // lookback and no order either.
-    const sortByGroup = document.getElementById('scheduleSortByGroup');
-    if (sortByGroup) {
-        sortByGroup.style.display = selected === 'full_library' ? '' : 'none';
-    }
-    MediaScanFilters.refresh('schedule');
+function onScheduleFilesChange() {
+    refreshScheduleFilesUi();
+    _showJobKindControls('schedule');
     // When flipping to recently-added in "Add" mode with untouched defaults,
     // nudge the trigger type to Interval and pre-fill 15 minutes — that's
     // the canonical shape of a Recently Added scanner.
-    if (selected === 'recently_added') {
+    if (document.getElementById('scheduleFilesRecent')?.checked) {
         const editId = document.getElementById('scheduleEditId').value;
         const intervalInput = document.getElementById('scheduleIntervalValue');
         if (!editId && intervalInput && intervalInput.value === '2') {
@@ -148,6 +132,38 @@ function onScanModeChange() {
             onScheduleTypeChange();
         }
     }
+}
+
+function _setScheduleKinds(kinds) {
+    const boxes = {
+        previews: 'scheduleKindPreviews',
+        intro_credits: 'scheduleKindMarkers',
+        loudness: 'scheduleKindLoudness',
+    };
+    for (const [kind, id] of Object.entries(boxes)) {
+        const box = document.getElementById(id);
+        if (box) box.checked = kinds.includes(kind);
+    }
+}
+
+// Fetches the libraries fresh on every open so the list matches the servers as they are now.
+async function _loadScheduleLibraries() {
+    MediaScanFilters.setLoading('schedule', true);
+    const listEl = document.getElementById('scheduleLibraryList');
+    if (listEl) listEl.innerHTML = '<div class="text-muted small">Loading libraries…</div>';
+    try {
+        const data = await apiGet('/api/libraries');
+        libraries = data.libraries || [];
+        librariesLoadError = null;
+        _renderJobLibraryList(libraries, 'schedule');
+    } catch (e) {
+        console.warn('Failed to load libraries for the schedule dialog:', e);
+        if (listEl) listEl.innerHTML = '<div class="text-warning small">Could not load libraries.</div>';
+        showToast('Schedules', 'Could not load libraries', 'warning');
+    } finally {
+        MediaScanFilters.setLoading('schedule', false);
+    }
+    _updateJobScopeBadge('schedule');
 }
 
 function _schedulePriorityValue() {
@@ -167,11 +183,6 @@ function _resetScheduleForm() {
     MediaScanFilters.setLoading('schedule', false);
     document.getElementById('scheduleLibraryAll').checked = true;
     document.getElementById('scheduleName').value = '';
-    const srvSel = document.getElementById('scheduleServer');
-    if (srvSel) {
-        srvSel.value = '';
-        delete srvSel.dataset.pinnedServerId;
-    }
     document.getElementById('scheduleCron').value = '';
     document.getElementById('scheduleEditId').value = '';
     document.getElementById('scheduleEnabled').checked = true;
@@ -179,17 +190,16 @@ function _resetScheduleForm() {
     // reached the inherit path — every save posted an explicit Normal.
     document.getElementById('schedulePriority').value = '';
 
-    // Reset scan mode to Full library and hide lookback group
-    document.getElementById('scanModeFull').checked = true;
-    const findMarkers = document.getElementById('scheduleMarkersFind');
-    if (findMarkers) findMarkers.checked = true;
+    _setScheduleKinds(['previews']);
+    document.getElementById('scheduleFilesAll').checked = true;
     document.getElementById('scheduleLookback').value = '1';
     const sortByEl = document.getElementById('scheduleSortBy');
     if (sortByEl) {
         sortByEl.querySelector('option[value="inherit"]')?.remove();
         sortByEl.value = 'default';
     }
-    onScanModeChange();
+    refreshScheduleFilesUi();
+    _showJobKindControls('schedule');
 
     // Reset schedule type to Specific Time
     document.getElementById('scheduleTypeTime').checked = true;
@@ -222,20 +232,9 @@ function showNewScheduleModal() {
     document.getElementById('scheduleSubmitBtn').innerHTML =
         '<i class="bi bi-check me-1"></i>Create Schedule';
 
-    MediaScanFilters.setLoading('schedule', true);
-    _populateScheduleServerPicker().then(onScheduleServerChange);
+    _loadScheduleLibraries();
     const modal = new bootstrap.Modal(document.getElementById('newScheduleModal'));
     modal.show();
-}
-
-// The server picker lists enabled servers only. A schedule pinned to a disabled or
-// removed one must keep that pin on save instead of silently becoming "All servers".
-function _keepPinnedServerOption() {
-    const sel = document.getElementById('scheduleServer');
-    const pinned = sel && sel.dataset.pinnedServerId;
-    if (!pinned || Array.from(sel.options).some(o => o.value === pinned)) return;
-    sel.add(new Option(`${pinned} (disabled or removed)`, pinned));
-    sel.value = pinned;
 }
 
 function showEditScheduleModal(scheduleId) {
@@ -247,7 +246,6 @@ function showEditScheduleModal(scheduleId) {
 
     _resetScheduleForm();
 
-    document.getElementById('scheduleServer').dataset.pinnedServerId = schedule.server_id || '';
     document.getElementById('scheduleEditId').value = schedule.id;
     document.getElementById('scheduleName').value = schedule.name || '';
     document.getElementById('scheduleEnabled').checked = schedule.enabled !== false;
@@ -260,57 +258,49 @@ function showEditScheduleModal(scheduleId) {
     const stopInput = document.getElementById('scheduleStopTime');
     if (stopInput) stopInput.value = schedule.stop_time || '';
 
-    // Phase H7: pre-select the multi-select library checkboxes from
-    // schedule.library_ids (with single-element fallback for legacy entries).
-    const wantIds = Array.isArray(schedule.library_ids) && schedule.library_ids.length
-        ? schedule.library_ids.map(String)
-        : (schedule.library_id ? [String(schedule.library_id)] : []);
+    // Pre-select the library checkboxes from schedule.library_ids (single-element fallback for legacy entries).
+    // Library ids repeat across servers, so a pinned schedule only matches the libraries of its own server.
+    const savedPairs = schedule.config && Array.isArray(schedule.config.libraries) ? schedule.config.libraries : [];
+    const wantIds = savedPairs.length
+        ? savedPairs.map(p => String(p.library_id))
+        : Array.isArray(schedule.library_ids) && schedule.library_ids.length
+            ? schedule.library_ids.map(String)
+            : (schedule.library_id ? [String(schedule.library_id)] : []);
 
     function _applyLibraryPreselect() {
-        if (document.getElementById('scheduleEditId').value !== scheduleId
-            || document.getElementById('scheduleServer').value !== (schedule.server_id || '')) return;
-        MediaScanFilters.setLoading('schedule', false);
+        if (document.getElementById('scheduleEditId').value !== scheduleId) return;
         const allCb = document.getElementById('scheduleLibraryAll');
-        if (!wantIds.length) {
-            // "All Libraries" semantics — leave master checkbox checked.
-            if (allCb) allCb.checked = true;
-            onScheduleLibraryAllChange(allCb);
-            MediaScanFilters.reset('schedule', schedule.config || {});
-            MediaScanFilters.refresh('schedule');
-            return;
+        if (allCb) allCb.checked = !wantIds.length;
+        toggleAllLibraries(allCb, 'schedule');
+        if (wantIds.length) {
+            const wantPairs = (schedule.config && Array.isArray(schedule.config.libraries))
+                ? schedule.config.libraries.map(p => `${p.server_id}\u0000${p.library_id}`)
+                : null;
+            _libraryCheckboxes('schedule').forEach(cb => {
+                cb.disabled = false;
+                cb.checked = wantPairs
+                    ? wantPairs.includes(`${cb.dataset.serverId}\u0000${cb.value}`)
+                    : wantIds.includes(String(cb.value))
+                        && (!schedule.server_id || cb.dataset.serverId === schedule.server_id);
+            });
         }
-        if (allCb) allCb.checked = false;
-        onScheduleLibraryAllChange(allCb);
-        document.querySelectorAll('.schedule-library-checkbox').forEach(cb => {
-            cb.disabled = false;
-            cb.checked = wantIds.includes(String(cb.value));
-        });
         MediaScanFilters.reset('schedule', schedule.config || {});
-        MediaScanFilters.refresh('schedule');
+        _updateJobScopeBadge('schedule');
     }
+    _loadScheduleLibraries().then(_applyLibraryPreselect);
 
-    // Populate server picker, then refresh libraries scoped to it, then
-    // pre-select the saved library_ids.
-    MediaScanFilters.setLoading('schedule', true);
-    _populateScheduleServerPicker(schedule.server_id || '')
-        .then(_keepPinnedServerOption)
-        .then(onScheduleServerChange)
-        .then(_applyLibraryPreselect);
-
-    // Pre-fill scan mode + lookback from the schedule's config
+    // Pre-fill job types, files and look-back from the schedule's (normalised) config
     const cfg = schedule.config || {};
-    if (cfg.job_type === 'intro_credits') {
-        document.getElementById('scanModeMarkers').checked = true;
-        document.getElementById(cfg.reconcile ? 'scheduleMarkersCheckServers' : 'scheduleMarkersFind').checked = true;
-    } else if (cfg.job_type === 'recently_added') {
-        document.getElementById('scanModeRecent').checked = true;
+    _setScheduleKinds(Array.isArray(cfg.job_kinds) && cfg.job_kinds.length ? cfg.job_kinds : ['previews']);
+    if (cfg.job_type === 'recently_added') {
+        document.getElementById('scheduleFilesRecent').checked = true;
         const lookbackSelect = document.getElementById('scheduleLookback');
         const lookbackVal = String(cfg.lookback_hours || 1);
         if (Array.from(lookbackSelect.options).some(o => o.value === lookbackVal)) {
             lookbackSelect.value = lookbackVal;
         }
     } else {
-        document.getElementById('scanModeFull').checked = true;
+        document.getElementById('scheduleFilesAll').checked = true;
     }
     const sortBySelect = document.getElementById('scheduleSortBy');
     if (sortBySelect) {
@@ -325,7 +315,7 @@ function showEditScheduleModal(scheduleId) {
             sortBySelect.value = 'default';
         }
     }
-    onScanModeChange();
+    onScheduleFilesChange();
 
     if (schedule.trigger_type === 'interval' && schedule.trigger_value) {
         // Interval schedule: populate interval fields
@@ -387,52 +377,49 @@ async function saveSchedule() {
     }
 
     const scheduleType = _getSelectedScheduleType();
-    const checksServers = _scheduleChecksServers();
-    // Phase H7: collect selected library_ids from the checkbox group.
     // Empty list → "All Libraries" master is checked → backend treats as None.
     const allLibsCb = document.getElementById('scheduleLibraryAll');
-    let selectedLibraryIds = [];
-    if (!checksServers && allLibsCb && !allLibsCb.checked) {
-        selectedLibraryIds = Array.from(document.querySelectorAll('.schedule-library-checkbox:checked'))
-            .map(cb => cb.value);
-        if (selectedLibraryIds.length === 0) {
-            _setScheduleFieldError('scheduleLibrariesError', 'Select at least one library or check All Libraries.');
-            showToast('Error', 'Select at least one library or check "All Libraries"', 'warning');
-            return;
-        }
+    const ticked = allLibsCb && !allLibsCb.checked ? _libraryCheckboxes('schedule', true) : [];
+    if (allLibsCb && !allLibsCb.checked && ticked.length === 0) {
+        _setScheduleFieldError('scheduleLibrariesError', 'Select at least one library or check All Libraries.');
+        showToast('Error', 'Select at least one library or check "All Libraries"', 'warning');
+        return;
     }
+    const selectedLibraryIds = ticked.map(cb => cb.value);
+    // Always sent: the one server when every ticked library is on it, else "" (clears a pin on edit). Ids repeat across servers.
+    const tickedServerIds = new Set(ticked.map(cb => cb.dataset.serverId || '').filter(Boolean));
+    const serverId = tickedServerIds.size === 1 ? Array.from(tickedServerIds)[0] : '';
     // Display name: a single library uses its name; multi shows count.
-    let libraryDisplay = checksServers ? 'All servers' : 'All Libraries';
+    let libraryDisplay = 'All Libraries';
     if (selectedLibraryIds.length === 1) {
-        const lib = libraries.find(l => String(l.id) === String(selectedLibraryIds[0]));
+        const lib = libraries.find(l => String(l.id) === String(selectedLibraryIds[0])
+            && (l.server_id || '') === (ticked[0].dataset.serverId || ''));
         libraryDisplay = lib ? lib.name : 'Selected Library';
     } else if (selectedLibraryIds.length > 1) {
         libraryDisplay = `${selectedLibraryIds.length} libraries`;
     }
-    const scanMode = document.querySelector('input[name="scanMode"]:checked').value;
+    const files = document.querySelector('input[name="scheduleFiles"]:checked').value;
+    const jobKinds = _jobKinds('schedule');
 
-    // Build the config blob — recently-added schedules carry their
-    // lookback_hours value through the same config dict that user
-    // schedules already use.
-    const scheduleConfig = { job_type: scanMode };
-    if (checksServers) {
-        scheduleConfig.reconcile = true;
-    } else if (scanMode === 'recently_added') {
+    // Build the config blob: which job types, which files, and the options that go with those files.
+    const scheduleConfig = { job_kinds: jobKinds, job_type: files };
+    // Exact {server_id, library_id} picks, as Start new job sends them; absent for All Libraries.
+    if (ticked.length && ticked.every(cb => cb.dataset.serverId)) {
+        scheduleConfig.libraries = ticked.map(cb => ({ server_id: cb.dataset.serverId, library_id: cb.value }));
+    }
+    if (files === 'recently_added') {
         scheduleConfig.lookback_hours = parseFloat(document.getElementById('scheduleLookback').value) || 1;
-    } else if (scanMode === 'full_library') {
-        // Processing order only applies to full-library scans
+    } else {
         const scanFilters = MediaScanFilters.read('schedule');
         if (scanFilters === null) return;
         Object.assign(scheduleConfig, scanFilters);
+        // Processing order is a Previews option.
         const sortByEl = document.getElementById('scheduleSortBy');
         const sortBy = sortByEl ? sortByEl.value : '';
-        if (sortBy && sortBy !== 'inherit') {
+        if (jobKinds.includes('previews') && sortBy && sortBy !== 'inherit') {
             scheduleConfig.sort_by = sortBy;
         }
     }
-
-    const serverSelect = document.getElementById('scheduleServer');
-    const serverId = serverSelect && !checksServers ? serverSelect.value : '';
 
     // D20 — stop_time only applies to time-of-day triggers; for
     // interval triggers we always send an empty string so the backend
@@ -447,7 +434,7 @@ async function saveSchedule() {
         library_id: selectedLibraryIds.length === 1 ? selectedLibraryIds[0] : null,
         library_ids: selectedLibraryIds,
         library_name: libraryDisplay,
-        server_id: serverId || null,
+        server_id: serverId,
         enabled: document.getElementById('scheduleEnabled').checked,
         priority: _schedulePriorityValue(),
         config: scheduleConfig,

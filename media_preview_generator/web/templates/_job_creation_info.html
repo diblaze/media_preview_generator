@@ -11,6 +11,15 @@
     <p>Order in the queue when more than one job is waiting: High runs before Normal, Normal before Low.</p>
     <p>It also applies file-by-file — a running job is never cancelled or paused, but each worker that frees up goes to the highest-priority job first, so a High job overtakes a long scan mid-run.</p>
 </template>
+<template id="infoJobKindLoudnessTpl">
+    <p>Runs Plex's loudness analysis of each audio track in the chosen libraries and stores it in Plex, for Normalize Loudness.</p>
+    <p>Libraries need Loudness on (server settings). Requires a local Plex 1.43.4.x or 1.43.5.x database and a CPU worker group that allows Plex loudness.</p>
+</template>
+<template id="infoJobSortTpl">
+    <p>Newest and oldest use the date added to the library. Date ordering applies within each library; parallel workers may finish out of order.</p>
+    <p>Pick <strong>Random</strong> if your media is split across multiple disks, so workers don't all hit one disk at the same time.</p>
+    <p>Only Previews uses this order. Intro &amp; Credits and loudness keep their own.</p>
+</template>
 <template id="infoManualFindMediaTpl">
     <p>Pick a show to process its episodes, or a movie/episode for just that file. Choose the processing task under Job type.</p>
     <p>To target one episode, add its number — e.g. <code>The Office S01E01</code> (or <code>1x01</code>).</p>

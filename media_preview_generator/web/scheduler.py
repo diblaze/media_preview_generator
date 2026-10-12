@@ -60,6 +60,7 @@ _QUIET_HOURS_PAUSE_PREFIX = "__qh_pause_"
 _QUIET_HOURS_RESUME_PREFIX = "__qh_resume_"
 _QUIET_HOURS_RECHECK = "__qh_recheck"
 _LIBRARY_HEALTH_NIGHTLY = "__library_health_nightly"
+_MARKERS_CHECK_SERVERS_DAILY = "__markers_check_servers_daily"
 
 # APScheduler day_of_week names (Mon-first). Order matters for cron
 # strings — keep these literal so a typo in the JS payload can't slip
@@ -130,6 +131,78 @@ def _quiet_hours_resume() -> None:
     _quiet_hours_recompute_and_apply()
 
 
+def normalize_schedule_config(config: dict | None) -> dict:
+    """A schedule config in the current shape: ``job_kinds`` (which jobs) and ``job_type`` (which files).
+
+    Legacy configs carried one kind in ``job_type``: ``intro_credits`` becomes ``job_kinds=["intro_credits"]`` over the
+    whole library; ``recently_added`` gets every kind (its follow-ups already ran for all of them); anything else is
+    previews. The ``reconcile`` key (Check servers schedules, now automatic) is dropped.
+
+    Args:
+        config: A schedule's config, current or legacy; None = empty.
+
+    Returns:
+        A normalised copy: ``job_kinds`` in canonical order, ``job_type`` ``full_library`` or ``recently_added``.
+
+    Raises:
+        ValueError: ``job_kinds`` is empty, not a list, or names an unknown kind.
+    """
+    from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_PREVIEWS, JOB_KINDS
+
+    result = dict(config or {})
+    result.pop("reconcile", None)
+    job_type = str(result.get("job_type") or "full_library")
+    if "job_kinds" in result:
+        requested = result["job_kinds"]
+        if not isinstance(requested, list | tuple) or not requested:
+            raise ValueError("job_kinds must be a non-empty list")
+        unknown = [kind for kind in requested if kind not in JOB_KINDS]
+        if unknown:
+            raise ValueError(f"Unknown job_kinds: {', '.join(str(kind) for kind in unknown)}")
+        result["job_kinds"] = [kind for kind in JOB_KINDS if kind in requested]
+    elif job_type == "intro_credits":
+        result["job_kinds"] = [JOB_KIND_INTRO_CREDITS]
+    elif job_type == "recently_added":
+        result["job_kinds"] = list(JOB_KINDS)
+    else:
+        result["job_kinds"] = [JOB_KIND_PREVIEWS]
+    result["job_type"] = "recently_added" if job_type == "recently_added" else "full_library"
+    if "libraries" in result:
+        result["libraries"] = _normalise_library_pairs(result["libraries"])
+        if not result["libraries"]:
+            del result["libraries"]
+    return result
+
+
+def _normalise_library_pairs(raw: Any) -> list[dict[str, str]]:
+    """A schedule's exact library picks as ``[{"server_id", "library_id"}]`` without repeats.
+
+    Raises:
+        ValueError: ``raw`` isn't a list of objects with non-empty string ids.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("libraries must be a list of {server_id, library_id}")
+    pairs: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("libraries must be a list of {server_id, library_id}")
+        server_id, library_id = entry.get("server_id"), entry.get("library_id")
+        if not (
+            isinstance(server_id, str) and server_id.strip() and isinstance(library_id, str) and library_id.strip()
+        ):
+            raise ValueError("libraries must be a list of {server_id, library_id}")
+        pair = {"server_id": server_id.strip(), "library_id": library_id.strip()}
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def is_retired_check_servers_config(config: dict | None) -> bool:
+    """Whether a config is a legacy Check servers schedule (``intro_credits`` with ``reconcile``)."""
+    cfg = config or {}
+    return cfg.get("job_type") == "intro_credits" and bool(cfg.get("reconcile")) and "job_kinds" not in cfg
+
+
 def execute_schedule_stop(schedule_id: str) -> None:
     """Add this schedule's hold to its pending and running jobs.
 
@@ -180,22 +253,27 @@ _FIND_MARKERS_TICK_LOCK = threading.Lock()
 _FULL_LIBRARY_TICK_LOCK = threading.Lock()
 
 
-def _resumed_kind(config: dict | None) -> str | None:
-    """The job kind a schedule's start tick resumes after its stop time paused it (``execute_scheduled_job``).
+def _resumed_kinds(config: dict | None) -> set[str]:
+    """The job kinds a schedule's start tick resumes after its stop time paused them (``execute_scheduled_job``).
 
-    Returns:
-        ``intro_credits`` or ``previews`` (including Recently Added).
+    Recently Added always includes ``previews``: the scan job is a preview job whatever is ticked.
     """
-    from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_PREVIEWS
+    from ..job_kinds import JOB_KIND_PREVIEWS
 
-    job_type = str((config or {}).get("job_type", "full_library"))
-    return JOB_KIND_INTRO_CREDITS if job_type == "intro_credits" else JOB_KIND_PREVIEWS
+    try:
+        normalised = normalize_schedule_config(config)
+    except ValueError:
+        return {JOB_KIND_PREVIEWS}
+    kinds = set(normalised["job_kinds"])
+    if normalised["job_type"] == "recently_added":
+        kinds.add(JOB_KIND_PREVIEWS)
+    return kinds
 
 
 def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict | None) -> None:
     """Log a WARNING for each job this schedule's stop time paused that its start ticks no longer resume.
 
-    A schedule switched between previews, Intro & Credits and Recently Added leaves the other kind's paused job paused,
+    A schedule switched to other job kinds or between whole library and Recently Added leaves the old paused job paused,
     like a deleted schedule's; this names it instead of leaving it silently.
 
     Args:
@@ -206,7 +284,7 @@ def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict
     from .jobs import PAUSED_BY_SCHEDULE, JobStatus, get_job_manager
     from .routes.job_runner import RECENTLY_ADDED_JOB_SOURCE
 
-    kind = _resumed_kind(config)
+    kinds = _resumed_kinds(config)
     try:
         jobs = get_job_manager().get_all_jobs()
     except Exception:
@@ -216,7 +294,7 @@ def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict
         same_mode = ((job.config or {}).get("source") == RECENTLY_ADDED_JOB_SOURCE) == (
             (config or {}).get("job_type") == "recently_added"
         )
-        if job.parent_schedule_id != schedule_id or (job.kind == kind and same_mode):
+        if job.parent_schedule_id != schedule_id or (job.kind in kinds and same_mode):
             continue
         if not (job.paused and job.status is JobStatus.RUNNING and (job.config or {}).get(PAUSED_BY_SCHEDULE)):
             continue
@@ -233,7 +311,7 @@ def _warn_stop_paused_jobs_left_behind(schedule_id: str, name: str, config: dict
 def _warn_paused_jobs_of_deleted_schedule(schedule_id: str, name: str) -> None:
     """Log a WARNING for each paused job of a deleted schedule: no start tick of it will resume the job any more.
 
-    The jobs are left paused; a paused Check servers job keeps every other Check servers run from queueing.
+    The jobs are left paused.
 
     Args:
         schedule_id: The deleted schedule's id.
@@ -301,6 +379,8 @@ def _scan_scope(job: Any) -> tuple[str | None, frozenset[str] | None] | None:
         return (job.server_id or cfg.get("server_id") or None, frozenset(library_ids) if library_ids else None)
     if job.kind == JOB_KIND_INTRO_CREDITS:
         if cfg.get("file_paths") or cfg.get("reconcile") or cfg.get("verify") or cfg.get("follows_job_id"):
+            return None
+        if _has_scan_filters(cfg):
             return None
         if cfg.get("source") not in ("manual", "schedule"):
             return None
@@ -402,6 +482,54 @@ def _skip_if_already_scanned(
     return True
 
 
+def _unfinished_schedule_job(schedule_id: str, kind: str) -> Any:
+    """The schedule's pending or running job of ``kind`` from an earlier tick, or None.
+
+    A job whose own run is done and only its retry chain is left doesn't hold the schedule back, and neither does a
+    Check servers job.
+    """
+    from .jobs import JobStatus, get_job_manager, is_live_retry_chain
+
+    return next(
+        (
+            job
+            for job in get_job_manager().get_all_jobs()
+            if job.parent_schedule_id == schedule_id
+            and job.kind == kind
+            and not (job.config or {}).get("reconcile")
+            and not is_live_retry_chain(job.config)
+            and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
+        ),
+        None,
+    )
+
+
+def _pin_server_for_libraries(
+    schedule_id: str, label: str, library_ids: list[str], server_id: str | None
+) -> str | None:
+    """The server a tick's chosen libraries belong to, as Start new job infers it.
+
+    Library ids are only meaningful with their server, so ids without one are pinned to the server that owns them.
+
+    Returns:
+        ``server_id`` when given; else the one server owning every library; None (with a WARNING) when there is none.
+    """
+    if server_id or not library_ids:
+        return server_id
+    from .routes.api_jobs import _infer_server_from_library_ids
+
+    inferred = _infer_server_from_library_ids(library_ids)[0]
+    if not inferred:
+        logger.warning(
+            "Schedule {}: libraries {} don't belong to exactly one enabled media server, so its {} job wasn't started. "
+            "Edit the schedule and pick libraries from one server.",
+            schedule_id,
+            library_ids,
+            label,
+        )
+    return inferred
+
+
 def _start_scheduled_intro_credits_job(
     manager: "ScheduleManager",
     schedule_id: str,
@@ -409,15 +537,19 @@ def _start_scheduled_intro_credits_job(
     library_name: str,
     priority: int | str | None,
     server_id: str | None,
-) -> None:
+    scan_filters: dict | None = None,
+    pairs: list[dict] | None = None,
+) -> bool:
     """Create the Intro & Credits job for a schedule tick (LOW unless the schedule sets a priority).
 
-    Nothing is created while a Find markers job of this schedule is still pending or running (a Check servers job it
+    Nothing is created while an Intro & Credits job of this schedule is still pending or running (a Check servers job it
     queued before a switch doesn't count); that check and the creation are one step, so Run now beside a start tick
-    queues one job. Library ids are only meaningful with their server, so ids without one are
-    pinned to the server that owns them and a tick that can't be pinned starts nothing rather than checking every
+    queues one job. A tick whose libraries can't be pinned to one server starts nothing rather than checking every
     library. Chosen libraries outside the server's Intro & Credits selection are left out; a schedule with only a
     server takes that server's selection.
+
+    Returns:
+        True when a job was created.
     """
     with _FIND_MARKERS_TICK_LOCK:
         try:
@@ -425,41 +557,30 @@ def _start_scheduled_intro_credits_job(
             from ..markers.ownership import marker_libraries
             from ..markers.triggers import create_intro_credits_job
             from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
-            from .jobs import PRIORITY_LOW, JobStatus, get_job_manager, is_live_retry_chain, parse_priority
+            from .jobs import PRIORITY_LOW, parse_priority
             from .settings_manager import get_settings_manager
 
-            # A job whose own run is done and only its retry chain is left doesn't hold the schedule back.
-            unfinished = next(
-                (
-                    job
-                    for job in get_job_manager().get_all_jobs()
-                    if job.parent_schedule_id == schedule_id
-                    and job.kind == JOB_KIND_INTRO_CREDITS
-                    and not (job.config or {}).get("reconcile")
-                    and not is_live_retry_chain(job.config)
-                    and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
-                ),
-                None,
-            )
+            unfinished = _unfinished_schedule_job(schedule_id, JOB_KIND_INTRO_CREDITS)
             if unfinished is not None:
                 logger.info(
                     "Schedule {}: Intro & Credits job {} from an earlier run hasn't finished; not starting another",
                     schedule_id,
                     unfinished.id[:8],
                 )
-                return
+                return False
+            if pairs:
+                create_intro_credits_job(
+                    library_name=f"Intro & Credits: {library_name or 'all libraries'}",
+                    priority=parse_priority(priority) if priority is not None else PRIORITY_LOW,
+                    source="schedule",
+                    libraries=pairs,
+                    parent_schedule_id=schedule_id,
+                    scan_filters=scan_filters,
+                )
+                return True
+            server_id = _pin_server_for_libraries(schedule_id, "Intro & Credits", library_ids, server_id)
             if library_ids and not server_id:
-                from .routes.api_jobs import _infer_server_from_library_ids
-
-                server_id = _infer_server_from_library_ids(library_ids)[0]
-                if not server_id:
-                    logger.warning(
-                        "Schedule {}: libraries {} don't belong to exactly one enabled media server, so its Intro & "
-                        "Credits job wasn't started. Edit the schedule and pick the server.",
-                        schedule_id,
-                        library_ids,
-                    )
-                    return
+                return False
             if server_id:
                 entry = next(
                     (
@@ -493,11 +614,11 @@ def _start_scheduled_intro_credits_job(
                         schedule_id,
                         server_id,
                     )
-                    return
+                    return False
             if _skip_if_already_scanned(
                 manager, schedule_id, JOB_KIND_INTRO_CREDITS, server_id, library_ids, library_name
             ):
-                return
+                return False
             libraries = [{"server_id": server_id, "library_id": str(lid)} for lid in library_ids] if server_id else []
             # A schedule for one server's libraries publishes to that server only, as its scheduled preview job does
             # (``config["server_id"]`` in execute_scheduled_job): another server holding the same files isn't touched.
@@ -508,42 +629,122 @@ def _start_scheduled_intro_credits_job(
                 source="schedule",
                 libraries=libraries,
                 parent_schedule_id=schedule_id,
+                scan_filters=scan_filters,
                 **pin,
             )
-            manager._update_last_run(schedule_id)
+            return True
         except Exception:
             logger.exception(
                 "Scheduled Intro & Credits job {} could not start. It will try again on its next scheduled tick.",
                 schedule_id,
             )
+            return False
 
 
-def _start_scheduled_check_servers(manager: "ScheduleManager", schedule_id: str, priority: int | str | None) -> None:
-    """Queue Intro & Credits · Check servers for a schedule tick (LOW unless the schedule sets a priority).
+def _start_scheduled_loudness_job(
+    schedule_id: str,
+    library_ids: list[str],
+    library_name: str,
+    priority: int | str | None,
+    server_id: str | None,
+    scan_filters: dict | None = None,
+    pairs: list[dict] | None = None,
+) -> bool:
+    """Create the loudness job for a schedule tick (LOW unless the schedule sets a priority).
 
-    Nothing is queued while a Check servers job from anywhere is still queued or running; the schedule's last run is
-    stamped only when this tick queued the job.
+    Nothing is created while a loudness job of this schedule is still pending or running. Libraries loudness isn't on
+    for are left out by the job itself when it lists its files. ``pairs`` (exact picks on several servers) go to the
+    job as they are, as in Start new job.
+
+    Returns:
+        True when a job was created.
+    """
+    with _FIND_MARKERS_TICK_LOCK:
+        try:
+            from ..job_kinds import JOB_KIND_LOUDNESS
+            from ..loudness.job import create_loudness_job
+            from .jobs import PRIORITY_LOW, parse_priority
+
+            unfinished = _unfinished_schedule_job(schedule_id, JOB_KIND_LOUDNESS)
+            if unfinished is not None:
+                logger.info(
+                    "Schedule {}: loudness job {} from an earlier run hasn't finished; not starting another",
+                    schedule_id,
+                    unfinished.id[:8],
+                )
+                return False
+            if pairs:
+                create_loudness_job(
+                    library_name=f"Plex loudness: {library_name or 'all libraries'}",
+                    priority=parse_priority(priority) if priority is not None else PRIORITY_LOW,
+                    source="schedule",
+                    libraries=pairs,
+                    server_id=None,
+                    parent_schedule_id=schedule_id,
+                    scan_filters=scan_filters,
+                )
+                return True
+            server_id = _pin_server_for_libraries(schedule_id, "loudness", library_ids, server_id)
+            if library_ids and not server_id:
+                return False
+            libraries = [{"server_id": server_id, "library_id": str(lid)} for lid in library_ids] if server_id else []
+            create_loudness_job(
+                library_name=f"Plex loudness: {library_name or 'all libraries'}",
+                priority=parse_priority(priority) if priority is not None else PRIORITY_LOW,
+                source="schedule",
+                libraries=libraries,
+                server_id=server_id,
+                parent_schedule_id=schedule_id,
+                scan_filters=scan_filters,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Scheduled loudness job {} could not start. It will try again on its next scheduled tick.",
+                schedule_id,
+            )
+            return False
+
+
+def _resume_orphaned_check_servers_jobs() -> None:
+    """Clear the schedule hold on paused Check servers jobs whose schedule no longer exists.
+
+    A legacy Check servers schedule's stop time could pause its job; deleting the schedule leaves the job held by a
+    stop tick that will never come, and ``unfinished_reconcile_job`` would keep returning it.
+    """
+    from ..markers.reconcile import unfinished_reconcile_job
+    from .jobs import PAUSED_BY_SCHEDULE, get_job_manager
+
+    job = unfinished_reconcile_job()
+    if job is None or not job.paused or not (job.config or {}).get(PAUSED_BY_SCHEDULE):
+        return
+    manager = _schedule_manager
+    if job.parent_schedule_id and manager is not None:
+        with manager._lock:
+            if job.parent_schedule_id in manager._schedules:
+                return
+    job_manager = get_job_manager()
+    if job_manager.request_resume(job.id, only_paused_by_schedule=True):
+        job_manager.add_log(
+            job.id, f"INFO - Resumed by the daily check: its schedule {job.parent_schedule_id!r} no longer exists"
+        )
+
+
+def run_markers_check_servers_daily() -> None:
+    """Scheduler entry point: queue Intro & Credits · Check servers.
+
+    Does nothing when Intro & Credits is off everywhere, and joins a Check servers job that hasn't finished
+    (``run_markers_reconcile``). Quiet hours and Pause All don't skip it: a queued job waits out a pause at admission.
+    A paused job left by a deleted legacy Check servers schedule is resumed first, or it would hold the check forever.
+    Logs instead of raising so APScheduler never sees a failure.
     """
     try:
         from ..markers.reconcile import run_markers_reconcile
-        from .jobs import PRIORITY_LOW, parse_priority
 
-        queued = run_markers_reconcile(
-            priority=parse_priority(priority) if priority is not None else PRIORITY_LOW,
-            parent_schedule_id=schedule_id,
-        )
-        if queued.created:
-            manager._update_last_run(schedule_id)
-        elif queued.job_id is not None:
-            logger.info(
-                "Schedule {}: Check servers job {} hasn't finished; not queueing another",
-                schedule_id,
-                queued.job_id[:8],
-            )
+        _resume_orphaned_check_servers_jobs()
+        run_markers_reconcile()
     except Exception:
-        logger.exception(
-            "Scheduled Check servers {} could not start. It will try again on its next scheduled tick.", schedule_id
-        )
+        logger.exception("Daily Check servers could not start. It will try again tomorrow.")
 
 
 # Module-level function for APScheduler to call
@@ -564,18 +765,19 @@ def execute_scheduled_job(
     This function must be at module level (not a class method) because
     APScheduler's SQLAlchemy jobstore needs to pickle it.
 
-    Dispatches on ``config["job_type"]``:
+    ``config["job_kinds"]`` says which jobs to run and ``config["job_type"]`` which files:
 
-    * ``"recently_added"`` — runs the Recently Added scanner against the
-      schedule's libraries (or all libraries when none specified).
-      Uses ``config["lookback_hours"]`` (default 1). Plex-only.
-    * ``"intro_credits"`` — creates an Intro & Credits job for the schedule's
-      libraries (every library Intro & Credits goes to when none are chosen),
-      LOW priority unless the schedule sets one. With ``config["reconcile"]``
-      it queues Check servers instead (every server; libraries don't apply).
-    * anything else (including missing) — legacy **full library** scan via
-      ``manager.run_job_callback``, which creates a job processing every
-      item in the targeted libraries.
+    * ``"recently_added"`` — one Recently Added scan over the schedule's
+      libraries (or all libraries when none specified), using
+      ``config["lookback_hours"]`` (default 1). It generates previews only
+      when Previews is ticked, then queues the ticked follow-up kinds for the
+      new files.
+    * ``"full_library"`` (or missing) — one job per ticked kind, all queued on
+      this tick: previews via ``manager.run_job_callback``, Intro & Credits
+      and loudness via their own job creators. One kind failing doesn't stop
+      the others.
+
+    Legacy configs are normalised first (``normalize_schedule_config``).
 
     Args:
         schedule_id: The ID of the schedule triggering this job
@@ -603,12 +805,32 @@ def execute_scheduled_job(
         library_ids = [str(x) for x in library_ids_or_id if str(x).strip()]
     else:
         library_ids = []
-    primary_library_id = library_ids[0] if len(library_ids) == 1 else None
 
-    cfg = dict(config or {})
+    from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
+    from ..scan_filters import pick_filter_config
+
+    if is_retired_check_servers_config(config):
+        logger.info("Schedule {} is a retired Check servers schedule; ignoring its tick", schedule_id)
+        return
+    try:
+        cfg = normalize_schedule_config(config)
+    except ValueError as exc:
+        logger.error("Schedule {} has an invalid config ({}); fix it on the Schedules page", schedule_id, exc)
+        return
+    pairs = cfg.get("libraries") or []
+    pair_servers = {pair["server_id"] for pair in pairs}
+    if len(pair_servers) == 1:
+        # Exact picks on one server are the same as that server's flat library ids.
+        server_id = next(iter(pair_servers))
+        library_ids = [pair["library_id"] for pair in pairs]
+        pairs = []
+    elif pairs:
+        server_id = None
+        library_ids = [pair["library_id"] for pair in pairs]
     if server_id and "server_id" not in cfg:
         cfg["server_id"] = server_id
-    job_type = str(cfg.get("job_type", "full_library"))
+    job_type = cfg["job_type"]
+    job_kinds = cfg["job_kinds"]
     manager = get_schedule_manager()
 
     # D21 — global processing-paused gate. When the queue is paused
@@ -642,19 +864,18 @@ def execute_scheduled_job(
     # span across stop_time pauses with the same Job ID and progress.
     # Match kind and scan mode; clear only this schedule's hold so manual
     # pauses remain independent.
-    schedule_kind = _resumed_kind(cfg)
-    if schedule_kind is not None:
+    schedule_kinds = _resumed_kinds(cfg)
+    if schedule_kinds:
         try:
             from .jobs import PAUSED_BY_SCHEDULE, JobStatus, get_job_manager
             from .routes.job_runner import RECENTLY_ADDED_JOB_SOURCE
 
-            # A schedule switched between previews and Intro & Credits must not resume the other kind's job (the
-            # switch logs a WARNING naming it). Between finding markers and checking servers it does: nothing else
-            # would resume the other mode's job.
+            # A schedule switched to other job kinds must not resume a kind it no longer runs (the switch logs a
+            # WARNING naming the job).
             job_manager = get_job_manager()
             resumed = []
             for job in job_manager.get_all_jobs():
-                if job.parent_schedule_id != schedule_id or job.kind != schedule_kind:
+                if job.parent_schedule_id != schedule_id or job.kind not in schedule_kinds:
                     continue
                 if ((job.config or {}).get("source") == RECENTLY_ADDED_JOB_SOURCE) != (job_type == "recently_added"):
                     continue
@@ -694,13 +915,6 @@ def execute_scheduled_job(
                 schedule_id,
             )
 
-    if job_type == "intro_credits" and cfg.get("reconcile"):
-        _start_scheduled_check_servers(manager, schedule_id, priority)
-        return
-    if job_type == "intro_credits":
-        _start_scheduled_intro_credits_job(manager, schedule_id, library_ids, library_name, priority, server_id)
-        return
-
     if job_type == "recently_added":
         try:
             lookback = float(cfg.get("lookback_hours", 1) or 1)
@@ -738,6 +952,8 @@ def execute_scheduled_job(
                 lookback_hours=lookback,
                 library_name=f"Recently added: {display_label}",
                 priority=priority,
+                follow_up_kinds=[kind for kind in job_kinds if kind != JOB_KIND_PREVIEWS],
+                make_previews=JOB_KIND_PREVIEWS in job_kinds,
             )
             manager._update_last_run(schedule_id)
         except Exception:
@@ -748,80 +964,131 @@ def execute_scheduled_job(
             )
         return
 
-    logger.info("Executing scheduled job: {} for library: {}", schedule_id, library_name)
-
-    if manager.run_job_callback:
+    logger.info("Executing scheduled job: {} for library: {} (kinds: {})", schedule_id, library_name, job_kinds)
+    scan_filters = pick_filter_config(cfg)
+    queued = False
+    for kind in job_kinds:
         try:
-            # For multi-library schedules, hand off the full list via
-            # config.selected_library_ids so the orchestrator processes each
-            # library in one job. The legacy single-library shortcut goes via
-            # library_id when there's exactly one (keeps existing behaviour).
-            if len(library_ids) > 1:
-                cfg = dict(cfg)
-                cfg["selected_library_ids"] = sorted(set(library_ids))
-            kwargs: dict[str, Any] = {
-                "library_id": primary_library_id,
-                "library_name": library_name,
-                "config": cfg,
-                "parent_schedule_id": schedule_id,
-            }
-            if priority is not None:
-                kwargs["priority"] = priority
-            if server_id:
-                kwargs["server_id"] = server_id
-            # One unfinished scan owns this exact scheduled scope, including
-            # its pauses, parked checkpoints and retries. A later tick must
-            # not restart the same library beside it or clear a manual pause.
-            signature = json.dumps(
-                {"config": cfg, "libraries": sorted(set(library_ids)), "server_id": server_id, "priority": priority},
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            cfg["schedule_scope"] = signature
-            from .jobs import JobStatus, get_job_manager
-
-            pinned_server_id = server_id
-            if not pinned_server_id and library_ids:
-                from .routes.api_jobs import _infer_server_from_library_ids
-
-                pinned_server_id = _infer_server_from_library_ids(library_ids)[0]
-
-            with _FULL_LIBRARY_TICK_LOCK:
-                existing = next(
-                    (
-                        job
-                        for job in get_job_manager().get_all_jobs()
-                        if job.parent_schedule_id == schedule_id
-                        and job.kind == "previews"
-                        and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
-                        and (job.config or {}).get("schedule_scope") == signature
-                    ),
-                    None,
+            if kind == JOB_KIND_PREVIEWS:
+                preview_cfg = {key: value for key, value in cfg.items() if key not in ("job_kinds", "libraries")}
+                # One previews job per server, each pinned to it, as Start new job creates them.
+                scopes = _pairs_by_server(pairs) if pairs else [(server_id, library_ids)]
+                for scope_server_id, scope_library_ids in scopes:
+                    queued |= _start_scheduled_previews_job(
+                        manager,
+                        schedule_id,
+                        scope_library_ids,
+                        library_name,
+                        preview_cfg,
+                        priority,
+                        scope_server_id,
+                        force=bool((config or {}).get("force") or (config or {}).get("force_generate")),
+                    )
+            elif kind == JOB_KIND_INTRO_CREDITS:
+                queued |= _start_scheduled_intro_credits_job(
+                    manager, schedule_id, library_ids, library_name, priority, server_id, scan_filters, pairs=pairs
                 )
-                if existing is None and not _skip_if_already_scanned(
-                    manager,
-                    schedule_id,
-                    "previews",
-                    pinned_server_id,
-                    library_ids,
-                    library_name,
-                    force=bool((config or {}).get("force") or (config or {}).get("force_generate")),
-                ):
-                    manager.run_job_callback(**kwargs)
-                manager._update_last_run(schedule_id)
+            elif kind == JOB_KIND_LOUDNESS:
+                queued |= _start_scheduled_loudness_job(
+                    schedule_id, library_ids, library_name, priority, server_id, scan_filters, pairs=pairs
+                )
         except Exception:
             logger.exception(
-                "Scheduled job {} for library {!r} could not start. "
-                "It will retry on its next scheduled tick — check the Jobs page for any prior error details.",
+                "Scheduled {} job for {} could not start. It will retry on its next scheduled tick.",
+                kind,
                 schedule_id,
-                library_name or "all libraries",
             )
-    else:
+    if queued:
+        manager._update_last_run(schedule_id)
+
+
+def _pairs_by_server(pairs: list[dict]) -> list[tuple[str, list[str]]]:
+    """Exact library picks grouped by server, in first-seen order."""
+    by_server: dict[str, list[str]] = {}
+    for pair in pairs:
+        by_server.setdefault(pair["server_id"], []).append(pair["library_id"])
+    return list(by_server.items())
+
+
+def _start_scheduled_previews_job(
+    manager: "ScheduleManager",
+    schedule_id: str,
+    library_ids: list[str],
+    library_name: str,
+    cfg: dict,
+    priority: int | None,
+    server_id: str | None,
+    *,
+    force: bool,
+) -> bool:
+    """Start the previews job of a whole-library schedule tick through the job runner callback.
+
+    Returns:
+        True when the tick counts as run (a job was started, or the schedule's own unfinished scan of this exact scope
+        already covers it); False when another scan covers the libraries (that skip stamps the last run itself) or no
+        job runner is wired up.
+    """
+    if not manager.run_job_callback:
         logger.warning(
             "Scheduled job {} fired but no job runner is wired up — this is an internal startup issue. "
             "Restart the app; if it persists, please open an issue with the latest log lines.",
             schedule_id,
         )
+        return False
+    from ..job_kinds import JOB_KIND_PREVIEWS
+
+    primary_library_id = library_ids[0] if len(library_ids) == 1 else None
+    # Each call owns its config: it gets a ``schedule_scope`` of its own and becomes the job's saved config.
+    cfg = dict(cfg)
+    # For multi-library schedules, hand off the full list via config.selected_library_ids so the orchestrator
+    # processes each library in one job. The single-library shortcut goes via library_id.
+    if len(library_ids) > 1:
+        cfg["selected_library_ids"] = sorted(set(library_ids))
+    kwargs: dict[str, Any] = {
+        "library_id": primary_library_id,
+        "library_name": library_name,
+        "config": cfg,
+        "parent_schedule_id": schedule_id,
+    }
+    if priority is not None:
+        kwargs["priority"] = priority
+    if server_id:
+        kwargs["server_id"] = server_id
+    # One unfinished scan owns this exact scheduled scope, including its pauses, parked checkpoints and retries. A
+    # later tick must not restart the same library beside it or clear a manual pause.
+    signature = json.dumps(
+        {"config": cfg, "libraries": sorted(set(library_ids)), "server_id": server_id, "priority": priority},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cfg["schedule_scope"] = signature
+    from .jobs import JobStatus, get_job_manager
+
+    pinned_server_id = server_id
+    if not pinned_server_id and library_ids:
+        from .routes.api_jobs import _infer_server_from_library_ids
+
+        pinned_server_id = _infer_server_from_library_ids(library_ids)[0]
+
+    with _FULL_LIBRARY_TICK_LOCK:
+        existing = next(
+            (
+                job
+                for job in get_job_manager().get_all_jobs()
+                if job.parent_schedule_id == schedule_id
+                and job.kind == JOB_KIND_PREVIEWS
+                and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
+                and (job.config or {}).get("schedule_scope") == signature
+            ),
+            None,
+        )
+        if existing is None:
+            if _skip_if_already_scanned(
+                manager, schedule_id, JOB_KIND_PREVIEWS, pinned_server_id, library_ids, library_name, force=force
+            ):
+                return False
+            manager.run_job_callback(**kwargs)
+    return True
 
 
 class ScheduleManager:
@@ -838,6 +1105,8 @@ class ScheduleManager:
         self.schedules_file = os.path.join(config_dir, "schedules.json")
         self.run_job_callback = run_job_callback
         self._schedules: dict[str, dict] = {}
+        # Schedules deleted at load whose jobstore entries are removed once the scheduler starts (``start``).
+        self._retired_schedule_ids: list[str] = []
         # Surface the most recent schedules.json load result to the API +
         # UI. Pre-fix the loader's PermissionError was logged but the
         # Schedules page rendered "no schedules" with no recovery hint
@@ -905,6 +1174,8 @@ class ScheduleManager:
                         bad_count,
                     )
 
+                self._retire_check_servers_schedules()
+
                 # Phase H7 migration: legacy schedules stored a single
                 # ``library_id``. Promote to ``library_ids`` (list) so the
                 # rest of the codebase can treat them uniformly. We do NOT
@@ -923,6 +1194,7 @@ class ScheduleManager:
                         "Migrated {} legacy schedule(s) from single library_id to library_ids list",
                         migrated,
                     )
+                if self._normalise_loaded_configs() or migrated or self._retired_schedule_ids:
                     self._save_schedules()
                 # D30 — re-register every enabled schedule with APScheduler
                 # so a fresh / wiped scheduler.db doesn't leave the schedules
@@ -996,6 +1268,42 @@ class ScheduleManager:
                         "restore from a backup if one is available in the config directory."
                     )
                 self._load_status = status
+
+    def _retire_check_servers_schedules(self) -> None:
+        """Delete legacy Check servers schedules: the check is automatic now (``run_markers_check_servers_daily``)."""
+        for sched_id, sched in list(self._schedules.items()):
+            if not is_retired_check_servers_config(sched.get("config")):
+                continue
+            logger.warning(
+                "Deleted schedule {!r} ({}): Check servers is automatic now and runs daily whenever Intro & Credits is "
+                "on, so it no longer needs a schedule.",
+                sched.get("name") or sched_id,
+                sched_id,
+            )
+            del self._schedules[sched_id]
+            self._retired_schedule_ids.append(sched_id)
+
+    def _normalise_loaded_configs(self) -> bool:
+        """Bring every loaded schedule's config to the current shape (``normalize_schedule_config``).
+
+        Returns:
+            True when any config changed and schedules.json needs saving.
+        """
+        changed = False
+        for sched_id, sched in self._schedules.items():
+            try:
+                normalised = normalize_schedule_config(sched.get("config"))
+            except ValueError as exc:
+                logger.warning(
+                    "Schedule {!r} has an invalid config ({}); it is left as saved. Edit it on the Schedules page.",
+                    sched.get("name") or sched_id,
+                    exc,
+                )
+                continue
+            if normalised != sched.get("config"):
+                sched["config"] = normalised
+                changed = True
+        return changed
 
     def _enumerate_schedules_backups(self) -> list[str]:
         """Return ``schedules.json[.<stamp>].bak`` paths newest-first.
@@ -1348,7 +1656,63 @@ class ScheduleManager:
         if not self.scheduler.running:
             self.scheduler.start()
             logger.info("Scheduler started")
+            self._remove_retired_schedule_jobs()
+            self._remove_orphaned_schedule_jobs()
             self._register_library_health_nightly()
+            self._register_markers_check_servers_daily()
+
+    def _remove_retired_schedule_jobs(self) -> None:
+        """Drop the jobstore entries (start cron and stop cron) of schedules deleted at load."""
+        for sched_id in self._retired_schedule_ids:
+            for job_id in (sched_id, self._stop_job_id(sched_id)):
+                try:
+                    self.scheduler.remove_job(job_id)
+                except Exception:
+                    logger.debug("No scheduler job {} to remove for a retired schedule", job_id)
+        self._retired_schedule_ids = []
+
+    def _remove_orphaned_schedule_jobs(self) -> None:
+        """Drop start and stop crons of schedules missing from ``schedules.json``.
+
+        The app can die between saving ``schedules.json`` (a delete) and removing the jobstore entries. Only jobs
+        running ``execute_scheduled_job`` or ``execute_schedule_stop`` are looked at, so the internal ``__`` jobs stay.
+        Nothing is removed when ``schedules.json`` failed to load: the empty list would wipe every schedule's cron.
+        """
+        if self._load_status.get("status") != "ok":
+            return
+        try:
+            jobs = self.scheduler.get_jobs()
+        except Exception:
+            logger.warning("Could not list scheduler jobs to find leftovers of deleted schedules", exc_info=True)
+            return
+        with self._lock:
+            known = set(self._schedules)
+        for job in jobs:
+            if job.func not in (execute_scheduled_job, execute_schedule_stop):
+                continue
+            schedule_id = job.id.removesuffix("__stop")
+            if schedule_id in known:
+                continue
+            try:
+                self.scheduler.remove_job(job.id)
+                logger.info("Removed scheduler job {} left by a deleted schedule", job.id)
+            except Exception:
+                logger.debug("Could not remove leftover scheduler job {}", job.id, exc_info=True)
+
+    def _register_markers_check_servers_daily(self) -> None:
+        """Add the internal 04:30 Check servers run; hidden from user schedules by its ``__`` id."""
+        try:
+            self.scheduler.add_job(
+                run_markers_check_servers_daily,
+                CronTrigger(hour=4, minute=30),
+                id=_MARKERS_CHECK_SERVERS_DAILY,
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+        except Exception:
+            logger.warning("Could not register the daily Check servers run", exc_info=True)
 
     def _register_library_health_nightly(self) -> None:
         """Add the internal 03:00 library-health check; hidden from user schedules by its ``__`` id."""
@@ -1460,6 +1824,7 @@ class ScheduleManager:
 
         """
         schedule_id = str(uuid.uuid4())
+        config = normalize_schedule_config(config)
         # Validate stop_time up front so callers see the ValueError
         # before any partial side-effects (jobstore add, json save).
         stop_hm = _parse_hhmm(stop_time)
@@ -1496,7 +1861,7 @@ class ScheduleManager:
             "library_ids": ids_canonical,
             "library_name": library_name,
             "server_id": server_id,
-            "config": config or {},
+            "config": config,
             "enabled": enabled,
             "created_at": datetime.now(UTC).isoformat(),
             "last_run": None,
@@ -1604,8 +1969,10 @@ class ScheduleManager:
                 schedule["library_ids"] = [str(library_id)] if library_id else []
             if library_name is not None:
                 schedule["library_name"] = library_name
+            if config is not None:
+                config = normalize_schedule_config(config)
             resumes_other_jobs = config is not None and (
-                _resumed_kind(config) != _resumed_kind(stored.get("config"))
+                _resumed_kinds(config) != _resumed_kinds(stored.get("config"))
                 or (config.get("job_type") == "recently_added")
                 != ((stored.get("config") or {}).get("job_type") == "recently_added")
             )

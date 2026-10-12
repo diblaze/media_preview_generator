@@ -87,8 +87,9 @@ def test_automatic_eligibility_is_independent_of_preview_selection(automatic, ch
     manager, preview, cfg = automatic
     for key, value in change.items():
         setattr(cfg, key, value)
-    orchestrator._queue_loudness_follow_up(preview.id, [ProcessableItem(path, "plex")], None)
+    queued = orchestrator._queue_loudness_follow_up(preview.id, [ProcessableItem(path, "plex")], None)
     assert len(_loudness(manager)) == int(expected)
+    assert queued == [entry.id for entry in _loudness(manager)]
     if expected:
         assert _loudness(manager)[0].config["file_paths"] == [path]
 
@@ -97,7 +98,7 @@ def test_automatic_eligibility_is_independent_of_preview_selection(automatic, ch
 def test_repeated_preview_dispatch_deduplicates_persisted_followups(automatic, monkeypatch, tmp_path, state):
     manager, preview, _ = automatic
     items = [ProcessableItem("/media/movies/a.mkv", "plex")]
-    orchestrator._queue_loudness_follow_up(preview.id, items, "plex")
+    assert orchestrator._queue_loudness_follow_up(preview.id, items, "plex") == [_loudness(manager)[0].id]
     first = _loudness(manager)[0]
     if state == "running":
         manager.start_job(first.id)
@@ -108,7 +109,7 @@ def test_repeated_preview_dispatch_deduplicates_persisted_followups(automatic, m
     reloaded = jobs.JobManager(config_dir=str(tmp_path))
     for module in [triggers, job, jobs]:
         monkeypatch.setattr(module, "get_job_manager", lambda: reloaded)
-    orchestrator._queue_loudness_follow_up(preview.id, items, "plex")
+    assert orchestrator._queue_loudness_follow_up(preview.id, items, "plex") == []
     assert [entry.id for entry in _loudness(reloaded)] == [first.id]
 
 

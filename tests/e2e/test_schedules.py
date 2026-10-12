@@ -57,18 +57,38 @@ def _seed_servers_for_schedule_modal(page: Page) -> None:
         },
     ]
     mock_media_servers_status(page, servers=servers)
-    # The schedule modal's server picker reads /api/servers — separate
-    # from /api/system/media-servers/status which feeds the status panel.
     mock_servers_list(page, servers=servers)
-    # Libraries endpoint — returns a mixed set so the modal's library
-    # picker has something to render regardless of which server is pinned.
+    # Libraries endpoint: one library per server, grouped by server in the dialog.
     page.route(
         "**/api/libraries**",
         lambda r: _fulfill_json(
             r,
             {
                 "libraries": [
-                    {"id": "lib-1", "name": "Movies", "type": "movie", "server_id": "jf-1"},
+                    {
+                        "id": "1",
+                        "name": "TV Shows",
+                        "type": "show",
+                        "server_id": "plex-1",
+                        "server_name": "Home Plex",
+                        "server_type": "plex",
+                    },
+                    {
+                        "id": "lib-1",
+                        "name": "Movies",
+                        "type": "movie",
+                        "server_id": "jf-1",
+                        "server_name": "Home Jellyfin",
+                        "server_type": "jellyfin",
+                    },
+                    {
+                        "id": "lib-2",
+                        "name": "Films",
+                        "type": "movie",
+                        "server_id": "emby-1",
+                        "server_name": "Home Emby",
+                        "server_type": "emby",
+                    },
                 ]
             },
         ),
@@ -79,6 +99,20 @@ def _seed_servers_for_schedule_modal(page: Page) -> None:
         "**/api/schedules",
         lambda r: _fulfill_json(r, {"schedules": []}) if r.request.method == "GET" else r.continue_(),
     )
+
+
+def _tick_library(page: Page, server_id: str) -> None:
+    """Untick All Libraries (which enables the rows), then tick that server's library."""
+    expect(page.locator(f'.schedule-library-checkbox[data-server-id="{server_id}"]')).to_be_attached(timeout=3000)
+    page.locator("#scheduleLibraryAll").uncheck()
+    page.locator(f'.schedule-library-checkbox[data-server-id="{server_id}"]').check()
+
+
+def _open_new_schedule(page: Page, app_url: str) -> None:
+    page.goto(f"{app_url}/automation#schedules")
+    page.wait_for_load_state("domcontentloaded")
+    page.locator('button:has-text("Add Schedule")').first.click()
+    expect(page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
 
 
 @pytest.mark.e2e
@@ -115,13 +149,10 @@ class TestScheduleNonPlex:
         authed_page.locator('button:has-text("Add Schedule")').first.click()
         expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
 
-        # Fill the form: name + Recently Added scan mode + Jellyfin server.
+        # Fill the form: name + Recently added + the Jellyfin library (the server is inferred from it).
         authed_page.locator("#scheduleName").fill("Recent JF")
-        authed_page.locator("#scanModeRecent").check()
-        # Wait deterministically for the JS populator to add the
-        # jf-1 option before selecting it.
-        expect(authed_page.locator('#scheduleServer option[value="jf-1"]')).to_be_attached(timeout=3000)
-        authed_page.locator("#scheduleServer").select_option("jf-1")
+        authed_page.locator("#scheduleFilesRecent").check()
+        _tick_library(authed_page, "jf-1")
         # Submit — the form's primary button.
         save_btn = authed_page.locator(
             "#newScheduleModal button.btn-primary, #newScheduleModal button:has-text('Save')"
@@ -137,7 +168,12 @@ class TestScheduleNonPlex:
         body = captured[0]
         assert body.get("server_id") == "jf-1", body
         cfg = body.get("config") or {}
-        assert cfg.get("job_type") == "recently_added", body
+        assert cfg == {
+            "job_kinds": ["previews"],
+            "job_type": "recently_added",
+            "lookback_hours": 1,
+            "libraries": [{"server_id": "jf-1", "library_id": "lib-1"}],
+        }, body
 
     def test_save_full_library_schedule_against_emby_succeeds(self, authed_page: Page, app_url: str) -> None:
         """Phase E regression: api_schedules.create_schedule used to 400 on
@@ -171,10 +207,8 @@ class TestScheduleNonPlex:
         expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
 
         authed_page.locator("#scheduleName").fill("Nightly Emby")
-        # Full library is the default scanMode; wait for the server
-        # populator before selecting.
-        expect(authed_page.locator('#scheduleServer option[value="emby-1"]')).to_be_attached(timeout=3000)
-        authed_page.locator("#scheduleServer").select_option("emby-1")
+        # Whole library is the default; the server is inferred from the ticked library.
+        _tick_library(authed_page, "emby-1")
 
         save_btn = authed_page.locator(
             "#newScheduleModal button.btn-primary, #newScheduleModal button:has-text('Save')"
@@ -189,8 +223,8 @@ class TestScheduleNonPlex:
         body = captured[0]
         assert body.get("server_id") == "emby-1", body
         cfg = body.get("config") or {}
-        # Either omitted (defaults to full_library) or explicitly set.
-        assert cfg.get("job_type") in (None, "full_library"), body
+        assert cfg["job_kinds"] == ["previews"], body
+        assert cfg["job_type"] == "full_library", body
         assert cfg["sort_by"] == "default", body
 
 
@@ -216,7 +250,16 @@ def test_edit_schedule_preserves_processing_order(
         "**/api/schedules",
         lambda route: _fulfill_json(
             route,
-            {"schedules": [{"id": "order", "name": "Order", "config": config, "cron_expression": "0 3 * * *"}]},
+            {
+                "schedules": [
+                    {
+                        "id": "order",
+                        "name": "Order",
+                        "config": {"job_kinds": ["previews"], "job_type": "full_library", **config},
+                        "cron_expression": "0 3 * * *",
+                    }
+                ]
+            },
         ),
     )
     authed_page.goto(f"{app_url}/automation#schedules")
@@ -234,28 +277,42 @@ def test_edit_schedule_preserves_processing_order(
 
 
 @pytest.mark.e2e
-class TestScheduleServerDropdownVendorBadges:
-    def test_schedule_server_dropdown_shows_vendor_in_option_text(self, authed_page: Page, app_url: str) -> None:
-        """Phase F regression: the schedule server picker labels each option
-        with a vendor suffix so users can disambiguate same-named servers."""
+class TestScheduleLibrariesReuseStartJobPicker:
+    def test_libraries_group_by_server_and_the_server_dropdown_is_gone(self, authed_page: Page, app_url: str) -> None:
         _seed_servers_for_schedule_modal(authed_page)
-        authed_page.goto(f"{app_url}/automation#schedules")
-        authed_page.wait_for_load_state("domcontentloaded")
-        authed_page.locator('button:has-text("Add Schedule")').first.click()
-        expect(authed_page.locator("#scheduleServer")).to_be_visible(timeout=2000)
-        # Wait for the async populator to inject the test fixture's
-        # known server ids. The seeded mock from _seed_servers_for_schedule_modal
-        # always adds at least "plex-1" — pin on that.
-        expect(authed_page.locator('#scheduleServer option[value="plex-1"]')).to_be_attached(timeout=3000)
+        _open_new_schedule(authed_page, app_url)
 
-        option_texts = authed_page.locator("#scheduleServer option").all_text_contents()
-        joined = " | ".join(option_texts)
-        assert "(PLEX)" in joined, f"PLEX badge missing: {option_texts}"
-        assert "(EMBY)" in joined, f"EMBY badge missing: {option_texts}"
-        assert "(JELLYFIN)" in joined, f"JELLYFIN badge missing: {option_texts}"
+        expect(authed_page.locator("#scheduleLibraryList .ov-lg")).to_have_count(3, timeout=3000)
+        expect(authed_page.locator("#scheduleLibraryList")).to_contain_text("Home Jellyfin")
+        expect(authed_page.locator("#scheduleServer")).to_have_count(0)
+        expect(authed_page.locator("#scheduleScopeBadge")).to_contain_text("all servers")
+
+    def test_scope_badge_names_the_server_when_every_tick_is_on_one(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        _open_new_schedule(authed_page, app_url)
+        _tick_library(authed_page, "emby-1")
+
+        expect(authed_page.locator("#scheduleScopeBadge")).to_contain_text("Home Emby")
+        authed_page.locator('.schedule-library-checkbox[data-server-id="jf-1"]').check()
+        expect(authed_page.locator("#scheduleScopeBadge")).to_contain_text("2 servers")
+
+    def test_unticking_every_library_blocks_the_save_with_an_inline_error(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        captured = _capture_schedule_writes(authed_page, [])
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("No libs")
+        expect(authed_page.locator('.schedule-library-checkbox[data-server-id="jf-1"]')).to_be_attached(timeout=3000)
+        authed_page.locator("#scheduleLibraryAll").uncheck()
+
+        authed_page.locator("#scheduleSubmitBtn").click()
+
+        expect(authed_page.locator("#scheduleLibrariesError")).to_be_visible()
+        assert captured == []
 
 
-_MARKERS_SCHEDULE = {
+_INTRO_SCHEDULE = {
     "id": "sch-ic",
     "name": "Weekly Intro & Credits",
     "enabled": True,
@@ -267,9 +324,12 @@ _MARKERS_SCHEDULE = {
     "server_id": None,
     "priority": None,
     "stop_time": "",
-    "config": {"job_type": "intro_credits"},
+    # What normalize_schedule_config makes of a legacy {"job_type": "intro_credits"} schedule.
+    "config": {"job_kinds": ["intro_credits"], "job_type": "full_library"},
     "next_run": None,
 }
+
+_ALL_KINDS = ["previews", "intro_credits", "loudness"]
 
 
 def _capture_schedule_writes(page: Page, schedules: list[dict]) -> list[tuple[str, dict]]:
@@ -297,154 +357,289 @@ def _save_schedule(page: Page, path: str, method: str = "POST") -> None:
 
 
 @pytest.mark.e2e
-class TestScheduleIntroCredits:
-    def test_intro_credits_mode_hides_lookback_and_order_and_saves_its_job_type(
+class TestScheduleMultiKind:
+    def test_dialog_starts_on_previews_whole_library_with_default_priority(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        _open_new_schedule(authed_page, app_url)
+
+        expect(authed_page.locator("#scheduleKindPreviews")).to_be_checked()
+        expect(authed_page.locator("#scheduleKindMarkers")).not_to_be_checked()
+        expect(authed_page.locator("#scheduleKindLoudness")).not_to_be_checked()
+        expect(authed_page.locator("#scheduleFilesAll")).to_be_checked()
+        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_hidden()
+        expect(authed_page.locator("#schedulePriority")).to_have_value("")
+        expect(authed_page.locator("#newScheduleModal .ov-hint", has_text="run Low")).to_be_visible()
+        expect(authed_page.locator("#scheduleSummary")).to_contain_text("Whole library")
+        # Info icons on the new controls use the app's tooltip pattern.
+        for selector in ("#scheduleFilesGroup .info-icon", "#scheduleKindMarkersInfo", "#scheduleKindLoudnessInfo"):
+            expect(authed_page.locator(selector)).to_have_attribute("data-bs-toggle", "tooltip")
+
+    def test_ticking_all_three_kinds_saves_them_in_canonical_order_with_one_priority(
         self, authed_page: Page, app_url: str
     ) -> None:
         _seed_servers_for_schedule_modal(authed_page)
         captured = _capture_schedule_writes(authed_page, [])
-        authed_page.goto(f"{app_url}/automation#schedules")
-        authed_page.wait_for_load_state("domcontentloaded")
-        authed_page.locator('button:has-text("Add Schedule")').first.click()
-        expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        authed_page.locator("#scheduleName").fill("Weekly Intro & Credits")
-        # Recently added first, so switching away proves the lookback hides again.
-        authed_page.locator("#scanModeRecent").check()
-        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_visible()
-
-        authed_page.locator("#scanModeMarkers").check()
-
-        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_hidden()
-        expect(authed_page.locator("#scheduleSortByGroup")).to_be_hidden()
-        info = authed_page.locator("#scanModeMarkersInfo")
-        assert (info.get_attribute("data-bs-original-title") or info.get_attribute("title")) == (
-            "Checks the chosen libraries for intro and credits markers. Files already done are skipped. "
-            "Low priority unless you pick otherwise."
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("Nightly: everything")
+        authed_page.locator("#scheduleKindLoudness").check()
+        authed_page.locator("#scheduleKindMarkers").check()
+        authed_page.locator("#schedulePriority").evaluate(
+            "el => { el.value = '1'; el.dispatchEvent(new Event('change', {bubbles: true})); }"
         )
+
+        expect(authed_page.locator("#scheduleSummary .ov-task")).to_have_count(3)
+        expect(authed_page.locator("#scheduleSortByGroup")).to_be_visible()
         _save_schedule(authed_page, "/api/schedules")
 
         assert [method for method, _ in captured] == ["POST"]
         body = captured[0][1]
-        assert body["config"] == {"job_type": "intro_credits"}
-        assert body["priority"] is None
+        assert body["config"] == {
+            "job_kinds": _ALL_KINDS,
+            "job_type": "full_library",
+            "sort_by": "default",
+            "added_filter": "all",
+        }
+        assert body["priority"] == 1
+        assert (body["library_ids"], body["server_id"]) == ([], "")
+        assert "libraries" not in body["config"]
 
-    def test_list_badge_and_edit_round_trip_keep_the_mode(self, authed_page: Page, app_url: str) -> None:
+    def test_without_previews_the_order_is_hidden_the_filters_stay_and_no_sort_is_saved(
+        self, authed_page: Page, app_url: str
+    ) -> None:
         _seed_servers_for_schedule_modal(authed_page)
-        captured = _capture_schedule_writes(authed_page, [_MARKERS_SCHEDULE])
+        captured = _capture_schedule_writes(authed_page, [])
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("Markers nightly")
+        authed_page.locator("#scheduleKindMarkers").check()
+        authed_page.locator("#scheduleKindPreviews").uncheck()
+
+        expect(authed_page.locator("#scheduleSortByGroup")).to_be_hidden()
+        expect(authed_page.locator("#scheduleScanFilters")).to_be_visible()
+        _save_schedule(authed_page, "/api/schedules")
+
+        assert captured[0][1]["config"] == {
+            "job_kinds": ["intro_credits"],
+            "job_type": "full_library",
+            "added_filter": "all",
+        }
+
+    def test_the_last_ticked_kind_cannot_be_unticked(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        _open_new_schedule(authed_page, app_url)
+
+        authed_page.locator("#scheduleKindPreviews").click()
+
+        expect(authed_page.locator("#scheduleKindPreviews")).to_be_checked()
+
+    def test_recently_added_without_previews_saves_a_list_only_schedule(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        captured = _capture_schedule_writes(authed_page, [])
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("New arrivals: markers")
+        authed_page.locator("#scheduleKindMarkers").check()
+        authed_page.locator("#scheduleKindPreviews").uncheck()
+        authed_page.locator("#scheduleFilesRecent").check()
+
+        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_visible()
+        expect(authed_page.locator("#scheduleSortByGroup")).to_be_hidden()
+        expect(authed_page.locator("#scheduleScanFilters")).to_be_hidden()
+        expect(authed_page.locator("#scheduleFilesHint")).to_contain_text("No previews are made")
+        # Recently added nudges an untouched trigger to every 15 minutes.
+        expect(authed_page.locator("#scheduleTypeInterval")).to_be_checked()
+        expect(authed_page.locator("#scheduleIntervalValue")).to_have_value("15")
+        authed_page.locator("#scheduleLookback").select_option("6")
+        _save_schedule(authed_page, "/api/schedules")
+
+        body = captured[0][1]
+        assert body["config"] == {"job_kinds": ["intro_credits"], "job_type": "recently_added", "lookback_hours": 6}
+        assert body["interval_minutes"] == 15
+
+    def test_recently_added_with_previews_saves_every_ticked_kind_and_no_filters(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        captured = _capture_schedule_writes(authed_page, [])
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("New arrivals")
+        authed_page.locator("#scheduleKindMarkers").check()
+        authed_page.locator("#scheduleFilesRecent").check()
+
+        expect(authed_page.locator("#scheduleFilesHint")).to_contain_text("makes previews")
+        _save_schedule(authed_page, "/api/schedules")
+
+        assert captured[0][1]["config"] == {
+            "job_kinds": ["previews", "intro_credits"],
+            "job_type": "recently_added",
+            "lookback_hours": 1,
+        }
+
+    def test_check_servers_is_no_longer_offered(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        _open_new_schedule(authed_page, app_url)
+
+        expect(authed_page.locator("#scheduleMarkersCheckServers")).to_have_count(0)
+        expect(authed_page.locator("#scheduleCheckServersNote")).to_have_count(0)
+
+
+@pytest.mark.e2e
+class TestScheduleListAndEditRoundTrip:
+    def test_legacy_intro_credits_schedule_lists_its_chip_and_round_trips_through_edit(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        captured = _capture_schedule_writes(authed_page, [_INTRO_SCHEDULE])
         authed_page.goto(f"{app_url}/automation#schedules")
         authed_page.wait_for_load_state("domcontentloaded")
         row = authed_page.locator("#scheduleList tr", has_text="Weekly Intro & Credits")
-        expect(row.locator(".schedule-kind-badge")).to_have_text("Intro & Credits", timeout=3000)
+        expect(row.locator(".schedule-kind-badge")).to_have_text(["Intro & Credits"], timeout=3000)
+        expect(row.locator(".schedule-files-label")).to_have_text("Whole library")
         assert "Low" in (row.locator(".priority-badge").get_attribute("title") or "")
 
         row.locator('button[aria-label="Edit schedule"]').click()
         expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
 
-        expect(authed_page.locator("#scanModeMarkers")).to_be_checked()
-        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_hidden()
+        expect(authed_page.locator("#scheduleKindMarkers")).to_be_checked()
+        expect(authed_page.locator("#scheduleKindPreviews")).not_to_be_checked()
+        expect(authed_page.locator("#scheduleFilesAll")).to_be_checked()
         expect(authed_page.locator("#scheduleSortByGroup")).to_be_hidden()
         _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
 
         assert [method for method, _ in captured] == ["PUT"]
-        assert captured[0][1]["config"] == {"job_type": "intro_credits"}
+        assert captured[0][1]["config"] == {
+            "job_kinds": ["intro_credits"],
+            "job_type": "full_library",
+            "added_filter": "all",
+        }
+        assert captured[0][1]["priority"] is None
 
-    def test_check_servers_hides_the_server_and_library_pickers_and_saves_its_mode(
+    def test_legacy_recently_added_schedule_shows_every_kind_and_keeps_its_lookback(
         self, authed_page: Page, app_url: str
     ) -> None:
         _seed_servers_for_schedule_modal(authed_page)
-        captured = _capture_schedule_writes(authed_page, [])
-        authed_page.goto(f"{app_url}/automation#schedules")
-        authed_page.wait_for_load_state("domcontentloaded")
-        authed_page.locator('button:has-text("Add Schedule")').first.click()
-        expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        authed_page.locator("#scheduleName").fill("Check servers nightly")
-        expect(authed_page.locator("#scheduleMarkersModeGroup")).to_be_hidden()
-
-        authed_page.locator("#scanModeMarkers").check()
-        expect(authed_page.locator("#scheduleMarkersModeGroup")).to_be_visible()
-        expect(authed_page.locator("#scheduleMarkersFind")).to_be_checked()
-        expect(authed_page.locator("#scheduleServerGroup")).to_be_visible()
-        expect(authed_page.locator("#scheduleLibrariesGroup")).to_be_visible()
-        hint = authed_page.locator("#scheduleMarkersModeHint")
-        expect(hint).to_have_text(
-            "Finds skip markers for new or changed files in the libraries below, and puts back any a server has lost."
-        )
-
-        authed_page.locator("#scheduleMarkersCheckServers").check()
-        expect(hint).to_have_text(
-            "Doesn't scan files. Quickly checks every server still has the markers this app added, "
-            "and puts back any it lost."
-        )
-        expect(authed_page.locator("#scheduleServerGroup")).to_be_hidden()
-        expect(authed_page.locator("#scheduleLibrariesGroup")).to_be_hidden()
-        info = authed_page.locator("#scheduleMarkersCheckServersInfo.info-icon")
-        assert (info.get_attribute("data-bs-original-title") or info.get_attribute("title")) == (
-            "Doesn't scan files. Quickly checks every server still has the markers this app added, "
-            "and puts back any it lost. Click for more."
-        )
-        detail = " ".join(
-            authed_page.locator("#infoScheduleCheckServersTpl").evaluate("tpl => tpl.content.textContent").split()
-        )
-        assert "puts back any it lost. Low priority unless you pick otherwise." in detail
-        # A library pick left from before doesn't block the save: Check servers has no libraries.
-        authed_page.evaluate("document.getElementById('scheduleLibraryAll').checked = false")
-        _save_schedule(authed_page, "/api/schedules")
-
-        assert [method for method, _ in captured] == ["POST"]
-        body = captured[0][1]
-        assert body["config"] == {"job_type": "intro_credits", "reconcile": True}
-        assert (body["library_ids"], body["library_id"], body["server_id"]) == ([], None, None)
-        assert body["library_name"] == "All servers"
-        assert body["priority"] is None
-
-    def test_leaving_intro_and_credits_hides_its_modes_and_shows_the_pickers_again(
-        self, authed_page: Page, app_url: str
-    ) -> None:
-        _seed_servers_for_schedule_modal(authed_page)
-        _capture_schedule_writes(authed_page, [])
-        authed_page.goto(f"{app_url}/automation#schedules")
-        authed_page.wait_for_load_state("domcontentloaded")
-        authed_page.locator('button:has-text("Add Schedule")').first.click()
-        expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        authed_page.locator("#scanModeMarkers").check()
-        authed_page.locator("#scheduleMarkersCheckServers").check()
-
-        authed_page.locator("#scanModeFull").check()
-
-        expect(authed_page.locator("#scheduleMarkersModeGroup")).to_be_hidden()
-        expect(authed_page.locator("#scheduleServerGroup")).to_be_visible()
-        expect(authed_page.locator("#scheduleLibrariesGroup")).to_be_visible()
-
-    def test_check_servers_badge_and_edit_round_trip_keep_the_mode(self, authed_page: Page, app_url: str) -> None:
-        _seed_servers_for_schedule_modal(authed_page)
+        # What normalize_schedule_config makes of a legacy {"job_type": "recently_added", "lookback_hours": 6}.
         schedule = {
-            **_MARKERS_SCHEDULE,
-            "name": "Check servers nightly",
-            "library_name": "All servers",
-            "config": {"job_type": "intro_credits", "reconcile": True},
+            **_INTRO_SCHEDULE,
+            "name": "New arrivals",
+            "config": {"job_kinds": _ALL_KINDS, "job_type": "recently_added", "lookback_hours": 6},
         }
         captured = _capture_schedule_writes(authed_page, [schedule])
         authed_page.goto(f"{app_url}/automation#schedules")
         authed_page.wait_for_load_state("domcontentloaded")
-        row = authed_page.locator("#scheduleList tr", has_text="Check servers nightly")
-        expect(row.locator(".schedule-kind-badge")).to_have_text("Intro & Credits · Check servers", timeout=3000)
+        row = authed_page.locator("#scheduleList tr", has_text="New arrivals")
+        expect(row.locator(".schedule-kind-badge")).to_have_text(
+            ["Previews", "Intro & Credits", "Plex loudness"], timeout=3000
+        )
+        expect(row.locator(".schedule-files-label")).to_have_text("Recently added, last 6 hours")
 
         row.locator('button[aria-label="Edit schedule"]').click()
         expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        expect(authed_page.locator("#scanModeMarkers")).to_be_checked()
-        expect(authed_page.locator("#scheduleMarkersCheckServers")).to_be_checked()
-        expect(authed_page.locator("#scheduleServerGroup")).to_be_hidden()
-        expect(authed_page.locator("#scheduleLibrariesGroup")).to_be_hidden()
+        for kind_id in ("scheduleKindPreviews", "scheduleKindMarkers", "scheduleKindLoudness"):
+            expect(authed_page.locator(f"#{kind_id}")).to_be_checked()
+        expect(authed_page.locator("#scheduleFilesRecent")).to_be_checked()
+        expect(authed_page.locator("#scheduleLookback")).to_have_value("6")
         _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
 
-        assert [method for method, _ in captured] == ["PUT"]
-        assert captured[0][1]["config"] == {"job_type": "intro_credits", "reconcile": True}
+        assert captured[0][1]["config"] == {
+            "job_kinds": _ALL_KINDS,
+            "job_type": "recently_added",
+            "lookback_hours": 6,
+        }
 
-    def test_a_new_schedule_after_editing_check_servers_starts_on_find_markers(
+    def test_edit_preselects_the_saved_libraries_and_keeps_the_server_pin(
         self, authed_page: Page, app_url: str
     ) -> None:
         _seed_servers_for_schedule_modal(authed_page)
-        schedule = {**_MARKERS_SCHEDULE, "config": {"job_type": "intro_credits", "reconcile": True}}
+        schedule = {
+            **_INTRO_SCHEDULE,
+            "library_id": "lib-2",
+            "library_ids": ["lib-2"],
+            "library_name": "Films",
+            "server_id": "emby-1",
+        }
+        captured = _capture_schedule_writes(authed_page, [schedule])
+        authed_page.goto(f"{app_url}/automation#schedules")
+        authed_page.wait_for_load_state("domcontentloaded")
+        authed_page.locator("#scheduleList tr", has_text="Weekly Intro & Credits").locator(
+            'button[aria-label="Edit schedule"]'
+        ).click()
+
+        expect(authed_page.locator('.schedule-library-checkbox[data-server-id="emby-1"]')).to_be_checked(timeout=3000)
+        expect(authed_page.locator("#scheduleLibraryAll")).not_to_be_checked()
+        _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
+
+        body = captured[0][1]
+        assert (body["library_ids"], body["library_id"], body["server_id"]) == (["lib-2"], "lib-2", "emby-1")
+        assert body["config"]["libraries"] == [{"server_id": "emby-1", "library_id": "lib-2"}]
+
+    @staticmethod
+    def _open_pinned_edit(authed_page: Page, app_url: str, **extra) -> list[tuple[str, dict]]:
+        _seed_servers_for_schedule_modal(authed_page)
+        schedule = {
+            **_INTRO_SCHEDULE,
+            "library_id": "lib-2",
+            "library_ids": ["lib-2"],
+            "library_name": "Films",
+            "server_id": "emby-1",
+            **extra,
+        }
+        captured = _capture_schedule_writes(authed_page, [schedule])
+        authed_page.goto(f"{app_url}/automation#schedules")
+        authed_page.wait_for_load_state("domcontentloaded")
+        authed_page.locator("#scheduleList tr", has_text="Weekly Intro & Credits").locator(
+            'button[aria-label="Edit schedule"]'
+        ).click()
+        expect(authed_page.locator('.schedule-library-checkbox[data-server-id="emby-1"]')).to_be_checked(timeout=3000)
+        return captured
+
+    def test_editing_a_pinned_schedule_to_all_libraries_clears_the_server_pin(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        captured = self._open_pinned_edit(authed_page, app_url)
+        authed_page.locator("#scheduleLibraryAll").check()
+        _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
+
+        body = captured[0][1]
+        assert body["server_id"] == ""
+        assert body["library_ids"] == []
+        assert "libraries" not in body["config"]
+
+    def test_editing_a_pinned_schedule_to_libraries_on_two_servers_clears_the_server_pin(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        captured = self._open_pinned_edit(authed_page, app_url)
+        authed_page.locator('.schedule-library-checkbox[data-server-id="plex-1"]').check()
+        _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
+
+        body = captured[0][1]
+        assert body["server_id"] == ""
+        assert sorted(body["library_ids"]) == ["1", "lib-2"]
+        assert body["config"]["libraries"] == [
+            {"server_id": "plex-1", "library_id": "1"},
+            {"server_id": "emby-1", "library_id": "lib-2"},
+        ]
+
+    def test_edit_preselects_picks_on_two_servers_from_the_saved_pairs(self, authed_page: Page, app_url: str) -> None:
+        pairs = [{"server_id": "plex-1", "library_id": "1"}, {"server_id": "emby-1", "library_id": "lib-2"}]
+        captured = self._open_pinned_edit(
+            authed_page,
+            app_url,
+            library_ids=["1", "lib-2"],
+            library_id=None,
+            server_id=None,
+            config={"job_kinds": ["loudness"], "job_type": "full_library", "libraries": pairs},
+        )
+        expect(authed_page.locator('.schedule-library-checkbox[data-server-id="plex-1"]')).to_be_checked()
+        expect(authed_page.locator('.schedule-library-checkbox[data-server-id="jf-1"]')).not_to_be_checked()
+        _save_schedule(authed_page, "/api/schedules/sch-ic", method="PUT")
+
+        body = captured[0][1]
+        assert (body["server_id"], body["config"]["libraries"]) == ("", pairs)
+
+    def test_a_new_schedule_after_editing_starts_from_the_defaults(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        schedule = {**_INTRO_SCHEDULE, "config": {"job_kinds": _ALL_KINDS, "job_type": "recently_added"}}
         _capture_schedule_writes(authed_page, [schedule])
         authed_page.goto(f"{app_url}/automation#schedules")
         authed_page.wait_for_load_state("domcontentloaded")
@@ -452,31 +647,16 @@ class TestScheduleIntroCredits:
         # Bootstrap ignores a close click while the modal is still opening (its dialog slides in after the fade).
         watch_modal_shown(authed_page, "newScheduleModal")
         row.locator('button[aria-label="Edit schedule"]').click()
-        expect(authed_page.locator("#scheduleMarkersCheckServers")).to_be_checked(timeout=2000)
+        expect(authed_page.locator("#scheduleFilesRecent")).to_be_checked(timeout=2000)
         expect_modal_shown(authed_page, "newScheduleModal")
         authed_page.locator("#newScheduleModal .btn-close").click()
         expect(authed_page.locator("#newScheduleModal")).to_be_hidden(timeout=3000)
 
         authed_page.locator('button:has-text("Add Schedule")').first.click()
         expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        authed_page.locator("#scanModeMarkers").check()
 
-        expect(authed_page.locator("#scheduleMarkersFind")).to_be_checked()
-        expect(authed_page.locator("#scheduleLibrariesGroup")).to_be_visible()
-
-    def test_full_library_schedule_still_saves_its_sort_order(self, authed_page: Page, app_url: str) -> None:
-        _seed_servers_for_schedule_modal(authed_page)
-        captured = _capture_schedule_writes(authed_page, [])
-        authed_page.goto(f"{app_url}/automation#schedules")
-        authed_page.wait_for_load_state("domcontentloaded")
-        authed_page.locator('button:has-text("Add Schedule")').first.click()
-        expect(authed_page.locator("#newScheduleForm")).to_be_visible(timeout=2000)
-        authed_page.locator("#scheduleName").fill("Nightly")
-        authed_page.locator("#scanModeMarkers").check()
-        authed_page.locator("#scanModeFull").check()
-        expect(authed_page.locator("#scheduleSortByGroup")).to_be_visible()
-        authed_page.locator("#scheduleSortBy").select_option("random")
-
-        _save_schedule(authed_page, "/api/schedules")
-
-        assert captured[0][1]["config"] == {"job_type": "full_library", "sort_by": "random", "added_filter": "all"}
+        expect(authed_page.locator("#scheduleKindPreviews")).to_be_checked()
+        expect(authed_page.locator("#scheduleKindMarkers")).not_to_be_checked()
+        expect(authed_page.locator("#scheduleKindLoudness")).not_to_be_checked()
+        expect(authed_page.locator("#scheduleFilesAll")).to_be_checked()
+        expect(authed_page.locator("#scheduleLookbackGroup")).to_be_hidden()

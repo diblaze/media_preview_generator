@@ -18,6 +18,7 @@ from media_preview_generator.markers.models import FileIdentity, Marker, MarkerT
 from media_preview_generator.markers.source_counts import DecidedByTally
 from media_preview_generator.markers.store import MarkerStore
 from media_preview_generator.processing.types import ProcessableItem
+from media_preview_generator.scan_filters import ScanFilters
 from media_preview_generator.servers.base import Library, ServerType
 from tests.markers.fakes import FakeRegistry, server_config
 
@@ -136,12 +137,44 @@ class TestBuildItems:
                 cfg, registry=reg, cancel_check=cancel, progress_callback=progress
             )
         assert list(seen) == ["plex-1"]
+        filters = seen["plex-1"].pop("filters")
+        assert filters == ScanFilters(now=filters.now) and not filters.active
         assert seen["plex-1"] == {"library_ids": ["1", "2"], "cancel_check": cancel, "progress_callback": progress}
         assert (
             enum.call_args.kwargs["cancel_check"] is cancel and enum.call_args.kwargs["progress_callback"] is progress
         )
         assert [i.canonical_path for i in items] == ["/media/plex-1/a.mkv"]
         assert warnings == ["Couldn't list JF-1: TimeoutError: slow"]
+
+    def test_library_enumeration_honours_the_jobs_scan_filters_but_explicit_paths_ignore_them(self):
+        reg = FakeRegistry(
+            {"plex-1": server_config("plex-1", ServerType.PLEX, libraries=[Library("1", "TV", ("/m",))])}
+        )
+        seen = {}
+
+        def fake_enumerate(candidates, *, enumerate_one, cancel_check=None, label, progress_callback=None):
+            processor = MagicMock()
+            processor.list_canonical_paths.side_effect = lambda cfg, **kw: seen.update(kw) or []
+            for cfg in candidates:
+                enumerate_one(processor, cfg)
+            return [], []
+
+        cfg = {
+            "libraries": [{"server_id": "plex-1", "library_id": "1"}],
+            "added_filter": "last_days",
+            "added_last_days": 7,
+            "latest_seasons": 2,
+            "movie_year_from": 2020,
+            "movie_year_to": None,
+        }
+        with patch(
+            "media_preview_generator.jobs.orchestrator._enumerate_items_for_servers", side_effect=fake_enumerate
+        ):
+            job_runner.build_items(cfg, registry=reg)
+
+        filters = seen["filters"]
+        assert (filters.added_filter, filters.added_last_days, filters.latest_seasons) == ("last_days", 7, 2)
+        assert (filters.movie_year_from, filters.movie_year_to, filters.active) == (2020, None, True)
 
     def test_selected_libraries_outside_the_markers_selection_are_skipped_with_a_warning(self):
         reg = FakeRegistry(

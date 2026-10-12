@@ -8,9 +8,9 @@ html[data-bs-theme="light"] { --ov-panel: #fbfcfd; }
 
 /* ---- dialog shell ---- */
 .ov-modal { --tk: var(--accent); --tk-soft: var(--accent-soft); }
-.ov-modal[data-kind="previews"] { --tk: var(--t-previews); --tk-soft: var(--t-previews-soft); }
-.ov-modal[data-kind="intro_credits"], .ov-modal[data-kind="check"] { --tk: var(--t-intro); --tk-soft: var(--t-intro-soft); }
-.ov-modal[data-kind="loudness"] { --tk: var(--t-loud); --tk-soft: var(--t-loud-soft); }
+.ov-modal[data-kind="previews"], .ov-task[data-kind="previews"] { --tk: var(--t-previews); --tk-soft: var(--t-previews-soft); }
+.ov-modal[data-kind="intro_credits"], .ov-task[data-kind="intro_credits"] { --tk: var(--t-intro); --tk-soft: var(--t-intro-soft); }
+.ov-modal[data-kind="loudness"], .ov-task[data-kind="loudness"] { --tk: var(--t-loud); --tk-soft: var(--t-loud-soft); }
 .ov-modal .modal-content { background: var(--ov-panel); border: 1px solid var(--line-strong); border-radius: 16px; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5); }
 .ov-modal .modal-header { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .ov-modal .modal-header .modal-title { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.25; }

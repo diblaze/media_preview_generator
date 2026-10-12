@@ -160,6 +160,10 @@ class Config:
     # libraries to list (None = every library of the scanned servers). None = not a Recently Added job.
     recently_added_since: datetime | None = None
     recently_added_library_ids: list[str] | None = None
+    # Which Intro & Credits / loudness jobs that scan queues for its files (None = both), and whether it makes previews
+    # at all; False lists the files and queues only those follow-ups (a schedule without Previews ticked).
+    recently_added_follow_up_kinds: list[str] | None = None
+    recently_added_make_previews: bool = True
     # Exclude paths: list of {"value": str, "type": "path"|"regex"}; path = prefix match, regex = full match
     exclude_paths: list[dict[str, str]] | None = None
     # When a job is pinned to one configured media-server (via the Schedules

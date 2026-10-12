@@ -13,6 +13,7 @@ from loguru import logger
 
 from ..job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS
 from ..processing.types import ProcessableItem
+from ..scan_filters import pick_filter_config
 from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import webhook_path_candidates
 from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
@@ -121,6 +122,7 @@ def create_intro_credits_job(
     parent_job_id: str | None = None,
     max_retries: int = 0,
     server_id: str | None = None,
+    scan_filters: dict | None = None,
 ) -> Job:
     """Create and start an Intro & Credits job.
 
@@ -149,11 +151,14 @@ def create_intro_credits_job(
         server_id: Publish to this server only (``job_runner.server_pin``): the pin of the preview job it follows, as
             ``jobs.worker.resolve_per_item_pin`` resolved it, or of the job whose retry or check it is. None = every
             server with Intro & Credits on.
+        scan_filters: Scan-filter keys (``scan_filters.FILTER_CONFIG_KEYS``) limiting which library files are listed;
+            other keys are ignored. Not used with ``file_paths``.
 
     Returns:
         The created job.
     """
     config: dict[str, Any] = {
+        **pick_filter_config(scan_filters),
         "kind": JOB_KIND_INTRO_CREDITS,
         "source": source,
         "libraries": list(libraries or []),
@@ -489,9 +494,12 @@ def _submit_loudness_follow_up(
     pin: str | None,
     *,
     defer_directories: bool = False,
-) -> None:
+) -> list[str]:
     """Queue Plex loudness for eligible files enumerated by a preview run. Never raises:
     a failure here must not cost the files their Intro & Credits follow-up.
+
+    Returns:
+        The id of the loudness job queued, as a list; empty when nothing was queued.
 
     The job starts as soon as a loudness worker is free; it doesn't wait for the preview or Intro & Credits jobs. A file
     Plex hasn't added yet comes back "Not in Plex yet" and is retried.
@@ -502,21 +510,21 @@ def _submit_loudness_follow_up(
 
         configs = _server_configs()
         if not paths or not loudness_enabled_anywhere(configs):
-            return
+            return []
         if defer_directories:
             # Use only a type check, never traversal: the preview's existing expansion selects the children.
             # Missing explicit files stay intact for sender retries; dispatch then deduplicates actual files.
             paths = [path for path in paths if not any(os.path.isdir(p) for p in _local_candidates(path, configs))]
         if not paths:
-            return
+            return []
         # A known non-Plex originator can ask enabled Plex owners. A Plex pin never grants another server access.
         if pin is not None:
             pinned = next((cfg for cfg in configs if cfg.id == pin), None)
             if pinned is None:
-                return
+                return []
             if pinned.type is ServerType.PLEX:
                 if not loudness_enabled_anywhere([pinned]):
-                    return
+                    return []
             else:
                 pin = None
         jm = get_job_manager()
@@ -529,11 +537,12 @@ def _submit_loudness_follow_up(
             )
         )
         if not paths:
-            return
+            return []
         with _loudness_follow_up_lock:
-            _queue_loudness_paths(jm, configs, preview_job_id, paths, source, pin, create_loudness_job)
+            return _queue_loudness_paths(jm, configs, preview_job_id, paths, source, pin, create_loudness_job)
     except Exception as exc:
         logger.warning("Couldn't queue the Plex loudness job for preview job {}: {}", preview_job_id[:8], exc)
+        return []
 
 
 def _queue_loudness_paths(
@@ -544,8 +553,12 @@ def _queue_loudness_paths(
     source: str,
     pin: str | None,
     create_job: Callable[..., Job],
-) -> None:
-    """Persist one follow-up, deduplicating only this preview's own work under the creation lock."""
+) -> list[str]:
+    """Persist one follow-up, deduplicating only this preview's own work under the creation lock.
+
+    Returns:
+        The new job's id as a list; empty when this preview's earlier follow-ups already list every file.
+    """
     from ..loudness.inputs import read_file_paths
 
     queued: set[str] = set()
@@ -558,7 +571,7 @@ def _queue_loudness_paths(
                 queued |= _local_candidates(path, configs)
     rest = [path for path in paths if not (_local_candidates(path, configs) & queued)]
     if not rest:
-        return
+        return []
     preview = jm.get_job(preview_job_id)
     if len(rest) == len(paths) and preview is not None and preview.library_name:
         name = f"Plex loudness · {preview.library_name}"
@@ -566,7 +579,7 @@ def _queue_loudness_paths(
         name = f"Plex loudness · {os.path.basename(rest[0])}"
     else:
         name = f"Plex loudness · {len(rest)} files"
-    create_job(
+    job = create_job(
         library_name=name,
         priority=max(PRIORITY_NORMAL, preview.priority) if preview is not None else PRIORITY_NORMAL,
         source=source,
@@ -574,6 +587,7 @@ def _queue_loudness_paths(
         follows_job_id=preview_job_id,
         server_id=pin,
     )
+    return [job.id]
 
 
 def submit_redetect(path: str) -> str:

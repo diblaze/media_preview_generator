@@ -1,7 +1,7 @@
 """Check servers (reconcile): the job that makes sure servers still show what this app published.
 
 A normal job already reads a file's markers back before calling it up to date, and replaced files get a delayed verify
-job. Check servers covers every other file, on the schedule the user sets (nothing is scheduled by default) or when
+job. Check servers covers every other file, daily at 04:30 (``web.scheduler.run_markers_check_servers_daily``) or when
 asked (``POST /api/markers/reconcile``). It reads back each published server item
 (Plex item by item under its database lock proof, Jellyfin and Emby one request per item) and runs the pipeline only
 for the files of items that drifted (Plex's own forced detection, a Jellyfin rescan, an Emby refresh the plugin couldn't

@@ -1,4 +1,4 @@
-// Shared full-library filters for the New Job and Schedule dialogs.
+// Shared whole-library filters for the New Job and Schedule dialogs.
 window.MediaScanFilters = (() => {
     function root(prefix) {
         const el = document.getElementById(`${prefix}ScanFilters`);
@@ -54,9 +54,10 @@ window.MediaScanFilters = (() => {
         const el = root(prefix);
         if (!el) return;
         el.querySelectorAll('[data-filter-error]').forEach(box => { box.hidden = true; });
-        const enabled = prefix === 'schedule'
-            ? document.getElementById('scanModeFull')?.checked
-            : !!document.getElementById('jobKindPreviews')?.checked;
+        // Filters apply to every job type; a schedule on Recently added looks at the newest files only.
+        const anyKind = !!document.querySelector(`input[name="${prefix}Kind"]:checked`);
+        const recentlyAdded = !!document.getElementById(`${prefix}FilesRecent`)?.checked;
+        const enabled = anyKind && !recentlyAdded;
         el.hidden = !enabled;
         const all = document.getElementById(`${prefix}LibraryAll`)?.checked;
         const rows = Array.from(document.querySelectorAll(`.${prefix}-library-checkbox`));

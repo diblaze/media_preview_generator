@@ -8,11 +8,13 @@ by the web layer (job_runner.py).
 import os
 import random
 import shutil
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any, cast
 
 from loguru import logger
 
+from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS
 from ..markers.models import utcnow as _utcnow
 from ..processing.generator import ProcessingResult, clear_failures, log_failure_summary
 from ..processing.retry_queue import CHAPTER_PUBLISHER_STATUSES, publisher_needs_retry
@@ -1076,6 +1078,8 @@ def _run_recently_added_multi_server(
     warnings_out: list[str] | None = None,
     priority: int | None = None,
     tracker_wait=None,
+    follow_up_kinds: Collection[str] | None = None,
+    make_previews: bool = True,
 ) -> dict:
     """Recently-added scan for any vendor via :class:`VendorProcessor`.
 
@@ -1084,6 +1088,9 @@ def _run_recently_added_multi_server(
     handle the API differences (Plex's ``addedAt>>`` filter vs.
     Emby/Jellyfin's ``DateCreated`` sort) so the orchestrator stays
     vendor-agnostic.
+
+    ``follow_up_kinds`` limits the Intro & Credits / loudness jobs queued for the new files (None = both);
+    ``make_previews=False`` only lists the files and queues those follow-ups, with no preview dispatch.
 
     Returns the aggregated ProcessingResult counts. ``warnings_out``
     mirrors :func:`_run_full_scan_multi_server` — without this plumbing
@@ -1149,7 +1156,20 @@ def _run_recently_added_multi_server(
     if job_id and not (cancel_check and cancel_check()):
         listed = [item for _cfg, item in all_items]
         _remember_item_origins(job_id, listed, config, registry)
-        _queue_intro_credits_follow_ups(job_id, listed, server_id_filter)
+        queued_follow_ups = _queue_intro_credits_follow_ups(job_id, listed, server_id_filter, kinds=follow_up_kinds)
+    else:
+        queued_follow_ups = {}
+
+    if not make_previews:
+        queued_names = [
+            f"{name} ({len(queued_follow_ups[kind])})" for kind, name in _FOLLOW_UP_NAMES if queued_follow_ups.get(kind)
+        ]
+        logger.info(
+            "Recently-added scan found {} new file(s); previews are off, so it only queued {}.",
+            len(all_items),
+            ", ".join(queued_names) if queued_names else "nothing",
+        )
+        return counts
 
     return _dispatch_processable_items(
         all_items,
@@ -1215,7 +1235,12 @@ def _remember_item_origins(job_id: str, items: list, config, registry) -> None:
         )
 
 
-def _queue_intro_credits_follow_ups(job_id: str, items: list, pin: str | None) -> None:
+_FOLLOW_UP_NAMES = ((JOB_KIND_INTRO_CREDITS, "Intro & Credits"), (JOB_KIND_LOUDNESS, "Plex loudness"))
+
+
+def _queue_intro_credits_follow_ups(
+    job_id: str, items: list, pin: str | None, *, kinds: Collection[str] | None = None
+) -> dict[str, list[str]]:
     """Queue the Intro & Credits jobs for a Recently Added scan's files, as a webhook's are queued.
 
     Each follows this preview job and publishes where the file's previews do (``markers.triggers.submit_follow_ups``).
@@ -1227,15 +1252,25 @@ def _queue_intro_credits_follow_ups(job_id: str, items: list, pin: str | None) -
         job_id: The Recently Added preview job.
         items: The files it listed, with the server each came from.
         pin: The scan's server pin (``server_id_filter``); None when unpinned.
+        kinds: Which follow-ups to queue (``JOB_KIND_INTRO_CREDITS`` / ``JOB_KIND_LOUDNESS``); None = both.
+
+    Returns:
+        The ids of the jobs queued or joined, by kind; a kind that queued nothing is absent.
     """
+    queued: dict[str, list[str]] = {}
     try:
         from ..markers.job_runner import RECENTLY_ADDED_SOURCE
         from ..markers.triggers import submit_follow_ups
 
-        submit_follow_ups(preview_job_id=job_id, items=list(items), source=RECENTLY_ADDED_SOURCE, pin=pin)
-        _queue_loudness_follow_up(job_id, items, pin, source=RECENTLY_ADDED_SOURCE)
+        if kinds is None or JOB_KIND_INTRO_CREDITS in kinds:
+            queued[JOB_KIND_INTRO_CREDITS] = submit_follow_ups(
+                preview_job_id=job_id, items=list(items), source=RECENTLY_ADDED_SOURCE, pin=pin
+            )
+        if kinds is None or JOB_KIND_LOUDNESS in kinds:
+            queued[JOB_KIND_LOUDNESS] = _queue_loudness_follow_up(job_id, items, pin, source=RECENTLY_ADDED_SOURCE)
     except Exception:
         logger.exception("Could not queue the Intro & Credits jobs for the files Recently Added scan {} listed", job_id)
+    return queued
 
 
 def _queue_loudness_follow_up(
@@ -1244,11 +1279,14 @@ def _queue_loudness_follow_up(
     pin: str | None,
     *,
     source: str | None = None,
-) -> None:
+) -> list[str]:
     """Queue opted-in loudness for this preview's enumerated files, without another library scan.
 
     Manual and retry runs never spawn new feature jobs. ``follows_job_id`` identifies this preview's own follow-ups across
     restart, deduplicating this preview's upfront webhook or Recently Added follow-up at dispatch time.
+
+    Returns:
+        The id of the loudness job queued, as a list; empty when none was.
     """
     try:
         from ..job_kinds import JOB_KIND_PREVIEWS
@@ -1257,17 +1295,18 @@ def _queue_loudness_follow_up(
 
         preview = get_job_manager().get_job(job_id)
         if preview is None or preview.kind != JOB_KIND_PREVIEWS:
-            return
+            return []
         cfg = preview.config or {}
         if cfg.get("is_retry") or cfg.get("is_retry_attempt") or cfg.get("retry_attempt"):
-            return
+            return []
         origin = source or str(cfg.get("source") or "manual")
         if origin == "manual":
             # A manual run does exactly what its dialog ticked; loudness is its own job there.
-            return
-        _submit_loudness_follow_up(job_id, [item.canonical_path for item in items], origin, pin)
+            return []
+        return _submit_loudness_follow_up(job_id, [item.canonical_path for item in items], origin, pin)
     except Exception:
         logger.exception("Could not queue loudness for the files preview job {} listed", job_id)
+        return []
 
 
 def _resolve_pinned_server(sid_filter: str | None) -> tuple[dict | None, str]:
@@ -1974,6 +2013,8 @@ def run_processing(
                 worker_pool_callback=worker_pool_callback,
                 warnings_out=scan_warnings,
                 priority=priority,
+                follow_up_kinds=getattr(config, "recently_added_follow_up_kinds", None),
+                make_previews=getattr(config, "recently_added_make_previews", True),
                 **({"tracker_wait": tracker_wait} if tracker_wait else {}),
             )
             result = {"outcome": outcome_counts}

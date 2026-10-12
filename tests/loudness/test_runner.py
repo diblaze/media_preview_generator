@@ -382,6 +382,20 @@ def test_create_stores_a_retrys_due_time_and_pin(monkeypatch):
     assert config["server_id"] == "plex1" and config["retry_attempt"] == 2 and config["retry_not_before"]
 
 
+def test_create_stores_scan_filters_and_the_schedule_that_made_it(monkeypatch):
+    jm = MagicMock()
+    monkeypatch.setattr(job, "get_job_manager", lambda: jm)
+    monkeypatch.setattr(job, "start_loudness_job_async", lambda job_id: None)
+    job.create_loudness_job(
+        library_name="Scheduled", priority=3, source="schedule", parent_schedule_id="sched-1",
+        scan_filters={"latest_seasons": 2, "movie_year_from": 2020, "server_id": "ignored"},
+    )  # fmt: skip
+    created = jm.create_job.call_args.kwargs
+    assert created["parent_schedule_id"] == "sched-1"
+    assert created["config"]["latest_seasons"] == 2 and created["config"]["movie_year_from"] == 2020
+    assert "server_id" not in created["config"]
+
+
 def test_a_job_cancelled_during_its_files_is_cancelled_not_completed(run):
     run["outcomes"] = {"/m/a.mkv": job.WRITTEN}
     submit = run["dispatcher"].submit_items.side_effect

@@ -6,7 +6,7 @@ from flask import jsonify
 
 from ..auth import api_token_required
 from . import api
-from .api_markers import job_title, parse_job_request
+from .api_markers import job_title, parse_job_request, parse_scan_filters
 
 
 @api.route("/loudness/jobs", methods=["POST"])
@@ -16,7 +16,7 @@ def create_loudness_job_route():
 
     Body: ``libraries`` (``[{"server_id", "library_id"}]``) or ``file_paths`` (files or folders inside ``MEDIA_ROOT``)
     (neither means every library loudness goes to); ``priority`` (1-3 or high/normal/low, default low);
-    ``library_name`` (job title).
+    ``library_name`` (job title); ``scan_filters`` (added date, seasons, release year: which library files to list).
 
     Returns:
         201 with the job, 400 for an invalid body, 503 when the config directory isn't writable.
@@ -26,12 +26,16 @@ def create_loudness_job_route():
     parsed, error = parse_job_request()
     if error is not None:
         return error
-    libraries, resolved_paths, priority, library_name, _data = parsed
+    libraries, resolved_paths, priority, library_name, data = parsed
+    scan_filters, bad_filters = parse_scan_filters(data)
+    if bad_filters is not None:
+        return bad_filters
     job = create_loudness_job(
         library_name=job_title("Plex loudness", library_name, libraries, resolved_paths),
         priority=priority,
         source="manual",
         libraries=libraries,
         file_paths=resolved_paths,
+        scan_filters=scan_filters,
     )
     return jsonify(job.to_dict()), 201

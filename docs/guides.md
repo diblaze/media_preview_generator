@@ -140,10 +140,11 @@ filters. Newest/oldest refer to the library-added date and apply within each
 library. Random mixes the selected files; parallel checks and workers can start
 or finish out of order.
 
-The same filters are available on scheduled **Full library scans**. A "last
-30 days" schedule moves its window forward on every run; a date range stays
-fixed. Webhooks, **Recently Added** scanners, and **Process a file or folder** selections
-continue to use their own selection rules.
+The same filters are available for Intro & Credits and Plex loudness jobs, and on
+scheduled **Whole library** runs. A "last 30 days" schedule moves its window forward
+on every run; a date range stays fixed. Webhooks, **Recently Added** schedules, and
+**Process a file or folder** selections continue to use their own selection rules.
+Processing order applies to Previews only.
 
 ### Letting new imports jump the queue
 
@@ -206,11 +207,14 @@ An expanded queue row shows up to five requested paths; **View all** opens the F
 
 The Dashboard shows the next scheduled run in **Job statistics**, and **Run next schedule now** in **Quick actions**. Full schedule management lives on the **Automation** page, under **Schedules** (`/automation#schedules`, also linked from the top nav). **Add Schedule** asks for:
 
-- **What to run** — **Full library scan**, **Recently added only** (see [Auto-trigger from Plex](#auto-trigger-from-plex-no-sonarrradarr)) or **Intro & Credits**
+- **Job type** — tick any of **Previews**, **Intro & Credits** and **Plex loudness**, as in **Start new job**. Each tick queues one job per ticked type, side by side.
+- **Libraries** — all, or specific libraries
+- **Files** — **Whole library**, or **Recently added** (see [Auto-trigger from Plex](#auto-trigger-from-plex-no-sonarrradarr)). Recently added makes previews only if Previews is ticked, then queues the other ticked types for the files it finds.
 - **Schedule type** — **Specific Time**, **Interval** or **Cron Expression**
-- **Server and libraries** — one server or all, and specific libraries
-- **Stop time** (optional) — pauses the schedule's running job at that time of day
-- **Job Priority** and **Processing Order**, plus the same media filters as **Start new job**
+- **Stop time** (optional) — pauses the schedule's running jobs at that time of day
+- **Job Priority**, and for a whole library **Processing Order** (Previews) and the same media filters as **Start new job**
+
+**Check servers** is not a schedule: it runs by itself every day at 04:30 whenever Intro & Credits is on for a server. During quiet hours or Pause All it waits in the queue until processing resumes.
 
 > **Legacy URL note:** `/schedules` and `/webhooks` still work: they redirect to the Schedules and Triggers tabs of `/automation`, so bookmarks and shared links keep working.
 
@@ -870,7 +874,7 @@ A scheduled poll for items where Plex's `addedAt` falls within a configured look
 **Set one up:**
 
 1. Open **Automation → Schedules** and click **Add Schedule** (or **Edit** on an existing scanner). The **Recently Added Scanner** card under **Servers → Edit → Webhook & Scanner** has **Configure on Schedules page** and **Scan all now**.
-2. Under **What to run**, choose **Recently added only**. Pick your **Schedule type** (an interval suits a scanner) and frequency.
+2. Under **Files**, choose **Recently added**. Pick your **Schedule type** (an interval suits a scanner) and frequency.
 3. Choose a **Lookback window**: 15 minutes, 30 minutes, 1 hour (default), 2 hours, 6 hours, 24 hours, 3 days or 7 days.
 4. Pick a server and libraries (or leave all) and save.
 
@@ -1013,7 +1017,7 @@ job's daily lookups (or the smaller share left for full-library backfills) run o
 reached — lookups resume at 00:00 UTC" instead. See the troubleshooting table below for what a job or a file shows
 when this happens mid-run. Files checked without TheIntroDB are tried again by the next manual or scheduled
 **Find markers** job that includes them after the limit resets. To choose when that happens, create a **Find
-markers** schedule under **Schedules** with your preferred cron expression and libraries.
+markers** schedule (tick **Intro & Credits**) under **Schedules** with your preferred cron expression and libraries.
 
 To keep the daily lookups for shows TheIntroDB knows, a show it has no entry for (talk shows, for example) is left
 alone for 7 days once 3 of its episodes came back with nothing, while no episode of the show has an answer from it
@@ -1026,7 +1030,7 @@ always asks.
 **How often the online databases are asked again.** A database that had no entry for a file is asked again once that
 answer is 14 days old, by the next job that includes the file. A lookup that has to wait for a database's rate limit
 waits only while the job is checking the file, never on a GPU or CPU worker: there it says "unavailable (blocked)" and
-the next job asks. For regular re-checks, create a **Find markers** schedule under **Schedules**, choose the
+the next job asks. For regular re-checks, create a schedule with **Intro & Credits** ticked under **Schedules**, choose the
 libraries, and set its cron expression (for example, `0 3 * * sun` for Sundays at 03:00 in the schedule's timezone).
 Each run reuses saved answers that are still current and asks online sources again when their answers are due.
 The app no longer creates a weekly online re-check or a daily TheIntroDB recheck automatically; replace those
@@ -1346,21 +1350,16 @@ earlier file), drawn to the length the server reports. With no length anywhere t
 
 ### Check servers
 
-The checks above only run for files a job looks at. To check everything this app has published, run **Intro &
-Credits · Check servers**: `POST /api/markers/reconcile`, or a schedule in **Automation → Schedules** (type **Intro & Credits → Check servers**;
-the server and library pickers don't apply). A normal Intro & Credits job already re-checks servers for the files
-it covers, so Check servers is for a scheduled sweep of everything. Nothing is scheduled by default. It runs at Low priority unless you pick
+The checks above only run for files a job looks at. To check everything this app has published, **Intro & Credits ·
+Check servers** runs by itself every day at 04:30 whenever Intro & Credits is on for a server (skipped while processing
+is paused). You can also run it now: `POST /api/markers/reconcile`. A normal Intro & Credits job already re-checks
+servers for the files it covers, so Check servers is the sweep of everything. It runs at Low priority unless you pick
 another. A marker you locked in the Inspector that a server didn't get (it was down or not ready when you saved)
 is published again on every run until the server has it. Only one runs at a time: asking again while one is queued or
-running reuses it ("A Check servers job is
-already queued"), and a schedule tick then queues nothing. **Re-run** on a finished Check servers job asks the same
+running reuses it ("A Check servers job is already queued"). **Re-run** on a finished Check servers job asks the same
 way. When the job already there is paused, the message is "A Check servers job is paused. Resume or cancel it on the
-dashboard." A job paused by its schedule's stop time is resumed by that schedule's next start (or **Run now**), even
-if you've switched the schedule between **Find markers** and **Check servers** since. That start queues nothing else;
-the schedule's own mode queues on a later start, once the resumed job has finished. A job you paused yourself stays
-paused until you resume it. Deleting the schedule, or switching it to a preview or Recently Added schedule, leaves a
-paused job paused, and the log gets a warning naming the job: resume or cancel it on the dashboard. **Re-run** clears
-**Pause all**, as it does for any job. With Intro & Credits off on every server there's nothing to check.
+dashboard." **Re-run** clears **Pause all**, as it does for any job. With Intro & Credits off on every server there's
+nothing to check. Check servers schedules from earlier versions are deleted at startup, with a warning in the log.
 
 Its tooltip sums it up: "Checks that every server with Intro & Credits on still shows the markers this app sent, and
 sends them again where they're missing or changed (unless that server is set to keep its own). Covers all servers and

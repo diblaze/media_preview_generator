@@ -83,19 +83,40 @@ def test_job_combines_shared_tv_and_movie_filters(filter_page: Page) -> None:
 
 
 @pytest.mark.e2e
-def test_intro_credits_job_hides_and_omits_preview_filters(filter_page: Page) -> None:
+@pytest.mark.parametrize(
+    ("kind_id", "endpoint"),
+    [("jobKindMarkers", "/api/markers/jobs"), ("jobKindLoudness", "/api/loudness/jobs")],
+)
+def test_intro_credits_and_loudness_jobs_keep_the_filters_and_post_them_as_scan_filters(
+    filter_page: Page, kind_id: str, endpoint: str
+) -> None:
+    page = filter_page
+    page.locator("#jobAddedFilter").select_option("last_days")
+    page.locator("#jobAddedLastDays").fill("7")
+    page.locator("#jobSortBy").select_option("random")
+    pick_job_kind(page, kind_id)
+    expect(page.locator("#jobScanFilters")).to_be_visible()
+    expect(page.locator("#jobSortByGroup")).to_be_hidden()
+    page.route(f"**{endpoint}", lambda route: _fulfill_json(route, {"id": "other", "job_id": "other"}))
+    with page.expect_request(lambda request: request.url.endswith(endpoint) and request.method == "POST") as sent:
+        page.locator("#newJobModal .modal-footer .btn-primary").click()
+    body = sent.value.post_data_json
+    assert body["scan_filters"] == {"added_filter": "last_days", "added_last_days": 7}
+    assert "config" not in body
+    assert "sort_by" not in body
+
+
+@pytest.mark.e2e
+def test_markers_job_blocks_the_start_on_an_invalid_filter(filter_page: Page) -> None:
     page = filter_page
     page.locator("#jobAddedFilter").select_option("last_days")
     page.locator("#jobAddedLastDays").fill("0")
     pick_job_kind(page, "jobKindMarkers")
-    expect(page.locator("#jobScanFilters")).to_be_hidden()
-    endpoint = "/api/markers/jobs"
-    page.route(f"**{endpoint}", lambda route: _fulfill_json(route, {"id": "markers", "job_id": "markers"}))
-    with page.expect_request(lambda request: request.url.endswith(endpoint) and request.method == "POST") as sent:
-        page.locator("#newJobModal .modal-footer .btn-primary").click()
-    assert "added_filter" not in sent.value.post_data_json
-    assert "added_last_days" not in sent.value.post_data_json
-    assert "config" not in sent.value.post_data_json
+    posted = []
+    page.route("**/api/markers/jobs", lambda route: (posted.append(1), _fulfill_json(route, {"job_id": "x"})))
+    page.locator("#newJobModal .modal-footer .btn-primary").click()
+    expect(page.locator("#newJobModal")).to_be_visible()
+    assert posted == []
 
 
 @pytest.mark.e2e
@@ -222,12 +243,7 @@ def test_schedule_edit_round_trips_filters_and_inherited_order(authed_page: Page
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize(
-    ("mode_id", "job_type"), [("scanModeRecent", "recently_added"), ("scanModeMarkers", "intro_credits")]
-)
-def test_non_full_scan_schedule_omits_full_scan_filters(
-    authed_page: Page, app_url: str, mode_id: str, job_type: str
-) -> None:
+def test_recently_added_schedule_omits_whole_library_filters(authed_page: Page, app_url: str) -> None:
     _seed(authed_page)
     authed_page.goto(f"{app_url}/automation#schedules")
     authed_page.wait_for_function("libraries.length === 2")
@@ -235,41 +251,55 @@ def test_non_full_scan_schedule_omits_full_scan_filters(
     authed_page.locator("#scheduleName").fill("Recent")
     authed_page.locator("#scheduleScanFilters > summary").click()
     authed_page.locator("#scheduleSeasonMode").select_option("latest")
-    authed_page.locator(f"#{mode_id}").check()
+    authed_page.locator("#scheduleFilesRecent").check()
     expect(authed_page.locator("#scheduleScanFilters")).to_be_hidden()
     with authed_page.expect_request(
         lambda request: request.url.endswith("/api/schedules") and request.method == "POST"
     ) as sent:
         authed_page.locator("#scheduleSubmitBtn").click()
     config = sent.value.post_data_json["config"]
-    assert config["job_type"] == job_type
+    assert config["job_type"] == "recently_added"
     assert "added_filter" not in config
     assert "latest_seasons" not in config
 
 
 @pytest.mark.e2e
-def test_new_schedule_refreshes_all_library_types_after_server_specific_selection(
-    authed_page: Page, app_url: str
-) -> None:
+def test_markers_only_schedule_keeps_and_saves_the_filters(authed_page: Page, app_url: str) -> None:
+    _seed(authed_page)
+    authed_page.goto(f"{app_url}/automation#schedules")
+    authed_page.wait_for_function("libraries.length === 2")
+    authed_page.locator('button:has-text("Add Schedule")').first.click()
+    authed_page.locator("#scheduleName").fill("Markers")
+    authed_page.locator("#scheduleKindMarkers").check()
+    authed_page.locator("#scheduleKindPreviews").uncheck()
+    authed_page.locator("#scheduleScanFilters > summary").click()
+    authed_page.locator("#scheduleSeasonMode").select_option("latest")
+    authed_page.locator("#scheduleLatestSeasons").fill("2")
+    with authed_page.expect_request(
+        lambda request: request.url.endswith("/api/schedules") and request.method == "POST"
+    ) as sent:
+        authed_page.locator("#scheduleSubmitBtn").click()
+    config = sent.value.post_data_json["config"]
+    assert config["job_kinds"] == ["intro_credits"]
+    assert config["latest_seasons"] == 2
+    assert "sort_by" not in config
+
+
+@pytest.mark.e2e
+def test_schedule_filters_follow_the_ticked_library_types(authed_page: Page, app_url: str) -> None:
     _seed(authed_page)
     movies = {"id": "movies", "name": "Movies", "type": "movie", "server_id": "plex-1"}
     tv = {"id": "tv", "name": "TV Shows", "type": "show", "server_id": "other"}
-    authed_page.route(
-        "**/api/libraries**",
-        lambda route: _fulfill_json(
-            route,
-            {"libraries": [movies] if "server_id=plex-1" in route.request.url else [movies, tv]},
-        ),
-    )
+    authed_page.route("**/api/libraries**", lambda route: _fulfill_json(route, {"libraries": [movies, tv]}))
     authed_page.goto(f"{app_url}/automation#schedules")
     authed_page.wait_for_function("libraries.length === 2")
     authed_page.locator('button:has-text("Add Schedule")').first.click()
     authed_page.locator("#scheduleScanFilters > summary").click()
-    expect(authed_page.locator('#scheduleServer option[value="plex-1"]')).to_be_attached()
-    authed_page.locator("#scheduleServer").select_option("plex-1")
+    expect(authed_page.locator('.schedule-library-checkbox[data-server-id="plex-1"]')).to_be_attached()
+    authed_page.locator("#scheduleLibraryAll").uncheck()
+    authed_page.locator('.schedule-library-checkbox[data-server-id="plex-1"]').check()
     expect(authed_page.locator('#scheduleScanFilters [data-filter-type="tv"]')).to_be_hidden()
-    authed_page.locator('#newScheduleModal .modal-footer button:has-text("Cancel")').click()
-    authed_page.locator('button:has-text("Add Schedule")').first.click()
-    authed_page.locator("#scheduleScanFilters > summary").click()
+    expect(authed_page.locator('#scheduleScanFilters [data-filter-type="movie"]')).to_be_visible()
+    authed_page.locator("#scheduleLibraryAll").check()
     expect(authed_page.locator('#scheduleScanFilters [data-filter-type="tv"]')).to_be_visible()
     expect(authed_page.locator('#scheduleScanFilters [data-filter-type="movie"]')).to_be_visible()

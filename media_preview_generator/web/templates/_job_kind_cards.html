@@ -1,0 +1,26 @@
+{# Job-type cards shared by Start new job (prefix 'job') and the schedule dialog (prefix 'schedule'). #}
+<section class="ov-sec" id="{{ prefix }}TypeGroup">
+    <div class="ov-sec-h"><span class="ov-n" aria-hidden="true"></span>Job type</div>
+    <div class="ov-tcards" role="group" aria-label="Job types">
+        <div class="ov-tcard" data-type="previews">
+            <input class="ov-tcard-input" type="checkbox" name="{{ prefix }}Kind" id="{{ prefix }}KindPreviews" value="previews" checked onchange="onJobKindChange(this, '{{ prefix }}')">
+            <span class="ov-tt"><span class="ov-ti" aria-hidden="true"><i class="bi bi-film"></i></span><label for="{{ prefix }}KindPreviews">Previews</label></span>
+            <span class="ov-tp">Scrubbing thumbnails for Plex, Emby and Jellyfin.</span>
+            <i class="bi bi-check-circle-fill ov-ok" aria-hidden="true"></i>
+        </div>
+        <div class="ov-tcard" data-type="intro_credits">
+            <input class="ov-tcard-input" type="checkbox" name="{{ prefix }}Kind" id="{{ prefix }}KindMarkers" value="intro_credits" onchange="onJobKindChange(this, '{{ prefix }}')">
+            <span class="ov-tt"><span class="ov-ti" aria-hidden="true"><i class="bi bi-skip-forward"></i></span><label for="{{ prefix }}KindMarkers">Intro &amp; Credits</label>
+            <button type="button" class="info-icon" id="{{ prefix }}KindMarkersInfo" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Finds Skip Intro and Skip Credits markers for the chosen libraries and sends them to your servers." data-explain-title="Intro &amp; Credits job" data-explain-template="infoJobKindMarkersTpl" aria-label="Finds Skip Intro and Skip Credits markers for the chosen libraries and sends them to your servers."><i class="bi bi-info-circle" aria-hidden="true"></i></button></span>
+            <span class="ov-tp">Skip Intro and Skip Credits markers.</span>
+            <i class="bi bi-check-circle-fill ov-ok" aria-hidden="true"></i>
+        </div>
+        <div class="ov-tcard" data-type="loudness">
+            <input class="ov-tcard-input" type="checkbox" name="{{ prefix }}Kind" id="{{ prefix }}KindLoudness" value="loudness" onchange="onJobKindChange(this, '{{ prefix }}')">
+            <span class="ov-tt"><span class="ov-ti" aria-hidden="true"><i class="bi bi-soundwave"></i></span><label for="{{ prefix }}KindLoudness">Plex loudness</label>
+            <button type="button" class="info-icon" id="{{ prefix }}KindLoudnessInfo" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Runs Plex's loudness analysis of each audio track in the chosen libraries and stores it in Plex, for Normalize Loudness. Libraries need Loudness on (server settings)." data-explain-title="Plex loudness" data-explain-template="infoJobKindLoudnessTpl" aria-label="Runs Plex's loudness analysis of each audio track in the chosen libraries and stores it in Plex, for Normalize Loudness. Libraries need Loudness on (server settings)."><i class="bi bi-info-circle" aria-hidden="true"></i></button></span>
+            <span class="ov-tp">Audio loudness, stored in Plex.</span>
+            <i class="bi bi-check-circle-fill ov-ok" aria-hidden="true"></i>
+        </div>
+    </div>
+</section>

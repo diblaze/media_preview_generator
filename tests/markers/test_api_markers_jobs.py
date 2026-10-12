@@ -19,6 +19,7 @@ from tests.markers.conftest import api_headers as _api_headers
                 "libraries": [{"server_id": "plex-1", "library_id": "1"}],
                 "file_paths": [],
                 "force": False,
+                "scan_filters": {},
             },
         ),
         (
@@ -26,6 +27,7 @@ from tests.markers.conftest import api_headers as _api_headers
                 "libraries": [{"server_id": "plex-1", "library_id": 1}, {"server_id": "jf-1", "library_id": "abc"}],
                 "priority": 2,
                 "force": True,
+                "scan_filters": {},
                 "library_name": "TV everywhere",
             },
             {
@@ -35,6 +37,7 @@ from tests.markers.conftest import api_headers as _api_headers
                 "libraries": [{"server_id": "plex-1", "library_id": "1"}, {"server_id": "jf-1", "library_id": "abc"}],
                 "file_paths": [],
                 "force": True,
+                "scan_filters": {},
             },
         ),
         (
@@ -46,6 +49,7 @@ from tests.markers.conftest import api_headers as _api_headers
                 "libraries": [],
                 "file_paths": [],
                 "force": False,
+                "scan_filters": {},
             },
         ),
         (
@@ -57,6 +61,7 @@ from tests.markers.conftest import api_headers as _api_headers
                 "libraries": [],
                 "file_paths": [],
                 "force": False,
+                "scan_filters": {},
             },
         ),
     ],
@@ -84,6 +89,7 @@ def test_create_marker_job_for_files(client, created, media, priority, expected)
             "libraries": [],
             "file_paths": [str(episode), str(media / "tv")],
             "force": True,
+            "scan_filters": {},
         }
     ]
 
@@ -514,3 +520,34 @@ class TestRerunIntroCreditsJobs:
         new = jm.get_job(resp.get_json()["id"])
         assert new.id not in before
         assert (new.config["source"], new.config["file_paths"], new.priority) == (source, ["/m/tv/S01E01.mkv"], 2)
+
+
+FILTERS = {"added_filter": "last_days", "added_last_days": 7, "latest_seasons": 2, "movie_year_from": 2020}
+
+
+def test_create_marker_job_passes_validated_scan_filters(client, created):
+    body = {"libraries": [{"server_id": "plex-1", "library_id": "1"}], "scan_filters": FILTERS}
+    resp = client.post("/api/markers/jobs", json=body, headers=_api_headers())
+    assert resp.status_code == 201, resp.get_json()
+    assert created[0]["scan_filters"]["added_filter"] == "last_days"
+    assert created[0]["scan_filters"]["added_last_days"] == 7
+    assert created[0]["scan_filters"]["latest_seasons"] == 2
+    assert created[0]["scan_filters"]["movie_year_from"] == 2020
+
+
+@pytest.mark.parametrize(
+    "scan_filters",
+    [
+        "7 days",
+        {"added_filter": "yesterday"},
+        {"added_filter": "last_days"},
+        {"latest_seasons": -1},
+        {"sort_by": "newest"},
+        {"added_filter": "all", "force": True},
+    ],
+)
+def test_create_marker_job_rejects_bad_scan_filters(client, created, scan_filters):
+    body = {"libraries": [{"server_id": "plex-1", "library_id": "1"}], "scan_filters": scan_filters}
+    resp = client.post("/api/markers/jobs", json=body, headers=_api_headers())
+    assert resp.status_code == 400, resp.get_json()
+    assert created == []

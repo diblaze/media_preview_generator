@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -69,6 +69,96 @@ def test_the_listed_files_get_their_follow_ups_before_the_dispatch(scan, pin):
     follow_ups.assert_called_once_with(preview_job_id="ra-1", items=listed, source="recently_added", pin=pin)
     assert scan.order == ["follow_ups", "dispatch"]
     assert counts == {"generated": len(listed)}
+
+
+LOUDNESS_FOLLOW_UP = "media_preview_generator.jobs.orchestrator._queue_loudness_follow_up"
+
+
+def _all_listed(scan):
+    return scan.listed["plex-1"] + scan.listed["emby-1"]
+
+
+def test_by_default_both_follow_up_kinds_are_queued(scan):
+    with (
+        patch(FOLLOW_UPS, return_value=["ic-1"]) as intro,
+        patch(LOUDNESS_FOLLOW_UP, return_value=["ld-1"]) as loudness,
+    ):
+        _run()
+    intro.assert_called_once_with(preview_job_id="ra-1", items=_all_listed(scan), source="recently_added", pin=None)
+    loudness.assert_called_once_with("ra-1", _all_listed(scan), None, source="recently_added")
+
+
+@pytest.mark.parametrize(
+    ("kinds", "intro_queued", "loudness_queued"),
+    [(["intro_credits"], True, False), (["loudness"], False, True), (["intro_credits", "loudness"], True, True), ([], False, False)],
+)  # fmt: skip
+def test_only_the_requested_follow_up_kinds_are_queued(scan, kinds, intro_queued, loudness_queued):
+    with (
+        patch(FOLLOW_UPS, return_value=["ic-1"]) as intro,
+        patch(LOUDNESS_FOLLOW_UP, return_value=["ld-1"]) as loudness,
+    ):
+        _run(follow_up_kinds=kinds)
+    expected_intro = [call(preview_job_id="ra-1", items=_all_listed(scan), source="recently_added", pin=None)]
+    expected_loudness = [call("ra-1", _all_listed(scan), None, source="recently_added")]
+    assert intro.call_args_list == (expected_intro if intro_queued else [])
+    assert loudness.call_args_list == (expected_loudness if loudness_queued else [])
+    assert scan.dispatch.call_count == 1
+    assert [item for _cfg, item in scan.dispatch.call_args.args[0]] == _all_listed(scan)
+    assert scan.dispatch.call_args.kwargs["job_id"] == "ra-1"
+
+
+def test_without_previews_the_scan_only_lists_and_queues_its_follow_ups(scan):
+    messages: list[str] = []
+    sink = orchestrator.logger.add(messages.append, format="{message}", level="INFO")
+    try:
+        with (
+            patch(FOLLOW_UPS, return_value=["ic-1", "ic-2"]) as intro,
+            patch(LOUDNESS_FOLLOW_UP, return_value=["ld-1"]) as loudness,
+        ):
+            counts = _run(follow_up_kinds=["intro_credits", "loudness"], make_previews=False)
+    finally:
+        orchestrator.logger.remove(sink)
+
+    intro.assert_called_once_with(preview_job_id="ra-1", items=_all_listed(scan), source="recently_added", pin=None)
+    loudness.assert_called_once_with("ra-1", _all_listed(scan), None, source="recently_added")
+    scan.dispatch.assert_not_called()
+    assert all(count == 0 for count in counts.values())
+    assert [m.strip() for m in messages if "previews are off" in m] == [
+        "Recently-added scan found 2 new file(s); previews are off, so it only queued Intro & Credits (2), Plex loudness (1)."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("intro_ids", "loudness_ids", "said"),
+    [
+        ([], ["ld-1"], "Plex loudness (1)"),
+        (["ic-1"], [], "Intro & Credits (1)"),
+        ([], [], "nothing"),
+    ],
+)
+def test_the_list_only_log_names_only_what_was_actually_queued(scan, intro_ids, loudness_ids, said):
+    messages: list[str] = []
+    sink = orchestrator.logger.add(messages.append, format="{message}", level="INFO")
+    try:
+        with patch(FOLLOW_UPS, return_value=intro_ids), patch(LOUDNESS_FOLLOW_UP, return_value=loudness_ids):
+            _run(follow_up_kinds=["intro_credits", "loudness"], make_previews=False)
+    finally:
+        orchestrator.logger.remove(sink)
+
+    assert [m.strip() for m in messages if "previews are off" in m] == [
+        f"Recently-added scan found 2 new file(s); previews are off, so it only queued {said}."
+    ]
+
+
+def test_without_previews_an_empty_window_queues_nothing(scan):
+    scan.listed["plex-1"].clear()
+    scan.listed["emby-1"].clear()
+    with patch(FOLLOW_UPS) as intro, patch(LOUDNESS_FOLLOW_UP) as loudness:
+        counts = _run(follow_up_kinds=["intro_credits", "loudness"], make_previews=False)
+    intro.assert_not_called()
+    loudness.assert_not_called()
+    scan.dispatch.assert_not_called()
+    assert all(count == 0 for count in counts.values())
 
 
 def test_a_scan_without_a_job_queues_no_follow_up(scan):

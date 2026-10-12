@@ -1,0 +1,27 @@
+{# Priority, processing order and scan filters shared by Start new job (prefix 'job') and the schedule dialog
+   (prefix 'schedule'). `schedule_priority` adds a Default choice and its hint. #}
+<div class="ov-fld">
+    <label for="{{ prefix }}Priority" class="ov-lbl">Priority
+        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Which waiting job runs first: High, then Normal, then Low." data-explain-title="Priority" data-explain-template="infoJobPriorityTpl" aria-label="Which waiting job runs first: High, then Normal, then Low."><i class="bi bi-info-circle" aria-hidden="true"></i></button>
+    </label>
+    <select class="form-select ov-seg-select" id="{{ prefix }}Priority">
+        {% if schedule_priority %}<option value="" selected>Default</option>{% endif %}
+        <option value="1">High</option>
+        <option value="2"{% if not schedule_priority %} selected{% endif %}>Normal</option>
+        <option value="3">Low</option>
+    </select>
+    {% if schedule_priority %}<div class="ov-hint">Default: previews use the priority from Settings. Intro &amp; Credits and loudness run Low.</div>{% endif %}
+</div>
+<div class="ov-fld" id="{{ prefix }}SortByGroup">
+    <label for="{{ prefix }}SortBy" class="ov-lbl">Processing Order
+        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Orders items within each library by date added. Default uses server order. Parallel workers may finish out of order." data-explain-title="Processing Order" data-explain-template="infoJobSortTpl" aria-label="Orders items within each library by date added. Default uses server order. Parallel workers may finish out of order."><i class="bi bi-info-circle" aria-hidden="true"></i></button>
+    </label>
+    <select class="form-select" id="{{ prefix }}SortBy">
+        <option value="default" selected>Default (server order)</option>
+        <option value="newest">Newest added first</option>
+        <option value="oldest">Oldest added first</option>
+        <option value="random">Random</option>
+    </select>
+    <div class="ov-hint">Which preview files are processed first.</div>
+</div>
+<div id="{{ prefix }}ScanFiltersGroup">{% with filter_prefix=prefix %}{% include '_scan_filters.html' %}{% endwith %}</div>

@@ -1518,126 +1518,10 @@ async function scaleGpuWorkers(device, direction) {
     }
 }
 
-// Refresh the Schedules library checkbox group when the user picks a different
-// server in the modal. Hits /api/libraries?server_id=<id> when a specific
-// server is chosen so non-Plex servers (Emby/Jellyfin) are also covered.
-async function onScheduleServerChange() {
-    const sel = document.getElementById('scheduleServer');
-    if (!sel) return;
-    const serverId = sel.value;
-    MediaScanFilters.setLoading('schedule', true);
-    const listEl = document.getElementById('scheduleLibraryList');
-    if (listEl) listEl.innerHTML = '<div class="text-muted small">Loading libraries…</div>';
-    try {
-        const url = serverId
-            ? `/api/libraries?server_id=${encodeURIComponent(serverId)}`
-            : '/api/libraries';
-        const data = await apiGet(url);
-        if (sel.value !== serverId) return;
-        libraries = data.libraries || [];
-        _renderScheduleLibraryList(libraries, serverId || null);
-    } catch (e) {
-        if (sel.value !== serverId) return;
-        console.warn('Failed to refresh libraries for server change:', e);
-        if (listEl) listEl.innerHTML = '<div class="text-warning small">Could not load libraries.</div>';
-        showToast('Schedules', 'Could not load libraries for the selected server', 'warning');
-    } finally {
-        if (sel.value === serverId) MediaScanFilters.setLoading('schedule', false);
-    }
-}
-
-// Phase H7: render the Schedules modal library checkbox group. Same group-by-
-// server pattern as the New Job modal (H6). When pinned to one server, render
-// flat. Each checkbox is disabled while "All Libraries" is checked.
 // Library ids repeat across servers (Plex numbers from "1" on each), so DOM ids carry the server too.
 function _libraryDomId(prefix, lib) {
     const server = String(lib.server_id || '').replace(/[^A-Za-z0-9_-]/g, '_');
     return escapeHtml(`${prefix}_${server ? server + '_' : ''}${lib.id}`);
-}
-
-function _renderScheduleLibraryList(libs, filterServerId) {
-    const listEl = document.getElementById('scheduleLibraryList');
-    if (!listEl) return;
-    if (!libs || libs.length === 0) {
-        listEl.innerHTML = '<div class="text-muted small">No libraries available for this selection.</div>';
-        MediaScanFilters.refresh('schedule');
-        return;
-    }
-    const allDisabled = document.getElementById('scheduleLibraryAll').checked;
-    const renderRow = (lib, indent) => `
-        <div class="form-check ov-lib">
-            <input class="form-check-input schedule-library-checkbox" type="checkbox"
-                   value="${lib.id}" id="${_libraryDomId('schedLib', lib)}" ${allDisabled ? 'disabled' : ''}
-                   data-library-kind="${escapeHtml(lib.type || lib.kind || '')}"
-                   onchange="MediaScanFilters.refresh('schedule')">
-            <label class="form-check-label" for="${_libraryDomId('schedLib', lib)}">
-                ${escapeHtml(lib.name)} <span class="ov-lib-tag">${libraryTypeLabel(lib)}</span>
-            </label>
-        </div>
-    `;
-    if (filterServerId) {
-        listEl.innerHTML = libs.map(l => renderRow(l, false)).join('');
-        MediaScanFilters.refresh('schedule');
-        return;
-    }
-    const groups = new Map();
-    for (const lib of libs) {
-        const key = lib.server_id || '__legacy__';
-        if (!groups.has(key)) {
-            groups.set(key, { server_name: lib.server_name || '', server_type: lib.server_type || '', libs: [] });
-        }
-        groups.get(key).libs.push(lib);
-    }
-    const sections = [];
-    for (const [_, grp] of groups) {
-        const stype = (grp.server_type || '').toLowerCase();
-        const logo = _vendorLogo(stype, 14) || '';
-        const head = `<div class="ov-lg-h">${logo}<strong>${escapeHtml(grp.server_name || stype.toUpperCase() || 'Server')}</strong><span class="ov-lg-count">${grp.libs.length}</span></div>`;
-        sections.push(`<div class="ov-lg">${head}${grp.libs.map(l => renderRow(l, true)).join('')}</div>`);
-    }
-    listEl.innerHTML = sections.join('');
-    MediaScanFilters.refresh('schedule');
-}
-
-function onScheduleLibraryAllChange(checkbox) {
-    document.querySelectorAll('.schedule-library-checkbox').forEach(cb => {
-        cb.disabled = checkbox.checked;
-        if (checkbox.checked) cb.checked = false;
-    });
-    MediaScanFilters.refresh('schedule');
-}
-
-function setScheduleLibrariesChecked(checked) {
-    const allCb = document.getElementById('scheduleLibraryAll');
-    if (allCb && allCb.checked) {
-        allCb.checked = false;
-        onScheduleLibraryAllChange(allCb);
-    }
-    document.querySelectorAll('.schedule-library-checkbox').forEach(cb => {
-        cb.disabled = false;
-        cb.checked = checked;
-    });
-    MediaScanFilters.refresh('schedule');
-}
-
-// Populate the Schedules modal's "Media Server" dropdown from /api/servers.
-async function _populateScheduleServerPicker(currentServerId) {
-    const sel = document.getElementById('scheduleServer');
-    if (!sel) return;
-    try {
-        const data = await apiGet('/api/servers');
-        const servers = (data.servers || []).filter(s => s.enabled !== false);
-        sel.innerHTML = '<option value="">All servers</option>';
-        for (const s of servers) {
-            const opt = document.createElement('option');
-            opt.value = s.id;
-            opt.textContent = `${s.name} (${(s.type || '').toUpperCase()})`;
-            if (currentServerId && currentServerId === s.id) opt.selected = true;
-            sel.appendChild(opt);
-        }
-    } catch (e) {
-        console.warn('Could not load servers for schedule picker:', e);
-    }
 }
 
 function toggleJobFiles(jobId) {
@@ -3596,11 +3480,22 @@ function showNewJobModal() {
     modal.show();
 }
 
-function _renderJobLibraryList(libs) {
-    const listEl = document.getElementById('jobLibraryList');
+// Start new job (prefix 'job') and the schedule dialog (prefix 'schedule') share the helpers below. Every element id
+// and library checkbox class is `<prefix>...`, so one function serves both dialogs.
+const _JOB_DIALOG_IDS = {
+    job: { modal: 'newJobModal', summary: 'jobSummary' },
+    schedule: { modal: 'newScheduleModal', summary: 'scheduleSummary' },
+};
+
+function _libraryCheckboxes(prefix, checkedOnly = false) {
+    return Array.from(document.querySelectorAll(`.${prefix}-library-checkbox${checkedOnly ? ':checked' : ''}`));
+}
+
+function _renderJobLibraryList(libs, prefix = 'job') {
+    const listEl = document.getElementById(`${prefix}LibraryList`);
     if (!listEl) return;
 
-    const captionEl = document.getElementById('jobLibraryListCaption');
+    const captionEl = document.getElementById(`${prefix}LibraryListCaption`);
     if (captionEl) {
         const distinctServers = new Set();
         for (const l of libs || []) {
@@ -3647,15 +3542,15 @@ function _renderJobLibraryList(libs) {
         const logo = _vendorLogo(stype, 14) || '';
         const head = `<div class="ov-lg-h">${logo}<strong>${escapeHtml(grp.server_name || stype.toUpperCase() || 'Server')}</strong>`
             + `<span class="ov-lg-count">${grp.libs.length}</span>`
-            + '<button type="button" class="ov-link job-select-server">Select server</button></div>';
+            + `<button type="button" class="ov-link ${prefix}-select-server">Select server</button></div>`;
         const rows = grp.libs.map(lib => `
             <div class="form-check ov-lib">
-                <input class="form-check-input job-library-checkbox" type="checkbox"
-                       value="${lib.id}" id="${_libraryDomId('jobLib', lib)}"
+                <input class="form-check-input ${prefix}-library-checkbox" type="checkbox"
+                       value="${lib.id}" id="${_libraryDomId(`${prefix}Lib`, lib)}"
                        data-server-id="${escapeHtml(lib.server_id || '')}"
                        data-server-name="${escapeHtml(lib.server_name || '')}"
                        data-library-kind="${escapeHtml(lib.type || lib.kind || '')}" disabled>
-                <label class="form-check-label" for="${_libraryDomId('jobLib', lib)}">
+                <label class="form-check-label" for="${_libraryDomId(`${prefix}Lib`, lib)}">
                     ${escapeHtml(lib.name)} <span class="ov-lib-tag">${libraryTypeLabel(lib)}</span>
                 </label>
             </div>
@@ -3666,22 +3561,22 @@ function _renderJobLibraryList(libs) {
 
     // Refresh the scope badge whenever any library tick changes, so the
     // user always knows which server(s) the submit will target.
-    document.querySelectorAll('.job-library-checkbox').forEach(cb => {
-        cb.addEventListener('change', _updateJobScopeBadge);
+    _libraryCheckboxes(prefix).forEach(cb => {
+        cb.addEventListener('change', () => _updateJobScopeBadge(prefix));
     });
     // "Select server" ticks that server's rows only, leaving the rest as they are.
-    listEl.querySelectorAll('.job-select-server').forEach(link => {
+    listEl.querySelectorAll(`.${prefix}-select-server`).forEach(link => {
         link.addEventListener('click', () => {
-            const allCb = document.getElementById('jobLibraryAll');
+            const allCb = document.getElementById(`${prefix}LibraryAll`);
             if (allCb && allCb.checked) {
                 allCb.checked = false;
-                toggleAllLibraries(allCb);
+                toggleAllLibraries(allCb, prefix);
             }
-            link.closest('.ov-lg').querySelectorAll('.job-library-checkbox').forEach(cb => {
+            link.closest('.ov-lg').querySelectorAll(`.${prefix}-library-checkbox`).forEach(cb => {
                 cb.disabled = false;
                 cb.checked = true;
             });
-            _updateJobScopeBadge();
+            _updateJobScopeBadge(prefix);
         });
     });
 }
@@ -3692,10 +3587,10 @@ function _renderJobLibraryList(libs) {
 // the authoritative scope computation; the backend's
 // ``_infer_server_from_library_ids`` is a refusing fallback for clients
 // that don't send server_id (see issue #244).
-function _updateJobScopeBadge() {
-    MediaScanFilters.refresh('job');
-    _syncJobDialog();
-    const badge = document.getElementById('jobScopeBadge');
+function _updateJobScopeBadge(prefix = 'job') {
+    MediaScanFilters.refresh(prefix);
+    _syncJobDialog(prefix);
+    const badge = document.getElementById(`${prefix}ScopeBadge`);
     if (!badge) return;
     const show = (scope, icon, html) => {
         badge.dataset.scope = scope;
@@ -3706,17 +3601,17 @@ function _updateJobScopeBadge() {
         badge.innerHTML = '';
     };
 
-    const allCb = document.getElementById('jobLibraryAll');
+    const allCb = document.getElementById(`${prefix}LibraryAll`);
     if (allCb && allCb.checked) {
-        show('all', 'bi-globe2', _jobKindIsPreviews()
+        show('all', 'bi-globe2', _jobKindIsPreviews(prefix)
             ? 'Scanning every enabled library on all servers'
-            : _jobKindIsMarkers()
+            : _jobKindIsMarkers(prefix)
                 ? 'Checking every library with Intro &amp; Credits on'
                 : 'Checking every library with Loudness on');
         return;
     }
 
-    const ticked = Array.from(document.querySelectorAll('.job-library-checkbox:checked'));
+    const ticked = _libraryCheckboxes(prefix, true);
     if (ticked.length === 0) {
         hide();
         return;
@@ -3729,7 +3624,7 @@ function _updateJobScopeBadge() {
         serverNames.add(sid);
         singleServerName = cb.dataset.serverName || sid;
     }
-    const verb = _jobKindIsPreviews() ? 'Scanning' : 'Checking';
+    const verb = _jobKindIsPreviews(prefix) ? 'Scanning' : 'Checking';
     if (serverNames.size === 1) {
         show('one', 'bi-bullseye', `${verb} → <strong>${escapeHtml(singleServerName)}</strong> only`);
     } else if (serverNames.size > 1) {
@@ -3748,20 +3643,21 @@ const _JOB_DIALOG_TYPES = {
 };
 const _JOB_PRIORITY_NAMES = { 1: 'High', 2: 'Normal', 3: 'Low' };
 
-function _syncJobDialog() {
-    const modal = document.getElementById('newJobModal');
+function _syncJobDialog(prefix = 'job') {
+    const modal = document.getElementById(_JOB_DIALOG_IDS[prefix].modal);
     if (!modal) return;
-    const kinds = _jobKinds();
+    const kinds = _jobKinds(prefix);
     const types = kinds.map(kind => _JOB_DIALOG_TYPES[kind]);
     modal.dataset.kind = kinds[0];
 
-    const priority = document.getElementById('jobPriority');
-    if (priority) {
+    const priority = document.getElementById(`${prefix}Priority`);
+    // A schedule's Default priority follows each job type, so no single choice carries the "default" tag there.
+    if (priority && prefix === 'job') {
         priority.dataset.segDefault = _jobDefaultPriority();
         if (window.OverlaySegments) window.OverlaySegments.sync(priority);
     }
     const startLabel = document.getElementById('jobStartLabel');
-    if (startLabel) {
+    if (startLabel && prefix === 'job') {
         startLabel.textContent = types.length > 1 ? `Start ${types.length} jobs` : types[0].start;
     }
 
@@ -3774,51 +3670,60 @@ function _syncJobDialog() {
         modeHint.classList.toggle('ov-warn', !!regenerate);
     }
 
-    const summary = document.getElementById('jobSummary');
+    const summary = document.getElementById(_JOB_DIALOG_IDS[prefix].summary);
     if (summary) {
-        const all = document.getElementById('jobLibraryAll')?.checked;
-        const picked = document.querySelectorAll('.job-library-checkbox:checked').length;
+        const all = document.getElementById(`${prefix}LibraryAll`)?.checked;
+        const picked = _libraryCheckboxes(prefix, true).length;
         const scope = all ? 'All libraries' : `${picked} ${picked === 1 ? 'library' : 'libraries'}`;
-        const priorityName = _JOB_PRIORITY_NAMES[parseInt(priority?.value, 10)] || 'Normal';
+        const priorityName = _JOB_PRIORITY_NAMES[parseInt(priority?.value, 10)] || (prefix === 'schedule' ? 'Default priority' : 'Normal');
+        const parts = [scope];
+        if (prefix === 'schedule') {
+            const lookback = document.getElementById('scheduleLookback');
+            const lookbackText = lookback?.options[lookback.selectedIndex]?.text.toLowerCase() || '';
+            parts.unshift(document.getElementById('scheduleFilesRecent')?.checked ? `Recently added, ${lookbackText}` : 'Whole library');
+        }
         const taskChips = types.map(type => `<span class="ov-task"><i class="bi ${type.icon}" aria-hidden="true"></i>${escapeHtml(type.name)}</span>`).join('');
         summary.innerHTML = taskChips
-            + `<span>${scope} · <b>${priorityName}</b></span>`;
+            + `<span>${parts.map(escapeHtml).join(' · ')} · <b>${priorityName}</b></span>`;
     }
 }
 
 // Nothing ticked: the toast stays (existing flows read it) and the same sentence appears under the list.
-function _jobLibrariesMissing() {
+function _jobLibrariesMissing(prefix = 'job') {
     showToast('Error', 'Please select at least one library', 'warning');
-    document.getElementById('jobLibrariesError')?.removeAttribute('hidden');
-    document.getElementById('jobLibraryList')?.scrollIntoView({ block: 'nearest' });
+    document.getElementById(`${prefix}LibrariesError`)?.removeAttribute('hidden');
+    document.getElementById(`${prefix}LibraryList`)?.scrollIntoView({ block: 'nearest' });
 }
 
-document.getElementById('newJobForm')?.addEventListener('change', () => {
-    document.getElementById('jobLibrariesError')?.setAttribute('hidden', '');
-    _syncJobDialog();
+Object.keys(_JOB_DIALOG_IDS).forEach(prefix => {
+    const form = document.getElementById(prefix === 'job' ? 'newJobForm' : 'newScheduleForm');
+    form?.addEventListener('change', () => {
+        document.getElementById(`${prefix}LibrariesError`)?.setAttribute('hidden', '');
+        _syncJobDialog(prefix);
+    });
 });
 
-function _jobKindIsPreviews() {
-    const box = document.getElementById('jobKindPreviews');
+function _jobKindIsPreviews(prefix = 'job') {
+    const box = document.getElementById(`${prefix}KindPreviews`);
     return !!(box && box.checked);
 }
 
-function _jobKindIsMarkers() {
-    const box = document.getElementById('jobKindMarkers');
+function _jobKindIsMarkers(prefix = 'job') {
+    const box = document.getElementById(`${prefix}KindMarkers`);
     return !!(box && box.checked);
 }
 
-function _jobKindIsLoudness() {
-    const box = document.getElementById('jobKindLoudness');
+function _jobKindIsLoudness(prefix = 'job') {
+    const box = document.getElementById(`${prefix}KindLoudness`);
     return !!(box && box.checked);
 }
 
 // The ticked job types, in the order their jobs are started: previews first.
-function _jobKinds() {
+function _jobKinds(prefix = 'job') {
     const kinds = [];
-    if (_jobKindIsPreviews()) kinds.push('previews');
-    if (_jobKindIsMarkers()) kinds.push('intro_credits');
-    if (_jobKindIsLoudness()) kinds.push('loudness');
+    if (_jobKindIsPreviews(prefix)) kinds.push('previews');
+    if (_jobKindIsMarkers(prefix)) kinds.push('intro_credits');
+    if (_jobKindIsLoudness(prefix)) kinds.push('loudness');
     return kinds;
 }
 
@@ -3827,55 +3732,58 @@ function _jobDefaultPriority() {
     return _jobKindIsPreviews() ? '2' : '3';
 }
 
-// Processing mode, order and scan filters belong to Previews alone: Intro & Credits and loudness check every file
-// (the former with a "re-check" switch instead).
-function _showJobKindControls() {
-    const markers = _jobKindIsMarkers();
-    const previews = _jobKindIsPreviews();
+// Processing mode and order belong to Previews alone (Intro & Credits has a "re-check" switch instead). Scan filters
+// apply to every type. A schedule on Recently added has no filters or order: it only looks at the newest files.
+function _showJobKindControls(prefix = 'job') {
+    const markers = _jobKindIsMarkers(prefix);
+    const previews = _jobKindIsPreviews(prefix);
+    const recentlyAdded = !!document.getElementById(`${prefix}FilesRecent`)?.checked;
     const toggle = function (id, hidden) {
         const el = document.getElementById(id);
         if (el) el.hidden = hidden;
     };
-    toggle('jobProcessingModeGroup', !previews);
-    toggle('jobSortByGroup', !previews);
-    toggle('jobMarkersForceGroup', !markers);
-    toggle('jobScanFiltersGroup', !previews);
-    toggle('jobOwnRunnerFiltersNote', previews);
-    _updateJobScopeBadge();
+    toggle(`${prefix}ProcessingModeGroup`, !previews);
+    toggle(`${prefix}SortByGroup`, !previews || recentlyAdded);
+    toggle(`${prefix}MarkersForceGroup`, !markers);
+    toggle(`${prefix}ScanFiltersGroup`, recentlyAdded);
+    _updateJobScopeBadge(prefix);
 }
 
-// Ticking job types also picks the default priority. At least one type stays ticked.
-function onJobKindChange(changed) {
-    if (!_jobKinds().length && changed) changed.checked = true;
-    _showJobKindControls();
-    const priority = document.getElementById('jobPriority');
-    if (priority) priority.value = _jobDefaultPriority();
-    _syncJobDialog();
+// Ticking job types also picks the default priority in Start new job. At least one type stays ticked.
+function onJobKindChange(changed, prefix = 'job') {
+    if (!_jobKinds(prefix).length && changed) changed.checked = true;
+    _showJobKindControls(prefix);
+    if (prefix === 'job') {
+        const priority = document.getElementById('jobPriority');
+        if (priority) priority.value = _jobDefaultPriority();
+    } else if (typeof refreshScheduleFilesUi === 'function') {
+        refreshScheduleFilesUi();
+    }
+    _syncJobDialog(prefix);
 }
 
-function toggleAllLibraries(checkbox) {
-    const libraryCheckboxes = document.querySelectorAll('.job-library-checkbox');
-    libraryCheckboxes.forEach(cb => {
+function toggleAllLibraries(checkbox, prefix = 'job') {
+    _libraryCheckboxes(prefix).forEach(cb => {
         cb.disabled = checkbox.checked;
         if (checkbox.checked) {
             cb.checked = false;
         }
     });
-    _updateJobScopeBadge();
+    _updateJobScopeBadge(prefix);
 }
 
 // Phase H6: Select-all / None affordance for the multi-select picker.
-function setAllLibrariesChecked(checked) {
-    const allCb = document.getElementById('jobLibraryAll');
+function setAllLibrariesChecked(checked, prefix = 'job') {
+    const allCb = document.getElementById(`${prefix}LibraryAll`);
     if (allCb && allCb.checked) {
         allCb.checked = false;
-        toggleAllLibraries(allCb);
+        toggleAllLibraries(allCb, prefix);
     }
-    document.querySelectorAll('.job-library-checkbox').forEach(cb => {
+    _libraryCheckboxes(prefix).forEach(cb => {
         cb.disabled = false;
         cb.checked = checked;
     });
-    _updateJobScopeBadge();
+    _updateJobScopeBadge(prefix);
 }
 
 // Job title from the picked library names: one name, a short list, or a count when the list gets long.
@@ -3923,6 +3831,7 @@ async function _submitNewJobs(jobs) {
 
 // Intro & Credits: libraries go as server + library pairs, because library ids repeat across servers (Plex numbers
 // its libraries from "1" on every server). An empty list means every library with Intro & Credits turned on.
+// The media filters (added date, seasons, release year) go along as scan_filters.
 function _buildMarkersJob() {
     const allTicked = document.getElementById('jobLibraryAll').checked;
     const ticked = allTicked ? [] : Array.from(document.querySelectorAll('.job-library-checkbox:checked'));
@@ -3935,12 +3844,15 @@ function _buildMarkersJob() {
         .map(p => (libraries.find(l => String(l.id) === p.library_id && (l.server_id || '') === p.server_id) || {}).name)
         .filter(Boolean);
     const label = allTicked ? 'All Libraries' : _jobLibraryLabel(names, picked.length);
+    const scanFilters = MediaScanFilters.read('job');
+    if (scanFilters === null) return null;
     const payload = {
         libraries: picked,
         priority: parseInt(document.getElementById('jobPriority').value, 10) || 3,
         force: document.getElementById('jobMarkersForce').checked,
         library_name: `Intro & Credits: ${label}`,
     };
+    if (Object.keys(scanFilters).length) payload.scan_filters = scanFilters;
     return { url: '/api/markers/jobs', payload, message: 'Intro & Credits job has been started', name: 'Intro & Credits' };
 }
 
@@ -3958,11 +3870,14 @@ function _buildLoudnessJob() {
         .map(p => (libraries.find(l => String(l.id) === p.library_id && (l.server_id || '') === p.server_id) || {}).name)
         .filter(Boolean);
     const label = allTicked ? 'All Libraries' : _jobLibraryLabel(names, picked.length);
+    const scanFilters = MediaScanFilters.read('job');
+    if (scanFilters === null) return null;
     const payload = {
         libraries: picked,
         priority: parseInt(document.getElementById('jobPriority').value, 10) || 3,
         library_name: `Plex loudness: ${label}`,
     };
+    if (Object.keys(scanFilters).length) payload.scan_filters = scanFilters;
     return { url: '/api/loudness/jobs', payload, message: 'Plex loudness job has been started', name: 'Plex loudness' };
 }
 

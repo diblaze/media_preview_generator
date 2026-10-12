@@ -164,6 +164,22 @@ class TestCreateIntroCreditsJob:
         }
         start.assert_called_once_with("new-job-id")
 
+    def test_only_scan_filter_keys_are_stored(self, monkeypatch):
+        jm = MagicMock()
+        jm.create_job.return_value = MagicMock(id="new-job-id")
+        monkeypatch.setattr(triggers, "get_job_manager", lambda: jm)
+        with patch.object(triggers, "start_intro_credits_job_async"):
+            triggers.create_intro_credits_job(
+                library_name="x",
+                priority=3,
+                source="schedule",
+                scan_filters={"added_filter": "last_days", "added_last_days": 7, "force": True, "kind": "previews"},
+            )
+
+        config = jm.create_job.call_args.kwargs["config"]
+        assert (config["added_filter"], config["added_last_days"]) == ("last_days", 7)
+        assert config["kind"] == "intro_credits" and config["force"] is False
+
     def test_retry_job_config_carries_its_attempt_and_due_time(self, monkeypatch):
         from datetime import datetime
 

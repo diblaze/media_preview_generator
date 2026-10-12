@@ -46,6 +46,7 @@ from ..processing.generator import clear_failures, failure_scope, set_file_resul
 from ..processing.multi_server import source_replaced_reason
 from ..processing.retry_queue import retry_policy, scaled_backoff_delay
 from ..processing.types import ProcessableItem
+from ..scan_filters import pick_filter_config
 from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import apply_inverse_path_mappings
 from ..utils import redact_secrets
@@ -991,6 +992,8 @@ def create_loudness_job(
     parent_job_id: str | None = None,
     max_retries: int = 0,
     retry_baseline: dict | None = None,
+    parent_schedule_id: str = "",
+    scan_filters: dict | None = None,
 ):
     """Create and start a loudness job.
 
@@ -1007,11 +1010,15 @@ def create_loudness_job(
         parent_job_id: Original job whose row represents this hidden retry.
         max_retries: Global retry limit in force when this retry was queued.
         retry_baseline: Immutable aggregate and previous-file counts for this attempt.
+        parent_schedule_id: Schedule that created it (a stop time pauses and resumes the job by it).
+        scan_filters: Scan-filter keys (``scan_filters.FILTER_CONFIG_KEYS``) limiting which library files are listed;
+            other keys are ignored. Not used with ``file_paths``.
 
     Returns:
         The created job.
     """
     config: dict[str, Any] = {
+        **pick_filter_config(scan_filters),
         "kind": JOB_KIND_LOUDNESS,
         "source": source,
         "libraries": list(libraries or []),
@@ -1030,7 +1037,11 @@ def create_loudness_job(
     if retry_baseline is not None:
         config["retry_baseline"] = retry_baseline
     job = get_job_manager().create_job(
-        library_name=library_name, config=config, priority=priority, kind=JOB_KIND_LOUDNESS
+        library_name=library_name,
+        config=config,
+        priority=priority,
+        kind=JOB_KIND_LOUDNESS,
+        parent_schedule_id=parent_schedule_id,
     )
     start_loudness_job_async(job.id)
     logger.info("Created loudness job {} ({}, source={})", job.id[:8], library_name, source)

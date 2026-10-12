@@ -11,9 +11,22 @@ from ..scheduler import (
     get_schedule_manager,
     is_now_in_any_quiet_window,
     normalise_quiet_hours,
+    normalize_schedule_config,
 )
 from ..settings_manager import get_settings_manager
 from . import api
+
+
+def _normalised_config(raw_config):
+    """A request's schedule config in the current shape, with scan filters kept only for whole-library schedules.
+
+    Raises:
+        ValueError: The config isn't an object, or its job kinds or filters are invalid.
+    """
+    if not isinstance(raw_config, dict):
+        raise ValueError("config must be an object")
+    config = normalize_schedule_config(raw_config)
+    return normalize_scan_filter_config(config, full_scan=config["job_type"] == "full_library")
 
 
 @api.route("/schedules")
@@ -70,9 +83,7 @@ def create_schedule():
     data = request.get_json() or {}
     if "config" in data and data["config"] is not None:
         try:
-            raw_config = data["config"]
-            full_scan = not isinstance(raw_config, dict) or raw_config.get("job_type", "full_library") == "full_library"
-            data["config"] = normalize_scan_filter_config(raw_config, full_scan=full_scan)
+            data["config"] = _normalised_config(data["config"])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
 
@@ -153,9 +164,7 @@ def update_schedule(schedule_id):
     data = request.get_json() or {}
     if "config" in data and data["config"] is not None:
         try:
-            raw_config = data["config"]
-            full_scan = not isinstance(raw_config, dict) or raw_config.get("job_type", "full_library") == "full_library"
-            data["config"] = normalize_scan_filter_config(raw_config, full_scan=full_scan)
+            data["config"] = _normalised_config(data["config"])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
 

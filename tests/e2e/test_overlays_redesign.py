@@ -154,7 +154,7 @@ class TestStartNewJob:
         expect(page.locator("#jobPriority")).to_have_value(str(priority))
         expect(_segment(page, "jobPriority", "Low")).to_have_attribute("aria-checked", "true")
         expect(page.locator("#jobProcessingModeGroup")).to_be_hidden()
-        expect(page.locator("#jobOwnRunnerFiltersNote")).to_be_visible()
+        expect(page.locator("#jobScanFilters")).to_be_visible()
         page.locator("#jobLibraryAll").uncheck()
         page.locator('.job-library-checkbox[data-server-id="jf-1"]').check()
         page.locator("#jobStartButton").click()
@@ -162,6 +162,7 @@ class TestStartNewJob:
         body = [w for w in writes if w["url"] == url][0]["body"]
         assert body["libraries"] == [{"server_id": "jf-1", "library_id": "1"}]
         assert body["priority"] == priority
+        assert body["scan_filters"] == {"added_filter": "all"}
 
     def test_type_cards_colour_the_dialog_by_the_first_ticked_type(self, overlay_page) -> None:
         page, _ = overlay_page
@@ -214,7 +215,8 @@ class TestStartNewJob:
         page.locator("#jobKindLoudness").check()
         page.locator("#jobKindPreviews").uncheck()
         expect(page.locator("#jobProcessingModeGroup")).to_be_hidden()
-        expect(page.locator("#jobScanFiltersGroup")).to_be_hidden()
+        expect(page.locator("#jobSortByGroup")).to_be_hidden()
+        expect(page.locator("#jobScanFiltersGroup")).to_be_visible()
         expect(page.locator("#jobPriority")).to_have_value("3")
         expect(page.locator("#jobStartLabel")).to_have_text("Start loudness job")
 
@@ -333,21 +335,24 @@ class TestSchedule:
         page.locator("#scheduleSubmitBtn").click()
         assert [w for w in writes if w["url"] == "schedules"][0]["body"]["cron_expression"] == "0 */2 * * *"
 
-    def test_scan_modes_post_their_job_type_and_check_servers_hides_scope(self, overlay_page, app_url: str) -> None:
+    def test_files_choice_posts_its_job_type_and_recently_added_hides_the_whole_library_options(
+        self, overlay_page, app_url: str
+    ) -> None:
         page, writes = overlay_page
         _schedule_page(page, app_url)
         page.locator("#scheduleName").fill("Recent")
-        page.locator("#scanModeRecent").check()
+        page.locator("#scheduleKindMarkers").check()
+        page.locator("#scheduleFilesRecent").check()
         expect(page.locator("#scheduleIntervalValue")).to_have_value("15")
         expect(page.locator("#scheduleLookbackGroup")).to_be_visible()
-        page.locator("#scanModeMarkers").check()
-        page.locator("#scheduleMarkersCheckServers").check()
-        expect(page.locator("#scheduleScopeSection")).to_be_hidden()
-        expect(page.locator("#scheduleCheckServersNote")).to_be_visible()
-        expect(page.locator("#newScheduleModal")).to_have_attribute("data-kind", "check")
+        expect(page.locator("#scheduleSortByGroup")).to_be_hidden()
+        expect(page.locator("#scheduleScanFiltersGroup")).to_be_hidden()
+        expect(page.locator("#newScheduleModal")).to_have_attribute("data-kind", "previews")
+        page.locator("#scheduleKindPreviews").uncheck()
+        expect(page.locator("#newScheduleModal")).to_have_attribute("data-kind", "intro_credits")
         page.locator("#scheduleSubmitBtn").click()
         config = [w for w in writes if w["url"] == "schedules"][0]["body"]["config"]
-        assert config == {"job_type": "intro_credits", "reconcile": True}
+        assert config == {"job_kinds": ["intro_credits"], "job_type": "recently_added", "lookback_hours": 1}
 
     def test_missing_name_and_days_show_inline_errors(self, overlay_page, app_url: str) -> None:
         page, writes = overlay_page

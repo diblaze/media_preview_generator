@@ -925,6 +925,15 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             config.recently_added_since = _recently_added_since(job, value)
                         else:
                             config.recently_added_library_ids = [str(v) for v in value or []] or None
+                    elif key in ("follow_up_kinds", "make_previews") and config_overrides.get("source") == (
+                        RECENTLY_ADDED_JOB_SOURCE
+                    ):
+                        if key == "follow_up_kinds":
+                            config.recently_added_follow_up_kinds = (
+                                [str(v) for v in value] if value is not None else None
+                            )
+                        else:
+                            config.recently_added_make_previews = bool(value)
                     elif key in _CONFIG_ATTRIBUTE_OVERRIDES:
                         setattr(config, key, value)
                     elif hasattr(config, key):
@@ -2211,6 +2220,8 @@ def _start_recently_added_job_async(
     lookback_hours: float,
     library_name: str,
     priority: int | None = None,
+    follow_up_kinds: list[str] | None = None,
+    make_previews: bool = True,
 ) -> str:
     """Coalesce only never-started requests for the same schedule and scope."""
     with _recently_added_creation_lock:
@@ -2221,6 +2232,8 @@ def _start_recently_added_job_async(
             lookback_hours=lookback_hours,
             library_name=library_name,
             priority=priority,
+            follow_up_kinds=follow_up_kinds,
+            make_previews=make_previews,
         )
 
 
@@ -2232,6 +2245,8 @@ def _create_recently_added_job(
     lookback_hours: float,
     library_name: str,
     priority: int | None = None,
+    follow_up_kinds: list[str] | None = None,
+    make_previews: bool = True,
 ) -> str:
     """Create the Job for a scheduled "Recently Added" scan and start it through the preview runner.
 
@@ -2248,12 +2263,21 @@ def _create_recently_added_job(
     A tick while the schedule's last scan hasn't started yet queues nothing: that scan lists up to when it starts, so it
     already covers this tick's window (widened to it when this tick looks further back).
 
+    ``follow_up_kinds`` limits the Intro & Credits / loudness jobs queued for its files (None = both, as for webhooks).
+    ``make_previews=False`` makes it a list-only scan: it queues those follow-ups and generates no previews.
+
     Returns the new Job's UUID, or the waiting one's.
     """
     job_manager = get_job_manager()
     resolved_priority = parse_priority(priority) if priority is not None else incoming_job_priority()
     waiting = _waiting_recently_added_job(
-        job_manager, schedule_id, server_id=server_id, library_ids=library_ids, priority=resolved_priority
+        job_manager,
+        schedule_id,
+        server_id=server_id,
+        library_ids=library_ids,
+        priority=resolved_priority,
+        follow_up_kinds=follow_up_kinds,
+        make_previews=make_previews,
     )
     if waiting is not None:
         _widen_recently_added_window(job_manager, waiting, lookback_hours)
@@ -2267,17 +2291,22 @@ def _create_recently_added_job(
     # to the global "Incoming job priority" setting (issue #285) so Recently
     # Added sweeps overtake full scans by default, same as webhooks. Either
     # way the value reaches the gate, which admits at job.priority.
+    scan_config: dict[str, object] = {
+        "source": RECENTLY_ADDED_JOB_SOURCE,
+        "parent_schedule_id": schedule_id,
+        # The publish pin as well as the servers scanned: a scan pinned to one Plex server must not fan out to
+        # every server owning the file (issue #259).
+        "server_id": server_id,
+        "library_ids": library_ids,
+        "lookback_hours": lookback_hours,
+    }
+    if follow_up_kinds is not None:
+        scan_config["follow_up_kinds"] = list(follow_up_kinds)
+    if not make_previews:
+        scan_config["make_previews"] = False
     job = job_manager.create_job(
         library_name=library_name,
-        config={
-            "source": RECENTLY_ADDED_JOB_SOURCE,
-            "parent_schedule_id": schedule_id,
-            # The publish pin as well as the servers scanned: a scan pinned to one Plex server must not fan out to
-            # every server owning the file (issue #259).
-            "server_id": server_id,
-            "library_ids": library_ids,
-            "lookback_hours": lookback_hours,
-        },
+        config=scan_config,
         server_id=server_id,
         parent_schedule_id=schedule_id,
         priority=resolved_priority,
@@ -2293,6 +2322,8 @@ def _waiting_recently_added_job(
     server_id: str | None = None,
     library_ids: list[str] | None = None,
     priority: int | None = None,
+    follow_up_kinds: list[str] | None = None,
+    make_previews: bool = True,
 ):
     """The schedule's Recently Added scan that is queued and hasn't started (a revived one that had started isn't)."""
     for job in job_manager.get_pending_jobs():
@@ -2304,6 +2335,8 @@ def _waiting_recently_added_job(
             and cfg.get("source") == RECENTLY_ADDED_JOB_SOURCE
             and cfg.get("parent_schedule_id") == schedule_id
             and (priority is None or job.priority == priority)
+            and cfg.get("follow_up_kinds") == (list(follow_up_kinds) if follow_up_kinds is not None else None)
+            and cfg.get("make_previews", True) == make_previews
             and (cfg.get("server_id") or None) == (server_id or None)
             and sorted(str(value) for value in (cfg.get("library_ids") or []))
             == sorted(str(value) for value in (library_ids or []))

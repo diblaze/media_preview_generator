@@ -130,7 +130,7 @@ function loadSchedulesContext(formValues) {
     // Special: query selectors used by saveSchedule for the day checkboxes.
     const checkedDays = (formValues && formValues.__checkedDays) || [];
     const checkedLibs = (formValues && formValues.__checkedLibs) || [];
-    const scanModeChecked = (formValues && formValues.__scanMode) || 'full_library';
+    const filesChecked = (formValues && formValues.__scanMode) || 'full_library';
 
     const docStub = {
         addEventListener: function () {},
@@ -163,20 +163,11 @@ function loadSchedulesContext(formValues) {
             if (sel === '.schedule-day:checked') {
                 return checkedDays.map((v) => ({ value: String(v) }));
             }
-            if (sel === '.schedule-library-checkbox:checked') {
-                return checkedLibs.map((v) => ({ value: String(v) }));
-            }
-            if (sel === '.schedule-library-checkbox') {
-                return [];
-            }
-            if (sel === 'input[name="scanMode"]:checked') {
-                return [{ value: scanModeChecked }];
-            }
             return [];
         },
         querySelector: (sel) => {
-            if (sel === 'input[name="scanMode"]:checked') {
-                return { value: scanModeChecked };
+            if (sel === 'input[name="scheduleFiles"]:checked') {
+                return { value: filesChecked };
             }
             if (sel === 'input[name="scheduleType"]:checked') {
                 return { value: (formValues && formValues.__scheduleType) || 'specific-time' };
@@ -219,13 +210,18 @@ function loadSchedulesContext(formValues) {
         _getSelectedScheduleType: function () {
             return (formValues && formValues.__scheduleType) || 'specific-time';
         },
-        _populateScheduleServerPicker: () => Promise.resolve(),
-        _renderScheduleLibraryList: () => {},
         _resetScheduleForm: () => {},
-        onScheduleLibraryAllChange: () => {},
-        onScheduleServerChange: () => Promise.resolve(),
-        onScanModeChange: () => {},
         onScheduleTypeChange: () => {},
+        // app.js's prefix-keyed dialog helpers, shared with Start new job.
+        _jobKinds: () => (formValues && formValues.__kinds) || ['previews'],
+        _libraryCheckboxes: (prefix, checkedOnly) => checkedOnly
+            ? checkedLibs.map((v) => ({ value: String(v.id ?? v), dataset: { serverId: v.server_id || '' } }))
+            : [],
+        toggleAllLibraries: () => {},
+        _renderJobLibraryList: () => {},
+        _updateJobScopeBadge: () => {},
+        _showJobKindControls: () => {},
+        apiGet: async () => ({ libraries: [] }),
         console: console,
     };
     ctx.global = ctx;
@@ -625,7 +621,7 @@ class TestEditModalPriorityPrefill:
                 "trigger_type": "cron",
                 "trigger_value": "0 6 * * 1",
                 "library_ids": [],
-                "config": {"job_type": "recently_added", "lookback_hours": 1},
+                "config": {"job_kinds": ["previews"], "job_type": "recently_added", "lookback_hours": 1},
             }
         ]
         out = _eval_js(
@@ -644,6 +640,130 @@ class TestEditModalPriorityPrefill:
     @pytest.mark.parametrize("stored", [1, 2, 3])
     def test_explicit_pin_prefills_itself(self, stored: int) -> None:
         assert self._prefill_for(stored) == str(stored)
+
+
+# ---------------------------------------------------------------------------
+# saveSchedule — the multi-job config contract (job_kinds + job_type)
+# ---------------------------------------------------------------------------
+
+
+def _config_form(files: str, kinds: list[str], **extra) -> dict:
+    return {
+        "scheduleEditId": {"value": ""},
+        "scheduleName": {"value": "Multi"},
+        "scheduleEnabled": {"checked": True},
+        "schedulePriority": {"value": ""},
+        "scheduleStopTime": {"value": ""},
+        "scheduleLibraryAll": {"checked": True},
+        "scheduleTime": {"value": "06:00"},
+        "scheduleLookback": {"value": "6", "options": [{"value": "6"}]},
+        "scheduleSortBy": {"value": "newest"},
+        "__scheduleType": "specific-time",
+        "__checkedDays": [1],
+        "__scanMode": files,
+        "__kinds": kinds,
+        **extra,
+    }
+
+
+class TestSaveScheduleConfigContract:
+    """The config carries the ticked job types and which files they run on; Recently added drops the whole-library keys."""
+
+    def _saved(self, form: dict) -> dict:
+        return _eval_js("saveSchedule()", form_values=form)["captured"]["posts"][0]["body"]
+
+    def test_whole_library_carries_kinds_sort_order_and_priority_null(self) -> None:
+        body = self._saved(_config_form("full_library", ["previews", "intro_credits", "loudness"]))
+        assert body["config"] == {
+            "job_kinds": ["previews", "intro_credits", "loudness"],
+            "job_type": "full_library",
+            "sort_by": "newest",
+        }
+        assert body["priority"] is None
+
+    def test_processing_order_is_dropped_without_previews(self) -> None:
+        body = self._saved(_config_form("full_library", ["intro_credits"]))
+        assert body["config"] == {"job_kinds": ["intro_credits"], "job_type": "full_library"}
+
+    @pytest.mark.parametrize("kinds", [["previews"], ["intro_credits"], ["previews", "loudness"]])
+    def test_recently_added_carries_kinds_and_lookback_but_no_order(self, kinds: list[str]) -> None:
+        body = self._saved(_config_form("recently_added", kinds))
+        assert body["config"] == {"job_kinds": kinds, "job_type": "recently_added", "lookback_hours": 6}
+
+    def test_server_is_inferred_only_when_every_ticked_library_is_on_one_server(self) -> None:
+        one = _config_form(
+            "full_library",
+            ["previews"],
+            scheduleLibraryAll={"checked": False},
+            __checkedLibs=[{"id": "1", "server_id": "plex-1"}, {"id": "2", "server_id": "plex-1"}],
+        )
+        many = _config_form(
+            "full_library",
+            ["previews"],
+            scheduleLibraryAll={"checked": False},
+            __checkedLibs=[{"id": "1", "server_id": "plex-1"}, {"id": "1", "server_id": "jf-1"}],
+        )
+        assert self._saved(one)["server_id"] == "plex-1"
+        assert self._saved(many)["server_id"] == ""
+        assert self._saved(many)["library_ids"] == ["1", "1"]
+        assert self._saved(one)["config"]["libraries"] == [
+            {"server_id": "plex-1", "library_id": "1"},
+            {"server_id": "plex-1", "library_id": "2"},
+        ]
+        assert self._saved(many)["config"]["libraries"] == [
+            {"server_id": "plex-1", "library_id": "1"},
+            {"server_id": "jf-1", "library_id": "1"},
+        ]
+
+
+class TestEditModalKindPrefill:
+    """Reopening a normalised schedule ticks its kinds, its files choice and its look-back."""
+
+    @staticmethod
+    def _checked_after_edit(config: dict) -> dict:
+        form = _priority_form("2", edit_id="sch-1")
+        form["__autoStubMissing"] = True
+        form["scheduleLookback"] = {"value": "1", "options": [{"value": "1"}, {"value": "6"}]}
+        form["__schedules"] = [
+            {
+                "id": "sch-1",
+                "name": "Sweep",
+                "enabled": True,
+                "priority": None,
+                "trigger_type": "cron",
+                "trigger_value": "0 6 * * 1",
+                "library_ids": [],
+                "config": config,
+            }
+        ]
+        call = (
+            "(function(){ showEditScheduleModal('sch-1'); const ids = ['scheduleKindPreviews', 'scheduleKindMarkers',"
+            " 'scheduleKindLoudness', 'scheduleFilesAll', 'scheduleFilesRecent'];"
+            " const out = {}; ids.forEach(id => { out[id] = document.getElementById(id).checked; });"
+            " out.lookback = document.getElementById('scheduleLookback').value; return out; })()"
+        )
+        return _eval_js(call, form_values=form)["result"]
+
+    def test_legacy_intro_credits_schedule_reopens_on_that_kind_only(self) -> None:
+        got = self._checked_after_edit({"job_kinds": ["intro_credits"], "job_type": "full_library"})
+        assert (got["scheduleKindPreviews"], got["scheduleKindMarkers"], got["scheduleKindLoudness"]) == (
+            False,
+            True,
+            False,
+        )
+        assert got["scheduleFilesAll"] is True
+
+    def test_legacy_recently_added_schedule_reopens_with_every_kind_and_its_lookback(self) -> None:
+        got = self._checked_after_edit(
+            {"job_kinds": ["previews", "intro_credits", "loudness"], "job_type": "recently_added", "lookback_hours": 6}
+        )
+        assert (got["scheduleKindPreviews"], got["scheduleKindMarkers"], got["scheduleKindLoudness"]) == (
+            True,
+            True,
+            True,
+        )
+        assert got["scheduleFilesRecent"] is True
+        assert got["lookback"] == "6"
 
 
 # ---------------------------------------------------------------------------

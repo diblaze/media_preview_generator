@@ -3001,6 +3001,46 @@ class TestSchedulesAPI:
         assert bad.status_code == 400
         assert "error" in bad.get_json()
 
+    @pytest.mark.parametrize(
+        "libraries",
+        [
+            "plex-1:1",
+            [{"server_id": "plex-1"}],
+            [{"server_id": "", "library_id": "1"}],
+            [{"server_id": 1, "library_id": "1"}],
+            ["x"],
+        ],
+    )
+    def test_schedule_libraries_must_be_server_library_pairs(self, client, libraries):
+        resp = client.post(
+            "/api/schedules",
+            headers=_api_headers(),
+            json={"name": "bad", "cron_expression": "0 3 * * *", "config": {"libraries": libraries}},
+        )
+
+        assert resp.status_code == 400
+        assert "libraries must be a list of {server_id, library_id}" in resp.get_json()["error"]
+
+    def test_schedule_keeps_exact_library_picks_and_a_put_without_them_drops_them(self, client):
+        pairs = [{"server_id": "plex-1", "library_id": "1"}, {"server_id": "jf-1", "library_id": "1"}]
+        created = client.post(
+            "/api/schedules",
+            headers=_api_headers(),
+            json={"name": "two", "cron_expression": "0 3 * * *", "config": {"libraries": pairs}},
+        )
+        assert created.status_code == 201
+        assert created.get_json()["config"]["libraries"] == pairs
+
+        updated = client.put(
+            f"/api/schedules/{created.get_json()['id']}",
+            headers=_api_headers(),
+            json={"config": {"job_kinds": ["previews"]}, "server_id": ""},
+        )
+
+        assert updated.status_code == 200
+        assert "libraries" not in updated.get_json()["config"]
+        assert updated.get_json()["server_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # System API
@@ -7038,7 +7078,11 @@ class TestFullScanFilterAPI:
         schedule = response.get_json()
         from media_preview_generator.scan_filters import FILTER_CONFIG_KEYS
 
-        assert schedule["config"] == {key: stored[key] for key in FILTER_CONFIG_KEYS}
+        assert schedule["config"] == {
+            **{key: stored[key] for key in FILTER_CONFIG_KEYS},
+            "job_kinds": ["previews"],
+            "job_type": "full_library",
+        }
         reset = client.put(
             f"/api/schedules/{schedule['id']}",
             headers=_api_headers(),
@@ -7059,8 +7103,7 @@ class TestFullScanFilterAPI:
             )
         )
 
-    @pytest.mark.parametrize("job_type", ["recently_added", "intro_credits"])
-    def test_non_full_scan_schedule_drops_full_scan_filters(self, client, job_type: str) -> None:
+    def test_recently_added_schedule_drops_full_scan_filters(self, client) -> None:
         response = client.post(
             "/api/schedules",
             headers=_api_headers(),
@@ -7069,7 +7112,7 @@ class TestFullScanFilterAPI:
                 "interval_minutes": 60,
                 "enabled": False,
                 "config": {
-                    "job_type": job_type,
+                    "job_type": "recently_added",
                     "lookback_hours": 1,
                     "latest_seasons": -1,
                     "added_filter": "last_days",
@@ -7078,7 +7121,28 @@ class TestFullScanFilterAPI:
             },
         )
         assert response.status_code == 201, response.get_json()
-        assert response.get_json()["config"] == {"job_type": job_type, "lookback_hours": 1}
+        assert response.get_json()["config"] == {
+            "job_type": "recently_added",
+            "lookback_hours": 1,
+            "job_kinds": ["previews", "intro_credits", "loudness"],
+        }
+
+    def test_every_kind_keeps_whole_library_filters_and_bad_kinds_are_refused(self, client) -> None:
+        body = {
+            "name": "Markers",
+            "interval_minutes": 60,
+            "enabled": False,
+            "config": {"job_kinds": ["loudness", "intro_credits"], "added_filter": "last_days", "added_last_days": 5},
+        }
+        response = client.post("/api/schedules", headers=_api_headers(), json=body)
+        assert response.status_code == 201, response.get_json()
+        config = response.get_json()["config"]
+        assert config["job_kinds"] == ["intro_credits", "loudness"] and config["job_type"] == "full_library"
+        assert config["added_filter"] == "last_days" and config["added_last_days"] == 5
+
+        for bad in ([], ["previews", "bogus"], "previews"):
+            body["config"] = {"job_kinds": bad}
+            assert client.post("/api/schedules", headers=_api_headers(), json=body).status_code == 400
 
 
 class TestQueueDiscoveryContracts:

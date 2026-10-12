@@ -143,6 +143,42 @@ class TestStartRecentlyAddedJobAsync:
             assert callable(kwargs[name]), name
         assert callable(kwargs["worker_pool_callback"])  # pool reconcile, which the old runner never did
 
+    def test_a_scan_without_extras_keeps_todays_behaviour(self, app):
+        scans: list[dict] = []
+        with patch(SCAN, side_effect=lambda config, **kw: scans.append(kw) or {}):
+            job_id = _start()
+
+        assert "follow_up_kinds" not in _jm().get_job(job_id).config
+        assert "make_previews" not in _jm().get_job(job_id).config
+        assert scans[0]["follow_up_kinds"] is None and scans[0]["make_previews"] is True
+
+    def test_follow_up_kinds_and_list_only_reach_the_scan(self, app):
+        scans: list[dict] = []
+        with patch(SCAN, side_effect=lambda config, **kw: scans.append(kw) or {}):
+            job_id = _start(follow_up_kinds=["loudness"], make_previews=False)
+
+        config = _jm().get_job(job_id).config
+        assert config["follow_up_kinds"] == ["loudness"] and config["make_previews"] is False
+        assert scans[0]["follow_up_kinds"] == ["loudness"] and scans[0]["make_previews"] is False
+
+    def test_a_waiting_scan_is_only_reused_for_the_same_kinds(self, app):
+        from media_preview_generator.web.routes.job_runner import _create_recently_added_job
+
+        with patch("media_preview_generator.web.routes.job_runner._start_job_async"):
+            first = _create_recently_added_job(
+                schedule_id="sched-1", server_id=None, library_ids=None, lookback_hours=1.0, library_name="x",
+                follow_up_kinds=["loudness"], make_previews=False,
+            )  # fmt: skip
+            same = _create_recently_added_job(
+                schedule_id="sched-1", server_id=None, library_ids=None, lookback_hours=1.0, library_name="x",
+                follow_up_kinds=["loudness"], make_previews=False,
+            )  # fmt: skip
+            other = _create_recently_added_job(
+                schedule_id="sched-1", server_id=None, library_ids=None, lookback_hours=1.0, library_name="x",
+            )  # fmt: skip
+
+        assert same == first and other != first
+
     def test_acquires_gate_before_running_scan_and_releases_when_the_run_ends(self, app):
         call_log: list[str] = []
         acquired_at: list[int] = []

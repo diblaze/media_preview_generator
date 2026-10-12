@@ -450,6 +450,21 @@ function _renderScheduleSummary() {
         '<i class="bi bi-play-fill me-1" aria-hidden="true"></i>Run now</button>';
 }
 
+const _SCHEDULE_KIND_CHIPS = {
+    previews: { icon: 'bi-film', name: 'Previews' },
+    intro_credits: { icon: 'bi-skip-forward', name: 'Intro &amp; Credits' },
+    loudness: { icon: 'bi-soundwave', name: 'Plex loudness' },
+};
+
+// 0.25 -> "last 15 minutes", 1 -> "last 1 hour", 72 -> "last 3 days".
+function _lookbackLabel(hours) {
+    const minutes = Math.round(hours * 60);
+    if (minutes < 60) return `last ${minutes} minutes`;
+    if (hours < 24 || hours % 24 !== 0) return `last ${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+    const days = hours / 24;
+    return `last ${days} ${days === 1 ? 'day' : 'days'}`;
+}
+
 function updateScheduleList() {
     // Always update the teaser card if it exists (Dashboard).
     updateScheduleTeaser();
@@ -486,33 +501,24 @@ function updateScheduleList() {
             ? '<span class="next"><i class="bi bi-clock" aria-hidden="true"></i>' + formatDate(schedule.next_run) + '</span>'
             : '<span class="next off">' + (schedule.next_run ? formatDate(schedule.next_run) : '-') + '</span>';
 
-        // Recently-added schedules get a subtle primary badge next to
-        // the name so users can tell them apart from full-library scans.
+        // One coloured chip per job type, then which files the schedule covers.
         const cfg = schedule.config || {};
         const isRecentlyAdded = cfg.job_type === 'recently_added';
-        const isMarkers = cfg.job_type === 'intro_credits';
+        const kinds = Array.isArray(cfg.job_kinds) && cfg.job_kinds.length ? cfg.job_kinds : ['previews'];
 
-        // A null priority means "no pin". Rendering it as Normal would lie
-        // about a Recently Added sweep, which inherits the global Incoming
-        // job priority (High by default) at run time.
+        // A null priority means "no pin": previews follow Settings (a Recently Added sweep uses the Incoming job
+        // priority, High by default) and Intro & Credits / loudness run Low. Rendering it as Normal would lie.
         const rawPri = schedule.priority;
         const priIsDefault = rawPri === null || rawPri === undefined;
         const schedPriLabel = priIsDefault ? 'Default' : (PRIORITY_LABELS[rawPri] || 'Normal');
         const schedPriBadge = priIsDefault ? 'bg-secondary' : (PRIORITY_BADGE_CLASS[rawPri] || 'bg-primary');
-        let schedPriTitle = '';
-        if (priIsDefault) {
-            if (isMarkers) schedPriTitle = 'Intro & Credits checks run at Low unless pinned';
-            else if (isRecentlyAdded) schedPriTitle = 'Follows Settings → Processing Options → Incoming job priority';
-            else schedPriTitle = 'Full-library scans run at Normal unless pinned';
-        }
-        let typeBadge = '';
-        if (isRecentlyAdded) {
-            typeBadge = ' <span class="badge bg-primary bg-opacity-25 text-primary" title="Scans items added in the last ' + (cfg.lookback_hours || 1) + 'h"><i class="bi bi-arrow-repeat me-1"></i>Recently Added</span>';
-        } else if (isMarkers && cfg.reconcile) {
-            typeBadge = ' <span class="badge text-bg-dark schedule-kind-badge" title="Checks that servers still show the markers this app sent">Intro &amp; Credits · Check servers</span>';
-        } else if (isMarkers) {
-            typeBadge = ' <span class="badge text-bg-dark schedule-kind-badge" title="Checks the libraries for intro and credits markers">Intro &amp; Credits</span>';
-        }
+        const schedPriTitle = priIsDefault ? 'Previews use the priority from Settings. Intro & Credits and loudness run Low.' : '';
+        const kindChips = kinds.map(kind => {
+            const chip = _SCHEDULE_KIND_CHIPS[kind];
+            return chip ? ' <span class="ov-task schedule-kind-badge" data-kind="' + kind + '"><i class="bi ' + chip.icon + '" aria-hidden="true"></i>' + chip.name + '</span>' : '';
+        }).join('');
+        const filesText = isRecentlyAdded ? 'Recently added, ' + _lookbackLabel(cfg.lookback_hours || 1) : 'Whole library';
+        const typeBadge = kindChips + ' <span class="small text-muted schedule-files-label">' + escapeHtml(filesText) + '</span>';
 
         // D20 — show the optional stop-time inline next to the cron
         // summary so users can see at a glance which schedules pause
@@ -530,7 +536,7 @@ function updateScheduleList() {
             ? ' <i class="bi bi-exclamation-triangle text-warning" title="' + escapeHtml(overlapTip) + '" data-bs-toggle="tooltip"></i>'
             : '';
 
-        const kindIcon = isMarkers ? 'bi-skip-forward-circle' : (isRecentlyAdded ? 'bi-arrow-repeat' : 'bi-collection');
+        const kindIcon = isRecentlyAdded ? 'bi-arrow-repeat' : 'bi-collection';
         const toggleLabel = schedule.enabled ? 'Disable' : 'Enable';
         const sid = escapeHtml(schedule.id);
 

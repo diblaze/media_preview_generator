@@ -18,6 +18,11 @@ FILTER_CONFIG_KEYS = frozenset(
 )
 
 
+def pick_filter_config(config: dict | None) -> dict:
+    """The scan-filter keys of ``config`` and nothing else."""
+    return {key: value for key, value in (config or {}).items() if key in FILTER_CONFIG_KEYS}
+
+
 def _positive_integer(value: Any, name: str, *, maximum: int | None = None) -> int:
     if type(value) is not int or value < 1 or (maximum is not None and value > maximum):
         limit = f" between 1 and {maximum}" if maximum else " greater than zero"
@@ -40,7 +45,7 @@ def normalize_scan_filter_config(config: Any, *, full_scan: bool = True) -> dict
 
     Args:
         config: Job or schedule configuration; unrelated keys are preserved.
-        full_scan: False for Recently Added or Intro & Credits schedules.
+        full_scan: False for Recently Added schedules (their filters are cleared).
 
     Returns:
         A copy with canonical filter values, or unchanged keys when no filters

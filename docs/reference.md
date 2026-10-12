@@ -218,8 +218,8 @@ uses `newest`.
 
 ### Per-job media filters
 
-**Start new job → Filter media** and scheduled **Full library scans** can limit
-the media selected for a run. All filters are optional and default to unrestricted.
+**Start new job → Filter media** and scheduled **Whole library** runs can limit
+the media selected for a run, for Previews, Intro & Credits and Plex loudness alike. All filters are optional and default to unrestricted.
 They are stored in the job or schedule's `config`, not in global settings.
 
 - **Shared — Added to library:** `added_filter` is `all` (default), `last_days`, or
@@ -249,10 +249,10 @@ latest seasons, even though excluded files are not queued for generation.
 Changing library selection in the UI clears filters for media types no longer
 selected. **Clear** restores unrestricted selection.
 
-These options apply only to full-library jobs. **Process a file or folder** file/folder
-jobs, webhooks, **Recently Added** scanner schedules, and **Intro & Credits**
-jobs and schedules retain their existing selection behavior. Relative windows on scheduled full scans are recalculated
-for each execution; a saved date range stays fixed.
+These options apply only to whole-library jobs. **Process a file or folder** file/folder
+jobs, webhooks and **Recently Added** schedules keep their own selection rules. `POST /api/markers/jobs` and
+`POST /api/loudness/jobs` take the same keys in an optional `scan_filters` object. Relative windows on scheduled
+runs are recalculated for each execution; a saved date range stays fixed. `sort_by` applies to Previews only.
 
 ### Frame Reuse Cache (frame_reuse)
 
@@ -382,7 +382,7 @@ The Plex direct webhook (`/api/webhooks/plex`, needs Plex Pass on the server-own
 
 Webhook processing respects each server's enabled libraries. Paths outside them are ignored.
 
-The **Recently Added scanner** is a schedule type, not a settings key (see [Schedules Endpoints](#schedules-endpoints)). Create one on the Automation page (Schedules tab) with **Scan mode → Recently added only**.
+The **Recently Added scanner** is a schedule type, not a settings key (see [Schedules Endpoints](#schedules-endpoints)). Create one on the Automation page (Schedules tab) with **Files → Recently added**.
 
 > [!IMPORTANT]
 > The Plex direct webhook and Recently Added schedules trigger only on **new** library items (new `ratingKey`s). They do **not** detect in-place file upgrades — Plex keeps the same item when Sonarr/Radarr replaces a file. Use the existing Sonarr/Radarr webhooks (which fire on `On Upgrade`) for that case.
@@ -561,8 +561,9 @@ follow-up (renamed "Intro & Credits · N files") while it stays within 500 files
 episode doesn't wait for its own preview job: markers don't need previews.
 
 **Check servers** (`reconcile: true`, `source: "reconcile"`, named "Intro & Credits · Check servers") is created by
-`POST /api/markers/reconcile` or a schedule with `config.reconcile` (see
-[Schedules](#post-apischedules)); nothing schedules it by default. LOW priority unless the request or schedule sets one.
+`POST /api/markers/reconcile`, and by an internal job that runs it every day at 04:30 while Intro & Credits is on
+anywhere (during quiet hours or Pause All the queued job waits for processing to resume). It is not a user schedule. LOW priority unless the request sets one.
+While it runs, its config also carries `check_servers_listing` (the files it listed), so a run revived after a restart checks those same files; the key is dropped when the job ends.
 Only one is queued or running at a time: asking again (a **Re-run** of a finished one included) returns that job. It
 reads back every item this app published (`item_publish_state` with status `written`) on each enabled server with
 Intro & Credits on, 500 items per call (Plex one item per connection under the lock proof; Jellyfin and Emby one
@@ -664,10 +665,11 @@ need the page's CSRF token, like every other state-changing route (see [Authenti
 
 **Request:** `{"libraries": [{"server_id", "library_id"}]}` or `{"file_paths": [...]}` — omit both for every library
 Intro & Credits goes to. Optional: `priority` (`1`-`3` or `high`/`normal`/`low`, default `low`), `force` (re-detect
-files already done), `library_name` (job title).
+files already done), `library_name` (job title), `scan_filters` (the [media filters](#per-job-media-filters), for
+libraries only).
 
 **Response:** `201` with the created job; `400` for an invalid body (both `libraries` and `file_paths` given, a bad
-`priority`, …); `503` when the config directory isn't writable.
+`priority`, invalid `scan_filters`, …); `503` when the config directory isn't writable.
 
 #### GET /api/markers/servers/{server_id}/status
 
@@ -931,7 +933,7 @@ loudness worker is free. File outcomes:
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/loudness/jobs` | Start a job. Body: `libraries` or `file_paths` (inside `MEDIA_ROOT`), `priority` (1-3 or high/normal/low, default low), `library_name`. `201` with the job. |
+| `POST` | `/api/loudness/jobs` | Start a job. Body: `libraries` or `file_paths` (inside `MEDIA_ROOT`), `priority` (1-3 or high/normal/low, default low), `library_name`, `scan_filters` (the [media filters](#per-job-media-filters)). `201` with the job. |
 
 ## Path Mappings
 
@@ -1584,14 +1586,17 @@ setting (High out of the box), and a `full_library` schedule runs at Normal.
 On `PUT`, an absent `priority` key leaves an existing pin untouched; an
 explicit `null` clears it.
 
-`config.job_type` accepts:
+`config.job_kinds` is a non-empty list of `"previews"`, `"intro_credits"` and `"loudness"` (returned in that order); a tick runs every kind listed. An unknown kind or an empty list returns `400`. A config without it is read as before: `job_type: "intro_credits"` becomes `["intro_credits"]` over the whole library, `"recently_added"` becomes all three kinds, anything else `["previews"]`. A legacy Check servers schedule (`job_type: "intro_credits"` with `reconcile`) is deleted at startup with a WARNING, because Check servers is automatic now.
 
-- `"full_library"` *(default — optional, omit to get the same behaviour)* — schedule runs a full library scan via the standard job pipeline, processing matching items in `library_id` that are missing previews. Its `config` accepts the same [media filters](#per-job-media-filters) as `POST /api/jobs`.
-- `"recently_added"` — schedule runs a Recently Added scan instead. Requires `config.lookback_hours` (float, clamped to 0.25–720). Scans only items added within the lookback window (Plex `addedAt`, Emby/Jellyfin `DateCreated`), counted back from when the job was created (a job that waited for a slot, or was revived after a restart, still covers that window; a tick while the schedule's last scan hasn't started queues nothing, widening that scan's window when this tick looks further back), as one preview job with a Files-panel row per file, the usual retry for files a server hasn't indexed yet, and revival after a restart. Its files also get an Intro & Credits follow-up (`source: "recently_added"`) when a server with Intro & Credits on holds them. When `library_id` is `null`, the scan falls back to the globally selected libraries in Settings (or every supported library when no global filter is set); when set, only that section is scanned. Works for Plex, Emby, and Jellyfin — each vendor's processor implements `scan_recently_added` against its native API.
-- `"intro_credits"` — schedule creates an [Intro & Credits](#intro--credits) job (`kind=intro_credits`) instead of a preview job, for the schedule's libraries (every library Intro & Credits goes to when none are chosen). LOW priority unless the schedule sets one. A schedule with a `server_id` publishes to that server only (the job's `server_id`), as a scheduled preview job does. Skipped while an earlier Find markers job from the same schedule is still pending or running. With `config.reconcile: true` it queues Intro & Credits · Check servers instead (every server; libraries and server don't apply; the UI shows it as "All servers"), skipped while any Check servers job is still pending or running. A start tick (or `POST /api/schedules/{id}/run`) first resumes every Intro & Credits job of the schedule that its stop time paused, whichever of the two it is (the schedule may have been switched since), and then queues nothing that tick; the check above applies only when it resumed nothing. Manual and schedule holds are independent in `config.pause_reasons`: a start tick removes only the schedule hold, and a manual resume removes only the manual hold. A stop tick adds its schedule hold even when the job is already manually paused. The compatibility `paused_by_schedule` flag reflects the schedule hold. Deleting a schedule leaves its paused jobs paused and logs a WARNING naming each; so does a `PUT` that switches `config.job_type` to a kind its start ticks don't resume (`intro_credits` ↔ `full_library`, or either to `recently_added`), for each job its stop time paused. While a Check servers job runs, its config also carries `check_servers_listing` (the files it listed), so a run revived after a restart checks those same files; the key is dropped when the job ends.
+`config.job_type` says which files the kinds run on:
 
-Full-scan media filters are cleared when saving a Recently Added or Intro & Credits schedule. Filter
-validation also runs before creating or updating a full-library schedule; invalid
+- `"full_library"` *(default — optional, omit to get the same behaviour)* — the whole library. Each ticked kind is queued as its own job on the same tick, in the schedule's libraries (`library_ids`); a kind that fails to start doesn't stop the others. Previews processes the items missing previews. The config accepts the same [media filters](#per-job-media-filters) as `POST /api/jobs`, which apply to every kind. `priority` applies to every kind; unpinned, Previews follows its usual default and Intro & Credits and loudness run at Low. `server_id` is set when every chosen library is on one server, and `""` on a `PUT` clears the pin. `config.libraries` (optional) is a list of `{"server_id", "library_id"}` objects, the exact libraries picked (Start new job sends the same pairs); an invalid list returns `400`, and an absent one means the flat `library_ids` plus `server_id` apply. Picks on several servers create one Previews job per server, and one Intro & Credits or loudness job over all the pairs. A kind is skipped while an earlier job of the same kind from the schedule is still pending or running.
+- `"recently_added"` — schedule runs one Recently Added scan instead; the ticked kinds are what happens to the files it finds. Previews are generated only when `"previews"` is ticked; the other ticked kinds are queued as follow-ups for those files, and with Previews unticked the scan only lists the files and queues the follow-ups. Nothing found, nothing queued. Requires `config.lookback_hours` (float, clamped to 0.25–720). Scans only items added within the lookback window (Plex `addedAt`, Emby/Jellyfin `DateCreated`), counted back from when the job was created (a job that waited for a slot, or was revived after a restart, still covers that window; a tick while the schedule's last scan hasn't started queues nothing, widening that scan's window when this tick looks further back), as one preview job with a Files-panel row per file, the usual retry for files a server hasn't indexed yet, and revival after a restart. When `library_id` is `null`, the scan falls back to the globally selected libraries in Settings (or every supported library when no global filter is set); when set, only that section is scanned. Works for Plex, Emby, and Jellyfin — each vendor's processor implements `scan_recently_added` against its native API.
+
+A start tick (or `POST /api/schedules/{id}/run`) first resumes every job of the schedule that its stop time paused and that its kinds still cover (a Recently Added schedule always covers its scan job), and then queues nothing that tick. Manual and schedule holds are independent in `config.pause_reasons`: a start tick removes only the schedule hold, and a manual resume removes only the manual hold. A stop tick adds its schedule hold even when the job is already manually paused. The compatibility `paused_by_schedule` flag reflects the schedule hold. Deleting a schedule leaves its paused jobs paused and logs a WARNING naming each; so does a `PUT` that changes the kinds or `job_type` so that its start ticks no longer resume a job its stop time paused.
+
+Media filters are cleared when saving a Recently Added schedule. Filter
+validation also runs before creating or updating a whole-library schedule; invalid
 values return HTTP 400 without changing the saved schedule.
 
 Scheduled ticks during global pause are skipped rather than saved for a catch-up run. Repeated starts for an

@@ -186,11 +186,26 @@ def test_job_route_starts_a_library_job(client, created):
             "source": "manual",
             "libraries": [{"server_id": "plex-1", "library_id": "4"}],
             "file_paths": [],
+            "scan_filters": {},
         }
     ]
 
 
 def test_job_route_refuses_libraries_and_files_together(client, created):
     body = {"libraries": [{"server_id": "p", "library_id": "1"}], "file_paths": ["/x"]}
+    resp = client.post("/api/loudness/jobs", json=body, headers=api_headers())
+    assert resp.status_code == 400 and created == []
+
+
+def test_job_route_passes_validated_scan_filters(client, created):
+    filters = {"added_filter": "last_days", "added_last_days": 3, "movie_year_to": 2010}
+    body = {"libraries": [{"server_id": "plex-1", "library_id": "4"}], "scan_filters": filters}
+    resp = client.post("/api/loudness/jobs", json=body, headers=api_headers())
+    assert resp.status_code == 201, resp.get_json()
+    assert created[0]["scan_filters"]["added_last_days"] == 3 and created[0]["scan_filters"]["movie_year_to"] == 2010
+
+
+def test_job_route_rejects_bad_scan_filters(client, created):
+    body = {"scan_filters": {"added_filter": "last_days", "added_last_days": 0}}
     resp = client.post("/api/loudness/jobs", json=body, headers=api_headers())
     assert resp.status_code == 400 and created == []

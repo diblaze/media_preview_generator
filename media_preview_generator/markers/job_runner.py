@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
+from types import SimpleNamespace
 from typing import TypedDict
 
 from loguru import logger
@@ -24,6 +25,7 @@ from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, 
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
 from ..processing.retry_queue import retry_policy, scaled_backoff_delay
 from ..processing.types import ProcessableItem
+from ..scan_filters import ScanFilters, pick_filter_config
 from ..servers.base import ServerConfig
 from ..utils import redact_secrets, redacted_traceback
 from ..web.job_gate import format_wait_message, get_job_gate, release_slot
@@ -681,11 +683,13 @@ def build_items(
         warnings.extend(
             f"Skipped server {sid}: {sid} is no longer configured" for sid in requested if sid not in known_ids
         )
+        filters = ScanFilters.from_config(SimpleNamespace(**pick_filter_config(job_config)))
         pairs, errors = orchestrator._enumerate_items_for_servers(
             candidates,
             enumerate_one=lambda processor, cfg: processor.list_canonical_paths(
                 cfg,
                 library_ids=library_ids[cfg.id],
+                filters=filters,
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
             ),
