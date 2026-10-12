@@ -151,7 +151,7 @@ html {
 .automation-page .next-hero-when { display: flex; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .automation-page .next-hero-when b { color: var(--bs-body-color); }
 
-.automation-page .sched-table { --sched-cols: minmax(0, 2.2fr) minmax(0, 1.3fr) minmax(0, 1.5fr) 90px minmax(120px, 1fr) 100px 140px; display: block; width: 100%; background: transparent; }
+.automation-page .sched-table { --sched-cols: minmax(0, 3fr) minmax(0, 1.2fr) minmax(0, 1.2fr) 80px minmax(110px, 1fr) 96px 132px; display: block; width: 100%; background: transparent; }
 .automation-page .sched-table thead,
 .automation-page .sched-table tbody { display: grid; gap: 8px; }
 .automation-page .sched-table thead { margin-bottom: 8px; }
@@ -165,6 +165,11 @@ html {
 .automation-page .sched-title { font-weight: 600; font-size: 14px; }
 .automation-page .sched-table .next { display: inline-flex; align-items: center; gap: 6px; color: var(--accent-text); font-size: 12px; font-weight: 600; }
 .automation-page .sched-table .next.off { color: var(--faint); }
+.automation-page .sched-kinds { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+.automation-page .sched-kinds .ov-task { height: 20px; padding: 0 6px; border-radius: 6px; font-size: 11px; }
+.automation-page .sched-kinds .ov-task i { display: none; }
+.automation-page .sched-main { color: var(--bs-body-color); }
+.automation-page .sched-sub { display: block; margin-top: 2px; color: var(--faint); font-size: 12px; }
 .automation-page .racts { display: flex; gap: 2px; justify-content: flex-end; }
 
 @media (max-width: 991.98px) {

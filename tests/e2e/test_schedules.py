@@ -660,3 +660,52 @@ class TestScheduleListAndEditRoundTrip:
         expect(authed_page.locator("#scheduleKindLoudness")).not_to_be_checked()
         expect(authed_page.locator("#scheduleFilesAll")).to_be_checked()
         expect(authed_page.locator("#scheduleLookbackGroup")).to_be_hidden()
+
+
+@pytest.mark.e2e
+class TestScheduleListRowLayout:
+    """Each row keeps the job chips under the name, which files under the library, and the schedule in words."""
+
+    def test_row_puts_files_under_library_and_reads_schedule_and_next_run_in_words(
+        self, authed_page: Page, app_url: str, tmp_path
+    ) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        nightly = {
+            **_INTRO_SCHEDULE,
+            "id": "sch-tv",
+            "name": "TV Daily",
+            "trigger_value": "0 2 * * 0,1,2,3,4,5,6",
+            "library_name": "TV Shows",
+            "stop_time": "07:00",
+            "config": {"job_kinds": _ALL_KINDS, "job_type": "full_library"},
+            "next_run": "2099-01-01T02:00:00",
+        }
+        recent = {
+            **_INTRO_SCHEDULE,
+            "id": "sch-new",
+            "name": "New arrivals",
+            "trigger_type": "interval",
+            "trigger_value": "15",
+            "config": {"job_kinds": ["previews", "intro_credits"], "job_type": "recently_added", "lookback_hours": 1},
+        }
+        _capture_schedule_writes(authed_page, [nightly, recent])
+        authed_page.set_viewport_size({"width": 1400, "height": 900})
+        authed_page.goto(f"{app_url}/automation#schedules")
+        authed_page.wait_for_load_state("domcontentloaded")
+
+        row = authed_page.locator("#scheduleList tr", has_text="TV Daily")
+        cells = row.locator("td")
+        expect(cells.nth(0).locator(".sched-kinds .schedule-kind-badge")).to_have_count(3, timeout=3000)
+        expect(cells.nth(0).locator(".schedule-files-label")).to_have_count(0)
+        expect(cells.nth(1).locator(".schedule-files-label")).to_have_text("Whole library")
+        expect(cells.nth(2).locator(".sched-main")).to_have_text("Daily at 02:00")
+        expect(cells.nth(2).locator(".sched-sub")).to_have_text("Stops at 07:00")
+        expect(cells.nth(4).locator(".next")).to_contain_text("Jan")
+        expect(cells.nth(4)).not_to_contain_text("2099-01-01")
+
+        recent_row = authed_page.locator("#scheduleList tr", has_text="New arrivals")
+        expect(recent_row.locator("td").nth(1).locator(".schedule-files-label")).to_have_text(
+            "Recently added, last 1 hour"
+        )
+        expect(recent_row.locator("td").nth(2).locator(".sched-main")).to_have_text("Every 15 minutes")
+        authed_page.locator("#scheduleList").screenshot(path=str(tmp_path / "schedule_rows.png"))

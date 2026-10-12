@@ -173,6 +173,25 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('quickRunNextSchedule')?.addEventListener('click', runNextScheduleNow);
 });
 
+// "02:00 Daily" (describeSchedule's compact form, also used by the teaser) reads as "Daily at 02:00" in the list.
+function _scheduleInWords(described) {
+    const match = /^(\d{2}:\d{2}) (.+)$/.exec(described || '');
+    return match ? `${match[2]} at ${match[1]}` : described;
+}
+
+// "Today 02:00", "Tomorrow 02:00", "Wed 02:00", else a short date — the list's next-run cell.
+function _scheduleNextRunLabel(dt) {
+    const time = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    const now = new Date();
+    const nowMid = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const dtMid = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
+    const dayDiff = Math.round((dtMid - nowMid) / 86400000);
+    if (dayDiff === 0) return `Today ${time}`;
+    if (dayDiff === 1) return `Tomorrow ${time}`;
+    if (dayDiff > 1 && dayDiff < 7) return `${dt.toLocaleDateString(undefined, { weekday: 'short' })} ${time}`;
+    return `${dt.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${time}`;
+}
+
 // Natural-language "time until" for the schedule teaser.  Kept separate from
 // the generic formatDate helper so we can tune the copy for the dashboard
 // without affecting other screens.
@@ -497,9 +516,12 @@ function updateScheduleList() {
 
         const cronDisplay = describeSchedule(schedule.trigger_type, schedule.trigger_value);
 
-        const nextRun = schedule.enabled && schedule.next_run
-            ? '<span class="next"><i class="bi bi-clock" aria-hidden="true"></i>' + formatDate(schedule.next_run) + '</span>'
-            : '<span class="next off">' + (schedule.next_run ? formatDate(schedule.next_run) : '-') + '</span>';
+        const nextDate = schedule.next_run ? new Date(schedule.next_run) : null;
+        const nextValid = nextDate && !Number.isNaN(nextDate.getTime());
+        const nextRun = schedule.enabled && nextValid
+            ? '<span class="next"><i class="bi bi-clock" aria-hidden="true"></i>' + escapeHtml(_scheduleNextRunLabel(nextDate)) + '</span>'
+                + '<span class="sched-sub">' + escapeHtml(_formatRelativeToNow(nextDate)) + '</span>'
+            : '<span class="next off">' + (nextValid ? escapeHtml(_scheduleNextRunLabel(nextDate)) : '-') + '</span>';
 
         // One coloured chip per job type, then which files the schedule covers.
         const cfg = schedule.config || {};
@@ -515,16 +537,15 @@ function updateScheduleList() {
         const schedPriTitle = priIsDefault ? 'Previews use the priority from Settings. Intro & Credits and loudness run Low.' : '';
         const kindChips = kinds.map(kind => {
             const chip = _SCHEDULE_KIND_CHIPS[kind];
-            return chip ? ' <span class="ov-task schedule-kind-badge" data-kind="' + kind + '"><i class="bi ' + chip.icon + '" aria-hidden="true"></i>' + chip.name + '</span>' : '';
+            return chip ? '<span class="ov-task schedule-kind-badge" data-kind="' + kind + '"><i class="bi ' + chip.icon + '" aria-hidden="true"></i>' + chip.name + '</span>' : '';
         }).join('');
         const filesText = isRecentlyAdded ? 'Recently added, ' + _lookbackLabel(cfg.lookback_hours || 1) : 'Whole library';
-        const typeBadge = kindChips + ' <span class="small text-muted schedule-files-label">' + escapeHtml(filesText) + '</span>';
+        const typeBadge = '<div class="sched-kinds">' + kindChips + '</div>';
+        const filesLabel = '<span class="sched-sub schedule-files-label">' + escapeHtml(filesText) + '</span>';
 
-        // D20 — show the optional stop-time inline next to the cron
-        // summary so users can see at a glance which schedules pause
-        // at a specific time of day.
+        // D20 — the optional stop time sits under the schedule so users can see at a glance which schedules pause.
         const stopBadge = schedule.stop_time
-            ? ' <span class="badge bg-info text-dark" title="Pauses any running job from this schedule daily; resumes on next start">stops at ' + escapeHtml(schedule.stop_time) + '</span>'
+            ? '<span class="sched-sub" title="Pauses any running job from this schedule daily; resumes on next start">Stops at ' + escapeHtml(schedule.stop_time) + '</span>'
             : '';
 
         // D21 — overlap warning. The processing_paused gate in
@@ -536,15 +557,14 @@ function updateScheduleList() {
             ? ' <i class="bi bi-exclamation-triangle text-warning" title="' + escapeHtml(overlapTip) + '" data-bs-toggle="tooltip"></i>'
             : '';
 
-        const kindIcon = isRecentlyAdded ? 'bi-arrow-repeat' : 'bi-collection';
         const toggleLabel = schedule.enabled ? 'Disable' : 'Enable';
         const sid = escapeHtml(schedule.id);
 
         html += `
             <tr>
-                <td class="sched-name"><span class="tile" aria-hidden="true"><i class="bi ${kindIcon}"></i></span><div class="sched-name-text"><span class="sched-title">${escapeHtml(schedule.name)}</span>${typeBadge}${overlapBadge}</div></td>
-                <td>${escapeHtml(schedule.library_name) || 'All Libraries'}${_serverBadge(schedule)}</td>
-                <td><code>${escapeHtml(cronDisplay)}</code>${stopBadge}</td>
+                <td class="sched-name"><div class="sched-name-text"><span class="sched-title">${escapeHtml(schedule.name)}</span>${overlapBadge}${typeBadge}</div></td>
+                <td><span class="sched-main">${escapeHtml(schedule.library_name) || 'All Libraries'}</span>${_serverBadge(schedule)}${filesLabel}</td>
+                <td><span class="sched-main">${escapeHtml(_scheduleInWords(cronDisplay))}</span>${stopBadge}</td>
                 <td><span class="badge ${schedPriBadge} priority-badge" title="${escapeHtml(schedPriTitle)}">${schedPriLabel}</span></td>
                 <td>${nextRun}</td>
                 <td>${statusBadge}</td>
