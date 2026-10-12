@@ -202,7 +202,8 @@ class TestLibraryHealthPage:
         tv = authed_page.locator(".lh-table tbody tr", has_text="TV Shows")
         expect(tv.get_by_role("button", name="2 to do")).to_be_visible()
         expect(tv).not_to_contain_text("not checked")
-        expect(authed_page.locator("#lhLegend")).to_contain_text("Striped: checked, nothing found")
+        expect(tv.locator("td[data-label='Intro']")).to_contain_text("2 have an intro · 1 looked, no intro")
+        expect(authed_page.locator("#lhLegend")).to_contain_text("Striped: nothing to do")
         expect(authed_page.locator("#lhLegend")).not_to_contain_text("Has it")
 
     def test_fix_link_from_the_dashboard_opens_the_dialog(self, authed_page: Page, app_url: str, seeded_health) -> None:
@@ -332,7 +333,7 @@ class TestLibraryHealthPage:
         expect(headers.nth(1)).to_contain_text("Previews")
         expect(headers.nth(2)).to_contain_text("Chapters")
         cell = authed_page.locator("td[data-label='Chapters']")
-        expect(cell).to_contain_text("60 done · 30 have no chapters · 10 can't get thumbnails")
+        expect(cell).to_contain_text("60 done · 30 have no chapters in the file · 10 can't get thumbnails")
         cell.get_by_role("button", name="1,500 to do").click()
         modal = authed_page.locator("#lhFilesModal")
         expect(modal.locator("#lhFilesTitle")).to_have_text("Movies · Chapters")

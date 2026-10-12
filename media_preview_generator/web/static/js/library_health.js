@@ -16,13 +16,14 @@
     const JOB_LABEL = { previews: 'preview', chapters: 'chapter thumbnail', loudness: 'loudness', intro: 'intro & credits', credits: 'intro & credits' };
     const HEADER_TIP = {
         previews: 'A preview counts as made when its file is in the server\'s preview folder for that video.',
-        chapters: 'Counts chapter thumbnails Plex shows, made by this app or by Plex itself. Striped: files with no chapters, or that can\'t get thumbnails (for example a version split across several files).',
-        loudness: 'Counts loudness measured by this app or by Plex itself. Files where Plex\'s own loudness data is incomplete need Plex\'s own analysis; a loudness job here leaves them alone, so they stay on the to-do list.',
-        intro: 'Counts intros from the server\'s own detection and from this app. Some shows have no intro, so "to do" means nobody has looked yet, not that it is missing.',
-        credits: 'Counts credits from the server\'s own detection and from this app. "To do" means nobody has looked yet.',
+        chapters: 'Counts chapter thumbnails Plex shows, made by this app or by Plex itself. Striped: files with no chapters in the video, so there is nothing to make, and files that can\'t get thumbnails (for example a chapter that starts after the video ends).',
+        loudness: 'Counts loudness measured by this app or by Plex itself. Files with no audio aren\'t counted. Files where Plex\'s own loudness data is incomplete need Plex\'s own analysis; a loudness job here leaves them alone, so they stay on the to-do list.',
+        intro: 'Counts intros from the server\'s own detection and from this app. Some shows have no intro, so "to do" means nobody has looked yet, not that it is missing. Striped: looked, and there is no intro.',
+        credits: 'Counts credits from the server\'s own detection and from this app. "To do" means nobody has looked yet. Striped: looked, and there are no credits.',
     };
     const DONE_TEXT = { previews: 'All made', chapters: 'All made', loudness: 'All measured', intro: 'All checked', credits: 'All checked' };
     const HAVE_TEXT = { intro: 'have an intro', credits: 'have credits' };
+    const NONE_TEXT = { intro: 'looked, no intro', credits: 'looked, no credits' };
 
     const state = {
         data: null,
@@ -177,7 +178,7 @@
 
     function renderLegend() {
         setHtml('lhLegend', servers().length
-            ? '<div class="lh-legend"><span>Numbers in bold are files still to do; click one to list them.</span><span><i class="lh-sw lh-sw-none" aria-hidden="true"></i>Striped: checked, nothing found</span></div>'
+            ? '<div class="lh-legend"><span>Numbers in bold are files still to do; click one to list them.</span><span><i class="lh-sw lh-sw-none" aria-hidden="true"></i>Striped: nothing to do (looked and none found, no chapters in the file, or can\'t be made)</span></div>'
             : '');
     }
 
@@ -215,10 +216,10 @@
         let note = '';
         if (feature === 'chapters') {
             note = `${n(cell.done)} done`
-                + (cell.nothing_found ? ` · ${n(cell.nothing_found)} have no chapters` : '')
+                + (cell.nothing_found ? ` · ${n(cell.nothing_found)} have no chapters in the file` : '')
                 + (cell.cant_do ? ` · ${n(cell.cant_do)} can't get thumbnails` : '');
         } else if (HAVE_TEXT[feature]) {
-            note = `${n(cell.done)} ${HAVE_TEXT[feature]}` + (cell.nothing_found ? ` · ${n(cell.nothing_found)} nothing found` : '');
+            note = `${n(cell.done)} ${HAVE_TEXT[feature]}` + (cell.nothing_found ? ` · ${n(cell.nothing_found)} ${NONE_TEXT[feature]}` : '');
         } else if (cell.todo > 0) {
             const pct = Math.min(99, Math.round(donePct));
             note = `${n(cell.done)} of ${n(total)} done · ${pct}%`;
