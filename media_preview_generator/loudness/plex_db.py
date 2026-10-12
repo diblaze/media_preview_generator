@@ -357,8 +357,10 @@ def mark_item(
     expected: tuple | None = None,
     source: SourceFingerprint | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    skipped: frozenset[tuple[str, int, str]] = frozenset(),
 ) -> bool:
-    """Mark an item analysed (``ln:loudnessAnalysisVersion`` in its extra_data) once all its audio streams are.
+    """Mark an item analysed (``ln:loudnessAnalysisVersion`` in its extra_data) once all its audio streams are
+    measured or known undecodable (``skipped``: ``(part hash, stream index, codec)``).
 
     All its live parts count, so an item with several versions is marked when the last one is done. Only
     ``extra_data`` is set: Plex's triggers on the table fire on title changes only (``check_schema``).
@@ -388,15 +390,17 @@ def mark_item(
                 # The streams read_streams would give: Plex's optimized copies are left out, as the app never analyses them.
                 pending = [
                     extra
-                    for extra, file, proxy_type in conn.execute(
-                        "SELECT ms.extra_data, mp.file, mi.proxy_type FROM media_streams ms "
+                    for extra, file, proxy_type, part_hash, index, codec in conn.execute(
+                        'SELECT ms.extra_data, mp.file, mi.proxy_type, mp.hash, ms."index", ms.codec FROM media_streams ms '
                         "JOIN media_parts mp ON mp.id = ms.media_part_id "
                         "JOIN media_items mi ON mi.id = mp.media_item_id "
                         'WHERE mi.metadata_item_id = ? AND ms.stream_type_id = ? AND ms."index" IS NOT NULL '
                         "AND mp.deleted_at IS NULL AND mi.deleted_at IS NULL",
                         (metadata_item_id, AUDIO),
                     )
-                    if not _optimized_copy(file, proxy_type) and not has_analysis(extra)
+                    if not _optimized_copy(file, proxy_type)
+                    and not has_analysis(extra)
+                    and (part_hash, index, codec) not in skipped
                 ]
                 if _marked(before) or pending or not snapshot:
                     conn.execute("ROLLBACK")

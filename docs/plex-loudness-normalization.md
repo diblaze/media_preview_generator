@@ -109,6 +109,7 @@ different decoder builds, so measurements need not be identical for every codec 
 Tracks Plex (or an earlier job) already analysed are skipped: a file whose tracks and item are all done never reaches
 a worker, and one whose tracks are done but whose item isn't marked yet is only marked.
 The same file listed twice in Plex is analysed once and written to both.
+Tracks FFmpeg can't decode (for example AV3A "Audio Vivid") are skipped, remembered, and don't count as to do in Library Health.
 Existing partial or unrecognised loudness metadata is also preserved. Such a track reports a failure with advice to
 run Plex's native analysis, instead of overwriting data the app cannot verify.
 

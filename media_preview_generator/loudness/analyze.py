@@ -54,8 +54,16 @@ def resolve_ffmpeg(fallback: str) -> str:
     return fallback
 
 
+# ffmpeg's wording when it has no decoder for the audio stream it read (ffmpeg 7+, then older builds).
+_NO_DECODER_HINTS = ("no decoder found for", "not found for input stream")
+
+
 class LoudnessError(Exception):
     """ffmpeg failed, timed out, was cancelled, or printed no loudnorm report."""
+
+
+class LoudnessNoDecoder(LoudnessError):
+    """ffmpeg has no decoder for the audio stream; no FFmpeg build this app ships can measure it."""
 
 
 class LoudnessCancelled(LoudnessError):
@@ -296,6 +304,7 @@ def _run_command(
     Raises:
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded ``timeout_s``.
+        LoudnessNoDecoder: ffmpeg has no decoder for the stream.
         LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero.
     """
     name = os.path.basename(path)
@@ -354,7 +363,10 @@ def _run_command(
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
     text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        raise LoudnessError(f"ffmpeg exited {proc.returncode} analysing {name} {description}: {text.strip()[-200:]}")
+        message = f"ffmpeg exited {proc.returncode} analysing {name} {description}: {text.strip()[-200:]}"
+        if any(hint in text for hint in _NO_DECODER_HINTS):
+            raise LoudnessNoDecoder(message)
+        raise LoudnessError(message)
     return text
 
 
@@ -387,6 +399,7 @@ def run(
     Raises:
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded its time limit.
+        LoudnessNoDecoder: ffmpeg has no decoder for the stream.
         LoudnessError: ffmpeg failed or printed no usable report.
     """
     text = _run_command(
@@ -426,6 +439,7 @@ def run_many(
     Raises:
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded the sum of its tracks' time limits.
+        LoudnessNoDecoder: ffmpeg has no decoder for one of the streams.
         LoudnessError: The batch is invalid, ffmpeg failed, or its reports can't be attributed.
     """
     args = command_many(ffmpeg, path, tracks)

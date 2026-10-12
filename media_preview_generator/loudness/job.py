@@ -54,7 +54,7 @@ from ..web.jobs import JobStatus, get_job_manager
 from ..web.routes._helpers import _ensure_gpu_cache
 from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _inflight_lock
 from ..web.settings_manager import get_settings_manager
-from . import analyze, chain
+from . import analyze, chain, undecodable
 from .deleted_sources import confirmed_deleted_paths
 from .guard import GuardedLoudnessDb, create_loudness_db
 from .inputs import load_file_input
@@ -201,9 +201,11 @@ def _lookup(
             source.verify()
             if any(s.part_hash != current_hash or s.part_size != source.size for s in streams):
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
-        needed = [s for s in streams if needs_analysis(s)]
+        skipped = undecodable.skipped_keys(undecodable.ffmpeg_identity(ctx.ffmpeg))
+        needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
         if streams and not needed and all(s.item_marked for s in streams) and isinstance(db, GuardedLoudnessDb):
-            db.verify_streams(streams)
+            # verify_streams requires complete loudness on every stream it is given, which undecodable ones never have.
+            db.verify_streams([s for s in streams if not undecodable.is_skipped(s, skipped)])
             source.verify()
     except (DatabaseBusyError, SourceChangedError, OSError) as exc:
         return _row(cfg, WAITING, str(exc)), [], []
@@ -215,6 +217,26 @@ def _lookup(
     if not streams:
         return _row(cfg, UP_TO_DATE, "No audio track"), [], []
     return None, streams, needed
+
+
+def _skip_undecodable(
+    path: str, index: int, same: list[AudioStream], exc: analyze.LoudnessNoDecoder, ffmpeg: str
+) -> tuple[bool, str]:
+    """Remember a stream this ffmpeg can't decode so it isn't tried again.
+
+    Returns:
+        Whether every row of the stream was remembered, and the text for the outcome row.
+    """
+    codec = same[0].codec
+    identity = undecodable.ffmpeg_identity(ffmpeg)
+    remembered = all(undecodable.record(s.part_hash, s.index, s.codec, str(exc), identity) for s in same)
+    if not remembered:
+        return False, f"stream {index} ({codec}): ffmpeg can't decode it and that couldn't be remembered: {exc}"
+    write_line(f"{display_name(path)}: ffmpeg can't decode audio track {index} ({codec}); loudness skips it")
+    logger.bind(**{JOB_LOG_SKIP: True}).info(
+        "{}: ffmpeg can't decode audio track {} ({}); loudness skips it", os.path.basename(path), index, codec
+    )
+    return True, f"stream {index} ({codec}) skipped: FFmpeg can't decode it"
 
 
 def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
@@ -335,7 +357,7 @@ def process_item(
         todo: dict[int, list[AudioStream]] = {}
         for stream in needed:
             todo.setdefault(stream.index, []).append(stream)
-        written, errors = 0, []
+        written, errors, skipped = 0, [], []
         waiting = []
         db, _ = ctx.db(cfg)
         try:
@@ -448,6 +470,9 @@ def process_item(
                     waiting.append(f"stream {index} ({same[0].codec}): {exc}")
                     stop_analysis = True
                     break
+                except analyze.LoudnessNoDecoder as exc:
+                    remembered, text = _skip_undecodable(path, index, same, exc, ctx.ffmpeg)
+                    (skipped if remembered else errors).append(text)
                 except (analyze.LoudnessError, PublishError) as exc:
                     if isinstance(exc, PublishError) and exc.state is Capability.UNREACHABLE:
                         waiting.append(f"stream {index} ({same[0].codec}): {exc}")
@@ -458,7 +483,7 @@ def process_item(
                 break
         marked = 0
         if not errors and not waiting:
-            # Plex analyses an item again unless it's marked; marked once all its streams (all versions) are done.
+            # Plex analyses an item again unless it's marked; marked once all its streams (all versions) are measured or recorded undecodable.
             for item_id in sorted({s.metadata_item_id for s in streams if not s.item_marked}):
                 try:
                     with cancellable_waits(cancel_check):
@@ -469,6 +494,7 @@ def process_item(
                             expected=snapshots[item_id],
                             source=source,
                             cancel_check=cancel_check,
+                            skipped=undecodable.skipped_keys(undecodable.ffmpeg_identity(ctx.ffmpeg)),
                         )
                 except (DatabaseBusyError, SourceChangedError) as exc:
                     waiting.append(f"marking item {item_id}: {exc}")
@@ -484,7 +510,8 @@ def process_item(
                 )
                 if {s.identity() for s in current} != {s.identity() for s in streams}:
                     raise SourceChangedError("Plex's audio sources changed before playback verification")
-                db.verify_streams(current)
+                skipped_keys = undecodable.skipped_keys(undecodable.ffmpeg_identity(ctx.ffmpeg))
+                db.verify_streams([s for s in current if not undecodable.is_skipped(s, skipped_keys)])
                 source.verify()
             except (DatabaseBusyError, SourceChangedError) as exc:
                 waiting.append(str(exc))
@@ -496,12 +523,13 @@ def process_item(
         elif waiting:
             rows.append(_row(cfg, WAITING, "; ".join(waiting)))
         elif written:
-            done = [f"{written} stream(s)"] + (["item marked analysed"] if marked else [])
+            done = [f"{written} stream(s)"] + (["item marked analysed"] if marked else []) + skipped
             rows.append(_row(cfg, WRITTEN, ", ".join(done)))
         elif marked:
-            rows.append(_row(cfg, UP_TO_DATE, "Existing loudness reused; item marked analysed"))
+            done = ["Item marked analysed" if skipped else "Existing loudness reused; item marked analysed", *skipped]
+            rows.append(_row(cfg, UP_TO_DATE, ", ".join(done)))
         else:
-            rows.append(_row(cfg, UP_TO_DATE))
+            rows.append(_row(cfg, UP_TO_DATE, ", ".join(skipped)))
     if not rows:
         return ItemOutcome(NO_OWNERS, "No Plex server has loudness on for its library")
     return _settle(rows)

@@ -291,3 +291,21 @@ def test_a_kill_is_time_bound_when_a_child_keeps_the_pipes_open(tmp_path, monkey
     with pytest.raises(analyze.LoudnessError, match="cancelled"):
         analyze.run(ffmpeg, "/m/a.mkv", 1, duration_ms=None, cancel_check=lambda: len(calls) > 2 or calls.append(1))
     assert time.monotonic() - started < 2.0
+
+
+@pytest.mark.parametrize(
+    "stderr, error",
+    [
+        (b"Decoding requested, but no decoder found for: none", analyze.LoudnessNoDecoder),
+        (b"Decoder (codec av3a) not found for input stream #0:1", analyze.LoudnessNoDecoder),
+        (b"Invalid data found when processing input", None),
+    ],
+)
+def test_a_missing_decoder_is_told_apart_from_other_ffmpeg_failures(monkeypatch, stderr, error):
+    proc = MagicMock(returncode=234)
+    proc.stdout = io.BytesIO(b"")
+    proc.stderr = io.BytesIO(stderr)
+    monkeypatch.setattr(analyze.subprocess, "Popen", MagicMock(return_value=proc))
+    with pytest.raises(analyze.LoudnessError, match="ffmpeg exited 234") as raised:
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
+    assert isinstance(raised.value, analyze.LoudnessNoDecoder) is (error is not None)

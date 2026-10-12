@@ -9,6 +9,7 @@ import pytest
 
 from media_preview_generator.library_health import plex
 from media_preview_generator.library_health.models import CellState, CheckCancelled, Feature
+from media_preview_generator.loudness import undecodable
 from media_preview_generator.loudness.analyze import ANALYSIS_VERSION, ln_fields
 from media_preview_generator.loudness.plex_db import VERSION_FIELD
 from media_preview_generator.markers.publishers.base import PublishError
@@ -317,3 +318,22 @@ def test_large_library_counts_quickly(monkeypatch, tmp_path):
     assert _cell(result, "1", Feature.PREVIEWS).done == total // 20
     assert _cell(result, "1", Feature.LOUDNESS).done == total // 2
     assert elapsed < 5
+
+
+def test_an_undecodable_audio_stream_does_not_keep_the_part_to_do(monkeypatch, tmp_path):
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(plex, "ffmpeg_identity", lambda _binary: "ffmpeg-a")
+    items = [_movie("A", "/m/a.mkv", "aa11", audio=[_FULL_LOUDNESS, _FULL_LOUDNESS, None])]
+
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
+    assert (_cell(result, "1", Feature.LOUDNESS).done, _cell(result, "1", Feature.LOUDNESS).todo) == (0, 1)
+
+    undecodable.record("aa11", 3, "av3a", "no decoder", "ffmpeg-b")
+    (tmp_path / "plex.db").unlink()
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
+    assert _cell(result, "1", Feature.LOUDNESS).done == 0  # another ffmpeg's record doesn't count
+
+    undecodable.record("aa11", 3, "av3a", "no decoder", "ffmpeg-a")
+    (tmp_path / "plex.db").unlink()
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
+    assert (_cell(result, "1", Feature.LOUDNESS).done, _cell(result, "1", Feature.LOUDNESS).todo) == (1, 0)

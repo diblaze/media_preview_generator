@@ -19,7 +19,9 @@ from typing import Any, cast
 from loguru import logger
 
 from ..config.paths import path_to_canonical_local
+from ..loudness import analyze
 from ..loudness.plex_db import has_analysis
+from ..loudness.undecodable import ffmpeg_identity, skipped_count_by_part_hash
 from ..markers.publishers.base import PublishError
 from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import plex_database
@@ -94,6 +96,7 @@ class _PlexRows:
     parts: list[tuple[Any, ...]]
     audio_counts: dict[int, int]
     loudness_streams: dict[int, list[str | None]]
+    undecodable: dict[str, int] = field(default_factory=dict)
     markers: dict[int, set[str]] = field(default_factory=dict)
 
 
@@ -190,21 +193,24 @@ def _section_ids(scopes: list[LibraryScope]) -> list[int]:
 
 def _read_rows(db: LocalPlexDb, section_ids: list[int], *, want_markers: bool) -> _PlexRows:
     marks = ",".join("?" * len(section_ids))
+    # In the image this is always the bundled analyser the loudness job uses; outside it a custom ffmpeg_path makes
+    # Health conservative (skips recorded by another ffmpeg don't count), never optimistic.
+    ffmpeg = ffmpeg_identity(analyze.resolve_ffmpeg("ffmpeg"))
     with db._database(read_only=True, deadline=time.monotonic() + _DB_WAIT_S) as conn:
         parts = conn.execute(_PARTS_SQL.format(ids=marks), section_ids).fetchall()
         audio_counts = dict(conn.execute(_AUDIO_COUNT_SQL.format(ids=marks), section_ids).fetchall())
         loudness_streams: dict[int, list[str | None]] = defaultdict(list)
         for part_id, extra in conn.execute(_LOUDNESS_STREAMS_SQL.format(ids=marks), section_ids):
             loudness_streams[part_id].append(extra)
-        rows = _PlexRows(parts, audio_counts, loudness_streams)
+        rows = _PlexRows(parts, audio_counts, loudness_streams, skipped_count_by_part_hash(ffmpeg))
         if want_markers:
             for item_id, text in conn.execute(_MARKERS_SQL):
                 rows.markers.setdefault(item_id, set()).add(text)
     return rows
 
 
-def _loudness_done(part_id: int, rows: _PlexRows) -> bool:
-    """Every audio stream of the part carries a complete result of this app's analysis."""
+def _loudness_done(part_id: int, part_hash: str, rows: _PlexRows) -> bool:
+    """Every audio stream of the part carries a complete result of this app's analysis or is known undecodable."""
     passing = 0
     for extra in rows.loudness_streams.get(part_id, ()):
         try:
@@ -212,7 +218,8 @@ def _loudness_done(part_id: int, rows: _PlexRows) -> bool:
                 passing += 1
         except PublishError:
             continue
-    return passing == rows.audio_counts[part_id]
+    # >=: a stream recorded undecodable could later gain loudness data.
+    return passing + rows.undecodable.get(part_hash, 0) >= rows.audio_counts[part_id]
 
 
 def _build_parts(cfg: ServerConfig, rows: _PlexRows, scopes: list[LibraryScope]) -> dict[str, list[_Part]]:
@@ -293,7 +300,7 @@ def _tally_library(
         if Feature.LOUDNESS in counted and rows.audio_counts.get(part.part_id):
             cell = cells[Feature.LOUDNESS]
             cell.total += 1
-            if _loudness_done(part.part_id, rows):
+            if _loudness_done(part.part_id, part.bundle_hash, rows):
                 cell.done += 1
             else:
                 add_todo(Feature.LOUDNESS, part)
