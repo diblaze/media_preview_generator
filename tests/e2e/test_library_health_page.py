@@ -332,7 +332,7 @@ class TestLibraryHealthPage:
         expect(headers.nth(1)).to_contain_text("Previews")
         expect(headers.nth(2)).to_contain_text("Chapters")
         cell = authed_page.locator("td[data-label='Chapters']")
-        expect(cell).to_contain_text("60 of 1,560 done · 30 have no chapters · 10 can't get thumbnails")
+        expect(cell).to_contain_text("60 done · 30 have no chapters · 10 can't get thumbnails")
         cell.get_by_role("button", name="1,500 to do").click()
         modal = authed_page.locator("#lhFilesModal")
         expect(modal.locator("#lhFilesTitle")).to_have_text("Movies · Chapters")

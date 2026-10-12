@@ -214,7 +214,7 @@
         const bar = `<div class="lh-bar lh-bar-${feature}" aria-hidden="true"><i class="lh-fill" style="width:${donePct.toFixed(2)}%"></i><i class="lh-hatch" style="width:${nonePct.toFixed(2)}%"></i></div>`;
         let note = '';
         if (feature === 'chapters') {
-            note = `${n(cell.done)} of ${n(cell.done + cell.todo)} done`
+            note = `${n(cell.done)} done`
                 + (cell.nothing_found ? ` · ${n(cell.nothing_found)} have no chapters` : '')
                 + (cell.cant_do ? ` · ${n(cell.cant_do)} can't get thumbnails` : '');
         } else if (HAVE_TEXT[feature]) {
