@@ -357,7 +357,8 @@ def process_item(
         todo: dict[int, list[AudioStream]] = {}
         for stream in needed:
             todo.setdefault(stream.index, []).append(stream)
-        written, errors, skipped = 0, [], []
+        written, errors = 0, []
+        skipped: list[str] = []
         waiting = []
         db, _ = ctx.db(cfg)
         try:
