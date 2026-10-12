@@ -4,6 +4,7 @@
 .lh {
     --lh-hatch: repeating-linear-gradient(45deg, var(--faint) 0 2px, transparent 2px 5px);
     --lh-hatch-intro: repeating-linear-gradient(45deg, var(--t-intro) 0 2px, transparent 2px 4px);
+    --lh-hatch-chapters: repeating-linear-gradient(45deg, var(--t-chapters) 0 2px, transparent 2px 4px);
     display: grid;
     gap: 1rem;
 }
@@ -77,6 +78,7 @@
 
 .lh-sw-none { background: var(--lh-hatch-intro); }
 .lh-sw-previews { background: var(--t-previews); }
+.lh-sw-chapters { background: var(--t-chapters); }
 .lh-sw-loudness { background: var(--t-loud); }
 .lh-sw-intro,
 .lh-sw-credits { background: var(--t-intro); }
@@ -208,6 +210,8 @@
 .lh-fill { display: block; height: 100%; background: var(--muted); }
 .lh-hatch { display: block; height: 100%; background: var(--lh-hatch); }
 .lh-bar-previews .lh-fill { background: var(--t-previews); }
+.lh-bar-chapters .lh-fill { background: var(--t-chapters); }
+.lh-bar-chapters .lh-hatch { background: var(--lh-hatch-chapters); }
 .lh-bar-loudness .lh-fill { background: var(--t-loud); }
 .lh-bar-intro .lh-fill,
 .lh-bar-credits .lh-fill { background: var(--t-intro); }

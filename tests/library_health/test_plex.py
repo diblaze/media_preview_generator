@@ -1,5 +1,6 @@
 """Tests for library_health.plex."""
 
+import json
 import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -337,3 +338,79 @@ def test_an_undecodable_audio_stream_does_not_keep_the_part_to_do(monkeypatch, t
     (tmp_path / "plex.db").unlink()
     result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
     assert (_cell(result, "1", Feature.LOUDNESS).done, _cell(result, "1", Feature.LOUDNESS).todo) == (1, 0)
+
+
+_THUMB = "/library/media/1/chapterImages/1?mpgChapter=abc"
+
+
+def _chapters_cfg(tmp_path):
+    cfg = _cfg(tmp_path, [_lib()])
+    cfg.output["chapter_thumbnails"] = True
+    return cfg
+
+
+def _with_chapters(item, chapters, duration=600_000):
+    return {**item, "chapters": chapters, "duration": duration}
+
+
+def _write_manifest(tmp_path, bundle_hash, media_path, **fields):
+    from media_preview_generator.output.plex_bundle import PlexBundleAdapter
+    from media_preview_generator.output.plex_hash import get_source_fingerprint
+
+    folder = PlexBundleAdapter.bundle_bif_path(str(tmp_path / "plex"), bundle_hash).parent.parent / "Chapters"
+    folder.mkdir(parents=True, exist_ok=True)
+    source = fields.pop("source", None) or list(get_source_fingerprint(media_path))
+    (folder / "chapter-thumbnails.mpg.json").write_text(json.dumps({"source": source, **fields}))
+
+
+def test_chapters_count_done_none_todo_and_cant_do(monkeypatch, tmp_path):
+    split = [
+        {"file": "/m/f1.mkv", "hash": None, "extra_data": None, "audio": []},
+        {"file": "/m/f2.mkv", "hash": None, "extra_data": None, "audio": []},
+    ]
+    items = [
+        _with_chapters(_movie("A", "/m/a.mkv"), [(0, _THUMB), (60_000, "media://plex-own.jpg")]),
+        _movie("B", "/m/b.mkv"),
+        _with_chapters(_movie("C", "/m/c.mkv"), [(0, _THUMB), (60_000, "")]),
+        _with_chapters(_movie("D", "/m/d.mkv"), [(0, _THUMB), (700_000, None)]),
+        _with_chapters(_movie("E", "/m/e.mkv"), [(650_000, ""), (700_000, "")]),
+        _with_chapters(_movie("F", "", parts=split), [(0, "")]),
+    ]
+
+    result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    # A and D done (D's only bare chapter starts after the end); B none; E all past the end and F split: can't do.
+    assert (cell.total, cell.done, cell.nothing_found, cell.cant_do, cell.todo) == (7, 2, 1, 3, 1)
+    assert [t.path for t in result.todo if t.feature == Feature.CHAPTERS] == ["/m/c.mkv"]
+
+
+def test_chapter_manifest_marks_failed_files_and_real_past_end(monkeypatch, tmp_path):
+    media = {name: tmp_path / f"{name}.mkv" for name in ("failed", "past", "stale", "open")}
+    for path in media.values():
+        path.write_bytes(b"video")
+    _write_manifest(tmp_path, "f1", media["failed"], failed="decoder crashed")
+    _write_manifest(tmp_path, "p1", media["past"], images={"2": {"past_end": True}})
+    _write_manifest(tmp_path, "s1", media["stale"], source=[0, 0, 0, 0, 0], unsupported="old file")
+    _write_manifest(tmp_path, "o1", media["open"], images={"2": {"sha256": "x"}})
+    bare = [(0, _THUMB), (590_000, "")]
+    items = [
+        _with_chapters(_movie(name, str(path), bundle_hash), bare)
+        for (name, path), bundle_hash in zip(media.items(), ("f1", "p1", "s1", "o1"), strict=True)
+    ]
+
+    result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    assert (cell.done, cell.cant_do, cell.todo) == (1, 1, 2)
+    assert sorted(t.title for t in result.todo if t.feature == Feature.CHAPTERS) == ["open", "stale"]
+
+
+def test_chapters_off_skips_the_chapter_queries(monkeypatch, tmp_path):
+    items = [_with_chapters(_movie("A", "/m/a.mkv"), [(0, "")])]
+
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    assert cell.state == CellState.OFF and cell.total == 0
+    assert not [t for t in result.todo if t.feature == Feature.CHAPTERS]

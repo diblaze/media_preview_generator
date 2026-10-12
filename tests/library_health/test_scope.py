@@ -101,3 +101,17 @@ def test_intro_and_credits_off_cells_are_separate_objects():
     scope = library_scopes(cfg)[0]
     assert scope.features[Feature.INTRO].state == CellState.OFF
     assert scope.features[Feature.INTRO] is not scope.features[Feature.CREDITS]
+
+
+def test_chapters_cell_per_server_type_and_switches():
+    def chapters(server_type=ServerType.PLEX, output=None, enabled=True):
+        cfg = _cfg(server_type, [_lib(enabled=enabled)], output=output or {})
+        return library_scopes(cfg)[0].features[Feature.CHAPTERS]
+
+    on = {"chapter_thumbnails": True}
+    assert chapters(output=on) is None
+    assert chapters(output={}).state == CellState.OFF
+    assert chapters(output=on, enabled=False).reason == "Previews are off for this library"
+    for other in (ServerType.EMBY, ServerType.JELLYFIN):
+        cell = chapters(other, output=on)
+        assert cell.state == CellState.NOT_APPLICABLE and cell.reason == "Plex only"

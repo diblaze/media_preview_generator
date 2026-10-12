@@ -294,3 +294,51 @@ class TestLibraryHealthPage:
             assert bodies[0] == {"libraries": [{"server_id": "e2e-plex", "library_id": "1"}]}
         else:
             assert len(bodies[0]["file_paths"]) == todo_count
+
+    def test_saved_result_without_chapters_has_no_chapters_column(
+        self, authed_page: Page, app_url: str, seeded_health
+    ) -> None:
+        authed_page.goto(f"{app_url}/library-health")
+
+        expect(authed_page.locator(".lh-table thead")).to_contain_text("Previews")
+        expect(authed_page.locator(".lh-table thead")).not_to_contain_text("Chapters")
+
+    def test_chapters_column_lists_files_and_starts_a_chapter_job(
+        self, authed_page: Page, app_url: str, seeded_health: HealthStore
+    ) -> None:
+        result = _result()
+        # 1,500 to do: above the path-job limit, which must not turn a chapter job into a library job.
+        result.libraries[0].cells[Feature.CHAPTERS] = Cell(
+            CellState.COUNTED, total=1600, done=60, nothing_found=30, cant_do=10
+        )
+        result.todo += [
+            TodoFile(Feature.CHAPTERS, f"/media/Movies/C{i}/C{i}.mkv", f"C{i}", str(100 + i), library_id="1")
+            for i in range(3)
+        ]
+        seeded_health.replace_server(result)
+        bodies: list[dict] = []
+
+        def capture(route) -> None:
+            bodies.append(route.request.post_data_json)
+            route.fulfill(status=202, json={"started": True, "files": 3})
+
+        authed_page.route(
+            re.compile(r".*/api/library-health/chapters-job$"),
+            lambda route: capture(route) if route.request.method == "POST" else route.continue_(),
+        )
+        authed_page.goto(f"{app_url}/library-health")
+
+        headers = authed_page.locator(".lh-table thead th")
+        expect(headers.nth(1)).to_contain_text("Previews")
+        expect(headers.nth(2)).to_contain_text("Chapters")
+        cell = authed_page.locator("td[data-label='Chapters']")
+        expect(cell).to_contain_text("60 of 1,560 done · 30 have no chapters · 10 can't get thumbnails")
+        cell.get_by_role("button", name="1,500 to do").click()
+        modal = authed_page.locator("#lhFilesModal")
+        expect(modal.locator("#lhFilesTitle")).to_have_text("Movies · Chapters")
+        expect(modal.locator(".lh-file")).to_have_count(3)
+        modal.get_by_role("button", name="Start chapter thumbnail job for these 1,500 files").click()
+        modal.get_by_role("button", name="Start", exact=True).click()
+
+        expect(authed_page.locator("#toastNotification")).to_contain_text("Job started")
+        assert bodies == [{"server_id": "e2e-plex", "library_id": "1"}]

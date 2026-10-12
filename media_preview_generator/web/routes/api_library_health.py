@@ -7,6 +7,7 @@ from flask import jsonify, request
 from ...library_health.models import Feature, ServerResult
 from ...library_health.runner import get_runner
 from ...library_health.store import default_store
+from ...servers.base import ServerType
 from ..auth import api_token_required
 from ..scheduler import _LIBRARY_HEALTH_NIGHTLY, job_next_run
 from . import api
@@ -143,3 +144,36 @@ def start_plex_reread():
     if not started:
         return jsonify({"error": result.message}), result.status
     return jsonify({"started": True, "progress": result.to_dict()}), 202
+
+
+@api.route("/library-health/chapters-job", methods=["POST"])
+@api_token_required
+def start_chapters_job():
+    """Start preview jobs that make the chapter thumbnails a library still needs.
+
+    Body: ``{"server_id", "library_id"}``. Each file goes with its Plex item id from the last check, which the
+    chapter step needs for a file holding several episodes. Previews that already exist are skipped.
+
+    Returns:
+        ``{"started": true, "files": n}``; 400 when there's nothing to do or chapter thumbnails are off, 404 for an
+        unknown server.
+    """
+    from ...library_health.runner import _settings_registry, start_files_job
+
+    data = request.get_json(silent=True) or {}
+    server_id = data.get("server_id")
+    library_id = data.get("library_id")
+    if not isinstance(server_id, str) or not server_id or not isinstance(library_id, str) or not library_id:
+        return jsonify({"error": "server_id and library_id are required"}), 400
+    registry = _settings_registry()
+    cfg = next((c for c in registry.configs() if c.id == server_id), None) if registry else None
+    if cfg is None:
+        return jsonify({"error": "That server isn't available"}), 404
+    if cfg.type is not ServerType.PLEX or cfg.output.get("chapter_thumbnails") is not True:
+        return jsonify({"error": "Chapter thumbnails are off for this server"}), 400
+    files = [(f.path, f.item_id) for f in default_store().todo_for(server_id, library_id, Feature.CHAPTERS)]
+    if not files:
+        return jsonify({"error": "Nothing left to do here — run Check now."}), 400
+    library_name = next((lib.name for lib in cfg.libraries if lib.id == library_id), library_id)
+    start_files_job(cfg, files, f"Chapter thumbnails for {library_name}")
+    return jsonify({"started": True, "files": len(files)}), 202

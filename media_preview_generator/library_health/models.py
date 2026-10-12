@@ -15,6 +15,7 @@ class Feature(str, Enum):
     """The things a library can be checked for."""
 
     PREVIEWS = "previews"
+    CHAPTERS = "chapters"
     LOUDNESS = "loudness"
     INTRO = "intro"
     CREDITS = "credits"
@@ -39,12 +40,13 @@ class Cell:
     done: int = 0
     nothing_found: int = 0
     not_showing: int = 0  # Plex previews only
+    cant_do: int = 0  # Plex chapters only: files the chapter step can never finish
     reason: str = ""  # shown for OFF / NOT_APPLICABLE / UNAVAILABLE / ERROR
 
     @property
     def todo(self) -> int:
-        """Files still to do: not done and not already searched with nothing found."""
-        return max(self.total - self.done - self.nothing_found, 0)
+        """Files still to do: not done, not already searched with nothing found, and not impossible."""
+        return max(self.total - self.done - self.nothing_found - self.cant_do, 0)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-ready form, including the computed ``todo``."""
@@ -54,6 +56,7 @@ class Cell:
             "done": self.done,
             "nothing_found": self.nothing_found,
             "not_showing": self.not_showing,
+            "cant_do": self.cant_do,
             "reason": self.reason,
             "todo": self.todo,
         }
@@ -67,6 +70,7 @@ class Cell:
             done=data.get("done", 0),
             nothing_found=data.get("nothing_found", 0),
             not_showing=data.get("not_showing", 0),
+            cant_do=data.get("cant_do", 0),
             reason=data.get("reason", ""),
         )
 

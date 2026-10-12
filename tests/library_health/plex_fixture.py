@@ -13,13 +13,15 @@ from media_preview_generator.output.plex_bundle import PlexBundleAdapter
 _SCHEMA = """
 CREATE TABLE metadata_items (id INTEGER PRIMARY KEY, library_section_id INTEGER, metadata_type INTEGER,
     parent_id INTEGER, title TEXT, "index" INTEGER, deleted_at INTEGER);
-CREATE TABLE media_items (id INTEGER PRIMARY KEY, metadata_item_id INTEGER, deleted_at INTEGER, proxy_type INTEGER);
+CREATE TABLE media_items (id INTEGER PRIMARY KEY, metadata_item_id INTEGER, deleted_at INTEGER, proxy_type INTEGER,
+    duration INTEGER);
 CREATE TABLE media_parts (id INTEGER PRIMARY KEY, media_item_id INTEGER, file TEXT, hash TEXT, extra_data TEXT,
     deleted_at INTEGER);
 CREATE TABLE media_streams (id INTEGER PRIMARY KEY, media_part_id INTEGER, stream_type_id INTEGER, extra_data TEXT,
     "index" INTEGER);
 CREATE TABLE tags (id INTEGER PRIMARY KEY, tag TEXT, tag_type INTEGER);
-CREATE TABLE taggings (id INTEGER PRIMARY KEY, metadata_item_id INTEGER, tag_id INTEGER, text TEXT);
+CREATE TABLE taggings (id INTEGER PRIMARY KEY, metadata_item_id INTEGER, tag_id INTEGER, text TEXT, "index" INTEGER,
+    time_offset INTEGER, thumb_url TEXT);
 """
 
 SD_FLAG = '{"ma:container":"mkv","mi:indexes":"sd"}'
@@ -33,11 +35,12 @@ def build_plex_db(path: str | Path, items: list[dict[str, Any]]) -> None:
         items: One dict per movie/episode with ``section`` (int), ``type`` (1 movie, 4 episode), ``title`` and
             ``parts`` (list of dicts: ``file``, ``hash``, ``extra_data`` and ``audio``, a list of stream
             ``extra_data`` values). Optional: ``show``, ``season_index``, ``index`` (episodes), ``tags``
-            (``"intro"`` / ``"credits"``).
+            (``"intro"`` / ``"credits"``), ``duration`` (ms) and ``chapters`` (``(start_ms, thumb_url)`` pairs).
     """
     conn = sqlite3.connect(str(path))
     conn.executescript(_SCHEMA)
     conn.execute("INSERT INTO tags (id, tag, tag_type) VALUES (1, '', 12)")
+    conn.execute("INSERT INTO tags (id, tag, tag_type) VALUES (2, '', 9)")
     next_id = {"item": 1, "media": 1, "part": 1, "stream": 1, "tagging": 1}
 
     def take(kind: str) -> int:
@@ -68,7 +71,7 @@ def build_plex_db(path: str | Path, items: list[dict[str, Any]]) -> None:
             (item_id, item["section"], item["type"], parent_id, item["title"], item.get("index", 1)),
         )
         media_id = take("media")
-        conn.execute("INSERT INTO media_items VALUES (?, ?, NULL, 0)", (media_id, item_id))
+        conn.execute("INSERT INTO media_items VALUES (?, ?, NULL, 0, ?)", (media_id, item_id, item.get("duration")))
         for part in item["parts"]:
             part_id = take("part")
             conn.execute(
@@ -84,7 +87,16 @@ def build_plex_db(path: str | Path, items: list[dict[str, Any]]) -> None:
                     "INSERT INTO media_streams VALUES (?, ?, 2, ?, NULL)", (take("stream"), part_id, stream_extra)
                 )
         for tag in item.get("tags", []):
-            conn.execute("INSERT INTO taggings VALUES (?, ?, 1, ?)", (take("tagging"), item_id, tag))
+            conn.execute(
+                "INSERT INTO taggings (id, metadata_item_id, tag_id, text) VALUES (?, ?, 1, ?)",
+                (take("tagging"), item_id, tag),
+            )
+        for index, (start, thumb) in enumerate(item.get("chapters", []), start=1):
+            conn.execute(
+                'INSERT INTO taggings (id, metadata_item_id, tag_id, "index", time_offset, thumb_url) '
+                "VALUES (?, ?, 2, ?, ?, ?)",
+                (take("tagging"), item_id, index, start, thumb),
+            )
     conn.commit()
     conn.close()
 

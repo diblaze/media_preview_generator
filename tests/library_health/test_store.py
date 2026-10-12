@@ -180,3 +180,14 @@ def test_not_showing_lookups_use_an_index(store, sql):
     params = ("s1", "1")[: sql.count("?")]
     plan = " ".join(row[-1] for row in store._conn.execute(f"EXPLAIN QUERY PLAN {sql}", params))
     assert "idx_todo_not_showing" in plan, plan
+
+
+def test_cell_cant_do_round_trips_and_leaves_todo():
+    from media_preview_generator.library_health.models import Cell, CellState
+
+    cell = Cell(CellState.COUNTED, total=10, done=4, nothing_found=3, cant_do=2)
+    data = cell.to_dict()
+    assert (data["cant_do"], data["todo"]) == (2, 1)
+    assert Cell.from_dict(data) == cell
+    del data["cant_do"]
+    assert Cell.from_dict(data).cant_do == 0

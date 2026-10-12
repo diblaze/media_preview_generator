@@ -45,6 +45,16 @@ def library_scopes(cfg: ServerConfig) -> list[LibraryScope]:
         else:
             features[Feature.PREVIEWS] = None
 
+        if cfg.type != ServerType.PLEX:
+            features[Feature.CHAPTERS] = Cell(CellState.NOT_APPLICABLE, reason="Plex only")
+        elif cfg.output.get("chapter_thumbnails") is not True:
+            features[Feature.CHAPTERS] = Cell(CellState.OFF, reason="Chapter thumbnails are off for this server")
+        elif not lib.enabled:
+            # Chapter thumbnails are made by the preview job, so they follow the library's previews switch.
+            features[Feature.CHAPTERS] = Cell(CellState.OFF, reason="Previews are off for this library")
+        else:
+            features[Feature.CHAPTERS] = None
+
         if loudness is None:
             features[Feature.LOUDNESS] = Cell(CellState.NOT_APPLICABLE, reason="Plex only")
         elif not loudness.enabled or not library_chosen(loudness, library_id=lib.id, kind=lib.kind):

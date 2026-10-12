@@ -11,16 +11,17 @@
     const PATH_PAGE_SIZE = 500;
     const FILTER_DEBOUNCE_MS = 300;
 
-    const FEATURES = ['previews', 'loudness', 'intro', 'credits'];
-    const FEATURE_LABEL = { previews: 'Previews', loudness: 'Loudness', intro: 'Intro', credits: 'Credits' };
-    const JOB_LABEL = { previews: 'preview', loudness: 'loudness', intro: 'intro & credits', credits: 'intro & credits' };
+    const FEATURES = ['previews', 'chapters', 'loudness', 'intro', 'credits'];
+    const FEATURE_LABEL = { previews: 'Previews', chapters: 'Chapters', loudness: 'Loudness', intro: 'Intro', credits: 'Credits' };
+    const JOB_LABEL = { previews: 'preview', chapters: 'chapter thumbnail', loudness: 'loudness', intro: 'intro & credits', credits: 'intro & credits' };
     const HEADER_TIP = {
         previews: 'A preview counts as made when its file is in the server\'s preview folder for that video.',
+        chapters: 'Counts chapter thumbnails Plex shows, made by this app or by Plex itself. Striped: files with no chapters, or that can\'t get thumbnails (for example a version split across several files).',
         loudness: 'Counts loudness measured by this app or by Plex itself. Files where Plex\'s own loudness data is incomplete need Plex\'s own analysis; a loudness job here leaves them alone, so they stay on the to-do list.',
         intro: 'Counts intros from the server\'s own detection and from this app. Some shows have no intro, so "to do" means nobody has looked yet, not that it is missing.',
         credits: 'Counts credits from the server\'s own detection and from this app. "To do" means nobody has looked yet.',
     };
-    const DONE_TEXT = { previews: 'All made', loudness: 'All measured', intro: 'All checked', credits: 'All checked' };
+    const DONE_TEXT = { previews: 'All made', chapters: 'All made', loudness: 'All measured', intro: 'All checked', credits: 'All checked' };
     const HAVE_TEXT = { intro: 'have an intro', credits: 'have credits' };
 
     const state = {
@@ -206,13 +207,17 @@
         const total = cell.total || 0;
         if (!total) return '<span class="lh-na">–</span>';
         const donePct = total ? (cell.done / total) * 100 : 0;
-        const nonePct = total ? (cell.nothing_found / total) * 100 : 0;
+        const nonePct = total ? ((cell.nothing_found + (cell.cant_do || 0)) / total) * 100 : 0;
         const head = cell.todo > 0
             ? `<span class="lh-big">${cellButton(server, lib, feature, `<span class="lh-num">${n(cell.todo)}</span> <small>to do</small>`, false, 'lh-todo')}</span>`
             : `<span class="lh-done"><i class="bi bi-check2" aria-hidden="true"></i> ${DONE_TEXT[feature]}</span>`;
         const bar = `<div class="lh-bar lh-bar-${feature}" aria-hidden="true"><i class="lh-fill" style="width:${donePct.toFixed(2)}%"></i><i class="lh-hatch" style="width:${nonePct.toFixed(2)}%"></i></div>`;
         let note = '';
-        if (HAVE_TEXT[feature]) {
+        if (feature === 'chapters') {
+            note = `${n(cell.done)} of ${n(cell.done + cell.todo)} done`
+                + (cell.nothing_found ? ` · ${n(cell.nothing_found)} have no chapters` : '')
+                + (cell.cant_do ? ` · ${n(cell.cant_do)} can't get thumbnails` : '');
+        } else if (HAVE_TEXT[feature]) {
             note = `${n(cell.done)} ${HAVE_TEXT[feature]}` + (cell.nothing_found ? ` · ${n(cell.nothing_found)} nothing found` : '');
         } else if (cell.todo > 0) {
             const pct = Math.min(99, Math.round(donePct));
@@ -234,10 +239,20 @@
         return !!(intro && credits && intro.state === 'off' && credits.state === 'off' && intro.reason === credits.reason);
     }
 
+    // Chapter thumbnails are Plex-only, and results saved before the column existed have no cell for it.
+    function serverFeatures(server) {
+        return FEATURES.filter(function (f) {
+            return f !== 'chapters' || (server.libraries || []).some(function (lib) {
+                const cell = lib.cells && lib.cells.chapters;
+                return cell && cell.state !== 'not_applicable';
+            });
+        });
+    }
+
     // Intro and credits are switched off together, so one notice spans both columns instead of repeating.
-    function rowCells(server, lib) {
+    function rowCells(server, lib, features) {
         const merge = bothMarkersOff(lib);
-        return FEATURES.map(function (f) {
+        return features.map(function (f) {
             if (merge && f === 'credits') return '';
             const span = merge && f === 'intro' ? ' colspan="2"' : '';
             const label = merge && f === 'intro' ? 'Intro &amp; credits' : FEATURE_LABEL[f];
@@ -251,15 +266,16 @@
         const letter = escapeHtml((server.type || '?').charAt(0).toUpperCase());
         const chips = (server.access ? `<span class="lh-chip lh-chip-ok">${escapeHtml(server.access)}</span>` : '')
             + (server.error ? `<span class="lh-chip lh-chip-bad" role="status"><i class="bi bi-exclamation-circle me-1" aria-hidden="true"></i>${escapeHtml(server.error)}</span>` : '');
-        const head = FEATURES.map(function (f) {
+        const features = serverFeatures(server);
+        const head = features.map(function (f) {
             return `<th scope="col"><span class="lh-sw lh-sw-${f}"></span>${FEATURE_LABEL[f]}${tip(HEADER_TIP[f])}</th>`;
         }).join('');
         const rows = libs.map(function (lib) {
-            const counted = FEATURES.some(function (f) { return lib.cells && lib.cells[f] && lib.cells[f].state === 'counted'; });
+            const counted = features.some(function (f) { return lib.cells && lib.cells[f] && lib.cells[f].state === 'counted'; });
             const fileLine = lib.total > 0
                 ? `<div class="lh-sub">${n(lib.total)} files</div>`
                 : (counted ? '<div class="lh-sub">No files</div>' : '');
-            const cells = rowCells(server, lib);
+            const cells = rowCells(server, lib, features);
             return `<tr><th scope="row" class="lh-lib"><b>${escapeHtml(lib.name)}</b>${fileLine}</th>${cells}</tr>`;
         }).join('');
         return `<section class="lh-server" aria-label="${escapeHtml(server.name)}">
@@ -436,8 +452,9 @@
         }
     }
 
+    // Chapter jobs always go by file: each file needs its Plex item id, which a library job doesn't carry.
     function jobTarget(f) {
-        return f.todo > state.data.path_job_limit ? 'library' : 'paths';
+        return f.feature !== 'chapters' && f.todo > state.data.path_job_limit ? 'library' : 'paths';
     }
 
     function resetFilesFooter() {
@@ -447,7 +464,7 @@
         const start = $('lhFilesStart');
         start.disabled = false;
         start.hidden = f.notShowing;
-        const target = f.todo > state.data.path_job_limit ? f.libraryName : `these ${n(f.todo)} files`;
+        const target = jobTarget(f) === 'library' ? f.libraryName : `these ${n(f.todo)} files`;
         start.textContent = `Start ${JOB_LABEL[f.feature]} job for ${target}`;
         f.confirming = false;
     }
@@ -507,6 +524,12 @@
         const start = $('lhFilesStart');
         start.disabled = true;
         try {
+            if (f.feature === 'chapters') {
+                await request('POST', '/api/library-health/chapters-job', { server_id: f.serverId, library_id: f.libraryId });
+                modalFor('lhFilesModal').hide();
+                toast('Job started', 'See the Dashboard for progress.', 'success');
+                return;
+            }
             const libraries = [{ server_id: f.serverId, library_id: f.libraryId }];
             const byLibrary = jobTarget(f) === 'library';
             const paths = byLibrary ? [] : await allPaths(f);

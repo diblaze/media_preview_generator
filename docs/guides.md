@@ -502,18 +502,19 @@ system temp folder; nothing is written next to your media.
 
 ### Library health
 
-**Tools → Library health** shows, for every library on every server, how many files still need previews, loudness
-or Intro & Credits. There is one card per server and one row per library, with the columns **Previews**,
-**Loudness**, **Intro** and **Credits**.
+**Tools → Library health** shows, for every library on every server, how many files still need previews, chapter
+thumbnails, loudness or Intro & Credits. There is one card per server and one row per library, with the columns
+**Previews**, **Chapters** (Plex with chapter thumbnails on), **Loudness**, **Intro** and **Credits**.
 
 - **The number.** The bold number is how many files still have work to do. For Intro and Credits, **to do** means
   nobody has looked yet; many shows have no intro. **Nothing found** (the striped part of the bar) means the app
-  looked and found none.
+  looked and found none. For Chapters, the striped part is files with no chapters, or files that can't get
+  thumbnails (a version split across several files, or one the chapter step gave up on until the file changes).
 - **Other cell text.** **Off for this library** means the feature is turned off in Servers. **Not used for films**
   is Intro on a movie library. **Plex only** is Loudness on Emby or Jellyfin.
 - **Click a number** to list those files. From the list you can open a file in the Inspector, or start the matching
   job (previews, loudness, or Intro & Credits) for exactly those files. Past 1,000 files, the job covers the whole
-  library.
+  library. Chapters starts preview jobs for exactly those files; previews that already exist are skipped.
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
 - **How long it takes.** Plex with access to its database takes seconds, even for 100,000+ files. Without that

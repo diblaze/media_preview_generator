@@ -45,6 +45,7 @@ class FakeRunner:
 class FakeStore:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.chapter_todo: list[TodoFile] = []
 
     def load(self):
         return [
@@ -53,6 +54,10 @@ class FakeStore:
             _server("p2", "Zulu", "plex"),
             _server("p1", "alpha", "plex"),
         ]
+
+    def todo_for(self, server_id, library_id, feature):
+        self.calls.append({"todo_for": (server_id, library_id, feature)})
+        return self.chapter_todo
 
     def list_todo(self, server_id, library_id, feature, **kwargs):
         self.calls.append({"server_id": server_id, "library_id": library_id, "feature": feature, **kwargs})
@@ -75,6 +80,7 @@ ROUTES = [
     ("post", "/api/library-health/cancel"),
     ("get", "/api/library-health/files"),
     ("post", "/api/library-health/plex-reread"),
+    ("post", "/api/library-health/chapters-job"),
 ]
 
 
@@ -198,3 +204,66 @@ def test_reread_started(client, auth_headers, fakes):
     runner.reread_result = (True, CheckProgress(kind="reread", started_at=1.0, reason="manual"))
     resp = client.post("/api/library-health/plex-reread", json={"server_id": "p1"}, headers=auth_headers)
     assert resp.status_code == 202
+
+
+@pytest.fixture
+def chapter_server(monkeypatch):
+    from media_preview_generator.library_health import runner as runner_mod
+    from media_preview_generator.servers.base import Library, ServerConfig, ServerType
+
+    cfg = ServerConfig(
+        id="p1",
+        type=ServerType.PLEX,
+        name="Plex",
+        enabled=True,
+        url="http://x",
+        auth={},
+        libraries=[Library(id="2", name="TV Shows", remote_paths=(), enabled=True, kind="show")],
+        output={"chapter_thumbnails": True},
+    )
+    started: list[tuple] = []
+    monkeypatch.setattr(runner_mod, "_settings_registry", lambda: type("R", (), {"configs": lambda self: [cfg]})())
+    monkeypatch.setattr(runner_mod, "start_files_job", lambda *args: started.append(args))
+    return cfg, started
+
+
+def test_chapters_job_starts_preview_jobs_with_item_ids(client, auth_headers, fakes, chapter_server):
+    _, store = fakes
+    cfg, started = chapter_server
+    store.chapter_todo = [
+        TodoFile(Feature.CHAPTERS, "/tv/a.mkv", "A", "11"),
+        TodoFile(Feature.CHAPTERS, "/tv/b.mkv", "B", "12"),
+    ]
+    resp = client.post(
+        "/api/library-health/chapters-job", json={"server_id": "p1", "library_id": "2"}, headers=auth_headers
+    )
+    assert resp.status_code == 202 and resp.get_json() == {"started": True, "files": 2}
+    assert store.calls == [{"todo_for": ("p1", "2", Feature.CHAPTERS)}]
+    assert started == [(cfg, [("/tv/a.mkv", "11"), ("/tv/b.mkv", "12")], "Chapter thumbnails for TV Shows")]
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        ({"server_id": "p1"}, 400),
+        ({"server_id": "nope", "library_id": "2"}, 404),
+        ({"server_id": "p1", "library_id": "2"}, 400),
+    ],
+)
+def test_chapters_job_refusals(client, auth_headers, fakes, chapter_server, body, status):
+    _, started = chapter_server
+    resp = client.post("/api/library-health/chapters-job", json=body, headers=auth_headers)
+    assert resp.status_code == status
+    assert started == []
+
+
+def test_chapters_job_refused_when_chapters_off(client, auth_headers, fakes, chapter_server):
+    _, store = fakes
+    cfg, started = chapter_server
+    cfg.output["chapter_thumbnails"] = False
+    store.chapter_todo = [TodoFile(Feature.CHAPTERS, "/tv/a.mkv", "A", "11")]
+    resp = client.post(
+        "/api/library-health/chapters-job", json={"server_id": "p1", "library_id": "2"}, headers=auth_headers
+    )
+    assert resp.status_code == 400 and "off" in resp.get_json()["error"]
+    assert started == []
