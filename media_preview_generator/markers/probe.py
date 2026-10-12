@@ -1,6 +1,6 @@
-"""ffprobe wrapper for duration, chapters, the container's and first audio stream's first timestamps, the main video
-stream's codec, first packet headers and last readable timestamp, and the bounded kill it shares with the fingerprint
-ffmpeg.
+"""ffprobe wrapper for duration, chapters, the container's and first audio stream's first timestamps, the audio streams,
+the main video stream's codec, first packet headers and last readable timestamp, and the bounded kill it shares with the
+fingerprint ffmpeg.
 
 A process stuck in an uninterruptible read on a stalled network mount can't die until that read returns, and it holds
 its pipes until then. Collecting it with a plain ``wait()`` or ``communicate()`` -- what ``subprocess.run`` does after
@@ -248,6 +248,58 @@ class StreamStarts:
         """How far into the file the first audio sample plays: a fingerprint's point 0 is that sample, since ffmpeg
         doesn't pad the late start of an audio stream (measured on an mkv whose audio starts 2 s after its video)."""
         return 0.0 if self.audio_s is None else max(0.0, self.audio_s - self.container_s)
+
+
+@dataclass(frozen=True)
+class AudioStream:
+    """One audio stream of a file, as ffprobe lists it."""
+
+    index: int
+    codec: str | None
+    channels: int
+
+
+def audio_streams(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> list[AudioStream]:
+    """The file's audio streams in the order ffmpeg prefers them when it picks one itself: default-flagged first, then
+    most channels, then file order. Reads only the headers.
+
+    Args:
+        path: Media file.
+        ffprobe: ffprobe binary.
+        timeout_s: Hard timeout, as for :func:`probe_media`.
+
+    Returns:
+        The audio streams; empty for a file without one.
+
+    Raises:
+        ProbeStalledError: ``MAX_STUCK_FFPROBES`` earlier ffprobes are still stuck; none is started.
+        ProbeTimeoutError: ffprobe ran past ``timeout_s``.
+        ProbeError: ffprobe missing, failed or returned something other than its JSON.
+    """
+    cmd = [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries",
+           "stream=index,codec_name,channels:stream_disposition=default", "-of", "json", path]  # fmt: skip
+    stdout = _run_ffprobe(cmd, path, timeout_s)
+    try:
+        data = json.loads(stdout or "")
+    except ValueError as exc:
+        raise ProbeError(f"ffprobe returned invalid JSON for {path}") from exc
+    streams = data.get("streams") if isinstance(data, dict) else None
+    if not isinstance(streams, list):
+        raise ProbeError(f"ffprobe returned an unexpected stream list for {path}")
+    ranked: list[tuple[bool, int, AudioStream]] = []
+    for stream in streams:
+        if not isinstance(stream, dict) or type(stream.get("index")) is not int:
+            continue
+        channels = stream.get("channels")
+        codec = stream.get("codec_name")
+        found = AudioStream(
+            stream["index"],
+            codec if isinstance(codec, str) and codec else None,
+            channels if type(channels) is int and channels > 0 else 0,
+        )
+        ranked.append((bool((stream.get("disposition") or {}).get("default")), found.channels, found))
+    ranked.sort(key=lambda entry: (not entry[0], -entry[1], entry[2].index))
+    return [entry[2] for entry in ranked]
 
 
 def stream_starts(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> StreamStarts:

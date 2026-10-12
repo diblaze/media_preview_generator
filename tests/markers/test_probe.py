@@ -658,3 +658,37 @@ class TestStreamStarts:
         proc.communicate.side_effect = [subprocess.TimeoutExpired("ffprobe", 30), ("", "")]
         with patch(RUN, return_value=proc), pytest.raises(ProbeTimeoutError):
             probe.stream_starts("/m/a.mkv", ffprobe="ffprobe", timeout_s=30.0)
+
+
+def test_audio_streams_come_in_ffmpegs_order_of_preference():
+    # ffmpeg's own pick: the default-flagged stream first, then the most channels, then file order.
+    payload = {
+        "streams": [
+            {"index": 1, "codec_name": "aac", "channels": 2, "disposition": {"default": 0}},
+            {"index": 2, "channels": 6, "disposition": {"default": 1}},  # no codec_name: ffprobe has no codec id
+            {"index": 3, "codec_name": "eac3", "channels": 6, "disposition": {"default": 1}},
+            {"index": 4, "codec_name": "ac3", "channels": 6, "disposition": {"default": 0}},
+            {"index": "5", "codec_name": "opus", "channels": 2},  # not ffprobe's shape: dropped
+        ]
+    }
+    with patch(RUN, return_value=_ok(payload)) as run:
+        streams = probe.audio_streams("/m/a.mp4", ffprobe="ffprobe", timeout_s=30.0)
+    assert [(s.index, s.codec, s.channels) for s in streams] == [
+        (2, None, 6),
+        (3, "eac3", 6),
+        (4, "ac3", 6),
+        (1, "aac", 2),
+    ]
+    cmd = run.call_args.args[0]
+    assert cmd[:5] == ["ffprobe", "-v", "error", "-select_streams", "a"] and cmd[-1] == "/m/a.mp4"
+
+
+def test_audio_streams_of_a_file_without_audio_is_empty():
+    with patch(RUN, return_value=_ok({"streams": []})):
+        assert probe.audio_streams("/m/a.mkv", ffprobe="ffprobe") == []
+
+
+@pytest.mark.parametrize("stdout", ["not json", json.dumps([1]), json.dumps({"streams": {"index": 1}})])
+def test_audio_streams_rejects_output_that_isnt_ffprobes(stdout):
+    with patch(RUN, return_value=_proc(stdout=stdout)), pytest.raises(ProbeError):
+        probe.audio_streams("/m/a.mkv", ffprobe="ffprobe")

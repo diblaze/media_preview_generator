@@ -22,6 +22,7 @@ import pytest
 from media_preview_generator.markers.audio import POINT_S
 from media_preview_generator.markers.audio import fingerprint as fpmod
 from media_preview_generator.markers.models import FileIdentity
+from media_preview_generator.markers.probe import AudioStream, ProbeError, ProbeStalledError, ProbeTimeoutError
 from media_preview_generator.markers.store import MarkerStore
 from tests.markers.fakes import poll_until as _wait_for
 from tests.markers.fakes import process_state as _state
@@ -317,6 +318,162 @@ def test_file_without_audio_gives_an_empty_fingerprint():
     err = b"Output file #0 does not contain any stream\n"
     with patch.object(fpmod.subprocess, "Popen", return_value=_proc(stderr=err, returncode=1)):
         assert fpmod.compute_fingerprint("/m/a.mkv", 60_000, ffmpeg="ffmpeg").size == 0
+
+
+_NO_DECODER = (
+    b"[aist#0:1/none @ 0x638d4dda6140] Decoding requested, but no decoder found for: none\n"
+    b"Error opening output file -.\n"
+)
+_AV3A_THEN_EAC3 = [
+    AudioStream(1, None, 6),  # AV3A: ffprobe knows no codec for it, nor does ffmpeg
+    AudioStream(2, "eac3", 6),
+    AudioStream(3, "aac", 2),
+]
+
+
+def _maps(popen) -> list[str | None]:
+    """The ``-map`` of each ffmpeg started, None where ffmpeg picked the stream itself."""
+    maps = []
+    for call in popen.call_args_list:
+        cmd = call.args[0]
+        maps.append(cmd[cmd.index("-map") + 1] if "-map" in cmd else None)
+    return maps
+
+
+def test_a_healthy_file_runs_one_ffmpeg_and_no_ffprobe():
+    raw = np.array([5, 6], dtype="<u4").tobytes()
+    with (
+        patch.object(fpmod.subprocess, "Popen", return_value=_proc(stdout=raw)) as popen,
+        patch.object(fpmod, "audio_streams") as streams,
+    ):
+        assert fpmod.compute_fingerprint("/m/a.mkv", 60_000, ffmpeg="ffmpeg").tolist() == [5, 6]
+    assert _maps(popen) == [None]
+    streams.assert_not_called()
+
+
+def test_an_undecodable_first_audio_stream_fingerprints_the_next_decodable_one():
+    raw = np.array([7, 8, 9], dtype="<u4").tobytes()
+    runs = [_proc(stderr=_NO_DECODER, returncode=234), _proc(stderr=_NO_DECODER, returncode=234), _proc(stdout=raw)]
+    with (
+        patch.object(fpmod.subprocess, "Popen", side_effect=runs) as popen,
+        patch.object(fpmod, "audio_streams", return_value=_AV3A_THEN_EAC3) as streams,
+    ):
+        points = fpmod.compute_fingerprint("/m/a.mp4", 1_321_472, ffmpeg="/ff/ffmpeg", retime=0.95)
+    assert points.tolist() == [7, 8, 9]
+    assert _maps(popen) == [None, "0:1", "0:2"]
+    assert popen.call_args.args[0] == fpmod.fingerprint_command(
+        "/ff/ffmpeg", "/m/a.mp4", fpmod.window_s(1_321_472), retime=0.95, audio_stream=2
+    )
+    streams.assert_called_once_with(
+        "/m/a.mp4", ffprobe=fpmod.ffprobe_path_for("/ff/ffmpeg"), timeout_s=pytest.approx(fpmod.PROBE_TIMEOUT_S, abs=1)
+    )
+
+
+def test_no_decodable_audio_stream_raises_ffmpegs_first_error():
+    runs = [_proc(stderr=_NO_DECODER, returncode=234) for _ in range(4)]
+    with (
+        patch.object(fpmod.subprocess, "Popen", side_effect=runs) as popen,
+        patch.object(fpmod, "audio_streams", return_value=_AV3A_THEN_EAC3),
+        pytest.raises(fpmod.FingerprintError, match="no decoder found"),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg")
+    assert _maps(popen) == [None, "0:1", "0:2", "0:3"]
+
+
+def test_an_audio_stream_list_ffprobe_cant_give_raises_ffmpegs_error():
+    with (
+        patch.object(fpmod.subprocess, "Popen", return_value=_proc(stderr=_NO_DECODER, returncode=234)) as popen,
+        patch.object(fpmod, "audio_streams", side_effect=ProbeError("ffprobe exited 1")),
+        pytest.raises(fpmod.FingerprintError, match="no decoder found"),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg")
+    assert _maps(popen) == [None]
+
+
+def test_another_failure_on_a_retried_stream_ends_the_retries():
+    runs = [_proc(stderr=_NO_DECODER, returncode=234), _proc(stderr=b"Invalid data found\n", returncode=1)]
+    with (
+        patch.object(fpmod.subprocess, "Popen", side_effect=runs) as popen,
+        patch.object(fpmod, "audio_streams", return_value=_AV3A_THEN_EAC3[1:]),
+        pytest.raises(fpmod.FingerprintError, match="Invalid data"),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg")
+    assert _maps(popen) == [None, "0:2"]
+
+
+@pytest.mark.parametrize(
+    ("probe_error", "raised"),
+    [
+        # A stalled mount isn't the file's fault: the stalled error records nothing against it.
+        (ProbeStalledError("2 earlier ffprobes are still stuck"), fpmod.FingerprintStalledError),
+        (ProbeTimeoutError("ffprobe failed: TimeoutExpired"), fpmod.FingerprintError),
+    ],
+)
+def test_an_ffprobe_stall_or_timeout_listing_the_streams_ends_the_fingerprint(probe_error, raised):
+    with (
+        patch.object(fpmod.subprocess, "Popen", return_value=_proc(stderr=_NO_DECODER, returncode=234)) as popen,
+        patch.object(fpmod, "audio_streams", side_effect=probe_error),
+        pytest.raises(raised) as info,
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg")
+    assert type(info.value) is raised
+    assert _maps(popen) == [None]
+
+
+def test_a_stalled_mount_between_runs_starts_no_retry():
+    stalled = [0]
+
+    def first_run(*_args, **_kwargs):
+        stalled[0] = fpmod.STALLED_LIMIT  # other files' reads got stuck while the first run failed
+        return _proc(stderr=_NO_DECODER, returncode=234)
+
+    with (
+        patch.object(fpmod, "stalled_ffmpegs", lambda: stalled[0]),
+        patch.object(fpmod.subprocess, "Popen", side_effect=first_run) as popen,
+        patch.object(fpmod, "audio_streams") as streams,
+        pytest.raises(fpmod.FingerprintStalledError),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg")
+    assert _maps(popen) == [None]
+    streams.assert_not_called()
+
+
+def test_a_cancel_between_runs_starts_no_retry():
+    cancelled = threading.Event()
+
+    def run(*_args, **_kwargs):
+        cancelled.set()
+        return _proc(stderr=_NO_DECODER, returncode=234)
+
+    with (
+        patch.object(fpmod.subprocess, "Popen", side_effect=run) as popen,
+        patch.object(fpmod, "audio_streams", return_value=_AV3A_THEN_EAC3),
+        pytest.raises(fpmod.FingerprintError, match="cancelled"),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg", cancel_check=cancelled.is_set)
+    assert _maps(popen) == [None]
+
+
+def test_the_retries_share_the_calls_time_limit(monkeypatch):
+    # One time limit for the whole call, so a waiter's LOCK_WAIT_S still covers it however many ffmpegs it ran.
+    from media_preview_generator.markers import freeze
+
+    clock = _Clock()
+    monkeypatch.setattr(freeze, "time", SimpleNamespace(monotonic=clock, sleep=time.sleep))
+
+    def slow_run(*_args, **_kwargs):
+        clock.now += 250  # the first ffmpeg only failed after most of the limit
+        return _proc(stderr=_NO_DECODER, returncode=234)
+
+    streams = MagicMock(return_value=_AV3A_THEN_EAC3[1:])
+    with (
+        patch.object(fpmod.subprocess, "Popen", side_effect=slow_run) as popen,
+        patch.object(fpmod, "audio_streams", streams),
+        pytest.raises(fpmod.FingerprintError, match="timed out after 300 s"),
+    ):
+        fpmod.compute_fingerprint("/m/a.mp4", 60_000, ffmpeg="ffmpeg", timeout_s=300)
+    assert streams.call_args.kwargs["timeout_s"] == pytest.approx(50)  # what is left of the limit, not its own 60 s
+    assert _maps(popen) == [None, "0:2"]
 
 
 def test_other_ffmpeg_errors_raise():

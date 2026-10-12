@@ -27,7 +27,15 @@ from ..freeze import Freeze
 from ..fs import gone_from_disk
 from ..locks import KeyedLocks
 from ..missing import sweep_missing_files
-from ..probe import kill_and_collect, stuck_processes
+from ..probe import (
+    ProbeError,
+    ProbeStalledError,
+    ProbeTimeoutError,
+    audio_streams,
+    ffprobe_path_for,
+    kill_and_collect,
+    stuck_processes,
+)
 from ..progress import StepFactory, StepProgress, read_progress
 from ..store import SEASON_PAIR_WINDOW, FileRecord, FingerprintCheck, MarkerStore, StoredFingerprint
 
@@ -66,15 +74,21 @@ CHROMAPRINT_RETRY_S = 600.0
 JELLYFIN_FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 # How long a killed ffmpeg may take to let go of its output before it is left to a reaper thread.
 KILL_WAIT_S = 5.0
-# The time limit of one fingerprint's ffmpeg (a hung network mount must not hold a worker).
+# The time limit of one fingerprint (a hung network mount must not hold a worker), shared by its ffmpeg runs when the
+# first one had no decoder for the audio it picked.
 FINGERPRINT_TIMEOUT_S = 300.0
-# The longest a caller waits for another run of the same file's fingerprint: the most a running one takes, with its kill
-# and its store write. Only a run frozen by its job's schedule's stop time holds the file longer, until that schedule's
-# next start; time the waiter itself is paused doesn't count.
+# The longest a caller waits for another run of the same file's fingerprint: the most a running one takes (one time
+# limit, however many ffmpegs and ffprobes it ran, and one kill) and its store write. Only a run frozen by its job's
+# schedule's stop time holds the file longer, until that schedule's next start; time the waiter itself is paused doesn't
+# count.
 LOCK_WAIT_S = FINGERPRINT_TIMEOUT_S + KILL_WAIT_S + 10.0
 _POLL_S = 0.5
 # ffmpeg's wording when a file has no audio stream to fingerprint: a stored empty answer, not a retryable failure.
 _NO_AUDIO_HINTS = ("does not contain any stream", "matches no streams", "Output file is empty")
+# ffmpeg's wording when it has no decoder for the audio stream it read (ffmpeg 7+, then older builds).
+_NO_DECODER_HINTS = ("no decoder found for", "not found for input stream")
+# The ffprobe that lists a file's audio streams reads only its headers.
+PROBE_TIMEOUT_S = 60.0
 _FILE_LOCKS = KeyedLocks()
 _monotonic = time.monotonic
 # Per ffmpeg binary: what its muxer list said, and when to ask again (None: never).
@@ -102,6 +116,10 @@ class FingerprintError(Exception):
     """ffmpeg couldn't fingerprint the file. No fingerprint is stored; season audio records the failure, so other
     episodes' season steps skip the file for a day while it is unchanged, and only its own run and a forced re-detect
     try it again sooner."""
+
+
+class _NoDecoderError(FingerprintError):
+    """ffmpeg has no decoder for the audio stream it read; another stream of the file may have one."""
 
 
 class FingerprintStalledError(FingerprintError):
@@ -216,7 +234,12 @@ def fingerprint_window(retime: float | None) -> str:
 
 
 def fingerprint_command(
-    ffmpeg: str, path: str, length_s: float, retime: float | None = None, progress_fd: int | None = None
+    ffmpeg: str,
+    path: str,
+    length_s: float,
+    retime: float | None = None,
+    progress_fd: int | None = None,
+    audio_stream: int | None = None,
 ) -> list[str]:
     """The command: raw algorithm-1 chromaprint of the first ``length_s`` seconds, stereo.
 
@@ -229,6 +252,7 @@ def fingerprint_command(
             * retime`` seconds into the file.
         progress_fd: A descriptor ffmpeg writes its ``-progress`` blocks to (the caller passes it to the child); None
             for no progress, which leaves the command as it always was.
+        audio_stream: The absolute index of the audio stream to fingerprint; None lets ffmpeg pick, as it always did.
 
     Returns:
         The command.
@@ -242,9 +266,10 @@ def fingerprint_command(
         [] if retime is None else ["-af", f"aresample={RETIME_BASE_RATE},asetrate={round(RETIME_BASE_RATE * retime)}"]
     )
     report = [] if progress_fd is None else ["-progress", f"pipe:{progress_fd}"]
+    stream = [] if audio_stream is None else ["-map", f"0:{audio_stream}"]
     return [
         ffmpeg, "-nostdin", "-v", "error", *report,
-        "-ss", "0", "-t", f"{length_s:.3f}", "-i", path,
+        "-ss", "0", "-t", f"{length_s:.3f}", "-i", path, *stream,
         "-vn", "-sn", "-dn", "-ac", "2", *speed,
         "-f", "chromaprint", "-algorithm", str(ALGORITHM), "-fp_format", "raw", "-",
     ]  # fmt: skip
@@ -268,8 +293,8 @@ def compute_fingerprint(
         duration_ms: File duration, for the window.
         ffmpeg: An ffmpeg with chromaprint.
         cancel_check: True once the job is cancelled; ffmpeg is killed.
-        timeout_s: Hard limit (a hung network mount must not hold a worker): the call returns within it plus
-            ``KILL_WAIT_S`` and one poll, not counting time paused.
+        timeout_s: Hard limit (a hung network mount must not hold a worker) for the whole call, every ffmpeg and
+            ffprobe it runs: it returns within it plus ``KILL_WAIT_S`` and one poll, not counting time paused.
         retime: Fingerprint the audio retimed to another speed (:func:`fingerprint_command`); None for its own.
         pause_check: True while everything is paused (:class:`..freeze.Freeze`): ffmpeg doesn't start, or its process
             group is stopped where it is until the resume, and the time limit moves out by the time paused. A cancel
@@ -283,12 +308,94 @@ def compute_fingerprint(
 
     Raises:
         FingerprintError: ffmpeg failed, timed out or the job was cancelled.
-        FingerprintStalledError: A pause before the start outlasted a mount stall (``STALLED_LIMIT`` ffmpegs stuck).
+        FingerprintStalledError: A pause before the start outlasted a mount stall (``STALLED_LIMIT`` ffmpegs stuck), or
+            a retry on another audio stream found the mount stalled (ffmpegs or ffprobes stuck).
+    """
+    name = os.path.basename(path)
+    freeze = Freeze.of(pause_check)
+    deadline = freeze.clock() + timeout_s
+
+    def run(audio_stream: int | None) -> np.ndarray:
+        return _run_fingerprint(
+            path,
+            duration_ms,
+            ffmpeg=ffmpeg,
+            cancel_check=cancel_check,
+            freeze=freeze,
+            deadline=deadline,
+            timeout_s=timeout_s,
+            retime=retime,
+            progress=progress,
+            audio_stream=audio_stream,
+        )
+
+    def before_the_next_run() -> None:
+        freeze.hold(cancel_check=cancel_check, name=name)
+        if cancel_check and cancel_check():
+            raise FingerprintError(f"Fingerprinting {name} cancelled")
+        _raise_if_stalled(name)
+        if freeze.clock() > deadline:
+            raise FingerprintError(f"Fingerprinting {name} timed out after {timeout_s:.0f} s")
+
+    try:
+        return run(None)
+    except _NoDecoderError as exc:
+        picked_error = exc
+    # The audio stream ffmpeg picks itself can be one it has no decoder for (AV3A ahead of an EAC3 in some web
+    # releases). Every audio stream is tried in ffmpeg's own order until one decodes; the one that just failed, listed
+    # first, fails again at once.
+    before_the_next_run()
+    try:
+        streams = audio_streams(
+            path, ffprobe=ffprobe_path_for(ffmpeg), timeout_s=min(PROBE_TIMEOUT_S, deadline - freeze.clock())
+        )
+    except ProbeStalledError as exc:
+        raise FingerprintStalledError(f"Not fingerprinting {name}: {exc}") from exc
+    except ProbeTimeoutError as exc:
+        raise FingerprintError(f"Listing the audio streams of {name} timed out: {exc}") from exc
+    except ProbeError as exc:
+        logger.debug("Couldn't list the audio streams of {}: {}", name, exc)
+        streams = []
+    for stream in streams:
+        before_the_next_run()
+        try:
+            points = run(stream.index)
+        except _NoDecoderError:
+            continue
+        logger.info(
+            "{}: ffmpeg can't decode the audio track it picks itself; fingerprinted track {} ({}) instead",
+            name,
+            stream.index,
+            stream.codec or "unknown codec",
+        )
+        return points
+    raise picked_error
+
+
+def _run_fingerprint(
+    path: str,
+    duration_ms: int,
+    *,
+    ffmpeg: str,
+    cancel_check: Callable[[], bool] | None,
+    freeze: Freeze,
+    deadline: float,
+    timeout_s: float,
+    retime: float | None,
+    progress: StepFactory | None,
+    audio_stream: int | None,
+) -> np.ndarray:
+    """One ffmpeg run of :func:`compute_fingerprint` on ``audio_stream`` (None: ffmpeg's own pick), killed past the
+    call's ``deadline`` on ``freeze``'s clock (``timeout_s`` from its start).
+
+    Raises:
+        _NoDecoderError: ffmpeg has no decoder for the audio stream it read.
+        FingerprintError: ffmpeg failed otherwise, timed out or the job was cancelled.
+        FingerprintStalledError: A pause before the start outlasted a mount stall.
     """
     name = os.path.basename(path)
     length_s = window_s(duration_ms)
-    command = fingerprint_command(ffmpeg, path, length_s, retime)
-    freeze = Freeze.of(pause_check)
+    command = fingerprint_command(ffmpeg, path, length_s, retime, audio_stream=audio_stream)
     if freeze.hold(cancel_check=cancel_check, name=name):
         # Held before the start: what was checked before the pause may no longer hold.
         if cancel_check and cancel_check():
@@ -299,7 +406,9 @@ def compute_fingerprint(
     reader: threading.Thread | None = None
     try:
         if progress_pipe is not None:
-            command = fingerprint_command(ffmpeg, path, length_s, retime, progress_fd=progress_pipe[1])
+            command = fingerprint_command(
+                ffmpeg, path, length_s, retime, progress_fd=progress_pipe[1], audio_stream=audio_stream
+            )
         # Its own session, so a pause stops ffmpeg's whole group and never the app's.
         proc = subprocess.Popen(
             command,
@@ -314,7 +423,6 @@ def compute_fingerprint(
     if progress_pipe is not None and step is not None:
         os.close(progress_pipe[1])  # ffmpeg holds the only write end, so the reader sees EOF when it exits
         reader = _start_progress_reader(progress_pipe[0], step, retime)
-    deadline = freeze.clock() + timeout_s
     try:
         while True:
             try:
@@ -337,6 +445,8 @@ def compute_fingerprint(
         text = (err or b"").decode("utf-8", errors="replace")
         if any(hint in text for hint in _NO_AUDIO_HINTS):
             return np.zeros(0, dtype="<u4")
+        if any(hint in text for hint in _NO_DECODER_HINTS):
+            raise _NoDecoderError(f"ffmpeg exited {proc.returncode} fingerprinting {name}: {text.strip()[-200:]}")
         raise FingerprintError(f"ffmpeg exited {proc.returncode} fingerprinting {name}: {text.strip()[-200:]}")
     usable = len(out) - len(out) % 4
     return np.frombuffer(out[:usable], dtype="<u4").copy()
