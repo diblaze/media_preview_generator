@@ -69,12 +69,11 @@ without changing it or starting a job. The job banner identifies **Plex loudness
 Plex keeps analysing on its own schedule too. The app preserves complete native measurements it finds before
 publication. Once the item's completion mark exists, Plex's non-forced analysis skips the completed item.
 
-Setup Health shows Plex's own **Analyze audio tracks for loudness** setting as information. Keeping native analysis
-enabled is valid: Plex can serve music and video libraries this app does not cover. Native video analysis also
-depends on each library's **Enable Loudness Analysis** setting; a server-wide schedule alone does not mean both
-applications are analysing the same videos.
+Setup Health recommends setting Plex's own **Analyze audio tracks for loudness** to **Never**, because while it's on
+Plex repeats this app's work on the Plex machine's CPU. Keeping it on is still valid if Plex serves music or video
+libraries this app does not cover; dismiss the recommendation in that case.
 
-When this app has eligible video libraries selected, its writer is ready, and a CPU device has usable loudness hours, **Set to Never** is an optional,
+When this app has eligible video libraries selected, its writer is ready, and a CPU device has usable loudness hours, **Set to Never** is a
 separately confirmed action. It changes Plex's server-wide schedule, including music and unselected video libraries;
 it does not enable this app, extend its library selection or erase existing measurements. Keep native analysis on
 if those other libraries need it. The app checks its selection, writer readiness and configured CPU eligibility again when the action runs. Busy

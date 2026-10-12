@@ -108,11 +108,11 @@ See [Plex chapter thumbnails](../guides.md#plex-chapter-thumbnails) for job beha
 **Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
 Select the movie and TV libraries this app should analyse in the server's loudness settings.
 
-**Plex's own analysis:** shows the current server-wide **Analyze audio tracks for loudness** schedule. This is
-informational: native analysis can remain enabled for music, unselected video libraries and excluded files.
-The schedule alone does not prove duplicate video work; Plex also has a per-library loudness setting.
+**Plex's own analysis:** recommends setting the server-wide **Analyze audio tracks for loudness** schedule to
+**Never**. While it's on, Plex analyses the same videos this app does, on the Plex machine's CPU. Keep it on, and
+dismiss the recommendation, if you need it for music, unselected video libraries or excluded files.
 
-**Set to Never:** an optional action when this app's writer is ready and eligible video libraries are selected.
+**Set to Never:** available when this app's writer is ready and eligible video libraries are selected.
 The confirmation explains that it stops Plex's native loudness analysis in every library, including music.
 It does not turn on this app or expand its coverage, and existing measurements remain available. Selection
 and writer readiness are checked again before the change is sent to Plex. This action is excluded from bulk fixes.

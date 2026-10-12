@@ -2886,7 +2886,6 @@
             const btn = _makeActionButton(
                 'btn-outline-secondary text-body', icon, escapeHtml(check.optional_label), check, optionalDir,
             );
-            btn.querySelector('i').setAttribute('aria-hidden', 'true');
             btn.title = check.optional_label;
             btn.addEventListener('click', () => _runCheckAction(serverId, serverType, check, optionalDir, btn));
             acts.appendChild(btn);
@@ -3006,7 +3005,7 @@
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = `btn btn-sm ${colorCls} mt-1`;
-        btn.innerHTML = `<i class="bi ${iconCls} me-1"></i>${text}`;
+        btn.innerHTML = `<i class="bi ${iconCls} me-1" aria-hidden="true"></i>${text}`;
         btn.title = `${text} ${check.label || check.id || ''}`;
         btn.dataset.direction = direction;
         return btn;

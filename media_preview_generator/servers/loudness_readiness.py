@@ -92,41 +92,44 @@ def loudness_readiness_section(
     workers_ready = bool(future_capacity(effective_worker_groups(saved), saved.get("quiet_hours"), "loudness"))
     can_disable = ready and bool(selected) and workers_ready and not plex_off
     if known:
-        unavailable = None
-        if not plex_off and not ready:
-            unavailable = "Set to Never is unavailable until this app can store loudness measurements."
-        elif not plex_off and not selected:
-            unavailable = (
-                "Choose at least one movie or TV library for this app's loudness analysis to use Set to Never."
+        native_reason: str | None = None
+        if not plex_off:
+            native_reason = (
+                "Plex also analyses loudness on its own schedule, repeating this app's work on the Plex machine's CPU. "
+                "Never stops it in every library, music included."
             )
-        elif not plex_off and not workers_ready:
-            unavailable = (
-                "Configure CPU workers for Loudness with hours outside global quiet hours before using Set to Never."
-            )
+            if not ready:
+                native_reason += " Set to Never is unavailable until this app can store loudness measurements."
+            elif not selected:
+                native_reason += (
+                    " Choose at least one movie or TV library for this app's loudness analysis to use Set to Never."
+                )
+            elif not workers_ready:
+                native_reason += " Configure CPU workers for Loudness with hours outside global quiet hours before using Set to Never."
         checks.append(
             {
                 "id": "loudness_plex_analysis",
-                "label": "Plex's own loudness schedule",
+                "label": "Plex's own loudness analysis is off" if plex_off else "Plex also analyses loudness",
                 "docs_anchor": "plex-loudness",
                 "tooltip": "Plex's server-wide Analyze audio tracks for loudness setting, for every library, music too.",
                 "explanation": (
                     "<p>Plex's <em>Analyze audio tracks for loudness</em> schedule applies server-wide, including music. "
-                    "For video libraries with Plex's <em>Enable Loudness Analysis</em> on, native analysis can overlap "
-                    "this app's work. Keeping Plex's schedule enabled is supported.</p>"
+                    "For video libraries with Plex's <em>Enable Loudness Analysis</em> on, Plex analyses the same files "
+                    "this app does.</p>"
                     "<p>This app analyses only its selected movie and TV libraries and respects your exclusions. "
                     "Keep Plex's analysis on if you need it for unselected files, music loudness leveling or smart "
-                    "transitions. Setting Never is optional and leaves existing measurements available.</p>"
+                    "transitions. Never leaves existing measurements available.</p>"
                 ),
-                "ok": True,
-                "severity": "info",
-                "informational": True,
+                "ok": plex_off,
+                "severity": "recommended",
                 "current": NATIVE_MODES[cast(str, mode)],
-                "reason": unavailable,
+                "recommended": "Never",
+                "reason": native_reason,
                 "help_url": "/settings#section-workers" if not workers_ready else None,
                 "help_label": "Configure CPU workers" if not workers_ready else None,
                 "actions": {"disable": _NEVER_ACTION} if can_disable else {},
-                "optional_action": "disable",
-                "optional_label": "Set to Never",
+                "fix_action": "disable",
+                "fix_label": "Set to Never",
                 # Server-wide, music included: never part of a bulk fix.
                 "bulk": False,
                 "meta": {"flag": PLEX_LOUDNESS_PREF},
@@ -136,7 +139,7 @@ def loudness_readiness_section(
         "id": "plex_loudness",
         "title": "Plex loudness",
         "docs_anchor": "plex-loudness",
-        "ok": ready,
+        "ok": ready and (plex_off or not known),
         "severity": "recommended" if ready else "critical",
         "checks": checks,
     }

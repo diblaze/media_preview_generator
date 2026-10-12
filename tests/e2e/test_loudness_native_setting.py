@@ -106,23 +106,22 @@ def _open(page: Page, native_server):
         page.locator('#editServerModal [data-bs-target="#edit-tab-health"]').click()
     expect(page.locator("#edit-tab-health")).to_have_css("opacity", "1")
     body = page.locator("#editReadinessBody")
-    expect(body).to_contain_text("Plex's own loudness schedule")
-    all_good = body.locator("details[data-tier='ok']")
-    all_good.evaluate("el => { el.open = true; }")
+    expect(body).to_contain_text("Plex also analyses loudness")
+    body.locator("details").evaluate_all("els => els.forEach(el => { el.open = true; })")
     return body
 
 
 @pytest.mark.parametrize("mode,description", [("scheduled", "As a scheduled task"), ("asap", "when media is added")])
-def test_native_schedule_is_visible_without_recommending_a_change(page: Page, native_server, mode, description):
+def test_native_schedule_is_recommended_off(page: Page, native_server, mode, description):
     native_server.mode = mode
     body = _open(page, native_server)
-    row = body.locator(".rd-row", has_text="Plex's own loudness schedule").first
+    row = body.locator("details[data-tier='recommended'] .rd-row", has_text="Plex also analyses loudness").first
     expect(row).to_contain_text(description)
-    expect(row).not_to_contain_text("Recommended")
+    expect(row).to_contain_text("Recommended")
+    expect(row).to_contain_text("repeating this app's work")
     expect(row).not_to_contain_text("override")
     expect(row.get_by_role("button", name="Set to Never", exact=True)).to_be_visible()
-    expect(page.locator("#editReadinessBadge")).to_have_text("ready")
-    expect(page.locator("#editReadinessFixControls")).to_be_hidden()
+    expect(page.locator("#editReadinessBadge")).to_have_text("recommendations")
     assert native_server.puts == []
 
 
@@ -173,7 +172,7 @@ def test_native_setting_remains_visible_when_mutation_is_unavailable(page: Page,
     assert native_server.puts == []
 
 
-def test_bulk_fix_plan_excludes_optional_native_loudness_action(page: Page, native_server):
+def test_bulk_fix_plan_excludes_server_wide_native_loudness_action(page: Page, native_server):
     native_server.prefs["FSEventLibraryUpdatesEnabled"] = False
     _open(page, native_server)
     page.locator("#editReadinessFixAllBtn").click()
@@ -185,7 +184,7 @@ def test_bulk_fix_plan_excludes_optional_native_loudness_action(page: Page, nati
 
 
 @pytest.mark.parametrize("width,theme", [(1440, "dark"), (390, "light")])
-def test_optional_setting_and_warning_fit_desktop_and_mobile(page: Page, native_server, width, theme):
+def test_native_setting_and_warning_fit_desktop_and_mobile(page: Page, native_server, width, theme):
     page.set_viewport_size({"width": width, "height": 1000})
     body = _open(page, native_server)
     page.evaluate("theme => document.documentElement.dataset.bsTheme = theme", theme)

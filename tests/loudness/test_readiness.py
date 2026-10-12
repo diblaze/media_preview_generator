@@ -58,7 +58,7 @@ def test_stored_unsupported_music_selection_is_not_reported_as_ready():
 
 
 @pytest.mark.parametrize("mode", ["never", "scheduled", "asap", None, "new-value", []])
-def test_native_schedule_is_information_not_a_required_fix(mode):
+def test_native_schedule_is_recommended_off(mode):
     prefs = {"LoudnessAnalysisBehavior": mode}
     server = MagicMock()
     cfg = _cfg({"enabled": True})
@@ -67,20 +67,22 @@ def test_native_schedule_is_information_not_a_required_fix(mode):
     ) as capability:
         section = loudness_readiness_section(server, cfg, prefs)
     capability.assert_called_once_with(server, cfg)
-    assert section["ok"] is True
     rows = {check["id"]: check for check in section["checks"]}
     if mode not in ("never", "scheduled", "asap"):
         assert "loudness_plex_analysis" not in rows
+        assert section["ok"] is True
         return
     row = rows["loudness_plex_analysis"]
-    assert row["ok"] is True and row["severity"] == "info" and row["informational"] is True
-    assert "recommended" not in row and "fix_action" not in row
+    assert row["severity"] == "recommended" and "informational" not in row
+    assert row["recommended"] == "Never"
     assert row["bulk"] is False
+    assert section["ok"] is (mode == "never")
     if mode == "never":
-        assert row["actions"] == {}
+        assert row["ok"] is True and row["reason"] is None and row["actions"] == {}
     else:
-        assert row["optional_action"] == "disable"
-        assert row["optional_label"] == "Set to Never"
+        assert row["ok"] is False
+        assert "repeating this app's work" in row["reason"]
+        assert row["fix_action"] == "disable" and row["fix_label"] == "Set to Never"
         action = row["actions"]["disable"]
         assert action["action"] == "set_plex_loudness_never"
         assert all(term in action["confirm"]["body"] for term in ["music", "unselected", "Existing measurements"])
@@ -107,11 +109,12 @@ def test_optional_control_requires_current_writer_and_nonempty_video_selection(l
         section = loudness_readiness_section(server, cfg, {"LoudnessAnalysisBehavior": "scheduled"})
     capability.assert_called_once_with(server, cfg)
     row = next(row for row in section["checks"] if row["id"] == "loudness_plex_analysis")
-    assert section["ok"] is ready
+    assert section["ok"] is False
     assert bool(row["actions"]) is action
-    assert row["ok"] is True and row["informational"] is True
+    assert row["ok"] is False and row["severity"] == "recommended"
+    assert "repeating this app's work" in row["reason"]
     if not action:
-        assert row["reason"]
+        assert "Set to Never" in row["reason"]
 
 
 def test_native_information_remains_visible_when_probe_fails():
@@ -122,5 +125,5 @@ def test_native_information_remains_visible_when_probe_fails():
     assert section["ok"] is False and section["severity"] == "critical"
     row = section["checks"][1]
     assert row["id"] == "loudness_plex_analysis" and row["actions"] == {}
-    assert row["ok"] is True
+    assert row["ok"] is False and "unavailable until this app can store" in row["reason"]
     assert loudness_readiness_section(MagicMock(), _cfg({"enabled": False})) is None
