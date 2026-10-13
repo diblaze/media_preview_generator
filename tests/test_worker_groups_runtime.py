@@ -665,3 +665,29 @@ def test_two_groups_share_one_gpu_budget_during_handover():
     pool.reconcile_groups([member_group("b", gpu=2, cpu=0)], GPU)
     assert all(w._pending_removal for w in busy)
     assert pool._find_available_worker(kind="previews", claim=True) is None
+
+
+def test_idle_gpu_worker_is_picked_before_idle_cpu_worker_whatever_the_group_order():
+    """#404: an upgrade from v4 lists the CPU group first; jobs must still go to an idle GPU first, as v4 did."""
+    from media_preview_generator.worker_groups import groups_from_legacy
+
+    legacy = {"cpu_threads": 2, "gpu_config": [{"device": "cuda:0", "name": "Test GPU", "enabled": True, "workers": 2}]}
+    groups = groups_from_legacy(legacy)
+    assert [g["members"][0]["resource"] for g in groups] == ["cpu", "gpu"]
+    pool = WorkerPool(0, 0, GPU)
+    pool.reconcile_groups(groups, GPU)
+
+    picked = [pool._find_available_worker(kind="previews", claim=True).worker_type for _ in range(4)]
+
+    assert picked == ["GPU", "GPU", "CPU", "CPU"]
+    assert pool._find_available_worker(kind="previews", claim=True) is None
+
+
+def test_gpu_groups_keep_their_order_and_cpu_only_kinds_still_get_the_cpu():
+    pool = WorkerPool(0, 0, GPU)
+    pool.reconcile_groups([group("cpu"), group("gpu-a", resource="gpu"), group("gpu-b", resource="gpu")], GPU)
+
+    assert pool._find_available_worker(kind="loudness", claim=True).group_id == "cpu"
+    assert pool._find_available_worker(kind="previews", claim=True).group_id == "gpu-a"
+    assert pool._find_available_worker(kind="previews", claim=True).group_id == "gpu-b"
+    assert pool._find_available_worker(kind="previews", claim=True) is None

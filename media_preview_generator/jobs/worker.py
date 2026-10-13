@@ -1599,10 +1599,11 @@ class WorkerPool:
                 ``worker.is_busy = False`` if it backs out.
 
         Returns:
-            First available worker matching criteria, or None
+            An available worker matching criteria, GPU workers before CPU workers, or None
         """
         with self._workers_lock:
-            for worker in self.workers:
+            # Group order isn't a priority (an upgrade from v4 lists the CPU group first), so an idle GPU always wins.
+            for worker in sorted(self.workers, key=lambda w: w.worker_type != "GPU"):
                 if cpu_only and worker.worker_type != "CPU":
                     continue
                 if worker.is_available() and self._worker_supports_kind(worker, kind):
