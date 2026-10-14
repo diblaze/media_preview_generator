@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from media_preview_generator.markers.audio import season
-from media_preview_generator.markers.models import FileIdentity
+from media_preview_generator.markers.models import FileIdentity, Source
 from media_preview_generator.markers.pipeline import SEASON_CACHE_TTL_S
 from media_preview_generator.markers.season_cache import SeasonCache
 from media_preview_generator.markers.store import MarkerStore
@@ -219,6 +219,45 @@ class TestReadMemo:
             writer.start()
             writer.join()
             assert store.get_frame_rate(rec.id) == (True, 25.0)
+
+    def test_failure_lookups_are_made_once_inside_a_run(self, store, rec):
+        identity = FileIdentity(rec.canonical_path, rec.size, rec.mtime_ns)
+        with store.read_memo(), patch.object(store, "_reading", wraps=store._reading) as reading:
+            for _ in range(3):
+                assert store.get_detector_failure(rec.id, Source.SEASON_AUDIO) is None
+                assert store.credits_text_timed_out_at(identity) is None
+        assert reading.call_count == 2
+
+    def test_a_detector_failure_another_thread_records_is_seen(self, store, rec):
+        with store.read_memo():
+            assert store.get_detector_failure(rec.id, Source.SEASON_AUDIO) is None
+            writer = threading.Thread(target=store.set_detector_failure, args=(rec.id, Source.SEASON_AUDIO, "sig"))
+            writer.start()
+            writer.join()
+            assert store.get_detector_failure(rec.id, Source.SEASON_AUDIO) == "sig"
+
+    @pytest.mark.parametrize(
+        "record, read",
+        [
+            ("record_member_probe_failure", "member_probe_failed_at"),
+            ("record_member_fingerprint_failure", "member_fingerprint_failed_at"),
+            ("record_end_picture_failure", "end_picture_failed_at"),
+            ("record_credits_text_timeout", "credits_text_timed_out_at"),
+        ],
+    )
+    def test_an_identity_failure_another_thread_records_is_seen(self, store, rec, record, read):
+        identity = FileIdentity(rec.canonical_path, rec.size, rec.mtime_ns)
+        failed_at = datetime(2026, 10, 1, tzinfo=UTC)
+        with store.read_memo():
+            assert getattr(store, read)(identity) is None
+            writer = threading.Thread(
+                target=getattr(store, record),
+                args=(identity, failed_at),
+                kwargs={"forget_before": failed_at - timedelta(days=1)},
+            )
+            writer.start()
+            writer.join()
+            assert getattr(store, read)(identity) == failed_at
 
     def test_a_list_handed_out_can_be_changed_without_changing_the_next_read(self, store, rec):
         with store.read_memo():

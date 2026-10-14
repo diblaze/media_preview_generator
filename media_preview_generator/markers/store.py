@@ -544,9 +544,19 @@ class StoredFingerprint:
 
 
 # Tables a check's cached reads come from (a file's row, its evidence, frame rate, fingerprints, decided and locked
-# markers, detector runs): a write to any of them moves ``MarkerStore.data_generation``.
+# markers, detector runs and failures): a write to any of them moves ``MarkerStore.data_generation``.
 _READ_TABLES = frozenset(
-    {"files", "evidence", "evidence_versions", "frame_rates", "fingerprints", "markers", "detector_runs"}
+    {
+        "files",
+        "evidence",
+        "evidence_versions",
+        "frame_rates",
+        "fingerprints",
+        "markers",
+        "detector_runs",
+        "detector_failures",
+        *_IDENTITY_FAILURE_TABLES,
+    }
 )
 _WRITTEN_TABLE = re.compile(
     r"\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+(\w+)", re.IGNORECASE
@@ -2296,6 +2306,7 @@ class MarkerStore:
                 (file_id, source.value, signature, self._now()),
             )
 
+    @read_memoised
     def get_detector_failure(self, file_id: int, source: Source) -> str | None:
         """The signature a local detector's last failed attempt for a file was based on, or None."""
         with self._reading() as conn:
@@ -2394,6 +2405,7 @@ class MarkerStore:
                 (identity.canonical_path, identity.size, identity.mtime_ns, failed_at.isoformat()),
             )
 
+    @read_memoised
     def _identity_failed_at(self, table: str, identity: FileIdentity) -> datetime | None:
         """When a failure with exactly this identity was last recorded, or None (never, or another identity)."""
         if table not in _IDENTITY_FAILURE_TABLES:

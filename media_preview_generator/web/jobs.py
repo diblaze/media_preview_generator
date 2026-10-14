@@ -16,6 +16,7 @@ import os
 import queue
 import sqlite3
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -178,6 +179,10 @@ SLOT_WAIT_SINCE = "slot_wait_since"
 SLOT_WAIT_HEARTBEAT_S = 60.0
 LAST_ACTIVE_AT = "last_active_at"
 ACTIVITY_HEARTBEAT_S = 60.0
+# A scan replaces its per-server counts after every file, up to hundreds a second; saving the job and telling each
+# open Jobs page (which then reloads the whole list) that often took CPU from the scan itself. Progress events carry
+# the live counts, and finishing, cancelling, parking or stopping the app saves the last ones.
+PUBLISHERS_SAVE_INTERVAL_S = 1.0
 
 
 def _now() -> datetime:
@@ -870,6 +875,7 @@ class JobManager:
         self._lock = threading.RLock()
         self._log_write_lock = threading.Lock()
         self._running_job_ids: set = set()
+        self._publishers_saved_at: dict[str, float] = {}
         self._on_progress_callbacks: list[Callable] = []
 
         # SocketIO events waiting to be sent, oldest first, and whether a sender thread is draining them.
@@ -1357,6 +1363,7 @@ class JobManager:
                 self._delete_file_results(job_id)
                 self._job_logs.pop(job_id, None)
                 removed = self._jobs.pop(job_id)
+                self._publishers_saved_at.pop(job_id, None)
                 self._persist_delete(job_id, input_reference=(removed.config or {}).get("file_paths_ref"))
             logger.info("Retention: removed {} job(s) older than {} day(s)", len(expired_ids), days)
             # Reclaim the freelist pages those deletes produced so the
@@ -2357,12 +2364,21 @@ class JobManager:
         every task and overwrites the field, so this needs replace
         semantics rather than append. Keeps job.publishers bounded by
         the number of registered media servers, not by file count.
+        Saved and announced at most once per ``PUBLISHERS_SAVE_INTERVAL_S``
+        per job; the in-memory rows are always the latest.
         """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return
             job.publishers = list(publisher_rows or [])
+            now = time.monotonic()
+            saved_at = self._publishers_saved_at.get(job_id)
+            # A job that already ended (a check finishing after a cancel) isn't saved again by anything else.
+            ended = job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+            if not ended and saved_at is not None and now - saved_at < PUBLISHERS_SAVE_INTERVAL_S:
+                return
+            self._publishers_saved_at[job_id] = now
             self._persist_job(job)
             self._emit_event("job_updated", job.to_dict())
 
@@ -2502,6 +2518,7 @@ class JobManager:
                     # it. Staying RUNNING lets requeue_interrupted_jobs revive the job on the next start.
                     log_msg = f"Job {job_id} left running: the app is shutting down ({error or warning})"
                     log_level = "warning"
+                    self._persist_job(job)
                 elif job.status == JobStatus.CANCELLED:
                     self.clear_pause_flag(job_id)
                     self.clear_cancellation_flag(job_id)
@@ -2740,6 +2757,7 @@ class JobManager:
                 self._delete_file_results(jid)
                 self._job_logs.pop(jid, None)
                 removed = self._jobs.pop(jid)
+                self._publishers_saved_at.pop(jid, None)
                 self._persist_delete(jid, input_reference=(removed.config or {}).get("file_paths_ref"))
                 deleted_ids.append(jid)
         for jid in deleted_ids:
@@ -2816,6 +2834,7 @@ class JobManager:
                 self._delete_file_results(job_id)
                 self._job_logs.pop(job_id, None)
                 removed = self._jobs.pop(job_id)
+                self._publishers_saved_at.pop(job_id, None)
                 self._persist_delete(job_id, input_reference=(removed.config or {}).get("file_paths_ref"))
             if to_delete:
                 self._emit_event("jobs_cleared", {"count": len(to_delete)})

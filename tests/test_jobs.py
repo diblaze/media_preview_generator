@@ -870,6 +870,95 @@ class TestPublishersAttribution:
         names = {p["server_name"] for p in revived.publishers}
         assert names == {"Plex Home", "Emby"}
 
+    @staticmethod
+    def _rows(published: int) -> list[dict]:
+        return [{"server_id": "p1", "server_name": "Plex", "server_type": "plex", "counts": {"published": published}}]
+
+    def test_rapid_updates_are_saved_and_announced_once_a_second(self, config_dir, monkeypatch):
+        """A scan replaces the counts after every file; each save made every open Jobs page reload the whole list."""
+        import media_preview_generator.web.jobs as jobs_mod
+
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="X")
+        now = [1000.0]
+        monkeypatch.setattr(jobs_mod.time, "monotonic", lambda: now[0])
+        saved: list[int] = []
+        monkeypatch.setattr(jm, "_persist_job", lambda j: saved.append(j.publishers[0]["counts"]["published"]))
+        events: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            jm, "_emit_event", lambda e, d: events.append((e, d["publishers"][0]["counts"]["published"]))
+        )
+
+        for published in (1, 2, 3):
+            jm.set_publishers(job.id, self._rows(published))
+            now[0] += 0.3
+        assert saved == [1]
+        assert events == [("job_updated", 1)]
+        assert jm.get_job(job.id).publishers == self._rows(3)
+
+        now[0] += jobs_mod.PUBLISHERS_SAVE_INTERVAL_S
+        jm.set_publishers(job.id, self._rows(4))
+        assert saved == [1, 4]
+        assert events == [("job_updated", 1), ("job_updated", 4)]
+
+    def test_each_job_has_its_own_spacing(self, config_dir, monkeypatch):
+        import media_preview_generator.web.jobs as jobs_mod
+
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        first, second = jm.create_job(library_name="A"), jm.create_job(library_name="B")
+        monkeypatch.setattr(jobs_mod.time, "monotonic", lambda: 1000.0)
+        saved: list[str] = []
+        monkeypatch.setattr(jm, "_persist_job", lambda j: saved.append(j.id))
+
+        jm.set_publishers(first.id, self._rows(1))
+        jm.set_publishers(second.id, self._rows(1))
+        assert saved == [first.id, second.id]
+
+    @pytest.mark.parametrize("end", ["complete", "fail", "cancel", "park", "app_stopping"])
+    def test_ending_or_parking_saves_the_counts_held_back(self, config_dir, monkeypatch, end):
+        import media_preview_generator.web.jobs as jobs_mod
+
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="X")
+        jm.start_job(job.id)
+        monkeypatch.setattr(jobs_mod.time, "monotonic", lambda: 1000.0)
+        jm.set_publishers(job.id, self._rows(1))
+        jm.set_publishers(job.id, self._rows(2))
+        assert JobManager(config_dir=config_dir).get_job(job.id).publishers == self._rows(1)
+
+        if end == "complete":
+            jm.complete_job(job.id)
+        elif end == "fail":
+            jm.complete_job(job.id, error="boom")
+        elif end == "cancel":
+            jm.cancel_job(job.id)
+        elif end == "park":
+            jm.park_job(job.id, "checkpoint-ref", "waiting")
+        else:
+            monkeypatch.setattr(jobs_mod, "is_shutting_down", lambda: True)
+            jm.complete_job(job.id, error="killed by the stop")
+            assert jm.get_job(job.id).status == JobStatus.RUNNING
+
+        assert JobManager(config_dir=config_dir).get_job(job.id).publishers == self._rows(2)
+
+    def test_counts_arriving_after_a_cancel_are_saved(self, config_dir, monkeypatch):
+        import media_preview_generator.web.jobs as jobs_mod
+
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="X")
+        jm.start_job(job.id)
+        monkeypatch.setattr(jobs_mod.time, "monotonic", lambda: 1000.0)
+        jm.set_publishers(job.id, self._rows(1))
+        jm.cancel_job(job.id)
+
+        jm.set_publishers(job.id, self._rows(2))
+
+        assert JobManager(config_dir=config_dir).get_job(job.id).publishers == self._rows(2)
+
 
 class TestParentScheduleId:
     """D20 — Jobs spawned by a schedule carry parent_schedule_id so the

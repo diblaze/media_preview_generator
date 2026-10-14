@@ -448,6 +448,17 @@ function initDashboard() {
     });
 }
 
+// Every running job sends job_updated up to once a second, and each reload lists every job, so one reload covers
+// the updates that arrive within two seconds. An update that changes a shown job's status reloads at once.
+let _jobsReloadTimer = null;
+function loadJobsSoon() {
+    if (_jobsReloadTimer) return;
+    _jobsReloadTimer = setTimeout(function () {
+        _jobsReloadTimer = null;
+        loadJobs();
+    }, 2000);
+}
+
 // Polls fn every ms, skipping ticks while the tab is hidden or the previous call is still running.
 function startPoller(fn, ms) {
     let running = false;
@@ -495,7 +506,9 @@ function connectSocket() {
     });
 
     socket.on('job_updated', function(job) {
-        loadJobs();
+        const shown = jobs.find(j => j.id === job.id);
+        if (shown && shown.status !== job.status) loadJobs();
+        else loadJobsSoon();
     });
 
     socket.on('job_started', function(job) {
