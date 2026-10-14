@@ -10,7 +10,6 @@ import copy
 import hashlib
 import json
 import re
-import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,7 +34,6 @@ CREDITS_WINDOW_VALUES_S: tuple[int, ...] = (300, 600, 900, 1200, 1800)
 _CREDITS_WINDOW_KEYS: tuple[str, ...] = ("tv_s", "movie_s")
 SECRET_MASK = "****"
 _API_KEY_MAX_LEN = 200
-_AGENT_URL_MAX_LEN = 500
 # Sports libraries are excluded by default: no source covers them. Name-based because no vendor
 # exposes a "sports" library kind; an explicit library_ids choice always wins.
 _SPORTS_NAME_RE = re.compile(r"\bsports?\b", re.IGNORECASE)
@@ -56,8 +54,8 @@ DEFAULT_GLOBAL_MARKERS: dict[str, Any] = {
 
 
 def default_plex_agent() -> dict[str, Any]:
-    """The default Plex marker agent block: none set up, so the database is written in this process."""
-    return {"enabled": False, "url": "", "token": ""}
+    """The default Plex database node block: none chosen, so the database is written in this process."""
+    return {"enabled": False, "node_id": None}
 
 
 def default_server_markers(server_type: str) -> dict[str, Any]:
@@ -159,11 +157,14 @@ class ServerMarkersSettings:
     db_write_confirmed_at: str | None
     on_plex_redetect: str
     on_emby_redetect: str = "restore"
-    # The Plex marker agent beside a Plex on another machine (``publishers.plex_remote``).
+    # The Plex marker agent beside a Plex on another machine (``publishers.plex_remote``). The server stores only
+    # which node it is (``agent_node_id``); the address and key are read from that node's record.
     agent_enabled: bool = False
     agent_url: str = ""
     # repr=False: this dataclass's default repr reaches log lines and test-failure output, like TheIntroDB's key.
     agent_token: str = field(default="", repr=False)
+    agent_node_id: str | None = None
+    agent_node_name: str = ""
 
     @property
     def keeps_server_markers(self) -> bool:
@@ -306,55 +307,48 @@ def _normalise_credits_window(raw: object) -> tuple[dict | None, str]:
     return out, ""
 
 
-def _stored_agent_token(existing: object) -> str:
-    """The Plex marker agent key already on record for this server ("" when there is none)."""
+def _stored_agent_node_id(existing: object) -> str | None:
+    """The Plex database node already chosen for this server (None when there is none)."""
     if not isinstance(existing, dict):
-        return ""
+        return None
     plex = existing.get("plex")
     agent = plex.get("agent") if isinstance(plex, dict) else None
-    return str(agent.get("token") or "") if isinstance(agent, dict) else ""
+    node_id = agent.get("node_id") if isinstance(agent, dict) else None
+    return str(node_id) if node_id else None
 
 
-def _normalise_agent(raw: object, existing_token: str) -> tuple[dict | None, str]:
-    """Validate a posted Plex marker agent block.
+def _node_exists(node_id: str) -> bool:
+    from ..nodes.settings import find_node, stored_nodes
 
-    The address is checked here rather than at connect time so a typo is refused while the user is looking at the
-    field. The key is the same shape of secret as TheIntroDB's: ``****`` means "keep the stored one", and a block
-    that leaves it out keeps it too, so a save that doesn't touch the field can never drop it.
+    return find_node(stored_nodes(), node_id) is not None
+
+
+def _normalise_agent(raw: object, existing_node_id: str | None) -> tuple[dict | None, str]:
+    """Validate a posted Plex database node choice (``{"enabled", "node_id"}``).
+
+    The address and key live on the node's record (Nodes page); a server only says which node opens its database.
+    Only a newly chosen node is looked up: a stored choice is never re-checked on load, so a hand-edited nodes list
+    can't make the server's whole Intro & Credits block fall back to its defaults.
 
     Args:
-        raw: The posted ``markers.plex.agent`` value (None → the stored key with the agent off).
-        existing_token: The key currently on record.
+        raw: The posted ``markers.plex.agent`` value (None → the stored node, switched off).
+        existing_node_id: The node currently on record.
 
     Returns:
         ``(block, "")`` on success, ``(None, message)`` on error.
     """
     if raw is None:
-        return {**default_plex_agent(), "token": existing_token}, ""
+        return {"enabled": False, "node_id": existing_node_id}, ""
     if not isinstance(raw, dict):
         return None, "markers.plex.agent must be an object"
-    url = str(raw.get("url") or "").strip().rstrip("/")
-    if url:
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
-            return None, "markers.plex.agent.url must be an http(s) address, e.g. http://plex-host.lan:9494"
-        if "@" in parsed.netloc or len(url) > _AGENT_URL_MAX_LEN:
-            return None, "markers.plex.agent.url must be a plain address with no username, password or query"
-    token = raw.get("token", existing_token)
-    token = existing_token if token == SECRET_MASK else str(token or "").strip()
-    # The key goes in an Authorization header: a pasted curly quote or zero-width space would make the request fail
-    # with the key in the traceback, and the agent's constant-time compare raises on non-ASCII. Refused here instead.
-    if token and token != existing_token and not (len(token) <= _API_KEY_MAX_LEN and sendable_api_key(token)):
-        return (
-            None,
-            f"markers.plex.agent.token must be up to {_API_KEY_MAX_LEN} printable ASCII characters with no spaces",
-        )
-    if len(token) > _API_KEY_MAX_LEN:
-        return None, f"markers.plex.agent.token must be at most {_API_KEY_MAX_LEN} characters"
+    node_raw = raw.get("node_id", existing_node_id)
+    node_id = str(node_raw).strip() if node_raw else None
     enabled = bool(raw.get("enabled"))
-    if enabled and not (url and token):
-        return None, "Set the Plex marker agent's address and shared key before turning it on"
-    return {"enabled": enabled, "url": url, "token": token}, ""
+    if enabled and not node_id:
+        return None, "Choose the node that opens this Plex server's database before turning it on"
+    if node_id and node_id != existing_node_id and not _node_exists(node_id):
+        return None, "That node isn't on the Nodes page any more. Choose another node or add it again."
+    return {"enabled": enabled, "node_id": node_id}, ""
 
 
 def validate_server(raw: object, server_type: str, existing: object = None) -> tuple[dict | None, str]:
@@ -363,7 +357,7 @@ def validate_server(raw: object, server_type: str, existing: object = None) -> t
     Args:
         raw: The posted block (None → defaults).
         server_type: ``plex``, ``emby`` or ``jellyfin``.
-        existing: The stored block, used only to keep the Plex marker agent's key when ``****`` is posted back.
+        existing: The stored block, used only to tell a newly chosen Plex database node from the stored one.
 
     Returns:
         ``(block, "")`` on success, ``(None, message)`` on error.
@@ -390,7 +384,7 @@ def validate_server(raw: object, server_type: str, existing: object = None) -> t
         confirmed = str(confirmed) if confirmed else None
         if block["enabled"] and not confirmed:
             return None, "Confirm the Plex database write before turning on Intro & Credits for this Plex server"
-        agent, err = _normalise_agent(plex_raw.get("agent"), _stored_agent_token(existing))
+        agent, err = _normalise_agent(plex_raw.get("agent"), _stored_agent_node_id(existing))
         if err:
             return None, err
         block["plex"] = {"db_write_confirmed_at": confirmed, "on_plex_redetect": redetect, "agent": agent}
@@ -437,7 +431,8 @@ def mask_server(block: object, server_type: str) -> dict:
     out = copy.deepcopy(block) if isinstance(block, dict) else default_server_markers(server_type)
     plex = out.get("plex")
     agent = plex.get("agent") if isinstance(plex, dict) else None
-    if isinstance(agent, dict):
+    # Only a block from before nodes (v24) still holds a key; the node's own record holds it now.
+    if isinstance(agent, dict) and "token" in agent:
         agent["token"] = SECRET_MASK if agent.get("token") else ""
     return out
 
@@ -499,6 +494,12 @@ def load_server(raw: object, server_type: str) -> ServerMarkersSettings:
     plex = block.get("plex") or {}
     emby = block.get("emby") or {}
     agent = plex.get("agent") or {}
+    node_id = agent.get("node_id") or None
+    agent_url, agent_token, agent_node_name = "", "", ""
+    if node_id:
+        from ..nodes.settings import node_address
+
+        agent_url, agent_token, agent_node_name = node_address(node_id)
     ids = block["library_ids"]
     return ServerMarkersSettings(
         enabled=block["enabled"],
@@ -507,8 +508,10 @@ def load_server(raw: object, server_type: str) -> ServerMarkersSettings:
         on_plex_redetect=plex.get("on_plex_redetect", "restore"),
         on_emby_redetect=emby.get("on_emby_redetect", "restore"),
         agent_enabled=bool(agent.get("enabled")),
-        agent_url=str(agent.get("url") or ""),
-        agent_token=str(agent.get("token") or ""),
+        agent_url=agent_url,
+        agent_token=agent_token,
+        agent_node_id=node_id,
+        agent_node_name=agent_node_name,
     )
 
 

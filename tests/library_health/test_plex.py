@@ -212,7 +212,7 @@ def test_multi_part_item_counts_each_part_markers_shared(monkeypatch, tmp_path):
 
 _AGENT_ON = {
     **_MARKERS_ON,
-    "plex": {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": True, "url": "http://agent:9", "token": "k"}},
+    "plex": {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": True, "node_id": "n1"}},
 }
 
 

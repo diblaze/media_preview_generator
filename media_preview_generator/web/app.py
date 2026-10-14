@@ -273,6 +273,15 @@ def _prewarm_caches() -> None:
     threading.Thread(target=_warm_version, name="prewarm-version", daemon=True).start()
 
 
+def _start_node_registry() -> None:
+    """Start the remote nodes' health loop, and stop it when the process exits."""
+    from ..nodes.registry import get_registry
+
+    registry = get_registry()
+    registry.start()
+    atexit.register(registry.stop)
+
+
 # Chains whose `retry_started_at` is older than this at boot time are
 # NOT auto-resumed. Re-firing days-old webhook context risks publishing
 # against media that's been moved/deleted upstream. Users can manually
@@ -982,6 +991,8 @@ def create_app(config_dir: str | None = None) -> Flask:
             logger.debug("Scheduler shutdown error during exit", exc_info=True)
 
     atexit.register(_shutdown_scheduler)
+
+    _start_node_registry()
 
     # Log token on startup
     log_token_on_startup()

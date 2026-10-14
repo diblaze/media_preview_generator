@@ -1,0 +1,293 @@
+"""Test access: can a node see the app's media through its folder mappings (spec §10.4)?
+
+The app samples a few real video files from every enabled library, as the app sees them, and asks the node to find
+each one through the mappings (same size and ``mtime_ns``, so a different file at the same path doesn't pass). When
+files are missing, the folder listing the node sends back is used to suggest a corrected mapping row.
+"""
+
+from __future__ import annotations
+
+import os
+from collections import deque
+from dataclasses import dataclass
+from typing import Any
+
+from loguru import logger
+
+from .client import NodeClient
+from .protocol import PathMapping, map_app_path
+
+SAMPLES_PER_ROOT = 3
+# Directory entries looked at per library folder before giving up: a library whose first 500 entries hold no video
+# reports "no video files found" rather than walking a whole NAS.
+WALK_LIMIT = 500
+# Files per access-check request; the node checks each one on disk.
+CHECK_BATCH = 30
+
+
+def _video_extensions() -> frozenset[str]:
+    from ..plex_client import VIDEO_EXTENSIONS
+
+    return VIDEO_EXTENSIONS
+
+
+@dataclass(frozen=True)
+class LibraryRoot:
+    """One library folder as this app sees it."""
+
+    server: str
+    server_id: str
+    library: str
+    library_id: str
+    app_root: str
+
+
+def library_roots(servers: list[dict]) -> list[LibraryRoot]:
+    """Every enabled library folder of every enabled server, resolved to this app's own paths.
+
+    Args:
+        servers: The stored ``media_servers`` list.
+
+    Returns:
+        One entry per distinct (server, library, folder), in settings order.
+    """
+    from ..servers.ownership import apply_path_mappings
+    from ..servers.registry import UnsupportedServerTypeError, server_config_from_dict
+
+    out: list[LibraryRoot] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in servers or []:
+        if not isinstance(entry, dict) or not entry.get("enabled", True):
+            continue
+        try:
+            cfg = server_config_from_dict(entry)
+        except UnsupportedServerTypeError:
+            continue
+        for lib in cfg.libraries:
+            if not lib.enabled:
+                continue
+            for remote in lib.remote_paths:
+                for local in apply_path_mappings(remote, cfg.path_mappings):
+                    root = local.rstrip("/") or "/"
+                    key = (cfg.id, lib.id, root)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(LibraryRoot(cfg.name, cfg.id, lib.name, lib.id, root))
+    return out
+
+
+def sample_files(root: str, *, limit: int = SAMPLES_PER_ROOT, walk_limit: int = WALK_LIMIT) -> list[dict]:
+    """Up to ``limit`` video files under ``root``, breadth first, with their size and ``mtime_ns``.
+
+    Args:
+        root: A folder as this app sees it.
+        limit: Files wanted.
+        walk_limit: Directory entries looked at before stopping.
+
+    Returns:
+        ``[{"path", "size", "mtime_ns"}]``; empty when the folder is missing or holds no video in reach.
+    """
+    extensions = _video_extensions()
+    found: list[dict] = []
+    seen = 0
+    queue: deque[str] = deque([root])
+    while queue and len(found) < limit and seen < walk_limit:
+        folder = queue.popleft()
+        try:
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            seen += 1
+            if seen > walk_limit or len(found) >= limit:
+                break
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if not entry.name.startswith("."):
+                        queue.append(entry.path)
+                    continue
+                if os.path.splitext(entry.name)[1].lower() not in extensions:
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            found.append({"path": entry.path, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return found
+
+
+def _covering_row(app_root: str, mappings: list[PathMapping]) -> PathMapping | None:
+    best: PathMapping | None = None
+    for row in mappings:
+        prefix = row.app_prefix.rstrip("/") or "/"
+        covers = app_root == prefix or app_root.startswith(prefix.rstrip("/") + "/")
+        if covers and (best is None or len(prefix) > len(best.app_prefix.rstrip("/"))):
+            best = row
+    return best
+
+
+def _node_sep(path: str) -> str:
+    return "\\" if "\\" in path or (len(path) >= 2 and path[1] == ":") else "/"
+
+
+def _join(folder: str, name: str) -> str:
+    sep = _node_sep(folder)
+    return folder if not name else (folder if folder.endswith(sep) else folder + sep) + name
+
+
+def _parent(path: str, levels: int) -> str:
+    sep = _node_sep(path)
+    for _ in range(levels):
+        trimmed = path.rstrip(sep)
+        cut = trimmed.rfind(sep)
+        if cut <= 0:
+            return trimmed[: cut + 1] if cut == 0 else trimmed
+        path = trimmed[:cut]
+        if len(path) == 2 and path[1] == ":":
+            path += sep
+    return path
+
+
+def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> dict | None:
+    """A corrected ``node_prefix`` for the row covering ``app_root``, from the node's folder listings.
+
+    When a listing on the node holds a folder named like the app root's last component (case-insensitive), that
+    folder is where the node sees the root, so the row's ``node_prefix`` moves to match.
+
+    Args:
+        app_root: The library folder as this app sees it.
+        mappings: The rows tested.
+        nearby: The node's ``{node_dir: [names]}`` listings.
+
+    Returns:
+        ``{"from", "to"}`` (the row's current and suggested ``node_prefix``), or None.
+    """
+    row = _covering_row(app_root, mappings)
+    if row is None or not isinstance(nearby, dict):
+        return None
+    prefix = row.app_prefix.rstrip("/") or "/"
+    rest = [part for part in app_root[len(prefix) :].split("/") if part]
+    last = (rest[-1] if rest else app_root.rstrip("/").rsplit("/", 1)[-1]).casefold()
+    if not last:
+        return None
+    for node_dir, names in nearby.items():
+        if not isinstance(node_dir, str) or not isinstance(names, list):
+            continue
+        match = next((n for n in names if isinstance(n, str) and n.casefold() == last), None)
+        if match is None:
+            continue
+        seen_root = _join(node_dir, match)
+        # The row maps app_prefix, not app_root: step back up as many folders as app_root sits below app_prefix.
+        new_prefix = _parent(seen_root, len(rest)) if rest else seen_root
+        if new_prefix.rstrip("/\\") != row.node_prefix.rstrip("/\\"):
+            return {"from": row.node_prefix, "to": new_prefix}
+    return None
+
+
+def _check(client: NodeClient, mappings: list[PathMapping], files: list[dict]) -> tuple[dict[str, dict], dict]:
+    results: dict[str, dict] = {}
+    nearby: dict[str, Any] = {}
+    for start in range(0, len(files), CHECK_BATCH):
+        answer = client.access_check(mappings, files[start : start + CHECK_BATCH])
+        for result in answer.get("results") or []:
+            if isinstance(result, dict) and isinstance(result.get("path"), str):
+                results[result["path"]] = result
+        if isinstance(answer.get("nearby"), dict):
+            nearby.update(answer["nearby"])
+    return results, nearby
+
+
+def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: list[dict]) -> dict:
+    """Sample every enabled library and ask the node to find each file through ``mappings``.
+
+    Args:
+        client: The node.
+        mappings: The rows to test (saved or just edited).
+        servers: The stored ``media_servers`` list.
+
+    Returns:
+        ``{"libraries": [{"server", "library", "app_root", "checked", "ok", "files": [{"path", "ok", "kind",
+        "message", "node_path"}], "suggestion": {"from", "to"} | None, "error": str | None}]}``.
+
+    Raises:
+        NodeError: The node couldn't be asked.
+    """
+    roots = library_roots(servers)
+    samples = {root: sample_files(root.app_root) for root in roots}
+    files = [f for picked in samples.values() for f in picked]
+    results, nearby = _check(client, mappings, files) if files else ({}, {})
+    libraries = []
+    for root in roots:
+        picked = samples[root]
+        rows = []
+        for f in picked:
+            result = results.get(f["path"]) or {}
+            rows.append(
+                {
+                    "path": f["path"],
+                    "ok": bool(result.get("ok")),
+                    "kind": result.get("kind") or ("" if result else "no_answer"),
+                    "message": str(result.get("message") or ("" if result else "The node didn't answer for this file")),
+                    "node_path": result.get("node_path") or map_app_path(f["path"], mappings),
+                }
+            )
+        ok = bool(rows) and all(r["ok"] for r in rows)
+        error = None
+        if not picked:
+            error = (
+                f"This app can't open {root.app_root}"
+                if not os.path.isdir(root.app_root)
+                else f"No video files found near the top of {root.app_root}"
+            )
+        libraries.append(
+            {
+                "server": root.server,
+                "library": root.library,
+                "app_root": root.app_root,
+                "checked": len(rows),
+                "ok": ok,
+                "files": rows,
+                "suggestion": None if ok or not rows else suggest_row(root.app_root, mappings, nearby),
+                "error": error,
+            }
+        )
+    return {"libraries": libraries}
+
+
+def quick_access_check(client: NodeClient, mappings: list[PathMapping]) -> bool:
+    """One file per mapping row: True when the node sees every one (and there was at least one to check).
+
+    Args:
+        client: The node.
+        mappings: Its saved rows.
+
+    Returns:
+        Whether every sampled file was visible.
+    """
+    files = [f for row in mappings for f in sample_files(row.app_prefix, limit=1)]
+    if not files:
+        return False
+    try:
+        results, _ = _check(client, mappings, files)
+    except Exception as exc:
+        logger.debug("Quick access check failed: {}", exc)
+        return False
+    return all(bool((results.get(f["path"]) or {}).get("ok")) for f in files)
+
+
+def default_mappings_for(servers: list[dict]) -> list[dict[str, str]]:
+    """Pre-filled rows for Add node: one per distinct library folder, mapped to the same path on the node.
+
+    A folder inside another listed folder is covered by that one's row, so it gets none of its own.
+
+    Args:
+        servers: The stored ``media_servers`` list.
+    """
+    roots = sorted({root.app_root for root in library_roots(servers)}, key=lambda p: (len(p), p))
+    kept: list[str] = []
+    for root in roots:
+        if any(root == k or root.startswith(k.rstrip("/") + "/") for k in kept):
+            continue
+        kept.append(root)
+    return [{"app_prefix": root, "node_prefix": root} for root in sorted(kept)]

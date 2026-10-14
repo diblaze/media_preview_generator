@@ -43,6 +43,8 @@ LIBRARY_HEALTH_NOT_SHOWING_ID = "library_health_not_showing"
 LIBRARY_HEALTH_CHECK_FAILED_ID = "library_health_check_failed"
 
 CREDITS_ON_CPU_ID_PREFIX = "credits_on_cpu_"
+# ``node:<node id>:<state>``, one per node in an alert state.
+NODE_ID_PREFIX = "node:"
 
 # Cards that can be hidden until the next restart but never for good: the problem they report comes and goes, and a
 # permanent dismissal would hide the next occurrence too. An id stored by an older version is ignored.
@@ -55,6 +57,7 @@ def is_session_only_dismissal(notification_id_value: str) -> bool:
         notification_id_value in SESSION_ONLY_DISMISSAL_IDS
         or is_gpu_notification_id(notification_id_value)
         or notification_id_value.startswith(CREDITS_ON_CPU_ID_PREFIX)
+        or notification_id_value.startswith(NODE_ID_PREFIX)
     )
 
 
@@ -492,6 +495,70 @@ def _build_library_health_check_failed_notification() -> dict[str, Any] | None:
     }
 
 
+_NODE_CARD_TEXT = {
+    # state: (title, what to do, action label)
+    "offline": ("{name} is offline", "Check that the node is running and that this app can reach it.", "Open Nodes"),
+    "update_needed": ("{name} needs an update", "Update the node so its version matches this app.", "Open Nodes"),
+    "key_refused": ("{name} refused the key", "Copy the node's key into its settings on the Nodes page.", "Fix key"),
+    "access_problem": (
+        "{name} can't see your media",
+        "Its workers are paused. Run Test access and fix its folder mappings.",
+        "Test access",
+    ),
+    "gpu_lost": (
+        "{name} lost its GPU",
+        "Its CPU workers keep running. Check the GPU driver on the node.",
+        "Open Nodes",
+    ),
+}
+
+
+def node_notification_id(node_id: str, state: str) -> str:
+    """The bell card id for one node in one state."""
+    return f"{NODE_ID_PREFIX}{node_id}:{state}"
+
+
+def _build_node_notifications() -> list[dict[str, Any]]:
+    """One card per node that is offline, needs an update, refused the key, can't see media or lost its GPU.
+
+    The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
+    dismissal of a state the node has left is lifted, so the next time it happens the card shows again.
+    """
+    from markupsafe import escape
+
+    from ..nodes.registry import ALERT_STATES, get_registry
+
+    try:
+        views = get_registry().views()
+    except Exception as exc:
+        logger.debug("node notifications skipped: {}", exc)
+        return []
+    cards = []
+    for view in views:
+        for state in ALERT_STATES:
+            if state != view.state:
+                undismiss_session(node_notification_id(view.id, state))
+        text = _NODE_CARD_TEXT.get(view.state)
+        if text is None:
+            continue
+        title, todo, label = text
+        name = view.name or "A node"
+        reason = f"{escape(view.reason)} " if view.reason else ""
+        cards.append(
+            {
+                "id": node_notification_id(view.id, view.state),
+                "severity": "warning",
+                "title": title.format(name=name),
+                "body_html": f"<p class='mb-0'>{reason}{escape(todo)}</p>",
+                "dismissable": True,
+                "permanent_dismissable": False,
+                "source": "nodes",
+                "action": {"href": f"/nodes#node-{view.id}", "label": label},
+            }
+        )
+    return cards
+
+
 def _notification_sources() -> list[dict[str, Any] | None]:
     """All notification builders.  Add new sources here as they arrive."""
     return [
@@ -504,6 +571,7 @@ def _notification_sources() -> list[dict[str, Any] | None]:
         _build_library_health_check_failed_notification(),
         *_build_credits_on_cpu_notifications(),
         *_build_gpu_keeps_failing_notifications(),
+        *_build_node_notifications(),
     ]
 
 

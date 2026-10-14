@@ -536,6 +536,25 @@ def _neutralize_prewarm_caches(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_node_registry(monkeypatch):
+    """Keep ``create_app()`` from starting the nodes' health loop, and drop the registry singleton after each test.
+
+    The loop is a daemon thread that would outlive the test and read whichever settings manager the next test
+    builds. Tests of the registry build their own ``NodeRegistry`` and start it themselves.
+    """
+    try:
+        import media_preview_generator.web.app as app_mod
+        from media_preview_generator.nodes import registry as registry_mod
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(app_mod, "_start_node_registry", lambda: None)
+    registry_mod.set_registry(None)
+    yield
+    registry_mod.set_registry(None)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_setup_logging(request, monkeypatch):
     """Replace ``setup_logging`` with a no-op for every test by default.
 

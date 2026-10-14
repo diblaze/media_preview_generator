@@ -231,9 +231,11 @@ def _settings_block(config: ServerConfig, settings: ServerMarkersSettings) -> di
         block["plex"] = {
             "db_write_confirmed_at": settings.db_write_confirmed_at,
             "on_plex_redetect": settings.on_plex_redetect,
-            # The agent's key is never in a response: only whether one is stored (``has_token``).
+            # The agent's key is never in a response: only whether its node has one (``has_token``).
             "agent": {
                 "enabled": settings.agent_enabled,
+                "node_id": settings.agent_node_id,
+                "node_name": settings.agent_node_name,
                 "url": settings.agent_url,
                 "has_token": bool(settings.agent_token),
             },
@@ -298,6 +300,12 @@ def _checked_as_if_on(server: Any, config: ServerConfig, settings: ServerMarkers
             details["hint"] = PLEX_SAME_HOST_PATH_HINT
         if report.ready and details.get("plex_pass") is None:
             warning = PLEX_PASS_UNCHECKED_WARNING
+        if isinstance(details.get("agent"), dict) and settings.agent_node_id:
+            details["agent"] = {
+                **details["agent"],
+                "node_id": settings.agent_node_id,
+                "node_name": settings.agent_node_name,
+            }
     # Not asked of an Emby that can't be reached or rejects the credentials: the read would only fail, and slowly.
     emby_answers = report.state is not Capability.UNREACHABLE and report.message != CREDENTIALS_REJECTED
     if config.type is ServerType.EMBY and emby_answers:

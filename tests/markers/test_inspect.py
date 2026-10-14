@@ -123,7 +123,7 @@ def test_plex_disabled_but_configured_is_checked_as_if_enabled(factory):
             "plex": {
                 "db_write_confirmed_at": None,
                 "on_plex_redetect": "keep_plex",
-                "agent": {"enabled": False, "url": "", "has_token": False},
+                "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
             },
         },
         "capability": {
@@ -159,7 +159,7 @@ def test_plex_enabled_keeps_its_stored_confirmation_and_library_choice(factory):
         "plex": {
             "db_write_confirmed_at": CONFIRMED,
             "on_plex_redetect": "restore",
-            "agent": {"enabled": False, "url": "", "has_token": False},
+            "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
         },
     }
 
@@ -175,7 +175,7 @@ def test_invalid_stored_block_shows_the_disabled_defaults_the_app_uses(factory):
         "plex": {
             "db_write_confirmed_at": None,
             "on_plex_redetect": "restore",
-            "agent": {"enabled": False, "url": "", "has_token": False},
+            "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
         },
     }
     assert factory.calls[0]["settings"].enabled is True

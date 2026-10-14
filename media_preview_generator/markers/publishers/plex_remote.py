@@ -785,9 +785,10 @@ def plex_database(
         session: A ``requests.Session`` for the agent (tests pass their own).
 
     Returns:
-        A ``RemotePlexDb`` when the server has a Plex marker agent switched on with an address, else a
-        ``LocalPlexDb``.
+        A ``RemotePlexDb`` when the server has a Plex marker agent switched on, else a ``LocalPlexDb``. An agent
+        whose node has no address (its record is gone) still gets a ``RemotePlexDb``, which refuses every call:
+        falling back to this app's own copy of the folder would write a database Plex isn't reading.
     """
-    if getattr(settings, "agent_enabled", False) and getattr(settings, "agent_url", ""):
+    if getattr(settings, "agent_enabled", False):
         return RemotePlexDb(settings.agent_url, getattr(settings, "agent_token", ""), session=session)
     return LocalPlexDb(path_provider, label=label, mountinfo_path=mountinfo_path)

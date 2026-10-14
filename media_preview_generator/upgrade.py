@@ -26,7 +26,7 @@ from .config.validation import MAX_CPU_THREADS, validate_processing_thread_total
 # -------------------------------------------------------------------------
 # Schema version — bump when adding new migrations
 # -------------------------------------------------------------------------
-_CURRENT_SCHEMA_VERSION = 23
+_CURRENT_SCHEMA_VERSION = 24
 
 #: A flag earlier dev builds of v16, v17, v18 and v20 wrote and nothing reads; v23 deletes it.
 DECIDE_AGAIN_KEY = "_markers_decide_again"
@@ -103,6 +103,7 @@ def _v14_record_failure(sm) -> None:
 # backup; that's enough on its own.
 # -------------------------------------------------------------------------
 _USER_FACING_NOTES: dict[int, str] = {
+    24: "Your Plex helper now appears on the new Nodes page, which holds its address and key. It works as before.",
     23: "The Max concurrent jobs setting is gone — jobs now run as soon as a worker that handles them is free.",
     22: "Groups can now include several devices — your existing groups are unchanged.",
     21: "Your worker counts are now worker groups. Existing availability and pauses are preserved.",
@@ -544,6 +545,8 @@ def _migrate_schema(sm) -> None:
         _run(22, _migrate_to_v22)
     if current < 23:
         _run(23, _migrate_to_v23)
+    if current < 24:
+        _run(24, _migrate_to_v24)
 
     sm.set("_schema_version", _CURRENT_SCHEMA_VERSION)
 
@@ -1808,6 +1811,67 @@ def _migrate_to_v23(sm) -> list[str]:
     if "max_concurrent_jobs" not in stale:
         return []
     return ["v23: removed the Max concurrent jobs setting; workers now decide how much runs at once"]
+
+
+def _migrate_to_v24(sm) -> list[str]:
+    """Move every Plex helper's address and key into a ``nodes`` record and point the server at it.
+
+    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``.
+    Servers that share one helper (same address and key) share one node, which is on when any of them had it on. A
+    block without both an address and a key had no helper to move, so it becomes ``{"enabled": False, "node_id":
+    None}``. A block already in the new shape is left alone, so a re-run changes nothing.
+    """
+    from .nodes.settings import default_record
+
+    stored = sm.get_all()
+    servers = stored.get("media_servers")
+    if not isinstance(servers, list):
+        return []
+    nodes = copy.deepcopy([n for n in stored.get("nodes") or [] if isinstance(n, dict)])
+    by_address = {(str(n.get("url") or ""), str(n.get("key") or "")): n for n in nodes}
+    names = {str(n.get("name") or "").casefold() for n in nodes}
+    servers_out = copy.deepcopy(servers)
+    moved = created = 0
+    for entry in servers_out:
+        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+            continue
+        markers = entry.get("markers")
+        plex = markers.get("plex") if isinstance(markers, dict) else None
+        agent = plex.get("agent") if isinstance(plex, dict) else None
+        if not isinstance(agent, dict) or ("url" not in agent and "token" not in agent):
+            continue
+        url = str(agent.get("url") or "").strip().rstrip("/")
+        token = str(agent.get("token") or "").strip()
+        enabled = bool(agent.get("enabled"))
+        moved += 1
+        if not (url and token):
+            plex["agent"] = {"enabled": False, "node_id": None}
+            continue
+        node = by_address.get((url, token))
+        if node is None:
+            server_name = str(entry.get("name") or "").strip() or "Plex"
+            base = f"Plex helper ({server_name})"
+            name, suffix = base, 2
+            while name.casefold() in names:
+                name, suffix = f"{base} {suffix}", suffix + 1
+            names.add(name.casefold())
+            node = default_record(name=name, url=url, key=token, enabled=enabled)
+            nodes.append(node)
+            by_address[(url, token)] = node
+            created += 1
+        elif enabled:
+            node["enabled"] = True
+        plex["agent"] = {"enabled": enabled, "node_id": node["id"]}
+    if not moved:
+        return []
+    updates: dict[str, Any] = {"media_servers": servers_out}
+    if created:
+        updates["nodes"] = nodes
+        updates["nodes_revision"] = int(stored.get("nodes_revision", 0)) + 1
+    sm.apply_changes(updates=updates)
+    if not created:
+        return []
+    return [f"v24: moved {created} Plex helper(s) to the nodes list"]
 
 
 def _intro_credits_on_any_server(sm) -> bool:
