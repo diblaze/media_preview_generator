@@ -74,3 +74,8 @@ def gpu_worker_label(seq: int, device_label: str) -> str:
 def cpu_worker_label(seq: int) -> str:
     """Stable per-job label for a CPU worker row."""
     return f"CPU Worker {int(seq)}"
+
+
+def node_worker_label(node_name: str, label: str) -> str:
+    """Label for a worker whose heavy steps run on a node: ``"<node> · <label>"``."""
+    return f"{node_name} · {label}"

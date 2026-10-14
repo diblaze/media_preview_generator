@@ -1,8 +1,9 @@
 """Validated worker policy and weekly availability, independent of live workers.
 
 A saved group is ``id``, ``name``, ``enabled``, ``availability`` and ``members``; each member is one device
-(``resource``/``device``) with a worker ``count`` and its own ``job_types``. The runtime works on the flat
-``member_policies`` view, where every member looks like a legacy single-device group plus ``group_id``/``member_id``.
+(``resource``/``device``, on this app or on the remote node named by ``node``) with a worker ``count`` and its own
+``job_types``. The runtime works on the flat ``member_policies`` view, where every member looks like a legacy
+single-device group plus ``group_id``/``member_id``.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import copy
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, tzinfo
 from functools import lru_cache
 from typing import Any
@@ -57,6 +59,15 @@ def local_now(now: datetime | None = None) -> datetime:
     return now if now.tzinfo is not None else now.replace(tzinfo=application_timezone())
 
 
+def member_resource_key(resource: str, device: str | None, node: str | None = None) -> str:
+    """The budget one device's workers share: ``cpu``/``gpu:<device>`` here, ``node:<id>:...`` on a node.
+
+    Two nodes' CPUs (or a node GPU whose device string matches a local one) must never share a budget.
+    """
+    local = "cpu" if resource == "cpu" else f"gpu:{device}"
+    return f"node:{node}:{local}" if node else local
+
+
 def group_resource_key(policy: dict) -> str:
     """Identify the shared capacity budget, separately from individual groups.
 
@@ -68,7 +79,7 @@ def group_resource_key(policy: dict) -> str:
     """
     if "members" in policy:
         policy = _single_policy(policy)
-    return "cpu" if policy["resource"] == "cpu" else f"gpu:{policy['device']}"
+    return member_resource_key(policy["resource"], policy.get("device"), policy.get("node"))
 
 
 def _single_policy(group: dict) -> dict:
@@ -102,7 +113,8 @@ def member_policies(groups: list[dict]) -> list[dict]:
 
     Returns:
         Dicts with ``id`` (``"<group_id>:<member_id>"``), ``group_id``, ``member_id``, ``name`` (the group's),
-        ``enabled``, ``availability`` (the group's), ``resource``, ``device``, ``count``, ``job_types``.
+        ``enabled``, ``availability`` (the group's), ``resource``, ``device``, ``count``, ``job_types``, ``node``
+        (``None`` for this app).
     """
     policies: list[dict] = []
     for group in groups:
@@ -125,6 +137,7 @@ def member_policies(groups: list[dict]) -> list[dict]:
                     "device": member.get("device"),
                     "count": member["count"],
                     "job_types": list(member.get("job_types", [])),
+                    "node": member.get("node"),
                 }
             )
     return policies
@@ -224,14 +237,48 @@ def _peak(policies: list[dict]) -> int:
     return peak
 
 
-def configured_group_totals(groups: list[dict]) -> tuple[int, int]:
-    """Return peak (GPU, CPU) capacity, retaining the existing family limits."""
-    policies = member_policies(groups)
+def _peaks(policies: list[dict]) -> tuple[int, int]:
     gpu, cpu = (_peak([p for p in policies if p["resource"] == resource]) for resource in ("gpu", "cpu"))
     return gpu, cpu
 
 
-def _clean_member(raw: object, name: str, seen_ids: set[str], seen_devices: set[str], legacy: bool) -> dict:
+def configured_group_totals(groups: list[dict]) -> tuple[int, int]:
+    """Return this app's peak (GPU, CPU) capacity, retaining the existing family limits.
+
+    Node members are left out: they run on another machine's hardware and have their own per-node totals
+    (``configured_node_totals``).
+    """
+    return _peaks([p for p in member_policies(groups) if not p.get("node")])
+
+
+def configured_node_totals(groups: list[dict]) -> dict[str, tuple[int, int]]:
+    """Return each node's peak (GPU, CPU) capacity, keyed by node id."""
+    by_node: dict[str, list[dict]] = {}
+    for policy in member_policies(groups):
+        if policy.get("node"):
+            by_node.setdefault(policy["node"], []).append(policy)
+    return {node: _peaks(policies) for node, policies in by_node.items()}
+
+
+def _clean_node(raw: dict, name: str, nodes: Mapping[str, str] | None) -> str | None:
+    node = raw.get("node")
+    if node in (None, ""):
+        return None
+    if not isinstance(node, str) or len(node) > 128 or node != node.strip():
+        raise ValueError(f"{name}: choose a node from the device list")
+    if nodes is not None and node not in nodes:
+        raise ValueError(f"{name}: node {node} is not added. Add it under Nodes, or pick another device.")
+    return node
+
+
+def _clean_member(
+    raw: object,
+    name: str,
+    seen_ids: set[str],
+    seen_devices: set[str],
+    legacy: bool,
+    nodes: Mapping[str, str] | None = None,
+) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"{name}: each device must be an object")
     member_id = LEGACY_MEMBER_ID if legacy else raw.get("id")
@@ -248,8 +295,11 @@ def _clean_member(raw: object, name: str, seen_ids: set[str], seen_devices: set[
         raise ValueError(f"{name}: choose a GPU device")
     if resource == "cpu" and device not in (None, ""):
         raise ValueError(f"{name}: a CPU member cannot select a GPU device")
+    node = _clean_node(raw, name, nodes)
     label = "CPU" if resource == "cpu" else device
-    key = "cpu" if resource == "cpu" else f"gpu:{device}"
+    if node:
+        label = f"{(nodes or {}).get(node) or node} · {label}"
+    key = member_resource_key(resource, device, node)
     if key in seen_devices:
         raise ValueError(f"{name}: {label} appears twice; use one row per device")
     seen_devices.add(key)
@@ -262,13 +312,17 @@ def _clean_member(raw: object, name: str, seen_ids: set[str], seen_devices: set[
         raise ValueError(f"{name} ({label}): select at least one supported job type")
     if resource == "gpu" and JOB_KIND_LOUDNESS in kinds:
         raise ValueError(f"{name} ({label}): Plex loudness requires CPU workers")
-    return {
+    member = {
         "id": member_id,
         "resource": resource,
         "device": device if resource == "gpu" else None,
         "count": count,
         "job_types": [kind for kind in JOB_KINDS if kind in kinds],
     }
+    # A missing key means "this app"; writing ``node: null`` on every local member would churn saved settings.
+    if node:
+        member["node"] = node
+    return member
 
 
 def _reject_conflicting_flat_fields(raw: dict, members: list, name: str) -> None:
@@ -290,12 +344,12 @@ def _reject_conflicting_flat_fields(raw: dict, members: list, name: str) -> None
             raise ValueError(f"{name}: edit members[0] instead of the group's top-level {key}")
 
 
-def _clean_members(raw: dict, name: str) -> list[dict]:
+def _clean_members(raw: dict, name: str, nodes: Mapping[str, str] | None) -> list[dict]:
     if "members" not in raw:
         # Legacy flat group: the group's own device fields are its single member.
         if "resource" not in raw:
             raise ValueError(f"{name}: add at least one device")
-        return [_clean_member(raw, name, set(), set(), legacy=True)]
+        return [_clean_member(raw, name, set(), set(), legacy=True, nodes=nodes)]
     members = raw["members"]
     if not isinstance(members, list) or not members:
         raise ValueError(f"{name}: add at least one device")
@@ -304,7 +358,7 @@ def _clean_members(raw: dict, name: str) -> list[dict]:
         raise ValueError(f"{name}: use at most {MAX_MEMBERS} devices")
     seen_ids: set[str] = set()
     seen_devices: set[str] = set()
-    return [_clean_member(member, name, seen_ids, seen_devices, legacy=False) for member in members]
+    return [_clean_member(member, name, seen_ids, seen_devices, legacy=False, nodes=nodes) for member in members]
 
 
 def _clean_availability(raw: dict, name: str) -> dict:
@@ -330,7 +384,7 @@ def _clean_availability(raw: dict, name: str) -> dict:
     return {"mode": availability["mode"], "windows": clean_windows}
 
 
-def validate_worker_groups(value: object) -> list[dict[str, Any]]:
+def validate_worker_groups(value: object, *, nodes: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Normalize worker groups, rejecting malformed or overcommitted policies.
 
     Accepts the member shape and the legacy flat shape (one device per group, converted to one member ``m1``).
@@ -339,6 +393,8 @@ def validate_worker_groups(value: object) -> list[dict[str, Any]]:
 
     Args:
         value: Complete proposed group list; an empty list intentionally disables capacity.
+        nodes: Added nodes (id -> name) when saving an edit: a member on any other node is refused. ``None`` when
+            reading saved settings, so a member whose node was removed stays visible (as "node removed").
 
     Returns:
         An independent normalized list in the member shape, safe to persist.
@@ -363,7 +419,7 @@ def validate_worker_groups(value: object) -> list[dict[str, Any]]:
         enabled = raw.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError(f"{name}: enabled must be true or false")
-        members = _clean_members(raw, name)
+        members = _clean_members(raw, name, nodes)
         groups.append(
             {
                 "id": group_id,
@@ -379,6 +435,12 @@ def validate_worker_groups(value: object) -> list[dict[str, Any]]:
             f"Overlapping groups exceed capacity: peak CPU {cpu}/{MAX_CPU_WORKERS}, GPU {gpu}/{MAX_GPU_WORKERS}. "
             "Reduce counts or use different hours."
         )
+    for node, (node_gpu, node_cpu) in configured_node_totals(groups).items():
+        if node_cpu > MAX_CPU_WORKERS or node_gpu > MAX_GPU_WORKERS:
+            raise ValueError(
+                f"Overlapping groups exceed capacity on node {(nodes or {}).get(node) or node}: peak CPU "
+                f"{node_cpu}/{MAX_CPU_WORKERS}, GPU {node_gpu}/{MAX_GPU_WORKERS}. Reduce counts or use different hours."
+            )
     return groups
 
 

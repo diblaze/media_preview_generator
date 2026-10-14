@@ -1425,14 +1425,25 @@ class JobDispatcher:
         return fraction
 
     def _build_worker_statuses(self) -> list[dict]:
-        """Build the worker status list for the worker_callback."""
-        all_workers = self.worker_pool._snapshot_workers()
+        """Build the worker status list for the worker_callback.
 
-        type_counters: dict[str, int] = {}
+        A worker on a node is named ``"<node> · <label>"`` and numbered among that node's own workers, so this app's
+        labels stay the same whether or not nodes are in use. Each row carries ``node`` (``{"id", "name"}``, ``None``
+        for this app) and ``node_state`` (the node's registry state).
+        """
+        from .node_members import EMPTY_NODE_HARDWARE, NodeHardware, worker_node_id
+
+        all_workers = self.worker_pool._snapshot_workers()
+        nodes = getattr(self.worker_pool, "_node_hardware", None)
+        if not isinstance(nodes, NodeHardware):
+            nodes = EMPTY_NODE_HARDWARE
+
+        type_counters: dict[tuple[str | None, str], int] = {}
         worker_type_index: dict[int, int] = {}
         for w in all_workers:
-            type_counters[w.worker_type] = type_counters.get(w.worker_type, 0) + 1
-            worker_type_index[w.worker_id] = type_counters[w.worker_type]
+            counter_key = (worker_node_id(w), w.worker_type)
+            type_counters[counter_key] = type_counters.get(counter_key, 0) + 1
+            worker_type_index[w.worker_id] = type_counters[counter_key]
 
         statuses = []
         for worker in all_workers:
@@ -1450,13 +1461,14 @@ class JobDispatcher:
                 group_id, group_name, group_resource = worker.group_id, worker.group_name, worker.group_resource
                 member_id = worker.member_id
                 retiring = worker._pending_removal
+                node_id = worker_node_id(worker)
 
             idx = worker_type_index[worker.worker_id]
             # Shared label helper — keeps this dispatcher's rows visually
             # identical to the multi-server dispatcher's rows and to the
             # synthesised idle entries returned by /api/jobs/workers when
             # no job is active.
-            from .worker_naming import cpu_worker_label, friendly_device_label, gpu_worker_label
+            from .worker_naming import cpu_worker_label, friendly_device_label, gpu_worker_label, node_worker_label
 
             if worker.worker_type == "GPU":
                 device_label = friendly_device_label(
@@ -1467,6 +1479,12 @@ class JobDispatcher:
                 display_name = gpu_worker_label(idx, device_label)
             else:
                 display_name = cpu_worker_label(idx)
+            node = None
+            if node_id:
+                # The pool's latest registry read, not the name the worker was created with, so a rename shows.
+                node_name = nodes.node_name(node_id) if node_id in nodes.views else getattr(worker, "node_name", None)
+                node = {"id": node_id, "name": node_name or node_id}
+                display_name = node_worker_label(node["name"], display_name)
 
             fallback_active = bool(getattr(worker, "fallback_active", False))
             statuses.append(
@@ -1496,6 +1514,8 @@ class JobDispatcher:
                     "ffmpeg_started": ffmpeg_started,
                     "current_phase": current_phase,
                     "chapter_progress": progress_data.get("chapter_progress") if has_task else None,
+                    "node": node,
+                    "node_state": nodes.node_state(node_id) if node_id else None,
                 }
             )
         return statuses

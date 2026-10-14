@@ -428,6 +428,9 @@ class WorkerStatus:
     fallback_active: bool = False
     fallback_reason: str | None = None
     fallback_title: str = ""
+    # The node a remote worker runs on ({"id", "name"}; None = this app) and that node's registry state.
+    node: dict | None = None
+    node_state: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""

@@ -4,6 +4,7 @@ Provides Worker and WorkerPool classes that use threading instead of
 multiprocessing for better simplicity and performance with FFmpeg tasks.
 """
 
+import inspect
 import re
 import threading
 import time
@@ -27,6 +28,7 @@ from ..processing.generator import (
 )
 from ..utils import format_display_title, redact_secrets, redacted_traceback
 from .gpu_fallback import get_gpu_fallback_tracker
+from .node_members import EMPTY_NODE_HARDWARE, NODE_GPU_FFMPEG_THREADS, NodeHardware, NodeMemberHardware
 from .worker_naming import friendly_device_label
 
 # Map thread_id -> job_id. Each job's log handler filters on its own id, so concurrent jobs
@@ -984,6 +986,34 @@ class Worker:
                 )
 
 
+_WORKER_TAKES_NODE = "node_id" in inspect.signature(Worker.__init__).parameters
+
+
+def _new_worker(worker_id: int, worker_type: str, *, node_id: str | None, node_name: str | None, **kwargs) -> Worker:
+    """Construct a worker, handing it its node when ``Worker`` accepts one.
+
+    ``node_id``/``node_name`` are always readable on the result as attributes, so naming and status code can ask any
+    worker where it runs (``None`` = this app).
+
+    Args:
+        worker_id: Unique pool id.
+        worker_type: ``"GPU"`` or ``"CPU"``.
+        node_id: The node the worker's heavy steps run on, or ``None``.
+        node_name: That node's display name.
+        **kwargs: The remaining ``Worker`` arguments.
+
+    Returns:
+        The new worker.
+    """
+    if _WORKER_TAKES_NODE:
+        worker = Worker(worker_id, worker_type, node_id=node_id, node_name=node_name, **kwargs)
+    else:
+        worker = Worker(worker_id, worker_type, **kwargs)
+    worker.node_id = node_id
+    worker.node_name = node_name
+    return worker
+
+
 class WorkerPool:
     """Manages a pool of workers for processing media items."""
 
@@ -1021,6 +1051,9 @@ class WorkerPool:
         self._policy_targets: dict[str, int] = {}
         self._group_revision: int | None = None
         self._resource_targets: dict[str, int] = {}
+        # The node registry as read at the last reconcile; capacity and snapshots use it until the next one.
+        self._node_hardware: NodeHardware = EMPTY_NODE_HARDWARE
+        self._node_revision: int | None = None
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
 
@@ -1050,13 +1083,17 @@ class WorkerPool:
         Each group member is one policy owning its own slots. Closed and removed
         members contribute no target. Their in-flight tasks still consume the
         resource's assignment budget until reaped. Creating idle replacement
-        slots therefore cannot oversubscribe a handover.
+        slots therefore cannot oversubscribe a handover. A member on a node gets
+        its target from the node registry's capacity for that node.
         """
         from copy import deepcopy
 
         from ..worker_groups import group_is_available, group_resource_key, member_policies
+        from .node_members import member_detected, read_node_hardware
 
         by_id = {p["id"]: p for p in deepcopy(member_policies(groups))}
+        # Read before taking the pool lock: the registry has its own lock and the dispatch loop must not wait on it.
+        nodes = read_node_hardware(by_id.values())
         added = removed = 0
         with self._workers_lock:
             if revision is not None and self._group_revision is not None and revision < self._group_revision:
@@ -1068,9 +1105,7 @@ class WorkerPool:
             selected_gpus = list(self.selected_gpus if selected_gpus is None else selected_gpus)
             devices = {device: (gpu, device, info) for gpu, device, info in selected_gpus}
             targets = {
-                pid: p["count"]
-                if group_is_available(p, now=now) and (p["resource"] == "cpu" or p.get("device") in devices)
-                else 0
+                pid: p["count"] if group_is_available(p, now=now) and member_detected(p, devices, nodes) else 0
                 for pid, p in by_id.items()
             }
             resources: dict[str, int] = {}
@@ -1080,6 +1115,7 @@ class WorkerPool:
             self._policies = by_id
             self._policy_targets = targets
             self._resource_targets = resources
+            self._node_hardware = nodes
             self.selected_gpus = list(selected_gpus)
             self._pending_removals.clear()
             # Legacy/unowned slots and changed resources may finish, never
@@ -1106,18 +1142,25 @@ class WorkerPool:
                     if index < desired:
                         worker._pending_removal = False
                         if worker.worker_type == "GPU":
-                            worker.ffmpeg_threads = devices[policy["device"]][2].get("ffmpeg_threads")
+                            worker.ffmpeg_threads = (
+                                NODE_GPU_FFMPEG_THREADS
+                                if policy.get("node")
+                                else devices[policy["device"]][2].get("ffmpeg_threads")
+                            )
                     elif worker.is_busy:
                         worker._pending_removal = True
                     else:
                         self.workers.remove(worker)
                         removed += 1
                 for _ in range(max(0, desired - len(owned))):
-                    if policy["resource"] == "gpu":
-                        self._next_gpu_assignment_index = next(
-                            i for i, (_, device, _) in enumerate(self.selected_gpus) if device == policy["device"]
-                        )
-                    worker = self._create_worker("CPU" if policy["resource"] == "cpu" else "GPU")
+                    if policy.get("node"):
+                        worker = self._create_node_worker(policy, nodes.member(policy))
+                    else:
+                        if policy["resource"] == "gpu":
+                            self._next_gpu_assignment_index = next(
+                                i for i, (_, device, _) in enumerate(self.selected_gpus) if device == policy["device"]
+                            )
+                        worker = self._create_worker("CPU" if policy["resource"] == "cpu" else "GPU")
                     worker.group_id = policy["group_id"]
                     worker.member_id = policy["member_id"]
                     worker.policy_id = pid
@@ -1168,7 +1211,9 @@ class WorkerPool:
                     "reason": "ready" if opened else "configuration",
                     "next_opening": None,
                 }
-            result = capacity_for_groups(list(self._policies.values()), self.selected_gpus, kind)
+            result = capacity_for_groups(
+                list(self._policies.values()), self.selected_gpus, kind, nodes=self._node_hardware
+            )
             result["available"] = 0
             for resource, target in self._resource_targets.items():
                 resource_workers = [w for w in self.workers if w.group_resource == resource]
@@ -1200,10 +1245,13 @@ class WorkerPool:
 
         Each row is the member policy (``id`` = ``"<group_id>:<member_id>"``, ``group_id``, ``member_id``, ``name``,
         ``enabled``, ``availability``, ``resource``, ``device``, ``count``, ``job_types``) plus ``target``,
-        ``running``, ``available``, ``finishing``, ``state`` (active, disabled, hardware_unavailable, off_hours,
-        draining) and ``next_opening``. Draining rows have ``count`` 0 and ``enabled`` False.
+        ``running``, ``available``, ``finishing``, ``state`` (active, disabled, hardware_unavailable,
+        node_unavailable, off_hours, draining), ``reason`` (why a node member has zero workers, else ``""``),
+        ``node_name`` (``None`` for this app) and ``next_opening``. Draining rows have ``count`` 0 and ``enabled``
+        False.
         """
-        from ..worker_groups import next_group_opening
+        from ..worker_groups import group_resource_key, next_group_opening
+        from .node_members import MEMBER_STATE_NODE_UNAVAILABLE, worker_node_id
 
         with self._workers_lock:
             policies = dict(self._policies or {})
@@ -1220,24 +1268,30 @@ class WorkerPool:
                         "count": 0,
                         "job_types": list(worker.allowed_job_types or ()),
                         "availability": {"mode": "always", "windows": []},
+                        "node": worker_node_id(worker),
                     }
             rows = []
             devices = {device for _, device, _ in self.selected_gpus}
+            nodes = self._node_hardware
             for pid, policy in policies.items():
                 workers = [w for w in self.workers if w.policy_id == pid]
                 target = self._policy_targets.get(pid, 0)
                 finishing = sum(w.is_busy and w._pending_removal for w in workers)
+                node = policy.get("node")
+                hardware = nodes.member(policy) if node else None
                 state = "active"
                 if not policy["enabled"]:
                     state = "disabled"
-                elif policy["resource"] == "gpu" and policy.get("device") not in devices:
+                elif hardware is not None and not hardware.available:
+                    state = MEMBER_STATE_NODE_UNAVAILABLE
+                elif not node and policy["resource"] == "gpu" and policy.get("device") not in devices:
                     state = "hardware_unavailable"
                 elif not target:
                     state = "off_hours"
                 if finishing and not target:
                     state = "draining"
                 opening = next_group_opening(policy)
-                resource = "cpu" if policy["resource"] == "cpu" else f"gpu:{policy.get('device')}"
+                resource = group_resource_key(policy)
                 free_budget = max(
                     0,
                     self._resource_targets.get(resource, 0)
@@ -1257,10 +1311,37 @@ class WorkerPool:
                         ),
                         "finishing": finishing,
                         "state": state,
+                        "reason": hardware.reason if hardware is not None else "",
+                        "node_name": hardware.node_name if hardware is not None else None,
                         "next_opening": opening.isoformat() if opening is not None else None,
                     }
                 )
             return rows
+
+    def _create_node_worker(self, policy: dict, hardware: NodeMemberHardware) -> "Worker":
+        """Create a slot for a member on a node, typed and named from the node's own GPU entry.
+
+        Caller holds ``_workers_lock`` and has checked ``hardware.available``.
+        """
+        worker_id = self._next_worker_id
+        self._next_worker_id += 1
+        if policy["resource"] == "gpu":
+            gpu = hardware.gpu or {}
+            worker = _new_worker(
+                worker_id,
+                "GPU",
+                node_id=policy["node"],
+                node_name=hardware.node_name,
+                gpu=gpu.get("type"),
+                gpu_device=policy["device"],
+                gpu_index=hardware.gpu_index,
+                gpu_name=gpu.get("name") or policy["device"],
+                ffmpeg_threads=NODE_GPU_FFMPEG_THREADS,
+            )
+        else:
+            worker = _new_worker(worker_id, "CPU", node_id=policy["node"], node_name=hardware.node_name)
+        worker._done_event = self._worker_done_event
+        return worker
 
     def _create_worker(self, worker_type: str) -> "Worker":
         """Create a worker with a unique ID and display name, wired to wake the dispatch loop when it finishes."""

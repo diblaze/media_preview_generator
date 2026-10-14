@@ -9,6 +9,12 @@ from flask import jsonify, request
 from loguru import logger
 
 from ...job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
+from ...jobs.node_members import (
+    MEMBER_STATE_NODE_UNAVAILABLE,
+    NodeHardware,
+    member_detected,
+    read_node_hardware,
+)
 from ...worker_groups import (
     MAX_CPU_WORKERS,
     MAX_GPU_WORKERS,
@@ -63,17 +69,19 @@ def live_member_rows(pool) -> dict[tuple[str, str], dict]:
     return {(row["group_id"], row["member_id"]): row for row in pool.member_snapshots()}
 
 
-def _member_state(enabled: bool, detected: bool, opened: bool) -> str:
+def _member_state(enabled: bool, detected: bool, opened: bool, on_node: bool = False) -> str:
     if not enabled:
         return "disabled"
     if not detected:
-        return "hardware_unavailable"
+        return MEMBER_STATE_NODE_UNAVAILABLE if on_node else "hardware_unavailable"
     return "active" if opened else "off_hours"
 
 
-def _member_row(policy: dict, status: dict | None, devices: set, paused: bool) -> dict:
+def _member_row(policy: dict, status: dict | None, devices: set, paused: bool, nodes: NodeHardware) -> dict:
     """Capacity row for one saved member, preferring the pool's live numbers over the saved-policy fallback."""
-    detected = policy["resource"] == "cpu" or policy["device"] in devices
+    node = policy.get("node")
+    hardware = nodes.member(policy) if node else None
+    detected = member_detected(policy, devices, nodes)
     opened = group_is_available(policy)
     next_opening = next_group_opening(policy) if detected and not opened else None
     fallback_target = policy["count"] if policy["enabled"] and detected and opened else 0
@@ -82,12 +90,15 @@ def _member_row(policy: dict, status: dict | None, devices: set, paused: bool) -
         "id": policy["member_id"],
         "resource": policy["resource"],
         "device": policy["device"],
+        "node": node,
+        "node_name": hardware.node_name if hardware is not None else None,
+        "reason": status.get("reason") or (hardware.reason if hardware is not None else ""),
         "desired": policy["count"] if policy["enabled"] else 0,
         "target": status.get("target", fallback_target),
         "available": 0 if paused else status.get("available", fallback_target),
         "busy": max(0, status.get("running", 0) - status.get("finishing", 0)),
         "finishing": status.get("finishing", 0),
-        "state": status.get("state") or _member_state(policy["enabled"], detected, opened),
+        "state": status.get("state") or _member_state(policy["enabled"], detected, opened, bool(node)),
         "next_available_at": status.get("next_opening") or (next_opening.isoformat() if next_opening else None),
     }
 
@@ -97,6 +108,9 @@ def _draining_member_row(row: dict) -> dict:
         "id": row["member_id"],
         "resource": row.get("resource"),
         "device": row.get("device"),
+        "node": row.get("node"),
+        "node_name": row.get("node_name"),
+        "reason": "",
         "desired": 0,
         "target": row.get("target", 0),
         "available": 0,
@@ -118,7 +132,9 @@ def _group_row(group_id: str, name: str, enabled: bool, members: list[dict]) -> 
         state = "draining"
     elif "active" in states:
         state = "active"
-    elif states and all(value == "hardware_unavailable" for value in states):
+    elif states and all(value == MEMBER_STATE_NODE_UNAVAILABLE for value in states):
+        state = MEMBER_STATE_NODE_UNAVAILABLE
+    elif states and all(value in ("hardware_unavailable", MEMBER_STATE_NODE_UNAVAILABLE) for value in states):
         state = "hardware_unavailable"
     else:
         state = "off_hours"
@@ -137,6 +153,37 @@ def _group_row(group_id: str, name: str, enabled: bool, members: list[dict]) -> 
     }
 
 
+def node_rows() -> list[dict]:
+    """The device picker's view of each added node: state, reason, its GPUs and CPU cores (never its url or key)."""
+    from ...nodes.registry import get_registry
+
+    try:
+        views = get_registry().views()
+    except Exception as exc:  # noqa: BLE001 - a registry failure must not break the Workers page
+        logger.warning("Could not list nodes for the worker groups page ({})", exc)
+        return []
+    return [
+        {
+            "id": view.id,
+            "name": view.name,
+            "state": view.state,
+            "reason": view.reason,
+            "devices": [
+                {key: gpu.get(key) for key in ("device", "name", "type", "status")}
+                for gpu in view.gpus
+                if isinstance(gpu, dict) and gpu.get("device")
+            ],
+            "cpu_cores": view.cpu_cores,
+        }
+        for view in views
+    ]
+
+
+def _member_label(policy: dict, nodes: NodeHardware) -> str:
+    label = "CPU" if policy["resource"] == "cpu" else f"GPU {policy['device']}"
+    return f"{nodes.node_name(policy['node'])} · {label}" if policy.get("node") else label
+
+
 def worker_group_payload(settings=None) -> dict:
     """Read current policy and activity without exposing private configuration."""
     from ._helpers import _ensure_gpu_cache
@@ -152,6 +199,7 @@ def worker_group_payload(settings=None) -> dict:
         if isinstance(entry, dict)
     ]
     devices = {entry["device"] for entry in hardware if entry.get("status") != "failed"}
+    nodes = read_node_hardware(member_policies(groups))
     live = live_member_rows(_get_shared_worker_pool())
     paused = settings.processing_paused
     rows = []
@@ -160,8 +208,18 @@ def worker_group_payload(settings=None) -> dict:
         member_rows = []
         for policy in member_policies([group]):
             key = (policy["group_id"], policy["member_id"])
-            row = _member_row(policy, live.pop(key, None), devices, paused)
+            row = _member_row(policy, live.pop(key, None), devices, paused, nodes)
             member_rows.append(row)
+            if group["enabled"] and row["state"] == MEMBER_STATE_NODE_UNAVAILABLE:
+                warnings.append(
+                    {
+                        "code": MEMBER_STATE_NODE_UNAVAILABLE,
+                        "group_id": group["id"],
+                        "member_id": policy["member_id"],
+                        "message": f"{group['name']}: {_member_label(policy, nodes)} has no workers now "
+                        f"({row['reason'] or 'node unavailable'}). Its jobs wait; other devices keep working.",
+                    }
+                )
             if group["enabled"] and row["state"] == "hardware_unavailable":
                 warnings.append(
                     {
@@ -223,10 +281,15 @@ def worker_group_payload(settings=None) -> dict:
         "timezone_label": timezone_label,
         "limits": {"cpu": MAX_CPU_WORKERS, "gpu": MAX_GPU_WORKERS, "members": MAX_MEMBERS},
         "hardware": hardware,
+        "nodes": node_rows(),
         "capacity": {
             "groups": rows,
             "current": {
-                resource: sum(member["target"] for member in members_by_resource if member["resource"] == resource)
+                resource: sum(
+                    member["target"]
+                    for member in members_by_resource
+                    if member["resource"] == resource and not member.get("node")
+                )
                 for resource in ("cpu", "gpu")
             },
             "peak": {"cpu": cpu_peak, "gpu": gpu_peak},

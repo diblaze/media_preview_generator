@@ -878,7 +878,7 @@ def _translate_legacy_worker_updates(settings, updates: dict) -> dict:
             (g, m)
             for g in groups
             for m in g["members"]
-            if m["resource"] == resource and (device is None or m["device"] == device)
+            if m["resource"] == resource and not m.get("node") and (device is None or m["device"] == device)
         ]
         if len(matches) > 1:
             raise ValueError("Several worker groups use this resource. Adjust the named group under Workers.")

@@ -478,7 +478,8 @@ def _build_selected_gpus(settings, detected: list[dict] | None = None) -> list:
     if isinstance(groups, list):
         from ...worker_groups import configured_group_totals, member_policies
 
-        policies = member_policies(groups)
+        # A node's GPU is not this app's hardware, even when its device string matches a local one.
+        policies = [p for p in member_policies(groups) if not p.get("node")]
         grouped_devices = {p["device"] for p in policies if p["resource"] == "gpu" and p["enabled"]}
         for g in cached_gpus:
             device = g.get("device", "")
@@ -1007,6 +1008,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         group_name=worker_data.get("group_name"),
                         group_resource=worker_data.get("group_resource"),
                         retiring=bool(worker_data.get("retiring", False)),
+                        node=worker_data.get("node"),
+                        node_state=worker_data.get("node_state"),
                     )
                     job_manager.update_worker_status(worker_key, status)
                 job_manager.prune_worker_statuses(active_worker_keys)
