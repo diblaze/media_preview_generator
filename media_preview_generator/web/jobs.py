@@ -867,6 +867,7 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._storage: JobStorage | None = None
         self._lock = threading.RLock()
+        self._log_write_lock = threading.Lock()
         self._running_job_ids: set = set()
         self._on_progress_callbacks: list[Callable] = []
 
@@ -2850,12 +2851,15 @@ class JobManager:
     def add_log(self, job_id: str, message: str) -> None:
         """Add a log message for a job (in-memory and append to file), secrets masked (``utils.redact_secrets``)."""
         message = redact_secrets(message)
+        line = f"[{log_clock()}] {message}"
+        log_path = os.path.join(self._job_logs_dir, f"{job_id}.log")
         with self._lock:
             if job_id not in self._job_logs:
                 self._job_logs[job_id] = deque(maxlen=self._max_log_lines)
-            line = f"[{log_clock()}] {message}"
             self._job_logs[job_id].append(line)
-            log_path = os.path.join(self._job_logs_dir, f"{job_id}.log")
+        # The file append takes its own lock, not the manager's, which progress updates share. It never takes the
+        # manager's lock inside it, so a caller already holding that one (a cancel) can't deadlock with it.
+        with self._log_write_lock:
             try:
                 with open(log_path, "a") as f:
                     f.write(line + "\n")
@@ -3329,8 +3333,9 @@ class JobManager:
 
     def is_cancellation_requested(self, job_id: str) -> bool:
         """Check if cancellation has been requested for a job."""
-        with self._lock:
-            return self._cancellation_flags.get(job_id, False)
+        # No lock: one dict lookup is atomic, and every check thread asks this several times a file, so waiting for
+        # the manager's lock (held by progress updates and log appends) slowed every check.
+        return self._cancellation_flags.get(job_id, False)
 
     def clear_cancellation_flag(self, job_id: str) -> None:
         """Clear the cancellation flag for a job."""

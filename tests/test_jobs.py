@@ -1643,3 +1643,55 @@ def test_orphan_log_sweep_is_skipped_when_saved_jobs_could_not_be_read(config_di
     jm._jobs_load_failed = False
     jm._enforce_log_retention()
     assert not os.path.isfile(log)
+
+
+class TestLogAppendsDoNotHoldTheManagerLock:
+    """A job log's file append must not hold the manager's lock: every check thread's progress update and cancel
+    check takes that lock, and a slow disk write behind it stalled them all."""
+
+    def test_the_manager_lock_is_free_while_a_line_is_written(self, config_dir):
+        import threading
+
+        import media_preview_generator.web.jobs as jobs_mod
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        writing, release = threading.Event(), threading.Event()
+        real_open = open
+
+        def slow_open(path, *args, **kwargs):
+            if str(path).endswith(f"{job.id}.log"):
+                writing.set()
+                release.wait(5)
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(jobs_mod, "open", slow_open, create=True):
+            writer = threading.Thread(target=jm.add_log, args=(job.id, "INFO - line"))
+            writer.start()
+            assert writing.wait(5)
+            got = jm._lock.acquire(timeout=1)
+            if got:
+                jm._lock.release()
+            release.set()
+            writer.join(5)
+        assert got
+        assert jm.get_logs(job.id)[-1].endswith("INFO - line")
+
+    def test_a_cancel_logging_under_the_manager_lock_does_not_deadlock_with_an_append(self, config_dir):
+        import threading
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        jm.start_job(job.id)
+        appenders = [
+            threading.Thread(target=lambda: [jm.add_log(job.id, f"INFO - {n}") for n in range(200)]) for _ in range(4)
+        ]
+        for thread in appenders:
+            thread.start()
+        canceller = threading.Thread(target=jm.cancel_job_if_active, args=(job.id,))
+        canceller.start()
+        for thread in (*appenders, canceller):
+            thread.join(10)
+            assert not thread.is_alive()
+        assert jm.get_job(job.id).status is JobStatus.CANCELLED
+        assert any("Cancellation requested by user" in line for line in jm.get_logs(job.id))
