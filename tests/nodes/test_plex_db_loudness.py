@@ -442,6 +442,70 @@ class TestTheUndoRecordSurvivesAnUpdate:
             assert report.message.startswith(f"Mount a volume at {config_dir} on this Plex database node")
             assert "undo record survives updates" in report.message
 
+    @staticmethod
+    def _db(folder: Path, tmp_path: Path, *, root_fs: str, config_mounted: bool) -> RemoteLoudnessDb:
+        config_dir = Path(loudness_db.write_log_path()).parent
+        extra = f"40 22 0:50 / {config_dir} rw - ext4 /dev/sdb1 rw\n" if config_mounted else ""
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path, fs=root_fs, extra_lines=extra)).test_client()
+        return _remote(node)[0]
+
+    @pytest.mark.parametrize(
+        ("root_fs", "config_mounted", "ready"),
+        [("overlay", False, False), ("overlay", True, True), ("ext4", False, True)],
+        ids=["container-layer", "container-volume", "host-disk"],
+    )
+    @linux_mount_table
+    def test_the_file_checks_the_job_writes_by(self, folder, tmp_path, root_fs, config_mounted, ready):
+        report = self._db(folder, tmp_path, root_fs=root_fs, config_mounted=config_mounted).file_checks(
+            deadline=_deadline()
+        )
+        if ready:
+            assert report.state is Capability.READY
+        else:
+            assert report.state is Capability.MISCONFIGURED
+            assert "undo record survives updates" in report.message
+
+    @pytest.mark.parametrize(
+        ("root_fs", "config_mounted", "ready"),
+        [("overlay", False, False), ("overlay", True, True), ("ext4", False, True)],
+        ids=["container-layer", "container-volume", "host-disk"],
+    )
+    @linux_mount_table
+    def test_a_write_and_a_mark(self, folder, tmp_path, root_fs, config_mounted, ready):
+        db = self._db(folder, tmp_path, root_fs=root_fs, config_mounted=config_mounted)
+        journal = Path(loudness_db.write_log_path())
+        if ready:
+            assert loudness_db.write_stream(db, 11, FIELDS, deadline=_deadline()) is True
+            loudness_db.write_stream(db, 12, FIELDS, deadline=_deadline())
+            assert loudness_db.mark_item(db, 1, deadline=_deadline()) is True
+            assert _extra(folder, "media_streams", 11) == PLEX_ANALYSED and journal.exists()
+            return
+        with pytest.raises(PublishError, match="undo record survives updates") as ei:
+            loudness_db.write_stream(db, 11, FIELDS, deadline=_deadline())
+        assert ei.value.state is Capability.MISCONFIGURED
+        assert _extra(folder, "media_streams", 11) == BEFORE
+        # Every stream measured (by Plex itself), so only the refusal stops the mark.
+        with sqlite3.connect(plex_db.plex_db_path(str(folder))) as conn:
+            conn.execute("UPDATE media_streams SET extra_data = ? WHERE id IN (11, 12)", (PLEX_ANALYSED,))
+        conn.close()
+        with pytest.raises(PublishError, match="undo record survives updates") as ei:
+            loudness_db.mark_item(db, 1, deadline=_deadline())
+        assert ei.value.state is Capability.MISCONFIGURED
+        assert _extra(folder, "metadata_items", 1) is None
+        assert not journal.exists()
+
+    @linux_mount_table
+    def test_the_node_refuses_a_write_sent_straight_to_it(self, folder, tmp_path):
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path, fs="overlay")).test_client()
+        identity = {"machine_identifier": MACHINE, "pms_version": VERSION, "deadline_s": 5}
+        for operation, body in (("write", {"stream_id": 11, "fields": FIELDS}), ("mark", {"metadata_item_id": 1})):
+            response = node.post(f"/v1/loudness/{operation}", json={**identity, **body}, headers=AUTH)
+            assert response.status_code == 409
+            error = response.get_json()["error"]
+            assert error["state"] == Capability.MISCONFIGURED.value and "undo record" in error["message"]
+        assert _extra(folder, "media_streams", 11) == BEFORE
+        assert not Path(loudness_db.write_log_path()).exists()
+
     def test_a_folder_inside_the_volume_counts_as_on_it(self, folder, tmp_path, monkeypatch):
         volume = tmp_path / "node-config"
         monkeypatch.setenv("CONFIG_DIR", str(volume / "sub"))

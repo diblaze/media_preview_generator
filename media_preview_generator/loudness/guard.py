@@ -80,6 +80,7 @@ class LoudnessPlexDb(LocalPlexDb):
         label: str,
         identity: Callable[[], tuple[object, object]],
         mountinfo_path: str = "/proc/self/mountinfo",
+        undo_problem: str = "",
     ) -> None:
         """Create the database.
 
@@ -89,8 +90,11 @@ class LoudnessPlexDb(LocalPlexDb):
             identity: Returns the connected Plex's ``(machineIdentifier, version)``; raises ``PublishError`` when it
                 can't be read.
             mountinfo_path: For tests.
+            undo_problem: Why the undo record wouldn't survive an update (a Plex database node's
+                ``undo_record_problem``), or "": while set, the file checks are MISCONFIGURED, so nothing is written.
         """
         self.folder = Path(folder)
+        self._undo_problem = undo_problem
         self.machine_identifier = ""
         self._read_identity = identity
         self._identity_proven_at: float | None = None
@@ -147,8 +151,11 @@ class LoudnessPlexDb(LocalPlexDb):
             yield conn
 
     def file_checks(self, *, deadline: float) -> CapabilityReport:
-        """Retain the shared readiness states with loudness-specific wording."""
+        """Retain the shared readiness states with loudness-specific wording; MISCONFIGURED while the undo record
+        has nowhere lasting to go."""
         report = super().file_checks(deadline=deadline)
+        if report.ready and self._undo_problem:
+            return CapabilityReport(Capability.MISCONFIGURED, self._undo_problem)
         message = report.message.replace("markers", "loudness metadata").replace("Markers", "Loudness metadata")
         return CapabilityReport(report.state, message, report.details)
 

@@ -45,7 +45,7 @@ from ...loudness import plex_db as loudness_db
 from ...loudness.guard import LoudnessPlexDb
 from ...markers.fs import filesystem_type, is_network_filesystem, mount_of
 from ...markers.publishers import plex_remote
-from ...markers.publishers.base import Capability, CapabilityReport, PublishError
+from ...markers.publishers.base import Capability, PublishError
 from ...markers.publishers.plex_chapters import (
     CHAPTER_CAPABILITY,
     LocalChapters,
@@ -466,7 +466,12 @@ def register_plex_db(
         deadline = _deadline(body)
         # Passed through as sent: LoudnessPlexDb refuses a missing or mismatched identity the same way in-process.
         identity = (body.get("machine_identifier"), body.get("pms_version"))
-        loudness = LoudnessPlexDb(folder, label="node", identity=lambda: identity, mountinfo_path=mountinfo_path)
+        problem = "" if operation in {"streams", "snapshot"} else undo_record_problem(mountinfo_path=mountinfo_path)
+        if problem and operation in {"write", "mark"}:
+            return _refused(PublishError(problem, state=Capability.MISCONFIGURED))
+        loudness = LoudnessPlexDb(
+            folder, label="node", identity=lambda: identity, mountinfo_path=mountinfo_path, undo_problem=problem
+        )
         result: dict = {"capability": loudness_db.LOUDNESS_CAPABILITY}
         try:
             args = _loudness_args(operation, body)
@@ -476,11 +481,7 @@ def register_plex_db(
             if operation == "file_checks":
                 result["report"] = plex_remote.report_to_json(loudness.file_checks(deadline=deadline))
             elif operation == "check":
-                report = loudness.capability(deadline=deadline)
-                problem = undo_record_problem(mountinfo_path=mountinfo_path)
-                if report.state is Capability.READY and problem:
-                    report = CapabilityReport(Capability.MISCONFIGURED, problem)
-                result["report"] = plex_remote.report_to_json(report)
+                result["report"] = plex_remote.report_to_json(loudness.capability(deadline=deadline))
             elif operation == "streams":
                 streams, in_plex = loudness_db.read_streams(loudness, args["plex_paths"], deadline=deadline)
                 result["streams"] = [loudness_db.stream_to_json(s) for s in streams]
