@@ -86,6 +86,7 @@ a marker in the Inspector.
 **GPU first, CPU when needed**
 - **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed to the container.
 - **Named worker groups.** Choose each group's devices, their job types and worker counts, and weekly hours. Dashboard +/− changes are saved; reducing capacity lets current files finish. [Worker guide](docs/guides.md#worker-groups-and-availability).
+- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](docs/guides.md#remote-nodes).
 - **CPU fallback built in.** A file the GPU can't decode is retried on the CPU by the same worker.
 - **Key-frame skipping.** Jumps between key frames when a file's key-frame spacing allows it.
 
@@ -111,7 +112,7 @@ range. Combine filters while keeping existing previews. See the
 **Skip Intro and Skip Credits**
 - **Found once, sent to every server.** Finds intros and end credits from the file's chapters, online skip databases (TheIntroDB, IntroDB.app, SkipDB), the season's theme song or the credit roll itself (read on the GPU when that's faster), then sends the markers to every server. When it isn't sure, it sends nothing instead of a guess; you can add or adjust a marker in the Inspector. Off until you [turn it on](docs/guides.md#turning-it-on) for a server.
 - **Yours to correct.** Tools → Inspector adjusts, adds and locks a file's markers by hand, and Setup Health checks each server's Intro & Credits setup.
-- **Plex.** Needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the Plex machine, or next to it through the [Plex marker agent](nodes/plex-db/README.md).
+- **Plex.** Needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the Plex machine, or next to it through a [Plex database node](docs/guides.md#plex-on-another-machine-the-plex-database-node).
 - **Jellyfin.** Jellyfin 10.11 or 12.0, with the Media Preview Bridge plugin (the one trickplay uses).
 - **Emby.** Emby 4.9 or 4.10, with the Media Preview Bridge for Emby plugin. Skip Intro needs Emby Premiere; Skip Credits doesn't.
 
