@@ -590,7 +590,7 @@ class TestPlexTab:
         expect(modal).to_contain_text("The app must run on the same machine as Plex.")
         expect(modal).to_contain_text(SAME_HOST_HINT)
         expect(authed_page.locator("#markersPlexConfirmSameMachineHint")).to_be_visible()
-        expect(modal).not_to_contain_text("The Plex marker agent writes the markers")
+        expect(modal).not_to_contain_text("The Plex database node writes the markers")
 
     def test_confirm_modal_drops_the_same_machine_advice_when_the_agent_is_on(
         self, authed_page: Page, app_url: str
@@ -601,17 +601,21 @@ class TestPlexTab:
             server,
             _status(server, "ready", "Written into this Plex server's database", _plex_ready_details()),
         )
+        nodes = {"nodes": [{"id": "node-pc", "name": "gaming-pc", "roles": ["plex_db"], "legacy": False}]}
+        authed_page.route("**/api/nodes", lambda route: _fulfill(route, nodes))
         _open_tab(authed_page, app_url, server)
 
-        # Switched on live in the form, unsaved — the dialog reads the switch the user just flipped.
+        # Picked live in the form, unsaved — the dialog reads the Plex database choice the user just made.
         _switch_tab(authed_page, "general")
-        authed_page.locator("label[for='markersAgentEnabled']").click()
+        select = authed_page.locator("#markersPlexDatabase")
+        expect(select.locator("option[value='node-pc']")).to_be_attached(timeout=5000)
+        select.select_option("node-pc")
         _switch_tab(authed_page, "processing")
         _flip_switch_on(authed_page)
         modal = authed_page.locator("#markersPlexConfirmModal")
         expect(modal).to_be_visible(timeout=5000)
         expect(modal).to_contain_text(
-            "The Plex marker agent writes the markers on the Plex machine, so this app can run anywhere."
+            "The Plex database node writes the markers on the Plex machine, so this app can run anywhere."
         )
         expect(modal).not_to_contain_text("The app must run on the same machine as Plex.")
         # The config-folder sub-line's text() is still in the DOM (untouched innerHTML), but the element itself

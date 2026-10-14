@@ -41,7 +41,8 @@
 
     function syncSwitch() {
         const toggle = $('#loudnessEnabled');
-        const helper = !!($('#markersAgentEnabled') || {}).checked;
+        // Any route other than "Open it from this app" (the select's empty value) goes through a helper or node.
+        const helper = !!($('#markersPlexDatabase') || {}).value;
         if (toggle) toggle.disabled = helper && !toggle.checked;
         const hint = $('#loudnessHelperHint');
         if (hint) hint.classList.toggle('d-none', !helper);
@@ -126,8 +127,8 @@
     function wire() {
         const toggle = $('#loudnessEnabled');
         if (toggle) toggle.addEventListener('change', () => { syncSwitch(); syncLibraryColumn(); });
-        const helperToggle = $('#markersAgentEnabled');
-        if (helperToggle) helperToggle.addEventListener('change', syncSwitch);
+        const plexDbSelect = $('#markersPlexDatabase');
+        if (plexDbSelect) plexDbSelect.addEventListener('change', syncSwitch);
         const list = $('#editLibraryList');
         if (list) {
             list.addEventListener('change', (event) => {

@@ -17,7 +17,7 @@
 #serverList .card-footer > div { gap: .5rem !important; }
 #editServerModal .markers-opt { gap: 1rem; }
 #editServerModal .processing-feature,
-#editServerModal #markersPlexAgentFields { overflow-wrap: anywhere; }
+#editServerModal #markersAgentState { overflow-wrap: anywhere; }
 .job-details-toggle {
     --bs-btn-color: var(--bs-body-color);
     --bs-btn-border-color: var(--bs-secondary-color);

@@ -26,6 +26,10 @@
         // Library id → default_selected from the status check (null until it answers).
         statusDefaults: null,
         pendingConfirmation: null,
+        // Nodes with the Plex database role, from /api/nodes (null until it answers).
+        plexDbNodes: null,
+        // The Plex database choice before the last change, so "Add a Plex database node…" can put it back.
+        dbChoice: '',
     };
 
     function vendorOf(server) {
@@ -51,11 +55,28 @@
         return emby && typeof emby === 'object' ? emby : {};
     }
 
-    // The Plex marker agent as stored: {enabled, url, token}. The key arrives masked ('****') and is posted back
-    // masked unless the user types a new one, so a save can never overwrite it with the mask.
+    // How this server reaches Plex's database, as stored: {enabled, node_id}. enabled false = this app opens it;
+    // true = through the Plex database node node_id (the node record holds the address and key).
     function storedAgent(server) {
         const agent = storedPlex(server).agent;
         return agent && typeof agent === 'object' ? agent : {};
+    }
+
+    // The select's values besides a node id: this app, and the entry that opens the Nodes page.
+    const DB_LOCAL = '';
+    const DB_ADD_NODE = '__add_node__';
+    // A helper stored as {url, token} with no node behind it (settings from before nodes): kept as it is on save.
+    const DB_OLD_HELPER = '__old_helper__';
+
+    function storedDbChoice(server) {
+        const agent = storedAgent(server);
+        if (!agent.enabled) return DB_LOCAL;
+        if (agent.node_id) return String(agent.node_id);
+        return agent.url ? DB_OLD_HELPER : DB_LOCAL;
+    }
+
+    function isPlexDbNode(node) {
+        return !!node && ((Array.isArray(node.roles) && node.roles.includes('plex_db')) || !!node.legacy);
     }
 
     // ---------- status block ---------------------------------------------------
@@ -256,23 +277,113 @@
         return kvGrid(rows) + (pluginStates.includes(capability.state) ? '' : warningLine(capability));
     }
 
-    // The line under the agent's address: what the last check found, and a way to ask again.
+    function dbChoiceValue() {
+        const select = $('#markersPlexDatabase');
+        return select ? select.value : DB_LOCAL;
+    }
+
+    function dbChoiceLabel(value) {
+        const node = (tab.plexDbNodes || []).find((n) => String(n.id) === String(value));
+        if (node) return node.name || String(node.id);
+        if (value === DB_OLD_HELPER) return storedAgent(tab.server).url || 'Plex helper';
+        return String(value || '');
+    }
+
+    // The status line under the selector: what the last check of the saved route found, and a way to ask again.
+    // Nothing shows while this app opens the database itself.
     function renderAgentState(status) {
         const line = $('#markersAgentState');
         if (!line) return;
-        const agent = status ? agentDetails(status.capability || {}) : null;
+        const choice = dbChoiceValue();
+        line.classList.toggle('d-none', choice === DB_LOCAL);
+        if (choice === DB_LOCAL) {
+            line.innerHTML = '';
+            return;
+        }
         const check = '<button type="button" class="btn btn-sm btn-outline-secondary ms-2 py-0" id="markersAgentCheckBtn">Check again</button>';
+        const name = escapeHtml(dbChoiceLabel(choice));
+        if (tab.server && choice !== storedDbChoice(tab.server)) {
+            line.innerHTML = `${badge('off', 'Not set up')} <span class="text-muted">Save to use ${name}, then check.</span>`;
+            return;
+        }
+        const agent = status ? agentDetails(status.capability || {}) : null;
+        if (!status) {
+            line.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Checking…';
+            return;
+        }
         if (!agent) {
-            line.innerHTML = badge('off', 'Not set up')
-                + ' <span class="text-muted">Save the address and key, then check.</span>' + check;
+            line.innerHTML = `${badge('off', 'Not set up')} <span class="text-muted">${name} hasn't been checked yet.</span>${check}`;
             return;
         }
         const [tone, text] = AGENT_BADGES[agent.state] || AGENT_BADGES.unreachable;
-        const version = agent.version ? ` <span class="text-muted">version ${escapeHtml(agent.version)}</span>` : '';
+        const version = agent.version ? ` · v${escapeHtml(agent.version)}` : '';
         const note = agent.state === 'unreachable'
-            ? '<div class="text-muted mt-1">Markers wait here until the agent answers again. Nothing is lost.</div>'
+            ? `<div class="text-muted mt-1">Markers wait here until ${name} answers again. Nothing is lost.</div>`
             : '';
-        line.innerHTML = `${badge(tone, text)} <span class="font-monospace text-break">${escapeHtml(agent.url || '')}</span>${version}${check}${note}`;
+        line.innerHTML = `${badge(tone, text)} <span class="font-monospace text-break">${name}${version}</span>${check}${note}`;
+    }
+
+    function dbOption(value, text) {
+        return `<option value="${escapeHtml(value)}">${escapeHtml(text)}</option>`;
+    }
+
+    // "Open it from this app", each Plex database node, the stored choice even when its node is gone, and the
+    // entry that opens the Nodes page. Keeps whatever is selected now.
+    function renderDbOptions(server) {
+        const select = $('#markersPlexDatabase');
+        if (!select) return;
+        const current = select.dataset.loaded === '1' ? select.value : storedDbChoice(server);
+        const nodes = tab.plexDbNodes || [];
+        let html = dbOption(DB_LOCAL, 'Open it from this app');
+        nodes.forEach((node) => {
+            html += dbOption(String(node.id), `Through a Plex database node: ${node.name || node.id}`);
+        });
+        const stored = storedDbChoice(server);
+        if (stored === DB_OLD_HELPER) {
+            html += dbOption(DB_OLD_HELPER, `Through the Plex helper at ${storedAgent(server).url}`);
+        } else if (stored !== DB_LOCAL && !nodes.some((n) => String(n.id) === stored)) {
+            const label = tab.plexDbNodes === null ? stored : `${stored} (not on the Nodes page any more)`;
+            html += dbOption(stored, `Through a Plex database node: ${label}`);
+        }
+        html += dbOption(DB_ADD_NODE, 'Add a Plex database node…');
+        select.innerHTML = html;
+        select.value = current;
+        if (select.value !== current) select.value = stored;
+        select.dataset.loaded = '1';
+        tab.dbChoice = select.value;
+    }
+
+    async function fetchPlexDbNodes(server) {
+        const seq = tab.loadSeq;
+        let nodes = [];
+        try {
+            const r = await fetch('/api/nodes');
+            if (r.ok) {
+                const data = await r.json();
+                nodes = Array.isArray(data && data.nodes) ? data.nodes.filter(isPlexDbNode) : [];
+            }
+        } catch (_e) {
+            nodes = [];
+        }
+        if (seq !== tab.loadSeq) return;
+        tab.plexDbNodes = nodes;
+        renderDbOptions(server);
+        renderAgentState(tab.status);
+    }
+
+    function onDbChoiceChange(event) {
+        const select = event.target;
+        if (select.value === DB_ADD_NODE) {
+            // Not an edit of this server: put the choice back without the dialog counting it as a change.
+            event.stopPropagation();
+            select.value = tab.dbChoice;
+            const opened = window.open('/nodes#add', '_blank');
+            if (opened) opened.opener = null;
+            else window.location.assign('/nodes#add');
+            return;
+        }
+        tab.dbChoice = select.value;
+        renderAgentState(tab.status);
     }
 
     function renderStatus(server, status) {
@@ -444,16 +555,14 @@
 
         const agentGroup = $('#markersPlexAgentGroup');
         if (agentGroup) agentGroup.classList.toggle('d-none', !plex);
-        const agent = plex ? storedAgent(server) : {};
-        const agentToggle = $('#markersAgentEnabled');
-        if (agentToggle) agentToggle.checked = !!agent.enabled;
-        const agentUrl = $('#markersAgentUrl');
-        if (agentUrl) agentUrl.value = agent.url || '';
-        const agentToken = $('#markersAgentToken');
-        // The stored key comes back masked; leaving the mask in the field is what posts it back unchanged.
-        if (agentToken) agentToken.value = agent.token || '';
-        showAgentFields(plex);
-        renderAgentState(null);
+        tab.plexDbNodes = null;
+        const dbSelect = $('#markersPlexDatabase');
+        if (dbSelect) delete dbSelect.dataset.loaded;
+        if (plex) {
+            renderDbOptions(server);
+            renderAgentState(null);
+            fetchPlexDbNodes(server);
+        }
 
         const emby = vendorOf(server) === 'emby';
         const embyGroup = $('#markersEmbyRedetectGroup');
@@ -481,16 +590,13 @@
                 db_write_confirmed_at: storedPlex(server).db_write_confirmed_at || server._markersConfirmedAt || null,
                 on_plex_redetect: picked ? picked.value : (storedPlex(server).on_plex_redetect || 'restore'),
             };
-            const agent = {
-                enabled: !!($('#markersAgentEnabled') || {}).checked,
-                url: (($('#markersAgentUrl') || {}).value || '').trim(),
-                // An untouched field still holds the mask, which the API reads as "keep the stored key".
-                token: (($('#markersAgentToken') || {}).value || '').trim(),
-            };
-            // A server that never had an agent and whose fields are all empty posts no agent block at all, so a
-            // save that only changed something else doesn't write a field the user never filled in.
-            if (Object.keys(storedAgent(server)).length || agent.enabled || agent.url || agent.token) {
-                out.plex.agent = agent;
+            const choice = dbChoiceValue();
+            if (choice === DB_OLD_HELPER) {
+                out.plex.agent = { ...storedAgent(server) };
+            } else if (Object.keys(storedAgent(server)).length || choice !== DB_LOCAL) {
+                // A server that never had a route set and still opens the database itself posts no agent block, so a
+                // save that only changed something else doesn't write a field the user never touched.
+                out.plex.agent = choice === DB_LOCAL ? { enabled: false, node_id: null } : { enabled: true, node_id: choice };
             }
         }
         if (vendorOf(server) === 'emby') {
@@ -516,13 +622,13 @@
     }
 
     const CONFIRM_SAME_MACHINE_TEXT = 'The app must run on the same machine as Plex.';
-    const CONFIRM_AGENT_TEXT = 'The Plex marker agent writes the markers on the Plex machine, so this app can run anywhere.';
+    const CONFIRM_AGENT_TEXT = 'The Plex database node writes the markers on the Plex machine, so this app can run anywhere.';
 
     // The dialog is only ever opened while its own server's Edit form is on screen (both callers pass tab.server),
-    // so the live switch is the freshest answer; storedAgent is only the fallback for a caller that doesn't.
+    // so the live selector is the freshest answer; storedAgent is only the fallback for a caller that doesn't.
     function agentEnabledForConfirm(server) {
-        const toggle = $('#markersAgentEnabled');
-        if (toggle && tab.server && server && tab.server.id === server.id) return !!toggle.checked;
+        const select = $('#markersPlexDatabase');
+        if (select && tab.server && server && tab.server.id === server.id) return select.value !== DB_LOCAL;
         return !!storedAgent(server).enabled;
     }
 
@@ -589,14 +695,6 @@
         return tab.pendingConfirmation;
     }
 
-    // The address and key only matter once the agent is switched on; hidden otherwise, never for Jellyfin or Emby.
-    function showAgentFields(isPlexServer) {
-        const fields = $('#markersPlexAgentFields');
-        if (!fields) return;
-        const on = !!($('#markersAgentEnabled') || {}).checked;
-        fields.classList.toggle('d-none', !(isPlexServer && on));
-    }
-
     // The same section switch as the rail and the phone strip (servers.js exports it); the direct call is the
     // fallback for a page that loaded this file without servers.js.
     function showLibrariesTab() {
@@ -610,10 +708,8 @@
     }
 
     function wire() {
-        const agentToggle = $('#markersAgentEnabled');
-        if (agentToggle) {
-            agentToggle.addEventListener('change', () => showAgentFields(isPlex(tab.server)));
-        }
+        const dbSelect = $('#markersPlexDatabase');
+        if (dbSelect) dbSelect.addEventListener('change', onDbChoiceChange);
         const agentState = $('#markersAgentState');
         if (agentState) {
             agentState.addEventListener('click', (event) => {
