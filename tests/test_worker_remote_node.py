@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,7 +19,14 @@ from media_preview_generator.nodes.executor import (
     Placement,
     current_placement,
 )
-from media_preview_generator.nodes.registry import STATE_OFFLINE, STATE_READY, NodeRegistry, NodeView, set_registry
+from media_preview_generator.nodes.registry import (
+    STATE_OFFLINE,
+    STATE_READY,
+    NodeCapacity,
+    NodeRegistry,
+    NodeView,
+    set_registry,
+)
 from media_preview_generator.processing import CodecNotSupportedError
 from media_preview_generator.processing.types import ProcessableItem
 from tests.conftest import _ms, _pi
@@ -209,6 +217,8 @@ class TestPoolExcludesNodes:
 class _Registry(NodeRegistry):
     """One view per node: its state and when the registry last heard from it."""
 
+    revision = 0  # shadows the real registry's property
+
     def __init__(self) -> None:
         self.states: dict[str, tuple[str, float | None]] = {}
         self._clock = itertools.count(1)
@@ -222,6 +232,69 @@ class _Registry(NodeRegistry):
             return None
         state, seen = self.states[node_id]
         return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), (), 4, False, seen)
+
+    def capacity(self, node_id: str) -> NodeCapacity:
+        ready = self.states.get(node_id, (STATE_OFFLINE, None))[0] == STATE_READY
+        return NodeCapacity(ready, ready, "" if ready else "node offline")
+
+
+# Noon on a Monday; a scheduled group open only 00:00-00:01 is outside its hours then.
+NOON = datetime(2026, 10, 12, 12, 0)
+OFF_HOURS = {"mode": "scheduled", "windows": [{"days": list(range(7)), "start": "00:00", "end": "00:01"}]}
+ALWAYS = {"mode": "always", "windows": []}
+
+
+def _group(gid: str, *, node: str | None = None, kinds=("previews",), availability=ALWAYS, enabled=True) -> dict:
+    member = {"id": "m1", "resource": "cpu", "device": None, "count": 1, "job_types": list(kinds)}
+    if node is not None:
+        member["node"] = node
+    return {"id": gid, "name": gid, "enabled": enabled, "availability": availability, "members": [member]}
+
+
+class TestCanRunOutsideWithGroups:
+    """Every enabled member that supports the kind counts, whatever its hours or its node's state right now: the file
+    waits for it instead of failing."""
+
+    @pytest.fixture(autouse=True)
+    def registry(self):
+        fake = _Registry()
+        fake.set("a", STATE_READY, seen_now=True)
+        fake.set("b", STATE_OFFLINE, seen_now=False)
+        set_registry(fake)
+        yield fake
+        set_registry(None)
+
+    @staticmethod
+    def _can_run_outside_a(*groups: dict) -> bool:
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.reconcile_groups([_group("nas", node="a"), *groups], [], now=NOON)
+        return pool.can_run_outside("previews", {"a"})
+
+    @pytest.mark.parametrize(
+        ("other", "expected"),
+        [
+            (_group("local", availability=OFF_HOURS), True),
+            (_group("other-node", node="b"), True),
+            (_group("other-node-off-hours", node="b", availability=OFF_HOURS), True),
+            (_group("local"), True),
+            (_group("local", enabled=False), False),
+            (_group("local", kinds=("loudness",)), False),
+            (_group("nas-night", node="a", availability=OFF_HOURS), False),
+            (None, False),
+        ],
+        ids=[
+            "this-app-off-hours",
+            "offline-node",
+            "offline-node-off-hours",
+            "this-app-open",
+            "this-app-disabled",
+            "this-app-other-kind",
+            "excluded-node-off-hours",
+            "nothing-else",
+        ],
+    )
+    def test_members_that_count(self, other, expected):
+        assert self._can_run_outside_a(*([other] if other else [])) is expected
 
 
 class TestSuspectNodes:

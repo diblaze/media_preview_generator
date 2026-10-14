@@ -1320,7 +1320,8 @@ class WorkerPool:
         """Whether the configured workers can still run ``kind`` somewhere other than ``exclude_nodes``.
 
         True while nothing at all is configured for the kind (the item waits, as any item does); False only when every
-        configured slot for it is on an excluded node. Busy and off-hours slots count: they come back.
+        configured slot for it is on an excluded node. Busy slots, members outside their hours and members on a node
+        that is offline right now all count: they come back, so the item waits for them instead of failing.
 
         Args:
             kind: The job kind.
@@ -1340,8 +1341,8 @@ class WorkerPool:
             else:
                 nodes = [
                     policy.get("node")
-                    for pid, policy in self._policies.items()
-                    if self._policy_targets.get(pid, 0) > 0 and supports_job(policy, kind)
+                    for policy in self._policies.values()
+                    if policy.get("enabled", True) and policy.get("count", 0) > 0 and supports_job(policy, kind)
                 ]
             return not nodes or any(node is None or node not in exclude_nodes for node in nodes)
 
