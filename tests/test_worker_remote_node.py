@@ -10,6 +10,7 @@ import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome
 from media_preview_generator.jobs import worker as worker_mod
+from media_preview_generator.jobs.node_members import NodeMemberHardware
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes.executor import (
     REQUEUE_NODE_UNAVAILABLE,
@@ -343,3 +344,16 @@ class TestSuspectNodes:
         pool.workers.append(on_b)
         pool.mark_node_suspect("a")
         assert pool._find_available_worker() is on_b
+
+
+class TestNodeWorkerConstruction:
+    @pytest.mark.parametrize("resource", ["cpu", "gpu"])
+    def test_a_node_worker_without_a_node_name_is_named_by_its_node_id(self, resource):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        policy = {"node": "n1", "resource": resource, "device": "cuda:0" if resource == "gpu" else None}
+        gpu = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX"}
+        worker = pool._create_node_worker(policy, NodeMemberHardware(True, "", "", gpu=gpu, gpu_index=0))
+        assert (worker.node_id, worker.node_name) == ("n1", "n1")
+        assert worker.placement == Placement("n1", "n1")
+        assert worker.group_resource == ("node:n1:cpu" if resource == "cpu" else "node:n1:gpu:cuda:0")
+        assert worker.worker_type == resource.upper()

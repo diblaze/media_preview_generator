@@ -4,7 +4,6 @@ Provides Worker and WorkerPool classes that use threading instead of
 multiprocessing for better simplicity and performance with FFmpeg tasks.
 """
 
-import inspect
 import re
 import threading
 import time
@@ -1067,34 +1066,6 @@ class Worker:
                 )
 
 
-_WORKER_TAKES_NODE = "node_id" in inspect.signature(Worker.__init__).parameters
-
-
-def _new_worker(worker_id: int, worker_type: str, *, node_id: str | None, node_name: str | None, **kwargs) -> Worker:
-    """Construct a worker, handing it its node when ``Worker`` accepts one.
-
-    ``node_id``/``node_name`` are always readable on the result as attributes, so naming and status code can ask any
-    worker where it runs (``None`` = this app).
-
-    Args:
-        worker_id: Unique pool id.
-        worker_type: ``"GPU"`` or ``"CPU"``.
-        node_id: The node the worker's heavy steps run on, or ``None``.
-        node_name: That node's display name.
-        **kwargs: The remaining ``Worker`` arguments.
-
-    Returns:
-        The new worker.
-    """
-    if _WORKER_TAKES_NODE:
-        worker = Worker(worker_id, worker_type, node_id=node_id, node_name=node_name, **kwargs)
-    else:
-        worker = Worker(worker_id, worker_type, **kwargs)
-    worker.node_id = node_id
-    worker.node_name = node_name
-    return worker
-
-
 # A node that just dropped a file gets no new file until the registry's next check of it comes back ready, or this
 # long at most (a node that stays down loses its workers once the registry marks it offline).
 SUSPECT_NODE_S = 60.0
@@ -1445,7 +1416,7 @@ class WorkerPool:
         self._next_worker_id += 1
         if policy["resource"] == "gpu":
             gpu = hardware.gpu or {}
-            worker = _new_worker(
+            worker = Worker(
                 worker_id,
                 "GPU",
                 node_id=policy["node"],
@@ -1457,7 +1428,7 @@ class WorkerPool:
                 ffmpeg_threads=NODE_GPU_FFMPEG_THREADS,
             )
         else:
-            worker = _new_worker(worker_id, "CPU", node_id=policy["node"], node_name=hardware.node_name)
+            worker = Worker(worker_id, "CPU", node_id=policy["node"], node_name=hardware.node_name)
         worker._done_event = self._worker_done_event
         return worker
 
