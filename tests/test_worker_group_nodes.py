@@ -36,6 +36,9 @@ NODES = {"storage": "storage", "nuc": "nuc"}
 class FakeRegistry(NodeRegistry):
     """In-memory registry: each node has a view and a capacity; ``revision`` bumps on every change."""
 
+    # A plain class attribute shadows NodeRegistry's read-only property so the fake can bump it directly.
+    revision = 0
+
     def __init__(self) -> None:
         self.revision = 0
         self._views: dict[str, NodeView] = {}
