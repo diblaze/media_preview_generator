@@ -1451,16 +1451,19 @@ class TestACancelStopsTheFileWheneverItLands:
         # The only worker is held picking up the first episode while the second waits in the queue for it.
         from media_preview_generator.jobs.dispatcher import get_dispatcher
 
+        # The two files are checked side by side, so either can reach the worker first.
         first, second, _third = lab.episodes
+        queued: list[str] = []
 
-        def second_queued(job):
+        def other_queued(job):
             tracker = get_dispatcher()._trackers[job.id]
-            assert wait_for(lambda: [item.canonical_path for item in tracker.item_queue] == [second])
+            assert wait_for(lambda: len(tracker.item_queue) == 1)
+            queued.extend(item.canonical_path for item in tracker.item_queue)
 
         job, stored = self._cancel_while_held(engine, lab, [first, second], hold_at="pickup",
-                                              before_cancel=second_queued)  # fmt: skip
+                                              before_cancel=other_queued)  # fmt: skip
         self._assert_stopped_with_nothing_kept(engine, lab, job, stored, decodes=0)
-        assert lab.picked_up == [first]
+        assert len(queued) == 1 and lab.picked_up == [({first, second} - set(queued)).pop()]
 
     def test_a_cancel_as_the_worker_picks_the_file_up_starts_no_decode(self, engine, lab):
         job, stored = self._cancel_while_held(engine, lab, lab.episodes[:1], hold_at="pickup")
