@@ -11,7 +11,14 @@ from flask import jsonify, request
 from loguru import logger
 
 from ...nodes import protocol
-from ...nodes.client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError
+from ...nodes.client import (
+    NodeAddress,
+    NodeAuthError,
+    NodeClient,
+    NodeError,
+    NodeProtocolError,
+    NodeRequestError,
+)
 from ...nodes.mappings import default_mappings_for, run_test_access
 from ...nodes.readiness import node_readiness
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
@@ -21,6 +28,9 @@ from ..settings_manager import get_settings_manager
 from . import api
 
 LOG_LINES_MAX = 2000
+# Probe error kinds beyond the protocol's request-level ones: nothing answered, or another node than the one saved.
+KIND_UNREACHABLE = "unreachable"
+KIND_DIFFERENT_NODE = "different_node"
 
 
 def _app_version() -> str:
@@ -73,14 +83,14 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "roles": list(view.roles) if view else [],
         "legacy": bool(view.legacy) if view else False,
         "platform": details.platform if details else {},
-        "gpus": [dict(g) for g in view.gpus] if view else [],
+        "gpus": [dict(g) for g in details.gpus] if details else [],
         "cpu": {
             "cores": cpu.get("cores"),
             "load1": cpu.get("load1"),
             "ram_total": cpu.get("ram_total"),
             "ram_available": cpu.get("ram_available"),
         },
-        "busy": details.busy if details else False,
+        "busy": details.busy if details else 0,
         "last_seen": view.last_seen if view else None,
         "path_mappings": list(record.get("path_mappings") or []),
         "used_by": _used_by(record["id"]),
@@ -98,6 +108,56 @@ def _not_found(node_id: str):
     return jsonify({"error": f"No node with id {node_id}"}), 404
 
 
+def _probe_error(kind: str, message: str) -> dict[str, Any]:
+    return {"ok": False, "error": {"kind": kind, "message": message}}
+
+
+def _credit_notes(gpus: list[dict]) -> list[dict[str, str]]:
+    """One note per GPU whose credits text detection runs on the CPU (known once a credits task has run there)."""
+    notes = []
+    for gpu in gpus:
+        credit = gpu.get("credit_text")
+        if isinstance(credit, dict) and credit.get("on_gpu") is False:
+            notes.append(
+                {
+                    "title": "Credits text",
+                    "chip": f"CPU on {gpu.get('name') or gpu.get('device') or 'this GPU'}",
+                    "message": str(credit.get("reason") or ""),
+                }
+            )
+    return notes
+
+
+def _probe_info(info: dict) -> dict[str, Any]:
+    """The probe's ``info``: ``/v1/info`` projected to what Add node shows, plus whether the versions match."""
+    block = info.get("node") if isinstance(info.get("node"), dict) else {}
+    roles = [r for r in block.get("roles") or [] if r in protocol.ROLES]
+    version = str(block.get("version") or "")
+    worker = info.get("worker") if isinstance(info.get("worker"), dict) else None
+    gpus = [g for g in (worker or {}).get("gpus") or [] if isinstance(g, dict)]
+    plex_db = info.get("plex_db")
+    return {
+        "node": {
+            "id": str(block.get("id") or "") or None,
+            "name": str(block.get("name") or ""),
+            "version": version,
+            "roles": roles,
+        },
+        "legacy": False,
+        "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
+        "worker": None
+        if worker is None
+        else {
+            "gpus": gpus,
+            "cpu": worker.get("cpu") if isinstance(worker.get("cpu"), dict) else {},
+            "temp": worker.get("temp") if isinstance(worker.get("temp"), dict) else {},
+            "notes": _credit_notes(gpus),
+        },
+        "plex_db": plex_db if isinstance(plex_db, dict) else None,
+        "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
+    }
+
+
 def _probe(url: str, key: str) -> dict[str, Any]:
     """Ask an address what it is, without saving anything: ``{"ok", "info"}`` or ``{"ok": False, "error"}``."""
     from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_REJECTED
@@ -105,52 +165,38 @@ def _probe(url: str, key: str) -> dict[str, Any]:
     try:
         info = _make_client(url, key).info()
     except NodeAuthError:
-        return {"ok": False, "error": {"kind": protocol.KIND_AUTH, "message": "The node refused this key."}}
+        return _probe_error(protocol.KIND_AUTH, "The node refused this key.")
+    except NodeRequestError as exc:
+        return _probe_error(protocol.KIND_REQUEST, str(exc))
     except NodeProtocolError:
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
-            return {"ok": False, "error": {"kind": protocol.KIND_AUTH, "message": "The Plex helper refused this key."}}
+            return _probe_error(protocol.KIND_AUTH, "The Plex helper refused this key.")
         if state != AGENT_CONNECTED:
-            return {
-                "ok": False,
-                "error": {
-                    "kind": protocol.KIND_PROTOCOL,
-                    "message": "Something answered at this address, but not as a node or a Plex helper this app "
-                    "can use.",
-                },
-            }
+            return _probe_error(
+                protocol.KIND_PROTOCOL,
+                "Something answered at this address, but not as a node or a Plex helper this app can use.",
+            )
         return {
             "ok": True,
             "info": {
-                "node_uid": None,
-                "name": "",
-                "version": version,
-                "roles": [protocol.ROLE_PLEX_DB],
-                "gpus": [],
-                "platform": {},
+                "node": {"id": None, "name": "", "version": version, "roles": [protocol.ROLE_PLEX_DB]},
                 "legacy": True,
+                "platform": {},
+                "worker": None,
+                "plex_db": None,
                 "version_match": None,
             },
         }
     except NodeError as exc:
-        return {"ok": False, "error": {"kind": "unreachable", "message": str(exc)}}
-    block = info.get("node") if isinstance(info.get("node"), dict) else {}
-    worker = info.get("worker") if isinstance(info.get("worker"), dict) else {}
-    roles = [r for r in block.get("roles") or [] if r in protocol.ROLES]
-    version = str(block.get("version") or "")
-    return {
-        "ok": True,
-        "info": {
-            "node_uid": str(block.get("id") or "") or None,
-            "name": str(block.get("name") or ""),
-            "version": version,
-            "roles": roles,
-            "gpus": [g for g in worker.get("gpus") or [] if isinstance(g, dict)],
-            "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
-            "legacy": False,
-            "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
-        },
-    }
+        return _probe_error(KIND_UNREACHABLE, str(exc))
+    return {"ok": True, "info": _probe_info(info)}
+
+
+def _log_line(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {"time": "", "level": "", "message": str(raw)}
+    return {k: str(raw.get(k) or "") for k in ("time", "level", "message")}
 
 
 def _json_body() -> dict:
@@ -161,17 +207,11 @@ def _json_body() -> dict:
 @api.route("/nodes", methods=["GET"])
 @setup_or_auth_required
 def list_nodes():
-    """Every node as ``NODE_ROW``, this app's version, and pre-filled mappings for Add node."""
+    """Every node as ``NODE_ROW`` and this app's version."""
     sm = get_settings_manager()
     registry = get_registry()
     rows = [_node_row(record, registry.details(record["id"])) for record in sm.nodes if record.get("id")]
-    return jsonify(
-        {
-            "nodes": rows,
-            "app_version": _app_version(),
-            "default_mappings": default_mappings_for(sm.get("media_servers") or []),
-        }
-    )
+    return jsonify({"nodes": rows, "app_version": _app_version()})
 
 
 @api.route("/nodes/probe", methods=["POST"])
@@ -182,17 +222,27 @@ def probe_node():
     url, err = normalise_url(data.get("url"))
     if url is None:
         return jsonify({"error": err}), 400
-    stored = ""
-    if data.get("key") == KEY_MASK and data.get("id"):
-        record = find_node(get_settings_manager().nodes, data.get("id"))
-        stored = str(record.get("key") or "") if record else ""
+    sm = get_settings_manager()
+    record = find_node(sm.nodes, data.get("id")) if data.get("id") else None
+    stored = str(record.get("key") or "") if record and data.get("key") == KEY_MASK else ""
     key, err = normalise_key(data.get("key"), stored)
     if key is None:
         return jsonify({"error": err}), 400
     result = _probe(url, key)
-    if result["ok"] and result["info"]["node_uid"]:
-        twin = next((n for n in get_settings_manager().nodes if n.get("node_uid") == result["info"]["node_uid"]), None)
-        result["info"]["already_added"] = twin["id"] if twin else None
+    if not result["ok"]:
+        return jsonify(result)
+    info = result["info"]
+    uid = info["node"]["id"]
+    if record is not None and record.get("node_uid") and uid and uid != record["node_uid"]:
+        return jsonify(
+            _probe_error(KIND_DIFFERENT_NODE, f"A different node answered at this address than {record.get('name')}.")
+        )
+    own_id = record["id"] if record else None
+    twin = next((n for n in sm.nodes if uid and n.get("node_uid") == uid and n["id"] != own_id), None)
+    info["already_added"] = {"id": twin["id"], "name": twin.get("name", "")} if twin else None
+    info["suggested_path_mappings"] = (
+        default_mappings_for(sm.get("media_servers") or []) if protocol.ROLE_WORKER in info["node"]["roles"] else []
+    )
     return jsonify(result)
 
 
@@ -206,12 +256,13 @@ def create_node():
     if record is None:
         return jsonify({"error": err}), 400
     probe = _probe(record["url"], record["key"])
-    uid = probe["info"]["node_uid"] if probe["ok"] else None
+    uid = probe["info"]["node"]["id"] if probe["ok"] else None
     with sm.locked():
         nodes = sm.nodes
         twin = next((n for n in nodes if uid and n.get("node_uid") == uid), None)
         if twin is not None:
-            return jsonify({"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}), 409
+            answer = {"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}
+            return jsonify({**answer, "name": twin.get("name", "")}), 409
         others_err = validate_node(record, existing=None, others=nodes)[1]
         if others_err:
             return jsonify({"error": others_err}), 400
@@ -326,7 +377,7 @@ def node_health(node_id: str):
 @api.route("/nodes/<node_id>/log", methods=["GET"])
 @setup_or_auth_required
 def node_log(node_id: str):
-    """The node's own last N log lines."""
+    """The node's own last N log lines, oldest first, as ``{time, level, message}``."""
     record = find_node(get_settings_manager().nodes, node_id)
     if record is None:
         return _not_found(node_id)
@@ -339,7 +390,7 @@ def node_log(node_id: str):
     except NodeError as exc:
         return jsonify({"error": f"Couldn't read {record.get('name')}'s log: {exc}"}), 502
     raw = answer.get("lines")
-    return jsonify({"lines": [str(line) for line in raw] if isinstance(raw, list) else []})
+    return jsonify({"lines": [_log_line(line) for line in raw] if isinstance(raw, list) else []})
 
 
 @api.route("/nodes/<node_id>/rescan-gpus", methods=["POST"])

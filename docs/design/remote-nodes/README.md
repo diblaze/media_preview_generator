@@ -297,20 +297,53 @@ Worker group member: `{"id", "resource", "device", "count", "job_types", "node":
 
 ### 10.4 Nodes REST API (Lane B backend ⇄ Lane B UI)
 
-All under `/api`, `@setup_or_auth_required`. Keys come back as `"****"`; posting `"****"` keeps the stored key.
+All under `/api`, `@setup_or_auth_required`. A node's key never comes back; posting `"****"` keeps the stored key.
+Errors are `{"error": "<sentence>"}` with 400 (bad input), 404 (unknown node) or 502 (the node couldn't be asked).
 
 | Route | Body | Answer |
 |---|---|---|
 | `GET /nodes` | – | `{"nodes": [NODE_ROW], "app_version"}` |
-| `POST /nodes/probe` | `{url, key}` | `{"ok", "info"}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved |
-| `POST /nodes` | `{name, url, key, path_mappings}` | `NODE_ROW` (409 when that node id is already added) |
+| `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key |
+| `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
 | `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW` |
-| `DELETE /nodes/<id>` | – | 409 `{"error", "used_by": [...]}` while a group member or Plex server uses it |
+| `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
-| `POST /nodes/<id>/test-access` | `{path_mappings?}` | `{"libraries": [{server, library, app_root, checked, ok, files: [{path, ok, kind, message, node_path}], suggestion: {from, to} | null}]}` |
+| `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |
-| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [...]}` |
+| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601) |
 | `POST /nodes/<id>/rescan-gpus` | – | `NODE_ROW` |
 
-`NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform, gpus, cpu: {cores, load1,
-ram_total, ram_available}, busy, last_seen, path_mappings, used_by: {groups: [...], servers: [...]}}`.
+`NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform: {os, arch, python}, gpus:
+[{type, device, name, status, error}], cpu: {cores, load1, ram_total, ram_available}, busy, last_seen, path_mappings,
+used_by: {groups: [{id, name}], servers: [{id, name}]}}`. `busy` = how many tasks the node is running (int);
+`last_seen` = epoch seconds of the last answer, or null; `error` is `""` for a working GPU. Facts the node hasn't
+reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `gpus: []`, `cpu` values null.
+
+`PROBE_INFO` is `/v1/info` projected for Add node:
+
+```
+{"node": {id, name, version, roles},          # id null and name "" for an older Plex helper
+ "legacy": bool,                              # an older Plex helper (no /v1/info; answered its /v1/ping)
+ "platform": {os, arch, python},              # {} for a helper
+ "worker": {gpus: [{type, device, name, status, error, credit_text?}], cpu: {...}, temp: {path, free_bytes},
+            notes: [{title, chip, message}]} | null,   # null without the worker role; notes = credits text on CPU
+ "plex_db": {config_dir, db_present, machine_identifier} | null,
+ "version_match": bool | null,                # null without the worker role (only a worker must match exactly)
+ "already_added": {id, name} | null,          # another saved node with this node id
+ "suggested_path_mappings": [{app_prefix, node_prefix}]}   # one row per library folder, same path; [] if no worker
+```
+
+Probe error kinds: `auth` (key refused), `unreachable` (no answer), `protocol` (answered, but not as a node or Plex
+helper this app can use), `request` (the node refused the request as malformed), `different_node` (with `id`: another
+node than the saved one answers there).
+
+`LIBRARY_ACCESS = {server, library, app_root, checked, ok, files: [{path, ok, kind, message, node_path}], nearby:
+{node_dir: [names]}, suggestion: {from, to} | null, error: str | null}`. `kind` is a `NOT_VISIBLE_*` reason (`""` when
+seen); `nearby` holds the node's listings of the deepest existing folder above this library's missing files;
+`suggestion` swaps the covering row's `node_prefix` (`from`, `to` are node-side paths); `error` says why no file was
+sampled (folder missing or no video near its top), with `checked: 0`.
+
+Node Setup Health rows are server Setup Health rows; a failing one also says where its fix is: `fix_tab`
+(`media` / `settings` / `overview`, the node dialog tab) with `fix_label` and, on a media row, `suggestion: {from, to,
+app_root}` (applied, then tested) or `fix_action: "test_access"`; `fix_where: "node"` (only the node's machine can
+fix it: version, GPU, Plex database); or `help_url` + `help_label` (a page of this app). Passing rows carry none.

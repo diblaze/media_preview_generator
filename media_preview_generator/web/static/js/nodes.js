@@ -117,35 +117,25 @@
         return `${days} ${days === 1 ? 'day' : 'days'} ago`;
     }
 
-    // busy is a count of running files, a {running, workers} pair, or a sentence from the API.
+    // busy is how many files the node is running right now.
     function busyText(busy) {
-        if (typeof busy === 'string') return busy;
-        if (typeof busy === 'number') return busy > 0 ? `${busy} ${busy === 1 ? 'file' : 'files'} running` : 'idle';
-        if (busy && typeof busy === 'object' && Number.isFinite(Number(busy.running))) {
-            const running = Number(busy.running);
-            if (Number.isFinite(Number(busy.workers)) && Number(busy.workers) > 0) {
-                return `${running} of ${Number(busy.workers)} workers busy`;
-            }
-            return running > 0 ? `${running} ${running === 1 ? 'file' : 'files'} running` : 'idle';
-        }
-        return '';
+        const running = Number(busy);
+        if (!Number.isFinite(running)) return '';
+        return running > 0 ? `${running} ${running === 1 ? 'file' : 'files'} running` : 'idle';
     }
 
     function nameOf(item) {
-        if (item && typeof item === 'object') return item.name || item.id || '';
-        return item == null ? '' : String(item);
+        return (item && (item.name || item.id)) || '';
     }
 
-    // used_by is {groups: [...], servers: [...]} on a node row and a flat list on a refused DELETE; items are names
-    // or {id, name, kind}.
+    // used_by is {groups: [{id, name}], servers: [{id, name}]} on a node row and a [{kind, id, name}] list on a
+    // refused DELETE.
     function usedByParts(usedBy) {
         const parts = [];
         if (Array.isArray(usedBy)) {
             usedBy.forEach((item) => {
-                const kind = item && typeof item === 'object' ? (item.kind || item.type || '') : '';
-                const label = kind === 'server' ? 'Plex server' : kind === 'group' ? 'worker group' : '';
-                const name = nameOf(item);
-                if (name) parts.push(label ? `${label} "${name}"` : `"${name}"`);
+                const label = item.kind === 'server' ? 'Plex server' : 'worker group';
+                if (nameOf(item)) parts.push(`${label} "${nameOf(item)}"`);
             });
             return parts;
         }
@@ -367,6 +357,15 @@
             return row;
         }
 
+        // Long paths share a prefix, so show each field's end (the folder that differs) and the whole path on hover.
+        // Only works on a visible field: callers run it again once the editor is on screen.
+        function revealEnds() {
+            $$('.nd-map-row input', rows).forEach((input) => {
+                input.title = input.value;
+                input.scrollLeft = input.scrollWidth;
+            });
+        }
+
         function set(mappings) {
             rows.innerHTML = '';
             results.innerHTML = '';
@@ -376,6 +375,7 @@
             if (list.length) list.forEach(addRow);
             else addRow();
             initTooltips(root);
+            requestAnimationFrame(revealEnds);
         }
 
         // null (with the half-filled field marked) when a row has only one side.
@@ -436,10 +436,11 @@
         function failureCard(lib, index) {
             const files = Array.isArray(lib.files) ? lib.files : [];
             const bad = files.find((f) => !f.ok) || {};
-            const why = NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
+            // A library with no files sampled failed on this app's side; its error says why.
+            const why = (!files.length && lib.error) || NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
             const tried = bad.node_path || bad.path || '';
             let html = `<div class="nd-fail" data-library="${esc(lib.library)}">`
-                + `<div><span class="nd-fail-h">${esc(lib.library)}: ${esc(why)}.</span>`
+                + `<div><span class="nd-fail-h">${esc(lib.library)}: ${esc(String(why).replace(/\.$/, ''))}.</span>`
                 + (tried ? ` <span class="text-muted">Tried</span> <span class="nd-mono">${esc(tried)}</span>` : '')
                 + '</div>';
             const nearby = lib.nearby && typeof lib.nearby === 'object' ? lib.nearby : {};
@@ -459,6 +460,7 @@
 
         function renderResults(libraries) {
             lastLibraries = libraries;
+            revealEnds();
             $$('.nd-chip-slot', rows).forEach((slot) => { slot.innerHTML = ''; });
             if (!libraries.length) {
                 results.innerHTML = '<div class="sm-hint">No libraries to test yet. Add a media server with libraries first.</div>';
@@ -488,6 +490,7 @@
                 $('.nd-app', row).value = lib.app_root || '';
                 $('.nd-node', row).value = to;
             }
+            revealEnds();
             changed();
         }
 
@@ -530,6 +533,7 @@
             set,
             read,
             test,
+            revealEnds,
             showError,
             applySuggestion,
             setName(name) { $('.nd-map-name', root).textContent = name || 'the node'; },
@@ -544,12 +548,8 @@
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
-            case 'key_refused':
                 return "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set.";
             case 'unreachable':
-            case 'offline':
-            case 'timeout':
-            case 'connection':
                 return 'Nothing answered at this address. Check the address and port, and that the node is running.';
             case 'protocol':
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
@@ -578,15 +578,17 @@
         const node = info.node || {};
         const worker = info.worker || {};
         const version = node.version || '';
+        // version_match is null for a node without the worker role: only a worker must match this app's version.
         const same = info.version_match !== false;
         const rows = [];
         rows.push(`<div class="nd-found-row">${pill('ok', '✓ Connected')}`
             + (same
-                ? `<span class="nd-faint">version ${esc(version)}${page.appVersion ? ' · same as this app' : ''}</span>`
+                ? `<span class="nd-faint">version ${esc(version || 'unknown')}${info.version_match === true ? ' · same as this app' : ''}</span>`
                 : `${pill('warn', 'Update needed')}<span class="nd-faint">version ${esc(version || 'unknown')}; this app is ${esc(page.appVersion || 'newer')}. Update the node so they match before it gets work.</span>`)
             + '</div>');
         let found = infoRoles(info).map((role) => pill('role', role === ROLE_PLEX_DB ? 'Plex database' : 'Worker')).join('');
         if (String((info.platform || {}).os || '').toLowerCase().startsWith('win')) found += pill('off', 'Windows');
+        if (info.legacy) found += pill('off', 'Older Plex helper');
         (Array.isArray(worker.gpus) ? worker.gpus : []).forEach((gpu) => {
             const okGpu = !gpu.status || gpu.status === 'ok';
             const label = [gpu.device, gpu.name].filter(Boolean).join(' · ');
@@ -605,12 +607,9 @@
                     : `${pill('ok', '✓ Database found')}<span class="nd-faint nd-mono">${esc(plexDb.config_dir || '')}</span>`)
                 + '</div>');
         }
-        const notes = Array.isArray(worker.notes) ? worker.notes : (Array.isArray(info.notes) ? info.notes : []);
-        notes.forEach((note) => {
-            const title = typeof note === 'object' ? (note.title || note.label || '') : '';
-            const message = typeof note === 'object' ? (note.message || '') : String(note);
-            rows.push(`<div class="nd-found-row"><span class="nd-found-k">${esc(title || 'Note')}</span>`
-                + `${note && note.chip ? pill('warn', note.chip) : ''}<span class="nd-faint">${esc(message)}</span></div>`);
+        (Array.isArray(worker.notes) ? worker.notes : []).forEach((note) => {
+            rows.push(`<div class="nd-found-row"><span class="nd-found-k">${esc(note.title || 'Note')}</span>`
+                + `${note.chip ? pill('warn', note.chip) : ''}<span class="nd-faint">${esc(note.message || '')}</span></div>`);
         });
         card.innerHTML = `<div class="nd-found">${rows.join('')}</div>`;
         card.classList.remove('d-none');
@@ -682,6 +681,14 @@
             setAddStep(1);
             return;
         }
+        const twin = r.data.info.already_added;
+        if (twin) {
+            add.probe = null;
+            $('#addNodeProbe').classList.add('d-none');
+            addError(alreadyAddedText(twin.name));
+            setAddStep(1);
+            return;
+        }
         add.probe = r.data.info;
         const nameEl = $('#addNodeName');
         if (!nameEl.value.trim() && add.probe.node && add.probe.node.name) nameEl.value = add.probe.node.name;
@@ -689,17 +696,26 @@
         setAddStep(1);
     }
 
+    function alreadyAddedText(name) {
+        return `This node is already added${name ? ` as "${name}"` : ''}. Open it from the list instead.`;
+    }
+
+    // An older Plex helper reports no name of its own; its address's host stands in.
+    function hostOf(url) {
+        try { return new URL(url).hostname; } catch (_) { return ''; }
+    }
+
     async function saveNewNode() {
-        const name = $('#addNodeName').value.trim() || ((add.probe.node || {}).name) || '';
-        const body = { name, url: $('#addNodeUrl').value.trim(), key: $('#addNodeKey').value.trim(), path_mappings: [] };
+        const url = $('#addNodeUrl').value.trim();
+        const name = $('#addNodeName').value.trim() || ((add.probe.node || {}).name) || hostOf(url);
+        const body = { name, url, key: $('#addNodeKey').value.trim(), path_mappings: [] };
         const btn = $('#addNodeNext');
         btn.disabled = true;
         const r = await api('POST', '/api/nodes', body);
         btn.disabled = false;
         if (!r.ok) {
             if (r.status === 409) {
-                const existing = r.data && (r.data.name || (r.data.node && r.data.node.name));
-                addError(`This node is already added${existing ? ` as "${existing}"` : ''}. Open it from the list instead.`);
+                addError(alreadyAddedText(r.data && r.data.name));
             } else {
                 addError(errorText(r, "Couldn't save the node"));
             }
@@ -979,9 +995,7 @@
         }
         const lines = Array.isArray(r.data && r.data.lines) ? r.data.lines : [];
         pre.textContent = lines.length
-            ? lines.map((line) => (line && typeof line === 'object'
-                ? [line.time, line.level, line.message].filter(Boolean).join(' ')
-                : String(line))).join('\n')
+            ? lines.map((line) => [line.time, line.level, line.message].filter(Boolean).join(' ')).join('\n')
             : 'No log lines yet.';
         pre.scrollTop = pre.scrollHeight;
     }
@@ -1075,8 +1089,11 @@
             fix.textContent = check.fix_label || 'Fix';
             fix.addEventListener('click', () => {
                 showTab(check.fix_tab);
-                if (check.fix_tab === 'media' && check.suggestion && check.suggestion.to) {
+                if (check.fix_tab !== 'media') return;
+                if (check.suggestion && check.suggestion.to) {
                     detail.editor.applySuggestion({ suggestion: check.suggestion, app_root: check.suggestion.app_root || '' });
+                    detail.editor.test();
+                } else if (check.fix_action === 'test_access') {
                     detail.editor.test();
                 }
             });
@@ -1213,6 +1230,7 @@
                 // Opening the dialog already loaded it; switching to the tab later checks again.
                 if (trigger.dataset.tab === 'health' && Date.now() - detail.healthStartedAt > 2000) loadHealth();
                 if (trigger.dataset.tab === 'log') loadLog();
+                if (trigger.dataset.tab === 'media') detail.editor.revealEnds();
             });
         });
         $('#nodeRescanGpus').addEventListener('click', rescanGpus);

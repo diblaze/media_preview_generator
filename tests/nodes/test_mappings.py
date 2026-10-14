@@ -7,7 +7,7 @@ import os
 import pytest
 
 from media_preview_generator.nodes import mappings as nm
-from media_preview_generator.nodes.protocol import PathMapping
+from media_preview_generator.nodes.protocol import PathMapping, map_app_path
 
 
 def _video(path, data=b"x"):
@@ -45,7 +45,7 @@ class FakeClient:
                 {
                     "path": f["path"],
                     "ok": ok,
-                    "node_path": "/node" + f["path"],
+                    "node_path": map_app_path(f["path"], mappings) or "/node" + f["path"],
                     "kind": "" if ok else "missing",
                     "message": "" if ok else "Not found on the node",
                 }
@@ -132,7 +132,7 @@ class TestRunTestAccess:
                 "ok": True,
                 "kind": "",
                 "message": "",
-                "node_path": "/node" + str(tmp_path / "media" / "Movies" / "a.mkv"),
+                "node_path": "/mnt/media/Movies/a.mkv",
             }
         ]
         assert (tv["ok"], tv["files"][0]["kind"], tv["files"][0]["message"]) == (
@@ -162,6 +162,30 @@ class TestRunTestAccess:
         client = FakeClient(visible=lambda path: False, nearby={"/mnt/nas": ["Music", "MOVIES"]})
         lib = nm.run_test_access(client, rows, servers)["libraries"][0]
         assert lib["suggestion"] == {"from": "/mnt/nas/films", "to": "/mnt/nas/MOVIES"}
+
+    def test_each_library_gets_only_the_listings_above_its_own_missing_files(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "a.mkv")
+        _video(tmp_path / "media" / "TV" / "s01e01.mkv")
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                    {"id": "2", "name": "TV", "remote_paths": ["/plexmedia/TV"]},
+                ],
+            )
+        ]
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies"), "/mnt/nas"),
+            PathMapping(str(tmp_path / "media" / "TV"), "/srv/tv"),
+        ]
+        client = FakeClient(
+            visible=lambda path: "TV" in path, nearby={"/mnt/nas": ["Movies", "TV"], "/elsewhere": ["x"]}
+        )
+        movies, tv = nm.run_test_access(client, rows, servers)["libraries"]
+        assert movies["nearby"] == {"/mnt/nas": ["Movies", "TV"]}
+        assert movies["suggestion"] == {"from": "/mnt/nas", "to": "/mnt/nas/Movies"}
+        assert (tv["ok"], tv["nearby"], tv["suggestion"]) == (True, {}, None)
 
     def test_requests_are_split_into_batches(self, tmp_path, monkeypatch):
         monkeypatch.setattr(nm, "CHECK_BATCH", 2)

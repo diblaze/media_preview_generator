@@ -2,6 +2,10 @@
 
 ``{"overall_ok", "sections": [{"id", "title", "docs_anchor", "ok", "severity", "checks": [row...]}]}``. A row is
 "must fix" (``critical``) when it stops the node doing work, "recommended" otherwise.
+
+A failing row says where its fix is: ``fix_tab`` (``media`` / ``settings`` / ``overview``, the node dialog tab, with
+``fix_label`` naming the button and, on media rows, the ``suggestion`` {from, to, app_root} the button applies),
+``fix_where: "node"`` (only the node's own machine can fix it), or ``help_url`` + ``help_label`` (a page of this app).
 """
 
 from __future__ import annotations
@@ -25,12 +29,19 @@ from .registry import (
 
 DOCS_ANCHOR = "nodes"
 PLEX_DB_CHECK_S = 10.0
+FIX_ON_NODE = "node"
+TAB_MEDIA = "media"
+TAB_SETTINGS = "settings"
+WORKERS_URL = "/settings#section-workers"
+# Node-only row keys; the shared row builder doesn't know them.
+_NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label")
 
 
 def _row(
     check_id: str, label: str, *, severity: str, ok: bool, explanation: str, tooltip: str | None = None, **extra: Any
 ) -> dict[str, Any]:
-    return readiness_row(
+    node_keys = {k: extra.pop(k) for k in _NODE_KEYS if k in extra}
+    row = readiness_row(
         check_id,
         label,
         severity=severity,
@@ -40,6 +51,16 @@ def _row(
         docs_anchor=DOCS_ANCHOR,
         **extra,
     )
+    # A passing row has nothing to fix, so it carries no fix pointer.
+    if not ok:
+        row.update({k: v for k, v in node_keys.items() if v is not None})
+        if row.get("fix_where") is None:
+            row.pop("fix_where", None)
+    else:
+        row.pop("fix_where", None)
+        row.pop("fix_label", None)
+        row.pop("fix_action", None)
+    return row
 
 
 def _section(section_id: str, title: str, checks: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -76,9 +97,9 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             severity=CRITICAL,
             ok=reachable,
             explanation="The app checks every node every 30 seconds.",
-            current=view.state,
-            recommended="answering",
             reason=None if reachable else view.reason,
+            fix_tab=TAB_SETTINGS,
+            fix_label="Check the address",
         )
     ]
     if not reachable:
@@ -92,6 +113,8 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             ok=key_ok,
             explanation="The node only works for an app that sends its key.",
             reason=None if key_ok else view.reason,
+            fix_tab=TAB_SETTINGS,
+            fix_label="Change the key",
         )
     )
     if not key_ok:
@@ -107,6 +130,7 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             current=view.version or "unknown",
             recommended=app_version if protocol.ROLE_WORKER in view.roles else None,
             reason=None if version_ok else view.reason,
+            fix_where=FIX_ON_NODE,
         )
     )
     if view.legacy:
@@ -119,6 +143,7 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
                 explanation="It keeps working for Plex's database. Updating it to a node adds health details and "
                 "the newer Plex database features.",
                 reason="Update the helper container to the node image.",
+                fix_where=FIX_ON_NODE,
             )
         )
     return rows
@@ -136,6 +161,9 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
                 ok=False,
                 explanation="Its workers are paused until a Test access passes.",
                 reason=view.reason,
+                fix_tab=TAB_MEDIA,
+                fix_label="Test access",
+                fix_action="test_access",
             )
         )
     result = details.access_result
@@ -147,6 +175,7 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
                 severity=RECOMMENDED,
                 ok=False,
                 explanation="Test access checks a few files from every library through this node's folder mappings.",
+                fix_tab=TAB_MEDIA,
                 fix_label="Test access",
                 fix_action="test_access",
             )
@@ -161,7 +190,7 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
         reason = None
         if not ok:
             reason = lib.get("error") or (missing[0].get("message") if missing else None)
-        suggestion = lib.get("suggestion")
+        suggestion = lib.get("suggestion") if isinstance(lib.get("suggestion"), dict) else None
         rows.append(
             _row(
                 f"node_access_{index}",
@@ -169,9 +198,12 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
                 severity=CRITICAL,
                 ok=ok,
                 explanation=f"Checked {lib.get('checked', 0)} file(s) under {lib.get('app_root')}.",
-                current=suggestion.get("from") if isinstance(suggestion, dict) else None,
-                recommended=suggestion.get("to") if isinstance(suggestion, dict) else None,
+                current=suggestion.get("from") if suggestion else None,
+                recommended=suggestion.get("to") if suggestion else None,
                 reason=reason,
+                fix_tab=TAB_MEDIA,
+                fix_label="Use the suggested path" if suggestion else "Open Media",
+                suggestion={**suggestion, "app_root": lib.get("app_root")} if suggestion else None,
             )
         )
     return rows
@@ -200,6 +232,8 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
             ok=used,
             explanation="A node runs work only for the worker groups it is a member of.",
             reason=None if used else "Add this node's GPU or CPU to a worker group on the Workers page.",
+            help_url=WORKERS_URL,
+            help_label="Open Workers",
         )
     ]
     for gpu in view.gpus:
@@ -214,6 +248,7 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
                 explanation="The node tests each GPU when it starts, every 5 minutes, and after a GPU error.",
                 current=gpu.get("status") or "unknown",
                 recommended="ok",
+                fix_where=FIX_ON_NODE,
             )
         )
     return rows
@@ -239,6 +274,7 @@ def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list
                 ok=False,
                 explanation="The node opens Plex's database on Plex's own machine.",
                 reason=report.message,
+                fix_where=FIX_ON_NODE,
             )
         ]
     present = "db_path" in details
@@ -251,6 +287,7 @@ def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list
             explanation="The node looks for it in the Plex folder it was started with.",
             current=details.get("db_path"),
             reason=None if present else report.message,
+            fix_where=FIX_ON_NODE,
         )
     ]
     if not present:
@@ -265,6 +302,7 @@ def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list
             explanation="SQLite can only be written safely on the disk Plex itself uses.",
             current=details.get("fs_type"),
             reason=None if local else report.message,
+            fix_where=FIX_ON_NODE,
         )
     )
     if not local:
@@ -278,6 +316,7 @@ def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list
             ok=writable,
             explanation="Markers and chapters are written into Plex's database.",
             reason=None if writable else report.message,
+            fix_where=FIX_ON_NODE,
         )
     )
     if not writable:
@@ -291,6 +330,7 @@ def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list
             ok=held,
             explanation="The node writes only while Plex is running from the same folder.",
             reason=None if held else report.message,
+            fix_where=FIX_ON_NODE,
         )
     )
     return rows

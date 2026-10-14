@@ -185,6 +185,18 @@ def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> d
     return None
 
 
+def _under(path: str, folder: str) -> bool:
+    sep = _node_sep(folder)
+    base = folder.rstrip(sep)
+    return path == base or path.startswith(base + sep)
+
+
+def _nearby_for(rows: list[dict], nearby: dict) -> dict[str, list]:
+    """The node's folder listings above this library's missing files (the request's listings cover every library)."""
+    missing = [r["node_path"] for r in rows if not r["ok"] and isinstance(r.get("node_path"), str)]
+    return {d: names for d, names in nearby.items() if any(_under(p, d) for p in missing)}
+
+
 def _check(client: NodeClient, mappings: list[PathMapping], files: list[dict]) -> tuple[dict[str, dict], dict]:
     results: dict[str, dict] = {}
     nearby: dict[str, Any] = {}
@@ -208,7 +220,9 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
 
     Returns:
         ``{"libraries": [{"server", "library", "app_root", "checked", "ok", "files": [{"path", "ok", "kind",
-        "message", "node_path"}], "suggestion": {"from", "to"} | None, "error": str | None}]}``.
+        "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
+        "error": str | None}]}``. ``nearby`` lists what the node does see above the library's missing files;
+        ``suggestion`` is the corrected ``node_prefix`` of the row covering the library.
 
     Raises:
         NodeError: The node couldn't be asked.
@@ -233,6 +247,7 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
                 }
             )
         ok = bool(rows) and all(r["ok"] for r in rows)
+        seen_nearby = _nearby_for(rows, nearby)
         error = None
         if not picked:
             error = (
@@ -248,7 +263,8 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
                 "checked": len(rows),
                 "ok": ok,
                 "files": rows,
-                "suggestion": None if ok or not rows else suggest_row(root.app_root, mappings, nearby),
+                "nearby": seen_nearby,
+                "suggestion": None if ok or not rows else suggest_row(root.app_root, mappings, seen_nearby),
                 "error": error,
             }
         )

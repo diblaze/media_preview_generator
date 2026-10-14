@@ -28,7 +28,7 @@ def _details(state=reg.STATE_READY, *, roles=(ROLE_WORKER,), gpus=(GPU,), legacy
         last_seen=1.0,
     )
     return reg.NodeDetails(
-        view=view, platform={}, cpu={}, busy=False, info=None, access_result=access, access_checked_at=None
+        view=view, platform={}, cpu={}, busy=0, info=None, access_result=access, access_checked_at=None
     )
 
 
@@ -112,7 +112,38 @@ def test_test_access_results_are_one_row_per_library_with_the_suggestion():
     assert ok["ok"] is True and "Home · Movies" in ok["label"]
     assert (bad["ok"], bad["severity"], bad["reason"]) == (False, "critical", "Not found")
     assert (bad["current"], bad["recommended"]) == ("/mnt/tv", "/mnt/TV")
+    assert (bad["fix_tab"], bad["fix_label"]) == ("media", "Use the suggested path")
+    assert bad["suggestion"] == {"from": "/mnt/tv", "to": "/mnt/TV", "app_root": "/data/tv"}
+    assert not {"fix_tab", "fix_label", "suggestion"} & set(ok)
     assert envelope["overall_ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("details", "check_id", "pointer"),
+    [
+        (_details(reg.STATE_OFFLINE), "node_reachable", {"fix_tab": "settings", "fix_label": "Check the address"}),
+        (_details(reg.STATE_KEY_REFUSED), "node_key", {"fix_tab": "settings", "fix_label": "Change the key"}),
+        (_details(reg.STATE_UPDATE_NEEDED), "node_version", {"fix_where": "node"}),
+        (_details(reg.STATE_ACCESS_PROBLEM), "node_access_problem", {"fix_tab": "media", "fix_action": "test_access"}),
+        (_details(), "node_access_untested", {"fix_tab": "media", "fix_action": "test_access"}),
+        (_details(), "node_in_group", {"help_url": "/settings#section-workers", "help_label": "Open Workers"}),
+        (_details(gpus=({**GPU, "status": "failed"},)), "node_gpu_cuda:0", {"fix_where": "node"}),
+    ],
+    ids=["offline", "key", "version", "access_problem", "untested", "group", "gpu"],
+)
+def test_every_failing_row_says_where_its_fix_is(details, check_id, pointer):
+    row = _check(_envelope(details), check_id)
+    assert row["ok"] is False
+    assert {k: row.get(k) for k in pointer} == pointer
+
+
+def test_passing_rows_carry_no_fix_pointer():
+    groups = [{"id": "g", "members": [{"id": "m1", "node": "n1"}]}]
+    envelope = _envelope(_details(), groups=groups)
+    for check_id in ("node_reachable", "node_key", "node_version", "node_in_group", "node_gpu_cuda:0"):
+        row = _check(envelope, check_id)
+        assert row["ok"] is True
+        assert not {"fix_tab", "fix_where", "fix_label", "help_url", "suggestion"} & set(row), check_id
 
 
 def test_an_access_problem_is_must_fix():
@@ -168,6 +199,7 @@ def test_each_plex_database_problem_stops_at_its_own_row(report, failing, rows):
     checks = _section(envelope, "node_plex_db")["checks"]
     assert len(checks) == rows
     assert (checks[-1]["id"], checks[-1]["ok"], checks[-1]["severity"]) == (failing, False, "critical")
+    assert checks[-1]["fix_where"] == "node"
     assert envelope["overall_ok"] is False
 
 
@@ -177,6 +209,6 @@ def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_row
         file_checks=_report(Capability.READY, "", db_path="/d", lock_holder=True),
     )
     legacy = _check(envelope, "node_legacy_helper")
-    assert (legacy["ok"], legacy["severity"]) == (False, "recommended")
+    assert (legacy["ok"], legacy["severity"], legacy["fix_where"]) == (False, "recommended", "node")
     assert [s["id"] for s in envelope["sections"]] == ["node_connection", "node_plex_db"]
     assert envelope["overall_ok"] is True

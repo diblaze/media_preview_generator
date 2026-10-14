@@ -75,7 +75,7 @@ def _four_nodes() -> list[dict]:
             "storage",
             gpus=[{"type": "NVIDIA", "device": "cuda:0", "name": "Quadro P5000", "status": "ok"}],
             cpu={"cores": 24, "load1": 3.1, "ram_total": 64e9, "ram_available": 40e9},
-            busy={"running": 2, "workers": 7},
+            busy=2,
             path_mappings=[{"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"}],
             used_by={"groups": [{"id": "g1", "name": "GPU box"}], "servers": []},
         ),
@@ -89,7 +89,7 @@ def _four_nodes() -> list[dict]:
             cpu={},
             used_by={"groups": [], "servers": [{"id": "plex-1", "name": "Home"}]},
         ),
-        _node("n-nuc", "nuc", "access_problem", reason="TV Shows not found at /media/tv", busy="workers paused"),
+        _node("n-nuc", "nuc", "access_problem", reason="TV Shows not found at /media/tv"),
         _node(
             "n-old",
             "old-laptop",
@@ -112,7 +112,7 @@ class NodesApi:
         self.create_answer: tuple[int, dict] | None = None
         self.test_answers: list[dict] = []
         self.health_answer: dict = {"overall_ok": True, "sections": []}
-        self.log_answer: dict = {"lines": ["14:01:02 INFO node started", "14:01:03 INFO 1 GPU found"]}
+        self.log_answer: dict = {"lines": [_log("14:01:02", "node started"), _log("14:01:03", "1 GPU found")]}
         self.delete_answer: tuple[int, dict] = (200, {"ok": True})
         page.route("**/api/nodes**", self._handle)
 
@@ -140,7 +140,7 @@ class NodesApi:
             info = self.probe_answer.get("info") or {}
             row = _node("n-new", body["name"], roles=list((info.get("node") or {}).get("roles") or ["worker"]))
             row["url"] = body["url"]
-            row["path_mappings"] = [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}]
+            row["path_mappings"] = body["path_mappings"]
             self.nodes.append(row)
             return _fulfill(route, row)
         node = self._find(parts[1])
@@ -167,16 +167,24 @@ class NodesApi:
         return _fulfill(route, {"error": "unexpected"}, 404)
 
 
+def _log(time_of_day: str, message: str, level: str = "INFO") -> dict:
+    return {"time": time_of_day, "level": level, "message": message}
+
+
 def _probe_info(roles: list[str] | None = None, version: str = APP_VERSION, version_match: bool = True) -> dict:
+    """The probe's ``info`` as ``POST /api/nodes/probe`` answers it for a worker node."""
     return {
-        "node": {"id": "uid-1", "name": "storage", "version": version, "protocols": [1], "roles": roles or ["worker"]},
+        "node": {"id": "uid-1", "name": "storage", "version": version, "roles": roles or ["worker"]},
+        "legacy": False,
         "version_match": version_match,
+        "already_added": None,
+        "suggested_path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}],
+        "plex_db": None,
         "platform": {"os": "linux", "arch": "x86_64", "python": "3.12"},
         "worker": {
             "gpus": [{"type": "NVIDIA", "device": "GPU0", "name": "Quadro P5000", "status": "ok"}],
             "cpu": {"cores": 24, "load1": 0.5, "ram_total": 64e9, "ram_available": 50e9},
             "temp": {"path": "/tmp", "free_bytes": 41e9},
-            "busy": 0,
             "notes": [{"title": "Credit text", "chip": "CPU on this GPU", "message": "Vulkan reports no hardware GPU"}],
         },
     }
@@ -260,7 +268,7 @@ class TestNodeList:
         expect(storage.locator(".nd-chips")).to_contain_text("Worker")
         expect(storage.locator(".nd-chips")).to_contain_text("Quadro P5000")
         expect(storage.locator(".nd-chips")).to_contain_text("24 CPU")
-        expect(storage.locator(".nd-chips")).to_contain_text("2 of 7 workers busy")
+        expect(storage.locator(".nd-chips")).to_contain_text("2 files running")
         expect(storage.locator(".nd-chips")).to_contain_text('used by worker group "GPU box"')
         expect(storage.locator(".nd-status")).to_contain_text(f"v{APP_VERSION} · seen")
 
@@ -387,7 +395,7 @@ class TestAddNode:
         expect(page.locator("#addNodeStepLabel")).to_have_text("Step 2 of 2")
         expect(modal.locator(".nd-map-head h3")).to_have_text("Where nas sees your media")
         expect(page.locator("#addNodeCancel")).to_have_text("Finish later")
-        # Pre-filled from what the saved node came back with.
+        # Pre-filled from the probe's suggested rows.
         editor = page.locator("#addNodeMappings")
         expect(editor.locator(".nd-app").first).to_have_value("/data/TV Shows")
         expect(editor.locator(".nd-node").first).to_have_value("/mnt/nas/tv")
@@ -458,7 +466,15 @@ class TestAddNode:
     def test_plex_database_node_skips_the_media_step(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         modal = _open_add(authed_page)
-        api.probe_answer = {"ok": True, "info": {**_probe_info(roles=["plex_db"]), "worker": {}}}
+        api.probe_answer = {
+            "ok": True,
+            "info": {
+                **_probe_info(roles=["plex_db"]),
+                "worker": None,
+                "version_match": None,
+                "suggested_path_mappings": [],
+            },
+        }
         api.probe_answer["info"]["plex_db"] = {"config_dir": "C:\\Plex", "db_present": True}
         authed_page.locator("#addNodeUrl").fill("http://pc:9494")
         authed_page.locator("#addNodeKey").fill("k")
@@ -492,6 +508,8 @@ class TestAddNode:
             ("auth", "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set."),
             ("unreachable", "Nothing answered at this address. Check the address and port"),
             ("protocol", "not as a node this app can use. Update the node"),
+            ("different_node", "A different node answered at this address"),
+            ("request", "didn't accept the request"),
         ],
     )
     def test_probe_errors_are_plain_words(self, authed_page: Page, app_url: str, kind: str, text: str) -> None:
@@ -515,13 +533,24 @@ class TestAddNode:
     def test_already_added_node_is_named(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)
-        api.create_answer = (409, {"error": "already added", "name": "storage"})
+        api.create_answer = (409, {"error": "already added", "node_id": "n-storage", "name": "storage"})
         authed_page.locator("#addNodeUrl").fill("http://nas:9494")
         authed_page.locator("#addNodeKey").fill("k")
         authed_page.locator("#addNodeConnect").click()
         authed_page.locator("#addNodeNext").click()
         expect(authed_page.locator("#addNodeError")).to_contain_text('This node is already added as "storage"')
         expect(authed_page.locator("#addNodeStep1")).to_be_visible()
+
+    def test_probe_of_a_node_already_added_says_so_before_saving(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.probe_answer = {"ok": True, "info": {**_probe_info(), "already_added": {"id": "n-1", "name": "storage"}}}
+        authed_page.locator("#addNodeUrl").fill("http://nas:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text('This node is already added as "storage"')
+        expect(authed_page.locator("#addNodeNext")).to_be_hidden()
+        assert not api.bodies("POST", "/nodes")
 
 
 @pytest.mark.e2e
@@ -534,7 +563,7 @@ class TestNodeDialog:
         expect(overview).to_contain_text("same as this app")
         expect(overview).to_contain_text("24 cores · load 3.1")
         expect(overview).to_contain_text("40 GB free of 64 GB")
-        expect(overview).to_contain_text("2 of 7 workers busy")
+        expect(overview).to_contain_text("2 files running")
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("Quadro P5000")
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("✓ Working")
 
@@ -631,7 +660,7 @@ class TestNodeDialog:
         _open_node(authed_page, "n-storage")
         _node_tab(authed_page, "log")
         expect(authed_page.locator("#nodeLog")).to_have_text("14:01:02 INFO node started\n14:01:03 INFO 1 GPU found")
-        api.log_answer = {"lines": ["14:05:00 INFO later"]}
+        api.log_answer = {"lines": [_log("14:05:00", "later")]}
         authed_page.locator("#nodeLogRefresh").click()
         expect(authed_page.locator("#nodeLog")).to_have_text("14:05:00 INFO later")
         assert any("/log" in path for _, path, _ in api.calls)
@@ -657,7 +686,10 @@ class TestNodeDialog:
             409,
             {
                 "error": "in use",
-                "used_by": [{"kind": "group", "name": "GPU box"}, {"kind": "server", "name": "Home"}],
+                "used_by": [
+                    {"kind": "group", "id": "g1", "name": "GPU box"},
+                    {"kind": "server", "id": "plex-1", "name": "Home"},
+                ],
             },
         )
         _open_node(authed_page, "n-storage")
@@ -682,12 +714,14 @@ class TestNodeDialog:
 
 @pytest.mark.e2e
 class TestPlexDatabaseSelector:
-    def _open(self, page: Page, app_url: str, agent: dict | None, details: dict | None = None) -> dict:
+    def _open(
+        self, page: Page, app_url: str, agent: dict | None, details: dict | None = None, nodes: list | None = None
+    ) -> dict:
         server = _plex_server()
         if agent is not None:
             server["markers"]["plex"]["agent"] = agent
         captured = _mock_server_page(page, server, _status(server, "ready", "", details or _plex_ready_details()))
-        NodesApi(page, _four_nodes())
+        NodesApi(page, nodes or _four_nodes())
         _open_tab(page, app_url, server, tab="general")
         # The node list has answered once the gaming-pc entry is there.
         expect(page.locator("#markersPlexDatabase option[value='n-pc']")).to_be_attached(timeout=5000)
@@ -748,6 +782,14 @@ class TestPlexDatabaseSelector:
         expect(select.locator("option[value='n-gone']")).to_contain_text("not on the Nodes page any more")
         body = _save_and_read_put(authed_page, "plex-1")
         assert body["markers"]["plex"]["agent"] == {"enabled": True, "node_id": "n-gone"}
+
+    def test_a_saved_node_that_hasnt_answered_yet_keeps_its_name(self, authed_page: Page, app_url: str) -> None:
+        # After a restart a node reports no roles until its first check answers, so the role filter misses it.
+        waking = _node("n-wake", "plex-box", "connecting", roles=[], gpus=[], cpu={})
+        self._open(authed_page, app_url, {"enabled": True, "node_id": "n-wake"}, nodes=[*_four_nodes(), waking])
+        select = authed_page.locator("#markersPlexDatabase")
+        expect(select).to_have_value("n-wake")
+        expect(select.locator("option[value='n-wake']")).to_have_text("Through a Plex database node: plex-box")
 
     def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(self, authed_page: Page, app_url: str) -> None:
         self._open(authed_page, app_url, None)

@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from media_preview_generator.nodes import registry as reg
-from media_preview_generator.nodes.client import NodeAuthError, NodeProtocolError, NodeUnreachableError
+from media_preview_generator.nodes.client import (
+    NodeAuthError,
+    NodeProtocolError,
+    NodeRequestError,
+    NodeUnreachableError,
+)
 from media_preview_generator.web.routes import api_nodes
 
 APP_VERSION = "9.9.9"
@@ -28,6 +33,7 @@ NODE_ROW_KEYS = {
     "used_by",
 }
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok", "error": None}
+GPU_ON_CPU_TEXT = {**GPU, "credit_text": {"on_gpu": False, "reason": "Vulkan reports no hardware GPU"}}
 
 
 def _info(uid="uid-1", version=APP_VERSION):
@@ -38,7 +44,9 @@ def _info(uid="uid-1", version=APP_VERSION):
         "worker": {
             "gpus": [GPU],
             "cpu": {"cores": 8, "load1": 0.25, "ram_total": 16, "ram_available": 9},
-            "busy": True,
+            "temp": {"path": "/tmp/node", "free_bytes": 41_000_000_000},
+            "busy": 2,
+            "ffmpeg": {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7"},
         },
     }
 
@@ -49,7 +57,9 @@ class FakeNode:
     def __init__(self):
         self.info_answer: object = _info()
         self.visible = True
-        self.log_answer: object = {"lines": ["one", "two"]}
+        self.log_answer: object = {
+            "lines": [{"time": "2026-10-15T09:00:00+00:00", "level": "INFO", "message": "one"}, "two"]
+        }
         self.access_requests: list = []
 
     def info(self):
@@ -113,22 +123,52 @@ def _add(client, **fields):
 class TestListAndProbe:
     def test_an_install_without_nodes(self, client, nodes):
         body = client.get("/api/nodes").get_json()
-        assert body == {"nodes": [], "app_version": APP_VERSION, "default_mappings": []}
+        assert body == {"nodes": [], "app_version": APP_VERSION}
 
     def test_probe_reports_what_answers_without_saving(self, client, nodes):
         resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "node-key"})
         body = resp.get_json()
         assert resp.status_code == 200 and body["ok"] is True
-        info = body["info"]
-        assert (info["node_uid"], info["roles"], info["version"], info["version_match"], info["legacy"]) == (
-            "uid-1",
-            ["worker"],
-            APP_VERSION,
-            True,
-            False,
-        )
-        assert info["gpus"] == [GPU] and info["already_added"] is None
+        assert body["info"] == {
+            "node": {"id": "uid-1", "name": "nuc", "version": APP_VERSION, "roles": ["worker"]},
+            "legacy": False,
+            "platform": {"os": "Linux", "arch": "x86_64", "python": "3.12"},
+            "worker": {
+                "gpus": [GPU],
+                "cpu": {"cores": 8, "load1": 0.25, "ram_total": 16, "ram_available": 9},
+                "temp": {"path": "/tmp/node", "free_bytes": 41_000_000_000},
+                "notes": [],
+            },
+            "plex_db": None,
+            "version_match": True,
+            "already_added": None,
+            "suggested_path_mappings": [],
+        }
         assert _sm().nodes == []
+
+    def test_probe_turns_credit_text_on_the_cpu_into_a_note(self, client, nodes):
+        answer = _info()
+        answer["worker"]["gpus"] = [GPU_ON_CPU_TEXT]
+        nodes("http://nuc:9494").info_answer = answer
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert info["worker"]["notes"] == [
+            {"title": "Credits text", "chip": "CPU on RTX", "message": "Vulkan reports no hardware GPU"}
+        ]
+
+    def test_probe_of_a_plex_database_node_passes_its_facts_through(self, client, nodes):
+        answer = _info()
+        answer["node"]["roles"] = ["plex_db"]
+        del answer["worker"]
+        answer["plex_db"] = {"config_dir": "/plex", "db_present": True, "machine_identifier": "m1"}
+        nodes("http://nuc:9494").info_answer = answer
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert (info["worker"], info["plex_db"], info["version_match"]) == (None, answer["plex_db"], None)
+        assert info["suggested_path_mappings"] == []
+
+    def test_probe_suggests_one_row_per_library_folder(self, client, nodes, tmp_path):
+        movies = TestTestAccess()._library(tmp_path)
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert info["suggested_path_mappings"] == [{"app_prefix": str(movies), "node_prefix": str(movies)}]
 
     def test_probe_says_when_the_version_differs(self, client, nodes):
         nodes("http://nuc:9494").info_answer = _info(version="1.0.0")
@@ -137,8 +177,12 @@ class TestListAndProbe:
 
     @pytest.mark.parametrize(
         ("error", "kind"),
-        [(NodeAuthError("no"), "auth"), (NodeUnreachableError("down"), "unreachable")],
-        ids=["auth", "unreachable"],
+        [
+            (NodeAuthError("no"), "auth"),
+            (NodeUnreachableError("down"), "unreachable"),
+            (NodeRequestError("bad request"), "request"),
+        ],
+        ids=["auth", "unreachable", "request"],
     )
     def test_probe_errors(self, client, nodes, error, kind):
         nodes("http://nuc:9494").info_answer = error
@@ -149,16 +193,35 @@ class TestListAndProbe:
         nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["ok"] is True
-        assert (body["info"]["legacy"], body["info"]["roles"], body["info"]["version"]) == (True, ["plex_db"], "1.2.0")
+        info = body["info"]
+        assert (info["legacy"], info["node"], info["worker"]) == (
+            True,
+            {"id": None, "name": "", "version": "1.2.0", "roles": ["plex_db"]},
+            None,
+        )
+        assert (info["version_match"], info["already_added"]) == (None, None)
 
     def test_probe_refuses_a_bad_address(self, client, nodes):
         resp = client.post("/api/nodes/probe", json={"url": "ftp://x", "key": "k"})
         assert resp.status_code == 400 and "address" in resp.get_json()["error"]
 
-    def test_probe_with_the_mask_uses_the_stored_key_and_names_the_node_already_added(self, client, nodes):
+    def test_probe_names_the_node_already_added(self, client, nodes):
         node_id = _add(client).get_json()["id"]
+        resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"})
+        assert resp.get_json()["info"]["already_added"] == {"id": node_id, "name": "nuc"}
+
+    def test_probe_with_the_mask_uses_the_stored_key_and_isnt_its_own_twin(self, client, nodes, monkeypatch):
+        node_id = _add(client).get_json()["id"]
+        keys = []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: keys.append(key) or nodes(url))
         resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id})
-        assert resp.get_json()["info"]["already_added"] == node_id
+        assert resp.get_json()["info"]["already_added"] is None and keys == ["node-key"]
+
+    def test_probe_of_a_saved_node_says_when_a_different_node_answers(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        nodes("http://nuc:9494").info_answer = _info(uid="uid-other")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id}).get_json()
+        assert body["ok"] is False and body["error"]["kind"] == "different_node" and "nuc" in body["error"]["message"]
 
 
 class TestCreate:
@@ -177,7 +240,8 @@ class TestCreate:
     def test_the_same_node_twice_is_refused(self, client, nodes):
         first = _add(client).get_json()
         resp = _add(client, name="again")
-        assert resp.status_code == 409 and resp.get_json()["node_id"] == first["id"]
+        assert resp.status_code == 409
+        assert (resp.get_json()["node_id"], resp.get_json()["name"]) == (first["id"], "nuc")
         assert len(_sm().nodes) == 1
 
     def test_an_unreachable_node_is_saved_and_records_its_id_later(self, client, nodes):
@@ -209,10 +273,10 @@ class TestRowState:
         resp = client.post(f"/api/nodes/{node_id}/check")
         row = resp.get_json()
         assert resp.status_code == 200 and row["state"] == "ready"
-        assert (row["version"], row["roles"], row["legacy"], row["busy"]) == (APP_VERSION, ["worker"], False, True)
+        assert (row["version"], row["roles"], row["legacy"], row["busy"]) == (APP_VERSION, ["worker"], False, 2)
         assert row["cpu"] == {"cores": 8, "load1": 0.25, "ram_total": 16, "ram_available": 9}
         assert row["platform"] == {"os": "Linux", "arch": "x86_64", "python": "3.12"}
-        assert row["gpus"] == [{"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok"}]
+        assert row["gpus"] == [{"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok", "error": ""}]
         assert row["last_seen"] is not None
         listed = client.get("/api/nodes").get_json()["nodes"]
         assert [n["state"] for n in listed] == ["ready"]
@@ -331,9 +395,6 @@ class TestTestAccess:
         lib = body["libraries"][0]
         assert (lib["library"], lib["app_root"], lib["checked"], lib["ok"]) == ("Movies", str(movies), 1, True)
         assert reg.get_registry().details(node_id).access_result == body
-        assert client.get("/api/nodes").get_json()["default_mappings"] == [
-            {"app_prefix": str(movies), "node_prefix": str(movies)}
-        ]
 
     def test_unsaved_mappings_are_tested_but_not_remembered(self, client, nodes, tmp_path):
         self._library(tmp_path)
@@ -372,7 +433,12 @@ class TestHealthAndLog:
     def test_log_lines(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         resp = client.get(f"/api/nodes/{node_id}/log?lines=5")
-        assert resp.get_json() == {"lines": ["one", "two"]}
+        assert resp.get_json() == {
+            "lines": [
+                {"time": "2026-10-15T09:00:00+00:00", "level": "INFO", "message": "one"},
+                {"time": "", "level": "", "message": "two"},
+            ]
+        }
 
     def test_log_errors(self, client, nodes):
         node_id = _add(client).get_json()["id"]

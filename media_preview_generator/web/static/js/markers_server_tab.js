@@ -28,6 +28,8 @@
         pendingConfirmation: null,
         // Nodes with the Plex database role, from /api/nodes (null until it answers).
         plexDbNodes: null,
+        // Every node from /api/nodes, to name a saved choice whose node hasn't reported its roles yet.
+        allNodes: [],
         // The Plex database choice before the last change, so "Add a Plex database node…" can put it back.
         dbChoice: '',
     };
@@ -342,7 +344,11 @@
         if (stored === DB_OLD_HELPER) {
             html += dbOption(DB_OLD_HELPER, `Through the Plex helper at ${storedAgent(server).url}`);
         } else if (stored !== DB_LOCAL && !nodes.some((n) => String(n.id) === stored)) {
-            const label = tab.plexDbNodes === null ? stored : `${stored} (not on the Nodes page any more)`;
+            // A saved node that hasn't answered since this app started reports no roles yet, so the filter above
+            // misses it: it is still on the Nodes page.
+            const known = (tab.allNodes || []).find((n) => String(n.id) === stored);
+            const label = known ? (known.name || stored)
+                : (tab.plexDbNodes === null ? stored : `${stored} (not on the Nodes page any more)`);
             html += dbOption(stored, `Through a Plex database node: ${label}`);
         }
         html += dbOption(DB_ADD_NODE, 'Add a Plex database node…');
@@ -355,18 +361,19 @@
 
     async function fetchPlexDbNodes(server) {
         const seq = tab.loadSeq;
-        let nodes = [];
+        let all = [];
         try {
             const r = await fetch('/api/nodes');
             if (r.ok) {
                 const data = await r.json();
-                nodes = Array.isArray(data && data.nodes) ? data.nodes.filter(isPlexDbNode) : [];
+                all = Array.isArray(data && data.nodes) ? data.nodes : [];
             }
         } catch (_e) {
-            nodes = [];
+            all = [];
         }
         if (seq !== tab.loadSeq) return;
-        tab.plexDbNodes = nodes;
+        tab.allNodes = all;
+        tab.plexDbNodes = all.filter(isPlexDbNode);
         renderDbOptions(server);
         renderAgentState(tab.status);
     }
@@ -556,6 +563,7 @@
         const agentGroup = $('#markersPlexAgentGroup');
         if (agentGroup) agentGroup.classList.toggle('d-none', !plex);
         tab.plexDbNodes = null;
+        tab.allNodes = [];
         const dbSelect = $('#markersPlexDatabase');
         if (dbSelect) delete dbSelect.dataset.loaded;
         if (plex) {

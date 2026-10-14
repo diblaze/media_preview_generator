@@ -89,15 +89,19 @@ class NodeCapacity:
 
 @dataclass(frozen=True)
 class NodeDetails:
-    """What the Nodes page shows beyond :class:`NodeView`: the last ``/v1/info`` facts and the last Test access."""
+    """What the Nodes page shows beyond :class:`NodeView`: the last ``/v1/info`` facts and the last Test access.
+
+    ``gpus`` keeps each GPU's ``error`` (the view drops it); ``busy`` is how many tasks the node was running.
+    """
 
     view: NodeView
     platform: dict
     cpu: dict
-    busy: bool
+    busy: int
     info: dict | None
     access_result: dict | None
     access_checked_at: float | None
+    gpus: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -213,6 +217,13 @@ def _clean_gpus(raw: object) -> tuple[dict, ...]:
     )
 
 
+def _count(raw: object) -> int:
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _gpus_in(answer: object) -> tuple[dict, ...]:
     """The GPU list in an ``/v1/info`` or ``/v1/gpus/rescan`` answer (``worker.gpus``, or a bare ``gpus``)."""
     if not isinstance(answer, dict):
@@ -316,10 +327,11 @@ class NodeRegistry:
                 view=self._view(live),
                 platform=dict((info or {}).get("platform") or {}),
                 cpu=dict(worker.get("cpu") or {}),
-                busy=bool(worker.get("busy")),
+                busy=_count(worker.get("busy")),
                 info=info,
                 access_result=copy.deepcopy(live.access_result),
                 access_checked_at=live.access_checked_at,
+                gpus=copy.deepcopy(live.gpus),
             )
 
     def client(self, node_id: str) -> NodeClient:
