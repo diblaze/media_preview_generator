@@ -452,6 +452,9 @@ class FakeDatabase:
 
     atomic_writes = True
 
+    def trust_key(self) -> None:
+        return None
+
     def __init__(self, *, parts=(PART,), exists=True) -> None:
         self.item = ItemRead(exists, list(parts))
         self.writes: list[WriteRequest] = []

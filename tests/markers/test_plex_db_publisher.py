@@ -3909,3 +3909,42 @@ class TestReadBackMany:
         assert report.details["detection"] == (
             {"intro": "never", "credits": "never"} if ui_details else {"intro": None, "credits": None}
         )
+
+
+class TestMarkerRowsUseTheItemIndex:
+    """Plex's one marker tag is on every marker row (183,690 on a real server); finding an item's rows by that tag
+    took 25 ms a file, by the item 0.03 ms."""
+
+    def test_every_item_marker_query_searches_by_item(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder)
+        conn = sqlite3.connect(db)
+        conn.executemany(
+            "INSERT INTO taggings (metadata_item_id, tag_id, [index], text) VALUES (?, 563, 0, 'intro')",
+            [(1000 + n,) for n in range(2000)],
+        )
+        conn.commit()
+        conn.close()
+        statements: list[str] = []
+        real_connect = plex_db.LocalPlexDb._connect
+
+        def traced(self, **kwargs):
+            opened = real_connect(self, **kwargs)
+            opened.set_trace_callback(statements.append)
+            return opened
+
+        pub = _publisher(tmp_path, folder)
+        with patch.object(plex_db.LocalPlexDb, "_connect", traced):
+            _write_one(pub, [INTRO])
+            _write_one(pub, [Marker(T.INTRO, 12_000, 37_000, ("chapters",))], previous=[INTRO])
+            pub.shows_many([("7", [INTRO], frozenset(), None)])
+            plex_db.LocalPlexDb(lambda: str(db)).read_item(7, deadline=time.monotonic() + 5)
+
+        item_queries = [s for s in statements if "FROM taggings WHERE metadata_item_id" in s]
+        assert any(s.startswith("DELETE") for s in item_queries)
+        assert any(s.startswith("SELECT") for s in item_queries)
+        plans = sqlite3.connect(db)
+        for statement in item_queries:
+            plan = " ".join(row[3] for row in plans.execute(f"EXPLAIN QUERY PLAN {statement}"))
+            assert "index_taggings_on_metadata_item_id" in plan, (statement, plan)
+        plans.close()

@@ -1276,11 +1276,13 @@ class LocalPlexDb(PlexDatabase):
 
     @staticmethod
     def _item_rows(conn: sqlite3.Connection, rating_key: int, tag_id: int) -> list[_TaggingRow]:
+        # "+tag_id" keeps SQLite off the tag_id index: the marker tag is on every marker row in the library, so
+        # searching by it reads them all (25 ms a file on a real server) where the item's own rows take 0.03 ms.
         return [
             _TaggingRow(*row)
             for row in conn.execute(
                 "SELECT id, [index], text, time_offset, end_time_offset, thumb_url, extra_data, created_at "
-                "FROM taggings WHERE metadata_item_id=? AND tag_id=? ORDER BY [index], id",
+                "FROM taggings WHERE metadata_item_id=? AND +tag_id=? ORDER BY [index], id",
                 (rating_key, tag_id),
             )
         ]
@@ -1718,7 +1720,7 @@ class LocalPlexDb(PlexDatabase):
             if plan.replaced_texts:
                 placeholders = ",".join("?" * len(plan.replaced_texts))
                 conn.execute(
-                    f"DELETE FROM taggings WHERE metadata_item_id=? AND tag_id=? AND text IN ({placeholders})",  # noqa: S608
+                    f"DELETE FROM taggings WHERE metadata_item_id=? AND +tag_id=? AND text IN ({placeholders})",  # noqa: S608
                     (rating_key, tag_id, *plan.replaced_texts),
                 )
             created_at = int(time.time())
@@ -1753,7 +1755,7 @@ class LocalPlexDb(PlexDatabase):
         if not self._item_exists(conn, rating_key):
             return Shown.GONE, []
         rows = conn.execute(
-            "SELECT text, time_offset, end_time_offset, extra_data FROM taggings WHERE metadata_item_id=? AND tag_id=?",
+            "SELECT text, time_offset, end_time_offset, extra_data FROM taggings WHERE metadata_item_id=? AND +tag_id=?",
             (rating_key, tag_id),
         ).fetchall()
         parts = self._item_parts(conn, rating_key)
