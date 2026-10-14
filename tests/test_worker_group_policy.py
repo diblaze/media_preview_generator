@@ -437,6 +437,7 @@ def test_member_policies_copy_group_and_member_fields_under_a_composite_id():
             "device": "cuda:0",
             "count": 3,
             "job_types": ["previews"],
+            "node": None,
         },
         {
             "id": "g1:b",
@@ -449,6 +450,7 @@ def test_member_policies_copy_group_and_member_fields_under_a_composite_id():
             "device": None,
             "count": 10,
             "job_types": ["loudness"],
+            "node": None,
         },
     ]
     assert member_policies(policies) == policies

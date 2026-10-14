@@ -478,7 +478,8 @@ def _build_selected_gpus(settings, detected: list[dict] | None = None) -> list:
     if isinstance(groups, list):
         from ...worker_groups import configured_group_totals, member_policies
 
-        policies = member_policies(groups)
+        # A node's GPU is not this app's hardware, even when its device string matches a local one.
+        policies = [p for p in member_policies(groups) if not p.get("node")]
         grouped_devices = {p["device"] for p in policies if p["resource"] == "gpu" and p["enabled"]}
         for g in cached_gpus:
             device = g.get("device", "")
