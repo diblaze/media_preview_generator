@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from media_preview_generator.nodes import registry as reg
@@ -430,12 +432,34 @@ class TestHealthAndLog:
         assert set(body) == {"overall_ok", "sections"}
         assert body["sections"][0]["id"] == "node_connection"
 
-    def test_log_lines(self, client, nodes):
+    @pytest.fixture
+    def app_in_sydney(self, monkeypatch):
+        monkeypatch.setenv("TZ", "Australia/Sydney")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
+    def test_log_lines(self, client, nodes, app_in_sydney):
+        """The node's lines come back in this app's time zone, as the app's own log reads, whatever the node's is:
+        the lab's UTC node showed 22:45 beside the app's 09:45."""
         node_id = _add(client).get_json()["id"]
+        nodes("http://nuc:9494").log_answer = {
+            "lines": [
+                # A node that sends ts: read from it, not from its own clock text.
+                {"time": "2026-10-15T09:00:00+00:00", "ts": 1792058400.0, "level": "INFO", "message": "one"},
+                # An older node, time only: read with its offset.
+                {"time": "2026-10-15T09:00:00+00:00", "level": "INFO", "message": "old node"},
+                {"time": "not a time", "level": "INFO", "message": "garbled"},
+                "two",
+            ]
+        }
         resp = client.get(f"/api/nodes/{node_id}/log?lines=5")
         assert resp.get_json() == {
             "lines": [
-                {"time": "2026-10-15T09:00:00+00:00", "level": "INFO", "message": "one"},
+                {"time": "2026-10-15T21:00:00+11:00", "level": "INFO", "message": "one"},
+                {"time": "2026-10-15T20:00:00+11:00", "level": "INFO", "message": "old node"},
+                {"time": "not a time", "level": "INFO", "message": "garbled"},
                 {"time": "", "level": "", "message": "two"},
             ]
         }

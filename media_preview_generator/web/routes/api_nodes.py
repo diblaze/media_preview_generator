@@ -5,6 +5,8 @@ Keys never come back: a node's key is stored, sent to the node, and nothing else
 
 from __future__ import annotations
 
+import math
+from datetime import UTC, datetime
 from typing import Any
 
 from flask import jsonify, request
@@ -196,7 +198,28 @@ def _probe(url: str, key: str) -> dict[str, Any]:
 def _log_line(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {"time": "", "level": "", "message": str(raw)}
-    return {k: str(raw.get(k) or "") for k in ("time", "level", "message")}
+    line = {k: str(raw.get(k) or "") for k in ("time", "level", "message")}
+    line["time"] = _in_app_time(raw.get("ts"), line["time"])
+    return line
+
+
+def _in_app_time(ts: object, node_time: str) -> str:
+    """A node log line's moment in this app's time zone (as the app's own log reads), ISO 8601 with its offset.
+
+    ``ts`` is epoch seconds; a node older than ``ts`` sends only ``time`` with its own offset, read instead. A time
+    that can't be read is passed on as the node wrote it.
+    """
+    when = None
+    if isinstance(ts, int | float) and not isinstance(ts, bool) and math.isfinite(ts):
+        when = datetime.fromtimestamp(ts, UTC)
+    else:
+        try:
+            parsed = datetime.fromisoformat(node_time)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.tzinfo is not None:
+            when = parsed
+    return when.astimezone().isoformat(timespec="seconds") if when is not None else node_time
 
 
 def _json_body() -> dict:

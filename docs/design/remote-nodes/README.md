@@ -91,7 +91,7 @@ package version; the Plex database role also keeps the agent's `"agent"` block f
 | `POST /v1/tasks/<id>/pause` / `resume` | – | `{"ok": true}` — the op's `pause_check()` follows it, exactly as a local pause |
 | `GET /v1/tasks/<id>/artifact` | – | the task's artifact (preview: a tar of the JPEGs) |
 | `DELETE /v1/tasks/<id>` | – | frees the task's temp dir |
-| `GET /v1/log?lines=N` | – | the node's last N log lines |
+| `GET /v1/log?lines=N` | – | `{"lines": [{time, ts, level, message}]}`, the node's last N lines oldest first: `time` ISO 8601 with the node's offset, `ts` epoch seconds (added later; an older node sends no `ts`) |
 
 `gpus[]` entries: `{"type", "device", "name", "status", "error"}` — the same tuple `gpu.detect.detect_all_gpus()`
 returns, made JSON-safe.
@@ -319,7 +319,7 @@ Errors are `{"error": "<sentence>"}` with 400 (bad input), 404 (unknown node) or
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
 | `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |
-| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601) |
+| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601 in this app's time zone, from the node's `ts`, else its `time`) |
 | `POST /nodes/<id>/rescan-gpus` | – | `NODE_ROW` |
 
 `NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform: {os, arch, python}, gpus:

@@ -664,6 +664,12 @@ class TestNodeDialog:
         authed_page.locator("#nodeLogRefresh").click()
         expect(authed_page.locator("#nodeLog")).to_have_text("14:05:00 INFO later")
         assert any("/log" in path for _, path, _ in api.calls)
+        # The API's ISO times (already in this app's zone) read as the app's own log reads its times.
+        api.log_answer = {"lines": [_log("2026-10-15T20:00:00+11:00", "zoned"), _log("2026-10-15T09:00:01Z", "utc")]}
+        authed_page.locator("#nodeLogRefresh").click()
+        expect(authed_page.locator("#nodeLog")).to_have_text(
+            "2026-10-15 20:00:00 INFO zoned\n2026-10-15 09:00:01 INFO utc"
+        )
 
     def test_settings_save_keeps_the_masked_key(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
