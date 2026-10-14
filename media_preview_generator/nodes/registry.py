@@ -1,15 +1,29 @@
 """The app's view of its nodes: who they are, their live state, and how much work each can take (spec §5, §10.2).
 
-Lane B owns the implementation. The names and types below are the binding interface the job code (Lane C) uses.
+The configured nodes come from settings.json (``nodes``, re-read whenever ``nodes_revision`` moves). Each one gets a
+live record the health loop keeps current: every 30 s a check asks the node for ``/v1/info`` (three attempts 4 s
+apart before it counts as offline, the same ~12 s the remote executor allows a task poll), backing off to 5 minutes
+while it stays offline. Job code reads :meth:`NodeRegistry.capacity` and reports what it saw (a node that stopped
+answering, a file it couldn't see, a GPU that failed); every state change bumps :attr:`NodeRegistry.revision`.
 """
 
 from __future__ import annotations
 
+import copy
 import threading
-from dataclasses import dataclass
+import time
+from collections import deque
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
 
-from .client import NodeClient
+from loguru import logger
+
+from . import protocol
+from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError
 from .protocol import PathMapping
+from .settings import find_node, node_mappings
 
 STATE_CONNECTING = "connecting"
 STATE_READY = "ready"
@@ -19,6 +33,31 @@ STATE_KEY_REFUSED = "key_refused"
 STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
 STATE_DISABLED = "disabled"
+
+# States that raise a bell notification (``web.notifications``).
+ALERT_STATES = (STATE_OFFLINE, STATE_UPDATE_NEEDED, STATE_KEY_REFUSED, STATE_ACCESS_PROBLEM, STATE_GPU_LOST)
+
+HEALTH_INTERVAL_S = 30.0
+# Delay before the next check after the 1st, 2nd, 3rd and later offline checks in a row.
+OFFLINE_BACKOFF_S = (30.0, 60.0, 120.0, 300.0)
+CHECK_ATTEMPTS = 3
+ATTEMPT_GAP_S = 4.0
+NOT_VISIBLE_WINDOW_S = 600.0
+NOT_VISIBLE_LIMIT = 3
+GPU_LOST_RECHECK_S = 300.0
+MAX_PARALLEL_CHECKS = 8
+LEGACY_PING_TIMEOUT_S = 10.0
+LOOP_TICK_S = 1.0
+
+# The short reason a worker member shows when its node gives it no workers.
+_CAPACITY_REASONS = {
+    STATE_CONNECTING: "connecting to node",
+    STATE_OFFLINE: "node offline",
+    STATE_UPDATE_NEEDED: "node needs an update",
+    STATE_KEY_REFUSED: "key refused",
+    STATE_ACCESS_PROBLEM: "fix media access first",
+    STATE_DISABLED: "node turned off",
+}
 
 
 @dataclass(frozen=True)
@@ -48,40 +87,733 @@ class NodeCapacity:
     reason: str
 
 
-class NodeRegistry:
-    """Configured nodes and their live state (implemented by Lane B)."""
+@dataclass(frozen=True)
+class NodeDetails:
+    """What the Nodes page shows beyond :class:`NodeView`: the last ``/v1/info`` facts and the last Test access."""
 
-    revision: int = 0
+    view: NodeView
+    platform: dict
+    cpu: dict
+    busy: bool
+    info: dict | None
+    access_result: dict | None
+    access_checked_at: float | None
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """What one health check found."""
+
+    state: str
+    reason: str = ""
+    info: dict | None = None
+    legacy: bool = False
+    version: str = ""
+    roles: tuple[str, ...] = ()
+    uid: str = ""
+
+
+@dataclass
+class _Live:
+    record: dict
+    client: NodeClient
+    probe_state: str = STATE_CONNECTING
+    probe_reason: str = ""
+    info: dict | None = None
+    legacy: bool = False
+    version: str = ""
+    roles: tuple[str, ...] = ()
+    gpus: tuple[dict, ...] = ()
+    last_seen: float | None = None
+    offline_streak: int = 0
+    next_check: float = 0.0
+    checking: bool = False
+    not_visible: deque = field(default_factory=lambda: deque(maxlen=64))
+    access_problem: str = ""
+    gpu_lost: str = ""
+    lost_device: str = ""
+    next_gpu_check: float = 0.0
+    access_result: dict | None = None
+    access_checked_at: float | None = None
+    check_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _app_version() -> str:
+    from .. import __version__
+
+    return str(__version__)
+
+
+def _default_revision() -> object:
+    from ..web.settings_manager import get_settings_manager
+
+    sm = get_settings_manager()
+    # The manager's identity is part of the key: a new manager (another config dir) can start at the same revision.
+    return (id(sm), sm.nodes_revision)
+
+
+def _default_nodes() -> list[dict]:
+    from ..web.settings_manager import get_settings_manager
+
+    return get_settings_manager().nodes
+
+
+def _default_client(record: dict) -> NodeClient:
+    return NodeClient(NodeAddress(str(record.get("url") or ""), str(record.get("key") or "")))
+
+
+def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
+    """Ask an address the Plex helper's own ``/v1/ping``; answers ``(agent state, agent version)``."""
+    from ..markers.publishers.base import PublishError
+    from ..markers.publishers.plex_remote import AgentClient
+
+    agent = AgentClient(url, key)
+    try:
+        agent.ping(timeout=LEGACY_PING_TIMEOUT_S)
+    except PublishError:
+        pass  # AgentClient records what went wrong in ``state``.
+    return agent.state, agent.version
+
+
+def _default_record_uid(node_id: str, uid: str) -> None:
+    from ..web.settings_manager import get_settings_manager
+
+    sm = get_settings_manager()
+    try:
+        with sm.locked():
+            nodes = sm.nodes
+            node = find_node(nodes, node_id)
+            if node is None or node.get("node_uid"):
+                return
+            node["node_uid"] = uid
+            sm.update_nodes(nodes)
+    except (OSError, ValueError) as exc:
+        logger.warning("Couldn't record which node answers at a saved address: {}", exc)
+
+
+def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
+    from .mappings import quick_access_check
+
+    return quick_access_check(client, mappings)
+
+
+def _clean_gpus(raw: object) -> tuple[dict, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        {
+            "type": str(g.get("type") or ""),
+            "device": str(g.get("device") or ""),
+            "name": str(g.get("name") or ""),
+            "status": str(g.get("status") or ""),
+            "error": str(g.get("error") or ""),
+        }
+        for g in raw
+        if isinstance(g, dict)
+    )
+
+
+def _gpus_in(answer: object) -> tuple[dict, ...]:
+    """The GPU list in an ``/v1/info`` or ``/v1/gpus/rescan`` answer (``worker.gpus``, or a bare ``gpus``)."""
+    if not isinstance(answer, dict):
+        return ()
+    if isinstance(answer.get("gpus"), list):
+        return _clean_gpus(answer["gpus"])
+    worker = answer.get("worker")
+    return _clean_gpus(worker.get("gpus")) if isinstance(worker, dict) else ()
+
+
+def _gpu_ok(gpus: tuple[dict, ...], device: str) -> tuple[bool, str]:
+    match = next((g for g in gpus if g["device"] == device), None)
+    if match is None:
+        return False, "the node no longer finds it"
+    if match["status"] != "ok":
+        return False, match["error"] or f"its status is {match['status'] or 'unknown'}"
+    return True, ""
+
+
+class NodeRegistry:
+    """Configured nodes and their live state.
+
+    Args:
+        revision_provider: Returns a value that changes whenever the stored node list does.
+        nodes_provider: Returns the stored node records.
+        client_factory: Builds the client for one record.
+        legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
+        record_uid: Persists the ``node_uid`` a node reported on first contact.
+        quick_access: Checks one file per mapping row on a node; True when every one is visible.
+        app_version: This app's version (a worker node must match it exactly).
+        attempt_gap_s: Seconds between the attempts of one check.
+        clock: Monotonic seconds.
+        wall_clock: Epoch seconds (for ``last_seen``).
+    """
+
+    def __init__(
+        self,
+        *,
+        revision_provider: Callable[[], object] = _default_revision,
+        nodes_provider: Callable[[], list[dict]] = _default_nodes,
+        client_factory: Callable[[dict], NodeClient] = _default_client,
+        legacy_ping: Callable[[str, str], tuple[str, str]] = _default_legacy_ping,
+        record_uid: Callable[[str, str], None] = _default_record_uid,
+        quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
+        app_version: Callable[[], str] = _app_version,
+        attempt_gap_s: float = ATTEMPT_GAP_S,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._revision_provider = revision_provider
+        self._nodes_provider = nodes_provider
+        self._client_factory = client_factory
+        self._legacy_ping = legacy_ping
+        self._record_uid = record_uid
+        self._quick_access = quick_access
+        self._app_version = app_version
+        self._attempt_gap_s = attempt_gap_s
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._lock = threading.RLock()
+        self._nodes: dict[str, _Live] = {}
+        self._settings_key: object = object()
+        self._revision = 0
+        self._signature: tuple = ()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._executor: ThreadPoolExecutor | None = None
+
+    # ------------------------------------------------------------------ reading
+
+    @property
+    def revision(self) -> int:
+        """Bumps on any state, capacity or settings change."""
+        self._sync()
+        return self._revision
 
     def views(self) -> list[NodeView]:
-        raise NotImplementedError
+        """Every configured node, in settings order."""
+        self._sync()
+        with self._lock:
+            return [self._view(live) for live in self._nodes.values()]
 
     def view(self, node_id: str) -> NodeView | None:
-        raise NotImplementedError
+        """One node, or None when it isn't configured."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            return self._view(live) if live else None
+
+    def details(self, node_id: str) -> NodeDetails | None:
+        """A node's view plus the last facts it reported and its last Test access, or None."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return None
+            info = copy.deepcopy(live.info)
+            worker = (info or {}).get("worker") or {}
+            return NodeDetails(
+                view=self._view(live),
+                platform=dict((info or {}).get("platform") or {}),
+                cpu=dict(worker.get("cpu") or {}),
+                busy=bool(worker.get("busy")),
+                info=info,
+                access_result=copy.deepcopy(live.access_result),
+                access_checked_at=live.access_checked_at,
+            )
 
     def client(self, node_id: str) -> NodeClient:
-        raise NotImplementedError
+        """The node's client. Raises KeyError for an unknown node."""
+        self._sync()
+        with self._lock:
+            return self._nodes[node_id].client
 
     def mappings(self, node_id: str) -> list[PathMapping]:
-        raise NotImplementedError
+        """The node's mapping rows ([] for an unknown node)."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            return node_mappings(live.record) if live else []
 
     def capacity(self, node_id: str) -> NodeCapacity:
-        raise NotImplementedError
+        """Whether the node's CPU / GPU members may take work now."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return NodeCapacity(False, False, "node removed")
+            state, reason = self._state(live)
+            if state == STATE_READY:
+                if protocol.ROLE_WORKER not in live.roles:
+                    return NodeCapacity(False, False, "node doesn't run workers")
+                return NodeCapacity(True, True, "")
+            if state == STATE_GPU_LOST:
+                return NodeCapacity(True, False, reason)
+            return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
+
+    # ------------------------------------------------------------------ reports from job code
 
     def report_unavailable(self, node_id: str) -> None:
-        raise NotImplementedError
+        """A node stopped answering mid-task: check it now rather than at its next turn."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return
+            live.next_check = 0.0
+        if self._running():
+            self._wake.set()
+        else:
+            self._submit(self._run_check, node_id)
 
     def report_not_visible(self, node_id: str, app_path: str, reason: str) -> None:
-        raise NotImplementedError
+        """A node couldn't see a file; three different files within 10 minutes is an access problem."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return
+            now = self._clock()
+            while live.not_visible and now - live.not_visible[0][0] > NOT_VISIBLE_WINDOW_S:
+                live.not_visible.popleft()
+            live.not_visible.append((now, app_path))
+            distinct = {path for _, path in live.not_visible}
+            if len(distinct) >= NOT_VISIBLE_LIMIT and not live.access_problem:
+                name = live.record.get("name") or "The node"
+                live.access_problem = (
+                    f"{name} couldn't see {len(distinct)} different files in 10 minutes (last: {reason}). "
+                    "Its workers are paused: run Test access on the Nodes page and fix the folder mappings."
+                )
+                logger.warning(
+                    "Node {} couldn't see {} different files in 10 minutes; pausing its workers until media access "
+                    "is fixed",
+                    name,
+                    len(distinct),
+                )
+            self._touch()
 
     def report_gpu_error(self, node_id: str, device: str) -> None:
-        raise NotImplementedError
+        """A GPU failed on a node: rescan its GPUs, and mark it lost when that GPU is missing or not OK."""
+        self._sync()
+        with self._lock:
+            if node_id not in self._nodes:
+                return
+        self._submit(self._gpu_check, node_id, device)
+
+    def record_access_result(self, node_id: str, result: dict) -> None:
+        """Remember a Test access result; a passing one clears an access problem.
+
+        Args:
+            node_id: The node.
+            result: ``{"libraries": [...]}`` as ``mappings.run_test_access`` returns it.
+        """
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return
+            live.access_result = copy.deepcopy(result)
+            live.access_checked_at = self._wall_clock()
+            if access_passed(result):
+                live.access_problem = ""
+                live.not_visible.clear()
+            self._touch()
+
+    # ------------------------------------------------------------------ checks on demand
+
+    def check_now(self, node_id: str) -> NodeView | None:
+        """Run a health check now (blocking). When the node has an access problem, a passing quick access check
+        (one file per mapping row) clears it.
+
+        Returns:
+            The view after the check, or None for an unknown node.
+        """
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return None
+            if not live.record.get("enabled", True):
+                return self._view(live)
+        self._run_check(node_id, access=True)
+        return self.view(node_id)
+
+    def rescan_gpus(self, node_id: str) -> NodeView | None:
+        """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return None
+            device = live.lost_device
+        self._gpu_check(node_id, device or None)
+        return self.view(node_id)
+
+    # ------------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        raise NotImplementedError
+        """Start the health loop (idempotent)."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHECKS, thread_name_prefix="node-check")
+            self._thread = threading.Thread(target=self._loop, name="node-health", daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
-        raise NotImplementedError
+        """Stop the health loop and abandon checks still waiting to run."""
+        with self._lock:
+            thread, executor = self._thread, self._executor
+            self._thread = self._executor = None
+        self._stop.set()
+        self._wake.set()
+        if thread is not None:
+            thread.join(timeout=5.0)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _submit(self, fn: Callable[..., Any], *args: Any) -> None:
+        executor = self._executor
+        if executor is not None:
+            try:
+                executor.submit(fn, *args)
+                return
+            except RuntimeError:
+                pass  # Shut down meanwhile.
+        threading.Thread(target=fn, args=args, name="node-check", daemon=True).start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("Node health loop tick failed; trying again in a second")
+            self._wake.wait(LOOP_TICK_S)
+            self._wake.clear()
+
+    def _tick(self) -> None:
+        self._sync()
+        now = self._clock()
+        due_checks, due_gpus = [], []
+        with self._lock:
+            for node_id, live in self._nodes.items():
+                if not live.record.get("enabled", True) or live.checking:
+                    continue
+                if live.next_check <= now:
+                    live.checking = True
+                    due_checks.append(node_id)
+                elif live.gpu_lost and live.next_gpu_check <= now:
+                    live.next_gpu_check = now + GPU_LOST_RECHECK_S
+                    due_gpus.append((node_id, live.lost_device))
+        for node_id in due_checks:
+            self._submit(self._run_check, node_id, False, True)
+        for node_id, device in due_gpus:
+            self._submit(self._gpu_check, node_id, device)
+
+    # ------------------------------------------------------------------ settings
+
+    def _sync(self) -> None:
+        try:
+            key = self._revision_provider()
+        except Exception as exc:
+            logger.debug("Node settings unreadable: {}", exc)
+            return
+        if key == self._settings_key:
+            return
+        try:
+            records = self._nodes_provider()
+        except Exception as exc:
+            logger.debug("Node settings unreadable: {}", exc)
+            return
+        with self._lock:
+            if key == self._settings_key:
+                return
+            fresh: dict[str, _Live] = {}
+            for record in records:
+                node_id = str(record.get("id") or "")
+                if not node_id or node_id in fresh:
+                    continue
+                fresh[node_id] = self._merge(self._nodes.get(node_id), record)
+            self._nodes = fresh
+            self._settings_key = key
+            self._touch()
+        self._wake.set()
+
+    def _merge(self, live: _Live | None, record: dict) -> _Live:
+        """A node's live record after its stored record changed (or a new one for a new node)."""
+        if live is None:
+            return _Live(record=copy.deepcopy(record), client=self._client_factory(record))
+        old = live.record
+        address_changed = (old.get("url"), old.get("key")) != (record.get("url"), record.get("key"))
+        reconnect = (
+            address_changed
+            or old.get("path_mappings") != record.get("path_mappings")
+            or (record.get("enabled", True) and not old.get("enabled", True))
+        )
+        live.record = copy.deepcopy(record)
+        if address_changed:
+            live.client = self._client_factory(record)
+        if reconnect:
+            # A new address, key or mapping set is a different node as far as anything learnt before goes.
+            live.probe_state, live.probe_reason = STATE_CONNECTING, ""
+            live.offline_streak = 0
+            live.next_check = 0.0
+            live.access_problem = ""
+            live.not_visible.clear()
+            if address_changed:
+                live.gpu_lost = live.lost_device = ""
+        return live
+
+    # ------------------------------------------------------------------ state
+
+    def _state(self, live: _Live) -> tuple[str, str]:
+        if not live.record.get("enabled", True):
+            return STATE_DISABLED, "Turned off on the Nodes page"
+        if live.probe_state == STATE_CONNECTING:
+            return STATE_CONNECTING, "Checking the node"
+        if live.probe_state != STATE_READY:
+            return live.probe_state, live.probe_reason
+        if live.access_problem:
+            return STATE_ACCESS_PROBLEM, live.access_problem
+        if live.gpu_lost:
+            return STATE_GPU_LOST, live.gpu_lost
+        return STATE_READY, ""
+
+    def _view(self, live: _Live) -> NodeView:
+        state, reason = self._state(live)
+        worker = (live.info or {}).get("worker") or {}
+        cpu = worker.get("cpu") or {}
+        try:
+            cores = int(cpu.get("cores") or 0)
+        except (TypeError, ValueError):
+            cores = 0
+        return NodeView(
+            id=str(live.record.get("id") or ""),
+            name=str(live.record.get("name") or ""),
+            url=str(live.record.get("url") or ""),
+            enabled=bool(live.record.get("enabled", True)),
+            state=state,
+            reason=reason,
+            version=live.version,
+            roles=live.roles,
+            gpus=tuple({k: g[k] for k in ("type", "device", "name", "status")} for g in live.gpus),
+            cpu_cores=cores,
+            legacy=live.legacy,
+            last_seen=live.last_seen,
+        )
+
+    def _touch(self) -> None:
+        """Bump the revision when anything a reader acts on changed (not on every ``last_seen``)."""
+        with self._lock:
+            signature = tuple(
+                (
+                    v.id,
+                    v.name,
+                    v.url,
+                    v.enabled,
+                    v.state,
+                    v.reason,
+                    v.version,
+                    v.roles,
+                    v.gpus,
+                    v.legacy,
+                    str(self._nodes[v.id].record.get("path_mappings")),
+                )
+                for v in (self._view(live) for live in self._nodes.values())
+            )
+            if signature != self._signature:
+                self._signature = signature
+                self._revision += 1
+
+    # ------------------------------------------------------------------ the checks
+
+    def _run_check(self, node_id: str, access: bool = False, claimed: bool = False) -> None:
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return
+            if not claimed:
+                live.checking = True
+            record, client = copy.deepcopy(live.record), live.client
+        try:
+            with live.check_lock:
+                outcome = self._probe(record, client)
+                with self._lock:
+                    if self._nodes.get(node_id) is not live or live.client is not client:
+                        return  # Settings changed while it ran: this answer is about an old address.
+                    self._apply(live, outcome)
+                    has_access_problem = bool(live.access_problem)
+                if outcome.uid and not record.get("node_uid"):
+                    self._record_uid(node_id, outcome.uid)
+                if access and has_access_problem and outcome.state == STATE_READY:
+                    self._quick_access_clear(node_id, live, client)
+        except Exception:
+            logger.exception("Health check of node {} failed unexpectedly", record.get("name") or node_id)
+        finally:
+            with self._lock:
+                live.checking = False
+
+    def _apply(self, live: _Live, outcome: _Outcome) -> None:
+        live.probe_state, live.probe_reason = outcome.state, outcome.reason
+        if outcome.state == STATE_OFFLINE:
+            live.offline_streak += 1
+            delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
+        else:
+            live.offline_streak = 0
+            delay = HEALTH_INTERVAL_S
+            live.last_seen = self._wall_clock()
+        live.next_check = self._clock() + delay
+        if outcome.info is not None or outcome.legacy:
+            live.info = outcome.info
+            live.legacy = outcome.legacy
+            live.version = outcome.version
+            live.roles = outcome.roles
+            live.gpus = _gpus_in(outcome.info)
+            if live.gpu_lost and live.lost_device and _gpu_ok(live.gpus, live.lost_device)[0]:
+                live.gpu_lost = live.lost_device = ""
+        self._touch()
+
+    def _probe(self, record: dict, client: NodeClient) -> _Outcome:
+        name = str(record.get("name") or "The node")
+        info: dict | None = None
+        for attempt in range(CHECK_ATTEMPTS):
+            try:
+                info = client.info()
+                break
+            except NodeAuthError:
+                return _Outcome(
+                    STATE_KEY_REFUSED,
+                    f"{name} refused the key. Copy the key from the node's log or settings into this node's key field.",
+                )
+            except NodeProtocolError:
+                return self._probe_legacy(record)
+            except NodeError as exc:
+                logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
+                if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
+                    break
+        if info is None:
+            return _Outcome(
+                STATE_OFFLINE,
+                f"{name} didn't answer. Check that it is running and reachable from this app.",
+            )
+        return self._read_info(record, info)
+
+    def _read_info(self, record: dict, info: dict) -> _Outcome:
+        from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_too_old
+
+        name = str(record.get("name") or "The node")
+        block = info.get("node") if isinstance(info.get("node"), dict) else {}
+        uid = str(block.get("id") or "")
+        roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
+        version = str(block.get("version") or "")
+        stored_uid = str(record.get("node_uid") or "")
+        if stored_uid and uid and uid != stored_uid:
+            return _Outcome(
+                STATE_OFFLINE,
+                "A different node answered at this address. Point this node at its own address, or remove it and "
+                "add the new one.",
+            )
+        outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
+        app_version = self._app_version()
+        if protocol.ROLE_WORKER in roles and version != app_version:
+            return _Outcome(
+                STATE_UPDATE_NEEDED,
+                f"{name} runs version {version or 'unknown'} and this app runs {app_version}. Update the node to "
+                f"{app_version}.",
+                **outcome,
+            )
+        agent = info.get("agent")
+        agent_version = str(agent.get("version") or "") if isinstance(agent, dict) else ""
+        if protocol.ROLE_PLEX_DB in roles and agent_version and agent_too_old(agent_version):
+            return _Outcome(
+                STATE_UPDATE_NEEDED,
+                f"{name}'s Plex database role is version {agent_version}; this app needs {MIN_AGENT_VERSION} or "
+                "newer. Update the node.",
+                **outcome,
+            )
+        return _Outcome(STATE_READY, **outcome)
+
+    def _probe_legacy(self, record: dict) -> _Outcome:
+        """A node that doesn't know ``/v1/info``: an old Plex helper keeps working as a Plex database node."""
+        from ..markers.publishers.plex_remote import (
+            AGENT_CONNECTED,
+            AGENT_INCOMPATIBLE,
+            AGENT_REJECTED,
+            MIN_AGENT_VERSION,
+            agent_too_old,
+        )
+
+        name = str(record.get("name") or "The node")
+        state, version = self._legacy_ping(str(record.get("url") or ""), str(record.get("key") or ""))
+        legacy = {"legacy": True, "version": version, "roles": (protocol.ROLE_PLEX_DB,), "info": None}
+        if state == AGENT_CONNECTED:
+            return _Outcome(STATE_READY, **legacy)
+        if state == AGENT_REJECTED:
+            return _Outcome(STATE_KEY_REFUSED, f"{name} refused the key. Set the same key on both sides.", **legacy)
+        if state == AGENT_INCOMPATIBLE:
+            if agent_too_old(version):
+                reason = f"{name} is Plex helper {version}; this app needs {MIN_AGENT_VERSION} or newer. Update it."
+            else:
+                reason = f"{name} speaks a newer protocol than this app. Update this app to match it."
+            return _Outcome(STATE_UPDATE_NEEDED, reason, **legacy)
+        return _Outcome(
+            STATE_OFFLINE,
+            "Something answered at this address, but not as a node or a Plex helper. Check the address.",
+        )
+
+    def _quick_access_clear(self, node_id: str, live: _Live, client: NodeClient) -> None:
+        mappings = node_mappings(live.record)
+        try:
+            passed = self._quick_access(client, mappings)
+        except Exception as exc:
+            logger.debug("Quick access check on node {} failed: {}", node_id, exc)
+            return
+        if passed:
+            with self._lock:
+                live.access_problem = ""
+                live.not_visible.clear()
+                self._touch()
+
+    def _gpu_check(self, node_id: str, device: str | None) -> None:
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return
+            client, name = live.client, str(live.record.get("name") or "The node")
+        try:
+            gpus = _gpus_in(client.rescan_gpus())
+        except NodeError as exc:
+            logger.debug("GPU rescan on node {} failed: {}", name, exc)
+            self.report_unavailable(node_id)
+            return
+        with self._lock:
+            if self._nodes.get(node_id) is not live or live.client is not client:
+                return
+            live.gpus = gpus
+            if device:
+                ok, why = _gpu_ok(gpus, device)
+                if ok:
+                    if live.lost_device == device:
+                        live.gpu_lost = live.lost_device = ""
+                else:
+                    if not live.gpu_lost:
+                        logger.warning("Node {} lost its GPU {} ({}); its GPU workers are paused", name, device, why)
+                    live.gpu_lost = f"{name} lost its GPU {device} ({why}). Its CPU workers keep running."
+                    live.lost_device = device
+                    live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
+            self._touch()
+
+
+def access_passed(result: object) -> bool:
+    """Whether a Test access result saw every sampled file (and sampled at least one)."""
+    if not isinstance(result, dict):
+        return False
+    libraries = [lib for lib in result.get("libraries") or [] if isinstance(lib, dict)]
+    checked = [lib for lib in libraries if lib.get("checked")]
+    return bool(checked) and all(lib.get("ok") for lib in checked)
 
 
 _registry: NodeRegistry | None = None
