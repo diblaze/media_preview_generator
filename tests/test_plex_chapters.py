@@ -6,7 +6,6 @@ import contextlib
 import hashlib
 import json
 import sqlite3
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -598,18 +597,26 @@ def test_an_image_replaced_after_validation_is_refused_inside_the_transaction(ba
     assert rows(backend) == before
 
 
-def test_agent_typed_requests_and_auth(backend, monkeypatch):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plex-marker-agent"))
-    import plex_marker_agent
+def _role_client(backend, monkeypatch):
+    """The Plex database role on a bare node app, serving ``backend``'s chapters."""
+    from flask import Flask
 
-    monkeypatch.setattr(plex_marker_agent, "LocalChapters", lambda *_a, **_kw: backend)
-    client = plex_marker_agent.create_app(config_dir=str(backend.folder), token="synthetic-key").test_client()
+    from media_preview_generator.nodes.server import plex_db as plex_db_role
+
+    monkeypatch.setattr(plex_db_role, "LocalChapters", lambda *_a, **_kw: backend)
+    app = Flask(__name__)
+    plex_db_role.register_plex_db(app, plex_config_dir=str(backend.folder), key="synthetic-key")
+    return app.test_client()
+
+
+def test_agent_typed_requests_and_auth(backend, monkeypatch):
+    client = _role_client(backend, monkeypatch)
     headers = {"Authorization": "Bearer synthetic-key", "X-Marker-Agent-Protocol": "1"}
     body = {"machine_identifier": MACHINE, "pms_version": VERSION, "deadline_s": 3, "source_path": SOURCE}
     assert client.post("/v1/chapters/read", json=body).status_code == 401
     response = client.post("/v1/chapters/read", json=body, headers=headers)
     assert response.status_code == 200
-    assert response.json["agent"]["capabilities"] == ["chapters_v1"]
+    assert "chapters_v1" in response.json["agent"]["capabilities"]
     snapshot = response.json["result"]["target"]
     _, revisions = images(backend)
     body.update(target=snapshot, revisions=[{"index": i, "sha256": sha} for i, sha in revisions.items()])
@@ -680,11 +687,7 @@ def test_register_clears_only_our_own_stale_reference_for_chapters_without_an_im
 
 
 def test_agent_validates_a_subset_of_chapter_revisions(backend, monkeypatch):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plex-marker-agent"))
-    import plex_marker_agent
-
-    monkeypatch.setattr(plex_marker_agent, "LocalChapters", lambda *_a, **_kw: backend)
-    client = plex_marker_agent.create_app(config_dir=str(backend.folder), token="synthetic-key").test_client()
+    client = _role_client(backend, monkeypatch)
     headers = {"Authorization": "Bearer synthetic-key", "X-Marker-Agent-Protocol": "1"}
     body = {"machine_identifier": MACHINE, "pms_version": VERSION, "deadline_s": 3, "source_path": SOURCE}
     snapshot = client.post("/v1/chapters/read", json=body, headers=headers).json["result"]["target"]

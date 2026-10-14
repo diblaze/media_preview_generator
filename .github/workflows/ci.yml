@@ -613,15 +613,16 @@ jobs:
           check /app/models/latin_PP-OCRv5_rec_mobile.onnx REC_SHA256
 
   marker-agent-image:
-    # The Plex marker agent (plex-marker-agent/) installs the app's wheel with --no-deps, so the only libraries in
-    # that image are the ones requirements.lock.txt names. tests/test_plex_marker_agent.py can't see when that stops
-    # being enough: it imports the agent inside a full dev environment, so a new module-scope `import numpy`
-    # anywhere under markers/publishers/ would leave every one of those tests green and still kill the container at
-    # boot. Nothing else in CI builds this image. This job is what proves the --no-deps install still works: it
+    # The Plex database node (nodes/plex-db/, the former Plex marker agent) installs the app's wheel with --no-deps,
+    # so the only libraries in that image are the ones requirements.lock.txt names. tests/nodes/test_plex_db_role.py
+    # can't see when that stops being enough: it imports the role inside a full dev environment, so a new
+    # module-scope `import numpy` anywhere on its path (nodes/server/, markers/publishers/, loudness's database
+    # modules, library_health/plex_rows.py) would leave every one of those tests green and still kill the container
+    # at boot. Nothing else in CI builds this image. This job is what proves the --no-deps install still works: it
     # builds it, boots it and calls it.
     #
     # Runs on every event this workflow handles, with no `if:` of its own (only `needs: lint`). paths-ignore doesn't exclude
-    # plex-marker-agent/, and `*.md` only matches top-level markdown (a GitHub path glob's `*` doesn't cross `/`),
+    # nodes/, and `*.md` only matches top-level markdown (a GitHub path glob's `*` doesn't cross `/`),
     # so a change anywhere in that folder reaches this job. amd64 only — the release workflow
     # (.github/workflows/marker-agent.yml) builds arm64 on a native runner, and the image has no compiled code, so
     # an arm64 build here would only re-prove the same pure-Python wheels.
@@ -655,7 +656,7 @@ jobs:
         with:
           # The repository root: the image installs the app's own source, which is what the agent runs.
           context: .
-          file: plex-marker-agent/Dockerfile
+          file: nodes/plex-db/Dockerfile
           platforms: linux/amd64
           push: false
           load: true
@@ -702,10 +703,11 @@ jobs:
           fi
           echo "Container is healthy"
 
-          # /v1/health takes no key; /v1/ping needs one and reaches the app's own plex_db code.
+          # /v1/health takes no key and still carries the agent block old apps read; /v1/ping needs one and reaches
+          # the app's own plex_db code.
           curl -fsS http://127.0.0.1:9494/v1/health > health.json
           curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:9494/v1/ping > ping.json
-          jq -e '.ok == true' health.json > /dev/null
+          jq -e '.ok == true and (.agent.version | type == "string")' health.json > /dev/null
           jq -e '.ok == true and (.result | has("db_present") and has("machine_identifier"))' ping.json > /dev/null
 
           # An unauthenticated call is refused and says nothing about this Plex.
@@ -717,10 +719,10 @@ jobs:
           jq -e '.ok == false and .error.kind == "auth" and (.error | has("message") | not)' unauth.json > /dev/null
 
           # The image reports the version the source says it should, so a stale build can't be published quietly.
-          expected="$(python3 -c 'import ast, sys; body = ast.parse(open(sys.argv[1]).read()).body; print(next(n.value.value for n in body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "AGENT_VERSION" for t in n.targets)))' plex-marker-agent/plex_marker_agent.py)"
+          expected="$(python3 -c 'import ast, sys; body = ast.parse(open(sys.argv[1]).read()).body; print(next(n.value.value for n in body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "AGENT_VERSION" for t in n.targets)))' media_preview_generator/nodes/server/plex_db.py)"
           actual="$(jq -r '.agent.version' ping.json)"
           if [[ "$actual" != "$expected" ]]; then
-            echo "::error::The image reports agent version $actual, plex_marker_agent.py says $expected"
+            echo "::error::The image reports agent version $actual, nodes/server/plex_db.py says $expected"
             exit 1
           fi
           echo "Agent $actual answered /v1/health and /v1/ping, and refused a call without the key"

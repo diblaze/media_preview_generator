@@ -1,20 +1,20 @@
-"""The Plex marker agent itself: its guards, its refusals, and the app writing Plex through it.
+"""The Plex database role (the Plex marker agent, folded into the node server): its guards, its refusals, and the app
+writing Plex through it.
 
-The agent is a container the user runs beside Plex (``plex-marker-agent/``); it is not part of the web app, so it
-lives outside the package and is imported from its folder.
+The role is mounted on a bare Flask app here: the node server (``nodes.server.app``) owns ``/v1/health`` and the
+role's routes keep their own guard, so a stand-in health route proves the two don't leak into each other.
 """
 
 from __future__ import annotations
 
 import re
 import sqlite3
-import sys
 import tomllib
 from pathlib import Path
 from unittest.mock import MagicMock
-from urllib.parse import urlsplit
 
 import pytest
+from flask import Flask
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
@@ -26,18 +26,15 @@ from media_preview_generator.markers.publishers.base import Capability, PublishE
 from media_preview_generator.markers.publishers.plex_db import PlexMarkerPublisher
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.markers.settings import ServerMarkersSettings
+from media_preview_generator.nodes.server import plex_db as plex_db_role
 from media_preview_generator.servers.base import ServerConfig, ServerType
 from tests.markers.test_plex_db_publisher import _make_db, _mountinfo
+from tests.nodes.plex_db_harness import TOKEN, FlaskSession, node_app
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-AGENT_DIR = REPO_ROOT / "plex-marker-agent"
-if str(AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(AGENT_DIR))
-
-import plex_marker_agent  # noqa: E402
+REPO_ROOT = Path(__file__).resolve().parents[2]
+AGENT_DIR = REPO_ROOT / "nodes" / "plex-db"
 
 T = MarkerType
-TOKEN = "lab-shared-key-0123456789"
 DUR = 1_320_000
 INTRO = Marker(T.INTRO, 11_000, 37_000, ("chapters",))
 LOCKED_INTRO = Marker(T.INTRO, 20_000, 44_000, ("user",), locked=True)
@@ -91,10 +88,8 @@ def plex_config(tmp_path):
 
 @pytest.fixture
 def agent(plex_config, tmp_path):
-    """The agent, pointed at that folder, with everything on a local disk."""
-    app = plex_marker_agent.create_app(config_dir=str(plex_config), token=TOKEN, mountinfo_path=_mountinfo(tmp_path))
-    app.config["TESTING"] = True
-    return app.test_client()
+    """The role, pointed at that folder, with everything on a local disk."""
+    return node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path)).test_client()
 
 
 def _db_file(plex_config: Path) -> Path:
@@ -117,16 +112,18 @@ def _served(plex_config: Path, item: int = 7) -> list[tuple]:
 class TestItStartsOnlyWhenItIsSetUp:
     def test_no_shared_key_refuses_to_start(self, plex_config):
         with pytest.raises(SystemExit, match="AGENT_TOKEN"):
-            plex_marker_agent.create_app(config_dir=str(plex_config), token="")
+            node_app(str(plex_config), key="")
 
     def test_no_plex_config_folder_refuses_to_start(self):
         with pytest.raises(SystemExit, match="PLEX_CONFIG_DIR"):
-            plex_marker_agent.create_app(config_dir="", token=TOKEN)
+            node_app("", key=TOKEN)
 
-    def test_it_reads_both_from_the_environment(self, plex_config, monkeypatch):
-        monkeypatch.setenv("PLEX_CONFIG_DIR", str(plex_config))
-        monkeypatch.setenv("AGENT_TOKEN", TOKEN)
-        assert plex_marker_agent.create_app() is not None
+    def test_it_leaves_the_health_route_to_the_node_server(self, plex_config):
+        app = Flask(__name__)
+        plex_db_role.register_plex_db(app, plex_config_dir=str(plex_config), key=TOKEN)
+        routes = {rule.rule for rule in app.url_map.iter_rules()}
+        assert "/v1/health" not in routes
+        assert {"/v1/ping", "/v1/item/write", "/v1/loudness/<operation>", "/v1/library-health/rows"} <= routes
 
 
 class TestTheGuards:
@@ -139,6 +136,9 @@ class TestTheGuards:
         ("post", "/v1/item/write", {"write": {}}),
         ("post", "/v1/items/shown", {"items": []}),
         ("post", "/v1/item/exists", {"rating_key": 7}),
+        ("post", "/v1/chapters/check", {}),
+        ("post", "/v1/loudness/check", {}),
+        ("post", "/v1/library-health/rows", {"section_ids": [1]}),
         ("get", "/v1/ping", None),
     ]
 
@@ -178,7 +178,7 @@ class TestTheGuards:
         """The other half of the pair. The app stores printable ASCII only (``markers/settings.py``), so such a
         key could never match one it sends: every request would 401 and look like a typo on the app's side."""
         with pytest.raises(SystemExit, match="ASCII"):
-            plex_marker_agent.create_app(config_dir=str(tmp_path), token=token)
+            node_app(str(tmp_path), key=token)
 
     def test_a_wrong_key_says_nothing_about_this_plex(self, agent):
         body = agent.post("/v1/checks/file", json={}, headers={"Authorization": "Bearer nope"}).get_data(as_text=True)
@@ -192,7 +192,7 @@ class TestTheGuards:
         response = agent.post("/v1/item/read", json={"rating_key": 7}, headers=headers)
         assert response.status_code == 409
         message = response.get_json()["error"]["message"]
-        assert plex_marker_agent.AGENT_VERSION in message and "protocol 1" in message
+        assert plex_db_role.AGENT_VERSION in message and "protocol 1" in message
 
     @pytest.mark.parametrize("asked", [None, "99"], ids=["no-protocol-header", "another-protocol"])
     def test_the_ping_still_answers_a_caller_whose_protocol_it_doesnt_speak(self, agent, asked):
@@ -203,28 +203,21 @@ class TestTheGuards:
             headers[plex_remote.PROTOCOL_HEADER] = asked
         response = agent.get("/v1/ping", headers=headers)
         assert response.status_code == 200
-        assert response.get_json()["agent"]["version"] == plex_marker_agent.AGENT_VERSION
+        assert response.get_json()["agent"]["version"] == plex_db_role.AGENT_VERSION
 
     def test_the_ping_still_needs_the_key(self, agent):
         assert agent.get("/v1/ping", headers={"Authorization": "Bearer nope"}).status_code == 401
 
-    def test_the_health_check_needs_nothing_and_says_nothing(self, agent):
+    def test_the_roles_guard_doesnt_reach_the_node_servers_own_routes(self, agent):
+        # The stand-in /v1/health has no key and no protocol header, as the container's HEALTHCHECK calls it.
         payload = agent.get("/v1/health").get_json()
         assert payload["ok"] is True
-        assert payload["agent"] == {
-            "version": plex_marker_agent.AGENT_VERSION,
-            "protocols": [1],
-            "capabilities": ["chapters_v1"],
-        }
+        assert payload["agent"] == plex_db_role.agent_block()
         assert "db" not in str(payload)
 
     def test_every_answer_carries_the_agents_version_so_skew_is_seen_on_the_first_call(self, agent):
         for response in (agent.get("/v1/ping", headers=AUTH), agent.post("/v1/checks/file", json={}, headers=AUTH)):
-            assert response.get_json()["agent"] == {
-                "version": plex_marker_agent.AGENT_VERSION,
-                "protocols": [1],
-                "capabilities": ["chapters_v1"],
-            }
+            assert response.get_json()["agent"] == plex_db_role.agent_block()
 
     @pytest.mark.parametrize(
         ("path", "body"),
@@ -299,9 +292,7 @@ class TestItRefusesWhatTheInProcessWriterRefuses:
     """The same guards, because it is the same code — never a second implementation."""
 
     def test_a_database_on_a_network_share_is_refused_here_too(self, plex_config, tmp_path):
-        app = plex_marker_agent.create_app(
-            config_dir=str(plex_config), token=TOKEN, mountinfo_path=_mountinfo(tmp_path, fs="nfs4")
-        )
+        app = node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path, fs="nfs4"))
         report = app.test_client().post("/v1/checks/file", json={}, headers=AUTH).get_json()["result"]["report"]
         assert report["state"] == Capability.NEEDS_LOCAL_DB.value
         assert "network share" in report["message"]
@@ -325,7 +316,7 @@ class TestItRefusesWhatTheInProcessWriterRefuses:
     def test_a_plex_that_never_made_its_marker_tag_row_is_refused_and_none_is_created(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         _make_db(folder, tag_row=None, journal_mode="wal")
-        app = plex_marker_agent.create_app(config_dir=str(folder), token=TOKEN, mountinfo_path=_mountinfo(tmp_path))
+        app = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path))
         response = app.test_client().post(
             "/v1/item/write", json=_write_body(rating_key=7, wanted=[INTRO]), headers=AUTH
         )
@@ -340,30 +331,6 @@ class TestItRefusesWhatTheInProcessWriterRefuses:
     def test_an_item_this_plex_doesnt_have_is_an_item_not_found(self, agent):
         response = agent.post("/v1/item/read", json={"rating_key": 999}, headers=AUTH)
         assert response.status_code == 200 and response.get_json()["result"]["item"]["exists"] is False
-
-
-class _FlaskResponse:
-    """A ``requests``-shaped view of a Flask test response."""
-
-    def __init__(self, response) -> None:
-        self.status_code = response.status_code
-        self._response = response
-
-    def json(self):
-        return self._response.get_json()
-
-
-class ClientSession:
-    """A ``requests.Session`` that calls the agent in-process, as the app's HTTP client would over the LAN."""
-
-    def __init__(self, client) -> None:
-        self._client = client
-        self.stopped = False
-
-    def post(self, url, json=None, headers=None, timeout=None):
-        if self.stopped:
-            raise __import__("requests").ConnectionError("connection refused")
-        return _FlaskResponse(self._client.post(urlsplit(url).path, json=json, headers=headers))
 
 
 def _publisher_through(session, *, keep_plex=False, identity=None) -> PlexMarkerPublisher:
@@ -401,7 +368,7 @@ class TestTheAppWritesPlexThroughTheAgent:
     """The whole path, both halves: nothing here opens the database except the agent."""
 
     def test_markers_are_written_read_back_and_cleaned_up(self, agent, plex_config):
-        session = ClientSession(agent)
+        session = FlaskSession(agent)
         publisher = _publisher_through(session)
 
         ours = publisher.write(
@@ -418,9 +385,9 @@ class TestTheAppWritesPlexThroughTheAgent:
         assert _served(plex_config) == []
 
     def test_the_second_run_changes_nothing(self, agent, plex_config):
-        publisher = _publisher_through(ClientSession(agent))
+        publisher = _publisher_through(FlaskSession(agent))
         publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
-        again = _publisher_through(ClientSession(agent))
+        again = _publisher_through(FlaskSession(agent))
         again.write("7", [INTRO], previous=[INTRO], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
         assert again.last_write_changed is False
         assert _served(plex_config) == [("intro", 11_000, 37_000)]
@@ -435,7 +402,7 @@ class TestTheAppWritesPlexThroughTheAgent:
         conn.commit()
         conn.close()
 
-        publisher = _publisher_through(ClientSession(agent), keep_plex=True)
+        publisher = _publisher_through(FlaskSession(agent), keep_plex=True)
         ours = publisher.write(
             "7", [LOCKED_INTRO], previous=None, duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv"
         )
@@ -454,21 +421,21 @@ class TestTheAppWritesPlexThroughTheAgent:
         conn.commit()
         conn.close()
 
-        publisher = _publisher_through(ClientSession(agent), keep_plex=True)
+        publisher = _publisher_through(FlaskSession(agent), keep_plex=True)
         publisher.write("7", [INTRO], previous=None, duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
 
         assert _served(plex_config) == [("intro", 990, 29306)]
         assert publisher.last_kept_types == frozenset({T.INTRO})
 
     def test_the_capability_is_ready_and_shows_the_agents_own_path(self, agent, plex_config):
-        report = _publisher_through(ClientSession(agent)).capability()
+        report = _publisher_through(FlaskSession(agent)).capability()
         assert report.state is Capability.READY
         assert report.details["db_path"] == str(_db_file(plex_config))
         assert report.details["agent"]["state"] == "connected"
-        assert report.details["agent"]["version"] == plex_marker_agent.AGENT_VERSION
+        assert report.details["agent"]["version"] == plex_db_role.AGENT_VERSION
 
     def test_an_agent_that_stops_mid_publish_fails_the_write_and_leaves_plex_untouched(self, agent, plex_config):
-        session = ClientSession(agent)
+        session = FlaskSession(agent)
         publisher = _publisher_through(session)
         publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
         session.stopped = True
@@ -481,22 +448,22 @@ class TestTheAppWritesPlexThroughTheAgent:
         assert _served(plex_config) == [("intro", 11_000, 37_000)]  # exactly what the first run left
 
     def test_a_stopped_agent_makes_the_server_not_ready_rather_than_crashing(self, agent):
-        session = ClientSession(agent)
+        session = FlaskSession(agent)
         session.stopped = True
         report = _publisher_through(session).capability()
         assert report.state is Capability.AGENT_UNAVAILABLE
         assert report.details["agent"]["state"] == "unreachable"
 
     def test_a_wrong_key_writes_nothing_and_says_which_side_to_fix(self, agent, plex_config):
-        publisher = _publisher_through(ClientSession(agent))
-        publisher._db = RemotePlexDb("http://plex-host.lan:9494", "not-the-key", session=ClientSession(agent))
+        publisher = _publisher_through(FlaskSession(agent))
+        publisher._db = RemotePlexDb("http://plex-host.lan:9494", "not-the-key", session=FlaskSession(agent))
         with pytest.raises(PublishError) as ei:
             publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
         assert "refused this app's key" in str(ei.value)
         assert _served(plex_config) == []
 
     def test_an_item_missing_from_plex_is_reported_through_the_agent(self, agent):
-        publisher = _publisher_through(ClientSession(agent))
+        publisher = _publisher_through(FlaskSession(agent))
         assert publisher.item_missing("7") is False
         assert publisher.item_missing("999") is True
 
@@ -542,7 +509,7 @@ class TestTheImageStaysInStepWithTheApp:
         installs = [line for line in instructions if "pip wheel" in line and "-r " in line]
         assert len(installs) == 1, f"expected exactly one dependency install, found {installs}"
         assert "--require-hashes" in installs[0] and "requirements.lock.txt" in installs[0]
-        assert any("COPY plex-marker-agent/requirements.lock.txt" in line for line in instructions)
+        assert any("COPY nodes/plex-db/requirements.lock.txt" in line for line in instructions)
 
         bases = [line for line in instructions if line.startswith("FROM ")]
         assert bases, "the image must declare a base"
@@ -556,8 +523,8 @@ class TestTheImageStaysInStepWithTheApp:
             assert "--hash=sha256:" in entry, f"{name} is pinned without a hash; --require-hashes will refuse the file"
 
     def test_the_version_the_agent_reports_is_one_this_app_accepts(self):
-        assert not plex_remote.agent_too_old(plex_marker_agent.AGENT_VERSION)
-        assert plex_remote.AGENT_PROTOCOL in plex_marker_agent.PROTOCOLS
+        assert not plex_remote.agent_too_old(plex_db_role.AGENT_VERSION)
+        assert plex_remote.AGENT_PROTOCOL in plex_db_role.PROTOCOLS
 
     @pytest.mark.parametrize("document", ["docker-compose.yml", "README.md"])
     def test_the_image_tag_people_are_told_to_pull_is_the_version_the_agent_reports(self, document):
@@ -567,7 +534,7 @@ class TestTheImageStaysInStepWithTheApp:
         text = (AGENT_DIR / document).read_text()
         tags = set(re.findall(r"ghcr\.io/[\w.-]+/plex-marker-agent:(\S+)", text))
         assert tags, f"{document} should name the image tag the user is told to pull"
-        assert tags == {plex_marker_agent.AGENT_VERSION}
+        assert tags == {plex_db_role.AGENT_VERSION}
 
 
 class TestWhichPlexTheAgentServes:
@@ -589,15 +556,67 @@ class TestWhichPlexTheAgentServes:
 
     def test_the_app_writes_through_an_agent_beside_the_right_plex(self, agent, plex_config):
         self._preferences(plex_config, "plex-aaa")
-        publisher = _publisher_through(ClientSession(agent), identity="plex-aaa")
+        publisher = _publisher_through(FlaskSession(agent), identity="plex-aaa")
         publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
         assert _served(plex_config) == [("intro", 11_000, 37_000)]
 
     def test_the_app_refuses_an_agent_beside_another_plex_before_it_writes(self, agent, plex_config):
         self._preferences(plex_config, "plex-bbb")
-        publisher = _publisher_through(ClientSession(agent), identity="plex-aaa")
+        publisher = _publisher_through(FlaskSession(agent), identity="plex-aaa")
         with pytest.raises(PublishError) as ei:
             publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
         assert "different Plex server" in str(ei.value)
         assert _served(plex_config) == []
         assert publisher.capability().state is Capability.AGENT_UNAVAILABLE
+
+
+class TestTheAgentBlock:
+    """What old apps read off every answer and off ``/v1/health``: the version, the protocols, the capabilities."""
+
+    def test_it_names_the_version_the_protocol_and_every_optional_capability(self):
+        assert plex_db_role.agent_block() == {
+            "version": plex_db_role.AGENT_VERSION,
+            "protocols": [1],
+            "capabilities": ["chapters_v1", "loudness_v1", "library_health_v1"],
+        }
+
+    def test_the_capabilities_are_the_names_the_app_asks_for(self):
+        from media_preview_generator.library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY
+        from media_preview_generator.loudness.plex_db import LOUDNESS_CAPABILITY
+        from media_preview_generator.markers.publishers.plex_chapters import CHAPTER_CAPABILITY
+
+        capabilities = plex_db_role.agent_block()["capabilities"]
+        assert {CHAPTER_CAPABILITY, LOUDNESS_CAPABILITY, LIBRARY_HEALTH_CAPABILITY} == set(capabilities)
+
+    def test_a_caller_changing_its_copy_changes_nothing_here(self):
+        block = plex_db_role.agent_block()
+        block["capabilities"].append("anything")
+        block["protocols"].append(2)
+        assert plex_db_role.agent_block()["capabilities"] == plex_db_role.CAPABILITIES
+        assert plex_db_role.agent_block()["protocols"] == [1]
+
+    def test_the_version_is_the_one_the_apps_update_messages_name(self):
+        from media_preview_generator.library_health.plex import LIBRARY_HEALTH_AGENT_VERSION
+        from media_preview_generator.loudness.guard import LOUDNESS_AGENT_VERSION
+
+        # The app names these versions in "update the helper" messages; a build that ships the capabilities under
+        # another number would send people to the wrong image.
+        assert plex_db_role.AGENT_VERSION == LOUDNESS_AGENT_VERSION == LIBRARY_HEALTH_AGENT_VERSION
+
+
+class TestTheInfoBlock:
+    def test_it_names_the_folder_whether_the_database_is_there_and_which_plex(self, plex_config):
+        (plex_config / "Preferences.xml").write_text('<Preferences ProcessedMachineIdentifier="plex-aaa"/>')
+        node_app(str(plex_config))
+        assert plex_db_role.info_block() == {
+            "config_dir": str(plex_config),
+            "db_present": True,
+            "machine_identifier": "plex-aaa",
+        }
+
+    def test_a_folder_without_a_database_says_so(self, tmp_path):
+        assert plex_db_role.info_block(str(tmp_path)) == {
+            "config_dir": str(tmp_path),
+            "db_present": False,
+            "machine_identifier": "",
+        }
