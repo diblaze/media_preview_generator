@@ -107,6 +107,46 @@ class TestGpuKeepsFailingNotification:
         _flag()
         assert [n["id"] for n in build_active_notifications()] == [notification_id(KEY)]
 
+    def test_a_node_gpu_card_names_the_node_and_links_to_it_not_this_apps_gpu_settings(self, monkeypatch):
+        from media_preview_generator.nodes import registry as reg
+
+        class _Registry:
+            def view(self, node_id):
+                assert node_id == "n1"
+                return reg.NodeView("n1", "Storage <box>", "http://n", True, reg.STATE_READY, "", "1", ("worker",),
+                                    (), 4, False, None)  # fmt: skip
+
+        monkeypatch.setattr(reg, "_registry", _Registry())
+        key = f"node:n1:{KEY}"
+        _flag(key, name="Storage <box> Intel Arc A380")
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert card["id"] == notification_id(key) and card["device"] == key
+        assert card["body_html"] == (
+            "<p class='mb-0'>Storage &lt;box&gt; Intel Arc A380 couldn't process the last 5 files, so they ran on the "
+            "CPU (slower). Last reason: hevc not supported. Check the GPU driver on Storage &lt;box&gt;, then Rescan "
+            "GPUs on its Nodes page.</p>"
+        )
+        assert "Settings → GPU" not in card["body_html"]
+        assert card["action"] == {"href": "/nodes#node-n1", "label": "Open node"}
+
+    def test_a_node_gpu_card_still_shows_when_the_node_is_gone(self, monkeypatch):
+        from media_preview_generator.nodes import registry as reg
+
+        class _Registry:
+            def view(self, node_id):
+                return None
+
+        monkeypatch.setattr(reg, "_registry", _Registry())
+        _flag(f"node:n1:{KEY}", name="NAS Intel Arc A380")
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert "Check the GPU driver on the node, then Rescan GPUs on its Nodes page." in card["body_html"]
+        assert card["action"] == {"href": "/nodes#node-n1", "label": "Open node"}
+
+    def test_a_local_gpu_card_has_no_node_link(self):
+        _flag()
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert "action" not in card
+
     def test_session_only_dismissal_covers_gpu_cards_and_the_media_mount_card(self):
         assert is_session_only_dismissal(notification_id(KEY)) is True
         assert is_session_only_dismissal(notif_mod.MEDIA_MOUNT_UNHEALTHY_ID) is True

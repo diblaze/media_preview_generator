@@ -390,24 +390,50 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
         # them; a streak whose last file fell back for another reason (a preview decode) still gets this card.
         if state.key in credits_keys and (state.last_reason or "").startswith(CREDITS_ON_CPU_PREFIX):
             continue
+        node_id = _gpu_streak_node_id(state.key)
+        if node_id is None:
+            todo = "Check the GPU driver in Settings → GPU."
+        else:
+            todo = f"Check the GPU driver on {_node_name(node_id)}, then Rescan GPUs on its Nodes page."
         body = (
             f"<p class='mb-0'>{escape(state.name)} couldn't process the last {GPU_FALLBACK_STREAK} files, so they "
             f"ran on the CPU (slower). Last reason: {escape(state.last_reason or 'GPU processing failed')}. "
-            "Check the GPU driver in Settings → GPU.</p>"
+            f"{escape(todo)}</p>"
         )
-        cards.append(
-            {
-                "id": notification_id(state.key),
-                "severity": "warning",
-                "title": "GPU keeps failing: files are running on the CPU",
-                "body_html": body,
-                "dismissable": True,
-                "permanent_dismissable": False,
-                "source": "gpu_fallback_streak",
-                "device": state.key,
-            }
-        )
+        card = {
+            "id": notification_id(state.key),
+            "severity": "warning",
+            "title": "GPU keeps failing: files are running on the CPU",
+            "body_html": body,
+            "dismissable": True,
+            "permanent_dismissable": False,
+            "source": "gpu_fallback_streak",
+            "device": state.key,
+        }
+        if node_id is not None:
+            card["action"] = {"href": f"/nodes#node-{node_id}", "label": "Open node"}
+        cards.append(card)
     return cards
+
+
+def _gpu_streak_node_id(key: str) -> str | None:
+    """The node a GPU streak key (``node:<id>:<device>``, from a node worker) belongs to; None for this app's GPU."""
+    if not key.startswith("node:"):
+        return None
+    node_id = key.split(":", 2)[1]
+    return node_id or None
+
+
+def _node_name(node_id: str) -> str:
+    """The node's name for a card, or "the node" once it is gone."""
+    from ..nodes.registry import get_registry
+
+    try:
+        view = get_registry().view(node_id)
+    except Exception as exc:
+        logger.debug("node name for a GPU card unavailable: {}", exc)
+        view = None
+    return view.name if view is not None and view.name else "the node"
 
 
 def _not_showing_by_plex_server() -> dict[str, int]:
