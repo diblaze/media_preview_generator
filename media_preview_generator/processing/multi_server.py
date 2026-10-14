@@ -46,6 +46,7 @@ from ..config.paths import expand_path_mapping_candidates
 from ..markers.external_ids import ids_from_path, is_extra
 from ..markers.fs import gone_from_disk
 from ..markers.missing import disk_roots, library_folders
+from ..nodes import executor, remote_ops
 from ..output import BifBundle, EmbyBifAdapter, JellyfinTrickplayAdapter, PlexBundleAdapter
 from ..output.base import OutputAdapter
 from ..output.journal import (
@@ -2124,8 +2125,10 @@ def _process_canonical_path_previews(
                 gpu_device_path or "-",
                 tmp_path,
             )
+            # A remote worker's frames come from its node; everything around them stays here.
+            extract = remote_ops.generate_images if executor.current_placement() else generate_images
             try:
-                gen_result = generate_images(
+                gen_result = extract(
                     canonical_path,
                     tmp_path,
                     gpu,
@@ -2148,6 +2151,8 @@ def _process_canonical_path_previews(
                 # worker's CancellationError handler records it cleanly.
                 logger.info("Frame extraction cancelled for {} — stopping this file.", canonical_path)
                 raise
+            except (executor.NodeUnavailableError, executor.FileNotVisibleError):
+                raise  # not this file's failure: the worker gives it back to the queue
             except Exception as exc:
                 if not os.path.isfile(canonical_path):
                     # It passed the up-front check and went away since (an upgrade replacing it mid-run).

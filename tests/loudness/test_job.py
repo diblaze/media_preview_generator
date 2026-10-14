@@ -801,3 +801,91 @@ def test_worker_stops_after_a_retryable_write_error_without_analysing_the_next_g
     assert outcome.outcome_key == job.WAITING
     assert str(error) in outcome.message
     assert not job.read_streams(db, [FILE], deadline=1e12)[0][0].item_marked
+
+
+def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import protocol, remote_ops
+    from media_preview_generator.nodes.executor import Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append((op, app_path, params, kwargs["gpu"]))
+        return {"results": [{"index": index, "fields": FIELDS} for index, _codec, _ms in params["tracks"]]}
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with (
+        patch.object(job.analyze, "run_many") as run_many,
+        patch.object(job.analyze, "run") as run,
+        placed_on(Placement("n1", "NAS")),
+    ):
+        outcome = job.process_item(_item(media), ctx=ctx, gpu="intel")
+    run_many.assert_not_called()
+    run.assert_not_called()
+    assert calls == [
+        (
+            protocol.OP_LOUDNESS_ANALYZE,
+            media,
+            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True},
+            None,
+        )
+    ]
+    assert outcome.outcome_key == job.WRITTEN
+    assert all(json.loads(v)["ln:loudness"] == FIELDS["ln:loudness"] for v in _streams(db).values())
+
+
+def test_a_streams_own_error_in_a_node_batch_is_kept_as_locally(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append(params)
+        return {
+            "results": [{"index": 1, "fields": FIELDS}, {"index": 2, "error_type": "LoudnessError", "message": "x"}]
+        }
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with placed_on(Placement("n1", "NAS")):
+        outcome = job.process_item(_item(media), ctx=ctx)
+    # A single-track run would fail the same way, so stream 2 isn't run again.
+    assert [p["batch"] for p in calls] == [True]
+    assert outcome.outcome_key == job.FAILED and "stream 2 (aac): x" in outcome.message
+
+
+def test_a_failed_node_batch_is_retried_one_track_at_a_time_on_the_node(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import NodeTaskError, Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append(params)
+        if params["batch"]:
+            raise NodeTaskError("failed", "reports can't be attributed", error_type="LoudnessError")
+        return {"fields": FIELDS}
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with placed_on(Placement("n1", "NAS")):
+        outcome = job.process_item(_item(media), ctx=ctx)
+    assert [(p["batch"], p["tracks"]) for p in calls] == [
+        (True, [[1, "aac", 424000], [2, "aac", 424000]]),
+        (False, [[1, "aac", 424000]]),
+        (False, [[2, "aac", 424000]]),
+    ]
+    assert outcome.outcome_key == job.WRITTEN
+
+
+def test_a_node_drop_leaves_the_file_unwritten_for_the_worker_to_give_back(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import NodeUnavailableError, Placement, placed_on
+
+    def run_on_node(op, app_path, params, **kwargs):
+        raise NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    before = _streams(db)
+    with placed_on(Placement("n1", "NAS")), pytest.raises(NodeUnavailableError):
+        job.process_item(_item(media), ctx=ctx)
+    assert _streams(db) == before

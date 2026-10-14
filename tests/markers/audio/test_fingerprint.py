@@ -673,6 +673,36 @@ def test_ensure_computes_once_then_reads_the_cache(store, tmp_path):
     assert (stored.start_s, stored.length_s, stored.algorithm) == (0.0, 105.0, 1)
 
 
+def test_a_remote_worker_fingerprints_on_its_node_and_the_cache_and_store_stay_here(store, tmp_path, monkeypatch):
+    from media_preview_generator.nodes import protocol, remote_ops
+    from media_preview_generator.nodes.executor import Placement, placed_on
+
+    rec = _record(store, tmp_path)
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append((op, app_path, params, kwargs["gpu"]))
+        return {"points": protocol.encode_array(np.array([5, 6], dtype="<u4"), "uint32")}
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with patch.object(fpmod, "compute_fingerprint") as local, placed_on(Placement("n1", "NAS")):
+        first = fpmod.ensure_fingerprint(store, rec, ffmpeg="ffmpeg")
+        second = fpmod.ensure_fingerprint(store, rec, ffmpeg="ffmpeg")
+    local.assert_not_called()
+    assert first.tolist() == second.tolist() == [5, 6]
+    assert first.dtype == np.dtype("<u4")
+    # Once: the second answer is the cached one, read here.
+    assert calls == [
+        (
+            protocol.OP_INTRO_FINGERPRINT,
+            rec.canonical_path,
+            {"duration_ms": 300_000, "retime": None, "progress": False},
+            None,
+        )
+    ]
+    assert store.get_fingerprint(rec.id, "intro") is not None
+
+
 def test_a_retimed_fingerprint_is_computed_and_cached_beside_the_files_own(store, tmp_path):
     rec = _record(store, tmp_path)
     retime = 24000 / 1001 / 25

@@ -884,6 +884,8 @@ def detect_credits_text(
             of a tail without an answer) is not one: that stores the 320x180 answer or "nothing found". Nor is a card
             at the start that can't be read (the same failures): that stores the start the roll gave.
     """
+    from ...nodes import remote_ops
+    from ...nodes.executor import current_placement
     from ...processing.generator import CodecNotSupportedError
     from ..pipeline import DetectorAnswer, DetectorUnavailableError
 
@@ -896,17 +898,33 @@ def detect_credits_text(
     ffmpeg = getattr(ctx.config, "ffmpeg_path", None) or "ffmpeg"
 
     def read(device: str | None, device_path: str | None, threads: int | None) -> CreditsTextResult:
+        common: dict[str, Any] = {
+            "duration_ms": cast(int, rec.duration_ms),
+            "is_episode": rec.season_key is not None,
+            "tail_s": _tail_s(rec, ctx),
+            "ffmpeg": ffmpeg,
+            "gpu": device,
+            "gpu_device_path": device_path,
+            "cancel_check": cancel_check,
+            "phase": phase_callback,
+            "earliest_start_s": _earliest_start_s(rec, ctx),
+            "pause_check": pause_check,
+            "ffmpeg_threads": threads,
+            "progress_callback": progress_callback,
+        }
+        text_worker = gpu_worker or gpu is not None
+        if current_placement() is not None:
+            # A remote worker reads on its node, with the node's own text detection; its CPU notes come back here.
+            return remote_ops.find_credits(
+                rec.canonical_path, gpu_worker=text_worker, on_cpu=fallback_callback, **common
+            )
         return find_credits(
             rec.canonical_path,
-            duration_ms=cast(int, rec.duration_ms),
-            is_episode=rec.season_key is not None,
-            tail_s=_tail_s(rec, ctx),
-            ffmpeg=ffmpeg,
             detect_boxes=lambda planes: pool.detect_boxes(
                 planes,
                 gpu=device,
                 gpu_device_path=device_path,
-                gpu_worker=gpu_worker or gpu is not None,
+                gpu_worker=text_worker,
                 on_cpu=fallback_callback,
                 cancel_check=cancel_check,
             ),
@@ -914,18 +932,11 @@ def detect_credits_text(
                 planes,
                 gpu=device,
                 gpu_device_path=device_path,
-                gpu_worker=gpu_worker or gpu is not None,
+                gpu_worker=text_worker,
                 on_cpu=fallback_callback,
                 cancel_check=cancel_check,
             ),
-            gpu=device,
-            gpu_device_path=device_path,
-            cancel_check=cancel_check,
-            phase=phase_callback,
-            earliest_start_s=_earliest_start_s(rec, ctx),
-            pause_check=pause_check,
-            ffmpeg_threads=threads,
-            progress_callback=progress_callback,
+            **common,
         )
 
     try:

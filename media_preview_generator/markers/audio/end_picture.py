@@ -423,8 +423,12 @@ class Reader:
         start_s, length_s = window(times, shift_s)
         key = (path, start_s, length_s)
         if key not in self._frames:
+            from ...nodes import remote_ops
+            from ...nodes.executor import current_placement
+
+            decode = remote_ops.decode_frames if current_placement() else decode_frames
             try:
-                self._frames[key] = decode_frames(
+                self._frames[key] = decode(
                     path,
                     start_s,
                     length_s,

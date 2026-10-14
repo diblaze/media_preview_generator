@@ -193,6 +193,41 @@ class TestReader:
         reader = ep.Reader(ffmpeg="/usr/bin/ffmpeg", gpu="NVIDIA", gpu_device_path="cuda:0", **kwargs)
         return reader, patch.multiple(ep, stream_starts=starts, decode_frames=decoder)
 
+    def test_a_remote_worker_decodes_on_its_node_with_the_same_window_and_device(self, monkeypatch):
+        from media_preview_generator.nodes import protocol, remote_ops
+        from media_preview_generator.nodes.executor import Placement, placed_on
+
+        frame = np.linspace(0, 255, ep.FRAME_W * ep.FRAME_H, dtype=np.float32).reshape(ep.FRAME_H, ep.FRAME_W)
+        calls = []
+
+        def run_on_node(op, app_path, params, **kwargs):
+            calls.append((op, app_path, params, kwargs["gpu"]))
+            return {"frames": [{"t": 33.0, "frame": protocol.encode_array(frame, "float32")}]}
+
+        monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+        reader = ep.Reader(ffmpeg="/usr/bin/ffmpeg", gpu="NVIDIA", gpu_device_path="cuda:0", ffmpeg_threads=3)
+        times = [33.5, 34.0]
+        with patch.object(ep, "decode_frames") as local, placed_on(Placement("n1", "NAS")):
+            got = reader._decoded("a.mkv", StreamStarts(1.5, 0.0, True, "yuv420p10le"), times, 0.25)
+        local.assert_not_called()
+        assert len(got) == 1 and got[0][0] == 33.0 and np.array_equal(got[0][1], frame)
+        start_s, length_s = ep.window(times, 0.25)
+        assert calls == [
+            (
+                protocol.OP_INTRO_END_PICTURE,
+                "a.mkv",
+                {
+                    "start_s": start_s,
+                    "length_s": length_s,
+                    "container_start_s": 1.5,
+                    "download_format": frames.DOWNLOAD_FORMATS.get("yuv420p10le"),
+                    "ffmpeg_threads": 3,
+                    "progress": False,
+                },
+                ("NVIDIA", "cuda:0"),
+            )
+        ]
+
     def test_the_audio_offsets_move_each_files_window_and_the_pairs_line_up(self):
         # "a" is an HBO Max release (audio 0.976 s in), "b" isn't: their title cards line up in file time only once
         # each fingerprint time is moved to its file's audio start.
