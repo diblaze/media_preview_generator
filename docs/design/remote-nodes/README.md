@@ -128,9 +128,10 @@ retry runs (on the **node's** CPU, see §6).
 
 ## 4. Settings
 
-* New top-level `nodes`: `[{"id", "name", "url", "key", "enabled", "path_mappings": [{"app_prefix",
-  "node_prefix"}], "added_at"}]`. `id` is the id the node reports; a different id answering at the same address is
-  refused ("a different node answered").
+* New top-level `nodes`: `[{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings": [{"app_prefix",
+  "node_prefix"}], "added_at"}]`. `id` is assigned by the app (stable; members and Plex servers reference it).
+  `node_uid` is the id the node reports, recorded on first contact; a different `node_uid` answering at the same
+  address is refused ("a different node answered at this address"). A legacy helper has no `node_uid`.
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.
 * Plex servers: `markers.plex.agent` gains `"node_id"`. Migration v24 turns every enabled helper (`url` + `token`)
@@ -208,8 +209,8 @@ Lanes build in parallel against these signatures. Change one only by updating th
 ### 10.1 Node server (Lane A) ⇄ ops (Lane C) ⇄ Plex database role (Lane D)
 
 ```python
-# nodes/server/tasks.py (Lane A)
-class TaskContext:                      # one per task, handed to the op
+# nodes/protocol.py (foundation; both sides import these)
+class TaskContext(Protocol):             # one per task, handed to the op; Lane A's task table implements it
     gpu: tuple[str, str] | None         # (type, device) on THIS node, or None for CPU
     temp_dir: str                       # private, removed with the task
     def cancel_check(self) -> bool: ...
@@ -232,11 +233,16 @@ OPS: dict[str, OpFn]                     # keys = protocol.OPS; CodecNotSupporte
 
 # nodes/server/plex_db.py (Lane D)
 AGENT_VERSION: str
+def agent_block() -> dict                # the agent's {"version", "protocols", "capabilities"}; /v1/health carries it
 def register_plex_db(app: Flask, *, plex_config_dir: str, key: str, mountinfo_path: str = "/proc/self/mountinfo") -> None
 # Adds today's agent routes (/v1/ping, /v1/checks/*, /v1/chapters/*, /v1/item/*, /v1/items/shown, + new loudness and
 # library-health routes) with the agent's own protocol header check. /v1/health is Lane A's and also carries the
 # agent block when this role is on, so old apps keep reading it.
 ```
+
+Import discipline: `nodes/server/app.py` imports only Flask, loguru, `nodes.protocol` and its own small modules at
+module scope. Worker-role modules (GPU detection, FFmpeg, numpy, ops) are imported only when the worker role is on,
+so the slim Plex database builds (Linux image without the app's dependencies, Windows exe) can run `create_node_app`.
 
 Env: `MODE=node` (wrapper.sh), `NODE_PORT` (default 9494), `NODE_ROLES`, `NODE_NAME` (default hostname),
 `NODE_KEY` (else `AGENT_TOKEN`, else generated once into `<CONFIG_DIR>/node.json`), `PLEX_CONFIG_DIR` (plex_db).

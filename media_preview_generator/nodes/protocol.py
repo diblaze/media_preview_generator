@@ -11,8 +11,9 @@ helpers already deployed keep working; the constants below cover the node routes
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import numpy as np
@@ -75,6 +76,39 @@ OPS = (OP_PREVIEW_FRAMES, OP_LOUDNESS_ANALYZE, OP_INTRO_FINGERPRINT, OP_INTRO_EN
 TASK_UNPOLLED_EXPIRY_S = 60.0
 # A finished task's artifact is kept this long after its last poll unless the app deletes it first.
 TASK_FINISHED_KEEP_S = 600.0
+
+
+class TaskContext(Protocol):
+    """What a node hands each op (spec §10.1). The node server's task table implements it."""
+
+    gpu: tuple[str, str] | None
+    temp_dir: str
+
+    def cancel_check(self) -> bool: ...
+
+    def pause_check(self) -> bool: ...
+
+    def progress(self, percent: float, **extra: object) -> None: ...
+
+    def log(self, level: str, message: str) -> None: ...
+
+    def set_artifact(self, path: str) -> None: ...
+
+
+OpFn = Callable[[TaskContext, str, dict], dict]
+
+
+class OpError(Exception):
+    """Raised by an op to finish its task with a specific error kind (``KIND_*``) and extra JSON-safe fields."""
+
+    def __init__(self, kind: str, message: str, **extra: object) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.extra = extra
+
+    def to_json(self) -> dict[str, Any]:
+        return {"kind": self.kind, "message": self.message, **self.extra}
 
 
 @dataclass(frozen=True)
