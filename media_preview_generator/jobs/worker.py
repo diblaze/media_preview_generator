@@ -29,7 +29,13 @@ from ..processing.generator import (
 )
 from ..utils import format_display_title, redact_secrets, redacted_traceback
 from .gpu_fallback import get_gpu_fallback_tracker
-from .node_members import EMPTY_NODE_HARDWARE, NODE_GPU_FFMPEG_THREADS, NodeHardware, NodeMemberHardware
+from .node_members import (
+    EMPTY_NODE_HARDWARE,
+    NODE_GPU_FFMPEG_THREADS,
+    NodeHardware,
+    NodeMemberHardware,
+    ready_seen_at,
+)
 from .worker_naming import friendly_device_label
 
 # Map thread_id -> job_id. Each job's log handler filters on its own id, so concurrent jobs
@@ -1089,6 +1095,11 @@ def _new_worker(worker_id: int, worker_type: str, *, node_id: str | None, node_n
     return worker
 
 
+# A node that just dropped a file gets no new file until the registry's next check of it comes back ready, or this
+# long at most (a node that stays down loses its workers once the registry marks it offline).
+SUSPECT_NODE_S = 60.0
+
+
 class WorkerPool:
     """Manages a pool of workers for processing media items."""
 
@@ -1129,6 +1140,8 @@ class WorkerPool:
         # The node registry as read at the last reconcile; capacity and snapshots use it until the next one.
         self._node_hardware: NodeHardware = EMPTY_NODE_HARDWARE
         self._node_revision: int | None = None
+        # Node id -> (monotonic time it stops being suspect, the registry's ready ``last_seen`` when it was marked).
+        self._suspect_nodes: dict[str, tuple[float, float | None]] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
 
@@ -1769,6 +1782,47 @@ class WorkerPool:
             logger.info("Kept {} busy CPU worker(s) that were due to retire", cancelled)
         return {"added": added, "removed": removed, "deferred": deferred, "retiring": retiring}
 
+    def mark_node_suspect(self, node_id: str) -> None:
+        """Hold new files back from a node that just dropped one, until it checks ready again (spec §6).
+
+        Without this the file it gave back goes straight to another worker on the same dead node (GPU workers are
+        picked first), and so does every other queued file, each one failing there within milliseconds.
+
+        Args:
+            node_id: The node.
+        """
+        seen = ready_seen_at(node_id)  # Read before the pool lock: the registry has its own.
+        with self._workers_lock:
+            self._suspect_nodes[node_id] = (time.monotonic() + SUSPECT_NODE_S, seen)
+
+    def refresh_suspect_nodes(self) -> None:
+        """Clear each suspect node the registry has heard from since (and calls ready), or whose hold ran out.
+
+        Call without the pool lock held; the dispatch loop calls it once per assignment pass.
+        """
+        with self._workers_lock:
+            if not self._suspect_nodes:
+                return
+            suspects = dict(self._suspect_nodes)
+        now = time.monotonic()
+        cleared = []
+        for node_id, (until, seen) in suspects.items():
+            ready_at = None if now >= until else ready_seen_at(node_id)
+            if now >= until or (ready_at is not None and (seen is None or ready_at > seen)):
+                cleared.append(node_id)
+        with self._workers_lock:
+            for node_id in cleared:
+                # A drop marked meanwhile starts a new hold.
+                if self._suspect_nodes.get(node_id) == suspects[node_id]:
+                    del self._suspect_nodes[node_id]
+
+    def _is_suspect(self, node_id: str | None, now: float) -> bool:
+        """Whether ``node_id``'s new files are held back. Caller holds ``_workers_lock``."""
+        if node_id is None:
+            return False
+        hold = self._suspect_nodes.get(node_id)
+        return hold is not None and now < hold[0]
+
     def _find_available_worker(
         self,
         cpu_only: bool = False,
@@ -1789,17 +1843,20 @@ class WorkerPool:
                 ``worker.is_busy = False`` if it backs out.
             kind: The job kind the worker must run.
             exclude_nodes: Node ids whose workers are skipped (nodes that couldn't see the item's file). This app's
-                own workers have no node and are never skipped.
+                own workers have no node and are never skipped. Workers on a node that just dropped a file
+                (:meth:`mark_node_suspect`) are skipped too.
 
         Returns:
             An available worker matching criteria, GPU workers before CPU workers, or None
         """
+        now = time.monotonic()
         with self._workers_lock:
             # Group order isn't a priority (an upgrade from v4 lists the CPU group first), so an idle GPU always wins.
             for worker in sorted(self.workers, key=lambda w: w.worker_type != "GPU"):
                 if cpu_only and worker.worker_type != "CPU":
                     continue
-                if getattr(worker, "node_id", None) is not None and worker.node_id in exclude_nodes:
+                node_id = getattr(worker, "node_id", None)
+                if node_id is not None and (node_id in exclude_nodes or self._is_suspect(node_id, now)):
                     continue
                 if worker.is_available() and self._worker_supports_kind(worker, kind):
                     if claim:

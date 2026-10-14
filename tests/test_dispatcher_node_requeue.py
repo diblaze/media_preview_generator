@@ -2,19 +2,46 @@
 
 from __future__ import annotations
 
+import itertools
 import threading
+import time
 from collections import deque
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
+from media_preview_generator.jobs import dispatcher as dispatcher_mod
 from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes.executor import FileNotVisibleError, NodeUnavailableError, current_placement
+from media_preview_generator.nodes.registry import STATE_OFFLINE, STATE_READY, NodeRegistry, NodeView, set_registry
 from media_preview_generator.processing.types import ProcessableItem
 
 KEYS = ("markers_published", "failed")
+
+
+class _Registry(NodeRegistry):
+    """Node views for the pool's suspect-node hold. ``fresh`` nodes answer every re-check at once (ready, just seen);
+    the others keep their last view until :meth:`back` (or :meth:`down`)."""
+
+    def __init__(self, *, fresh: bool = True) -> None:
+        self.fresh = fresh
+        self.states: dict[str, tuple[str, float]] = {}
+        self._clock = itertools.count(1)
+
+    def view(self, node_id: str) -> NodeView | None:
+        if self.fresh:
+            state, seen = STATE_READY, float(next(self._clock))
+        else:
+            state, seen = self.states.get(node_id, (STATE_READY, 0.0))
+        return NodeView(node_id, node_id.upper(), "http://n", True, state, "", "1", ("worker",), (), 4, False, seen)
+
+    def down(self, node_id: str) -> None:
+        self.states[node_id] = (STATE_OFFLINE, self.states.get(node_id, (STATE_READY, 0.0))[1])
+
+    def back(self, node_id: str) -> None:
+        self.states[node_id] = (STATE_READY, float(next(self._clock)))
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +49,14 @@ def _reset():
     reset_dispatcher()
     yield
     reset_dispatcher()
+    set_registry(None)
+
+
+@pytest.fixture(autouse=True)
+def registry():
+    fake = _Registry()
+    set_registry(fake)
+    return fake
 
 
 def _config():
@@ -38,11 +73,15 @@ def _items(*paths):
     return [ProcessableItem(canonical_path=p, server_id="s1", title=p) for p in paths]
 
 
-def _pool(*nodes: tuple[str | None, str]) -> WorkerPool:
-    """A pool of CPU workers, one per ``(node_id, node_name)``; a None id is this app's own worker."""
+def _pool(*nodes: tuple[str | None, str], gpu_on: frozenset[str] = frozenset()) -> WorkerPool:
+    """A pool of CPU workers, one per ``(node_id, node_name)``; a None id is this app's own worker. Workers on a node in
+    ``gpu_on`` are GPU workers (the pool picks those first)."""
     pool = WorkerPool(cpu_workers=0, gpu_workers=0, selected_gpus=[])
     for index, (node_id, node_name) in enumerate(nodes):
-        worker = Worker(index, "CPU", node_id=node_id, node_name=node_name)
+        if node_id in gpu_on:
+            worker = Worker(index, "GPU", "NVIDIA", "cuda:0", 0, "RTX", node_id=node_id, node_name=node_name)
+        else:
+            worker = Worker(index, "CPU", node_id=node_id, node_name=node_name)
         worker.display_name = f"CPU Worker {index + 1}"
         worker._done_event = pool._worker_done_event
         pool.workers.append(worker)
@@ -62,7 +101,7 @@ def _run(pool: WorkerPool, process, *paths: str):
             tracker = dispatcher.submit_items(
                 "j1", _items(*paths), _config(), MagicMock(), kind="intro_credits", handlers=handlers
             )
-            assert tracker.wait(timeout=10)
+            assert tracker.wait(timeout=15)
     finally:
         dispatcher.shutdown()
     return tracker, dispatcher_rows.call_args_list + worker_rows.call_args_list
@@ -74,7 +113,7 @@ def _node() -> str | None:
 
 
 class TestNodeDrops:
-    def test_a_file_whose_node_drops_once_runs_again_and_counts_once(self):
+    def test_a_file_whose_only_node_drops_once_runs_there_again_once_it_checks_ready_and_counts_once(self):
         calls = []
         lock = threading.Lock()
 
@@ -92,7 +131,60 @@ class TestNodeDrops:
         assert [r.args[0] for r in rows] == ["/m/a.mkv"]
         assert tracker.active_processing == 0
 
-    def test_a_second_drop_fails_the_file_once(self):
+    @pytest.mark.parametrize("node_back", [False, True], ids=["node-still-down", "node-checked-ready"])
+    def test_a_dropped_file_retries_on_this_apps_worker_not_the_node_gpu_that_dropped_it(self, registry, node_back):
+        registry.fresh = node_back  # back: the hold clears at once, so only the file's own preference keeps it away
+        calls = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            with lock:
+                calls.append(_node())
+                if len(calls) == 1:
+                    raise NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool(("n1", "NAS"), (None, ""), gpu_on=frozenset({"n1"})), process, "/m/a.mkv")
+        assert calls == ["n1", None]
+        assert (tracker.successful, tracker.failed) == (1, 0)
+        assert [r.args[0] for r in rows] == ["/m/a.mkv"]
+
+    @pytest.mark.parametrize("with_local", [False, True], ids=["node-only", "node-and-this-app"])
+    def test_a_node_restart_during_a_queue_fails_no_file(self, registry, with_local):
+        registry.fresh = False
+        paths = [f"/m/{n}.mkv" for n in range(8)]
+        state = {"down": True, "refused": 0}
+        done: list[tuple[str, str | None]] = []
+        lock = threading.Lock()
+
+        def bring_back():
+            time.sleep(0.3)
+            with lock:
+                state["down"] = False
+            registry.back("n1")
+
+        def process(item, **_kwargs):
+            node = _node()
+            with lock:
+                if node == "n1" and state["down"]:
+                    state["refused"] += 1
+                    if state["refused"] == 1:
+                        registry.down("n1")
+                        threading.Thread(target=bring_back, daemon=True).start()
+                    raise NodeUnavailableError("n1", "NAS", "NAS couldn't start the task", started=False)
+                done.append((item.canonical_path, node))
+            return ItemOutcome("markers_published", "ok")
+
+        nodes = [("n1", "NAS"), ("n1", "NAS")] + ([(None, "")] if with_local else [])
+        tracker, rows = _run(_pool(*nodes, gpu_on=frozenset({"n1"})), process, *paths)
+        assert (tracker.successful, tracker.failed) == (8, 0)
+        assert sorted(path for path, _ in done) == paths
+        assert all(r.args[1].value != "failed" for r in rows)
+        # The node is held back after its first refusal: only the files already handed to its two workers hit it.
+        assert 1 <= state["refused"] <= 2
+        assert tracker.active_processing == 0
+
+    def test_a_second_genuine_drop_fails_the_file_once(self):
         calls = []
 
         def process(item, **_kwargs):
@@ -106,6 +198,22 @@ class TestNodeDrops:
         (row,) = rows
         assert row.args[0] == "/m/a.mkv" and row.args[1].value == "failed"
         assert row.args[2] == "node unavailable twice (NAS)"
+        assert tracker.active_processing == 0
+
+    def test_starts_the_node_never_takes_dont_count_as_drops_but_are_capped(self, monkeypatch):
+        monkeypatch.setattr(dispatcher_mod, "MAX_NODE_START_FAILURES", 3)
+        calls = []
+
+        def process(item, **_kwargs):
+            calls.append(_node())
+            raise NodeUnavailableError("n1", "NAS", "NAS couldn't start the task", started=False)
+
+        tracker, rows = _run(_pool(("n1", "NAS")), process, "/m/a.mkv")
+        assert calls == ["n1", "n1", "n1"]
+        assert (tracker.successful, tracker.failed) == (0, 1)
+        (row,) = rows
+        assert row.args[2] == "the node couldn't start it 3 times (NAS)"
+        assert tracker.node_drops == {}
         assert tracker.active_processing == 0
 
 

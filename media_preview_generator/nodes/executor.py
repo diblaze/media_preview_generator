@@ -39,6 +39,8 @@ CANCEL_WAIT_S = 30.0
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
 
 REQUEUE_NODE_UNAVAILABLE = "node_unavailable"
+# The node never ran the task (it refused the connection or didn't answer the start): no drop counts against the file.
+REQUEUE_NODE_NOT_STARTED = "node_not_started"
 REQUEUE_NOT_VISIBLE = "not_visible"
 
 
@@ -78,12 +80,14 @@ class NodeUnavailableError(Exception):
     Attributes:
         node_id: The node.
         node_name: Its name.
+        started: False when the node never ran the task (it didn't take the start), so the drop doesn't count.
     """
 
-    def __init__(self, node_id: str, node_name: str, message: str) -> None:
+    def __init__(self, node_id: str, node_name: str, message: str, *, started: bool = True) -> None:
         super().__init__(message)
         self.node_id = node_id
         self.node_name = node_name
+        self.started = started
 
 
 class FileNotVisibleError(Exception):
@@ -127,7 +131,7 @@ class NodeTaskCancelledError(NodeTaskError):
 class NodeRequeue(NamedTuple):
     """Why a remote worker gave its file back without an outcome; the dispatcher queues it again or fails it."""
 
-    reason: str  # REQUEUE_NODE_UNAVAILABLE or REQUEUE_NOT_VISIBLE
+    reason: str  # REQUEUE_NODE_UNAVAILABLE, REQUEUE_NODE_NOT_STARTED or REQUEUE_NOT_VISIBLE
     node_id: str
     node_name: str
     message: str
@@ -136,7 +140,8 @@ class NodeRequeue(NamedTuple):
 def requeue_for(exc: BaseException) -> NodeRequeue | None:
     """The requeue a worker records for ``exc``; None for any other exception."""
     if isinstance(exc, NodeUnavailableError):
-        return NodeRequeue(REQUEUE_NODE_UNAVAILABLE, exc.node_id, exc.node_name, str(exc))
+        reason = REQUEUE_NODE_UNAVAILABLE if exc.started else REQUEUE_NODE_NOT_STARTED
+        return NodeRequeue(reason, exc.node_id, exc.node_name, str(exc))
     if isinstance(exc, FileNotVisibleError):
         return NodeRequeue(REQUEUE_NOT_VISIBLE, exc.node_id, exc.node_name, str(exc))
     return None
@@ -227,13 +232,13 @@ class _TaskRun:
         self._paused_at: float | None = None
         self.gone = False
 
-    def _unavailable(self, message: str) -> Exception:
+    def _unavailable(self, message: str, *, started: bool = True) -> Exception:
         self.gone = True
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
         if self._cancel_sent_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
             return NodeTaskCancelledError(protocol.KIND_CANCELLED, message)
-        return NodeUnavailableError(self._placement.node_id, self._placement.node_name, message)
+        return NodeUnavailableError(self._placement.node_id, self._placement.node_name, message, started=started)
 
     def start(self, spec: dict) -> None:
         name = self._placement.node_name
@@ -242,7 +247,7 @@ class _TaskRun:
         except NodeRequestError as exc:
             raise NodeTaskError(protocol.KIND_REQUEST, f"{name} refused the task: {exc}") from exc
         except NodeError as exc:
-            raise self._unavailable(f"{name} couldn't start the task: {exc}") from exc
+            raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
 
     def _cancel_requested(self) -> bool:
         return bool(self._cancel_check and self._cancel_check())
@@ -420,7 +425,7 @@ def run_on_node(
         The op's result.
 
     Raises:
-        NodeUnavailableError: The node didn't start the task, stopped answering, or forgot it.
+        NodeUnavailableError: The node didn't start the task (``started`` False), stopped answering, or forgot it.
         FileNotVisibleError: The node can't see the file as the app sees it.
         CodecNotSupportedError: The node's GPU couldn't run the op (the worker reruns it on the node's CPU).
         NodeTaskCancelledError: The job was cancelled.
@@ -438,7 +443,7 @@ def run_on_node(
         mappings = registry.mappings(placement.node_id)
     except KeyError as exc:
         raise NodeUnavailableError(
-            placement.node_id, placement.node_name, f"{placement.node_name} is no longer configured"
+            placement.node_id, placement.node_name, f"{placement.node_name} is no longer configured", started=False
         ) from exc
     spec = {
         "op": op,

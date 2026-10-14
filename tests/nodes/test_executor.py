@@ -227,12 +227,32 @@ class TestNodeDrops:
         assert registry.reports == [("unavailable", NODE_ID)]
 
     @pytest.mark.parametrize("error", [unreachable(), NodeAuthError("refused the key")])
-    def test_a_node_that_wont_start_the_task_is_unavailable(self, media, error):
+    def test_a_node_that_wont_start_the_task_is_unavailable_and_never_ran_it(self, media, error):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})], start_error=error)
         registry = _install(client)
-        with pytest.raises(NodeUnavailableError, match="couldn't start"):
+        with pytest.raises(NodeUnavailableError, match="couldn't start") as raised:
             _run(media)
+        assert raised.value.started is False
+        assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_a_removed_node_never_ran_the_task(self, media):
+        set_registry(FakeRegistry({}))
+        with pytest.raises(NodeUnavailableError) as raised:
+            _run(media)
+        assert raised.value.started is False
+
+    @pytest.mark.parametrize(
+        "script",
+        [[running(), unreachable(), unreachable(), unreachable()], [running(), NodeUnknownTaskError("unknown_task")]],
+        ids=["stopped-answering", "forgot-the-task"],
+    )
+    def test_a_drop_after_the_start_counts_as_a_drop(self, media, script):
+        _install(ScriptedClient(script))
+        with pytest.raises(NodeUnavailableError) as raised:
+            _run(media)
+        assert raised.value.started is True
+        assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_UNAVAILABLE
 
 
 class TestErrors:

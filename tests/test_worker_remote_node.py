@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import itertools
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome
+from media_preview_generator.jobs import worker as worker_mod
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes.executor import (
     REQUEUE_NODE_UNAVAILABLE,
@@ -16,6 +18,7 @@ from media_preview_generator.nodes.executor import (
     Placement,
     current_placement,
 )
+from media_preview_generator.nodes.registry import STATE_OFFLINE, STATE_READY, NodeRegistry, NodeView, set_registry
 from media_preview_generator.processing import CodecNotSupportedError
 from media_preview_generator.processing.types import ProcessableItem
 from tests.conftest import _ms, _pi
@@ -201,3 +204,69 @@ class TestPoolExcludesNodes:
         assert self._pool(on_a, on_b).can_run_outside("previews", {"a", "b"}) is False
         assert self._pool(on_a, Worker(0, "CPU")).can_run_outside("previews", {"a"}) is True
         assert self._pool().can_run_outside("previews", {"a"}) is True
+
+
+class _Registry(NodeRegistry):
+    """One view per node: its state and when the registry last heard from it."""
+
+    def __init__(self) -> None:
+        self.states: dict[str, tuple[str, float | None]] = {}
+        self._clock = itertools.count(1)
+
+    def set(self, node_id: str, state: str, *, seen_now: bool) -> None:
+        last = self.states.get(node_id, (STATE_READY, None))[1]
+        self.states[node_id] = (state, float(next(self._clock)) if seen_now else last)
+
+    def view(self, node_id: str) -> NodeView | None:
+        if node_id not in self.states:
+            return None
+        state, seen = self.states[node_id]
+        return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), (), 4, False, seen)
+
+
+class TestSuspectNodes:
+    @pytest.fixture
+    def registry(self):
+        fake = _Registry()
+        fake.set("a", STATE_READY, seen_now=True)
+        set_registry(fake)
+        yield fake
+        set_registry(None)
+
+    @staticmethod
+    def _pool() -> tuple[WorkerPool, Worker, Worker]:
+        on_a = Worker(0, "GPU", "NVIDIA", "cuda:0", 0, "RTX", node_id="a", node_name="A")
+        local = Worker(1, "CPU")
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.workers.extend([on_a, local])
+        return pool, on_a, local
+
+    def test_a_node_that_dropped_a_file_gets_none_until_its_next_check_comes_back_ready(self, registry):
+        pool, on_a, local = self._pool()
+        assert pool._find_available_worker() is on_a  # an idle GPU wins
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is local
+        registry.set("a", STATE_OFFLINE, seen_now=False)  # the re-check: still down
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is local
+        registry.set("a", STATE_READY, seen_now=False)  # ready, but nobody has heard from it since the drop
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is local
+        registry.set("a", STATE_READY, seen_now=True)
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is on_a
+
+    def test_the_hold_ends_on_its_own_after_a_while(self, registry, monkeypatch):
+        pool, on_a, local = self._pool()
+        monkeypatch.setattr(worker_mod, "SUSPECT_NODE_S", 0.0)
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is on_a
+        pool.refresh_suspect_nodes()
+        assert pool._suspect_nodes == {}
+
+    def test_only_the_dropping_nodes_workers_are_held(self, registry):
+        pool, on_a, local = self._pool()
+        on_b = Worker(2, "GPU", "NVIDIA", "cuda:0", 0, "RTX", node_id="b", node_name="B")
+        pool.workers.append(on_b)
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is on_b

@@ -159,7 +159,10 @@ retry runs (on the **node's** CPU, see §6).
 * While a task runs the worker polls every 1 s; node log lines are written into the job log by the worker's own
   thread (job-log routing is by registered thread id), prefixed `<node>/<device> ·`.
 * **Node drops** (3 failed polls ≈ 12 s, or the node no longer knows the task): `NodeUnavailableError` → the item
-  goes back in the queue once; a second drop on the same item fails it ("node unavailable twice").
+  goes back in the queue once; a second drop on the same item fails it ("node unavailable twice"). A start the node
+  never took (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most
+  5 times, then it fails). After either, the node gets no new file until the registry's next check of it comes back
+  ready (60 s at most), and the item's retry goes to another node or this app when one is free.
 * **File not visible**: the item goes to the next eligible worker on a different node (or this app); when every
   eligible worker has failed it, the item fails "not visible on X, Y". Three different files not visible on one node
   within 10 minutes → node state `access_problem` (workers paused, alert).

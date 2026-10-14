@@ -18,7 +18,7 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_outcome, outcome_value
-from ..nodes.executor import REQUEUE_NODE_UNAVAILABLE, NodeRequeue
+from ..nodes.executor import REQUEUE_NODE_NOT_STARTED, REQUEUE_NODE_UNAVAILABLE, NodeRequeue
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
 from .worker import JOB_LOG_SKIP, Worker, WorkerPool, logging_for_job
@@ -34,6 +34,9 @@ WAITING_FOR_WORKER = "Waiting for a free worker"
 CAPPED_KINDS_SHARE = 0.75
 # A file whose node drops it this many times fails instead of going back in the queue (spec §6).
 MAX_NODE_DROPS = 2
+# A start the node never took doesn't count as a drop, but a node that answers its health check while refusing every
+# task must not keep a file in the queue forever.
+MAX_NODE_START_FAILURES = 5
 # How far down a job's queue the dispatcher looks for a file a free worker may run, when files at the front can't run
 # on that worker's node.
 EXCLUDED_SCAN_LIMIT = 64
@@ -118,8 +121,11 @@ class JobTracker:
         self.check_queue: deque = deque(items)
         self.item_queue: deque = deque()
         # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
-        # how often each one's node dropped it, and the nodes (id -> name) that can't see it.
+        # how often each one's node dropped it or never took its start, the node that last did (its retry goes
+        # elsewhere when it can), and the nodes (id -> name) that can't see it.
         self.node_drops: dict[str, int] = {}
+        self.node_start_failures: dict[str, int] = {}
+        self.dropped_on: dict[str, str] = {}
         self.excluded_nodes: dict[str, dict[str, str]] = {}
         self.total_items = len(items)
         self.successful = 0
@@ -967,10 +973,12 @@ class JobDispatcher:
     def _requeue_or_fail(self, worker: Worker, tracker: JobTracker, item, requeue: NodeRequeue) -> None:
         """Put a file a remote worker gave back at the front of its job's queue, or fail it (spec §6).
 
-        A node that dropped the file sends it back once; a second drop fails it. A node that can't see it is left out
-        for that file and it goes back for another worker; once no configured worker outside the nodes that can't see
-        it remains, it fails. The queue and ``active_processing`` change together under ``_trackers_lock``, so a
-        parking snapshot never misses the file.
+        A node that dropped the file sends it back once; a second drop fails it. A start the node never took doesn't
+        count as a drop (up to ``MAX_NODE_START_FAILURES``). Either way the node gets no new file until it checks ready
+        again, and this file's retry prefers another node or this app. A node that can't see it is left out for that
+        file and it goes back for another worker; once no configured worker outside the nodes that can't see it
+        remains, it fails. The queue and ``active_processing`` change together under ``_trackers_lock``, so a parking
+        snapshot never misses the file.
 
         Args:
             worker: The worker that gave it back.
@@ -980,11 +988,20 @@ class JobDispatcher:
         """
         path = item.canonical_path
         failure: str | None = None
+        dropped = requeue.reason in (REQUEUE_NODE_UNAVAILABLE, REQUEUE_NODE_NOT_STARTED)
+        if dropped:
+            self.worker_pool.mark_node_suspect(requeue.node_id)
         with self._trackers_lock:
+            if dropped:
+                tracker.dropped_on[path] = requeue.node_id
             if requeue.reason == REQUEUE_NODE_UNAVAILABLE:
                 tracker.node_drops[path] = tracker.node_drops.get(path, 0) + 1
                 if tracker.node_drops[path] >= MAX_NODE_DROPS:
                     failure = f"node unavailable twice ({requeue.node_name})"
+            elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
+                tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
+                if tracker.node_start_failures[path] >= MAX_NODE_START_FAILURES:
+                    failure = f"the node couldn't start it {MAX_NODE_START_FAILURES} times ({requeue.node_name})"
             else:
                 excluded = tracker.excluded_nodes.setdefault(path, {})
                 excluded[requeue.node_id] = requeue.node_name
@@ -1059,6 +1076,7 @@ class JobDispatcher:
     def _assign_tasks(self) -> None:
         """Reserve a compatible job and slot together under a fixed lock order."""
         stranded: list[tuple[JobTracker, Any, str]] = []
+        self.worker_pool.refresh_suspect_nodes()
         try:
             self._assign_tasks_locked(stranded)
         finally:
@@ -1073,8 +1091,9 @@ class JobDispatcher:
     def _claim_worker(self, tracker: JobTracker, stranded: list) -> tuple[Worker, Any] | None:
         """Claim a free worker and the first queued file of the job it may run; the caller holds both locks.
 
-        A file some nodes can't see only goes to a worker on another node (or this app). One that no configured worker
-        can run any more is taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed).
+        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped goes to
+        a worker elsewhere when one is free, else back to that node. One that no configured worker can run any more is
+        taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed).
 
         Args:
             tracker: The job.
@@ -1084,12 +1103,19 @@ class JobDispatcher:
             The claimed worker and the file, or None.
         """
         pool = self.worker_pool
-        if not tracker.excluded_nodes:
+        if not tracker.excluded_nodes and not tracker.dropped_on:
             worker = pool._find_available_worker(claim=True, kind=tracker.kind)
             return None if worker is None else (worker, tracker.item_queue.popleft())
         for index, item in enumerate(itertools.islice(tracker.item_queue, EXCLUDED_SCAN_LIMIT)):
             excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
-            worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
+            dropped_on = tracker.dropped_on.get(item.canonical_path)
+            worker = None
+            if dropped_on is not None:
+                worker = pool._find_available_worker(
+                    claim=True, kind=tracker.kind, exclude_nodes={*excluded, dropped_on}
+                )
+            if worker is None:
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
             if worker is not None:
                 del tracker.item_queue[index]
                 return worker, item

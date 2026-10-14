@@ -154,6 +154,20 @@ def member_detected(policy: dict, local_devices: set[str] | dict, nodes: NodeHar
     return policy["resource"] == "cpu" or policy.get("device") in local_devices
 
 
+def ready_seen_at(node_id: str) -> float | None:
+    """When the registry last heard from ``node_id`` while it is ready; None while it isn't ready or can't be read."""
+    from ..nodes.registry import STATE_READY, get_registry
+
+    try:
+        view = get_registry().view(node_id)
+    except Exception as exc:
+        logger.debug("Could not read node {} from the node registry: {}", node_id, exc)
+        return None
+    if view is None or view.state != STATE_READY:
+        return None
+    return view.last_seen
+
+
 def worker_node_id(worker: object) -> str | None:
     """The node a worker runs on, or ``None`` for this app (also for stand-in workers without the attribute)."""
     node_id = getattr(worker, "node_id", None)
