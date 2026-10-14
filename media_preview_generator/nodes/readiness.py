@@ -142,7 +142,7 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
                 ok=False,
                 explanation="It keeps working for Plex's database. Updating it to a node adds health details and "
                 "the newer Plex database features.",
-                reason="Update the helper container to the node image.",
+                reason="Update it to the Plex database node image.",
                 fix_where=FIX_ON_NODE,
             )
         )

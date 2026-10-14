@@ -68,7 +68,7 @@ def loudness_readiness_section(
             "docs_anchor": "plex-loudness",
             "tooltip": "Checks Plex's database and server identity without changing them.",
             "explanation": (
-                "<p>Loudness requires Plex's config folder mounted locally on the same machine, or the Plex helper "
+                "<p>Loudness requires Plex's config folder mounted locally on the same machine, or a Plex database node "
                 "(version 1.2.0 or newer) beside a Plex on another machine. The database must match the connected "
                 "server and supported Plex version.</p>"
                 "<p>Intro &amp; Credits can stay off.</p>"

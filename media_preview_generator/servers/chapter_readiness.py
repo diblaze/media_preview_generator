@@ -42,12 +42,12 @@ def chapter_readiness_section(
         "id": "chapter_registration",
         "label": "Chapter thumbnails can be registered" if ready else "Chapter thumbnails cannot be registered",
         "docs_anchor": "chapter-thumbnails",
-        "tooltip": "Checks the local Plex database or the configured Plex helper without changing it.",
+        "tooltip": "Checks the local Plex database or the chosen Plex database node without changing it.",
         "explanation": (
             "<p>This app writes chapter JPEGs and updates the image references on Plex's existing chapters. "
             "It does not create chapters or change their timing.</p>"
             "<p>The database must be local to the writer and belong to this Plex server. "
-            "When Plex runs on another machine, configure a compatible Plex helper beside it. "
+            "When Plex runs on another machine, choose a Plex database node beside it. "
             "Intro &amp; Credits can stay off.</p>"
         ),
         "ok": ready,
@@ -59,8 +59,8 @@ def chapter_readiness_section(
     if not ready:
         registration["note"] = {
             "text": (
-                "The Plex helper connection is shared by chapter thumbnails and Intro & Credits. "
-                "You can configure it without enabling Intro & Credits."
+                "The Plex database node is shared by chapter thumbnails and Intro & Credits. "
+                "You can choose it without enabling Intro & Credits."
             ),
             "configure_plex_helper": True,
         }

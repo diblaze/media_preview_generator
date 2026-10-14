@@ -81,6 +81,18 @@ class TestValidateNode:
         assert err == "" and record["enabled"] is False
         assert record["path_mappings"] == stored["path_mappings"] and record["url"] == stored["url"]
 
+    @pytest.mark.parametrize(
+        ("url", "kept"),
+        [("http://nuc.lan:9494/", True), ("http://moved.lan:9494", False)],
+        ids=["same-address", "new-address"],
+    )
+    def test_a_new_address_forgets_the_node_id_recorded_at_the_old_one(self, url, kept):
+        stored, _ = ns.validate_node(_post(), existing=None, others=[])
+        stored["node_uid"] = "uid-1"
+        record, err = ns.validate_node({"url": url, "key": "k-123"}, existing=stored, others=[])
+        assert err == ""
+        assert record["node_uid"] == ("uid-1" if kept else None)
+
     def test_enabled_must_be_a_boolean(self):
         record, err = ns.validate_node(_post(enabled="yes"), existing=None, others=[])
         assert record is None and "enabled" in err

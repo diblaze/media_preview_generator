@@ -201,8 +201,44 @@ class TestStates:
         h.change(node_uid="uid-original")
         h.client().default_info = _info(uid="uid-other")
         view = h.registry.check_now("n1")
-        assert view.state == reg.STATE_OFFLINE and "different node answered" in view.reason.lower()
+        assert view.state == reg.STATE_OFFLINE
+        assert view.reason.startswith("A different node answered at nuc's address.")
         assert h.uids == []
+        assert h.registry.identity_ok("n1") is False
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+
+    def test_a_different_node_is_checked_every_30_s_without_offline_backoff(self, h):
+        h.change(node_uid="uid-original")
+        h.client().default_info = _info(uid="uid-other")
+        delays = []
+        for _ in range(4):
+            h.registry.check_now("n1")
+            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
+        assert delays == [reg.HEALTH_INTERVAL_S] * 4
+        assert h.registry._nodes["n1"].offline_streak == 0
+
+    def test_the_right_node_answering_again_clears_the_mismatch(self, h):
+        h.change(node_uid="uid-original")
+        client = h.client()
+        client.default_info = _info(uid="uid-other")
+        h.registry.check_now("n1")
+        client.default_info = _info(uid="uid-original")
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+        assert h.registry.identity_ok("n1") is True
+
+    def test_re_pointing_the_node_clears_the_mismatch_before_its_next_check(self, h):
+        h.change(node_uid="uid-original")
+        h.client().default_info = _info(uid="uid-other")
+        h.registry.check_now("n1")
+        h.change(url="http://elsewhere:9494", node_uid=None)
+        assert h.registry.identity_ok("n1") is True
+        assert h.registry.view("n1").state == reg.STATE_CONNECTING
+
+    def test_identity_is_ok_for_a_node_never_caught_out_and_an_unknown_node(self, h):
+        h.client().default_info = _info()
+        h.registry.check_now("n1")
+        assert h.registry.identity_ok("n1") is True
+        assert h.registry.identity_ok("nope") is True
 
     def test_a_turned_off_node_is_disabled_and_never_asked(self, h):
         h.change(enabled=False)

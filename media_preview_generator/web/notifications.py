@@ -513,6 +513,13 @@ _NODE_CARD_TEXT = {
 }
 
 
+_DIFFERENT_NODE_CARD_TEXT = (
+    "A different node answered at {name}'s address",
+    "Nothing is sent to it until that is fixed.",
+    "Open Nodes",
+)
+
+
 def node_notification_id(node_id: str, state: str) -> str:
     """The bell card id for one node in one state."""
     return f"{NODE_ID_PREFIX}{node_id}:{state}"
@@ -529,7 +536,8 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     from ..nodes.registry import ALERT_STATES, get_registry
 
     try:
-        views = get_registry().views()
+        registry = get_registry()
+        views = registry.views()
     except Exception as exc:
         logger.debug("node notifications skipped: {}", exc)
         return []
@@ -541,6 +549,8 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         text = _NODE_CARD_TEXT.get(view.state)
         if text is None:
             continue
+        if view.state == "offline" and not registry.identity_ok(view.id):
+            text = _DIFFERENT_NODE_CARD_TEXT
         title, todo, label = text
         name = view.name or "A node"
         reason = f"{escape(view.reason)} " if view.reason else ""

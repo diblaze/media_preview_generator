@@ -165,6 +165,8 @@ class ServerMarkersSettings:
     agent_token: str = field(default="", repr=False)
     agent_node_id: str | None = None
     agent_node_name: str = ""
+    # False when the node is turned off on the Nodes page: nothing is then sent to it (``plex_remote.node_refusal``).
+    agent_node_enabled: bool = True
 
     @property
     def keeps_server_markers(self) -> bool:
@@ -307,13 +309,22 @@ def _normalise_credits_window(raw: object) -> tuple[dict | None, str]:
     return out, ""
 
 
-def _stored_agent_node_id(existing: object) -> str | None:
-    """The Plex database node already chosen for this server (None when there is none)."""
+# The helper's own address and key from before nodes (v24 leaves them as a rollback aid; nothing here reads them).
+_LEGACY_AGENT_KEYS = ("url", "token")
+
+
+def _stored_agent(existing: object) -> dict:
+    """The stored ``markers.plex.agent`` block ({} when there is none)."""
     if not isinstance(existing, dict):
-        return None
+        return {}
     plex = existing.get("plex")
     agent = plex.get("agent") if isinstance(plex, dict) else None
-    node_id = agent.get("node_id") if isinstance(agent, dict) else None
+    return agent if isinstance(agent, dict) else {}
+
+
+def _stored_agent_node_id(existing: object) -> str | None:
+    """The Plex database node already chosen for this server (None when there is none)."""
+    node_id = _stored_agent(existing).get("node_id")
     return str(node_id) if node_id else None
 
 
@@ -385,8 +396,11 @@ def validate_server(raw: object, server_type: str, existing: object = None) -> t
         if block["enabled"] and not confirmed:
             return None, "Confirm the Plex database write before turning on Intro & Credits for this Plex server"
         agent, err = _normalise_agent(plex_raw.get("agent"), _stored_agent_node_id(existing))
-        if err:
+        if err or agent is None:
             return None, err
+        # Carried as stored, never taken from a client: only a build from before nodes reads them (upgrade v24).
+        stored_agent = _stored_agent(existing)
+        agent.update({k: stored_agent[k] for k in _LEGACY_AGENT_KEYS if k in stored_agent})
         block["plex"] = {"db_write_confirmed_at": confirmed, "on_plex_redetect": redetect, "agent": agent}
     if server_type == "emby":
         emby_raw = raw.get("emby") or {}
@@ -495,11 +509,14 @@ def load_server(raw: object, server_type: str) -> ServerMarkersSettings:
     emby = block.get("emby") or {}
     agent = plex.get("agent") or {}
     node_id = agent.get("node_id") or None
-    agent_url, agent_token, agent_node_name = "", "", ""
+    agent_url, agent_token, agent_node_name, agent_node_enabled = "", "", "", True
     if node_id:
-        from ..nodes.settings import node_address
+        from ..nodes.settings import node_record
 
-        agent_url, agent_token, agent_node_name = node_address(node_id)
+        record = node_record(node_id) or {}
+        agent_url, agent_token = str(record.get("url") or ""), str(record.get("key") or "")
+        agent_node_name = str(record.get("name") or "")
+        agent_node_enabled = bool(record.get("enabled", True))
     ids = block["library_ids"]
     return ServerMarkersSettings(
         enabled=block["enabled"],
@@ -512,6 +529,7 @@ def load_server(raw: object, server_type: str) -> ServerMarkersSettings:
         agent_token=agent_token,
         agent_node_id=node_id,
         agent_node_name=agent_node_name,
+        agent_node_enabled=agent_node_enabled,
     )
 
 

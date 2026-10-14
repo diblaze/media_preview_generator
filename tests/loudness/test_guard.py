@@ -199,7 +199,7 @@ def test_a_helper_switched_on_without_an_address_never_falls_back_to_the_local_f
     _, cfg, server = guarded
     cfg.markers = {"plex": {"agent": {"enabled": True}}}
     report = loudness_capability(server, cfg)
-    assert report.state is Capability.MISCONFIGURED and "helper's address" in report.message
+    assert report.state is Capability.MISCONFIGURED and "no Plex database node" in report.message
     server._connect.assert_not_called()
 
 

@@ -35,7 +35,7 @@ from .plex_rows import read_rows
 from .scope import LibraryScope, excluded, library_scopes
 
 ACCESS_DIRECT = "Reads Plex's database directly"
-ACCESS_NODE = "Reads Plex's database through the Plex helper"
+ACCESS_NODE = "Reads Plex's database through the Plex database node"
 ACCESS_API_ONLY = "No access to Plex's database"
 NEEDS_DATABASE = "Needs access to Plex's database"
 
@@ -160,7 +160,7 @@ def count_plex(
     else:
         unavailable, access = NEEDS_DATABASE, ACCESS_API_ONLY
         if refused:
-            logger.warning("Library health: the Plex helper for {} can't count: {}", cfg.name, refused)
+            logger.warning("Library health: the Plex database node for {} can't count: {}", cfg.name, refused)
             unavailable = refused[:200]
         elif share:
             logger.warning(
@@ -257,7 +257,12 @@ def _rows_from(raw: dict, undecodable: dict[str, int]) -> _PlexRows:
 
 
 def _read_rows(
-    db: LocalPlexDb | RemotePlexDb, section_ids: list[int], *, want_markers: bool, want_chapters: bool
+    db: LocalPlexDb | RemotePlexDb,
+    section_ids: list[int],
+    *,
+    want_markers: bool,
+    want_chapters: bool,
+    machine_identifier: str = "",
 ) -> _PlexRows:
     # In the image this is always the bundled analyser the loudness job uses; outside it a custom ffmpeg_path makes
     # Health conservative (skips recorded by another ffmpeg don't count), never optimistic.
@@ -270,6 +275,7 @@ def _read_rows(
             want_chapters=want_chapters,
             deadline=deadline,
             needs=LIBRARY_HEALTH_AGENT_VERSION,
+            machine_identifier=machine_identifier,
         )
     else:
         with db._database(read_only=True, deadline=deadline) as conn:
@@ -470,7 +476,13 @@ def _count_from_db(
     want_chapters = any(scope.features.get(Feature.CHAPTERS) is None for scope in scopes)
     progress("Reading Plex's database", 0, 0)
     try:
-        rows = _read_rows(db, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+        rows = _read_rows(
+            db,
+            section_ids,
+            want_markers=want_markers,
+            want_chapters=want_chapters,
+            machine_identifier=str(getattr(cfg, "server_identity", None) or ""),
+        )
     except (PublishError, sqlite3.Error, ValueError) as exc:
         logger.warning("Library health: could not read Plex's database on {}: {}", cfg.name, exc)
         return [_error_library(scope, str(exc)) for scope in scopes], []

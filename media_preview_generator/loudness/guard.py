@@ -17,13 +17,16 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from loguru import logger
 
-from ..markers.publishers.base import Capability, CapabilityReport, PublishError
+from ..markers.publishers.base import Capability, CapabilityReport, DatabaseBusyError, PublishError
 from ..markers.publishers.plex_db import (
     BUSY_TIMEOUT_S,
+    PLEX_BUSY_PREFIX,
     TESTED_PMS_LABEL,
+    WAIT_SLICE_S,
     LocalPlexDb,
     decode_extra_data,
     is_tested_pms_version,
+    plex_busy_error,
     plex_db_path,
     publish_error_from_sqlite,
 )
@@ -236,7 +239,7 @@ def _flag(result: dict, key: str) -> bool:
     value = result.get(key)
     if not isinstance(value, bool):
         raise PublishError(
-            "The Plex helper sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
+            "The Plex database node sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
         )
     return value
 
@@ -251,6 +254,11 @@ class RemoteLoudnessDb:
 
     The node keeps the undo record (``loudness-writes.jsonl`` in its own ``CONFIG_DIR``), because the undo tool has
     to run beside the database file with Plex stopped.
+
+    A write can't be cancelled or see the source file while the node waits for Plex's lock, so it is sent with a
+    deadline of one ``WAIT_SLICE_S`` at a time: before each attempt the cancel and the source file are checked here,
+    and a busy answer is tried again until the write's own deadline, as the in-process writer checks between its
+    lock-wait slices.
     """
 
     def __init__(self, server: Any, remote: RemotePlexDb) -> None:
@@ -274,8 +282,8 @@ class RemoteLoudnessDb:
         self._identity_read_at = time.monotonic()
         return self._read
 
-    def _call(self, operation: str, body: dict, *, deadline: float, read_only: bool = True) -> dict:
-        machine, version = self._identity(trust_recent=read_only)
+    def _call(self, operation: str, body: dict, *, deadline: float, trust_recent: bool = True) -> dict:
+        machine, version = self._identity(trust_recent=trust_recent)
         result = self._remote.loudness(
             operation,
             {"machine_identifier": machine, "pms_version": version, **body},
@@ -300,7 +308,7 @@ class RemoteLoudnessDb:
         except ValueError as exc:
             logger.debug("Plex helper: unreadable loudness report: {}", exc)
             report = CapabilityReport(
-                Capability.AGENT_UNAVAILABLE, "The Plex helper sent a loudness answer this app can't read"
+                Capability.AGENT_UNAVAILABLE, "The Plex database node sent a loudness answer this app can't read"
             )
         return CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
 
@@ -322,7 +330,7 @@ class RemoteLoudnessDb:
             return [stream_from_json(stream) for stream in raw], _flag(result, "in_plex")
         except (KeyError, ValueError) as exc:
             raise PublishError(
-                "The Plex helper sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
+                "The Plex database node sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
             ) from exc
 
     def read_item_snapshot(self, metadata_item_id: int, *, deadline: float) -> tuple:
@@ -332,7 +340,7 @@ class RemoteLoudnessDb:
             return snapshot_from_json(result.get("snapshot"))
         except ValueError as exc:
             raise PublishError(
-                "The Plex helper sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
+                "The Plex database node sent a loudness answer this app can't read", state=Capability.AGENT_UNAVAILABLE
             ) from exc
 
     def write_stream(
@@ -345,17 +353,22 @@ class RemoteLoudnessDb:
         source: SourceFingerprint | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> bool:
-        """``plex_db.write_stream``, run on the node; the source file and the cancel are checked here first."""
-        if cancel_check and cancel_check():
-            raise PublishError("Loudness analysis cancelled before publication")
-        if source is not None:
-            source.verify()
+        """``plex_db.write_stream``, run on the node; the source file and the cancel are checked here before each
+        attempt."""
         body = {
             "stream_id": stream_id,
             "fields": dict(fields),
             "expected": stream_to_json(expected) if expected is not None else None,
         }
-        return _flag(self._call("write", body, deadline=deadline, read_only=False), "written")
+        result = self._write_in_slices(
+            "write",
+            body,
+            deadline=deadline,
+            source=source,
+            cancel_check=cancel_check,
+            cancelled="Loudness analysis cancelled before publication",
+        )
+        return _flag(result, "written")
 
     def mark_item(
         self,
@@ -367,17 +380,67 @@ class RemoteLoudnessDb:
         cancel_check: Callable[[], bool] | None = None,
         skipped: frozenset[tuple[str, int, str]] = frozenset(),
     ) -> bool:
-        """``plex_db.mark_item``, run on the node; the source file and the cancel are checked here first."""
-        if cancel_check and cancel_check():
-            raise PublishError("Loudness analysis cancelled before marking the item")
-        if source is not None:
-            source.verify()
+        """``plex_db.mark_item``, run on the node; the source file and the cancel are checked here before each
+        attempt."""
         body = {
             "metadata_item_id": metadata_item_id,
             "expected": snapshot_to_json(expected) if expected is not None else None,
             "skipped": sorted([str(h), int(i), str(c)] for h, i, c in skipped),
         }
-        return _flag(self._call("mark", body, deadline=deadline, read_only=False), "marked")
+        result = self._write_in_slices(
+            "mark",
+            body,
+            deadline=deadline,
+            source=source,
+            cancel_check=cancel_check,
+            cancelled="Loudness analysis cancelled before marking the item",
+        )
+        return _flag(result, "marked")
+
+    def _write_in_slices(
+        self,
+        operation: str,
+        body: dict,
+        *,
+        deadline: float,
+        source: SourceFingerprint | None,
+        cancel_check: Callable[[], bool] | None,
+        cancelled: str,
+    ) -> dict:
+        """Send one write with a deadline of at most ``WAIT_SLICE_S``, again while the database is busy.
+
+        Args:
+            operation: ``write`` or ``mark``.
+            body: The operation's fields.
+            deadline: When the write as a whole stops waiting for the database.
+            source: Checked before each attempt; a changed file stops the write.
+            cancel_check: Checked before each attempt; a cancel stops the write.
+            cancelled: The message of a cancelled write.
+
+        Returns:
+            The answer's ``result``.
+
+        Raises:
+            PublishError: Cancelled, the source changed, or the node refused; ``DatabaseBusyError`` once the
+                database stayed busy past ``deadline``.
+        """
+        started = time.monotonic()
+        trust_recent = False
+        while True:
+            if cancel_check and cancel_check():
+                raise PublishError(cancelled)
+            if source is not None:
+                source.verify()
+            attempt_deadline = min(deadline, time.monotonic() + WAIT_SLICE_S)
+            try:
+                # The identity is proven on the first attempt; a retry a second later may reuse that proof.
+                return self._call(operation, body, deadline=attempt_deadline, trust_recent=trust_recent)
+            except DatabaseBusyError as exc:
+                if time.monotonic() >= deadline:
+                    if str(exc).startswith(PLEX_BUSY_PREFIX):
+                        raise plex_busy_error(time.monotonic() - started) from exc
+                    raise
+            trust_recent = True
 
     def verify_streams(self, streams: list[AudioStream]) -> None:
         """Require Plex's API to serve the streams just written (see :meth:`GuardedLoudnessDb.verify_streams`)."""
@@ -389,24 +452,26 @@ def create_loudness_db(cfg: ServerConfig, server: Any) -> GuardedLoudnessDb | Re
     """The server's loudness database, independently of Intro & Credits consent: through its Plex database node
     when one is set up, else the guarded local file."""
     from ..markers.publishers.plex_db import PlexMarkerPublisher
-    from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
+    from ..markers.publishers.plex_remote import NO_NODE_REFUSAL, plex_database
     from ..markers.settings import load_server
     from ..servers.base import ServerType
 
     if cfg.type is not ServerType.PLEX:
         raise PublishError("Loudness analysis requires a Plex server", state=Capability.MISCONFIGURED)
-    plex = (cfg.markers or {}).get("plex") or {}
-    agent = plex.get("agent") if isinstance(plex, dict) else None
-    if isinstance(agent, dict) and agent.get("enabled"):
+    settings = load_server(cfg.markers, "plex")
+    if settings.agent_enabled:
         db = plex_database(
-            load_server(cfg.markers, "plex"),
+            settings,
             path_provider=lambda: PlexMarkerPublisher.db_path_for(cfg),
             label=cfg.name or "",
         )
-        if not isinstance(db, RemotePlexDb):
-            # Switched on but unusable (no address): never fall back to a local folder the user meant not to use.
-            raise PublishError("Set the Plex helper's address and key", state=Capability.MISCONFIGURED)
         return RemoteLoudnessDb(server, db)
+    plex = (cfg.markers or {}).get("plex") or {}
+    agent = plex.get("agent") if isinstance(plex, dict) else None
+    if isinstance(agent, dict) and agent.get("enabled"):
+        # Switched on in a block that doesn't load (no node chosen): never fall back to a local folder the user
+        # meant not to use.
+        raise PublishError(NO_NODE_REFUSAL.message, state=Capability.MISCONFIGURED)
     return GuardedLoudnessDb(cfg, server)
 
 

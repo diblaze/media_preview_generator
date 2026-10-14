@@ -255,6 +255,10 @@ _path_locks_guard = threading.Lock()
 _thread_state = threading.local()
 
 
+# How :func:`plex_busy_error` starts, so a caller that waited in several requests can tell it from "another task".
+PLEX_BUSY_PREFIX = "Plex's database was busy (held by another program)"
+
+
 def plex_busy_error(seconds: float) -> DatabaseBusyError:
     """The failure of a write that gave up because another program kept Plex's database locked.
 
@@ -265,7 +269,7 @@ def plex_busy_error(seconds: float) -> DatabaseBusyError:
         The error, UNREACHABLE like any lock wait that ran out.
     """
     return DatabaseBusyError(
-        f"Plex's database was busy (held by another program) for {max(1, round(seconds))} s; {NEXT_RUN}",
+        f"{PLEX_BUSY_PREFIX} for {max(1, round(seconds))} s; {NEXT_RUN}",
         state=Capability.UNREACHABLE,
     )
 
@@ -1954,7 +1958,7 @@ class PlexMarkerPublisher(MarkerPublisher):
             return None
         return CapabilityReport(
             Capability.AGENT_UNAVAILABLE,
-            f"The Plex marker agent at {agent.get('url') or 'this address'} is next to a different Plex server than "
+            f"The Plex database node at {agent.get('url') or 'this address'} is next to a different Plex server than "
             f"{self._config.name or 'this one'}. Check the address: markers would have gone into the wrong database.",
             {**report.details, "agent": {**agent, "wrong_plex": True}},
         )
@@ -1981,23 +1985,23 @@ class PlexMarkerPublisher(MarkerPublisher):
         if local.state is Capability.NEEDS_LOCAL_DB:
             fs_type = str(details.get("fs_type") or "")
             where = (
-                f"Plex's database is on a network share ({fs_type}) where the Plex marker agent runs."
+                f"Plex's database is on a network share ({fs_type}) where the Plex database node runs."
                 if is_network_filesystem(fs_type)
-                else "Plex's database is on a filesystem the Plex marker agent doesn't recognise as a local disk "
+                else "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
                 f"({fs_type or 'unknown'})."
             )
             return CapabilityReport(
                 local.state,
-                f"{where} Mount Plex's config folder into the agent's container from a local disk of the Plex "
-                "machine; Plex stays read-only.",
+                f"{where} Give the node Plex's config folder from a local disk of the Plex machine (in Docker, mount "
+                "it from one); Plex stays read-only.",
                 details,
             )
         if local.state is Capability.MISCONFIGURED and details.get("unwritable"):
             paths = ", ".join(str(p) for p in details["unwritable"])
             return CapabilityReport(
                 local.state,
-                f"The Plex marker agent (user {details.get('writer_uid') or 'unknown'}) can't write {paths}. Run the "
-                f"agent's container with the user that owns Plex's database "
+                f"The Plex database node (user {details.get('writer_uid') or 'unknown'}) can't write {paths}. Run "
+                f"the node as the user that owns Plex's database "
                 f"(user {details.get('db_owner_uid') or 'unknown'}).",
                 details,
             )
@@ -2018,7 +2022,7 @@ class PlexMarkerPublisher(MarkerPublisher):
             if status is None:
                 return local
             # With an agent the path is the one IT sees; this app sees no database at all.
-            whose = "the agent sees" if local.details.get("agent") else "this app sees"
+            whose = "the Plex database node sees" if local.details.get("agent") else "this app sees"
             return CapabilityReport(
                 Capability.NEEDS_LOCAL_DB,
                 f"Plex is running, but not with the database file {whose} at {local.details['db_path']}. "
