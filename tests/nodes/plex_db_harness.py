@@ -40,13 +40,15 @@ class _FlaskResponse:
 class FlaskSession:
     """A ``requests.Session`` that calls the node in-process, as the app's HTTP client would over the LAN.
 
-    ``paths`` records every request, so a test can prove what was (or wasn't) sent.
+    ``paths`` records every request, so a test can prove what was (or wasn't) sent; ``bodies`` the last body sent
+    to each path.
     """
 
     def __init__(self, client) -> None:
         self._client = client
         self.stopped = False
         self.paths: list[str] = []
+        self.bodies: dict[str, dict] = {}
 
     def _check(self, url: str) -> str:
         if self.stopped:
@@ -56,7 +58,9 @@ class FlaskSession:
         return path
 
     def post(self, url, json=None, headers=None, timeout=None):
-        return _FlaskResponse(self._client.post(self._check(url), json=json, headers=headers))
+        path = self._check(url)
+        self.bodies[path] = json
+        return _FlaskResponse(self._client.post(path, json=json, headers=headers))
 
     def get(self, url, headers=None, timeout=None):
         return _FlaskResponse(self._client.get(self._check(url), headers=headers))

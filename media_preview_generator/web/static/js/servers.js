@@ -2734,12 +2734,16 @@
         const hasFixAction = !!(actionsObj.enable || actionsObj.disable);
         const vendorLabel = _vendorDisplayName(serverType);
         // check.fix_where is an explicit hint from the backend (readiness.py) for rows whose fix happens
-        // somewhere other than the vendor's own admin UI — today only the Plex marker agent's rows. Reading
-        // this off the row id would drift the moment a new agent-fixed row shipped without updating this list.
-        const manualBadgeText = check.fix_where === 'agent' ? 'Fix on the agent' : `Change in ${vendorLabel} UI`;
+        // somewhere other than the vendor's own admin UI — today only the Plex database node's rows: 'agent' on
+        // the node's machine, 'app' in this app (the Nodes page or Edit → Connection). Reading this off the row id
+        // would drift the moment a new node-fixed row shipped without updating this list.
+        const manualBadgeText = check.fix_where === 'agent' ? 'Fix on the node'
+            : check.fix_where === 'app' ? 'Fix in this app' : `Change in ${vendorLabel} UI`;
         const manualBadgeTitle = check.fix_where === 'agent'
-            ? "This app can't toggle this for you — fix it on the machine running the Plex marker agent."
-            : `This app can't toggle this for you — open ${vendorLabel}'s admin UI and follow the instructions below.`;
+            ? "This app can't toggle this for you — fix it on the machine running the Plex database node."
+            : check.fix_where === 'app'
+                ? 'Nothing is sent to the Plex database node until this is fixed here — follow the instructions below.'
+                : `This app can't toggle this for you — open ${vendorLabel}'s admin UI and follow the instructions below.`;
         let tone = '';
         let tierBadge;
         if (informational) {

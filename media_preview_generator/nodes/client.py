@@ -6,6 +6,7 @@ class, never on status codes or message text. The key is sent only in the Author
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,16 +65,29 @@ class NodeAddress:
 
 
 class NodeClient:
-    """Calls one node's routes. Thread-safe: one ``requests.Session`` per client, used under its own lock-free API.
+    """Calls one node's routes. Safe to share between threads: each thread gets its own ``requests.Session``.
+
+    The health loop and every job thread running a task on the node use one client, and ``requests`` doesn't promise
+    that a ``Session`` (its cookie jar and connection pool) is safe to use from several threads at once.
 
     Args:
         address: The node's URL and key.
-        session: For tests.
+        session: For tests: used by every thread.
     """
 
     def __init__(self, address: NodeAddress, *, session: requests.Session | None = None) -> None:
         self._address = address
-        self._session = session or requests.Session()
+        self._shared_session = session
+        self._local = threading.local()
+
+    @property
+    def _session(self) -> requests.Session:
+        if self._shared_session is not None:
+            return self._shared_session
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = requests.Session()
+        return session
 
     @property
     def url(self) -> str:

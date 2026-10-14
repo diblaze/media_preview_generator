@@ -347,7 +347,7 @@ class TestAnOlderHelper:
         monkeypatch.setattr(plex_db_role, "CAPABILITIES", [CHAPTER_CAPABILITY])
         db, _ = _remote(node)
         report = db.file_checks(deadline=_deadline())
-        assert report.state is Capability.PLUGIN_OUTDATED and "Update the helper" in report.message
+        assert report.state is Capability.PLUGIN_OUTDATED and "Update the node" in report.message
 
     def test_an_unreachable_helper_is_a_retryable_unavailable_not_a_crash(self, node):
         db, session = _remote(node)
@@ -407,3 +407,139 @@ class TestTheCodec:
     def test_a_changed_source_keeps_its_type_across_the_wire(self):
         error = plex_remote.error_from_json(plex_remote.error_to_json(loudness_db.SourceChangedError("changed")))
         assert type(error) is loudness_db.SourceChangedError and str(error) == "changed"
+
+
+class TestTheUndoRecordSurvivesAnUpdate:
+    """The node keeps the undo record in ``CONFIG_DIR``; inside a container that folder has to be a mount of its own."""
+
+    @staticmethod
+    def _check(folder: Path, tmp_path: Path, *, root_fs: str, config_mounted: bool) -> object:
+        config_dir = Path(loudness_db.write_log_path()).parent
+        extra = f"40 22 0:50 / {config_dir} rw - ext4 /dev/sdb1 rw\n" if config_mounted else ""
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path, fs=root_fs, extra_lines=extra)).test_client()
+        db, _ = _remote(node)
+        return db.capability(deadline=_deadline())
+
+    @pytest.mark.parametrize(
+        ("root_fs", "config_mounted", "ready"),
+        [
+            ("overlay", False, False),
+            ("overlay", True, True),
+            ("ext4", False, True),
+        ],
+        ids=["container-layer", "container-volume", "host-disk"],
+    )
+    def test_the_readiness_check(self, folder, tmp_path, root_fs, config_mounted, ready):
+        report = self._check(folder, tmp_path, root_fs=root_fs, config_mounted=config_mounted)
+        if ready:
+            assert report.state is Capability.READY
+        else:
+            assert report.state is Capability.MISCONFIGURED
+            config_dir = Path(loudness_db.write_log_path()).parent
+            assert report.message.startswith(f"Mount a volume at {config_dir} on this Plex database node")
+            assert "undo record survives updates" in report.message
+
+    def test_a_folder_inside_the_volume_counts_as_on_it(self, folder, tmp_path, monkeypatch):
+        volume = tmp_path / "node-config"
+        monkeypatch.setenv("CONFIG_DIR", str(volume / "sub"))
+        extra = f"40 22 0:50 / {volume} rw - ext4 /dev/sdb1 rw\n"
+        assert (
+            plex_db_role.undo_record_problem(mountinfo_path=_mountinfo(tmp_path, fs="overlay", extra_lines=extra)) == ""
+        )
+
+    def test_windows_keeps_it_under_localappdata_and_is_never_asked_for_a_volume(self, folder, tmp_path, monkeypatch):
+        monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
+        assert self._check(folder, tmp_path, root_fs="overlay", config_mounted=False).state is Capability.READY
+
+    def test_an_unreadable_mountinfo_is_not_a_refusal(self, tmp_path):
+        assert plex_db_role.undo_record_problem(mountinfo_path=str(tmp_path / "missing")) == ""
+
+    def test_the_image_declares_the_volume(self):
+        dockerfile = (Path(__file__).parents[2] / "nodes/plex-db/Dockerfile").read_text()
+        assert "\nVOLUME /config\n" in dockerfile
+
+
+class TestAWriteWaitsForPlexInSlices:
+    """The node can't see the job's cancel or the source file, so the app sends short waits and checks between them."""
+
+    @staticmethod
+    def _plex_holds_the_write_lock(folder: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(plex_db.plex_db_path(str(folder)), isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    def test_a_cancel_during_a_long_lock_wait_stops_within_one_slice_and_writes_nothing(self, node, folder):
+        db, session = _remote(node)
+        plex = self._plex_holds_the_write_lock(folder)
+        calls = []
+
+        def cancel_check() -> bool:
+            calls.append(time.monotonic())
+            return len(calls) > 1
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(PublishError, match="cancelled"):
+                loudness_db.write_stream(db, 11, FIELDS, deadline=time.monotonic() + 60, cancel_check=cancel_check)
+        finally:
+            plex.rollback()
+            plex.close()
+        assert time.monotonic() - started < plex_db.WAIT_SLICE_S + 2.0
+        assert session.paths.count("/v1/loudness/write") == 1
+        assert _extra(folder, "media_streams", 11) == BEFORE
+
+    def test_a_source_change_between_slices_stops_the_write(self, node, folder, tmp_path):
+        db, session = _remote(node)
+        source = tmp_path / "local.mkv"
+        source.write_bytes(b"old")
+        fingerprint = loudness_db.SourceFingerprint.read(str(source))
+        plex = self._plex_holds_the_write_lock(folder)
+        calls = []
+
+        def cancel_check() -> bool:
+            calls.append(1)
+            if len(calls) == 2:
+                source.write_bytes(b"changed while Plex held the lock")
+            return False
+
+        try:
+            with pytest.raises(loudness_db.SourceChangedError):
+                loudness_db.write_stream(
+                    db, 11, FIELDS, deadline=time.monotonic() + 60, source=fingerprint, cancel_check=cancel_check
+                )
+        finally:
+            plex.rollback()
+            plex.close()
+        assert session.paths.count("/v1/loudness/write") == 1
+        assert _extra(folder, "media_streams", 11) == BEFORE
+
+    def test_the_write_goes_through_once_plex_lets_go(self, node, folder):
+        db, session = _remote(node)
+        plex = self._plex_holds_the_write_lock(folder)
+
+        def cancel_check() -> bool:
+            if session.paths.count("/v1/loudness/write") == 1 and plex.in_transaction:
+                plex.rollback()
+            return False
+
+        try:
+            assert loudness_db.write_stream(db, 11, FIELDS, deadline=time.monotonic() + 60, cancel_check=cancel_check)
+        finally:
+            plex.close()
+        assert session.paths.count("/v1/loudness/write") == 2
+        assert _extra(folder, "media_streams", 11) != BEFORE
+
+    def test_each_attempt_asks_the_node_for_at_most_one_slice(self, node, folder):
+        db, session = _remote(node)
+        plex = self._plex_holds_the_write_lock(folder)
+        try:
+            with pytest.raises(plex_db.DatabaseBusyError) as caught:
+                loudness_db.mark_item(db, 1, deadline=time.monotonic() + 2.5)
+        finally:
+            plex.rollback()
+            plex.close()
+        assert session.paths.count("/v1/loudness/mark") >= 2
+        assert session.bodies["/v1/loudness/mark"]["deadline_s"] <= plex_db.WAIT_SLICE_S
+        # The message counts the whole wait, not the last slice.
+        assert "for 2 s" in str(caught.value) or "for 3 s" in str(caught.value)
+        assert _extra(folder, "metadata_items", 1) is None

@@ -8,8 +8,10 @@ files are missing, the folder listing the node sends back is used to suggest a c
 from __future__ import annotations
 
 import os
+import threading
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
@@ -23,6 +25,10 @@ SAMPLES_PER_ROOT = 3
 WALK_LIMIT = 500
 # Files per access-check request; the node checks each one on disk.
 CHECK_BATCH = 30
+# The longest Test access spends reading this app's own library folders. A stalled network mount blocks a directory
+# read in the kernel where no timeout reaches it, so each library is read on its own thread and one that isn't done
+# by then is reported as timed out; the request answers with what the others found.
+SAMPLE_BUDGET_S = 20.0
 
 
 def _video_extensions() -> frozenset[str]:
@@ -77,6 +83,16 @@ def library_roots(servers: list[dict]) -> list[LibraryRoot]:
     return out
 
 
+@dataclass
+class _Sampling:
+    """One library folder's sampling, shared with the thread doing it (which may still be stuck in a read)."""
+
+    found: list[dict] = field(default_factory=list)
+    folder: str = ""
+    timed_out: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+
+
 def sample_files(root: str, *, limit: int = SAMPLES_PER_ROOT, walk_limit: int = WALK_LIMIT) -> list[dict]:
     """Up to ``limit`` video files under ``root``, breadth first, with their size and ``mtime_ns``.
 
@@ -88,12 +104,23 @@ def sample_files(root: str, *, limit: int = SAMPLES_PER_ROOT, walk_limit: int = 
     Returns:
         ``[{"path", "size", "mtime_ns"}]``; empty when the folder is missing or holds no video in reach.
     """
+    sampling = _Sampling()
+    _sample_into(sampling, root, limit=limit, walk_limit=walk_limit, deadline=None)
+    return sampling.found
+
+
+def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int, deadline: float | None) -> None:
+    """:func:`sample_files` into ``sampling``, stopping (``timed_out``) at ``deadline`` between directory reads."""
     extensions = _video_extensions()
-    found: list[dict] = []
+    found = sampling.found
     seen = 0
     queue: deque[str] = deque([root])
     while queue and len(found) < limit and seen < walk_limit:
+        if deadline is not None and time.monotonic() >= deadline:
+            sampling.timed_out = True
+            return
         folder = queue.popleft()
+        sampling.folder = folder
         try:
             with os.scandir(folder) as it:
                 entries = sorted(it, key=lambda e: e.name)
@@ -114,7 +141,30 @@ def sample_files(root: str, *, limit: int = SAMPLES_PER_ROOT, walk_limit: int = 
             except OSError:
                 continue
             found.append({"path": entry.path, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
-    return found
+
+
+def _sample_roots(roots: list[LibraryRoot], budget_s: float) -> dict[LibraryRoot, _Sampling]:
+    """Sample every library folder at once, giving up on the ones not done within ``budget_s``.
+
+    Daemon threads, not a pool: a thread stuck in a read on a stalled mount must neither hold up the answer nor the
+    app's exit.
+    """
+    deadline = time.monotonic() + budget_s
+    samplings: dict[LibraryRoot, _Sampling] = {}
+    for root in roots:
+        sampling = samplings[root] = _Sampling()
+
+        def run(sampling: _Sampling = sampling, folder: str = root.app_root) -> None:
+            try:
+                _sample_into(sampling, folder, limit=SAMPLES_PER_ROOT, walk_limit=WALK_LIMIT, deadline=deadline)
+            finally:
+                sampling.done.set()
+
+        threading.Thread(target=run, name="test-access-sample", daemon=True).start()
+    for sampling in samplings.values():
+        if not sampling.done.wait(max(0.0, deadline - time.monotonic())):
+            sampling.timed_out = True
+    return samplings
 
 
 def _covering_row(app_root: str, mappings: list[PathMapping]) -> PathMapping | None:
@@ -228,7 +278,9 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
         NodeError: The node couldn't be asked.
     """
     roots = library_roots(servers)
-    samples = {root: sample_files(root.app_root) for root in roots}
+    samplings = _sample_roots(roots, SAMPLE_BUDGET_S)
+    # A copy: a thread that timed out may still be adding to its list.
+    samples = {root: list(samplings[root].found) for root in roots}
     files = [f for picked in samples.values() for f in picked]
     results, nearby = _check(client, mappings, files) if files else ({}, {})
     libraries = []
@@ -249,7 +301,11 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
         ok = bool(rows) and all(r["ok"] for r in rows)
         seen_nearby = _nearby_for(rows, nearby)
         error = None
-        if not picked:
+        if not picked and samplings[root].timed_out:
+            error = (
+                f"Timed out reading {samplings[root].folder or root.app_root} (no answer within {SAMPLE_BUDGET_S:g} s)"
+            )
+        elif not picked:
             error = (
                 f"This app can't open {root.app_root}"
                 if not os.path.isdir(root.app_root)

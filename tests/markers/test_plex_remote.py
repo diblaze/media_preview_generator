@@ -283,7 +283,7 @@ class TestVersionSkew:
         with pytest.raises(AgentError) as ei:
             remote.read_item(7, deadline=_deadline())
         assert "0.3.0" in str(ei.value) and plex_remote.MIN_AGENT_VERSION in str(ei.value)
-        assert "Update the agent container" in str(ei.value)
+        assert "Update the node." in str(ei.value)
 
     def test_an_agent_older_than_this_app_is_refused_even_when_it_answers(self):
         remote, _ = _remote(_envelope({"item": {"exists": True, "parts": []}}, version="0.3.0"))
@@ -326,7 +326,7 @@ class TestFailuresLookLikeTodays:
         remote, _ = _remote(requests.ConnectionError("connection refused"))
         report = remote.file_checks(deadline=_deadline())
         assert report.state is Capability.AGENT_UNAVAILABLE
-        assert "Can't reach the Plex marker agent" in report.message and "nothing is lost" in report.message
+        assert "Can't reach the Plex database node" in report.message and "nothing is lost" in report.message
         assert report.details["agent"] == {
             "url": URL,
             "version": "",
@@ -768,8 +768,8 @@ class TestARefusalNamesTheContainerItIsAbout:
         ).capability()
         assert report.state is Capability.NEEDS_LOCAL_DB
         assert report.message == (
-            "Plex's database is on a network share (nfs4) where the Plex marker agent runs. Mount Plex's config "
-            "folder into the agent's container from a local disk of the Plex machine; Plex stays read-only."
+            "Plex's database is on a network share (nfs4) where the Plex database node runs. Give the node Plex's "
+            "config folder from a local disk of the Plex machine (in Docker, mount it from one); Plex stays read-only."
         )
         # The refusal the agent exists to make unnecessary must not be the advice it gives.
         assert "The app must run on the same machine as Plex" not in report.message
@@ -784,9 +784,9 @@ class TestARefusalNamesTheContainerItIsAbout:
             )
         ).capability()
         assert report.message == (
-            "Plex's database is on a filesystem the Plex marker agent doesn't recognise as a local disk "
-            "(fuse.weird). Mount Plex's config folder into the agent's container from a local disk of the Plex "
-            "machine; Plex stays read-only."
+            "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
+            "(fuse.weird). Give the node Plex's config folder from a local disk of the Plex machine (in Docker, "
+            "mount it from one); Plex stays read-only."
         )
         assert "this app doesn't recognise" not in report.message
 
@@ -801,8 +801,8 @@ class TestARefusalNamesTheContainerItIsAbout:
         ).capability()
         assert report.state is Capability.MISCONFIGURED
         assert report.message == (
-            "The Plex marker agent (user 1000) can't write /agent/db, /agent/db-wal. Run the agent's container "
-            "with the user that owns Plex's database (user 998)."
+            "The Plex database node (user 1000) can't write /agent/db, /agent/db-wal. Run the node as the user "
+            "that owns Plex's database (user 998)."
         )
         assert "This app (user" not in report.message
 
@@ -832,7 +832,7 @@ class TestARefusalNamesTheContainerItIsAbout:
             )
         ).capability()
         assert report.state is Capability.NEEDS_LOCAL_DB
-        assert "the database file the agent sees at /agent/db" in report.message
+        assert "the database file the Plex database node sees at /agent/db" in report.message
 
 
 class TestWhatAFailedWriteLeavesBehind:

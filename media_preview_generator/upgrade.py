@@ -463,6 +463,8 @@ def _migrate_schema(sm) -> None:
         v22 -- Gives every worker group a member list: each v21 group keeps its id, name, hours and becomes one group
                with one member ``m1`` (device, count, job types). The groups revision moves on by one.
         v23 -- Drops ``max_concurrent_jobs``: workers decide how much runs at once, and only job start-up is bounded.
+        v24 -- Moves every Plex helper's address and key into a ``nodes`` record (Plex database role) and points the
+               server's ``markers.plex.agent.node_id`` at it; the old ``url``/``token`` stay as a rollback aid.
     """
     current = sm.get("_schema_version", 1)
     if current > _CURRENT_SCHEMA_VERSION:
@@ -1816,19 +1818,24 @@ def _migrate_to_v23(sm) -> list[str]:
 def _migrate_to_v24(sm) -> list[str]:
     """Move every Plex helper's address and key into a ``nodes`` record and point the server at it.
 
-    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``.
-    Servers that share one helper (same address and key) share one node, which is on when any of them had it on. A
-    block without both an address and a key had no helper to move, so it becomes ``{"enabled": False, "node_id":
-    None}``. A block already in the new shape is left alone, so a re-run changes nothing.
+    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it gains ``"node_id"``. Servers that
+    share one helper (same address and key) share one node, which is on when any of them had it on. A block without
+    both an address and a key had no helper to move, so it gets ``"enabled": False, "node_id": None``.
+
+    The old ``url`` and ``token`` are left in the block only as a rollback aid: a build from before nodes reads them,
+    so going back keeps writing through the helper instead of quietly opening this app's own copy of the database.
+    Nothing new reads them (the node record holds the address and key), nothing new writes them, and
+    ``markers.settings.mask_server`` keeps masking ``token``. A block that already has ``node_id`` is left alone, and
+    a helper already on the nodes list (same address and key) is reused, so a re-run changes nothing.
     """
-    from .nodes.settings import default_record
+    from .nodes.settings import NAME_MAX_LEN, default_record
 
     stored = sm.get_all()
     servers = stored.get("media_servers")
     if not isinstance(servers, list):
         return []
     nodes = copy.deepcopy([n for n in stored.get("nodes") or [] if isinstance(n, dict)])
-    by_address = {(str(n.get("url") or ""), str(n.get("key") or "")): n for n in nodes}
+    by_address = {(str(n.get("url") or "").rstrip("/"), str(n.get("key") or "")): n for n in nodes}
     names = {str(n.get("name") or "").casefold() for n in nodes}
     servers_out = copy.deepcopy(servers)
     moved = created = 0
@@ -1838,22 +1845,18 @@ def _migrate_to_v24(sm) -> list[str]:
         markers = entry.get("markers")
         plex = markers.get("plex") if isinstance(markers, dict) else None
         agent = plex.get("agent") if isinstance(plex, dict) else None
-        if not isinstance(agent, dict) or ("url" not in agent and "token" not in agent):
+        if not isinstance(agent, dict) or "node_id" in agent or ("url" not in agent and "token" not in agent):
             continue
         url = str(agent.get("url") or "").strip().rstrip("/")
         token = str(agent.get("token") or "").strip()
         enabled = bool(agent.get("enabled"))
         moved += 1
         if not (url and token):
-            plex["agent"] = {"enabled": False, "node_id": None}
+            agent.update({"enabled": False, "node_id": None})
             continue
         node = by_address.get((url, token))
         if node is None:
-            server_name = str(entry.get("name") or "").strip() or "Plex"
-            base = f"Plex helper ({server_name})"
-            name, suffix = base, 2
-            while name.casefold() in names:
-                name, suffix = f"{base} {suffix}", suffix + 1
+            name = _helper_node_name(str(entry.get("name") or "").strip() or "Plex", names, NAME_MAX_LEN)
             names.add(name.casefold())
             node = default_record(name=name, url=url, key=token, enabled=enabled)
             nodes.append(node)
@@ -1861,7 +1864,7 @@ def _migrate_to_v24(sm) -> list[str]:
             created += 1
         elif enabled:
             node["enabled"] = True
-        plex["agent"] = {"enabled": enabled, "node_id": node["id"]}
+        agent.update({"enabled": enabled, "node_id": node["id"]})
     if not moved:
         return []
     updates: dict[str, Any] = {"media_servers": servers_out}
@@ -1872,6 +1875,25 @@ def _migrate_to_v24(sm) -> list[str]:
     if not created:
         return []
     return [f"v24: moved {created} Plex helper(s) to the nodes list"]
+
+
+def _helper_node_name(server_name: str, taken: set[str], limit: int) -> str:
+    """``Plex helper (<server name>)``, numbered when taken, with the server name cut so it fits ``limit``.
+
+    Args:
+        server_name: The Plex server's name.
+        taken: Casefolded names already used.
+        limit: The longest name a node may have.
+    """
+    suffix = 1
+    while True:
+        tail = f") {suffix}" if suffix > 1 else ")"
+        room = limit - len("Plex helper (") - len(tail)
+        short = server_name if len(server_name) <= room else server_name[: room - 1].rstrip() + "…"
+        name = f"Plex helper ({short}{tail}"
+        if name.casefold() not in taken:
+            return name
+        suffix += 1
 
 
 def _intro_credits_on_any_server(sm) -> bool:

@@ -37,7 +37,7 @@ from .plex_db import (
     plex_db_path,
     publish_error_from_sqlite,
 )
-from .plex_remote import AgentClient, agent_older_than, report_from_json
+from .plex_remote import AgentClient, agent_older_than, node_refusal, report_from_json
 
 CHAPTER_CAPABILITY = "chapters_v1"
 MAX_CHAPTERS = 1000
@@ -562,14 +562,16 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
     settings = load_server(getattr(config, "markers", None), "plex")
     backend: AgentClient | LocalChapters
     if settings.agent_enabled:
-        if not settings.agent_url or not settings.agent_token:
-            raise ChapterError("Configure the Plex-side helper address and key", state=Capability.AGENT_UNAVAILABLE)
+        refusal = node_refusal(settings)
+        if refusal is not None:
+            raise ChapterError(refusal.message, state=refusal.state)
         backend = AgentClient(settings.agent_url, settings.agent_token)
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
         if not folder:
             raise ChapterError(
-                "Set a local Plex config folder or configure the Plex-side helper", state=Capability.NEEDS_LOCAL_DB
+                "Set a local Plex config folder or choose a Plex database node in Edit → Connection",
+                state=Capability.NEEDS_LOCAL_DB,
             )
         backend = LocalChapters(folder)
     return backend, machine, version, plex
@@ -583,17 +585,18 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
     identity = client.ping(timeout=5)
     if CHAPTER_CAPABILITY not in client.capabilities:
         raise ChapterError(
-            "Update the Plex-side helper to version 1.1.0 or newer for chapter registration",
+            "Update the Plex database node to version 1.1.0 or newer for chapter registration",
             state=Capability.PLUGIN_OUTDATED,
         )
     if version.startswith("1.43.5.") and agent_older_than(client.version, _AGENT_FOR_PMS_1_43_5):
         raise ChapterError(
-            f"Update the Plex-side helper to version {_AGENT_FOR_PMS_1_43_5} or newer for Plex 1.43.5",
+            f"Update the Plex database node to version {_AGENT_FOR_PMS_1_43_5} or newer for Plex 1.43.5",
             state=Capability.PLUGIN_OUTDATED,
         )
     if not machine or identity.get("machine_identifier") != machine:
         raise ChapterError(
-            "The Plex-side helper belongs to a different or unverifiable Plex server", state=Capability.MISCONFIGURED
+            "The Plex database node is beside a different Plex server, or can't say which one",
+            state=Capability.MISCONFIGURED,
         )
     result = client.post(
         f"/v1/chapters/{operation}",
@@ -606,7 +609,7 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
         timeout=13,
     )
     if result.get("capability") != CHAPTER_CAPABILITY:
-        raise ChapterError("Update the Plex-side helper for chapter registration", state=Capability.PLUGIN_OUTDATED)
+        raise ChapterError("Update the Plex database node for chapter registration", state=Capability.PLUGIN_OUTDATED)
     return result
 
 
@@ -620,7 +623,9 @@ def chapter_capability(server: Any, server_config: Any = None) -> CapabilityRepo
     except PublishError as exc:
         return CapabilityReport(exc.state or Capability.UNREACHABLE, str(exc))
     except (KeyError, TypeError, ValueError):
-        return CapabilityReport(Capability.AGENT_UNAVAILABLE, "Plex-side helper returned an invalid chapter response")
+        return CapabilityReport(
+            Capability.AGENT_UNAVAILABLE, "The Plex database node sent a chapter answer this app can't read"
+        )
 
 
 def resolve_chapter_target(
@@ -645,7 +650,7 @@ def resolve_chapter_target(
                 raise ValueError("Wrong source identity")
             return target
         except (KeyError, TypeError, ValueError) as exc:
-            raise ChapterError("Plex-side helper returned an invalid chapter snapshot") from exc
+            raise ChapterError("The Plex database node sent a chapter snapshot this app can't read") from exc
     return backend.read(
         canonical_path,
         machine,

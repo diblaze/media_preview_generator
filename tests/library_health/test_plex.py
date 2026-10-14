@@ -299,7 +299,7 @@ def test_an_unreachable_helper_counts_previews_through_the_api_and_says_why(monk
     assert (previews.total, previews.done, previews.todo) == (2, 1, 1)
     server._connect.return_value.query.assert_called_once_with("/library/sections/1/all?type=1")
     loudness = _cell(result, "1", Feature.LOUDNESS)
-    assert loudness.state == CellState.UNAVAILABLE and "helper" in loudness.reason
+    assert loudness.state == CellState.UNAVAILABLE and "Plex database node" in loudness.reason
     assert _cell(result, "1", Feature.INTRO).state == CellState.NOT_APPLICABLE
     assert result.access == plex.ACCESS_API_ONLY
     assert result.todo[0].library_id == "1"

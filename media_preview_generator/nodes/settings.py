@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from .protocol import PathMapping
+from .protocol import PathMapping, sendable_key
 
 KEY_MASK = "****"
 NAME_MAX_LEN = 80
@@ -30,15 +30,6 @@ def new_node_id() -> str:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def sendable_key(key: str) -> bool:
-    """Whether a key can go in an Authorization header: printable ASCII with no spaces.
-
-    A pasted curly quote or zero-width space would make every request fail with the key in a traceback, and the
-    node's constant-time compare refuses non-ASCII, so such a key is refused while the user is looking at it.
-    """
-    return all(33 <= ord(ch) <= 126 for ch in key)
 
 
 def normalise_url(raw: object) -> tuple[str | None, str]:
@@ -120,7 +111,8 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     """Validate one posted node against the record it updates and the other nodes.
 
     Fields left out keep their stored value. ``id``, ``node_uid`` and ``added_at`` are never taken from a client
-    for an existing node; a new node gets a fresh id.
+    for an existing node; a new node gets a fresh id. A new address clears ``node_uid`` (it is recorded again on
+    first contact), so re-pointing a node at another machine isn't refused as "a different node".
 
     Args:
         raw: The posted fields.
@@ -153,6 +145,9 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     if type(enabled) is not bool:
         return None, "enabled must be true or false"
     uid = base.get("node_uid") if existing is not None else raw.get("node_uid")
+    if existing is not None and url != normalise_url(base.get("url"))[0]:
+        # A new address may be a different machine: the id is recorded again on its first answer.
+        uid = None
     return {
         "id": str(base.get("id") or "") or new_node_id(),
         "node_uid": str(uid) if uid else None,
@@ -188,6 +183,7 @@ def validate_nodes(raw: object) -> tuple[list[dict] | None, str]:
         stored = {
             "id": node_id,
             "node_uid": entry.get("node_uid"),
+            "url": entry.get("url"),
             "key": str(entry.get("key") or ""),
             "added_at": entry.get("added_at"),
         }
@@ -230,6 +226,20 @@ def stored_nodes() -> list[dict]:
     return get_settings_manager().nodes
 
 
+def node_record(node_id: str | None) -> dict | None:
+    """The stored record for a node id (a copy), or None when there is no such node.
+
+    Args:
+        node_id: The app-side node id.
+    """
+    if not node_id:
+        return None
+    from ..web.settings_manager import get_settings_manager
+
+    node = find_node(get_settings_manager().get("nodes"), node_id)
+    return copy.deepcopy(node) if node is not None else None
+
+
 def node_address(node_id: str | None) -> tuple[str, str, str]:
     """The ``(url, key, name)`` on record for a node id; empty strings when there is no such node.
 
@@ -239,11 +249,7 @@ def node_address(node_id: str | None) -> tuple[str, str, str]:
     Args:
         node_id: The app-side node id.
     """
-    if not node_id:
-        return "", "", ""
-    from ..web.settings_manager import get_settings_manager
-
-    node = find_node(get_settings_manager().get("nodes"), node_id)
+    node = node_record(node_id)
     if node is None:
         return "", "", ""
     return str(node.get("url") or ""), str(node.get("key") or ""), str(node.get("name") or "")

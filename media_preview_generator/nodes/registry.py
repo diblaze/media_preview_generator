@@ -115,6 +115,7 @@ class _Outcome:
     version: str = ""
     roles: tuple[str, ...] = ()
     uid: str = ""
+    different_node: bool = False
 
 
 @dataclass
@@ -139,6 +140,7 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
+    different_node: bool = False
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -346,6 +348,17 @@ class NodeRegistry:
         with self._lock:
             live = self._nodes.get(node_id)
             return node_mappings(live.record) if live else []
+
+    def identity_ok(self, node_id: str) -> bool:
+        """False when the last check found a different node answering at this node's address.
+
+        True for a node no check has caught out (including an unknown node and an older Plex helper, which reports
+        no node id): the Plex database role refuses to send anything to an address that answers as another node.
+        """
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            return live is None or not live.different_node
 
     def capacity(self, node_id: str) -> NodeCapacity:
         """Whether the node's CPU / GPU members may take work now."""
@@ -577,6 +590,7 @@ class NodeRegistry:
             live.not_visible.clear()
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
+                live.different_node = False
         return live
 
     # ------------------------------------------------------------------ state
@@ -670,7 +684,12 @@ class NodeRegistry:
 
     def _apply(self, live: _Live, outcome: _Outcome) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason
-        if outcome.state == STATE_OFFLINE:
+        live.different_node = outcome.different_node
+        if outcome.different_node:
+            # Something answers; it just isn't this node. Waiting longer won't change that, so no offline backoff.
+            live.offline_streak = 0
+            delay = HEALTH_INTERVAL_S
+        elif outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
         else:
@@ -725,8 +744,9 @@ class NodeRegistry:
         if stored_uid and uid and uid != stored_uid:
             return _Outcome(
                 STATE_OFFLINE,
-                "A different node answered at this address. Point this node at its own address, or remove it and "
+                f"A different node answered at {name}'s address. Point {name} at its own address, or remove it and "
                 "add the new one.",
+                different_node=True,
             )
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         app_version = self._app_version()
@@ -767,13 +787,16 @@ class NodeRegistry:
             return _Outcome(STATE_KEY_REFUSED, f"{name} refused the key. Set the same key on both sides.", **legacy)
         if state == AGENT_INCOMPATIBLE:
             if agent_too_old(version):
-                reason = f"{name} is Plex helper {version}; this app needs {MIN_AGENT_VERSION} or newer. Update it."
+                reason = (
+                    f"{name} is a Plex database node, version {version}; this app needs {MIN_AGENT_VERSION} or "
+                    "newer. Update it."
+                )
             else:
                 reason = f"{name} speaks a newer protocol than this app. Update this app to match it."
             return _Outcome(STATE_UPDATE_NEEDED, reason, **legacy)
         return _Outcome(
             STATE_OFFLINE,
-            "Something answered at this address, but not as a node or a Plex helper. Check the address.",
+            "Something answered at this address, but not as a node this app can use. Check the address.",
         )
 
     def _quick_access_clear(self, node_id: str, live: _Live, client: NodeClient) -> None:

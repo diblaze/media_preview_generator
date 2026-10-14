@@ -161,6 +161,9 @@
         unreachable: ['bad', "Can't reach it"],
         rejected: ['bad', 'Key refused'],
         incompatible: ['warn', 'Update needed'],
+        disabled: ['warn', 'Turned off'],
+        different_node: ['bad', 'Different node'],
+        no_node: ['bad', 'No node'],
     };
 
     function renderPlexStatus(status) {

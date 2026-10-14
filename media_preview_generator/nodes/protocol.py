@@ -29,6 +29,17 @@ ROLE_WORKER = "worker"
 ROLE_PLEX_DB = "plex_db"
 ROLES = (ROLE_WORKER, ROLE_PLEX_DB)
 
+
+def sendable_key(key: str) -> bool:
+    """Whether a key can go in an Authorization header: printable ASCII with no spaces (33..126).
+
+    A pasted curly quote or zero-width space would make every request fail with the key in a traceback, and the
+    node's constant-time compare refuses non-ASCII. Both sides apply this one rule: the app refuses to store such a
+    key, and a node refuses to start with one, since no request the app sends could ever match it.
+    """
+    return bool(key) and all(33 <= ord(ch) <= 126 for ch in key)
+
+
 # Routes, so neither side spells them twice.
 ROUTE_HEALTH = "/v1/health"
 ROUTE_INFO = "/v1/info"

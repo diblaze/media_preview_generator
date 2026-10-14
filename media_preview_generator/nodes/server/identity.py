@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from ..protocol import sendable_key
 from .nodelog import SECRET_EXTRA
 
 IDENTITY_FILE = "node.json"
@@ -41,10 +42,12 @@ def default_config_dir() -> str:
 
 
 def _check_key(key: str, source: str) -> str:
-    # The app refuses to store a key that isn't printable ASCII, so a key with anything else in it could never match
-    # one the app sends: every request would 401 and look like a typo on the app's side. Said once, at start.
-    if not key or not key.isascii() or not key.isprintable():
-        raise SystemExit(f"{source} must be plain printable ASCII: the app can't send a key with any other character.")
+    # The app refuses to store a key outside printable ASCII without spaces, so such a key could never match one the
+    # app sends: every request would 401 and look like a typo on the app's side. Said once, at start.
+    if not sendable_key(key):
+        raise SystemExit(
+            f"{source} must be printable ASCII with no spaces: the app can't send a key with any other character."
+        )
     return key
 
 

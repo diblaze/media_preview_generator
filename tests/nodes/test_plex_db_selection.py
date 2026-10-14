@@ -84,7 +84,7 @@ def test_chapters_go_to_the_nodes_address_and_key(monkeypatch):
 
 
 def test_chapters_refuse_a_node_that_is_gone(monkeypatch):
-    with pytest.raises(plex_chapters.ChapterError, match="helper address and key"):
+    with pytest.raises(plex_chapters.ChapterError, match="no Plex database node on the Nodes page"):
         _chapter_backend(monkeypatch, _markers({"enabled": True, "node_id": "gone"}))
 
 
@@ -93,3 +93,47 @@ def test_chapters_without_a_node_use_the_local_folder(monkeypatch, tmp_path):
         monkeypatch, _markers({"enabled": False, "node_id": None}), {"plex_config_folder": str(tmp_path)}
     )
     assert not isinstance(backend, AgentClient)
+
+
+class TestLegacyHelperFields:
+    """v24 leaves the helper's own ``url``/``token`` in the block for a rollback; nothing new reads or changes them."""
+
+    LEGACY = {"enabled": True, "node_id": "n1", "url": "http://old-helper:9494", "token": "old-token"}
+
+    def test_the_node_record_decides_the_address_not_the_legacy_fields(self):
+        settings = load_server(_markers(dict(self.LEGACY)), "plex")
+        assert (settings.agent_url, settings.agent_token) == ("http://plex-host.lan:9494", "node-key")
+        db = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
+        assert (db._client.url, db._client._token) == ("http://plex-host.lan:9494", "node-key")
+
+    def test_a_gone_node_never_falls_back_to_the_legacy_address(self):
+        settings = load_server(_markers({**self.LEGACY, "node_id": "gone"}), "plex")
+        db = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
+        assert isinstance(db, RemotePlexDb) and db._client.url == ""
+
+    def test_a_save_keeps_the_stored_legacy_fields_and_ignores_posted_ones(self):
+        from media_preview_generator.markers.settings import validate_server
+
+        stored = _markers(dict(self.LEGACY))
+        posted = _markers({"enabled": False, "node_id": "n1", "url": "http://evil:1", "token": "****"})
+        block, err = validate_server(posted, "plex", stored)
+        assert err == ""
+        assert block["plex"]["agent"] == {
+            "enabled": False,
+            "node_id": "n1",
+            "url": "http://old-helper:9494",
+            "token": "old-token",
+        }
+
+    def test_a_block_without_legacy_fields_gets_none(self):
+        from media_preview_generator.markers.settings import validate_server
+
+        block, _ = validate_server(_markers({"enabled": True, "node_id": "n1"}), "plex", None)
+        assert block["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
+
+    def test_the_legacy_token_is_masked_for_the_browser(self):
+        from media_preview_generator.markers.settings import mask_server
+
+        masked = mask_server(_markers(dict(self.LEGACY)), "plex")
+        assert masked["plex"]["agent"]["token"] == "****"
+        assert "old-token" not in str(masked)

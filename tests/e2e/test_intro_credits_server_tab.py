@@ -1483,9 +1483,9 @@ class TestSetupHealthMarkerRows:
         self._open_health(authed_page, app_url, _plex_server(), payload)
 
         must_fix = authed_page.locator("#editReadinessBody details[data-tier='critical']")
-        expect(must_fix).to_contain_text("The Plex marker agent isn't answering", timeout=5000)
+        expect(must_fix).to_contain_text("The Plex database node isn't answering", timeout=5000)
         expect(must_fix).to_contain_text("Skip buttons need Plex Pass")
-        expect(must_fix).to_contain_text("Fix on the agent")
+        expect(must_fix).to_contain_text("Fix on the node")
         expect(must_fix).to_contain_text("Change in Plex UI")
 
     def test_database_row_with_an_agent_says_fix_on_the_agent(self, authed_page: Page, app_url: str) -> None:
@@ -1502,9 +1502,9 @@ class TestSetupHealthMarkerRows:
 
         must_fix = authed_page.locator("#editReadinessBody details[data-tier='critical']")
         expect(must_fix).to_contain_text(
-            "The Plex marker agent isn't on the machine with Plex's database", timeout=5000
+            "The Plex database node isn't on the machine with Plex's database", timeout=5000
         )
-        expect(must_fix).to_contain_text("Fix on the agent")
+        expect(must_fix).to_contain_text("Fix on the node")
         expect(must_fix).not_to_contain_text("Change in Plex UI")
 
     @staticmethod

@@ -181,6 +181,30 @@ class TestTheGuards:
         with pytest.raises(SystemExit, match="ASCII"):
             node_app(str(tmp_path), key=token)
 
+    def test_a_key_with_a_space_refuses_to_start(self, tmp_path):
+        with pytest.raises(SystemExit, match="no spaces"):
+            node_app(str(tmp_path), key="two words")
+
+    def test_the_role_without_a_key_says_how_to_get_one(self, tmp_path):
+        """The node server always passes NODE_KEY, AGENT_TOKEN or its generated key; the message says so instead of
+        claiming the role needs AGENT_TOKEN."""
+        from flask import Flask
+
+        with pytest.raises(SystemExit) as caught:
+            plex_db_role.register_plex_db(Flask(__name__), plex_config_dir=str(tmp_path), key="")
+        message = str(caught.value)
+        assert "generates a key and prints it once" in message
+        assert "won't start without" not in message
+
+    def test_the_node_server_starts_the_role_with_its_generated_key(self, tmp_path, monkeypatch):
+        from media_preview_generator.nodes.server.app import create_node_app
+
+        monkeypatch.delenv("NODE_KEY", raising=False)
+        monkeypatch.delenv("AGENT_TOKEN", raising=False)
+        monkeypatch.setenv("PLEX_CONFIG_DIR", str(tmp_path / "plex"))
+        app = create_node_app(config_dir=str(tmp_path / "node"), roles=["plex_db"])
+        assert "/v1/ping" in {rule.rule for rule in app.url_map.iter_rules()}
+
     def test_a_wrong_key_says_nothing_about_this_plex(self, agent):
         body = agent.post("/v1/checks/file", json={}, headers={"Authorization": "Bearer nope"}).get_data(as_text=True)
         assert "Plex Media Server" not in body and "db_path" not in body
@@ -454,7 +478,7 @@ class TestTheAppWritesPlexThroughTheAgent:
             publisher.write("7", [CREDITS], previous=[INTRO], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
 
         assert ei.value.state is Capability.AGENT_UNAVAILABLE
-        assert "Can't reach the Plex marker agent" in str(ei.value)
+        assert "Can't reach the Plex database node" in str(ei.value)
         assert _served(plex_config) == [("intro", 11_000, 37_000)]  # exactly what the first run left
 
     def test_a_stopped_agent_makes_the_server_not_ready_rather_than_crashing(self, agent):
