@@ -27,6 +27,9 @@ _submission_counter = 0
 CHECK_STAGE_WORKER_NAME = "Library scan"
 # What a submitted job shows until the first of its files is picked.
 WAITING_FOR_WORKER = "Waiting for a free worker"
+# Kinds with a check_share < 1 together hold at most this share of the checking threads, so with Intro & Credits and
+# loudness both scanning, a quarter is still free for preview checks.
+CAPPED_KINDS_SHARE = 0.75
 
 
 def _next_submission_order() -> int:
@@ -1131,16 +1134,28 @@ class JobDispatcher:
                 and t.check_queue
             ]
             eligible.sort(key=_pick_order)
+            capped_kinds = {t.kind for t in self._trackers.values() if self._kind_check_cap(t) is not None}
+            capped_in_flight = sum(by_kind.get(kind, 0) for kind in capped_kinds)
             for tracker in eligible:
                 if not self.worker_pool.has_capacity_for(tracker.kind):
                     continue
-                if (cap := self._kind_check_cap(tracker)) is not None and by_kind.get(tracker.kind, 0) >= cap:
+                if (cap := self._kind_check_cap(tracker)) is not None and (
+                    by_kind.get(tracker.kind, 0) >= cap or capped_in_flight >= self._capped_kinds_limit()
+                ):
                     continue
                 item = tracker.check_queue.popleft()
                 tracker.active_checks += 1
                 self._stamp_pick(tracker)
                 return (tracker, item)
         return None
+
+    def _capped_kinds_limit(self) -> int:
+        """In-flight checks all capped kinds may hold together, so preview checks always keep threads of their own.
+
+        Returns:
+            ``max(1, int(_max_checks * CAPPED_KINDS_SHARE))``.
+        """
+        return max(1, int(self._max_checks * CAPPED_KINDS_SHARE))
 
     def _kind_check_cap(self, tracker: JobTracker) -> int | None:
         """In-flight check limit for the tracker's kind, or None when the kind may use every checking thread.

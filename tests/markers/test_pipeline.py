@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -170,7 +170,7 @@ class TestOwners:
         jf_cfg.libraries = [Library("7", "TV", (_media_root(media),), enabled=False)]
         jf_cfg.markers["enabled"] = False
         _run(_ctx(store, reg), media, {"plex-1": ready_publisher()})
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
         reg.get("jellyfin-1").get_media_segments.assert_called_once_with("item-jellyfin-1")
 
     @pytest.mark.parametrize(
@@ -883,7 +883,7 @@ class TestEvidenceAndDecisions:
         out, _ = _run(ctx, media, {"plex-1": plex, "jellyfin-1": jf}, probe=_probe(CHAPTERS_BOTH))
         assert out.outcome_key == FileOutcome.PUBLISHED.value
         assert [len(c.calls) for c in ctx.clients.values()] == [1, 1, 1]
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
         reg.get("jellyfin-1").get_media_segments.assert_called_once_with("item-jellyfin-1")
         for pub, sid in ((plex, "plex-1"), (jf, "jellyfin-1")):
             args, kwargs = pub.write.call_args
@@ -1181,7 +1181,7 @@ class TestEvidenceAndDecisions:
         assert plex.write.call_args.args[1] == [Marker(T.INTRO, 127_500, 157_000, ("skipdb", "theintrodb"))]
         assert [len(c.calls) for c in clients.values()] == [1, 0, 1]
         # The server is still read before the first publish: its own marker could shorten the decided skip (rule 7).
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
 
     def test_a_server_read_after_everything_is_decided_shortens_agreed_credits(self, store, media):
         reg = _registry(media, ServerType.PLEX)
@@ -1200,7 +1200,7 @@ class TestEvidenceAndDecisions:
         assert plex.write.call_args.args == ("item-plex-1", [shortened])
         decision = store.get_decisions(store.get_file(media).id)[T.CREDITS]
         assert decision.reason == "sources agree: introdb, skipdb; start shortened to the server's own marker (plex-1)"
-        plex_server.get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        plex_server.get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
 
     def test_chapters_alone_keep_the_search_open_so_agreeing_sources_veto_them_on_the_first_run(self, store, media):
         # The generic "Intro" chapter is the cold open (0-95 s); the theme sits in an unnamed chapter
@@ -1263,7 +1263,7 @@ class TestEvidenceAndDecisions:
         assert [c["priority"] for c in clients["theintrodb"].calls] == ([priority] if theintrodb_asked else [])
         # The free sources and the servers are still asked: two of them agreeing could still veto the chapters.
         assert (len(clients["introdb"].calls), len(clients["skipdb"].calls)) == (1, 1)
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
 
     def test_a_lone_online_answer_writes_nothing_and_the_file_says_why(self, store, media):
         reg = _registry(media, ServerType.PLEX)
@@ -1837,7 +1837,7 @@ class TestServerMarkers:
         plex = ready_publisher()
         out, _ = _run(_ctx(store, reg, clients=clients, settings_raw=INTRO_ONLY), media, {"plex-1": plex})
         assert out.outcome_key == FileOutcome.PUBLISHED.value
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
         _run(_ctx(store, reg, clients=clients, settings_raw=INTRO_ONLY, force=True), media, {"plex-1": plex})
         assert reg.get("plex-1").get_markers.call_count == 1  # never re-read a server we've published to
         assert plex.write.call_args.args[1] == [Marker(T.INTRO, 127_894, 156_824, ("theintrodb", "server_markers"))]
@@ -1848,7 +1848,11 @@ class TestServerMarkers:
         _run(_ctx(store, reg), media, {"jellyfin-1": ready_publisher("jellyfin_bridge")})
         for sid in ("plex-1", "jellyfin-1", "emby-1"):
             # Plex's evidence read is unknown while the item's library hides a type (its own setting off).
-            hidden = {"unknown_if_hidden": True} if reg.get_config(sid).type is ServerType.PLEX else {}
+            hidden = (
+                {"unknown_if_hidden": True, "part_durations": ANY}
+                if reg.get_config(sid).type is ServerType.PLEX
+                else {}
+            )
             _vendor_read(reg, sid).assert_called_once_with(f"item-{sid}", **hidden)
         stored = {r.origin for r in store.evidence_rows(store.get_file(media).id) if r.source is Source.SERVER_MARKERS}
         assert stored == {"plex-1", "jellyfin-1", "emby-1"}
@@ -1896,7 +1900,7 @@ class TestServerMarkers:
         )
         store.set_publish_state(rec.id, "plex-1", item_id="item-plex-1", markers=[], status="written")
         _run(_ctx(store, reg), media, {"plex-1": ready_publisher()})
-        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        reg.get("plex-1").get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
 
     @pytest.mark.parametrize(
         "setup",
@@ -1989,7 +1993,7 @@ class TestServerMarkers:
         _run(_ctx(store, reg, settings_raw=raw, now=lambda: clock["t"]), media, {"plex-1": ready_publisher()})
         server = reg.get("plex-1")
         assert server.get_markers.call_count == (2 if read_again else 1)
-        server.get_markers.assert_called_with("item-plex-1", unknown_if_hidden=True)
+        server.get_markers.assert_called_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
         store.close()
 
     def test_a_sibling_publish_landing_during_the_read_discards_the_answer(self, store, tmp_path):
@@ -2016,7 +2020,7 @@ class TestServerMarkers:
 
         server.get_markers.side_effect = plex_markers
         _run(_ctx(store, reg), version_a, {"plex-1": ready_publisher()})
-        server.get_markers.assert_called_once_with("42", unknown_if_hidden=True)
+        server.get_markers.assert_called_once_with("42", unknown_if_hidden=True, part_durations=ANY)
         assert store.evidence_fetched_at(store.get_file(version_a).id, Source.SERVER_MARKERS, "plex-1") is None
 
     def test_server_without_the_item_is_not_read(self, store, media):
@@ -2104,7 +2108,7 @@ class TestServerMarkersFromVendors:
         assert [(c.start_ms, c.end_ms) for c in stored] == [
             (r["start_ms"], None if r["final"] else r["end_ms"]) for r in plex_rows
         ]
-        plex_server.get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True)
+        plex_server.get_markers.assert_called_once_with("item-plex-1", unknown_if_hidden=True, part_durations=ANY)
         plex_server.get_part_durations.assert_called_once_with("item-plex-1")
 
     @pytest.mark.parametrize(
@@ -5889,7 +5893,7 @@ class TestHandlersAndContext:
         process.assert_called_once_with(item, ctx=ctx, gpu="NVIDIA", gpu_device_path="cuda:0", pause_check=cancel)
         assert handlers.outcome_keys == OUTCOME_KEYS
         assert handlers.check_label == "Looking up markers…" and handlers.check_worker_label == "Intro & Credits"
-        assert handlers.check_share == 0.25
+        assert handlers.check_share == 0.5
 
     def test_build_clients_for_enabled_online_sources_only(self):
         from media_preview_generator.markers.sources.introdb import IntroDbClient
@@ -6097,3 +6101,29 @@ class TestFrameRateIgnoresStaleServerMarkers:
             rate = pipeline._frame_rate(ctx, rec, evidence, self.ORDER)
         assert read_rate.call_args_list == ([call(ctx, rec, probe=pipeline.probe_media)] if read else [])
         assert rate == (25.0 if read else None)
+
+
+class TestPartsKeptAsksPlexOnce:
+    def test_the_markers_read_supplies_the_part_durations(self):
+        server = MagicMock()
+
+        def get_markers(item_id, *, unknown_if_hidden=False, part_durations=None):
+            part_durations[item_id] = [1000, None]
+            return []
+
+        server.get_markers.side_effect = get_markers
+        kept: dict = {}
+        client = pipeline._PartsKept(server, kept)
+        assert client.get_markers("7", unknown_if_hidden=True) == []
+        assert client.get_part_durations("7") == [1000, None]
+        server.get_part_durations.assert_not_called()
+        assert kept == {"7": [1000, None]}
+
+    def test_a_client_that_does_not_fill_them_still_asks_for_them(self):
+        server = MagicMock()
+        server.get_markers.return_value = []
+        server.get_part_durations.return_value = [5]
+        client = pipeline._PartsKept(server, {})
+        client.get_markers("7", unknown_if_hidden=True)
+        assert client.get_part_durations("7") == [5]
+        server.get_part_durations.assert_called_once_with("7")

@@ -193,16 +193,16 @@ class TestReadMemo:
         )
 
     def test_a_read_is_made_once_inside_a_run(self, store, rec):
-        with store.read_memo(), patch.object(store, "_conn", wraps=store._conn) as conn:
+        with store.read_memo(), patch.object(store, "_reading", wraps=store._reading) as reading:
             store.get_evidence(rec.id)
             store.get_evidence(rec.id)
-        assert conn.execute.call_count == 1
+        assert reading.call_count == 1
 
     def test_reads_outside_a_run_are_never_remembered(self, store, rec):
-        with patch.object(store, "_conn", wraps=store._conn) as conn:
+        with patch.object(store, "_reading", wraps=store._reading) as reading:
             store.get_evidence(rec.id)
             store.get_evidence(rec.id)
-        assert conn.execute.call_count == 2
+        assert reading.call_count == 2
 
     def test_a_write_by_the_run_ends_what_it_read(self, store, rec):
         with store.read_memo():

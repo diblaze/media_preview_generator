@@ -858,6 +858,76 @@ def test_kind_check_share_caps_in_flight_checks_and_leaves_room_for_previews():
     assert t_ic.outcome_counts["markers_published"] == 6
 
 
+def test_capped_kinds_together_leave_a_quarter_of_the_threads_for_previews():
+    """Intro & Credits and loudness at half each would fill every checking thread; together they stop at 3/4."""
+    from tests.conftest import _ms
+
+    pool = WorkerPool(cpu_workers=1, gpu_workers=0, selected_gpus=[])
+    dispatcher = JobDispatcher(pool)
+    release = threading.Event()
+    lock = threading.Lock()
+    in_flight: dict[str, int] = {"ic": 0, "loud": 0}
+    peak = {"total": 0}
+
+    def stuck_check(kind):
+        def check(item, *, cancel_check):
+            with lock:
+                in_flight[kind] += 1
+                peak["total"] = max(peak["total"], sum(in_flight.values()))
+            release.wait(timeout=10)
+            with lock:
+                in_flight[kind] -= 1
+            return ItemOutcome("markers_published")
+
+        return check
+
+    def handlers(kind):
+        return KindHandlers(check_fn=stuck_check(kind), process_fn=MagicMock(), outcome_keys=KEYS, check_share=0.5)
+
+    config = _config()
+    config.scan_workers = 8  # each kind may hold 4; together they may hold 6
+    with (
+        patch("media_preview_generator.processing.generator._notify_file_result"),
+        patch("media_preview_generator.web.jobs.get_job_manager"),
+        patch(
+            "media_preview_generator.processing.multi_server.process_canonical_path",
+            side_effect=lambda **kw: _ms("skipped", canonical_path=kw["canonical_path"]),
+        ),
+    ):
+        try:
+            t_ic = dispatcher.submit_items(
+                "ic",
+                _items(*[f"/m/ic{i}.mkv" for i in range(6)]),
+                config,
+                MagicMock(),
+                kind="intro_credits",
+                handlers=handlers("ic"),
+            )
+            t_loud = dispatcher.submit_items(
+                "loud",
+                _items(*[f"/m/l{i}.mkv" for i in range(6)]),
+                config,
+                MagicMock(),
+                kind="loudness",
+                handlers=handlers("loud"),
+            )
+            for _ in range(100):
+                if sum(in_flight.values()) == 6:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)
+            assert peak["total"] == 6
+            assert in_flight["ic"] <= 4 and in_flight["loud"] <= 4
+            t_prev = dispatcher.submit_items("prev", _items("/m/p1.mkv", "/m/p2.mkv"), config, MagicMock())
+            assert t_prev.wait(timeout=10)  # previews still get checking threads while both kinds are stuck
+            release.set()
+            assert t_ic.wait(timeout=10) and t_loud.wait(timeout=10)
+        finally:
+            release.set()
+            dispatcher.shutdown()
+    assert peak["total"] == 6
+
+
 def test_previews_tracker_without_handlers_still_calls_process_canonical_path_with_same_kwargs():
     from tests.conftest import _ms
 

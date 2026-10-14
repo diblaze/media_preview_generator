@@ -309,6 +309,10 @@ def _revision(path: Path) -> str:
     return _file_sha256(path)
 
 
+def _file_stamp(info: os.stat_result) -> dict:
+    return {"size": info.st_size, "mtime_ns": info.st_mtime_ns, "ino": info.st_ino}
+
+
 def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
     target = cast("ChapterTarget", plan.target)
     try:
@@ -317,6 +321,7 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
             return {}
         entries = manifest.get("images", {})
         fresh = {}
+        proven: dict[str, tuple[dict, dict]] = {}
         for chapter in target.chapters:
             entry = entries.get(str(chapter.index), {})
             if entry.get("start_ms") != chapter.start_ms or entry.get("end_ms") != chapter.end_ms:
@@ -326,15 +331,66 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
                 continue
             path = plan.folder / f"chapter{chapter.index}.jpg"
             try:
+                stamp = _file_stamp(os.stat(path))
+                # Any write or replacement moves the size, modification time or inode, so a matching stamp is the
+                # same bytes the hash below was recorded for; only a changed or unstamped image is read again.
+                if all(entry.get(key) == value for key, value in stamp.items()):
+                    fresh[str(chapter.index)] = entry
+                    continue
                 # The recorded hash was taken only after _revision decoded this image, so identical bytes are
                 # already known to be a complete 1280px JPEG. Truncated or replaced files differ in their hash.
-                if entry.get("sha256") == _file_sha256(path):
+                if entry.get("sha256") == _file_sha256(path) and _file_stamp(os.stat(path)) == stamp:
+                    proven[str(chapter.index)] = (dict(entry), stamp)
+                    entry.update(stamp)
                     fresh[str(chapter.index)] = entry
             except OSError:
                 continue
+        if proven:
+            _stamp_manifest(plan, proven)
         return fresh
     except (OSError, ValueError, TypeError, AttributeError):
         return {}
+
+
+def _folder_lock(plan: ChapterPlan) -> threading.Lock:
+    return _LOCKS[hash(str(plan.folder)) % len(_LOCKS)]
+
+
+def _stamp_manifest(plan: ChapterPlan, proven: dict[str, tuple[dict, dict]]) -> None:
+    """Keep the stamps of images just proven unchanged by their hash, so the next check needn't read them.
+
+    Under the folder's lock, on the manifest as it is now: a stamp is added only where the entry still has the hash
+    and times that were proven and the image still has that stamp. While a worker holds the lock (this thread's own
+    worker included) nothing is written; its own manifest wins and the next check hashes those images again.
+
+    Args:
+        proven: Per chapter index, the manifest entry whose hash matched and the image's stamp at that moment.
+    """
+    lock = _folder_lock(plan)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        manifest = json.loads(plan.manifest_path.read_text())
+        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+            return
+        entries = manifest.get("images", {})
+        changed = False
+        for index, (entry_then, stamp) in proven.items():
+            entry = entries.get(index)
+            if not isinstance(entry, dict):
+                continue
+            if any(entry.get(key) != entry_then.get(key) for key in ("sha256", "start_ms", "end_ms")):
+                continue
+            if _file_stamp(os.stat(plan.folder / f"chapter{index}.jpg")) != stamp:
+                continue
+            entry.update(stamp)
+            changed = True
+        if changed:
+            _replace_manifest(plan, manifest)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        logger.debug("Could not record chapter image stamps in {}: {}", plan.manifest_path, exc)
+    finally:
+        lock.release()
 
 
 def _has_image(entry: dict | None) -> bool:
@@ -399,6 +455,10 @@ def _write_manifest(
         payload["failed"] = failed
     if verified:
         payload["verified"] = _registration_key(plan, images)
+    _replace_manifest(plan, payload)
+
+
+def _replace_manifest(plan: ChapterPlan, payload: dict) -> None:
     fd, name = tempfile.mkstemp(prefix=".mpg-chapters-", suffix=".json", dir=plan.folder)
     try:
         with os.fdopen(fd, "w") as output:
@@ -603,7 +663,7 @@ def publish_chapters(
                 {"stage": stage, "processed": processed, "total": total, "ready": len(images), "failed": failed}
             )
 
-    lock = _LOCKS[hash(str(plan.folder)) % len(_LOCKS)]
+    lock = _folder_lock(plan)
     report("waiting")
     while not lock.acquire(timeout=0.1):
         if cancel_check and cancel_check():
@@ -699,12 +759,14 @@ def publish_chapters(
                         else:
                             recovery["cause"] = "seek_timeout"
                     revision = _revision(staged)
+                    stamp = _file_stamp(os.stat(staged))
                     _check_source(plan)
                     os.replace(staged, plan.folder / f"chapter{chapter.index}.jpg")
                     images[str(chapter.index)] = {
                         "start_ms": chapter.start_ms,
                         "end_ms": chapter.end_ms,
                         "sha256": revision,
+                        **stamp,
                         **({"recovery": recovery} if recovery else {}),
                     }
                     _write_manifest(plan, images)

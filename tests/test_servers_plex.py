@@ -2041,6 +2041,25 @@ class TestPlexMarkerHelpers:
         assert plex_server_under_test.get_part_durations("/library/metadata/777") == [1_444_574, 1_384_574, None]
         assert conn.query.call_args.args[0] == "/library/metadata/777"
 
+    def test_get_markers_hands_back_the_part_durations_from_the_same_request(self, plex_server_under_test):
+        import xml.etree.ElementTree as ET
+
+        xml = ET.fromstring(
+            '<MediaContainer><Video ratingKey="777" duration="1444574">'
+            '<Marker type="intro" startTimeOffset="1000" endTimeOffset="9000"/>'
+            '<Media id="1" duration="1444574"><Part id="11" duration="1444574" file="/tv/bd.mkv"/></Media>'
+            '<Media id="2"><Part id="21" file="/tv/unknown.mkv"/></Media>'
+            "</Video></MediaContainer>"
+        )
+        conn = plex_server_under_test._connect.return_value
+        conn.query.return_value = xml
+        durations: dict = {}
+        markers = plex_server_under_test.get_markers("777", part_durations=durations)
+        assert markers == [{"type": "intro", "start_ms": 1000, "end_ms": 9000, "final": False}]
+        assert durations == {"777": [1_444_574, None]}
+        assert conn.query.call_count == 1
+        assert conn.query.call_args.args[0] == "/library/metadata/777?includeMarkers=1"
+
     @pytest.mark.parametrize(
         ("media", "count"),
         [

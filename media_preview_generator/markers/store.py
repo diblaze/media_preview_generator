@@ -625,6 +625,9 @@ class MarkerStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._readers: list[sqlite3.Connection] = []
+        self._readers_lock = threading.Lock()
+        self._closed = False
         try:
             with self._lock:
                 self._open_schema()
@@ -738,9 +741,62 @@ class MarkerStore:
         return self._clock().isoformat()
 
     def close(self) -> None:
-        """Close the connection."""
+        """Close the connection and every pooled reader."""
         with self._lock:
             self._conn.close()
+        with self._readers_lock:
+            self._closed = True
+            for reader in self._readers:
+                reader.close()
+            self._readers.clear()
+
+    @contextmanager
+    def _reading(self) -> Iterator[sqlite3.Connection]:
+        """A connection for a read-only block; reads never wait for the store lock or for a writer (WAL).
+
+        The block sees one snapshot (a read transaction spans it). A thread inside its own ``_tx`` gets the writing
+        connection under the lock instead, so it sees its own uncommitted writes.
+
+        Yields:
+            A connection no other thread uses until the block ends.
+        """
+        if self._tx_owner == threading.get_ident():
+            with self._lock:
+                yield self._conn
+            return
+        with self._readers_lock:
+            conn = self._readers.pop() if self._readers else None
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+        healthy = False
+        try:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                healthy = self._end_read(conn)
+        finally:
+            with self._readers_lock:
+                pooled = healthy and not self._closed
+                if pooled:
+                    self._readers.append(conn)
+            if not pooled:
+                conn.close()
+
+    @staticmethod
+    def _end_read(conn: sqlite3.Connection) -> bool:
+        """End a reader's read transaction; False when the connection can't be used again."""
+        # ROLLBACK, not COMMIT: the block wrote nothing, and a ROLLBACK also resets any cursor left open, which
+        # would otherwise keep its old snapshot into the next thread's read.
+        for ending in ("ROLLBACK", "COMMIT"):
+            try:
+                conn.execute(ending)
+            except sqlite3.Error:
+                continue
+            return True
+        return False
 
     @contextmanager
     def _tx(self, *, cached_reads_unchanged: bool = False) -> Iterator[sqlite3.Connection]:
@@ -935,8 +991,8 @@ class MarkerStore:
     @read_memoised
     def get_file(self, canonical_path: str) -> FileRecord | None:
         """Look a file up by canonical path."""
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM files WHERE canonical_path=?", (canonical_path,)).fetchone()
+        with self._reading() as conn:
+            row = conn.execute("SELECT * FROM files WHERE canonical_path=?", (canonical_path,)).fetchone()
         return self._file(row) if row else None
 
     @staticmethod
@@ -998,9 +1054,9 @@ class MarkerStore:
     def moved_here(self, rec: FileRecord) -> bool:
         """Whether a file's identity (size and mtime) is another path's row too: it was moved here from there (a
         rename keeps both), so it didn't replace this path's earlier file."""
-        with self._lock:
+        with self._reading() as conn:
             return (
-                self._conn.execute(
+                conn.execute(
                     "SELECT 1 FROM files WHERE size=? AND mtime_ns=? AND id != ? LIMIT 1",
                     (rec.size, rec.mtime_ns, rec.id),
                 ).fetchone()
@@ -1016,8 +1072,8 @@ class MarkerStore:
         Returns:
             One per type an earlier identity decided, needed review for or found nothing for.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT r.type, r.start_ms, r.end_ms, r.decided_by, r.duration_ms, r.seen_at, v.versions "
                 "FROM replaced_decisions r LEFT JOIN replaced_versions v "
                 "ON v.file_id = r.file_id AND v.type = r.type AND v.seen_at = r.seen_at "
@@ -1048,9 +1104,9 @@ class MarkerStore:
             Their records.
         """
         found: dict[int, FileRecord] = {}
-        with self._lock:
+        with self._reading() as conn:
             for server_id, item_id in items:
-                for r in self._conn.execute(
+                for r in conn.execute(
                     "SELECT f.* FROM publish_state p JOIN files f ON f.id = p.file_id "
                     "WHERE p.server_id=? AND p.item_id=? AND f.id != ?",
                     (server_id, item_id, other_than),
@@ -1067,12 +1123,12 @@ class MarkerStore:
         Returns:
             One per type it decided, needed review for or found nothing for; none when its length is unknown.
         """
-        with self._lock:
-            row = self._conn.execute("SELECT duration_ms, updated_at FROM files WHERE id=?", (file_id,)).fetchone()
+        with self._reading() as conn:
+            row = conn.execute("SELECT duration_ms, updated_at FROM files WHERE id=?", (file_id,)).fetchone()
             if row is None or not row["duration_ms"]:
                 return []
-            judged = self._judged(self._conn, file_id)
-            stored = self._answer_versions(self._conn, file_id)
+            judged = self._judged(conn, file_id)
+            stored = self._answer_versions(conn, file_id)
         return [
             PreviousDecision(
                 MarkerType(mtype),
@@ -1087,8 +1143,8 @@ class MarkerStore:
 
     def files_in_season(self, season_key: str) -> list[FileRecord]:
         """All known files of a season folder that aren't missing from disk, sorted by path."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT * FROM files WHERE season_key=? AND missing_since IS NULL ORDER BY canonical_path",
                 (season_key,),
             ).fetchall()
@@ -1105,8 +1161,8 @@ class MarkerStore:
         Returns:
             The paths.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT DISTINCT f.canonical_path FROM publish_state p JOIN files f ON f.id = p.file_id "
                 "LEFT JOIN version_reruns r ON r.file_id = f.id AND r.detector = ? "
                 "WHERE p.status='waiting' AND substr(p.message, 1, ?) = ? AND f.missing_since IS NULL "
@@ -1118,8 +1174,8 @@ class MarkerStore:
     def files_with_season_audio_intro(self) -> list[str]:
         """Canonical paths of the files whose intro marker was decided with a season audio answer (or the
         previous-season hint) and isn't locked, sorted; files missing from disk are left out."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT f.canonical_path FROM markers m JOIN files f ON f.id = m.file_id "
                 "WHERE m.type=? AND m.locked=0 AND f.missing_since IS NULL AND EXISTS "
                 "(SELECT 1 FROM json_each(m.decided_by) WHERE json_each.value IN (?, ?)) ORDER BY f.canonical_path",
@@ -1134,8 +1190,8 @@ class MarkerStore:
         pair can be online times from the film-rate release and a marker made for an earlier file of the item. On that
         run the server's answer is read again and flagged when Plex says so, or, from a Plex server that shows our
         markers now (so can't be read again), stops counting."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT DISTINCT f.canonical_path FROM markers m JOIN files f ON f.id = m.file_id "
                 "WHERE m.type IN (?, ?) AND m.locked=0 AND f.missing_since IS NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(m.decided_by) WHERE json_each.value = ?) "
@@ -1187,8 +1243,8 @@ class MarkerStore:
         type_names = [mtype.value for mtype in types]
         in_sources = ",".join("?" * len(names))
         in_types = ",".join("?" * len(type_names))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT DISTINCT f.canonical_path FROM evidence_versions v "
                 "JOIN files f ON f.id = v.file_id "
                 "JOIN decisions d ON d.file_id = v.file_id "
@@ -1235,8 +1291,8 @@ class MarkerStore:
         Returns:
             The paths.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT f.canonical_path, d.status, d.reason FROM decisions d "
                 "JOIN files f ON f.id = d.file_id "
                 "LEFT JOIN markers m ON m.file_id = d.file_id AND m.type = d.type "
@@ -1269,8 +1325,8 @@ class MarkerStore:
         Returns:
             The paths.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT f.canonical_path, i.markers_json, m.type, m.start_ms, m.end_ms, "
                 "json_extract(iv.files_json, '$[0]') AS item_file FROM publish_state p "
                 "JOIN files f ON f.id = p.file_id "
@@ -1310,8 +1366,8 @@ class MarkerStore:
 
     def version_rerun(self, file_id: int, detector: str) -> int | None:
         """The version of ``detector`` the file was last taken to be read again for, or None."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 "SELECT version FROM version_reruns WHERE file_id=? AND detector=?", (file_id, detector)
             ).fetchone()
         return int(row["version"]) if row else None
@@ -1331,8 +1387,8 @@ class MarkerStore:
         if not values:
             return []
         marks = ",".join("?" * len(values))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT DISTINCT f.canonical_path FROM files f JOIN (SELECT file_id FROM evidence "
                 f"WHERE origin='' AND source IN ({marks}) GROUP BY file_id, source "  # noqa: S608
                 "HAVING COUNT(type) = 0 AND MAX(fetched_at) < ?) e ON e.file_id = f.id "
@@ -1540,8 +1596,8 @@ class MarkerStore:
     @read_memoised
     def evidence_version(self, file_id: int, source: Source, origin: str = "") -> int | None:
         """The version one lookup's stored evidence was made with (None = never stored, or stored without one)."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 "SELECT version FROM evidence_versions WHERE file_id=? AND source=? AND origin=?",
                 (file_id, source.value, origin),
             ).fetchone()
@@ -1565,16 +1621,16 @@ class MarkerStore:
     @read_memoised
     def evidence_fetched_at(self, file_id: int, source: Source, origin: str = "") -> datetime | None:
         """When a source was last looked up for this file (None = never)."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 "SELECT MAX(fetched_at) AS t FROM evidence WHERE file_id=? AND source=? AND origin=?",
                 (file_id, source.value, origin),
             ).fetchone()
         return datetime.fromisoformat(row["t"]) if row and row["t"] else None
 
     def _evidence_query(self, file_id: int) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._conn.execute("SELECT * FROM evidence WHERE file_id=? ORDER BY id", (file_id,)).fetchall()
+        with self._reading() as conn:
+            return conn.execute("SELECT * FROM evidence WHERE file_id=? ORDER BY id", (file_id,)).fetchall()
 
     @read_memoised
     def evidence_rows(self, file_id: int) -> list[EvidenceRow]:
@@ -1665,8 +1721,8 @@ class MarkerStore:
 
     def _markers(self, file_id: int, locked_only: bool) -> dict[MarkerType, Marker]:
         sql = "SELECT * FROM markers WHERE file_id=?" + (" AND locked=1" if locked_only else "")
-        with self._lock:
-            rows = self._conn.execute(sql, (file_id,)).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute(sql, (file_id,)).fetchall()
         return {
             MarkerType(r["type"]): Marker(
                 MarkerType(r["type"]), r["start_ms"], r["end_ms"], tuple(json.loads(r["decided_by"])), bool(r["locked"])
@@ -1769,8 +1825,8 @@ class MarkerStore:
 
     def locked_at(self, file_id: int) -> dict[MarkerType, str]:
         """When the user locked each locked marker of a file, by type (rows locked before this column are left out)."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT type, locked_at FROM markers WHERE file_id=? AND locked=1 AND locked_at IS NOT NULL",
                 (file_id,),
             ).fetchall()
@@ -1778,8 +1834,8 @@ class MarkerStore:
 
     def get_decisions(self, file_id: int) -> dict[MarkerType, DecisionRow]:
         """Stored decisions by type."""
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM decisions WHERE file_id=?", (file_id,)).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute("SELECT * FROM decisions WHERE file_id=?", (file_id,)).fetchall()
         return {
             MarkerType(r["type"]): DecisionRow(
                 MarkerType(r["type"]),
@@ -1842,18 +1898,16 @@ class MarkerStore:
 
     def get_publish_state(self, file_id: int, server_id: str) -> PublishStateRow | None:
         """Last publish record for one server."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT * FROM publish_state WHERE file_id=? AND server_id=?", (file_id, server_id)
             ).fetchone()
         return self._publish_row(r) if r else None
 
     def publish_states(self, file_id: int) -> list[PublishStateRow]:
         """Publish records for every server, sorted by server id."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM publish_state WHERE file_id=? ORDER BY server_id", (file_id,)
-            ).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute("SELECT * FROM publish_state WHERE file_id=? ORDER BY server_id", (file_id,)).fetchall()
         return [self._publish_row(r) for r in rows]
 
     def set_server_kind(self, file_id: int, kind: str) -> None:
@@ -1871,8 +1925,8 @@ class MarkerStore:
 
     def get_server_kind(self, file_id: int) -> str | None:
         """The kind a server reported for this version of the file, or None when none has."""
-        with self._lock:
-            row = self._conn.execute("SELECT kind FROM server_kinds WHERE file_id=?", (file_id,)).fetchone()
+        with self._reading() as conn:
+            row = conn.execute("SELECT kind FROM server_kinds WHERE file_id=?", (file_id,)).fetchone()
         return row["kind"] if row else None
 
     def set_fingerprint(
@@ -1934,10 +1988,8 @@ class MarkerStore:
             The fingerprint, or None when it was never fingerprinted (or changed since), or was made with another
             algorithm or window length (it is computed again).
         """
-        with self._lock:
-            r = self._conn.execute(
-                "SELECT * FROM fingerprints WHERE file_id=? AND window=?", (file_id, window)
-            ).fetchone()
+        with self._reading() as conn:
+            r = conn.execute("SELECT * FROM fingerprints WHERE file_id=? AND window=?", (file_id, window)).fetchone()
         if r is None or not self._made_as(r, algorithm, length_s):
             return None
         return StoredFingerprint(
@@ -1949,8 +2001,8 @@ class MarkerStore:
         self, file_id: int, window: str, *, algorithm: int | None = None, length_s: float | None = None
     ) -> bool:
         """Whether ``get_fingerprint`` with the same arguments finds one, without reading its points."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT algorithm, length_s FROM fingerprints WHERE file_id=? AND window=?", (file_id, window)
             ).fetchone()
         return r is not None and self._made_as(r, algorithm, length_s)
@@ -1975,12 +2027,12 @@ class MarkerStore:
             "SELECT p.file_id, f.canonical_path, f.size, f.mtime_ns, f.missing_since FROM fingerprints p "
             "JOIN files f ON f.id = p.file_id WHERE p.file_id {} ? GROUP BY p.file_id ORDER BY p.file_id LIMIT ?"
         )
-        with self._lock:
-            row = self._conn.execute("SELECT value FROM meta WHERE key=?", (_FINGERPRINT_CHECKED_UP_TO,)).fetchone()
+        with self._reading() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (_FINGERPRINT_CHECKED_UP_TO,)).fetchone()
             after = int(row["value"]) if row else 0
-            batch = self._conn.execute(query.format(">"), (after, limit)).fetchall()
+            batch = conn.execute(query.format(">"), (after, limit)).fetchall()
             if len(batch) < limit:
-                batch += self._conn.execute(query.format("<="), (after, limit - len(batch))).fetchall()
+                batch += conn.execute(query.format("<="), (after, limit - len(batch))).fetchall()
         marked_before = None if missing_for is None else self._clock() - missing_for
         return [
             FingerprintCheck(
@@ -2046,21 +2098,21 @@ class MarkerStore:
         """
         if limit <= 0:
             return []
-        with self._lock:
-            marked = self._cursor_batch("missing_since IS NOT NULL", _MISSING_CHECKED_UP_TO, max(1, limit // 2))
-            on_disk = self._cursor_batch("missing_since IS NULL", _FILES_CHECKED_UP_TO, limit - len(marked))
+        with self._reading() as conn:
+            marked = self._cursor_batch(conn, "missing_since IS NOT NULL", _MISSING_CHECKED_UP_TO, max(1, limit // 2))
+            on_disk = self._cursor_batch(conn, "missing_since IS NULL", _FILES_CHECKED_UP_TO, limit - len(marked))
         return [self._file(r) for r in (*marked, *on_disk)]
 
-    def _cursor_batch(self, where: str, cursor_key: str, limit: int) -> list[sqlite3.Row]:
+    def _cursor_batch(self, conn: sqlite3.Connection, where: str, cursor_key: str, limit: int) -> list[sqlite3.Row]:
         """Up to ``limit`` rows of ``files`` matching ``where``, in id order from after the cursor, wrapping round."""
         if limit <= 0:
             return []
         query = f"SELECT * FROM files WHERE {where} AND id {{}} ? ORDER BY id LIMIT ?"  # noqa: S608 - fixed clauses
-        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (cursor_key,)).fetchone()
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (cursor_key,)).fetchone()
         after = int(row["value"]) if row else 0
-        batch = self._conn.execute(query.format(">"), (after, limit)).fetchall()
+        batch = conn.execute(query.format(">"), (after, limit)).fetchall()
         if len(batch) < limit:
-            batch += self._conn.execute(query.format("<="), (after, limit - len(batch))).fetchall()
+            batch += conn.execute(query.format("<="), (after, limit - len(batch))).fetchall()
         return batch
 
     def finish_file_checks(self, *, missing_up_to: int | None, on_disk_up_to: int | None) -> None:
@@ -2122,8 +2174,8 @@ class MarkerStore:
         self, file_a: int, file_b: int, matcher_version: int
     ) -> list[tuple[float, float, float, float]] | None:
         """Cached matcher runs between two files (``file_a`` was the matcher's first argument); None when not computed."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT runs_json FROM season_pair_runs WHERE file_a=? AND file_b=? AND matcher_version=?",
                 (file_a, file_b, matcher_version),
             ).fetchone()
@@ -2174,8 +2226,8 @@ class MarkerStore:
 
     def get_end_picture(self, key: EndPictureKey, check_version: int) -> CachedShare | None:
         """A cached end-picture share between two files (season audio's check); None when not checked yet."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT share FROM season_end_pictures WHERE file_a=? AND file_b=? AND start_ms=? AND end_ms=? "
                 "AND offset_ms=? AND check_version=?",
                 (*key, check_version),
@@ -2221,8 +2273,8 @@ class MarkerStore:
     @read_memoised
     def get_detector_run(self, file_id: int, source: Source) -> str | None:
         """The signature a local detector's stored answer for a file was based on, or None."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT signature FROM detector_runs WHERE file_id=? AND source=?", (file_id, source.value)
             ).fetchone()
         return r["signature"] if r else None
@@ -2237,8 +2289,8 @@ class MarkerStore:
 
     def get_detector_failure(self, file_id: int, source: Source) -> str | None:
         """The signature a local detector's last failed attempt for a file was based on, or None."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT signature FROM detector_failures WHERE file_id=? AND source=?", (file_id, source.value)
             ).fetchone()
         return r["signature"] if r else None
@@ -2257,8 +2309,8 @@ class MarkerStore:
         Returns:
             ``(stored, limit_ms)``: whether one was stored, and the limit (None: no limit applied).
         """
-        with self._lock:
-            r = self._conn.execute("SELECT limit_ms FROM intro_chapter_limits WHERE file_id=?", (file_id,)).fetchone()
+        with self._reading() as conn:
+            r = conn.execute("SELECT limit_ms FROM intro_chapter_limits WHERE file_id=?", (file_id,)).fetchone()
         return (False, None) if r is None else (True, r["limit_ms"])
 
     @read_memoised
@@ -2269,8 +2321,8 @@ class MarkerStore:
             ``(stored, frame_rate)``: whether the file was probed for it with its current identity, and the rate (None:
             it has none).
         """
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT r.frame_rate FROM frame_rates r JOIN files f ON f.id = r.file_id "
                 "AND f.size = r.size AND f.mtime_ns = r.mtime_ns WHERE r.file_id=?",
                 (file_id,),
@@ -2337,8 +2389,8 @@ class MarkerStore:
         """When a failure with exactly this identity was last recorded, or None (never, or another identity)."""
         if table not in _IDENTITY_FAILURE_TABLES:
             raise ValueError(table)
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 f"SELECT failed_at FROM {table} WHERE canonical_path=? AND size=? AND mtime_ns=?",  # noqa: S608
                 (identity.canonical_path, identity.size, identity.mtime_ns),
             ).fetchone()
@@ -2410,14 +2462,14 @@ class MarkerStore:
 
     def get_item_publish_state(self, server_id: str, item_id: str) -> ItemPublishStateRow | None:
         """What this app last left on a server item, or None when it never published there."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT * FROM item_publish_state WHERE server_id=? AND item_id=?", (server_id, item_id)
             ).fetchone()
             if r is None:
                 return None
-            kept = self._kept_types(self._conn, server_id, item_id)
-            files_row = self._conn.execute(
+            kept = self._kept_types(conn, server_id, item_id)
+            files_row = conn.execute(
                 "SELECT files_json FROM item_versions WHERE server_id=? AND item_id=?", (server_id, item_id)
             ).fetchone()
         item_files = tuple(json.loads(files_row["files_json"])) if files_row else None
@@ -2528,17 +2580,17 @@ class MarkerStore:
         Returns:
             The items' rows, by item id (text order).
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT * FROM item_publish_state WHERE server_id=? AND status='written' ORDER BY item_id", (server_id,)
             ).fetchall()
             kept: dict[str, set[MarkerType]] = {}
-            for r in self._conn.execute("SELECT item_id, type FROM item_kept_types WHERE server_id=?", (server_id,)):
+            for r in conn.execute("SELECT item_id, type FROM item_kept_types WHERE server_id=?", (server_id,)):
                 kept.setdefault(r["item_id"], set()).add(MarkerType(r["type"]))
             own: dict[str, set[MarkerType]] = {}
             kept_own_rows = [
                 r
-                for r in self._conn.execute(
+                for r in conn.execute(
                     "SELECT p.item_id, d.type, d.reason, f.canonical_path, f.size, f.mtime_ns FROM publish_state p "
                     "JOIN decisions d ON d.file_id = p.file_id JOIN files f ON f.id = p.file_id "
                     "WHERE p.server_id=? AND p.item_id IS NOT NULL AND d.status=?",
@@ -2551,12 +2603,10 @@ class MarkerStore:
             # would list the item as missing on every run).
             if _same_identity_on_disk(r["canonical_path"], r["size"], r["mtime_ns"]):
                 own.setdefault(r["item_id"], set()).add(MarkerType(r["type"]))
-        with self._lock:
+        with self._reading() as conn:
             files = {
                 r["item_id"]: tuple(json.loads(r["files_json"]))
-                for r in self._conn.execute(
-                    "SELECT item_id, files_json FROM item_versions WHERE server_id=?", (server_id,)
-                )
+                for r in conn.execute("SELECT item_id, files_json FROM item_versions WHERE server_id=?", (server_id,))
             }
         out = []
         for r in rows:
@@ -2600,8 +2650,8 @@ class MarkerStore:
         if not ids or not after:
             return []
         marks = ",".join("?" * len(ids))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT i.server_id, i.item_id, i.updated_at, r.retries, r.retried_at FROM item_publish_state i "
                 "LEFT JOIN failed_item_retries r ON r.server_id = i.server_id AND r.item_id = i.item_id "
                 "AND r.item_version = i.version "
@@ -2648,8 +2698,8 @@ class MarkerStore:
         Returns:
             Their canonical paths, sorted.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT f.canonical_path FROM publish_state p JOIN files f ON f.id = p.file_id "
                 "WHERE p.server_id=? AND p.item_id=? ORDER BY f.canonical_path",
                 (server_id, item_id),
@@ -2673,8 +2723,8 @@ class MarkerStore:
         if not ids:
             return []
         marks = ",".join("?" * len(ids))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT DISTINCT f.canonical_path, p.server_id FROM markers m "
                 "JOIN files f ON f.id = m.file_id JOIN publish_state p ON p.file_id = m.file_id "
                 f"WHERE m.locked=1 AND p.status IN ('failed','skipped') AND p.server_id IN ({marks}) "  # noqa: S608
@@ -2710,8 +2760,8 @@ class MarkerStore:
             return []
         steps = " ".join("WHEN ? THEN ?" for _ in after)
         marks = ",".join("?" * len(ids))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "WITH answers AS ("
                 "  SELECT file_id, origin AS server_id, MAX(fetched_at) AS fetched_at FROM evidence"
                 f"  WHERE source IN (?, ?) AND origin IN ({marks})"  # noqa: S608 - placeholders only
@@ -2779,13 +2829,13 @@ class MarkerStore:
             re-reads so far reached.
         """
         marks = ",".join("?" * len(SERVER_SOURCES))
-        with self._lock:
-            stored, typed, fetched = self._conn.execute(
+        with self._reading() as conn:
+            stored, typed, fetched = conn.execute(
                 "SELECT COUNT(*), COUNT(type), MAX(fetched_at) FROM evidence "
                 f"WHERE file_id=? AND origin=? AND source IN ({marks})",  # noqa: S608 - placeholders only
                 (file_id, server_id, *_SERVER_SOURCE_VALUES),
             ).fetchone()
-            row = self._conn.execute(
+            row = conn.execute(
                 "SELECT rereads, failed_reread_at FROM server_marker_rereads WHERE file_id=? AND server_id=?",
                 (file_id, server_id),
             ).fetchone()
@@ -2828,8 +2878,8 @@ class MarkerStore:
     def drift_listed_at(self, server_id: str, item_ids: Iterable[str]) -> dict[str, str]:
         """When Check servers last listed each of these drifted items' files (items never listed are left out)."""
         wanted = set(item_ids)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT item_id, listed_at FROM drift_listings WHERE server_id=?", (server_id,)
             ).fetchall()
         return {r["item_id"]: r["listed_at"] for r in rows if r["item_id"] in wanted}
@@ -2858,8 +2908,8 @@ class MarkerStore:
 
     def get_publish_basis(self, file_id: int, server_id: str) -> tuple[str, int] | None:
         """``(decided_hash, item_version)`` of the file's last publish to the server, or None."""
-        with self._lock:
-            r = self._conn.execute(
+        with self._reading() as conn:
+            r = conn.execute(
                 "SELECT decided_hash, item_version FROM publish_basis WHERE file_id=? AND server_id=?",
                 (file_id, server_id),
             ).fetchone()
@@ -2877,8 +2927,8 @@ class MarkerStore:
 
     def source_usage(self, source_id: str, day: str) -> dict | None:
         """Usage for a source on a UTC day (YYYY-MM-DD)."""
-        with self._lock:
-            r = self._conn.execute("SELECT * FROM source_usage WHERE source=? AND day=?", (source_id, day)).fetchone()
+        with self._reading() as conn:
+            r = conn.execute("SELECT * FROM source_usage WHERE source=? AND day=?", (source_id, day)).fetchone()
         return {"used": r["used"], "limit": r["limit_"], "remaining": r["remaining"]} if r else None
 
     @staticmethod
@@ -2977,20 +3027,20 @@ class MarkerStore:
         Returns:
             The end of the pause, or None when the series may be asked now.
         """
-        with self._lock:
-            paused = self._conn.execute(
+        with self._reading() as conn:
+            paused = conn.execute(
                 "SELECT paused_at FROM series_pauses WHERE source=? AND series_key=?", (source.value, series_key)
             ).fetchone()
             if paused is None:
                 return None
             until = datetime.fromisoformat(paused["paused_at"]) + pause
-            if until <= self._clock() or self._series_has_answers(self._conn, source, show_folder):
+            if until <= self._clock() or self._series_has_answers(conn, source, show_folder):
                 return None
         return until
 
     def _count(self, table: str) -> int:
-        with self._lock:
-            return int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        with self._reading() as conn:
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
     @staticmethod
     def markers_hash(markers: Iterable[Marker]) -> str:

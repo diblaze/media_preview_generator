@@ -1121,3 +1121,98 @@ class TestRememberedChapterFailures:
         chapters.publish_chapters(plan, config)
 
         assert _prepare_for(plan, config, monkeypatch).outcome.status != "skipped"
+
+
+class TestImageStamps:
+    """An image whose size, modification time and inode match its stamp isn't read again to be hashed."""
+
+    def _hashes(self, monkeypatch):
+        hashed: list[str] = []
+        real = chapters._file_sha256
+        monkeypatch.setattr(chapters, "_file_sha256", lambda path: hashed.append(path.name) or real(path))
+        return hashed
+
+    def test_a_stamped_image_is_not_read_again(self, plan, config, extraction, monkeypatch):
+        chapters.publish_chapters(plan, config)
+        hashed = self._hashes(monkeypatch)
+        assert set(chapters._fresh_images(plan)) == {"1", "2"}
+        assert hashed == []
+
+    def test_a_rewritten_image_is_hashed_and_a_different_one_is_not_fresh(self, plan, config, extraction, monkeypatch):
+        chapters.publish_chapters(plan, config)
+        _image(plan.folder / "chapter2.jpg", color="blue")
+        hashed = self._hashes(monkeypatch)
+        assert set(chapters._fresh_images(plan)) == {"1"}
+        assert hashed == ["chapter2.jpg"]
+
+    def test_an_unstamped_manifest_is_hashed_once_then_stamped(self, plan, config, extraction, monkeypatch):
+        chapters.publish_chapters(plan, config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        for entry in manifest["images"].values():
+            for key in ("size", "mtime_ns", "ino"):
+                entry.pop(key)
+        plan.manifest_path.write_text(json.dumps(manifest))
+        hashed = self._hashes(monkeypatch)
+
+        assert set(chapters._fresh_images(plan)) == {"1", "2"}
+        assert sorted(hashed) == ["chapter1.jpg", "chapter2.jpg"]
+        stamped = json.loads(plan.manifest_path.read_text())
+        assert stamped["verified"] == manifest["verified"]
+        assert {k: v["sha256"] for k, v in stamped["images"].items()} == {
+            k: v["sha256"] for k, v in manifest["images"].items()
+        }
+
+        hashed.clear()
+        assert set(chapters._fresh_images(plan)) == {"1", "2"}
+        assert hashed == []
+
+    def test_a_same_size_rewrite_with_the_old_time_is_still_caught_by_its_new_inode(
+        self, plan, config, extraction, monkeypatch
+    ):
+        import os
+
+        chapters.publish_chapters(plan, config)
+        path = plan.folder / "chapter2.jpg"
+        before = os.stat(path)
+        replacement = plan.folder / "replacement.jpg"
+        replacement.write_bytes(bytes(reversed(path.read_bytes())))
+        os.replace(replacement, path)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert os.stat(path).st_size == before.st_size and os.stat(path).st_mtime_ns == before.st_mtime_ns
+        assert "2" not in chapters._fresh_images(plan)
+
+    def _unstamp(self, plan):
+        manifest = json.loads(plan.manifest_path.read_text())
+        for entry in manifest["images"].values():
+            for key in ("size", "mtime_ns", "ino"):
+                entry.pop(key)
+        plan.manifest_path.write_text(json.dumps(manifest))
+        return manifest
+
+    def test_no_stamps_are_written_while_a_worker_holds_the_folder(self, plan, config, extraction):
+        chapters.publish_chapters(plan, config)
+        before = self._unstamp(plan)
+        lock = chapters._folder_lock(plan)
+        with lock:
+            assert set(chapters._fresh_images(plan)) == {"1", "2"}
+        assert json.loads(plan.manifest_path.read_text()) == before
+
+    def test_a_manifest_a_worker_rewrote_meanwhile_keeps_its_entries(self, plan, config, extraction, monkeypatch):
+        chapters.publish_chapters(plan, config)
+        self._unstamp(plan)
+        real = chapters._stamp_manifest
+
+        def worker_first(plan_, proven):
+            # A worker replaced chapter 2's entry (new hash) and wrote "failed" between the hash and the stamp.
+            manifest = json.loads(plan_.manifest_path.read_text())
+            manifest["images"]["2"]["sha256"] = "worker-wrote-this"
+            manifest["failed"] = "worker state"
+            plan_.manifest_path.write_text(json.dumps(manifest))
+            real(plan_, proven)
+
+        monkeypatch.setattr(chapters, "_stamp_manifest", worker_first)
+        chapters._fresh_images(plan)
+        after = json.loads(plan.manifest_path.read_text())
+        assert after["failed"] == "worker state"
+        assert after["images"]["2"]["sha256"] == "worker-wrote-this" and "ino" not in after["images"]["2"]
+        assert "ino" in after["images"]["1"]

@@ -847,14 +847,17 @@ class _ItemServers:
         return self._stale[sid]
 
     def part_count(self, owner: _Owning, item_id: str) -> int | None:
-        """How many parts the server's item has across its versions (Plex), as the markers read asked for them; None
-        when that read didn't ask (no markers there) or got no answer."""
+        """How many parts the server's item has across its versions (Plex), as the markers read got them; None when
+        that read got no answer."""
         durations = self._parts.get(owner.config.id, {}).get(item_id)
         return len(durations) if durations else None
 
 
 class _PartsKept:
-    """A server client whose ``get_part_durations`` answers are kept, so the markers read's request is asked once."""
+    """A server client whose ``get_part_durations`` answers are kept, so the markers read's request is asked once.
+
+    The markers read hands back the part durations from its own response, so a file asks Plex once, not twice.
+    """
 
     def __init__(self, server: Any, kept: dict[str, list[int | None] | None]) -> None:
         self._server = server
@@ -862,6 +865,13 @@ class _PartsKept:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._server, name)
+
+    def get_markers(self, item_id: str, **kwargs: Any) -> list[dict] | None:
+        seen: dict[str, list[int | None]] = {}
+        rows = self._server.get_markers(item_id, part_durations=seen, **kwargs)
+        if item_id in seen:
+            self._kept.setdefault(item_id, seen[item_id])
+        return rows
 
     def get_part_durations(self, item_id: str) -> list[int | None] | None:
         if item_id not in self._kept:
@@ -3918,5 +3928,7 @@ def kind_handlers(ctx: PipelineContext) -> KindHandlers:
         outcome_keys=OUTCOME_KEYS,
         check_label="Looking up markers…",
         check_worker_label="Intro & Credits",
-        check_share=0.25,
+        # Half the checking threads, like loudness: a done file's check is mostly waiting on the share and Plex, so
+        # more threads finish a scan sooner. The dispatcher keeps a quarter free for preview checks when both run.
+        check_share=0.5,
     )

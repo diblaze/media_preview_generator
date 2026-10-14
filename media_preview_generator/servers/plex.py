@@ -2539,7 +2539,13 @@ class PlexServer(MediaServer):
             kind for kind, pref in LIBRARY_MARKER_DETECTION_PREFS.items() if _pref_bool(values.get(pref)) is False
         )
 
-    def get_markers(self, item_id: str, *, unknown_if_hidden: bool = False) -> list[dict] | None:
+    def get_markers(
+        self,
+        item_id: str,
+        *,
+        unknown_if_hidden: bool = False,
+        part_durations: dict[str, list[int | None]] | None = None,
+    ) -> list[dict] | None:
         """Intro/credits markers Plex serves for an item (``includeMarkers=1``).
 
         Args:
@@ -2547,6 +2553,8 @@ class PlexServer(MediaServer):
             unknown_if_hidden: Answer None while the item's library hides a marker type (:meth:`hidden_marker_types`):
                 Plex then serves no marker of that type there, its own or ours, so what it serves says nothing about
                 what the item has. False: what clients see.
+            part_durations: When given, ``part_durations[item_id]`` is set to what :meth:`get_part_durations` would
+                answer, read from the same response, so a caller needing both asks Plex once.
 
         Returns:
             ``{"type", "start_ms", "end_ms", "final"}`` per intro or credits marker; None on error, or (with
@@ -2563,6 +2571,8 @@ class PlexServer(MediaServer):
         node = next(iter(root), None) if root is not None else None
         if node is None:
             return None
+        if part_durations is not None:
+            part_durations[item_id] = self._part_durations(node)
         if unknown_if_hidden:
             library_id = node.get("librarySectionID") or root.get("librarySectionID")
             hidden = self.hidden_marker_types(library_id) if library_id else None
@@ -2608,6 +2618,10 @@ class PlexServer(MediaServer):
         node = next(iter(root), None) if root is not None else None
         if node is None:
             return None
+        return self._part_durations(node)
+
+    @staticmethod
+    def _part_durations(node: Any) -> list[int | None]:
         durations: list[int | None] = []
         for part in node.findall("Media/Part"):
             raw = part.get("duration")
