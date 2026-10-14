@@ -11,6 +11,7 @@ import types
 
 import pytest
 
+import media_preview_generator.nodes.server as server_package
 from media_preview_generator import __version__
 from media_preview_generator.nodes import protocol
 from media_preview_generator.nodes.server import app as node_app
@@ -337,6 +338,8 @@ class TestRoles:
         fake.agent_block = lambda: {"version": "1.1.2", "protocols": [1], "capabilities": []}
         fake.info_block = lambda: {"config_dir": "/plex", "db_present": True, "machine_identifier": "abc"}
         monkeypatch.setitem(sys.modules, fake.__name__, fake)
+        # `from . import plex_db` reads the package attribute first once the real module has been imported.
+        monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
         monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
 
         client = make_app(roles=["plex_db"]).test_client()
@@ -353,6 +356,8 @@ class TestRoles:
         fake.register_plex_db = lambda app, **kwargs: None
         fake.agent_block = lambda: {}
         monkeypatch.setitem(sys.modules, fake.__name__, fake)
+        # `from . import plex_db` reads the package attribute first once the real module has been imported.
+        monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
         monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
         client = make_app(roles=["plex_db"]).test_client()
 

@@ -40,10 +40,8 @@
     }
 
     function syncSwitch() {
-        const toggle = $('#loudnessEnabled');
-        // Any route other than "Open it from this app" (the select's empty value) goes through a helper or node.
+        // Any route other than "Open it from this app" (the select's empty value) goes through a Plex database node.
         const helper = !!($('#markersPlexDatabase') || {}).value;
-        if (toggle) toggle.disabled = helper && !toggle.checked;
         const hint = $('#loudnessHelperHint');
         if (hint) hint.classList.toggle('d-none', !helper);
     }

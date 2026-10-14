@@ -14,10 +14,6 @@ from ..servers.ownership import OwnershipMatch, find_library_matches
 # Plex uses "episode" for TV sections; older saved configs can call them "show".
 # Music also needs album gain and fades, which this video feature does not generate.
 DEFAULT_KINDS = frozenset({"movie", "episode", "show"})
-NO_AGENT = (
-    "Loudness analysis requires a local Plex database on the same machine as this app. "
-    "The Plex helper does not support loudness analysis."
-)
 # Server ids already warned about an invalid stored block: it's read per file, so it's said once per process.
 _warned: set[str] = set()
 
@@ -35,25 +31,14 @@ class ServerLoudnessSettings:
     library_ids: tuple[str, ...] | None
 
 
-def _plex_block(markers: object) -> dict:
-    plex = markers.get("plex") if isinstance(markers, dict) else None
-    return plex if isinstance(plex, dict) else {}
-
-
-def _uses_agent(markers: object) -> bool:
-    agent = _plex_block(markers).get("agent")
-    return bool(isinstance(agent, dict) and agent.get("enabled"))
-
-
 def validate_server_loudness(
-    raw: object, server_type: str, markers: object, *, library_kinds: dict[str, str | None] | None = None
+    raw: object, server_type: str, *, library_kinds: dict[str, str | None] | None = None
 ) -> tuple[dict | None, str]:
     """Validate and normalise a per-server ``loudness`` block.
 
     Args:
         raw: The posted block (None → defaults).
         server_type: ``plex``, ``emby`` or ``jellyfin``.
-        markers: The server's ``markers`` block, which holds the shared Plex helper configuration.
         library_kinds: Known library types, so explicit non-video selections can be refused.
 
     Returns:
@@ -74,8 +59,6 @@ def validate_server_loudness(
         return None, "loudness.enabled must be a boolean"
     if enabled and server_type != "plex":
         return None, "Loudness analysis is for Plex servers only"
-    if enabled and _uses_agent(markers):
-        return None, NO_AGENT
     if (
         enabled
         and library_ids
@@ -93,7 +76,7 @@ def validate_server_loudness(
 def load_server_loudness(cfg: ServerConfig) -> ServerLoudnessSettings:
     """A server's loudness settings, falling back to off when the stored block is invalid (logged)."""
     block, err = validate_server_loudness(
-        cfg.loudness or None, cfg.type.value, cfg.markers, library_kinds={lib.id: lib.kind for lib in cfg.libraries}
+        cfg.loudness or None, cfg.type.value, library_kinds={lib.id: lib.kind for lib in cfg.libraries}
     )
     if err or block is None:
         if cfg.id not in _warned:

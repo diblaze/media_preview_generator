@@ -195,12 +195,22 @@ def test_capability_refuses_changed_schema(guarded, monkeypatch):
     assert loudness_capability(server, cfg).state is Capability.UNSUPPORTED_SCHEMA
 
 
-def test_helper_is_explicitly_unavailable(guarded):
+def test_a_helper_switched_on_without_an_address_never_falls_back_to_the_local_folder(guarded):
     _, cfg, server = guarded
     cfg.markers = {"plex": {"agent": {"enabled": True}}}
     report = loudness_capability(server, cfg)
-    assert report.state is Capability.MISCONFIGURED and "helper does not support" in report.message
+    assert report.state is Capability.MISCONFIGURED and "helper's address" in report.message
     server._connect.assert_not_called()
+
+
+def test_a_helper_with_an_address_is_used_instead_of_the_local_folder(guarded, monkeypatch):
+    _, cfg, server = guarded
+    monkeypatch.setattr(
+        "media_preview_generator.nodes.settings.node_address", lambda node_id: ("http://helper:9494", "k", "helper")
+    )
+    cfg.markers = {"plex": {"agent": {"enabled": True, "node_id": "n1"}}}
+    cfg.id = "plex-a"
+    assert isinstance(create_loudness_db(cfg, server), guard.RemoteLoudnessDb)
 
 
 def test_missing_folder_is_refused(guarded):

@@ -883,7 +883,7 @@
                                         </label>
                                         <div class="sm-hint">Viewers on this server get Normalize Loudness sooner. <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Requirements, CPU worker group and database writes." data-explain-title="Loudness requirements" data-explain-template="infoEditLoudnessReqTpl"><i class="bi bi-info-circle"></i></button>
 <template id="infoEditLoudnessReqTpl">
-    <p>Requires Plex 1.43.4.x or 1.43.5.x on the same machine, with Plex's config folder mounted locally. Network-mounted databases are not supported. Analysis requires a CPU worker group that allows Plex loudness; configure it in <a href="/settings#section-workers">Settings → Workers</a>. It does not use GPU workers or rewrite source media. Enabling this writes loudness measurements to Plex's database. Intro &amp; Credits can stay off.</p>
+    <p>Requires Plex 1.43.4.x or 1.43.5.x, with Plex's config folder mounted locally, or the Plex helper (version 1.2.0 or newer) beside a Plex on another machine. Network-mounted databases are not supported. Analysis requires a CPU worker group that allows Plex loudness; configure it in <a href="/settings#section-workers">Settings → Workers</a>. It does not use GPU workers or rewrite source media. Enabling this writes loudness measurements to Plex's database. Intro &amp; Credits can stay off.</p>
 </template>
                                         </div>
                                     </div>
@@ -891,8 +891,8 @@
                                         <input class="form-check-input" type="checkbox" role="switch" id="loudnessEnabled">
                                     </div>
                                 </div>
-                                <div class="sm-warnline d-none" id="loudnessHelperHint">
-                                    <i class="bi bi-exclamation-triangle-fill"></i><span>A Plex database node does not support loudness analysis yet. Pick "Open it from this app" on the Connection tab to use it.</span>
+                                <div class="sm-hint d-none" id="loudnessHelperHint">
+                                    <i class="bi bi-info-circle"></i> <span>Loudness is written through the Plex database node, which needs version 1.2.0 or newer.</span>
                                 </div>
                                 <div class="sm-hint" id="loudnessLibrariesPointer">
                                     Choose movie and TV libraries on the <a href="#" class="loudness-libraries-link">Libraries</a> tab. <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Music libraries are not supported." data-explain-title="Loudness libraries" data-explain-template="infoEditLoudnessLibsTpl"><i class="bi bi-info-circle"></i></button>

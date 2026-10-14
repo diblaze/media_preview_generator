@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from ..markers.publishers.base import Capability, PublishError
 from ..markers.publishers.plex_db import (
@@ -27,10 +27,14 @@ from ..markers.publishers.plex_db import (
     encode_extra_data,
     publish_error_from_sqlite,
 )
-from ..output.plex_hash import get_source_fingerprint
 from .analyze import ANALYSIS_VERSION, LoudnessError, ln_fields
 
+if TYPE_CHECKING:
+    from .guard import RemoteLoudnessDb
+
 AUDIO = 2
+# What a Plex database node (the Plex helper) advertises when it can run the reads and writes below on Plex's machine.
+LOUDNESS_CAPABILITY = "loudness_v1"
 # The mark on the item, and on each stream beside its measurements.
 VERSION_FIELD = "ln:loudnessAnalysisVersion"
 # The columns read or written, as in Plex Media Server 1.43.4.
@@ -74,6 +78,10 @@ class SourceFingerprint(NamedTuple):
     @classmethod
     def read(cls, path: str) -> SourceFingerprint:
         """Capture the file before analysis; missing/inaccessible files remain retryable."""
+        # Here, not at module scope: output/ pulls in the app's server layer, and a Plex database node imports this
+        # module for its writes without ever reading a source file.
+        from ..output.plex_hash import get_source_fingerprint
+
         try:
             fingerprint = get_source_fingerprint(path)
         except OSError as exc:
@@ -187,6 +195,51 @@ class AudioStream(NamedTuple):
         )
 
 
+_SCALARS = (int, float, str, type(None))
+
+
+def _scalar_row(raw: Any, length: int, what: str) -> tuple:
+    if not isinstance(raw, list) or len(raw) != length or not all(isinstance(v, _SCALARS) for v in raw):
+        raise ValueError(f"not {what}")
+    return tuple(raw)
+
+
+def stream_to_json(stream: AudioStream) -> list:
+    """One stream for the wire to and from a Plex database node, every field in order."""
+    return list(stream)
+
+
+def stream_from_json(raw: Any) -> AudioStream:
+    """Read a stream back, exactly as it was read from Plex (its identity is compared field by field).
+
+    Raises:
+        ValueError: The value isn't a stream.
+    """
+    row = _scalar_row(raw, len(AudioStream._fields), "an audio stream")
+    stream = AudioStream(*row)
+    ids = (stream.id, stream.index, stream.metadata_item_id, stream.part_id, stream.media_item_id)
+    if any(type(v) is not int for v in ids) or not isinstance(stream.file, str) or type(stream.item_marked) is not bool:
+        raise ValueError("not an audio stream")
+    return stream
+
+
+def snapshot_to_json(snapshot: tuple) -> list:
+    """An item's ``item_snapshot`` for the wire."""
+    return [list(identity) for identity in snapshot]
+
+
+def snapshot_from_json(raw: Any) -> tuple:
+    """The inverse of :func:`snapshot_to_json`: equal to the ``item_snapshot`` it was made from.
+
+    Raises:
+        ValueError: The value isn't a snapshot.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("not an item snapshot")
+    width = len(AudioStream._fields) - 2  # identity() leaves out extra_data and item_marked
+    return tuple(_scalar_row(row, width, "an item snapshot") for row in raw)
+
+
 def write_log_path() -> str:
     """Where each write's before/after is kept (the undo record): ``<CONFIG_DIR>/loudness-writes.jsonl``."""
     return os.path.join(os.environ.get("CONFIG_DIR", "/config"), "loudness-writes.jsonl")
@@ -237,8 +290,10 @@ def item_snapshot(conn: sqlite3.Connection, metadata_item_id: int) -> tuple:
     return tuple(_audio_stream(row).identity() for row in rows if row[0] is not None)
 
 
-def read_item_snapshot(db: LocalPlexDb, metadata_item_id: int, *, deadline: float) -> tuple:
+def read_item_snapshot(db: LocalPlexDb | RemoteLoudnessDb, metadata_item_id: int, *, deadline: float) -> tuple:
     """Capture all versions before a worker starts changing their measurements."""
+    if not isinstance(db, LocalPlexDb):
+        return db.read_item_snapshot(metadata_item_id, deadline=deadline)
     try:
         with db._database(read_only=True, deadline=deadline) as conn:
             check_schema(conn)
@@ -247,7 +302,9 @@ def read_item_snapshot(db: LocalPlexDb, metadata_item_id: int, *, deadline: floa
         raise publish_error_from_sqlite(exc) from exc
 
 
-def read_streams(db: LocalPlexDb, plex_paths: list[str], *, deadline: float) -> tuple[list[AudioStream], bool]:
+def read_streams(
+    db: LocalPlexDb | RemoteLoudnessDb, plex_paths: list[str], *, deadline: float
+) -> tuple[list[AudioStream], bool]:
     """The audio streams of the live parts at these paths (as Plex names them).
 
     Returns:
@@ -258,6 +315,8 @@ def read_streams(db: LocalPlexDb, plex_paths: list[str], *, deadline: float) -> 
     """
     if not plex_paths:
         return [], False
+    if not isinstance(db, LocalPlexDb):
+        return db.read_streams(plex_paths, deadline=deadline)
     marks = ",".join("?" * len(plex_paths))
     try:
         with db._database(read_only=True, deadline=deadline) as conn:
@@ -276,7 +335,7 @@ def read_streams(db: LocalPlexDb, plex_paths: list[str], *, deadline: float) -> 
 
 
 def write_stream(
-    db: LocalPlexDb,
+    db: LocalPlexDb | RemoteLoudnessDb,
     stream_id: int,
     fields: dict[str, str],
     *,
@@ -288,7 +347,7 @@ def write_stream(
     """Add ``fields`` to one stream's extra_data, keeping its other fields, unless it already has loudness.
 
     Args:
-        db: The server's Plex database.
+        db: The server's Plex database (through its Plex database node, the same function runs there).
         stream_id: ``media_streams.id``.
         fields: The ``ln:*`` fields (``analyze.ln_fields``).
         deadline: When to stop waiting for the database locks.
@@ -305,6 +364,10 @@ def write_stream(
     """
     if set(fields) != MEASUREMENT_FIELDS | {VERSION_FIELD} or not has_analysis(encode_extra_data(fields)):
         raise PublishError("Refusing an incomplete loudness measurement")
+    if not isinstance(db, LocalPlexDb):
+        return db.write_stream(
+            stream_id, fields, deadline=deadline, expected=expected, source=source, cancel_check=cancel_check
+        )
     try:
         with db._database(read_only=False, deadline=deadline) as conn:
             check_schema(conn)
@@ -351,7 +414,7 @@ def write_stream(
 
 
 def mark_item(
-    db: LocalPlexDb,
+    db: LocalPlexDb | RemoteLoudnessDb,
     metadata_item_id: int,
     *,
     deadline: float,
@@ -373,6 +436,15 @@ def mark_item(
         PublishError: Publication or verification failed. Receipt/read-back failures can occur after commit;
             other failures roll back the transaction.
     """
+    if not isinstance(db, LocalPlexDb):
+        return db.mark_item(
+            metadata_item_id,
+            deadline=deadline,
+            expected=expected,
+            source=source,
+            cancel_check=cancel_check,
+            skipped=skipped,
+        )
     try:
         with db._database(read_only=False, deadline=deadline) as conn:
             check_schema(conn)

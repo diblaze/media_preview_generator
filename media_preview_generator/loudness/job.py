@@ -57,7 +57,7 @@ from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _infli
 from ..web.settings_manager import get_settings_manager
 from . import analyze, chain, undecodable
 from .deleted_sources import confirmed_deleted_paths
-from .guard import GuardedLoudnessDb, create_loudness_db
+from .guard import GuardedLoudnessDb, RemoteLoudnessDb, create_loudness_db
 from .inputs import load_file_input
 from .plex_db import (
     AudioStream,
@@ -105,7 +105,7 @@ class LoudnessContext:
     deleted_paths: frozenset[str] = frozenset()
     # Library scans only (``trusts_server_hash``): Plex's part hash stands in for reading the file when the size matches.
     trust_server_hash: bool = False
-    _dbs: dict[str, LocalPlexDb] = field(default_factory=dict)
+    _dbs: dict[str, LocalPlexDb | RemoteLoudnessDb] = field(default_factory=dict)
     # server id → (why it can't be written, "" when it can; when that was found)
     _ready: dict[str, tuple[str, float]] = field(default_factory=dict)
     _states: dict[str, Capability] = field(default_factory=dict)
@@ -158,7 +158,7 @@ class LoudnessContext:
         except Exception as exc:
             logger.warning("Couldn't ask {} to scan the folder of {}: {}", cfg.name, path, exc)
 
-    def db(self, cfg: ServerConfig) -> tuple[LocalPlexDb, str]:
+    def db(self, cfg: ServerConfig) -> tuple[LocalPlexDb | RemoteLoudnessDb, str]:
         """The server's Plex database, and "" when it can be written or why not.
 
         A writable answer holds for the job; any other is asked again after ``RECHECK_S``, so a moment when Plex was
@@ -259,7 +259,12 @@ def _lookup(
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
         skipped = ctx.undecodable_keys()
         needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
-        if streams and not needed and all(s.item_marked for s in streams) and isinstance(db, GuardedLoudnessDb):
+        if (
+            streams
+            and not needed
+            and all(s.item_marked for s in streams)
+            and isinstance(db, GuardedLoudnessDb | RemoteLoudnessDb)
+        ):
             # verify_streams requires complete loudness on every stream it is given, which undecodable ones never have.
             db.verify_streams([s for s in streams if not undecodable.is_skipped(s, skipped)])
             cast(SourceFingerprint, source).verify()
@@ -561,7 +566,7 @@ def process_item(
                 except PublishError as exc:
                     target = waiting if exc.state is Capability.UNREACHABLE else errors
                     target.append(f"marking item {item_id}: {exc}")
-        if not errors and not waiting and isinstance(db, GuardedLoudnessDb):
+        if not errors and not waiting and isinstance(db, GuardedLoudnessDb | RemoteLoudnessDb):
             try:
                 current, _ = read_streams(
                     db,

@@ -36,7 +36,7 @@ def test_off_by_default_and_for_a_missing_block():
 
 @pytest.mark.parametrize("enabled", ["false", "true", "", 0, 1, {}, [], None])
 def test_enable_requires_a_boolean_and_invalid_stored_values_stay_off(enabled):
-    block, error = ls.validate_server_loudness({"enabled": enabled}, "plex", {})
+    block, error = ls.validate_server_loudness({"enabled": enabled}, "plex")
     assert block is None and error == "loudness.enabled must be a boolean"
     assert ls.load_server_loudness(_cfg({"enabled": enabled})).enabled is False
 
@@ -54,7 +54,7 @@ def test_explicit_non_video_library_is_refused_and_never_owned(kind):
     settings = ls.ServerLoudnessSettings(enabled=True, library_ids=("3",))
     assert not ls.library_chosen(settings, library_id="3", kind=kind)
     block, error = ls.validate_server_loudness(
-        {"enabled": True, "library_ids": ["3"]}, "plex", {}, library_kinds={"3": kind}
+        {"enabled": True, "library_ids": ["3"]}, "plex", library_kinds={"3": kind}
     )
     assert block is None and "movie and TV" in error
 
@@ -64,7 +64,7 @@ def test_explicit_video_or_legacy_untyped_library_is_supported(kind):
     settings = ls.ServerLoudnessSettings(enabled=True, library_ids=("3",))
     assert ls.library_chosen(settings, library_id="3", kind=kind)
     block, error = ls.validate_server_loudness(
-        {"enabled": True, "library_ids": ["3"]}, "plex", {}, library_kinds={"3": kind}
+        {"enabled": True, "library_ids": ["3"]}, "plex", library_kinds={"3": kind}
     )
     assert block is not None and not error
 
@@ -74,16 +74,15 @@ def test_stored_music_opt_in_is_disabled():
 
 
 @pytest.mark.parametrize(
-    ("raw", "server_type", "markers", "error"),
+    ("raw", "server_type", "error"),
     [
-        ({"enabled": True}, "plex", {"plex": {"agent": {"enabled": True}}}, "helper does not support"),
-        ({"enabled": True}, "jellyfin", CONFIRMED, "Plex servers only"),
-        ({"library_ids": "all"}, "plex", CONFIRMED, "list or null"),
-        ("on", "plex", CONFIRMED, "must be an object"),
+        ({"enabled": True}, "jellyfin", "Plex servers only"),
+        ({"library_ids": "all"}, "plex", "list or null"),
+        ("on", "plex", "must be an object"),
     ],
 )
-def test_invalid_blocks_are_refused(raw, server_type, markers, error):
-    block, err = ls.validate_server_loudness(raw, server_type, markers)
+def test_invalid_blocks_are_refused(raw, server_type, error):
+    block, err = ls.validate_server_loudness(raw, server_type)
     assert block is None and error in err
 
 
@@ -93,14 +92,18 @@ def test_loudness_opt_in_is_independent_of_marker_settings(markers):
     assert ls.load_server_loudness(_cfg({}, markers=markers)).enabled is False
 
 
-def test_an_unsupported_helper_block_reads_as_off_and_is_warned_about_once(monkeypatch):
+def test_a_plex_helper_keeps_loudness_on_because_loudness_goes_through_it():
+    helper = {"plex": {"agent": {"enabled": True, "url": "http://helper:9494", "token": "k"}}}
+    assert ls.load_server_loudness(_cfg({"enabled": True}, markers=helper)).enabled is True
+
+
+def test_an_invalid_block_reads_as_off_and_is_warned_about_once(monkeypatch):
     monkeypatch.setattr(ls, "_warned", set())
     warnings = []
     sink = ls.logger.add(warnings.append, level="WARNING")
     try:
         for _ in range(3):
-            cfg = _cfg({"enabled": True}, markers={"plex": {"agent": {"enabled": True}}})
-            assert ls.load_server_loudness(cfg).enabled is False
+            assert ls.load_server_loudness(_cfg({"enabled": "yes"})).enabled is False
     finally:
         ls.logger.remove(sink)
     assert len(warnings) == 1

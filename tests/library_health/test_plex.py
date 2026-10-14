@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 from media_preview_generator.library_health import plex
 from media_preview_generator.library_health.models import CellState, CheckCancelled, Feature
@@ -15,6 +16,7 @@ from media_preview_generator.loudness.analyze import ANALYSIS_VERSION, ln_fields
 from media_preview_generator.loudness.plex_db import VERSION_FIELD
 from media_preview_generator.markers.publishers.base import PublishError
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, encode_extra_data
+from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
 
 from .plex_fixture import SD_FLAG, FakeLocalDb, build_plex_db, write_bif
@@ -216,10 +218,10 @@ _AGENT_ON = {
 }
 
 
-def test_open_db_is_none_when_the_marker_agent_is_on(tmp_path):
+def test_open_db_is_the_plex_helper_when_one_is_set_up(tmp_path):
     cfg = _cfg(tmp_path, [_lib()])
     cfg.markers = _AGENT_ON
-    assert plex._open_db(cfg) is None
+    assert isinstance(plex._open_db(cfg), RemotePlexDb)
 
 
 def test_open_db_is_none_without_a_plex_config_folder(tmp_path):
@@ -277,13 +279,17 @@ def test_show_library_uses_episode_type_and_movie_library_uses_movie_type(tmp_pa
     assert "Plex's database" in loudness.reason
 
 
-def test_agent_mode_uses_api_and_marks_unavailable(tmp_path):
+def test_an_unreachable_helper_counts_previews_through_the_api_and_says_why(monkeypatch, tmp_path):
     root = ET.fromstring(
         '<MediaContainer><Video ratingKey="7" type="movie" title="A"><Media>'
         '<Part file="/m/a.mkv" indexes="sd"/><Part file="/m/b.mkv"/></Media></Video></MediaContainer>'
     )
     server = MagicMock()
     server._connect.return_value.query.return_value = root
+    session = MagicMock()
+    session.get.side_effect = requests.ConnectionError("refused")
+    monkeypatch.setattr(plex, "_open_db", lambda _cfg: RemotePlexDb("http://agent:9", "k", session=session))
+    monkeypatch.setattr(plex, "_read_rows", MagicMock(side_effect=AssertionError("must not ask for the rows")))
 
     cfg = _cfg(tmp_path, [_lib()])
     cfg.markers = _AGENT_ON
@@ -293,7 +299,7 @@ def test_agent_mode_uses_api_and_marks_unavailable(tmp_path):
     assert (previews.total, previews.done, previews.todo) == (2, 1, 1)
     server._connect.return_value.query.assert_called_once_with("/library/sections/1/all?type=1")
     loudness = _cell(result, "1", Feature.LOUDNESS)
-    assert loudness.state == CellState.OFF  # the real settings turn loudness off when an agent is used
+    assert loudness.state == CellState.UNAVAILABLE and "helper" in loudness.reason
     assert _cell(result, "1", Feature.INTRO).state == CellState.NOT_APPLICABLE
     assert result.access == plex.ACCESS_API_ONLY
     assert result.todo[0].library_id == "1"

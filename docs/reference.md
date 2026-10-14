@@ -483,9 +483,9 @@ An Emby server's block has `"emby": {"on_emby_redetect": "restore"}` in place of
 
 ### Plex marker agent
 
-The small container for a Plex on another machine (`plex-marker-agent/`, image `ghcr.io/stevezau/plex-marker-agent`). Its
+The small container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`). Its
 setup, compose file, build steps, version rules and endpoint contract are in its
-[README](https://github.com/stevezau/media_preview_generator/blob/dev/plex-marker-agent/README.md); the app side is `media_preview_generator/markers/publishers/plex_remote.py`.
+[README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md); the app side is `media_preview_generator/markers/publishers/plex_remote.py`.
 The agent's own settings:
 
 | Variable | Notes |
@@ -493,9 +493,10 @@ The agent's own settings:
 | `AGENT_TOKEN` | Required. The key both sides share (Bearer token); it is what the app's `plex.agent.token` must equal. Never logged. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as the agent's container sees it. The database path is derived from it; the app never sends a path. |
 | `PLEX_CONFIG` | Compose only: Plex's config folder on the agent's host, mounted at `/plex`. Required. |
-| `AGENT_PORT` | Port to listen on. Default `9494`. |
+| `NODE_PORT` | Port to listen on. Default `9494`; `AGENT_PORT` still works when `NODE_PORT` isn't set. |
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
 | `PUID` / `PGID` | The user that owns Plex's database. Default `1000`. |
+| `CONFIG_DIR` | The helper's own folder, `/config` (a volume in the compose file): its node id and the undo record of each loudness write. |
 
 Every request carries `Authorization: Bearer <AGENT_TOKEN>` and `X-Marker-Agent-Protocol: 1`, and every answer carries
 the agent's version and the protocols it speaks; a mismatch in either direction is refused before anything is written.

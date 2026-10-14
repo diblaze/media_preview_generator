@@ -1,6 +1,7 @@
 """The Plex marker agent's wire protocol and the app's side of it.
 
-The agent's own side lives in ``tests/test_plex_marker_agent.py``, including the two containers' round trip.
+The agent's own side (the node's Plex database role) lives in ``tests/nodes/test_plex_db_role.py``, including the two
+containers' round trip.
 """
 
 from __future__ import annotations
