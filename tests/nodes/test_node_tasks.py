@@ -449,9 +449,8 @@ class TestExpiry:
         task_id = table.start(_spec(media))
         temp = _finished(table, task_id)["result"]["temp"]
 
-        _until(lambda: task_id not in table)
-
-        assert not os.path.exists(temp)
+        # Expiry drops the task from the table first and removes its temp dir just after, so wait for both.
+        _until(lambda: task_id not in table and not os.path.exists(temp))
 
     def test_delete_removes_at_once(self, make_table, media):
         table = make_table({"test.op": lambda ctx, p, q: {"temp": ctx.temp_dir}})
