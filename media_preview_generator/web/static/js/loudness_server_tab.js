@@ -40,9 +40,7 @@
     }
 
     function syncSwitch() {
-        const toggle = $('#loudnessEnabled');
         const helper = !!($('#markersAgentEnabled') || {}).checked;
-        if (toggle) toggle.disabled = helper && !toggle.checked;
         const hint = $('#loudnessHelperHint');
         if (hint) hint.classList.toggle('d-none', !helper);
     }

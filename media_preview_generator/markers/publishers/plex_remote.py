@@ -396,8 +396,12 @@ _ERROR_KINDS: dict[type[PublishError], str] = {ItemNotFoundError: "item_not_foun
 
 def error_to_json(exc: PublishError) -> dict:
     """Serialise a refusal so the app can raise the very same exception."""
+    from ...loudness.plex_db import SourceChangedError
     from .plex_chapters import ChapterError
 
+    if isinstance(exc, SourceChangedError):
+        # Loudness retries a changed source later instead of failing it, so the type has to survive the trip.
+        return {"kind": "source_changed", "message": str(exc), "state": exc.state.value if exc.state else None}
     if isinstance(exc, ChapterError):
         return {
             "kind": "chapter",
@@ -435,6 +439,10 @@ def error_from_json(raw: Any) -> PublishError:
         from .plex_chapters import ChapterError
 
         return ChapterError(message, code=str(raw.get("code") or "registration"), state=state)
+    if raw.get("kind") == "source_changed":
+        from ...loudness.plex_db import SourceChangedError
+
+        return SourceChangedError(message, state=state)
     kind = next((cls for cls, name in _ERROR_KINDS.items() if raw.get("kind") == name), PublishError)
     return kind(message, state=state)
 
@@ -511,6 +519,31 @@ class AgentClient:
         except requests.RequestException as exc:
             raise AgentError("Cannot reach the Plex-side helper", state=Capability.AGENT_UNAVAILABLE) from exc
         return self._read(response)
+
+    def require(self, capability: str, *, feature: str, needs: str, timeout: float = 5.0) -> None:
+        """Make sure the helper advertises an optional capability before sending its requests.
+
+        Every answer refreshes ``capabilities``, so this asks ``/v1/ping`` only when the last answer didn't list it.
+
+        Args:
+            capability: The capability name, e.g. ``loudness_v1``.
+            feature: What needs it, for the message ("loudness analysis").
+            needs: The helper version that first shipped it, for the message.
+            timeout: Seconds allowed for the ping.
+
+        Raises:
+            AgentError: PLUGIN_OUTDATED when the helper doesn't have it (an older helper: nothing is sent), or the
+                ping's own refusal.
+        """
+        if capability in self.capabilities:
+            return
+        self.ping(timeout=timeout)
+        if capability not in self.capabilities:
+            raise AgentError(
+                f"The Plex helper at {self.describe()} is version {self.version or 'unknown'}; {feature} needs "
+                f"version {needs} or newer. Update the helper container.",
+                state=Capability.PLUGIN_OUTDATED,
+            )
 
     def _read(self, response: Any) -> dict:
         try:
@@ -758,6 +791,72 @@ class RemotePlexDb(PlexDatabase):
         if not isinstance(result.get("exists"), bool):
             raise self._unreadable(ValueError("no exists flag"))
         return result["exists"]
+
+    def loudness(self, operation: str, body: dict, *, deadline: float, needs: str) -> dict:
+        """Run one fixed loudness operation (``/v1/loudness/{operation}``) on the helper.
+
+        Args:
+            operation: ``file_checks``, ``check``, ``streams``, ``snapshot``, ``write`` or ``mark``.
+            body: The operation's fields (``loudness.guard.RemoteLoudnessDb`` builds them).
+            deadline: When to stop waiting.
+            needs: The helper version that first ran loudness, for the "update the helper" message.
+
+        Returns:
+            The answer's ``result``.
+
+        Raises:
+            PublishError: The helper refused (the original exception, rebuilt), is too old for loudness, or couldn't
+                be used.
+        """
+        from ...loudness.plex_db import LOUDNESS_CAPABILITY
+
+        self._client.require(LOUDNESS_CAPABILITY, feature="loudness analysis", needs=needs)
+        remaining = self._remaining(deadline)
+        result = self._client.post(
+            f"/v1/loudness/{operation}", {**body, "deadline_s": remaining}, timeout=remaining + ANSWER_GRACE_S
+        )
+        if result.get("capability") != LOUDNESS_CAPABILITY:
+            raise self._unreadable(ValueError("no loudness capability in the answer"))
+        return result
+
+    def require_library_health(self, *, needs: str) -> None:
+        """Raise the "update the helper" refusal unless the helper can run the Library Health queries."""
+        from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY
+
+        self._client.require(LIBRARY_HEALTH_CAPABILITY, feature="Library Health's database counts", needs=needs)
+
+    def library_health_rows(
+        self, section_ids: list[int], *, want_markers: bool, want_chapters: bool, deadline: float, needs: str
+    ) -> dict:
+        """The Library Health queries' rows (``library_health.plex_rows.read_rows``), run on the helper.
+
+        Args:
+            section_ids: Plex library section ids to count.
+            want_markers: Also read the intro/credits marker rows.
+            want_chapters: Also read chapters and durations.
+            deadline: When to stop waiting.
+            needs: The helper version that first ran these queries, for the "update the helper" message.
+
+        Returns:
+            The rows, in ``read_rows``' shape.
+
+        Raises:
+            PublishError: The helper refused, is too old for Library Health counts, or couldn't be used.
+        """
+        from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY
+
+        self.require_library_health(needs=needs)
+        remaining = self._remaining(deadline)
+        body = {
+            "section_ids": list(section_ids),
+            "want_markers": want_markers,
+            "want_chapters": want_chapters,
+            "deadline_s": remaining,
+        }
+        result = self._client.post("/v1/library-health/rows", body, timeout=remaining + ANSWER_GRACE_S)
+        if result.get("capability") != LIBRARY_HEALTH_CAPABILITY or not isinstance(result.get("rows"), dict):
+            raise self._unreadable(ValueError("no Library Health rows in the answer"))
+        return result["rows"]
 
     def _unreadable(self, exc: Exception) -> AgentError:
         logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)

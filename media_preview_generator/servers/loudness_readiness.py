@@ -49,7 +49,6 @@ def loudness_readiness_section(
         block, reason = validate_server_loudness(
             server_config.loudness,
             server_config.type.value,
-            server_config.markers,
             library_kinds={lib.id: lib.kind for lib in server_config.libraries},
         )
         if not reason and not cast(dict, block)["enabled"]:
@@ -67,11 +66,12 @@ def loudness_readiness_section(
             "id": "loudness_registration",
             "label": "Loudness measurements can be stored" if ready else "Loudness measurements cannot be stored",
             "docs_anchor": "plex-loudness",
-            "tooltip": "Checks the local Plex database and server identity without changing them.",
+            "tooltip": "Checks Plex's database and server identity without changing them.",
             "explanation": (
-                "<p>Loudness requires Plex and this app on the same machine, with Plex's config folder mounted "
-                "locally. The database must match the connected server and supported Plex version.</p>"
-                "<p>Intro &amp; Credits can stay off. The Plex helper does not support loudness analysis.</p>"
+                "<p>Loudness requires Plex's config folder mounted locally on the same machine, or the Plex helper "
+                "(version 1.2.0 or newer) beside a Plex on another machine. The database must match the connected "
+                "server and supported Plex version.</p>"
+                "<p>Intro &amp; Credits can stay off.</p>"
             ),
             "ok": ready,
             "severity": "recommended" if ready else "critical",

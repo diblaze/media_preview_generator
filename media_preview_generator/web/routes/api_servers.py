@@ -515,18 +515,15 @@ def _validate_server_payload(
                 if isinstance(stored_loudness, dict) and isinstance(posted, dict)
                 else posted,
                 type_value,
-                markers_block,
                 library_kinds=library_kinds,
             )
             if err:
                 return None, err
         elif isinstance(stored_loudness, dict):
             loudness_block = copy.deepcopy(stored_loudness)
-            if "markers" in data or "libraries" in data:
-                # The shared helper can change without posting loudness; do not save an unsupported combination.
-                loudness_block, err = validate_server_loudness(
-                    loudness_block, type_value, markers_block, library_kinds=library_kinds
-                )
+            if "libraries" in data:
+                # A library's type can change without posting loudness; do not save a choice it no longer supports.
+                loudness_block, err = validate_server_loudness(loudness_block, type_value, library_kinds=library_kinds)
                 if err:
                     return None, err
         else:
