@@ -118,6 +118,27 @@ def test_test_access_results_are_one_row_per_library_with_the_suggestion():
     assert envelope["overall_ok"] is False
 
 
+@pytest.mark.parametrize("error", ["This app can't open /data/kids", "No video files found near the top of /data/kids"])
+def test_a_library_this_app_cant_sample_never_blames_the_node(error):
+    """The lab's Synth libraries weren't mounted in the app: Setup Health said "the node can't see its files" (must
+    fix, Open Media) although the node was never asked about them."""
+    access = {
+        "libraries": [
+            {"server": "Home", "library": "Movies", "app_root": "/data/movies", "checked": 3, "ok": True, "files": []},
+            {"server": "Home", "library": "Kids", "app_root": "/data/kids", "checked": 0, "ok": False, "files": [],
+             "error": error, "suggestion": None},
+        ]
+    }  # fmt: skip
+    envelope = _envelope(_details(access=access))
+    row = _check(envelope, "node_access_1")
+    assert (row["ok"], row["severity"], row["reason"]) == (False, "recommended", error)
+    assert row["label"] == "Home · Kids: not tested, this app can't read it itself"
+    assert (row["help_url"], row["help_label"]) == ("/servers", "Open Media Servers")
+    assert not {"fix_tab", "fix_action", "suggestion"} & set(row)
+    assert _section(envelope, "node_media_access")["severity"] == "recommended"
+    assert envelope["overall_ok"] is True
+
+
 @pytest.mark.parametrize(
     ("details", "check_id", "pointer"),
     [

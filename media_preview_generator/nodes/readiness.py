@@ -33,6 +33,8 @@ FIX_ON_NODE = "node"
 TAB_MEDIA = "media"
 TAB_SETTINGS = "settings"
 WORKERS_URL = "/settings#section-workers"
+# Where this app's own path mappings and library checks live.
+SERVERS_URL = "/servers"
 # Node-only row keys; the shared row builder doesn't know them.
 _NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label")
 
@@ -185,6 +187,23 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
         if not isinstance(lib, dict):
             continue
         label = f"{lib.get('server')} · {lib.get('library')}"
+        if not lib.get("checked"):
+            # Nothing was sampled: this app can't open the folder itself or found no video in it, so the node was
+            # never asked. Blaming the node (critical, "Open Media") would send the user to the wrong machine.
+            rows.append(
+                _row(
+                    f"node_access_{index}",
+                    f"{label}: not tested, this app can't read it itself",
+                    severity=RECOMMENDED,
+                    ok=False,
+                    explanation="Test access needs a file this app sees to ask the node for. Fix this app's own "
+                    "access to the library first; this row says nothing about the node.",
+                    reason=lib.get("error"),
+                    help_url=SERVERS_URL,
+                    help_label="Open Media Servers",
+                )
+            )
+            continue
         ok = bool(lib.get("ok"))
         missing = [f for f in lib.get("files") or [] if isinstance(f, dict) and not f.get("ok")]
         reason = None
