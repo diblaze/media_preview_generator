@@ -155,6 +155,14 @@ class NodeClient:
         """``POST /v1/tasks/<id>/cancel``."""
         self._call("POST", f"{protocol.ROUTE_TASKS}/{task_id}/cancel", json={})
 
+    def pause_task(self, task_id: str) -> None:
+        """``POST /v1/tasks/<id>/pause``: the task's ``pause_check()`` reads True until it is resumed."""
+        self._call("POST", f"{protocol.ROUTE_TASKS}/{task_id}/pause", json={})
+
+    def resume_task(self, task_id: str) -> None:
+        """``POST /v1/tasks/<id>/resume``."""
+        self._call("POST", f"{protocol.ROUTE_TASKS}/{task_id}/resume", json={})
+
     def fetch_artifact(self, task_id: str) -> bytes:
         """``GET /v1/tasks/<id>/artifact``: the task's artifact bytes (a preview's frames as a tar)."""
         return self._call(

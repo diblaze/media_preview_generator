@@ -41,6 +41,8 @@ from ..markers.outcomes import FileOutcome
 from ..markers.ownership import owning_servers
 from ..markers.publishers.base import Capability, DatabaseBusyError, PublishError, cancellable_waits
 from ..markers.publishers.plex_db import BUSY_TIMEOUT_S, LocalPlexDb
+from ..nodes import remote_ops
+from ..nodes.executor import current_placement
 from ..output.plex_hash import calculate_plex_hash
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
 from ..processing.multi_server import source_replaced_reason
@@ -452,8 +454,10 @@ def process_item(
                     break
                 if phase_callback:
                     phase_callback(f"Loudness {start + 1}-{start + len(group)}/{len(ordered)}")
+                # A remote worker measures on its node; the writes below stay here.
+                run_many = remote_ops.loudness_run_many if current_placement() else analyze.run_many
                 try:
-                    batch_fields = analyze.run_many(
+                    batch_fields = run_many(
                         ctx.ffmpeg,
                         path,
                         [(index, same[0].codec, same[0].duration_ms) for index, same in group],
@@ -501,7 +505,8 @@ def process_item(
                         errors.append(f"stream {index} ({same[0].codec}): {fields}")
                         continue
                     if fields is None:
-                        fields = analyze.run(
+                        run_one = remote_ops.loudness_run if current_placement() else analyze.run
+                        fields = run_one(
                             ctx.ffmpeg,
                             path,
                             index,

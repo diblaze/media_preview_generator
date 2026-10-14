@@ -605,8 +605,13 @@ def ensure_fingerprint(
         if skip is not None and skip():
             raise FingerprintSkippedError(f"Not fingerprinting {name} again yet")
         _raise_if_stalled(name)
+        from ...nodes import remote_ops
+        from ...nodes.executor import current_placement
+
+        # A remote worker fingerprints on its node; the lock, the cache and the store stay here.
+        compute = remote_ops.compute_fingerprint if current_placement() else compute_fingerprint
         try:
-            points = compute_fingerprint(
+            points = compute(
                 rec.canonical_path,
                 rec.duration_ms,
                 ffmpeg=ffmpeg,

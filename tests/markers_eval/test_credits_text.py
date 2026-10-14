@@ -490,12 +490,13 @@ def test_the_detector_digest_follows_every_source_file_it_names(tmp_path):
 # playback speeds decide reads online times by, the pause that stops a running decode where it is (it moves time
 # limits, never what a decode gives), the job log's clock, which only words a file cut short, and the previews
 # runner, read only for the decoder's "can't decode" line that ends a doomed GPU run sooner (the CPU reads it either way),
-# the stop flag, which only keeps a decode killed by the stop from being stored as a failure, and the worker row's
-# progress, which only reports how far a decode or fingerprint is.
+# the stop flag, which only keeps a decode killed by the stop from being stored as a failure, the worker row's
+# progress, which only reports how far a decode or fingerprint is, and the remote-node seam, which runs this same
+# detector code on a node.
 NOT_ANSWER_CODE = {"markers.models", "markers.locks", "markers.pipeline", "markers.store", "markers.speed",
                    "processing.generator", "gpu.vulkan_probe", "web.settings_manager", "markers.freeze",
                    "markers.job_log", "processing.ffmpeg_runner", "worker_groups", "shutdown",
-                   "markers.progress", "utils"}  # fmt: skip
+                   "markers.progress", "utils", "nodes.executor", "nodes.remote_ops"}  # fmt: skip
 
 
 def _package_imports(path, root):

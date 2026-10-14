@@ -2770,3 +2770,77 @@ class TestPlexLocalPublishing:
             get_frame_cache().get(str(media_file), extraction_key=_frame_extraction_key(mock_config_for_processing))
             is None
         )
+
+
+class TestOnARemoteNode:
+    """A worker placed on a node gets its frames from the node; publishing still happens here."""
+
+    @staticmethod
+    def _registry(tmp_path: Path) -> ServerRegistry:
+        movies = str(tmp_path / "data" / "movies")
+        return ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="emby-1",
+                    server_type=ServerType.EMBY,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(movies,), enabled=True)],
+                    output={"adapter": "emby_sidecar", "width": 320, "frame_interval": 10},
+                )
+            ],
+        )
+
+    def test_frames_come_from_the_node_and_the_bif_is_published_here(self, mock_config_for_processing, tmp_path):
+        from media_preview_generator.nodes import protocol, remote_ops
+        from media_preview_generator.nodes.executor import Placement, placed_on
+
+        media_dir = tmp_path / "data" / "movies" / "Test (2024)"
+        media_file = _seed_canonical_file(media_dir)
+        calls = []
+
+        def run_on_node(op, app_path, params, *, gpu, artifact_to, **kwargs):
+            calls.append((op, app_path, gpu))
+            _populate_frames(artifact_to, count=5)
+            return {"generate_images": [True, 5, False, 1.0, "1.0x", None], "failures": []}
+
+        with (
+            patch.object(remote_ops, "run_on_node", side_effect=run_on_node),
+            patch("media_preview_generator.processing.multi_server.generate_images") as local,
+            placed_on(Placement("n1", "NAS")),
+        ):
+            result = process_canonical_path(
+                canonical_path=str(media_file), registry=self._registry(tmp_path), config=mock_config_for_processing
+            )
+
+        assert result.status is MultiServerStatus.PUBLISHED
+        assert result.frame_count == 5
+        local.assert_not_called()
+        assert calls == [(protocol.OP_PREVIEW_FRAMES, str(media_file), None)]
+        assert (media_dir / "Test (2024)-320-10.bif").exists()
+
+    @pytest.mark.parametrize("not_visible", [False, True], ids=["node-gone", "file-not-visible"])
+    def test_a_node_handing_the_file_back_reaches_the_worker_instead_of_failing_it(
+        self, mock_config_for_processing, tmp_path, not_visible
+    ):
+        from media_preview_generator.nodes import remote_ops
+        from media_preview_generator.nodes.executor import (
+            FileNotVisibleError,
+            NodeUnavailableError,
+            Placement,
+            placed_on,
+        )
+
+        media_file = _seed_canonical_file(tmp_path / "data" / "movies" / "Test (2024)")
+        exc = (
+            FileNotVisibleError("n1", "NAS", "missing", "not under any mapping")
+            if not_visible
+            else NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+        )
+
+        with (
+            patch.object(remote_ops, "run_on_node", side_effect=exc),
+            placed_on(Placement("n1", "NAS")),
+            pytest.raises(type(exc)),
+        ):
+            process_canonical_path(
+                canonical_path=str(media_file), registry=self._registry(tmp_path), config=mock_config_for_processing
+            )

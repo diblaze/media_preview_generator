@@ -2486,6 +2486,79 @@ class TestDetect:
             detector.detect_credits_text(rec, ctx=ctx)
 
 
+class TestDetectOnANode:
+    """A remote worker reads the credits on its node: the same answer, the node's CPU notes shown here."""
+
+    def _remote(self, monkeypatch, answer):
+        from media_preview_generator.nodes import remote_ops
+        from media_preview_generator.nodes.server.ops import _jsonable
+
+        calls: list[tuple] = []
+
+        def run_on_node(op, app_path, params, **kwargs):
+            calls.append((op, app_path, params, kwargs["gpu"]))
+            if isinstance(answer, BaseException):
+                raise answer
+            kwargs["progress_callback"]({"percent": 0.0, "phase": "Reading credits…", "fallbacks": ["on the CPU"]})
+            return {"result": _jsonable(answer)}
+
+        monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+        return calls
+
+    def test_the_node_runs_find_credits_and_the_answer_is_the_local_one(self, monkeypatch, pool, ctx):
+        from media_preview_generator.nodes import protocol
+        from media_preview_generator.nodes.executor import Placement, placed_on
+
+        result = detector.CreditsTextResult(5690.4996, None, ((5690.0, 2, 12.0, CARDS),), (), ())
+        calls = self._remote(monkeypatch, result)
+        monkeypatch.setattr(detector, "find_credits", lambda *a, **k: pytest.fail("ran locally"))
+        phases, notes = [], []
+        with placed_on(Placement("n1", "NAS")):
+            answer = detector.detect_credits_text(
+                MOVIE,
+                ctx=ctx,
+                gpu="NVIDIA",
+                gpu_device_path="cuda:0",
+                ffmpeg_threads=3,
+                phase_callback=phases.append,
+                fallback_callback=notes.append,
+            )
+        assert answer == DetectorAnswer(
+            (Candidate(MarkerType.CREDITS, 5_690_500, None, Source.CREDITS_TEXT),),
+            "steps back to the earliest kept start",
+        )
+        ((op, path, params, gpu),) = calls
+        assert (op, path, gpu) == (protocol.OP_CREDITS_FIND, MOVIE.canonical_path, ("NVIDIA", "cuda:0"))
+        assert params == {
+            "duration_ms": 6_000_000,
+            "is_episode": False,
+            "tail_s": 900.0,
+            "earliest_start_s": detector._earliest_start_s(MOVIE, ctx),
+            "ffmpeg_threads": 3,
+            "gpu_worker": True,
+            "read_text": True,
+            "progress": False,
+        }
+        assert phases == ["Reading credits…"] and notes == ["on the CPU"]
+        assert pool.calls == []  # the node's own text detection, not this app's
+
+    def test_a_gpu_decode_failure_on_the_node_reruns_the_file_on_the_cpu(self, monkeypatch, pool, ctx):
+        from media_preview_generator.nodes.executor import NodeTaskError, Placement, placed_on
+
+        failed = NodeTaskError("gpu_failed", "cuda died", error_type="GpuDecodeError", extra={"stderr_tail": ["x"]})
+        self._remote(monkeypatch, failed)
+        with placed_on(Placement("n1", "NAS")), pytest.raises(CodecNotSupportedError, match="cuda died"):
+            detector.detect_credits_text(MOVIE, ctx=ctx, gpu="NVIDIA", gpu_device_path="cuda:0")
+
+    def test_a_node_drop_is_no_answer_of_the_file(self, monkeypatch, pool, ctx):
+        from media_preview_generator.nodes.executor import NodeUnavailableError, Placement, placed_on
+
+        self._remote(monkeypatch, NodeUnavailableError("n1", "NAS", "NAS stopped answering"))
+        with placed_on(Placement("n1", "NAS")), pytest.raises(NodeUnavailableError):
+            detector.detect_credits_text(MOVIE, ctx=ctx)
+        assert ctx.store.get_detector_failure(MOVIE.id, Source.CREDITS_TEXT) is None
+
+
 def test_spec_carries_the_version_and_asks_whether_a_worker_is_needed():
     spec = detector.credits_text_spec()
     assert (spec.source, spec.types, spec.version) == (

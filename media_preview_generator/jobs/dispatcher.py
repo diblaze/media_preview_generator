@@ -6,6 +6,7 @@ scheduling: workers focus on the highest-priority active job and only spill
 over to the next job when the current job's queue is empty.
 """
 
+import itertools
 import threading
 import time
 from collections import deque
@@ -17,9 +18,10 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_outcome, outcome_value
+from ..nodes.executor import REQUEUE_NODE_UNAVAILABLE, NodeRequeue
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
-from .worker import JOB_LOG_SKIP, Worker, WorkerPool
+from .worker import JOB_LOG_SKIP, Worker, WorkerPool, logging_for_job
 
 _submission_counter_lock = threading.Lock()
 _submission_counter = 0
@@ -30,6 +32,11 @@ WAITING_FOR_WORKER = "Waiting for a free worker"
 # Kinds with a check_share < 1 together hold at most this share of the checking threads, so with Intro & Credits and
 # loudness both scanning, a quarter is still free for preview checks.
 CAPPED_KINDS_SHARE = 0.75
+# A file whose node drops it this many times fails instead of going back in the queue (spec §6).
+MAX_NODE_DROPS = 2
+# How far down a job's queue the dispatcher looks for a file a free worker may run, when files at the front can't run
+# on that worker's node.
+EXCLUDED_SCAN_LIMIT = 64
 
 
 def _next_submission_order() -> int:
@@ -110,6 +117,10 @@ class JobTracker:
         self.active_processing = 0
         self.check_queue: deque = deque(items)
         self.item_queue: deque = deque()
+        # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
+        # how often each one's node dropped it, and the nodes (id -> name) that can't see it.
+        self.node_drops: dict[str, int] = {}
+        self.excluded_nodes: dict[str, dict[str, str]] = {}
         self.total_items = len(items)
         self.successful = 0
         self.failed = 0
@@ -918,7 +929,10 @@ class JobDispatcher:
             with self._trackers_lock:
                 tracker = self._trackers.get(job_id) if job_id else None
 
-            if tracker and not tracker.done_event.is_set():
+            requeue = getattr(worker, "last_task_requeue", None)
+            if tracker and not tracker.done_event.is_set() and isinstance(requeue, NodeRequeue):
+                self._requeue_or_fail(worker, tracker, worker.current_item, requeue)
+            elif tracker and not tracker.done_event.is_set():
                 success = worker.last_task_succeeded()
                 # The worker is already idle, so a merge error that skipped record_completion would leave
                 # tracker.wait() blocked forever.
@@ -949,6 +963,52 @@ class JobDispatcher:
             # Retire deferred-removal workers
             self.worker_pool._retire_idle_worker_if_scheduled(worker)
         return reaped
+
+    def _requeue_or_fail(self, worker: Worker, tracker: JobTracker, item, requeue: NodeRequeue) -> None:
+        """Put a file a remote worker gave back at the front of its job's queue, or fail it (spec §6).
+
+        A node that dropped the file sends it back once; a second drop fails it. A node that can't see it is left out
+        for that file and it goes back for another worker; once no configured worker outside the nodes that can't see
+        it remains, it fails. The queue and ``active_processing`` change together under ``_trackers_lock``, so a
+        parking snapshot never misses the file.
+
+        Args:
+            worker: The worker that gave it back.
+            tracker: Its job.
+            item: The :class:`ProcessableItem`.
+            requeue: Why.
+        """
+        path = item.canonical_path
+        failure: str | None = None
+        with self._trackers_lock:
+            if requeue.reason == REQUEUE_NODE_UNAVAILABLE:
+                tracker.node_drops[path] = tracker.node_drops.get(path, 0) + 1
+                if tracker.node_drops[path] >= MAX_NODE_DROPS:
+                    failure = f"node unavailable twice ({requeue.node_name})"
+            else:
+                excluded = tracker.excluded_nodes.setdefault(path, {})
+                excluded[requeue.node_id] = requeue.node_name
+                if not self.worker_pool.can_run_outside(tracker.kind, excluded):
+                    failure = f"not visible on {', '.join(excluded.values())}"
+            if failure is None:
+                tracker.item_queue.appendleft(item)
+                tracker.active_processing = max(0, tracker.active_processing - 1)
+        title = worker.media_title or path
+        try:
+            with logging_for_job(tracker.job_id):
+                if failure is None:
+                    logger.info("{} goes back in the queue for another try ({})", title, requeue.message)
+                else:
+                    logger.warning("{} failed: {}", title, failure)
+        except Exception as exc:  # a log line must never strand the file
+            logger.debug("Dispatcher: couldn't log the requeue of {}: {}", path, exc)
+        if failure is None:
+            return
+        try:
+            self._record_failed_item(tracker, item, worker.display_name, failure)
+        finally:
+            with self._trackers_lock:
+                tracker.active_processing = max(0, tracker.active_processing - 1)
 
     def _merge_worker_outcome(self, worker: Worker, tracker: JobTracker) -> None:
         """Merge the latest outcome delta from a worker into the tracker.
@@ -998,6 +1058,52 @@ class JobDispatcher:
 
     def _assign_tasks(self) -> None:
         """Reserve a compatible job and slot together under a fixed lock order."""
+        stranded: list[tuple[JobTracker, Any, str]] = []
+        try:
+            self._assign_tasks_locked(stranded)
+        finally:
+            # Failed outside the locks: completion runs the job's callbacks.
+            for tracker, item, reason in stranded:
+                try:
+                    self._record_failed_item(tracker, item, "", reason)
+                finally:
+                    with self._trackers_lock:
+                        tracker.active_processing = max(0, tracker.active_processing - 1)
+
+    def _claim_worker(self, tracker: JobTracker, stranded: list) -> tuple[Worker, Any] | None:
+        """Claim a free worker and the first queued file of the job it may run; the caller holds both locks.
+
+        A file some nodes can't see only goes to a worker on another node (or this app). One that no configured worker
+        can run any more is taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed).
+
+        Args:
+            tracker: The job.
+            stranded: Collects ``(tracker, item, reason)`` to fail once the locks are released.
+
+        Returns:
+            The claimed worker and the file, or None.
+        """
+        pool = self.worker_pool
+        if not tracker.excluded_nodes:
+            worker = pool._find_available_worker(claim=True, kind=tracker.kind)
+            return None if worker is None else (worker, tracker.item_queue.popleft())
+        for index, item in enumerate(itertools.islice(tracker.item_queue, EXCLUDED_SCAN_LIMIT)):
+            excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
+            worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
+            if worker is not None:
+                del tracker.item_queue[index]
+                return worker, item
+            if not excluded:
+                return None  # no free worker for this kind at all
+            if not pool.can_run_outside(tracker.kind, excluded):
+                del tracker.item_queue[index]
+                tracker.active_processing += 1
+                stranded.append((tracker, item, f"not visible on {', '.join(excluded.values())}"))
+                return None
+        return None
+
+    def _assign_tasks_locked(self, stranded: list) -> None:
+        """:meth:`_assign_tasks`'s loop; files no worker can run any more go to ``stranded``."""
         self.worker_pool._apply_deferred_removals()
         while True:
             # Pause/cancel callbacks may read settings or job-manager state.
@@ -1025,14 +1131,13 @@ class JobDispatcher:
                     )
                     chosen = None
                     for tracker in eligible:
-                        worker = self.worker_pool._find_available_worker(claim=True, kind=tracker.kind)
-                        if worker is not None:
-                            chosen = (tracker, worker)
+                        claimed = self._claim_worker(tracker, stranded)
+                        if claimed is not None:
+                            chosen = (tracker, *claimed)
                             break
                     if chosen is None:
                         return
-                    tracker, worker = chosen
-                    item = tracker.item_queue.popleft()
+                    tracker, worker, item = chosen
                     tracker.active_processing += 1
                     tracker.generation_started = True
                     self._stamp_pick(tracker)
@@ -1075,8 +1180,6 @@ class JobDispatcher:
             item: The :class:`ProcessableItem`.
             exc: What ``assign_task`` raised (a thread that couldn't start).
         """
-        from ..processing.generator import _notify_file_result, failure_scope
-
         reason = f"{worker.display_name} couldn't start on this file ({type(exc).__name__}: {exc})"
         logger.error(
             "Dispatch: {} couldn't start {!r} (job {}): {}: {}; counting it as failed",
@@ -1090,20 +1193,33 @@ class JobDispatcher:
         if not (worker.current_thread and worker.current_thread.is_alive()):
             worker.current_task = None
             worker.is_busy = False
+        self._record_failed_item(tracker, item, worker.display_name, reason)
+
+    def _record_failed_item(self, tracker: JobTracker, item, worker_display_name: str, reason: str) -> None:
+        """Count an item the dispatcher itself failed: its outcome, its Files-panel row, its completion.
+
+        Args:
+            tracker: The item's job.
+            item: The :class:`ProcessableItem`.
+            worker_display_name: The worker it was with ("" when none).
+            reason: The row's reason.
+        """
+        from ..processing.generator import _notify_file_result, failure_scope
+
         failed = ProcessingResult.FAILED.value
         with tracker._counts_lock:
             tracker.outcome_counts[failed] = tracker.outcome_counts.get(failed, 0) + 1
         try:
             with failure_scope(tracker.job_id):
                 _notify_file_result(
-                    item.canonical_path, cast(ProcessingResult, outcome_value(failed)), reason, worker.display_name
+                    item.canonical_path, cast(ProcessingResult, outcome_value(failed)), reason, worker_display_name
                 )
         except Exception as notify_exc:
-            logger.warning("Could not record the failed start of {}: {}", item.canonical_path, notify_exc)
+            logger.warning("Could not record the failure of {}: {}", item.canonical_path, notify_exc)
         finally:
             tracker.record_completion(
                 False,
-                worker.display_name,
+                worker_display_name,
                 getattr(item, "title", "") or item.canonical_path,
                 canonical_path=item.canonical_path,
             )
