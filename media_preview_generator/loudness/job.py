@@ -241,7 +241,7 @@ def _lookup(
         if streams and not needed and all(s.item_marked for s in streams) and isinstance(db, GuardedLoudnessDb):
             # verify_streams requires complete loudness on every stream it is given, which undecodable ones never have.
             db.verify_streams([s for s in streams if not undecodable.is_skipped(s, skipped)])
-            source.verify()
+            cast(SourceFingerprint, source).verify()
     except (DatabaseBusyError, SourceChangedError, OSError) as exc:
         return _row(cfg, WAITING, str(exc)), [], []
     except PublishError as exc:

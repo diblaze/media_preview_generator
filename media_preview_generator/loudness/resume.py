@@ -234,7 +234,7 @@ class CompletionLedger:
                     if cancel_check():
                         raise InterruptedError("Loudness resume cancelled")
                     row = None
-                    if pending is not None:
+                    if pending is not None and candidate is not None:
                         current = pending.result()
                         fingerprint = source_fingerprint(item)
                         if (
