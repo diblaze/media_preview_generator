@@ -5,7 +5,8 @@
 #
 #   nodes_lab.sh build <tag>   build the app + plex-db images from this checkout
 #   nodes_lab.sh up <tag>      start mlab-plex, the app (config copied from mlab-app-remote's) and the nodes
-#   nodes_lab.sh down          stop and remove the lab-nodes containers and their volumes (never the mlab_* ones)
+#   nodes_lab.sh down          stop and remove the lab-nodes containers and their own mlab_nodes_* volumes (never
+#                              another mlab_* volume)
 #
 # The app's config is a COPY of mlab_app_remote_config, so the v24 migration runs on a real lab settings file and
 # its Plex helper (mlab-plex-agent) turns into a legacy Plex database node. The app writes BIFs into mlab-plex's own
@@ -17,6 +18,7 @@ GPU_NODE=mlab-nodes-gpu
 CPU_NODE=mlab-nodes-cpu
 DB_NODE=mlab-nodes-plexdb
 APP_VOL=mlab_nodes_app_config
+NODE_VOLS=(mlab_nodes_gpu_config mlab_nodes_cpu_config mlab_nodes_plexdb_config)
 NODE_KEY_FILE="${NODE_KEY_FILE:-/tmp/claude-1000/mlab-nodes.key}"
 TZ_NAME=Australia/Sydney
 
@@ -60,20 +62,20 @@ case "$cmd" in
     docker run -d --name "$APP" --network mlab -p 127.0.0.1:18090:8080 \
       -e PUID=1000 -e PGID=1000 -e TZ="$TZ_NAME" -v "$APP_VOL":/config -v mlab_plex_config:/plexcfg \
       --runtime=nvidia --gpus all "${app_mounts[@]}" "plex-previews:${tag}"
-    docker run -d --name "$GPU_NODE" --network mlab -e MODE=node -e NODE_NAME=lab-gpu -e NODE_KEY="$key" -e TZ="$TZ_NAME" \
+    docker run -d --name "$GPU_NODE" --network mlab -e MODE=node -e NODE_NAME=lab-gpu -e NODE_KEY="$key" -e TZ="$TZ_NAME" -v mlab_nodes_gpu_config:/config \
       -e PUID=1000 -e PGID=1000 --runtime=nvidia --gpus all "${node_mounts[@]}" "plex-previews:${tag}"
-    docker run -d --name "$CPU_NODE" --network mlab -e MODE=node -e NODE_NAME=lab-cpu -e NODE_KEY="$key" -e TZ="$TZ_NAME" \
+    docker run -d --name "$CPU_NODE" --network mlab -e MODE=node -e NODE_NAME=lab-cpu -e NODE_KEY="$key" -e TZ="$TZ_NAME" -v mlab_nodes_cpu_config:/config \
       -e PUID=1000 -e PGID=1000 "${node_mounts[@]}" "plex-previews:${tag}"
     # Plex in mlab-plex runs as 1000:1000, so the database node does too.
     docker run -d --name "$DB_NODE" --network mlab --user 1000:1000 -e NODE_KEY="$key" -e TZ="$TZ_NAME" \
       -e PLEX_CONFIG_DIR="/plexcfg/Library/Application Support/Plex Media Server" \
-      -v mlab_plex_config:/plexcfg "plex-db-node:${tag}"
+      -v mlab_plex_config:/plexcfg -v mlab_nodes_plexdb_config:/config "plex-db-node:${tag}"
     echo "app: http://127.0.0.1:18090   nodes: http://${GPU_NODE}:9494 http://${CPU_NODE}:9494 http://${DB_NODE}:9494"
     echo "node key file: ${NODE_KEY_FILE}"
     ;;
   down)
     docker rm -f "$APP" "$GPU_NODE" "$CPU_NODE" "$DB_NODE" 2>/dev/null || true
-    docker volume rm "$APP_VOL" 2>/dev/null || true
+    docker volume rm "$APP_VOL" "${NODE_VOLS[@]}" 2>/dev/null || true
     docker stop mlab-plex mlab-plex-agent >/dev/null 2>&1 || true
     ;;
   *) echo "usage: $0 build|up|down [tag]"; exit 2 ;;
