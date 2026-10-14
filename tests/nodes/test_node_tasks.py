@@ -1,0 +1,460 @@
+"""The node's task table: statuses, cancel/pause, log capture and paging, expiry, artifacts (spec §3 Task lifetime)."""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+
+import pytest
+from loguru import logger
+
+from media_preview_generator.nodes import protocol
+from media_preview_generator.nodes.protocol import OpError
+from media_preview_generator.nodes.server import tasks
+
+WAIT_S = 10.0
+
+
+def _until(check, timeout: float = WAIT_S) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting")
+
+
+@pytest.fixture
+def media(tmp_path):
+    root = tmp_path / "media"
+    root.mkdir()
+    (root / "a.mkv").write_bytes(b"x" * 10)
+    return root
+
+
+@pytest.fixture
+def make_table(tmp_path):
+    made: list[tasks.TaskTable] = []
+
+    def make(ops, **kwargs) -> tasks.TaskTable:
+        table = tasks.TaskTable(ops, temp_root=str(tmp_path / "node-tmp"), reap_interval_s=0.02, **kwargs)
+        made.append(table)
+        return table
+
+    yield make
+    for table in made:
+        table.close()
+
+
+def _spec(media, op: str = "test.op", **extra) -> dict:
+    return {"op": op, "path": "/data/a.mkv", "size": 10, "mtime_ns": None,
+            "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}], "gpu": None, "params": {}, **extra}  # fmt: skip
+
+
+def _finished(table: tasks.TaskTable, task_id: str) -> dict:
+    _until(lambda: table.poll(task_id)["status"] != protocol.STATUS_RUNNING)
+    return table.poll(task_id)
+
+
+class TestStatuses:
+    def test_done_carries_the_result_and_the_node_path(self, make_table, media):
+        seen = {}
+
+        def op(ctx, node_path, params):
+            seen.update(path=node_path, params=params, gpu=ctx.gpu, temp=ctx.temp_dir)
+            ctx.progress(50, frames=3)
+            return {"answer": 42}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media, gpu={"type": "NVIDIA", "device": "cuda:0"}, params={"k": 1}))
+
+        state = _finished(table, task_id)
+
+        assert state["status"] == protocol.STATUS_DONE
+        assert state["result"] == {"answer": 42} and state["error"] is None
+        assert state["progress"] == {"percent": 50.0, "frames": 3}
+        assert seen["path"] == os.path.realpath(media / "a.mkv")
+        assert seen["params"] == {"k": 1} and seen["gpu"] == ("NVIDIA", "cuda:0")
+        assert os.path.isdir(seen["temp"]) and seen["temp"].startswith(table.temp_root)
+
+    def test_file_not_visible_runs_no_op(self, make_table, media):
+        called = []
+        table = make_table({"test.op": lambda *a: called.append(1) or {}})
+
+        state = _finished(table, table.start(_spec(media, size=11)))
+
+        assert state["status"] == protocol.STATUS_FILE_NOT_VISIBLE
+        assert state["error"]["kind"] == protocol.KIND_FILE_NOT_VISIBLE
+        assert state["error"]["reason"] == protocol.NOT_VISIBLE_DIFFERENT_FILE
+        assert not called
+
+    def test_any_exception_fails_with_type_and_message(self, make_table, media):
+        def op(ctx, node_path, params):
+            raise RuntimeError("boom")
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED
+        assert state["error"] == {"kind": protocol.KIND_FAILED, "message": "RuntimeError: boom"}
+        assert not any("Traceback" in line["message"] for line in state["log"])
+
+    def test_op_error_keeps_its_kind_and_extra(self, make_table, media):
+        def op(ctx, node_path, params):
+            raise OpError(protocol.KIND_CODEC_NOT_SUPPORTED, "no hevc", codec="hevc")
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED
+        assert state["error"] == {"kind": protocol.KIND_CODEC_NOT_SUPPORTED, "message": "no hevc", "codec": "hevc"}
+
+    def test_op_error_cancelled_is_status_cancelled(self, make_table, media):
+        def op(ctx, node_path, params):
+            raise OpError(protocol.KIND_CANCELLED, "stopped")
+
+        table = make_table({"test.op": op})
+
+        assert _finished(table, table.start(_spec(media)))["status"] == protocol.STATUS_CANCELLED
+
+    def test_the_apps_cancellation_error_is_status_cancelled(self, make_table, media):
+        from media_preview_generator.processing.generator import CancellationError
+
+        def op(ctx, node_path, params):
+            raise CancellationError("cancelled by user")
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_CANCELLED
+        assert state["error"]["kind"] == protocol.KIND_CANCELLED
+
+    def test_non_dict_result_fails(self, make_table, media):
+        table = make_table({"test.op": lambda *a: ["not", "a", "dict"]})
+
+        assert _finished(table, table.start(_spec(media)))["status"] == protocol.STATUS_FAILED
+
+    def test_result_that_isnt_json_fails_instead_of_breaking_the_poll(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {"x": object()}})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED and "TypeError" in state["error"]["message"]
+
+    def test_gpu_failed_asks_for_a_gpu_recheck(self, make_table, media):
+        rechecks = []
+
+        def op(ctx, node_path, params):
+            raise OpError(protocol.KIND_GPU_FAILED, "device lost")
+
+        table = make_table({"test.op": op}, on_gpu_failed=lambda: rechecks.append(1))
+
+        _finished(table, table.start(_spec(media)))
+
+        _until(lambda: rechecks == [1])
+
+    def test_other_failures_dont_recheck_gpus(self, make_table, media):
+        rechecks = []
+        table = make_table({"test.op": lambda *a: {}}, on_gpu_failed=lambda: rechecks.append(1))
+
+        _finished(table, table.start(_spec(media)))
+
+        assert rechecks == []
+
+
+class TestSpecValidation:
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"op": "nope"},
+            {"op": 3},
+            {"path": ""},
+            {"size": "10"},
+            {"size": True},
+            {"mtime_ns": -1},
+            {"mapping": "x"},
+            {"mapping": [{"app_prefix": "/data"}]},
+            {"gpu": {"type": "NVIDIA"}},
+            {"params": []},
+        ],
+    )
+    def test_malformed_spec_is_refused(self, make_table, media, change):
+        table = make_table({"test.op": lambda *a: {}})
+
+        with pytest.raises(tasks.TaskSpecError):
+            table.start({**_spec(media), **change})
+
+    def test_non_object_spec_is_refused(self, make_table):
+        with pytest.raises(tasks.TaskSpecError):
+            make_table({}).start([])
+
+
+class TestCancelAndPause:
+    def test_cancel_stops_the_op_and_is_cancelled(self, make_table, media):
+        started = threading.Event()
+
+        def op(ctx, node_path, params):
+            started.set()
+            _until(ctx.cancel_check)
+            return {"partial": True}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        started.wait(WAIT_S)
+
+        assert table.cancel(task_id)
+        state = _finished(table, task_id)
+
+        assert state["status"] == protocol.STATUS_CANCELLED
+        assert state["result"] is None
+
+    def test_exception_after_cancel_is_cancelled_not_failed(self, make_table, media):
+        started = threading.Event()
+
+        def op(ctx, node_path, params):
+            started.set()
+            _until(ctx.cancel_check)
+            raise RuntimeError("ffmpeg killed")
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        started.wait(WAIT_S)
+        table.cancel(task_id)
+
+        assert _finished(table, task_id)["status"] == protocol.STATUS_CANCELLED
+
+    def test_pause_and_resume_reach_pause_check(self, make_table, media):
+        seen: list[bool] = []
+
+        def op(ctx, node_path, params):
+            _until(ctx.pause_check)
+            seen.append(True)
+            _until(lambda: not ctx.pause_check())
+            seen.append(False)
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+
+        assert table.set_paused(task_id, True)
+        _until(lambda: seen == [True])
+        assert table.set_paused(task_id, False)
+
+        assert _finished(table, task_id)["status"] == protocol.STATUS_DONE
+        assert seen == [True, False]
+
+    def test_a_cancelled_task_never_reads_as_paused(self, make_table, media):
+        started, release = threading.Event(), threading.Event()
+        seen = {}
+
+        def op(ctx, node_path, params):
+            started.set()
+            release.wait(WAIT_S)
+            seen["paused"] = ctx.pause_check()
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        started.wait(WAIT_S)
+        table.set_paused(task_id, True)
+        table.cancel(task_id)
+        release.set()
+        _finished(table, task_id)
+
+        assert seen == {"paused": False}
+
+    def test_unknown_task_is_false(self, make_table):
+        table = make_table({})
+
+        assert not table.cancel("nope") and not table.set_paused("nope", True) and not table.delete("nope")
+        assert table.poll("nope") is None
+
+
+class TestLog:
+    def test_loguru_lines_from_the_op_thread_are_captured(self, make_table, media):
+        def op(ctx, node_path, params):
+            logger.info("decoding {}", "frames")
+            logger.debug("too chatty to keep")
+            ctx.log("warning", "direct line")
+            return {}
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        messages = [(line["level"], line["message"]) for line in state["log"]]
+        assert ("INFO", "decoding frames") in messages
+        assert ("WARNING", "direct line") in messages
+        assert messages.count(("WARNING", "direct line")) == 1
+        assert not any("too chatty" in m for _, m in messages)
+
+    def test_other_threads_only_when_they_register(self, make_table, media):
+        def op(ctx, node_path, params):
+            def helper(capture: bool) -> None:
+                if capture:
+                    with ctx.capture_thread():
+                        logger.info("from a registered thread")
+                else:
+                    logger.info("from a stray thread")
+
+            for capture in (True, False):
+                thread = threading.Thread(target=helper, args=(capture,))
+                thread.start()
+                thread.join()
+            return {}
+
+        table = make_table({"test.op": op})
+
+        messages = [line["message"] for line in _finished(table, table.start(_spec(media)))["log"]]
+
+        assert "from a registered thread" in messages
+        assert "from a stray thread" not in messages
+
+    def test_unknown_level_is_logged_as_info(self, make_table, media):
+        def op(ctx, node_path, params):
+            ctx.log("loud", "hello")
+            return {}
+
+        table = make_table({"test.op": op})
+
+        log = _finished(table, table.start(_spec(media)))["log"]
+
+        assert {"seq": 0, "level": "INFO", "message": "hello"} in log
+
+    def test_log_from_pages_by_seq(self, make_table, media):
+        def op(ctx, node_path, params):
+            for n in range(5):
+                ctx.log("info", f"line {n}")
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        _finished(table, task_id)
+
+        page = table.poll(task_id, log_from=3)
+
+        assert [line["seq"] for line in page["log"]] == [3, 4]
+        assert page["next_log"] == 5
+        assert table.poll(task_id, log_from=5)["log"] == []
+
+    def test_log_keeps_the_last_2000_lines_and_seq_keeps_counting(self, make_table, media):
+        def op(ctx, node_path, params):
+            for n in range(tasks.TASK_LOG_LINES + 10):
+                ctx.log("info", f"line {n}")
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        state = _finished(table, task_id)
+
+        assert len(state["log"]) == tasks.TASK_LOG_LINES
+        assert state["log"][0]["seq"] == 10
+        assert state["next_log"] == tasks.TASK_LOG_LINES + 10
+
+
+class TestExpiry:
+    def test_unpolled_running_task_is_cancelled_and_its_temp_dir_removed(self, make_table, media):
+        seen = {}
+
+        def op(ctx, node_path, params):
+            seen["temp"] = ctx.temp_dir
+            _until(ctx.cancel_check)
+            seen["cancelled"] = True
+            return {}
+
+        table = make_table({"test.op": op}, unpolled_expiry_s=0.2)
+        task_id = table.start(_spec(media))
+
+        _until(lambda: task_id not in table)
+
+        _until(lambda: seen.get("cancelled") and not os.path.exists(seen["temp"]))
+
+    def test_polling_keeps_a_running_task_alive(self, make_table, media):
+        release = threading.Event()
+
+        def op(ctx, node_path, params):
+            release.wait(WAIT_S)
+            return {}
+
+        table = make_table({"test.op": op}, unpolled_expiry_s=0.3)
+        task_id = table.start(_spec(media))
+        for _ in range(10):
+            assert table.poll(task_id) is not None
+            time.sleep(0.1)
+        release.set()
+
+        assert _finished(table, task_id)["status"] == protocol.STATUS_DONE
+
+    def test_finished_task_kept_until_its_keep_time_after_the_last_poll(self, make_table, media):
+        table = make_table({"test.op": lambda ctx, p, q: {"temp": ctx.temp_dir}}, finished_keep_s=0.3)
+        task_id = table.start(_spec(media))
+        temp = _finished(table, task_id)["result"]["temp"]
+
+        _until(lambda: task_id not in table)
+
+        assert not os.path.exists(temp)
+
+    def test_delete_removes_at_once(self, make_table, media):
+        table = make_table({"test.op": lambda ctx, p, q: {"temp": ctx.temp_dir}})
+        task_id = table.start(_spec(media))
+        temp = _finished(table, task_id)["result"]["temp"]
+
+        assert table.delete(task_id)
+
+        assert task_id not in table and not os.path.exists(temp)
+
+    def test_delete_while_running_cancels_and_cleans_up_when_the_op_returns(self, make_table, media):
+        seen = {}
+
+        def op(ctx, node_path, params):
+            seen["temp"] = ctx.temp_dir
+            _until(ctx.cancel_check)
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        _until(lambda: "temp" in seen)
+
+        table.delete(task_id)
+
+        _until(lambda: not os.path.exists(seen["temp"]))
+
+    def test_leftover_task_dirs_from_a_dead_process_are_removed_at_start(self, tmp_path):
+        root = tmp_path / "node-tmp"
+        (root / f"{tasks.TASK_DIR_PREFIX}old").mkdir(parents=True)
+        (root / "someone-elses").mkdir()
+
+        tasks.TaskTable({}, temp_root=str(root)).close()
+
+        assert sorted(os.listdir(root)) == ["someone-elses"]
+
+
+class TestArtifact:
+    def test_set_artifact_inside_the_temp_dir(self, make_table, media):
+        def op(ctx, node_path, params):
+            path = os.path.join(ctx.temp_dir, "frames.tar")
+            with open(path, "wb") as handle:
+                handle.write(b"tar")
+            ctx.set_artifact(path)
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        _finished(table, task_id)
+
+        assert open(table.get(task_id).artifact, "rb").read() == b"tar"
+
+    def test_artifact_outside_the_temp_dir_is_refused(self, make_table, media):
+        def op(ctx, node_path, params):
+            ctx.set_artifact(node_path)
+            return {}
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED and "ValueError" in state["error"]["message"]
