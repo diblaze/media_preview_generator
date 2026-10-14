@@ -27,8 +27,9 @@ from media_preview_generator.markers.publishers.plex_db import PlexMarkerPublish
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.markers.settings import ServerMarkersSettings
 from media_preview_generator.nodes.server import plex_db as plex_db_role
+from media_preview_generator.nodes.server import winplatform
 from media_preview_generator.servers.base import ServerConfig, ServerType
-from tests.markers.test_plex_db_publisher import _make_db, _mountinfo
+from tests.markers.test_plex_db_publisher import _make_db, _mountinfo, linux_mount_table, windows_only
 from tests.nodes.plex_db_harness import TOKEN, FlaskSession, node_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -291,11 +292,20 @@ def _write_body(*, rating_key: int, wanted: list[Marker], prior=(), keep_plex=Fa
 class TestItRefusesWhatTheInProcessWriterRefuses:
     """The same guards, because it is the same code — never a second implementation."""
 
+    @linux_mount_table
     def test_a_database_on_a_network_share_is_refused_here_too(self, plex_config, tmp_path):
         app = node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path, fs="nfs4"))
         report = app.test_client().post("/v1/checks/file", json={}, headers=AUTH).get_json()["result"]["report"]
         assert report["state"] == Capability.NEEDS_LOCAL_DB.value
         assert "network share" in report["message"]
+
+    @windows_only
+    def test_a_database_on_a_network_drive_is_refused_here_too(self, plex_config, monkeypatch):
+        monkeypatch.setattr(winplatform, "drive_type", lambda _path: winplatform.DRIVE_REMOTE)
+        app = node_app(str(plex_config))
+        report = app.test_client().post("/v1/checks/file", json={}, headers=AUTH).get_json()["result"]["report"]
+        assert report["state"] == Capability.NEEDS_LOCAL_DB.value
+        assert "network share (network drive)" in report["message"]
 
     def test_plex_not_holding_the_database_is_refused_here_too(self, agent, monkeypatch):
         monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: False)

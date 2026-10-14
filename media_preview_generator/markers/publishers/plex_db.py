@@ -13,17 +13,18 @@ read-back of what this app left on an item (``shows``) reads the database.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import urllib.parse
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
+from types import ModuleType
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from loguru import logger
@@ -45,6 +46,10 @@ from .base import (
     compare_shown,
     wait_cancelled,
 )
+
+# Windows has no fcntl: there the Plex database role asks ``nodes.server.winplatform`` instead (``_winplatform``).
+if sys.platform != "win32":
+    import fcntl
 
 if TYPE_CHECKING:
     from ...servers.base import ServerConfig
@@ -384,7 +389,17 @@ def shm_lock_held_elsewhere(db_path: str, *, deadline: float | None = None) -> b
         return _shm_dms_locked_elsewhere(db_path)
 
 
+def _winplatform() -> ModuleType:
+    # Imported on Windows only: the node server package never loads in the app's (Linux) web process.
+    from ...nodes.server import winplatform
+
+    return winplatform
+
+
 def _shm_dms_locked_elsewhere(db_path: str) -> bool:
+    if sys.platform == "win32":
+        # None (neither Restart Manager nor the lock could tell) proves nothing, like a failed F_GETLK below.
+        return _winplatform().plex_holds_db(db_path) is True
     try:
         fd = os.open(f"{db_path}-shm", os.O_RDONLY | os.O_CLOEXEC)
     except OSError:
@@ -397,6 +412,20 @@ def _shm_dms_locked_elsewhere(db_path: str) -> bool:
     finally:
         os.close(fd)
     return lock_type != fcntl.F_UNLCK
+
+
+def _this_user() -> str:
+    """Who this process writes as: the uid, or the Windows user name (a Windows file has no owner uid)."""
+    return _winplatform().current_user() if sys.platform == "win32" else str(os.geteuid())
+
+
+def _file_owner(path: str) -> str:
+    """Who owns ``path``, in :func:`_this_user`'s terms; "unknown" when it can't be read."""
+    if sys.platform == "win32":
+        return _winplatform().file_owner(path) or "unknown"
+    with contextlib.suppress(OSError):
+        return str(os.stat(path).st_uid)
+    return "unknown"
 
 
 def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
@@ -1190,7 +1219,8 @@ class LocalPlexDb(PlexDatabase):
     def _connect(self, *, read_only: bool, timeout: float) -> sqlite3.Connection:
         mode = "ro" if read_only else "rw"
         # Quoted: SQLite reads "?", "#" and "%" in a file: URI as query, fragment and escapes, which would open a
-        # different path for folders named like "Plex #2". mode=rw never creates a missing file.
+        # different path for folders named like "Plex #2". mode=rw never creates a missing file. The same on Windows:
+        # SQLite decodes the quoted drive colon and backslashes of a D:\ path back (windows-node.yml).
         uri = f"file:{urllib.parse.quote(os.path.abspath(self._path() or ''))}?mode={mode}"
         return sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level=None)
 
@@ -1312,6 +1342,11 @@ class LocalPlexDb(PlexDatabase):
 
     @staticmethod
     def _unwritable_paths(db: str) -> list[str]:
+        if sys.platform == "win32":
+            # os.access only reads the read-only attribute on Windows; the ACL decides who may write.
+            can_write = _winplatform().same_user_can_write
+            files = [p for p in (db, f"{db}-wal", f"{db}-shm") if os.path.exists(p) and not can_write(p)]
+            return files if can_write(os.path.dirname(db)) else [*files, os.path.dirname(db)]
         paths = [p for p in (db, f"{db}-wal", f"{db}-shm") if os.path.exists(p) and not os.access(p, os.W_OK)]
         folder = os.path.dirname(db)
         if not os.access(folder, os.W_OK | os.X_OK):
@@ -1334,7 +1369,12 @@ class LocalPlexDb(PlexDatabase):
                 Capability.MISCONFIGURED, f"Plex database not found at {db or '(Plex config folder not set)'}"
             )
         # realpath: a symlinked config folder or DB file must be judged by where SQLite actually locks it.
-        fs_type = filesystem_type(os.path.realpath(db), mountinfo_path=self._mountinfo_path)
+        real = os.path.realpath(db)
+        if sys.platform == "win32":
+            fs_type, local = _winplatform().filesystem_label(real), _winplatform().is_local_drive(real)
+        else:
+            fs_type = filesystem_type(real, mountinfo_path=self._mountinfo_path)
+            local = is_local_filesystem(fs_type)
         details: dict = {"db_path": db, "fs_type": fs_type}
         if is_network_filesystem(fs_type):
             return CapabilityReport(
@@ -1343,7 +1383,7 @@ class LocalPlexDb(PlexDatabase):
                 "to write markers; Plex stays read-only.",
                 details,
             )
-        if not is_local_filesystem(fs_type):
+        if not local:
             return CapabilityReport(
                 Capability.NEEDS_LOCAL_DB,
                 f"Plex's database is on a filesystem this app doesn't recognise as a local disk ({fs_type or 'unknown'}); "
@@ -1352,15 +1392,13 @@ class LocalPlexDb(PlexDatabase):
             )
         unwritable = self._unwritable_paths(db)
         if unwritable:
-            owner = "unknown"
-            with contextlib.suppress(OSError):
-                owner = str(os.stat(db).st_uid)
+            owner, writer = _file_owner(db), _this_user()
             # The facts as well as the sentence: with an agent this ran on Plex's machine, and ``capability()``
             # rebuilds the sentence around the agent rather than around this app.
-            details.update({"unwritable": list(unwritable), "writer_uid": str(os.geteuid()), "db_owner_uid": owner})
+            details.update({"unwritable": list(unwritable), "writer_uid": writer, "db_owner_uid": owner})
             return CapabilityReport(
                 Capability.MISCONFIGURED,
-                f"This app (user {os.geteuid()}) can't write {', '.join(unwritable)}. Run it with the user that owns "
+                f"This app (user {writer}) can't write {', '.join(unwritable)}. Run it with the user that owns "
                 f"Plex's database (user {owner}).",
                 details,
             )

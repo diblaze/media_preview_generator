@@ -33,6 +33,9 @@ NETWORK_FS_TYPES: frozenset[str] = frozenset(
         "fuse.s3fs",
         "lustre",
         "fuse.juicefs",
+        # Not a mountinfo type (those never hold a space): what the Windows Plex database node reports for a mapped
+        # drive or UNC path (``nodes.server.winplatform.DRIVE_LABELS``).
+        "network drive",
     }
 )
 

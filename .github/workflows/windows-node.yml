@@ -1,0 +1,131 @@
+name: Windows node
+
+# The Plex database role on Windows: its tests on a real Windows machine, and the PyInstaller build started and called.
+on:
+  pull_request:
+    paths:
+      - "nodes/**"
+      - "media_preview_generator/nodes/**"
+      - "media_preview_generator/markers/publishers/plex_db*.py"
+      - "media_preview_generator/markers/fs.py"
+      - "tests/test_winplatform.py"
+      - ".github/workflows/windows-node.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-node-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Plex database tests on Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install the app with dev extras
+        shell: pwsh
+        run: pip install -e ".[dev]"
+      - name: Run the Plex database and winplatform tests
+        shell: pwsh
+        run: |
+          # Files that a later change removes drop out instead of failing the run.
+          $files = @(
+            "tests/test_winplatform.py",
+            "tests/markers/test_plex_db_publisher.py",
+            "tests/markers/test_plex_db_lock.py",
+            "tests/nodes/test_plex_db_role.py",
+            "tests/test_plex_chapters.py",
+            "tests/nodes/test_plex_db_loudness.py",
+            "tests/nodes/test_plex_db_library_health.py"
+          ) | Where-Object { Test-Path $_ }
+          # Two workers: the runner's disk is slow to commit, and the lock-timing tests share it.
+          python -m pytest --no-cov -n 2 -q -rfEs -p no:cacheprovider @files
+          exit $LASTEXITCODE
+
+  build:
+    name: Build and smoke-test the Windows node
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools-scm works the app version out from the tags
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Is the node server here yet
+        id: ready
+        shell: pwsh
+        run: |
+          $missing = @("media_preview_generator/nodes/server/app.py", "media_preview_generator/nodes/server/plex_db.py") |
+            Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            "::notice::Skipping the Windows build: $($missing -join ', ') not in this tree yet (node server lanes)."
+            "run=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "run=true" >> $env:GITHUB_OUTPUT
+          }
+      - name: Build
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: ./nodes/windows/build.ps1
+      - name: Self-test the build (everything the role imports is in it)
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          ./dist/PlexDbNode/PlexDbNode-debug.exe --self-test
+          exit $LASTEXITCODE
+      - name: Smoke-test the windowed build
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          python nodes/windows/smoke_test.py dist/PlexDbNode/PlexDbNode.exe
+          exit $LASTEXITCODE
+      - name: Install for this user, call it, uninstall
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $key = -join ((1..32) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
+          "::add-mask::$key"
+          $env:NODE_KEY = $key
+          $plex = Join-Path $env:RUNNER_TEMP "Plex Media Server"
+          New-Item -ItemType Directory -Force $plex | Out-Null
+          $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          ./nodes/windows/install.ps1 -Source dist/PlexDbNode -Port 9495 -PlexConfigDir $plex
+          if (-not (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue)) {
+            throw "install.ps1 left no logon entry"
+          }
+          $ping = Invoke-RestMethod http://127.0.0.1:9495/v1/ping -Headers @{ Authorization = "Bearer $key" }
+          if (-not $ping.ok) { throw "the installed node didn't answer /v1/ping" }
+          "ok   the installed node answers /v1/ping"
+          ./nodes/windows/uninstall.ps1 -RemoveData
+          if (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue) {
+            throw "uninstall.ps1 left the logon entry"
+          }
+          if (Get-Process -Name PlexDbNode -ErrorAction SilentlyContinue) { throw "uninstall.ps1 left the node running" }
+          if (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\MediaPreviewGenerator\PlexDbNode")) {
+            throw "uninstall.ps1 left the program folder"
+          }
+          "ok   uninstall.ps1 removed the entry, the process and the folder"
+      - name: Upload the build
+        if: steps.ready.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlexDbNode-windows
+          path: |
+            dist/PlexDbNode
+            nodes/windows/install.ps1
+            nodes/windows/uninstall.ps1
+            nodes/windows/README.md
+          retention-days: 7
