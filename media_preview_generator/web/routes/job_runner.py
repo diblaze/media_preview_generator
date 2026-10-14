@@ -1008,6 +1008,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         group_name=worker_data.get("group_name"),
                         group_resource=worker_data.get("group_resource"),
                         retiring=bool(worker_data.get("retiring", False)),
+                        node=worker_data.get("node"),
+                        node_state=worker_data.get("node_state"),
                     )
                     job_manager.update_worker_status(worker_key, status)
                 job_manager.prune_worker_statuses(active_worker_keys)
