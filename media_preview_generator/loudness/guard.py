@@ -24,9 +24,15 @@ from ..markers.publishers.plex_db import (
 )
 from ..servers.base import ServerConfig, ServerType
 from .analyze import ANALYSIS_VERSION
+from .plex_db import check_schema
 
 if TYPE_CHECKING:
     from .plex_db import AudioStream
+
+# How long a read-only check trusts the Plex identity and database schema it just proved. Writes always prove them
+# again. Checks run on several threads: each stamp is one assignment, so two threads meeting an expired stamp both
+# prove it again, which is harmless.
+TRUST_S = 60.0
 
 
 class GuardedLoudnessDb(LocalPlexDb):
@@ -48,9 +54,18 @@ class GuardedLoudnessDb(LocalPlexDb):
         self.folder = Path(folder)
         self.server = server
         self.machine_identifier = ""
+        self._identity_proven_at: float | None = None
+        self._schema_proven_at: float | None = None
         super().__init__(lambda: plex_db_path(folder), label=cfg.name)
 
-    def _identity(self) -> None:
+    def _identity(self, *, trust_recent: bool = False) -> None:
+        if (
+            trust_recent
+            and self._identity_proven_at is not None
+            and time.monotonic() - self._identity_proven_at < TRUST_S
+        ):
+            return
+        self._identity_proven_at = None
         try:
             identity = self.server._connect().query("/identity")
             machine = identity.get("machineIdentifier")
@@ -77,10 +92,19 @@ class GuardedLoudnessDb(LocalPlexDb):
                 state=Capability.UNSUPPORTED_SCHEMA,
             )
         self.machine_identifier = machine
+        self._identity_proven_at = time.monotonic()
+
+    def check_schema_for_read(self, conn: sqlite3.Connection) -> None:
+        """``check_schema`` for a read, skipped when it passed in the last ``TRUST_S``."""
+        if self._schema_proven_at is not None and time.monotonic() - self._schema_proven_at < TRUST_S:
+            return
+        self._schema_proven_at = None
+        check_schema(conn)
+        self._schema_proven_at = time.monotonic()
 
     @contextmanager
     def _database(self, *, read_only: bool, deadline: float) -> Iterator[sqlite3.Connection]:
-        self._identity()
+        self._identity(trust_recent=read_only)
         if not read_only:
             report = self.file_checks(deadline=deadline)
             if not report.ready:
@@ -105,7 +129,7 @@ class GuardedLoudnessDb(LocalPlexDb):
         Raises:
             PublishError: Plex cannot yet serve the matching analysis; retry later.
         """
-        self._identity()
+        self._identity(trust_recent=True)
         by_item: dict[int, list[AudioStream]] = {}
         for stream in streams:
             by_item.setdefault(stream.metadata_item_id, []).append(stream)
@@ -152,8 +176,6 @@ def create_loudness_db(cfg: ServerConfig, server: Any) -> GuardedLoudnessDb:
 
 def loudness_capability(server: Any, cfg: ServerConfig) -> CapabilityReport:
     """Check the loudness backend without changing Plex or requiring marker consent."""
-    from .plex_db import check_schema
-
     try:
         db = create_loudness_db(cfg, server)
         deadline = time.monotonic() + BUSY_TIMEOUT_S

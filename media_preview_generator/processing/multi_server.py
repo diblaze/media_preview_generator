@@ -1570,6 +1570,7 @@ def _process_canonical_path_previews(
     source: str | None = None,
     originating_job_id: str | None = None,
     check_only: bool = False,
+    source_fingerprint: SourceFingerprint | None = None,
 ) -> MultiServerResult:
     """Process ``canonical_path`` and publish to every owning server.
 
@@ -1587,6 +1588,8 @@ def _process_canonical_path_previews(
             knows the id (typical for Plex / Emby / Jellyfin webhooks).
         regenerate: When True, publish even if all output paths already
             exist on disk.
+        source_fingerprint: The caller's own recent stat of ``canonical_path``
+            (a regular file), which saves stating it again.
         check_only: When True, run every pre-FFmpeg step (publisher
             resolution, source-missing / sibling-mount-rebind probe, the
             all-fresh short-circuit and its ``trigger_refresh`` +
@@ -1663,7 +1666,7 @@ def _process_canonical_path_previews(
         ", ".join(f"{srv.name}/{adp.name}" for srv, adp, _ in publishers),
     )
 
-    if not os.path.isfile(canonical_path):
+    if source_fingerprint is None and not os.path.isfile(canonical_path):
         # Issue #266 — a folder (TV series root, season dir) reached the
         # worker. Manual/webhook folder paths are normally expanded into
         # their video files upstream in _run_webhook_paths_phase; the only
@@ -1707,6 +1710,7 @@ def _process_canonical_path_previews(
                 rebound_path,
             )
             canonical_path = rebound_path
+            source_fingerprint = None
 
             # Re-resolve publishers against the rebound path.
             # The original publisher list was built from the stale path
@@ -1760,14 +1764,15 @@ def _process_canonical_path_previews(
         else:
             return _source_missing_result(canonical_path, registry, sibling_candidates)
 
-    try:
-        source_fingerprint = get_source_fingerprint(canonical_path)
-    except OSError as exc:
-        return MultiServerResult(
-            canonical_path=canonical_path,
-            status=MultiServerStatus.FAILED,
-            message=f"Could not inspect source file: {exc}",
-        )
+    if source_fingerprint is None:
+        try:
+            source_fingerprint = get_source_fingerprint(canonical_path)
+        except OSError as exc:
+            return MultiServerResult(
+                canonical_path=canonical_path,
+                status=MultiServerStatus.FAILED,
+                message=f"Could not inspect source file: {exc}",
+            )
 
     def _source_changed() -> bool:
         try:
@@ -2486,7 +2491,7 @@ def process_canonical_path(
         if chapter_progress_callback:
             chapter_progress_callback({"stage": "preparing", "processed": 0, "total": 0, "ready": 0, "failed": 0})
 
-    def prepare(path: str) -> None:
+    def prepare(path: str, fingerprint: SourceFingerprint | None = None) -> None:
         preparing_chapters()
         for server, _adapter, hint in _resolve_publishers(path, registry, item_id_by_server=item_id_by_server):
             if server.id not in enabled:
@@ -2502,17 +2507,34 @@ def process_canonical_path(
                     cancel_check=cancel_check,
                     trust_server_hash=_is_bulk_scan(source, config),
                     regenerate=force,
+                    source_fingerprint=fingerprint,
+                    reuse_recent_checks=True,
                 )
             except CancellationError:
                 raise
             except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
                 planning_failures[server.id] = _failure(exc)
 
-    if os.path.isfile(canonical_path):
-        prepare(canonical_path)
+    # One stat serves the file-exists check and chapter planning. A path that cannot be stat'ed as a regular file
+    # (missing, a folder) is left for the preview half to report.
+    try:
+        planned_fingerprint = get_source_fingerprint(canonical_path)
+    except (OSError, ValueError):
+        planned_fingerprint = None
+    preview_fingerprint = None
+    if planned_fingerprint is not None:
+        prepare(canonical_path, planned_fingerprint)
+        # Planning can take a while: the preview half stats the file again, so a file replaced or deleted meanwhile
+        # is judged as it is now (a failed stat leaves the preview half to report it, as before).
+        try:
+            preview_fingerprint = get_source_fingerprint(canonical_path)
+        except (OSError, ValueError):
+            preview_fingerprint = None
     if chapter_progress_callback:
         chapter_progress_callback(None)
-    result = _process_canonical_path_previews(canonical_path, registry, config, **options)
+    result = _process_canonical_path_previews(
+        canonical_path, registry, config, source_fingerprint=preview_fingerprint, **options
+    )
     if result.status not in {
         MultiServerStatus.PUBLISHED,
         MultiServerStatus.SKIPPED,

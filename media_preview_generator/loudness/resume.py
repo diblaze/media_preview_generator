@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,9 @@ from .chain import previous_result
 from .plex_db import SourceChangedError, SourceFingerprint
 
 _SUCCESS = frozenset({"loudness_written", "loudness_up_to_date"})
+# A revived job re-checks its saved files this many at a time, in groups of ``RESTORE_CHUNK``.
+RESTORE_CHECK_THREADS = 8
+RESTORE_CHUNK = 64
 
 
 def _valid_servers(rows: object) -> bool:
@@ -165,6 +169,32 @@ class CompletionLedger:
             self.error = f"Could not save loudness completion ({type(exc).__name__})"
             raise RuntimeError(self.error) from exc
 
+    @staticmethod
+    def _saved_candidate(item: ProcessableItem, encoded: str | None) -> dict | None:
+        """The saved success row for ``item`` when it still describes the same file and selection, else None.
+
+        A malformed private row means a fresh check, never an inferred success or an erased media result.
+        """
+        if not encoded:
+            return None
+        try:
+            candidate = json.loads(encoded)
+            fingerprint = source_fingerprint(item)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("version") == 1
+                and candidate.get("outcome") in _SUCCESS
+                and fingerprint is not None
+                and candidate.get("source") == list(fingerprint)
+                and candidate.get("server_id") == item.server_id
+                and candidate.get("item_id_by_server") == item.item_id_by_server
+                and _valid_servers(candidate.get("servers"))
+            ):
+                return candidate
+        except (ValueError, TypeError):
+            return None
+        return None
+
     def restore(
         self,
         items: list[ProcessableItem],
@@ -187,49 +217,49 @@ class CompletionLedger:
         }
         remaining = []
         last_progress = 0.0
-        for item in items:
-            if cancel_check():
-                raise InterruptedError("Loudness resume cancelled")
-            encoded = saved.get(item.canonical_path)
-            row = None
-            if encoded:
-                try:
-                    candidate = json.loads(encoded)
-                    fingerprint = source_fingerprint(item)
-                    if (
-                        isinstance(candidate, dict)
-                        and candidate.get("version") == 1
-                        and candidate.get("outcome") in _SUCCESS
-                        and fingerprint is not None
-                        and candidate.get("source") == list(fingerprint)
-                        and candidate.get("server_id") == item.server_id
-                        and candidate.get("item_id_by_server") == item.item_id_by_server
-                        and _valid_servers(candidate.get("servers"))
-                    ):
-                        current = check(item)
+        pool = ThreadPoolExecutor(RESTORE_CHECK_THREADS)
+        try:
+            for start in range(0, len(items), RESTORE_CHUNK):
+                chunk = items[start : start + RESTORE_CHUNK]
+                if cancel_check():
+                    raise InterruptedError("Loudness resume cancelled")
+                candidates = [self._saved_candidate(item, saved.get(item.canonical_path)) for item in chunk]
+                # The check reads the share and Plex, so a chunk's checks run side by side; their results are
+                # then judged here in file order.
+                checks = [
+                    pool.submit(check, item) if candidate else None
+                    for item, candidate in zip(chunk, candidates, strict=True)
+                ]
+                for item, candidate, pending in zip(chunk, candidates, checks, strict=True):
+                    if cancel_check():
+                        raise InterruptedError("Loudness resume cancelled")
+                    row = None
+                    if pending is not None:
+                        current = pending.result()
+                        fingerprint = source_fingerprint(item)
                         if (
                             current is not None
                             and current.outcome_key == "loudness_up_to_date"
                             and {server.get("server_id") for server in current.publisher_rows}
                             == {server.get("server_id") for server in candidate["servers"]}
-                            and source_fingerprint(item) == fingerprint
+                            and fingerprint is not None
+                            and candidate.get("source") == list(fingerprint)
                         ):
                             row = candidate
-                except (ValueError, TypeError):
-                    # A malformed private row must cause a fresh native check,
-                    # never an inferred success or an erased media result.
-                    row = None
-            if row is None:
-                remaining.append(item)
-                continue
-            state["successful"] += 1
-            self._accepted.add(item.canonical_path)
-            key = row["outcome"]
-            counts = state["outcome_counts"]
-            counts[key] = counts.get(key, 0) + 1
-            fold_publisher_rows_into_aggregate(state["publishers_aggregate"], row["servers"])
-            now = time.monotonic()
-            if progress and now - last_progress >= 1:
-                progress(state["successful"], len(items))
-                last_progress = now
+                    if row is None:
+                        remaining.append(item)
+                        continue
+                    state["successful"] += 1
+                    self._accepted.add(item.canonical_path)
+                    key = row["outcome"]
+                    counts = state["outcome_counts"]
+                    counts[key] = counts.get(key, 0) + 1
+                    fold_publisher_rows_into_aggregate(state["publishers_aggregate"], row["servers"])
+                    now = time.monotonic()
+                    if progress and now - last_progress >= 1:
+                        progress(state["successful"], len(items))
+                        last_progress = now
+        finally:
+            # On cancel the checks not yet started are dropped; only the ones in flight finish.
+            pool.shutdown(wait=True, cancel_futures=True)
         return remaining, state

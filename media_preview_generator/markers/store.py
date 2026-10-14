@@ -8,9 +8,11 @@ since every caller shares one connection and one lock -- WAL mode only benefits 
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -541,8 +543,69 @@ class StoredFingerprint:
     points: bytes
 
 
+# Tables a check's cached reads come from (a file's row, its evidence, frame rate, fingerprints, decided and locked
+# markers, detector runs): a write to any of them moves ``MarkerStore.data_generation``.
+_READ_TABLES = frozenset(
+    {"files", "evidence", "evidence_versions", "frame_rates", "fingerprints", "markers", "detector_runs"}
+)
+_WRITTEN_TABLE = re.compile(
+    r"\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?|DELETE\s+FROM)\s+(\w+)", re.IGNORECASE
+)
+
+
+class _WritesSeen:
+    """A transaction's connection: runs what it is given and notes which tables the statements write."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.tables: set[str] = set()
+
+    def _note(self, sql: str) -> None:
+        written = _WRITTEN_TABLE.match(sql)
+        if written:
+            self.tables.add(written.group(1).lower())
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        self._note(sql)
+        return self._conn.execute(sql, *args)  # type: ignore[arg-type]
+
+    def executemany(self, sql: str, *args: object) -> sqlite3.Cursor:
+        self._note(sql)
+        return self._conn.executemany(sql, *args)  # type: ignore[arg-type]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+def read_memoised(method: Callable) -> Callable:
+    """Make a read return what this thread's run (``MarkerStore.read_memo``) already read with the same arguments.
+
+    The memo is dropped by any write this thread makes and by a write to a table the reads come from by any thread
+    (``MarkerStore.data_generation``), so a repeated read sees everything a fresh one would. Lists and dicts are handed
+    out as copies (their items are frozen).
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: MarkerStore, *args: object, **kwargs: object) -> object:
+        memo = self._current_memo()
+        if memo is None:
+            return method(self, *args, **kwargs)
+        key = (method.__name__, args, tuple(sorted(kwargs.items())))
+        if key not in memo:
+            memo[key] = method(self, *args, **kwargs)
+        value = memo[key]
+        return value.copy() if isinstance(value, list | dict | set) else value
+
+    return wrapper
+
+
 class MarkerStore:
-    """Thread-safe access to ``markers.db``."""
+    """Thread-safe access to ``markers.db``.
+
+    Attributes:
+        data_generation: Moves on every committed write to a table a check's reads come from (``_READ_TABLES``). A
+            value cached while it was at N is out of date once it isn't N.
+    """
 
     def __init__(self, db_path: str, *, clock: Callable[[], datetime] | None = None) -> None:
         """Open (and create) the store.
@@ -556,6 +619,8 @@ class MarkerStore:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._tx_owner: int | None = None
+        self.data_generation = 0
+        self._local = threading.local()  # this thread's read memo and how many writes it has made
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -678,8 +743,15 @@ class MarkerStore:
             self._conn.close()
 
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self, *, cached_reads_unchanged: bool = False) -> Iterator[sqlite3.Connection]:
         """One ``BEGIN IMMEDIATE`` transaction under the store lock; the lock is released on every path.
+
+        A transaction that wrote moves this thread's write count, and ``data_generation`` when it wrote a table the
+        checks read, before the lock is released.
+
+        Args:
+            cached_reads_unchanged: The caller promises its writes change nothing a cached read returns (a ``files``
+                row's ``updated_at``, which no read hands out but the carry-over's), so neither is moved.
 
         Raises:
             RuntimeError: Called again on the same thread while its own transaction is still open --
@@ -695,9 +767,10 @@ class MarkerStore:
                 self._rollback_quietly()
             self._conn.execute("BEGIN IMMEDIATE")
             self._tx_owner = threading.get_ident()
+            seen = _WritesSeen(self._conn)
             try:
                 try:
-                    yield self._conn
+                    yield cast(sqlite3.Connection, seen)
                 except BaseException:
                     self._rollback_quietly()
                     raise
@@ -708,6 +781,35 @@ class MarkerStore:
                     raise
             finally:
                 self._tx_owner = None
+                if seen.tables and not cached_reads_unchanged:
+                    self._local.writes = getattr(self._local, "writes", 0) + 1
+                    if seen.tables & _READ_TABLES:
+                        self.data_generation += 1
+
+    @contextmanager
+    def read_memo(self) -> Iterator[None]:
+        """Within the block, this thread's ``read_memoised`` reads are made once per fact (a file's run reads the same
+        evidence, locks and frame rate several times). Not nested: an inner block shares the outer one's memo."""
+        if getattr(self._local, "memo", None) is not None:
+            yield
+            return
+        self._local.memo = {}
+        self._local.memo_tag = None
+        try:
+            yield
+        finally:
+            self._local.memo = None
+
+    def _current_memo(self) -> dict | None:
+        """This thread's read memo, emptied first when anything it read from may have changed since."""
+        memo = getattr(self._local, "memo", None)
+        if memo is None:
+            return None
+        tag = (self.data_generation, getattr(self._local, "writes", 0))
+        if self._local.memo_tag != tag:
+            memo.clear()
+            self._local.memo_tag = tag
+        return memo
 
     def _rollback_quietly(self) -> None:
         if not self._conn.in_transaction:
@@ -746,10 +848,37 @@ class MarkerStore:
         ``missing_since`` mark is cleared. What the replaced identity's decisions were is kept aside first
         (``replaced_decisions``, :meth:`replaced_in_place`), for the carry-over.
 
+        A file already stored exactly like this is returned as it is, with only its ``updated_at`` (when it was last
+        looked at) moved.
+
         Returns:
             The record.
         """
+        # One statement decides and writes: a file stored exactly like this only has its updated_at moved. Anything
+        # else (a changed identity, a missing mark to clear) matches no row and takes the full path below.
         now = self._now()
+        with self._tx(cached_reads_unchanged=True) as conn:
+            touched = conn.execute(
+                "UPDATE files SET updated_at=? WHERE canonical_path=? AND size=? AND mtime_ns=? "
+                "AND (? IS NULL OR duration_ms=?) AND season_key IS ? AND is_movie=? AND missing_since IS NULL",
+                (
+                    now,
+                    identity.canonical_path,
+                    identity.size,
+                    identity.mtime_ns,
+                    duration_ms,
+                    duration_ms,
+                    season_key,
+                    int(is_movie),
+                ),
+            ).rowcount
+            held = (
+                conn.execute("SELECT * FROM files WHERE canonical_path=?", (identity.canonical_path,)).fetchone()
+                if touched
+                else None
+            )
+        if held is not None:
+            return self._file(held)
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM files WHERE canonical_path=?", (identity.canonical_path,)).fetchone()
             if row is None:
@@ -803,6 +932,7 @@ class MarkerStore:
             new_row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
         return self._file(new_row)
 
+    @read_memoised
     def get_file(self, canonical_path: str) -> FileRecord | None:
         """Look a file up by canonical path."""
         with self._lock:
@@ -1407,6 +1537,7 @@ class MarkerStore:
                 ),
             )
 
+    @read_memoised
     def evidence_version(self, file_id: int, source: Source, origin: str = "") -> int | None:
         """The version one lookup's stored evidence was made with (None = never stored, or stored without one)."""
         with self._lock:
@@ -1431,6 +1562,7 @@ class MarkerStore:
                 (version, file_id, source.value, origin),
             )
 
+    @read_memoised
     def evidence_fetched_at(self, file_id: int, source: Source, origin: str = "") -> datetime | None:
         """When a source was last looked up for this file (None = never)."""
         with self._lock:
@@ -1444,6 +1576,7 @@ class MarkerStore:
         with self._lock:
             return self._conn.execute("SELECT * FROM evidence WHERE file_id=? ORDER BY id", (file_id,)).fetchall()
 
+    @read_memoised
     def evidence_rows(self, file_id: int) -> list[EvidenceRow]:
         """Every evidence row for a file, including empty lookups."""
         return [
@@ -1461,6 +1594,7 @@ class MarkerStore:
             for r in self._evidence_query(file_id)
         ]
 
+    @read_memoised
     def get_evidence(self, file_id: int) -> list[Candidate]:
         """Candidates for the decision rules (empty lookups excluded).
 
@@ -1544,6 +1678,7 @@ class MarkerStore:
         """Desired markers (decided + locked) for a file."""
         return self._markers(file_id, locked_only=False)
 
+    @read_memoised
     def get_locked(self, file_id: int) -> dict[MarkerType, Marker]:
         """User-locked markers for a file."""
         return self._markers(file_id, locked_only=True)
@@ -1809,6 +1944,7 @@ class MarkerStore:
             r["file_id"], r["window"], r["start_s"], r["length_s"], r["algorithm"], bytes(r["points"])
         )
 
+    @read_memoised
     def has_fingerprint(
         self, file_id: int, window: str, *, algorithm: int | None = None, length_s: float | None = None
     ) -> bool:
@@ -2082,6 +2218,7 @@ class MarkerStore:
             )
         return True
 
+    @read_memoised
     def get_detector_run(self, file_id: int, source: Source) -> str | None:
         """The signature a local detector's stored answer for a file was based on, or None."""
         with self._lock:
@@ -2124,6 +2261,7 @@ class MarkerStore:
             r = self._conn.execute("SELECT limit_ms FROM intro_chapter_limits WHERE file_id=?", (file_id,)).fetchone()
         return (False, None) if r is None else (True, r["limit_ms"])
 
+    @read_memoised
     def get_frame_rate(self, file_id: int) -> tuple[bool, float | None]:
         """A file's video frame rate as ffprobe read it from the file as its row is now.
 

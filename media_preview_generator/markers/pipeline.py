@@ -143,6 +143,7 @@ from .publishers.base import (
 )
 from .publishers.factory import publisher_for, supported_types_for
 from .publishers.plex_db import STALE_READ_WAIT_S, WAIT_CANCELLED, WAIT_SLICE_S, WORKER_BUSY_TIMEOUT_S
+from .season_cache import SeasonCache
 from .settings import GlobalMarkersSettings, ServerMarkersSettings, SourceSetting, get_global_settings, load_server
 from .source_counts import DecidedByTally, decided_groups
 from .sources import introdb, skipdb, theintrodb
@@ -180,6 +181,9 @@ EMPTY_SERVER_MARKERS_RETRY = timedelta(days=1)
 RECHECK_AFTER = tuple(timedelta(days=days) for days in (1, 2, 4, 8, 16))
 # A file replaced while it is analysed is detected again from scratch; one that keeps changing is being written.
 MAX_ATTEMPTS = 3
+# How long a job reuses what it read of a season (its folders' listing, its files' stored facts) for the season's next
+# episodes: a file added or replaced on disk meanwhile is seen at most this late.
+SEASON_CACHE_TTL_S = 60.0
 _ONLINE_LABELS = {Source.THEINTRODB: "TheIntroDB", Source.INTRODB: "IntroDB", Source.SKIPDB: "SkipDB"}
 PARSER_VERSIONS = {
     Source.THEINTRODB: theintrodb.PARSER_VERSION,
@@ -400,6 +404,8 @@ class PipelineContext:
             (``job_runner``). A pause of this job by hand isn't one: it gives the job's slot back and lets the running
             file finish. Handed to the detectors on a worker; None: never.
         monotonic: The clock the job log's step times are read from (tests use a fake one).
+        seasons: What the job's episodes share of their season (``season_cache``); keeps nothing unless it was given a
+            time to (``build_context``).
     """
 
     registry: Any
@@ -423,6 +429,7 @@ class PipelineContext:
     freeze_check: Callable[[], bool] | None = None
     monotonic: Callable[[], float] = time.monotonic
     decided_by: DecidedByTally = field(default_factory=DecidedByTally, repr=False)
+    seasons: SeasonCache = field(default_factory=SeasonCache, repr=False)
     _capabilities: dict[str, tuple[float, CapabilityReport]] = field(default_factory=dict, repr=False)
     _capability_locks: dict[str, threading.Lock] = field(default_factory=dict, repr=False)
     _capability_guard: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -500,7 +507,8 @@ class PipelineContext:
         with self._run_memos_guard:
             self._run_memos[canonical_path] = (threading.get_ident(), {})
         try:
-            yield
+            with self.store.read_memo():  # the run reads each fact of the file once, until something is written
+                yield
         finally:
             with self._run_memos_guard:
                 self._run_memos.pop(canonical_path, None)
@@ -1002,6 +1010,7 @@ def build_context(
         recheck_empty_server_markers=recheck_empty_server_markers,
         chromaprint=chromaprint,
         credits_text=credits_text,
+        seasons=SeasonCache(ttl_s=SEASON_CACHE_TTL_S),
     )
 
 

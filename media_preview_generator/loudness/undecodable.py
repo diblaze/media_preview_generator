@@ -85,26 +85,32 @@ def record(
     return True
 
 
-def _read(query: str, ffmpeg: str, path: str | None) -> list[tuple]:
+def _read(query: str, ffmpeg: str, path: str | None) -> list[tuple] | None:
+    """The query's rows, or None when the store can't be read."""
     try:
         with _lock, closing(sqlite3.connect(path or db_path(), timeout=_TIMEOUT_S)) as conn:
             conn.execute(_SCHEMA)
             return conn.execute(query, (ffmpeg,)).fetchall()
     except (sqlite3.Error, OSError) as exc:
         logger.debug("Loudness undecodable-stream store unreadable, treating it as empty: {}", exc)
-        return []
+        return None
+
+
+def read_skipped_keys(ffmpeg: str, path: str | None = None) -> frozenset[tuple[str, int, str]] | None:
+    """Like ``skipped_keys``, but None when the store can't be read, so a caller can ask again later."""
+    rows = _read("SELECT part_hash, stream_index, codec FROM undecodable_streams WHERE ffmpeg = ?", ffmpeg, path)
+    return None if rows is None else frozenset((h, i, c) for h, i, c in rows)
 
 
 def skipped_keys(ffmpeg: str, path: str | None = None) -> frozenset[tuple[str, int, str]]:
     """Every ``(part_hash, stream_index, codec)`` this ffmpeg failed on."""
-    rows = _read("SELECT part_hash, stream_index, codec FROM undecodable_streams WHERE ffmpeg = ?", ffmpeg, path)
-    return frozenset((h, i, c) for h, i, c in rows)
+    return read_skipped_keys(ffmpeg, path) or frozenset()
 
 
 def skipped_count_by_part_hash(ffmpeg: str, path: str | None = None) -> dict[str, int]:
     """How many streams this ffmpeg failed on, per part hash."""
     query = "SELECT part_hash, COUNT(*) FROM undecodable_streams WHERE ffmpeg = ? GROUP BY part_hash"
-    return dict(_read(query, ffmpeg, path))
+    return dict(_read(query, ffmpeg, path) or [])
 
 
 def is_skipped(stream: AudioStream, keys: frozenset[tuple[str, int, str]]) -> bool:

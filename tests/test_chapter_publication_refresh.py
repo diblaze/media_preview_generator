@@ -41,7 +41,7 @@ def publication(backend, tmp_path, monkeypatch):
     api = MagicMock()
     api.query.side_effect = query
     server = SimpleNamespace(_connect=lambda: api)
-    monkeypatch.setattr(plex_chapters, "_context", lambda _server: (backend, MACHINE, VERSION, None))
+    monkeypatch.setattr(plex_chapters, "_context", lambda _server, **_kw: (backend, MACHINE, VERSION, None))
     register = MagicMock(wraps=backend.register)
     monkeypatch.setattr(backend, "register", register)
     return SimpleNamespace(

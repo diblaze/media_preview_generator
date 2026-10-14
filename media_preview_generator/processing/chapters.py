@@ -188,6 +188,8 @@ def prepare_chapters(
     cancel_check=None,
     trust_server_hash: bool = False,
     regenerate: bool = False,
+    source_fingerprint: SourceFingerprint | None = None,
+    reuse_recent_checks: bool = False,
 ) -> ChapterPlan:
     """Resolve only an enabled Plex server's exact source and chapter map.
 
@@ -197,10 +199,13 @@ def prepare_chapters(
         trust_server_hash: Bulk scans only. Use Plex's hash for the part at this exact path
             when its byte size matches, instead of reading the file (the same rule as BIF paths).
         regenerate: Ignore a stored "unsupported source" or "failed before" stamp so an explicit regeneration retries the file.
+        source_fingerprint: The caller's own stat of this file, when it just took one; saves a second stat.
+        reuse_recent_checks: Covers only the read-side checks (a recent Plex identity and database check are reused);
+            writes (``register_chapters`` / ``LocalChapters.register``) always prove identity again.
     """
     from ..servers.plex_chapters import ChapterError, resolve_chapter_target
 
-    fingerprint = get_source_fingerprint(canonical_path)
+    fingerprint = source_fingerprint or get_source_fingerprint(canonical_path)
     bundle_hash = None if trust_server_hash else calculate_plex_hash(canonical_path)
     plan = ChapterPlan(
         server,
@@ -213,7 +218,9 @@ def prepare_chapters(
         last_error = None
         for remote_path in expand_path_mapping_candidates(canonical_path, server.path_mappings):
             try:
-                plan.target = resolve_chapter_target(server, remote_path, item_id_hint=item_id_hint)
+                plan.target = resolve_chapter_target(
+                    server, remote_path, item_id_hint=item_id_hint, reuse_recent_checks=reuse_recent_checks
+                )
                 break
             except ChapterError as exc:
                 if exc.code != "pending_index":
@@ -280,14 +287,19 @@ def _check_source(plan: ChapterPlan) -> None:
         raise SourceFileChangedError("Source changed during chapter processing; retry when the file is stable.")
 
 
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _revision(path: Path) -> str:
+    """Validate a freshly extracted chapter image, then return the hash that identifies it."""
     with Image.open(path) as image:
         if image.format != "JPEG" or image.width != _WIDTH or image.height < 1:
             raise ValueError(
                 f"Chapter extraction expected a 1280px JPEG; got {image.format} {image.width}x{image.height}"
             )
         image.load()
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return _file_sha256(path)
 
 
 def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
@@ -307,9 +319,11 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
                 continue
             path = plan.folder / f"chapter{chapter.index}.jpg"
             try:
-                if entry.get("sha256") == _revision(path):
+                # The recorded hash was taken only after _revision decoded this image, so identical bytes are
+                # already known to be a complete 1280px JPEG. Truncated or replaced files differ in their hash.
+                if entry.get("sha256") == _file_sha256(path):
                     fresh[str(chapter.index)] = entry
-            except (OSError, ValueError):
+            except OSError:
                 continue
         return fresh
     except (OSError, ValueError, TypeError, AttributeError):

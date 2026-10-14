@@ -38,6 +38,7 @@ from ..missing import library_folders
 from ..models import Candidate, FileIdentity, MarkerType, Source
 from ..probe import MediaProbe, ProbeError, ProbeStalledError, probe_media
 from ..progress import StepProgress, WorkerProgress
+from ..season_cache import SeasonResults
 from ..sources.chapters import CHAPTER_RULES_VERSION, chapter_candidates
 from ..speed import FILM_FPS, PAL_FPS, match_speed, playback_speed, retime_factor
 from ..store import PAIR_VERSION_STEP, EndPictureKey
@@ -916,20 +917,32 @@ def _probe_failed_lately(ctx: PipelineContext, identity: FileIdentity) -> bool:
     return failed_at is not None and ctx.now() - failed_at < UNREADABLE_MEMBER_RETRY
 
 
-def _member_record_if_readable(ctx: PipelineContext, path: str) -> FileRecord | None:
-    """:func:`_member_record` for the chapter step (no frame rate needed), with a member ffprobe can't be started for
-    now counting as unread (its own run reads it)."""
-    try:
-        return _member_record(ctx, path, with_frame_rate=False)
-    except ProbeStalledError as exc:
-        logger.debug("The season step leaves out {} for now: {}", os.path.basename(path), exc)
-        return None
-
-
 def _intro_chapter_ms(ctx: PipelineContext, rec: FileRecord | None) -> int | None:
     return (
         intro_chapter_length_ms(ctx.store.get_evidence(rec.id), cast(int, rec.duration_ms)) if rec is not None else None
     )
+
+
+def _member_intro_chapter_ms(ctx: PipelineContext, view: _SeasonView, path: str) -> int | None:
+    """:func:`_intro_chapter_ms` of a season member's record as :func:`_member_record` reads it for the chapter step (no
+    frame rate needed), with a member ffprobe can't be started for now counting as unread (its own run reads it).
+
+    Read once while nothing it comes from is written: a member that needed probing is written by it, so is never
+    answered from before, and a stalled probe is not remembered.
+    """
+    results = view.results()
+    if path in results.intro_chapter_ms:
+        return results.intro_chapter_ms[path]
+    generation = ctx.store.data_generation
+    try:
+        rec = _member_record(ctx, path, with_frame_rate=False)
+    except ProbeStalledError as exc:
+        logger.debug("The season step leaves out {} for now: {}", os.path.basename(path), exc)
+        return None
+    length = _intro_chapter_ms(ctx, rec)
+    if ctx.store.data_generation == generation:
+        results.intro_chapter_ms[path] = length
+    return length
 
 
 def season_intro_chapter_limit(ctx: PipelineContext, canonical_path: str) -> int | None:
@@ -952,7 +965,7 @@ def season_intro_chapter_limit(ctx: PipelineContext, canonical_path: str) -> int
         rec = _current_record(ctx, canonical_path)
         return ctx.store.get_intro_chapter_limit(rec.id)[1] if rec is not None else None
     episodes = view.group().episodes
-    lengths = {path: _intro_chapter_ms(ctx, _member_record_if_readable(ctx, path)) for path in episodes}
+    lengths = {path: _member_intro_chapter_ms(ctx, view, path) for path in episodes}
     if lengths[canonical_path] is None:
         return None
     return intro_chapter_limit_ms([ms for path, ms in lengths.items() if path != canonical_path and ms is not None])
@@ -1033,18 +1046,43 @@ class _SeasonView:
     file's signature item and signature. Kept for the run in ``ctx.run_memo`` (the pipeline drops it once a detector
     ran), so the chapter step, the follow-ups hook, the early-stop and pending checks (``season_audio_due``) and
     ``needs_worker`` read the season once. ``unreadable`` holds the folders of the season's disks that are there but
-    can't be read: season audio then can't tell the season, and waits (``season_audio_due``)."""
+    can't be read: season audio then can't tell the season, and waits (``season_audio_due``).
+
+    The listing and previous-season files come from the job's shared entry for the season (``ctx.seasons``), as do the
+    signatures and intro-chapter lengths (``results``) while nothing they were read from has been written."""
 
     def __init__(self, ctx: PipelineContext, canonical_path: str) -> None:
         self._ctx = ctx
         self.canonical_path = canonical_path
+        self._folder = os.path.dirname(canonical_path)
+        self._entry = ctx.seasons.entry(self._folder)
         self.configs = _server_configs(ctx)
-        self.unreadable: set[str] = set()
-        self.videos = season_videos(canonical_path, self.configs, self.unreadable)
-        self.on_disk: dict[str, list] = {}
+        videos, unreadable = self._entry.once("videos", self._read_videos)
+        self.videos: tuple[FolderVideo, ...] = videos
+        self.unreadable: set[str] = set(unreadable)
         self._groups: dict[str, SeasonGroup] = {}
-        self._signatures: dict[str, str] = {}
         self._previous: tuple[str, ...] | None = None
+
+    def _read_videos(self) -> tuple[tuple[FolderVideo, ...], frozenset[str]]:
+        unreadable: set[str] = set()
+        folders = season_folders(self.canonical_path, self.configs, unreadable)
+        self._entry.watch(folders)
+        videos = tuple(video for folder in folders for video in folder_videos(folder, unreadable))
+        if unreadable:
+            self._ctx.seasons.forget(self._folder, self._entry)  # asked again by the next episode, as ever
+        return videos, frozenset(unreadable)
+
+    def _read_previous(self) -> tuple[tuple[str, ...], frozenset[str]]:
+        unreadable: set[str] = set()
+        previous = previous_season_files(self.canonical_path, self.configs, unreadable)
+        if unreadable:
+            self._ctx.seasons.forget(self._folder, self._entry)
+        return previous, frozenset(unreadable)
+
+    def results(self) -> SeasonResults:
+        """What the store said about the season's files, as long as its ``data_generation`` hasn't moved (a write by
+        this run, or by any other thread, to what it was read from, ends it: the next ask starts empty)."""
+        return self._entry.results(self._ctx.store.data_generation)
 
     def group(self, path: str | None = None) -> SeasonGroup:
         """The season group of this run's episode, or of another file of its season."""
@@ -1056,19 +1094,21 @@ class _SeasonView:
     def previous_season(self) -> tuple[str, ...]:
         """This run's episode's :func:`previous_season_files`."""
         if self._previous is None:
-            self._previous = previous_season_files(self.canonical_path, self.configs, self.unreadable)
+            self._previous, unreadable = self._entry.once("previous", self._read_previous)
+            self.unreadable |= unreadable
         return self._previous
 
     def signature(self, path: str) -> str:
         """What an answer for ``path`` made from the files on disk now would be based on."""
-        if path not in self._signatures:
+        results = self.results()
+        if path not in results.signatures:
             group = self.group(path)
             if path == self.canonical_path and len(group.episodes) == 1:
                 paths = group.episodes + self.previous_season()
             else:
                 paths = _signature_paths(path, group, self.configs, self.unreadable)
-            self._signatures[path] = _signature(self._ctx, paths, on_disk=self.on_disk)
-        return self._signatures[path]
+            results.signatures[path] = _signature(self._ctx, paths, on_disk=results.items)
+        return results.signatures[path]
 
 
 def _season_view(ctx: PipelineContext, canonical_path: str) -> _SeasonView:

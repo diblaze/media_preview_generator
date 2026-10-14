@@ -8,12 +8,15 @@ split into several files is unsupported.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
 import re
 import sqlite3
+import threading
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
 from itertools import pairwise
@@ -42,6 +45,13 @@ MAX_JPEG_BYTES = 16 * 1024 * 1024
 _HASH = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _THUMB_MEDIA_ID = re.compile(r"/library/media/(\d+)/chapterImages/")
+
+# A library check asks the same two questions of every file: "which Plex is this?" and "is its database usable?".
+# Read-only checks may reuse a recent answer; anything that writes asks again.
+_RECENT_CHECK_TTL_S = 60.0
+_recent_lock = threading.Lock()
+_recent_identity: weakref.WeakKeyDictionary[Any, tuple[float, str, str]] = weakref.WeakKeyDictionary()
+_recent_database_checks: dict[tuple[str, str, str], float] = {}
 
 
 def _valid_bundle_hash(bundle_hash: str, source_size: int) -> bool:
@@ -367,12 +377,24 @@ class LocalChapters:
         *,
         item_id_hint: int | None = None,
         deadline: float,
+        reuse_recent_checks: bool = False,
     ) -> ChapterTarget:
-        """Read one exact source under the common database lock."""
-        self._guard(machine_identifier, version, deadline)
+        """Read one exact source under the common database lock.
+
+        Args:
+            reuse_recent_checks: Read side only (writes always prove identity again): skip the identity, file and
+                schema checks when they all passed for this database within the last minute. The database is still
+                opened and queried for every read, so the lock is never held between files.
+        """
+        key = (str(self.folder), machine_identifier, version)
+        checked = reuse_recent_checks and _database_checked_recently(key)
+        if not checked:
+            self._guard(machine_identifier, version, deadline)
         try:
             with self.database._database(read_only=True, deadline=deadline) as conn:
-                self._schema(conn)
+                if not checked:
+                    self._schema(conn)
+                    _remember_database_checked(key)
                 return self._read(conn, source_path, machine_identifier, item_id_hint)
         except sqlite3.Error as exc:
             raise publish_error_from_sqlite(exc) from exc
@@ -488,13 +510,41 @@ class LocalChapters:
             raise publish_error_from_sqlite(exc) from exc
 
 
-def _context(server: Any, server_config: Any = None) -> tuple[Any, str, str, Any]:
+def _database_checked_recently(key: tuple[str, str, str]) -> bool:
+    with _recent_lock:
+        checked_at = _recent_database_checks.get(key)
+    return checked_at is not None and time.monotonic() - checked_at < _RECENT_CHECK_TTL_S
+
+
+def _remember_database_checked(key: tuple[str, str, str]) -> None:
+    with _recent_lock:
+        _recent_database_checks[key] = time.monotonic()
+
+
+def _server_identity(server: Any, plex: Any, *, reuse_recent: bool) -> tuple[str, str]:
+    """The connected Plex's machine identifier and version; only successful answers are kept."""
+    if reuse_recent:
+        recent = None
+        with _recent_lock, contextlib.suppress(TypeError):
+            recent = _recent_identity.get(server)
+        if recent is not None and time.monotonic() - recent[0] < _RECENT_CHECK_TTL_S:
+            return recent[1], recent[2]
+    identity = plex.query("/identity")
+    machine = identity.get("machineIdentifier") or ""
+    version = identity.get("version") or ""
+    if machine and version:
+        with _recent_lock, contextlib.suppress(TypeError):
+            _recent_identity[server] = (time.monotonic(), machine, version)
+    return machine, version
+
+
+def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = False) -> tuple[Any, str, str, Any]:
     try:
         plex = server._connect()
-        identity = plex.query("/identity")
-        machine = identity.get("machineIdentifier") or ""
-        version = identity.get("version") or ""
+        machine, version = _server_identity(server, plex, reuse_recent=reuse_recent)
     except Exception as exc:
+        with _recent_lock, contextlib.suppress(TypeError):
+            _recent_identity.pop(server, None)  # a server that just failed is not one to trust from memory
         raise ChapterError(
             "Cannot verify Plex server identity for chapter registration",
             code="registration",
@@ -565,9 +615,20 @@ def chapter_capability(server: Any, server_config: Any = None) -> CapabilityRepo
         return CapabilityReport(Capability.AGENT_UNAVAILABLE, "Plex-side helper returned an invalid chapter response")
 
 
-def resolve_chapter_target(server: Any, canonical_path: str, *, item_id_hint: int | None = None) -> ChapterTarget:
-    """Resolve Plex's original source path to a guarded chapter snapshot."""
-    backend, machine, version, _ = _context(server)
+def resolve_chapter_target(
+    server: Any, canonical_path: str, *, item_id_hint: int | None = None, reuse_recent_checks: bool = False
+) -> ChapterTarget:
+    """Resolve Plex's original source path to a guarded chapter snapshot.
+
+    Args:
+        server: The Plex server.
+        canonical_path: Plex's original path of the source.
+        item_id_hint: Plex's item id, when known.
+        reuse_recent_checks: Read-side checks only: reuse a Plex identity and local database check made in the last
+            minute instead of repeating them for every file. The Plex connection is still made every time, and
+            writes (:func:`register_chapters`, :meth:`LocalChapters.register`) always prove identity again.
+    """
+    backend, machine, version, _ = _context(server, reuse_recent=reuse_recent_checks)
     if isinstance(backend, AgentClient):
         try:
             result = _remote(backend, "read", machine, version, source_path=canonical_path, item_id_hint=item_id_hint)
@@ -577,7 +638,14 @@ def resolve_chapter_target(server: Any, canonical_path: str, *, item_id_hint: in
             return target
         except (KeyError, TypeError, ValueError) as exc:
             raise ChapterError("Plex-side helper returned an invalid chapter snapshot") from exc
-    return backend.read(canonical_path, machine, version, item_id_hint=item_id_hint, deadline=time.monotonic() + 10)
+    return backend.read(
+        canonical_path,
+        machine,
+        version,
+        item_id_hint=item_id_hint,
+        deadline=time.monotonic() + 10,
+        reuse_recent_checks=reuse_recent_checks,
+    )
 
 
 def register_chapters(

@@ -112,6 +112,30 @@ class LoudnessContext:
     _locks_lock: threading.Lock = field(default_factory=threading.Lock)
     # (server id, folder) pairs Plex was already asked to scan in this job.
     _scan_requested: set[tuple[str, str]] = field(default_factory=set)
+    # What this ffmpeg can't decode, read from loudness.db on first use and kept current as this job records more.
+    _undecodable: frozenset[tuple[str, int, str]] | None = None
+    _undecodable_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def undecodable_keys(self) -> frozenset[tuple[str, int, str]]:
+        """The ``(part hash, stream index, codec)`` keys this job's ffmpeg can't decode, read once per job."""
+        with self._undecodable_lock:
+            return self._load_undecodable()
+
+    def note_undecodable(self, streams: list[AudioStream]) -> None:
+        """Add streams this job just recorded as undecodable."""
+        with self._undecodable_lock:
+            if self._undecodable is not None:  # not loaded yet: the first read gets these from loudness.db
+                self._undecodable = self._undecodable | {
+                    (s.part_hash, s.index, s.codec) for s in streams if s.part_hash
+                }
+
+    def _load_undecodable(self) -> frozenset[tuple[str, int, str]]:
+        if self._undecodable is None:
+            read = undecodable.read_skipped_keys(undecodable.ffmpeg_identity(self.ffmpeg))
+            if read is None:
+                return frozenset()  # unreadable: not remembered, so the next file reads it again
+            self._undecodable = read
+        return self._undecodable
 
     def request_plex_scan(self, cfg: ServerConfig, path: str) -> None:
         """Ask Plex to scan the file's folder, once per folder in the job, so a file it hasn't added yet turns up before
@@ -182,11 +206,21 @@ def _row(cfg: ServerConfig, status: str, message: str = "", *, retryable: bool =
     return row
 
 
+def _read_source(path: str) -> SourceFingerprint | None:
+    """The file's identity from one stat, or None when it isn't a readable regular file (as ``os.path.isfile``)."""
+    try:
+        return SourceFingerprint.read(path)
+    except SourceChangedError:
+        return None
+
+
 def _lookup(
-    ctx: LoudnessContext, cfg: ServerConfig, path: str
+    ctx: LoudnessContext, cfg: ServerConfig, path: str, source: SourceFingerprint | None = None
 ) -> tuple[dict | None, list[AudioStream], list[AudioStream]]:
     """The file's audio streams in the server's Plex and those without loudness yet; or, instead, the server's row when
-    there's nothing to analyse there (not in Plex yet, no audio track, the database unreadable just then)."""
+    there's nothing to analyse there (not in Plex yet, no audio track, the database unreadable just then).
+
+    ``source`` is the file's identity the caller already read; the one re-stat at the end proves it didn't change."""
     try:
         db, why = ctx.db(cfg)
         if why:
@@ -195,14 +229,14 @@ def _lookup(
         plex_paths = apply_inverse_path_mappings(path, cfg.path_mappings or [])
         streams, in_plex = read_streams(db, plex_paths, deadline=time.monotonic() + BUSY_TIMEOUT_S)
         if streams:
-            source = SourceFingerprint.read(path)
+            source = source or SourceFingerprint.read(path)
             if any(not s.part_hash or s.part_size is None for s in streams):
                 raise SourceChangedError("Plex has not fully indexed the audio source; retry after its scan")
-            current_hash = calculate_plex_hash(path)
+            current_hash = calculate_plex_hash(path, fingerprint=source[1:])
             source.verify()
             if any(s.part_hash != current_hash or s.part_size != source.size for s in streams):
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
-        skipped = undecodable.skipped_keys(undecodable.ffmpeg_identity(ctx.ffmpeg))
+        skipped = ctx.undecodable_keys()
         needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
         if streams and not needed and all(s.item_marked for s in streams) and isinstance(db, GuardedLoudnessDb):
             # verify_streams requires complete loudness on every stream it is given, which undecodable ones never have.
@@ -259,7 +293,8 @@ def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
 def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | None:
     """Check stage: settle a file with nothing to analyse; None sends it to a worker."""
     path = item.canonical_path
-    if not os.path.isfile(path):
+    source = _read_source(path)
+    if source is None:
         if os.path.normpath(path) in ctx.deleted_paths:
             return ItemOutcome(SOURCE_GONE, "Skipped: import webhook confirmed this absent source was deleted")
         return _not_on_disk(path, ctx)
@@ -268,7 +303,7 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
         return ItemOutcome(NO_OWNERS, "No Plex server has loudness on for its library")
     rows = []
     for cfg in servers:
-        row, streams, todo = _lookup(ctx, cfg, path)
+        row, streams, todo = _lookup(ctx, cfg, path, source)
         if row is not None:
             rows.append(row)
             if row["status"] == NOT_IN_LIBRARY:
@@ -474,6 +509,8 @@ def process_item(
                     break
                 except analyze.LoudnessNoDecoder as exc:
                     remembered, text = _skip_undecodable(path, index, same, exc, ctx.ffmpeg)
+                    if remembered:
+                        ctx.note_undecodable(same)
                     (skipped if remembered else errors).append(text)
                 except (analyze.LoudnessError, PublishError) as exc:
                     if isinstance(exc, PublishError) and exc.state is Capability.UNREACHABLE:
@@ -732,13 +769,19 @@ def _run_loudness_pass(job_id: str) -> bool | None:
                     ),
                 )
 
+                capacity_lock = threading.Lock()
+
                 def validate_saved(item: ProcessableItem) -> ItemOutcome | None:
-                    if held_by_pause() or not runtime_capacity(JOB_KIND_LOUDNESS)["open"]:
-                        # A wait here can last hours (a pause, closed worker hours); holding a start-up slot through
-                        # it would stall every other job's start-up.
-                        release_slot(slot, get_job_gate())
-                        if not wait_for_capacity(jm, job_id, JOB_KIND_LOUDNESS, cancel_check, held_by_pause):
-                            raise InterruptedError("Loudness resume cancelled")
+                    if cancel_check():
+                        raise InterruptedError("Loudness resume cancelled")
+                    # Called from several threads; one at a time releases the slot and waits, the rest queue behind it.
+                    with capacity_lock:
+                        if held_by_pause() or not runtime_capacity(JOB_KIND_LOUDNESS)["open"]:
+                            # A wait here can last hours (a pause, closed worker hours); holding a start-up slot
+                            # through it would stall every other job's start-up.
+                            release_slot(slot, get_job_gate())
+                            if not wait_for_capacity(jm, job_id, JOB_KIND_LOUDNESS, cancel_check, held_by_pause):
+                                raise InterruptedError("Loudness resume cancelled")
                     return check_item(item, ctx=ctx)
 
                 def report_restore_progress(restored: int, total: int) -> None:

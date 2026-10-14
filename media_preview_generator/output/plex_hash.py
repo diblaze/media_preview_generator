@@ -67,7 +67,7 @@ def _hash_stable_source(path: str, expected: SourceFingerprint) -> str:
     return hashlib.sha1(signature.encode("ascii"), usedforsecurity=False).hexdigest()
 
 
-def calculate_plex_hash(path: str | os.PathLike[str]) -> str:
+def calculate_plex_hash(path: str | os.PathLike[str], *, fingerprint: SourceFingerprint | None = None) -> str:
     """Calculate the current file's Plex bundle hash without a server lookup.
 
     Results are cached by file identity and change markers, so checks and
@@ -77,6 +77,9 @@ def calculate_plex_hash(path: str | os.PathLike[str]) -> str:
 
     Args:
         path: Local media filename.
+        fingerprint: The file's ``get_source_fingerprint`` the caller already read. The hash is then computed for
+            exactly that file state, and the closing re-stat is left to the caller, who re-checks the file after
+            using the hash.
 
     Returns:
         The Plex media bundle identifier. Small files include a decimal size
@@ -87,6 +90,8 @@ def calculate_plex_hash(path: str | os.PathLike[str]) -> str:
         SourceFileChangedError: The source was replaced or modified during hashing.
     """
     filename = os.path.abspath(path)
+    if fingerprint is not None:
+        return _hash_stable_source(filename, fingerprint)
     expected = get_source_fingerprint(filename)
     result = _hash_stable_source(filename, expected)
     if get_source_fingerprint(filename) != expected:

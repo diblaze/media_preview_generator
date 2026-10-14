@@ -175,6 +175,21 @@ def test_a_recorded_stream_is_not_looked_up_again(ctx, db, media):  # noqa: F811
     assert [s.index for s in needed] == [1, 2, 3]
 
     undecodable.record(needed[0].part_hash, 1, "av3a", "no decoder", FF)
+    _row, _streams_, needed_still = job._lookup(ctx, cfg, media)
+    assert [s.index for s in needed_still] == [1, 2, 3]  # a job reads the list once; another job's record waits
+
+    ctx._undecodable = None  # the next job
+    _row, _streams_, needed = job._lookup(ctx, cfg, media)
+    assert [s.index for s in needed] == [2, 3]
+
+
+def test_a_stream_this_job_records_is_skipped_by_its_later_checks(ctx, db, media):  # noqa: F811
+    _three_streams(db)
+    cfg = job.owners(media, ctx.registry)[0]
+    _row, _streams_, needed = job._lookup(ctx, cfg, media)
+
+    ctx.note_undecodable(needed[:1])
+
     _row, _streams_, needed = job._lookup(ctx, cfg, media)
     assert [s.index for s in needed] == [2, 3]
 
@@ -226,3 +241,38 @@ def test_real_ffmpeg_reports_a_missing_decoder_for_one_track_and_measures_the_ot
     with pytest.raises(analyze.LoudnessNoDecoder):
         analyze.run(ffmpeg, str(av3a), 0, duration_ms=3000)
     assert "ln:loudness" in analyze.run(ffmpeg, str(av3a), 1, duration_ms=3000)
+
+
+def test_an_unreadable_skip_list_is_not_remembered_for_the_job(ctx, db, media, monkeypatch):  # noqa: F811
+    _three_streams(db)
+    cfg = job.owners(media, ctx.registry)[0]
+    calls = []
+
+    def unreadable(*_args, **_kwargs):
+        calls.append(1)
+        return None
+
+    with monkeypatch.context() as patched:
+        patched.setattr(undecodable, "_read", unreadable)
+        _row, _streams_, needed = job._lookup(ctx, cfg, media)
+        assert [s.index for s in needed] == [1, 2, 3]
+        job._lookup(ctx, cfg, media)
+        assert len(calls) == 2  # asked again for the next file
+
+    undecodable.record(needed[0].part_hash, 1, "av3a", "no decoder", FF)
+    _row, _streams_, needed = job._lookup(ctx, cfg, media)
+    assert [s.index for s in needed] == [2, 3]
+
+
+def test_noting_a_stream_before_the_list_is_loaded_leaves_it_to_the_first_read(ctx, db, media):  # noqa: F811
+    _three_streams(db)
+    cfg = job.owners(media, ctx.registry)[0]
+    _row, _streams_, needed = job._lookup(ctx, cfg, media)
+    ctx._undecodable = None  # not read yet in this job
+
+    ctx.note_undecodable(needed[:1])
+
+    assert ctx._undecodable is None  # nothing cached, so the next file reads loudness.db
+    undecodable.record(needed[0].part_hash, 1, "av3a", "no decoder", FF)
+    _row, _streams_, needed = job._lookup(ctx, cfg, media)
+    assert [s.index for s in needed] == [2, 3]

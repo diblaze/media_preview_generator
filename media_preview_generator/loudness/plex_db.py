@@ -261,7 +261,8 @@ def read_streams(db: LocalPlexDb, plex_paths: list[str], *, deadline: float) -> 
     marks = ",".join("?" * len(plex_paths))
     try:
         with db._database(read_only=True, deadline=deadline) as conn:
-            check_schema(conn)
+            # The guarded database skips the table check when it passed moments ago; any other runs it every time.
+            getattr(db, "check_schema_for_read", check_schema)(conn)
             rows = conn.execute(
                 _STREAM_SELECT + f"WHERE mp.file IN ({marks}) AND mp.deleted_at IS NULL AND mi.deleted_at IS NULL "  # noqa: S608
                 "AND NOT (COALESCE(mi.proxy_type, 0) != 0 AND REPLACE(mp.file, char(92), '/') LIKE '%/Plex Versions/%') "

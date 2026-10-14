@@ -10,6 +10,7 @@ from xml.etree.ElementTree import Element
 
 import pytest
 
+from media_preview_generator.loudness import guard
 from media_preview_generator.loudness.guard import create_loudness_db, loudness_capability
 from media_preview_generator.markers.publishers.base import Capability, CapabilityReport, PublishError
 from media_preview_generator.markers.publishers.plex_db import plex_db_path
@@ -319,3 +320,35 @@ def test_readback_connection_failure_is_retryable_and_does_not_leak_tokens(serve
         db.verify_streams([expected])
     assert caught.value.state is Capability.UNREACHABLE
     assert "secret-token" not in str(caught.value)
+
+
+def test_reads_trust_a_recent_identity_but_writes_and_expired_trust_prove_it_again(guarded, monkeypatch):
+    db, _, server = guarded
+    monkeypatch.setattr(db, "file_checks", MagicMock(return_value=CapabilityReport(Capability.READY, "Ready")))
+    query = server._connect.return_value.query
+
+    for _ in range(3):
+        with db._database(read_only=True, deadline=1e12):
+            pass
+    assert query.call_count == 1
+
+    with db._database(read_only=False, deadline=1e12):
+        pass
+    assert query.call_count == 2
+
+    db._identity_proven_at -= guard.TRUST_S
+    with db._database(read_only=True, deadline=1e12):
+        pass
+    assert query.call_count == 3
+
+
+def test_a_failed_identity_proof_is_not_trusted_by_the_next_read(guarded):
+    db, _, server = guarded
+    with db._database(read_only=True, deadline=1e12):
+        pass
+    server._connect.return_value.query.side_effect = OSError("down")
+    db._identity_proven_at -= guard.TRUST_S
+
+    for _ in range(2):
+        with pytest.raises(PublishError), db._database(read_only=True, deadline=1e12):
+            pass

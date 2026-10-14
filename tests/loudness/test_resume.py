@@ -12,7 +12,7 @@ import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome
 from media_preview_generator.jobs.checkpoints import item_descriptor, write_checkpoint
-from media_preview_generator.loudness import job
+from media_preview_generator.loudness import job, resume
 from media_preview_generator.loudness.resume import CompletionLedger, source_fingerprint
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.web.jobs import JobStatus
@@ -323,6 +323,7 @@ def test_global_pause_between_native_resume_checks_waits_for_resume_or_cancel(
     monkeypatch,
     finish,
 ):
+    monkeypatch.setattr(resume, "RESTORE_CHECK_THREADS", 1)  # one at a time: the pause is seen between two checks
     lifecycle.api_ready = True
     paths = [lifecycle.add_file("pause-first.mkv"), lifecycle.add_file("pause-second.mkv")]
     parent = lifecycle.start(paths)
@@ -368,5 +369,128 @@ def test_global_pause_between_native_resume_checks_waits_for_resume_or_cancel(
         assert gate.snapshot()[0] == 0
     finally:
         settings.processing_paused = False
+        lifecycle.manager.request_cancellation(parent.id)
+        runner.join(3)
+
+
+def test_saved_files_are_rechecked_side_by_side_and_judged_in_order(tmp_path):
+    ledger = CompletionLedger(tmp_path, "resume")
+    items = []
+    for n in range(20):
+        source = tmp_path / f"source{n}.mkv"
+        source.write_bytes(b"audio %d" % n)
+        item = ProcessableItem(str(source), "plex", {"plex": str(n)})
+        ledger.record(item, outcome(), source_fingerprint(item))
+        items.append(item)
+    running, peak, lock = 0, 0, threading.Lock()
+    release = threading.Event()
+
+    def check(item):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+            if running > 1:
+                release.set()
+        release.wait(2)
+        with lock:
+            running -= 1
+        return outcome("loudness_up_to_date") if item is not items[3] else None
+
+    try:
+        remaining, state = ledger.restore(items, check=check, cancel_check=lambda: False)
+    finally:
+        ledger.close()
+
+    assert peak > 1
+    assert remaining == [items[3]]
+    assert state["successful"] == 19
+
+
+def _many_saved(tmp_path, count=200):
+    ledger = CompletionLedger(tmp_path, "resume")
+    items = []
+    for n in range(count):
+        source = tmp_path / f"source{n}.mkv"
+        source.write_bytes(b"audio %d" % n)
+        item = ProcessableItem(str(source), "plex", {"plex": str(n)})
+        ledger.record(item, outcome(), source_fingerprint(item))
+        items.append(item)
+    return ledger, items
+
+
+def test_cancelling_a_resume_stops_within_one_check_per_thread(tmp_path):
+    ledger, items = _many_saved(tmp_path)
+    cancelled = threading.Event()
+    started, lock = [], threading.Lock()
+
+    def check(item):
+        with lock:
+            started.append(item)
+            if len(started) >= resume.RESTORE_CHECK_THREADS:
+                cancelled.set()
+        time.sleep(0.05)
+        return outcome("loudness_up_to_date")
+
+    try:
+        with pytest.raises(InterruptedError):
+            ledger.restore(items, check=check, cancel_check=cancelled.is_set)
+    finally:
+        ledger.close()
+
+    assert len(started) <= 2 * resume.RESTORE_CHECK_THREADS
+
+
+@pytest.mark.parametrize("finish", ["resume", "cancel"])
+def test_eight_threads_stop_at_a_cancel_and_wait_out_a_pause(lifecycle: Lifecycle, monkeypatch, finish):
+    threads = resume.RESTORE_CHECK_THREADS
+    lifecycle.api_ready = True
+    paths = [lifecycle.add_file(f"many-{n}.mkv") for n in range(3 * threads)]
+    parent = lifecycle.start(paths)
+    parent.status = JobStatus.PENDING
+    parent.completed_at = None
+    settings = job.get_settings_manager()
+    in_flight, checked, guard = threading.Event(), [], threading.Lock()
+    hold = threading.Event()
+    original = job.check_item
+
+    def check(item, **kwargs):
+        with guard:
+            checked.append(item.canonical_path)
+            if len(checked) == threads:
+                in_flight.set()
+        if finish == "cancel":
+            hold.wait(3)  # every thread is inside a check when the cancel arrives
+        elif len(checked) == 1:
+            settings.processing_paused = True  # seen by every check not yet started
+        return original(item, **kwargs)
+
+    monkeypatch.setattr(job, "check_item", check)
+    runner = threading.Thread(target=job.run_loudness_job, args=(parent.id,))
+    runner.start()
+    try:
+        if finish == "cancel":
+            assert in_flight.wait(3)
+            lifecycle.manager.request_cancellation(parent.id)
+            hold.set()
+        else:
+            deadline = time.monotonic() + 3
+            while not checked and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.3)
+            assert 1 <= len(checked) < len(paths), "no new check starts while processing is paused"
+            assert runner.is_alive()
+            settings.processing_paused = False
+        runner.join(5)
+        assert not runner.is_alive()
+        if finish == "cancel":
+            assert len(checked) == threads, "only the checks already running finish"
+            assert parent.status is JobStatus.CANCELLED
+        else:
+            assert sorted(checked) == sorted(paths)
+            assert parent.status is JobStatus.COMPLETED
+    finally:
+        settings.processing_paused = False
+        hold.set()
         lifecycle.manager.request_cancellation(parent.id)
         runner.join(3)
