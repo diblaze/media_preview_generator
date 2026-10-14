@@ -1186,12 +1186,30 @@ class TestReadBackVerify:
         path = ProcessableItem(canonical_path=item.paths["1080p"], server_id="plex-1")
         assert pipeline.check_item(path, ctx=ctx).outcome_key == "markers_published"  # capability cached READY
         item._sql(("DELETE FROM taggings WHERE metadata_item_id=7",))
-        # Plex stops holding its database: the read-back can't be trusted, so nothing is decided from it.
+        # Plex stopped holding its database over a minute ago: the read-back can't be trusted, so nothing is decided
+        # from it.
         monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: False)
+        plex_db._ready_file_checks.clear()
 
         out = pipeline.check_item(path, ctx=ctx)
 
         assert (out.outcome_key, out.publisher_rows[0]["message"]) == ("markers_up_to_date", "Up to date")
+        assert item.commits == 1
+
+    def test_plex_stopping_within_the_trusted_minute_is_caught_by_the_write(self, plex_item, monkeypatch):
+        item = plex_item(versions=("1080p",))
+        item.chapters[item.paths["1080p"]] = chapters(intro=INTRO_X, credits=CREDITS_AT)
+        ctx = _ctx(item.store, item.registry, settings_raw=NO_ONLINE)
+        path = ProcessableItem(canonical_path=item.paths["1080p"], server_id="plex-1")
+        assert pipeline.check_item(path, ctx=ctx).outcome_key == "markers_published"
+        item._sql(("DELETE FROM taggings WHERE metadata_item_id=7",))
+        # Reads trust the READY check for a minute; the write proves Plex holds the database again and refuses.
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: False)
+
+        out = pipeline.check_item(path, ctx=ctx)
+
+        assert out.outcome_key == "failed"
+        assert "Markers are only written while Plex is running" in out.publisher_rows[0]["message"]
         assert item.commits == 1
 
     def test_a_write_that_finds_nothing_left_to_do_under_the_lock_is_up_to_date(self, plex_item, monkeypatch):
