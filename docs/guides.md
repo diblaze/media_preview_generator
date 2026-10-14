@@ -19,6 +19,7 @@ Guides for the web interface, automation and webhooks, HDR handling, and trouble
 
 - [Web Interface](#web-interface)
 - [Setup Health (per-check toggles & explanations)](guides/previews-readiness.md)
+- [Remote nodes](#remote-nodes)
 - [Webhook Integration](#webhook-integration)
 - [Auto-trigger from Plex (no Sonarr/Radarr)](#auto-trigger-from-plex-no-sonarrradarr)
 - [Intro & Credits](#intro--credits)
@@ -326,8 +327,8 @@ chapter timestamp rather than repeatedly retrying it. The app preserves the sour
    default. Enabling it lets this app write chapter images and update their references in Plex's database; it does
    not change your videos, create chapters, or change chapter times.
 2. Open **Setup Health**. The app needs a supported, positively identified Plex database on the same machine, or a
-   compatible [Plex helper](#plex-on-another-machine-the-plex-marker-agent) beside Plex. If a helper is needed,
-   **Configure Plex helper** takes you directly to the shared connection controls. **Intro & Credits can stay off**.
+   compatible [Plex database node](#plex-on-another-machine-the-plex-database-node) beside Plex. If one is needed,
+   pick it under **Edit → Connection → Plex database**. **Intro & Credits can stay off**.
 3. In Plex's **Settings → Library → Generate chapter thumbnails**, select **Never** to avoid Plex repeating the work
    and replacing these images. This Plex setting affects all its libraries. The app checks it but does not change it.
 4. Run your usual **Previews** job. Existing schedules and webhooks also include chapters while the toggle is on;
@@ -641,6 +642,60 @@ Login and API endpoints are rate-limited to protect against brute force. See [Re
 ### Real-Time Updates
 
 The dashboard streams live job progress over WebSocket (Flask-SocketIO, `/jobs` namespace). See [Reference — WebSocket Events](reference.md#websocket-events) for the event table and payloads.
+
+---
+
+## Remote nodes
+
+A **node** is another machine that helps this app. The app stays in charge: it keeps the queue, the schedules, your
+server tokens and every write to your servers. A node runs one heavy step it is handed and sends the result back.
+
+A node has one or both roles:
+
+- **Worker**: lends its GPU or CPU for video previews, Intro & Credits detection and loudness. It needs to read your
+  media; it never gets a server token and writes nothing outside its own temp folder.
+- **Plex database**: runs where Plex runs (Linux or Windows) and opens Plex's database for Intro & Credits, chapter
+  thumbnails, loudness and Library Health counts. It replaces the separate Plex marker agent.
+
+### Running a worker node
+
+Use the app's own image, the **same tag** as the app, started with `MODE=node`:
+
+```bash
+docker run -d --name media-preview-node -p 9494:9494 \
+  -e MODE=node -e NODE_KEY=change-me -e PUID=1000 -e PGID=1000 \
+  --device /dev/dri:/dev/dri \
+  -v /path/to/media:/media:ro -v /path/to/node/config:/config \
+  stevezzau/media_preview_generator:latest
+```
+
+- Mount your media read-only, at any path.
+- Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA).
+- Leave out `NODE_KEY` and the node makes one, printed once in `docker logs`.
+- A compose file is in [`nodes/worker/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/worker/docker-compose.yml).
+
+### Adding it
+
+1. **Settings → Nodes → Add node**: a name, the node's address (`http://machine:9494`) and its key.
+2. **Media**: for each library, the folder this app uses and the folder the node sees the same files at.
+   **Test access** picks 3 real files per library and checks the node sees each one with the same size and
+   modified time. A wrong mapping shows the exact path tried.
+3. **Settings → Workers**: add the node's GPU or CPU to a worker group. Devices are listed under **This app** first,
+   then under each node's name. Hours, job types and worker counts work as for this app's devices.
+
+The node card shows its state: **Ready**, **Offline**, **Key refused**, **Update needed**, **Access problem** or
+**GPU lost**. Only a ready node gets work; a node that lost its GPU keeps its CPU workers. Each node also has its own
+**Setup Health** and **Log** tabs.
+
+If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
+at its mapped path runs elsewhere instead of failing.
+
+### Plex on another machine
+
+Run a Plex database node beside Plex: the [Linux image](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)
+or the [Windows build](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md). Add it
+under **Settings → Nodes**, then pick it in **Servers → your Plex → Edit → Connection → Plex database**. A Plex
+marker agent you already set up is moved to the Nodes page on upgrade and keeps working.
 
 ---
 
@@ -1176,9 +1231,9 @@ Plex has no API or plugin system for markers, so this app writes them directly i
 exact place Plex stores its own. Because that's unsupported by Plex, it's **opt-in with a one-time confirmation** the
 first time you turn it on for a Plex server:
 
-- **The app must run on the same machine as Plex, or you run the Plex marker agent next to Plex.** SQLite's write
+- **The app must run on the same machine as Plex, or you run a Plex database node next to Plex.** SQLite's write
   mode (WAL) doesn't work over a network filesystem, so a network-mounted database stays read-only. See
-  [Plex on another machine](#plex-on-another-machine-the-plex-marker-agent).
+  [Plex on another machine](#plex-on-another-machine-the-plex-database-node).
 - **Map Plex's config folder into both containers from the identical host path.** On unRAID specifically, don't mix
   `/mnt/user` and `/mnt/cache` between the two containers — even though both paths can reach the same files, Plex and
   this app must open the database through the exact same path for the app's same-host proof to succeed.
@@ -1206,7 +1261,7 @@ first time you turn it on for a Plex server:
   isn't used as a second opinion. When the file gives an answer, ours replaces Plex's marker (row message e.g.
   "Replaced Plex's intro: it was detected for an earlier file"); when it gives none, **Keep Plex's** keeps Plex's,
   which is still the closest there is. The job log marks those markers **(made for an earlier file)**. When Plex's
-  database can't tell this time (busy, or an older Plex marker agent), every Plex marker counts as before and the next
+  database can't tell this time (busy, or an older Plex database node), every Plex marker counts as before and the next
   run asks again.
 - **Don't turn off a library's own *Intro markers* / *Credits markers* setting** (Edit library → Advanced). While
   it is off, Plex hides every skip marker of that type in the library, ours included, so nobody sees a skip button
@@ -1227,25 +1282,29 @@ first time you turn it on for a Plex server:
 - Tested against Plex 1.43. If a future Plex update changes the database's shape, the app stops writing and shows a
   message rather than guessing.
 
-### Plex on another machine: the Plex marker agent
+### Plex on another machine: the Plex database node
 
-If this app and Plex run on different machines, run the **Plex marker agent** next to Plex. It is a small container of
-its own (`nodes/plex-db/` in the repository, image `ghcr.io/stevezau/plex-marker-agent`) with Plex's config folder
-mounted. The app asks it to do the database write on Plex's machine. It is the only supported way to write markers to a
-Plex on another machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine,
-don't run it.
+If this app and Plex run on different machines, run a **Plex database node** next to Plex, with Plex's config
+folder mounted: the Linux image in [`nodes/plex-db/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)
+(image `ghcr.io/stevezau/plex-marker-agent`, formerly the Plex marker agent) or the Windows build in
+[`nodes/windows/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md). The app asks
+it to do the database write on Plex's machine. It is the only supported way to write markers to a Plex on another
+machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine, don't run it.
 
-1. Run the agent as its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md) says: the compose file, the settings (`AGENT_TOKEN`,
-   `PLEX_CONFIG`, `PUID`/`PGID`) and the key.
-2. In the app: **Servers → your Plex → Edit → Connection → Plex helper**. Switch it on, enter its **Address**
-   (for example `http://plex-host.lan:9494`) and the **Shared key**, the same value as `AGENT_TOKEN`. The key is masked
-   once saved. The one-time database-write confirmation applies when enabling Intro & Credits. Chapter thumbnails
-   have their own opt-in under General and can use this connection while Intro & Credits is off.
-3. The line under the address shows the state: **Connected**, **Can't reach it**, **Key refused** or **Update needed**.
-   **Check again** asks now. The agent has its own version, and a version the app doesn't accept is refused on the first
-   call, in either direction, with a message saying which side to update.
+1. Run the node as its README says: the compose file, the settings (`AGENT_TOKEN` or `NODE_KEY`, `PLEX_CONFIG`,
+   `PUID`/`PGID`) and the key.
+2. In the app: **Settings → Nodes → Add node** with its address (for example `http://plex-host.lan:9494`) and key.
+   See [Remote nodes](#remote-nodes).
+3. **Servers → your Plex → Edit → Connection → Plex database**: pick the node. The one-time database-write
+   confirmation applies when enabling Intro & Credits. Chapter thumbnails have their own opt-in under General and can
+   use this node while Intro & Credits is off.
+4. The node's card on the Nodes page shows its state (**Ready**, **Offline**, **Key refused**, **Update needed**).
+   A version the app doesn't accept is refused on the first call, in either direction, with a message saying which
+   side to update.
 
-For Intro & Credits, the agent writes the marker rows of one item into Plex's library database. A compatible agent
+A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working.
+
+For Intro & Credits, the node writes the marker rows of one item into Plex's library database. A compatible agent
 also supports [chapter thumbnails](#plex-chapter-thumbnails), updating only existing chapter image references.
 Version 1.2.0 or newer also writes [loudness](plex-loudness-normalization.md) and runs Library Health's database counts.
 It refuses a database that isn't
@@ -1572,14 +1631,14 @@ table covers every state the check can report, using its exact wording:
 | Log line "season_audio had no answer for \<file\> this time: Not fingerprinting \<episode\>: N earlier fingerprint ffmpegs are still stuck reading their files" | Earlier fingerprint reads stalled on the media mount and can't be stopped until it answers; no more are started meanwhile, so episodes that still need fingerprinting get no season audio answer (nothing is held against the files) | Check the media mount (NFS/SMB) is responding. It clears on its own once the stuck reads finish; the next run matches the season |
 | A file fails with "Couldn't read the file: Not reading \<path\>: N earlier ffprobes are still stuck reading their files", or a log line "season_audio (or credits_text) had no answer for \<file\> this time: … Not reading \<path\>: N earlier ffprobes are still stuck reading their files" | Earlier ffprobe reads stalled on the media mount; until they finish no new ffprobe is started, so new files can't be checked | Check the media mount is responding; it clears on its own once the stuck reads finish, and the files are tried again on the next run |
 | *(Plex)* Red "✕ Not active" next to Plex Pass: "This Plex server has no Plex Pass, so Plex won't show any markers." | Plex hides all markers — even ones already in its database — without Plex Pass | Add Plex Pass to this Plex server |
-| *(Plex)* "Plex's database is on a network share (…). The app must run on the same machine as Plex to write markers; Plex stays read-only." | SQLite's write mode doesn't work over NFS/SMB/CIFS | Run this app on the same machine as Plex, or run the [Plex marker agent](#plex-on-another-machine-the-plex-marker-agent) next to Plex. With an agent, the same kind of message means the *agent's* mount is a network share |
+| *(Plex)* "Plex's database is on a network share (…). The app must run on the same machine as Plex to write markers; Plex stays read-only." | SQLite's write mode doesn't work over NFS/SMB/CIFS | Run this app on the same machine as Plex, or run the [Plex marker agent](#plex-on-another-machine-the-plex-database-node) next to Plex. With an agent, the same kind of message means the *agent's* mount is a network share |
 | *(Plex)* "Plex's database is on a filesystem this app doesn't recognise as a local disk (…); Plex stays read-only." | The app couldn't prove the folder is a real local disk, so it refuses to risk Plex's database | Check the mount; open an issue if it's genuinely local |
 | *(Plex)* "Plex is running, but not with the database file this app sees at …. Mount the exact folder Plex uses, on the same machine (on unRAID, the same /mnt/cache or /mnt/user path Plex uses)." | The app proves it shares Plex's live database lock before ever writing; this Plex has a different copy open | Map Plex's config folder into both containers from the identical host path |
 | *(Plex)* "Plex doesn't have its database open through this folder right now (Plex is stopped, or this app sees a different path to the file). Markers are only written while Plex is running." | Same same-host proof, failing because nothing has the database open | Start Plex; recheck the mounted path |
 | *(Plex)* "Plex hasn't created its marker tag yet. Run Plex's own intro or credits detection once on any item, then try again." | Markers reuse a database row Plex creates itself the first time it ever writes a marker | Run Plex's own intro or credits analysis once on any item, then recheck |
 | *(Jellyfin)* Amber "Update needed" badge, "— installed 1.0.0.0" (the version the plugin reports; "installed version unknown" when it doesn't say) + **Update** button; the job's rows say "Update Media Preview Bridge (installed …) to get markers support" | An older plugin build predates the markers feature | Click **Update** |
 | *(Plex)* "Plex \[…\] data has an unknown shape; not writing markers." / "Plex's database has more than one marker tag row, so it's unclear which one Plex serves; not writing markers." | A future Plex version changed its database in a way the app doesn't recognise | Check for an app update; report your Plex version in an issue |
-| *(Plex)* "Plex's database was busy (held by another program) for N s; trying again on the next run" (or "Plex is busy writing its database; trying again on the next run (database is locked)", or "Another Intro & Credits task is still using this Plex database; trying again on the next run", or "Another Intro & Credits task is still checking this Plex server; trying again on the next run") | Another program kept Plex's database locked for longer than a job waits (2 minutes, or 10 seconds for a file on a GPU or CPU worker when the job retries it): Plex itself during a big scan or database optimize, or a tool that writes to Plex's database (Kometa and the like) | Nothing, usually. In a job the file's row says "this job tries again in a few minutes" instead, and the job does, on the usual retry schedule (**Settings → Processing options → Retry policy**). Only a file still refused after the last retry stays **Failed**, for Check servers' next day. Cancelling the job stops its wait within a second when this app opens Plex's database itself; through the [Plex marker agent](#plex-on-another-machine-the-plex-marker-agent) the agent's own wait (up to 2 minutes) runs out first. If it keeps happening, schedule that tool outside your Intro & Credits runs |
+| *(Plex)* "Plex's database was busy (held by another program) for N s; trying again on the next run" (or "Plex is busy writing its database; trying again on the next run (database is locked)", or "Another Intro & Credits task is still using this Plex database; trying again on the next run", or "Another Intro & Credits task is still checking this Plex server; trying again on the next run") | Another program kept Plex's database locked for longer than a job waits (2 minutes, or 10 seconds for a file on a GPU or CPU worker when the job retries it): Plex itself during a big scan or database optimize, or a tool that writes to Plex's database (Kometa and the like) | Nothing, usually. In a job the file's row says "this job tries again in a few minutes" instead, and the job does, on the usual retry schedule (**Settings → Processing options → Retry policy**). Only a file still refused after the last retry stays **Failed**, for Check servers' next day. Cancelling the job stops its wait within a second when this app opens Plex's database itself; through the [Plex marker agent](#plex-on-another-machine-the-plex-database-node) the agent's own wait (up to 2 minutes) runs out first. If it keeps happening, schedule that tool outside your Intro & Credits runs |
 | *(Jellyfin)* "Can't reach this Jellyfin server" / "Can't reach the Media Preview Bridge markers endpoint on this Jellyfin server" | A transient connection problem | Confirm the server is up and reachable; recheck |
 | *(Jellyfin)* "Jellyfin rejected this server's credentials; reconnect it" | The stored token/login no longer works | Reconnect the server from the Servers page |
 | *(Jellyfin)* "Jellyfin refused the Media Preview Bridge markers endpoint; this server's API key or user needs administrator rights" | The connected account isn't an administrator | Reconnect with an admin account or API key |

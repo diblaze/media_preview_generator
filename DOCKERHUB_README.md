@@ -89,7 +89,7 @@ range. Combine filters while keeping existing previews. See the
 **Skip Intro and Skip Credits**
 - **Found once, sent to every server.** Finds intros and end credits from the file's chapters, online skip databases (TheIntroDB, IntroDB.app, SkipDB), the season's theme song or the credit roll itself (read on the GPU when that's faster), then sends the markers to every server. When it isn't sure, it sends nothing instead of a guess; you can add or adjust a marker in the Inspector. Off until you [turn it on](https://mediapreviewgenerator.dev/guides/#turning-it-on) for a server.
 - **Yours to correct.** Tools → Inspector adjusts, adds and locks a file's markers by hand, and Setup Health checks each server's Intro & Credits setup.
-- **Plex.** Needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the Plex machine, or next to it through the [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent).
+- **Plex.** Needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the Plex machine, or next to it through a [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node).
 - **Jellyfin.** Jellyfin 10.11 or 12.0, with the Media Preview Bridge plugin (the one trickplay uses).
 - **Emby.** Emby 4.9 or 4.10, with the Media Preview Bridge for Emby plugin. Skip Intro needs Emby Premiere; Skip Credits doesn't.
 

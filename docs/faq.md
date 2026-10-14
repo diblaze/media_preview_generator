@@ -128,7 +128,7 @@ Yes. The app supports Plex, Emby, and Jellyfin — alone or in any combination. 
 
 Yes, on Plex, Emby and Jellyfin, once you turn it on for each server. What each server needs:
 
-- **Plex**: needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the same machine as Plex, or the Plex marker agent runs there for it.
+- **Plex**: needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the same machine as Plex, or a Plex database node runs there for it.
 - **Jellyfin** 10.11 or 12.0: the Media Preview Bridge plugin.
 - **Emby** 4.9 or 4.10: the Media Preview Bridge for Emby plugin. Skip Intro also needs Emby Premiere, which is Emby's rule; Skip Credits doesn't.
 

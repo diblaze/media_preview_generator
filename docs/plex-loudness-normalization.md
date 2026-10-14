@@ -29,7 +29,7 @@ unlock the playback feature. See Plex's [Audio Track Enhancements for Video](htt
 ## Turning it on
 
 1. Run this app on the same machine as Plex and mount Plex's config folder locally, or run the
-   [Plex helper](guides.md#plex-on-another-machine-the-plex-marker-agent) (version 1.2.0 or newer) beside a Plex on
+   [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node) (version 1.2.0 or newer) beside a Plex on
    another machine. Plex must be running. Loudness supports Plex **1.43.4.x or 1.43.5.x**. A network-mounted
    database is refused.
 2. Under **Servers → Edit → Processing → Loudness**, switch on **Analyse loudness for this server**.
@@ -123,10 +123,10 @@ to the journal. Undo only replays confirmed writes: a crash or rollback cannot m
 If saving the confirmation fails, the database write remains and the app warns; keep the journal for recovery, because
 that unconfirmed record will not be replayed automatically.
 
-Through the Plex helper, the helper keeps this record instead, in `/config` of its own container, because undo has to
+Through a Plex database node, the node keeps this record instead, in its own `/config`, because undo has to
 run beside the database file.
 
-To restore the affected tracks and items, stop Plex and run, in the app's container (or the helper's):
+To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
 ```
 docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \

@@ -13,7 +13,7 @@ server that owns it, in the format that server expects.
 ## Connect and check your servers
 
 1. [Install the container](getting-started.md) where you want the processing to run. Its media paths and output mounts must reach the same files your servers use.
-2. Open **Servers → Add Server**, choose Plex, Emby or Jellyfin, and complete the connection flow. Click **Test connection**, then **Save server**. Repeat for each server. The **Connection** tab of **Edit** holds authentication and Plex helper settings.
+2. Open **Servers → Add Server**, choose Plex, Emby or Jellyfin, and complete the connection flow. Click **Test connection**, then **Save server**. Repeat for each server. The **Connection** tab of **Edit** holds authentication and the Plex database choice.
 3. Click **Edit** on a server card, then open **Libraries** to choose which libraries get previews. Use the **Processing** tab for that server's chapter thumbnails, Intro & Credits and, on a supported local Plex server, loudness.
 4. Check the **Path mappings** tab when the server and container use different paths. Open **Setup Health** for each server and resolve the relevant output and library checks.
 5. Process one shared movie or episode with **Process a file or folder** on the Dashboard. Expand **All jobs → Job details** to check results for each server, then inspect the output in its player. **Open logs and files** preserves the per-file result when one server is waiting or failed.
@@ -30,8 +30,8 @@ each server's API. Map the server's media paths to the paths inside this contain
 - **Plex previews:** mount Plex's data folder read-write for BIF output. The media mount may be read-only. Follow [the Plex mount checks](guides/previews-readiness.md#plex-config-folder).
 - **Emby previews:** the container needs write access beside each video for the BIF sidecar.
 - **Jellyfin trickplay:** the default writes beside the video. [Off-media mode](guides/previews-readiness.md#jellyfin-config-folder) needs a writable Jellyfin config mount and the Media Preview Bridge plugin; the media may then stay read-only.
-- **Plex markers and chapter thumbnails:** the relevant [Plex helper setup](guides.md#plex-on-another-machine-the-plex-marker-agent) supports operations that must happen beside Plex. Check each feature's requirements before enabling it.
-- **Plex loudness:** it requires Plex 1.43.4.x or 1.43.5.x database access, either local or through the Plex helper (version 1.2.0 or newer); network-mounted databases are unsupported. See [Plex loudness requirements](plex-loudness-normalization.md).
+- **Plex markers and chapter thumbnails:** a [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node) supports operations that must happen beside Plex. Check each feature's requirements before enabling it.
+- **Plex loudness:** it requires Plex 1.43.4.x or 1.43.5.x database access, either local or through a Plex database node (version 1.2.0 or newer); network-mounted databases are unsupported. See [Plex loudness requirements](plex-loudness-normalization.md).
 
 Start with one file and watch both the worker's activity and each server's saved result. A network
 share, slow disk or server indexing delay can be the limit even when the GPU has spare capacity.
