@@ -40,6 +40,7 @@ media_preview_generator/nodes/
   registry.py        NodeRegistry: configured nodes, their live state, the health loop, alerts
   mappings.py        app path <-> node path rules, Test access sampling and suggestions
   readiness.py       node Setup Health rows (same buckets as server Setup Health)
+  access_results.py  each node's last Test access, kept across restarts (<CONFIG_DIR>/node_access_results.json)
   executor.py        runs one op on a node for a remote worker: start, poll, log lines, cancel, errors
 media_preview_generator/web/routes/api_nodes.py      REST API behind the Nodes page
 media_preview_generator/web/templates/nodes.html     Nodes page (+ static/js/nodes.js)
@@ -316,7 +317,7 @@ Errors are `{"error": "<sentence>"}` with 400 (bad input), 404 (unknown node) or
 | `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW` |
 | `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
-| `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health |
+| `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |
 | `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601) |
 | `POST /nodes/<id>/rescan-gpus` | – | `NODE_ROW` |
