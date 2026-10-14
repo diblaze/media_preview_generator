@@ -6,6 +6,7 @@ the folders, the file), but a season's shared facts are read once for the season
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import threading
@@ -27,7 +28,7 @@ EPISODES = 10
 # Per checked file, on a steady season of EPISODES episodes, with the season already read by an earlier episode (warm)
 # and with the first episode reading it (cold: its reads are shared by the EPISODES files). Before the season was
 # shared they were 156 statements, 24 stats and 3 listings for every file, and grew with the season's size.
-MAX_QUERIES_PER_FILE = {"warm": 47, "cold": 51}
+MAX_QUERIES_PER_FILE = {"warm": 40, "cold": 45}
 MAX_STATS_PER_FILE = {"warm": 4, "cold": 7}  # one of them is the season folder's mtime check
 MAX_LISTINGS_PER_FILE = {"warm": 0, "cold": 0.5}
 
@@ -37,11 +38,29 @@ class _Reads:
 
     def __init__(self, store, root: str, monkeypatch) -> None:
         self.counts: Counter[str] = Counter()
+        self.statements: Counter[str] = Counter()
         self._guard = threading.Lock()
         self._root = root
-        store._conn.set_trace_callback(lambda _sql: self._add("queries"))
+        store._conn.set_trace_callback(self._statement)
+        reading = store._reading
+
+        @contextlib.contextmanager
+        def traced_reading(**kwargs):
+            # Reads run on pooled connections of their own (``MarkerStore._reading``), not on the writing one.
+            with reading(**kwargs) as conn:
+                conn.set_trace_callback(self._statement)
+                yield conn
+
+        monkeypatch.setattr(store, "_reading", traced_reading)
         for name in ("stat", "scandir", "listdir"):
             monkeypatch.setattr(os, name, self._counting(name, getattr(os, name)))
+
+    def _statement(self, sql: str) -> None:
+        if sql.split(None, 1)[0].upper() in ("BEGIN", "COMMIT", "ROLLBACK"):
+            return  # transaction bounds, not reads
+        self._add("queries")
+        with self._guard:
+            self.statements[re.sub(r"\s+", " ", sql)[:120]] += 1
 
     def _add(self, name: str) -> None:
         with self._guard:
