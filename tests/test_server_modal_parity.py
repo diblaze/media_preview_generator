@@ -29,8 +29,9 @@ SCRIPTS = (
 )
 INVENTORY_ROWS = 146
 # Rows 55-56 (the Jellyfin plugin opt-in checkbox and its warning) and row 17 (the Jellyfin plugin badge handler)
-# were removed from the modal; numbers are not reused.
-RETIRED_ROWS = {17, 55, 56}
+# were removed from the modal; rows 25-26 (the Plex helper's own address and key fields) went when the Plex database
+# selector replaced them (row 24): the node record holds both. Numbers are not reused.
+RETIRED_ROWS = {17, 25, 26, 55, 56}
 MAX_HINT_CHARS = 95
 
 

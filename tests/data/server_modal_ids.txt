@@ -27,9 +27,7 @@
 21	J	general	attached	#editJellyfinConfigFolder
 22	J	general	attached	#editJellyfinConfigBrowseBtn
 23	J	general	attached	#editJellyfinOffMediaWarning
-24	P	general	visible	#markersAgentEnabled
-25	P	general	attached	#markersAgentUrl
-26	P	general	attached	#markersAgentToken
+24	P	general	visible	#markersPlexDatabase
 27	P	general	attached	#markersAgentState
 28	PEJ	general	visible	#editCredToggle
 28	PEJ	general	attached	#editReauthSection

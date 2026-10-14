@@ -166,6 +166,17 @@ def servers_page():
     return render_template("servers.html")
 
 
+@main.route("/nodes")
+@login_required
+def nodes_page():
+    """Remote nodes page: other machines that lend this app their GPU/CPU or open Plex's database.
+
+    Dumb HTML like the Servers page; the list, the Add node flow and each node's detail all go through the
+    ``/api/nodes*`` REST endpoints (``api_nodes.py``).
+    """
+    return render_template("nodes.html")
+
+
 @main.route("/setup")
 def setup_wizard():
     """Setup wizard page.

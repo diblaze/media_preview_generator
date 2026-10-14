@@ -2981,7 +2981,7 @@
             const link = document.createElement('a');
             link.href = '#edit-tab-general';
             link.className = 'd-inline-block mt-1 chapter-helper-link';
-            link.textContent = 'Configure Plex helper';
+            link.textContent = 'Choose the Plex database';
             link.addEventListener('click', _showPlexHelperConfiguration);
             body.appendChild(link);
         }

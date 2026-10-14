@@ -122,15 +122,17 @@
                         </ul>
                     </li>
                     <li class="nav-item dropdown nav-hover-menu">
-                        <a class="nav-link dropdown-toggle {% if request.endpoint == 'main.settings' %}active{% endif %}"
-                           href="{{ url_for('main.settings') }}" id="navSettingsDropdown" data-nav-menu-toggle{% if request.endpoint == 'main.settings' %} aria-current="page"{% endif %}
+                        <a class="nav-link dropdown-toggle {% if request.endpoint in ('main.settings', 'main.nodes_page') %}active{% endif %}"
+                           href="{{ url_for('main.settings') }}" id="navSettingsDropdown" data-nav-menu-toggle{% if request.endpoint in ('main.settings', 'main.nodes_page') %} aria-current="page"{% endif %}
                            aria-haspopup="true" aria-expanded="false" aria-controls="navSettingsMenu">
                             <i class="bi bi-gear me-1"></i>Settings
                         </a>
-                        {# The Settings page's sidebar sections, in its order (settings.html). #}
+                        {# The Settings page's sidebar sections, in its order (settings.html), plus the Nodes page under
+                           Workers: nodes are where remote workers come from, and each one has its own checks. #}
                         <ul class="dropdown-menu" id="navSettingsMenu" aria-labelledby="navSettingsDropdown">
                             <li><h6 class="dropdown-header">Processing</h6></li>
                             <li>{{ menu_item(url_for('main.settings') ~ '#section-workers', 'cpu', 'Workers', 'Groups, job permissions and availability', anchor='section-workers', label='Workers: groups, job permissions and availability') }}</li>
+                            <li>{{ menu_item(url_for('main.nodes_page'), 'pc-display-horizontal', 'Nodes', 'Other machines that lend a GPU, CPU or Plex database', label='Nodes: other machines that lend this app their GPU, CPU or Plex database', active=request.endpoint == 'main.nodes_page') }}</li>
                             <li>{{ menu_item(url_for('main.settings') ~ '#section-worker-quiet-hours', 'moon-stars', 'Global pause schedule', 'Times when all processing pauses', anchor='section-worker-quiet-hours', label='Global pause schedule: times when all processing pauses') }}</li>
                             <li>{{ menu_item(url_for('main.settings') ~ '#section-processing', 'speedometer2', 'Processing Options', 'Job limits, device tuning, thumbnails', anchor='section-processing', label='Processing Options: job limits, device tuning and thumbnails') }}</li>
                             <li>{{ menu_item(url_for('main.settings') ~ '#section-markers', 'skip-forward', 'Intro & Credits', 'Skip-intro and credits markers', anchor='section-markers', label='Intro & Credits: skip-intro and credits markers') }}</li>

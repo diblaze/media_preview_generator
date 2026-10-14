@@ -236,46 +236,27 @@
                             </div>
                         </section>
 
-                        <!-- Plex only: the marker agent beside a Plex on another machine. Its address and shared
-                             key are stored in markers.plex.agent; the key comes back masked and is posted back
-                             masked unless the user types a new one. -->
+                        <!-- Plex only: how this app reaches Plex's database. Stored as markers.plex.agent
+                             {enabled, node_id}: off = this app opens it itself; on = through the named Plex database
+                             node (the node record holds its address and key). -->
                         <section class="sm-sec d-none" id="markersPlexAgentGroup">
-                            <div class="sm-sec-h">Plex on another machine</div>
+                            <div class="sm-sec-h">Plex database</div>
                             <div class="sm-card"><div class="sm-card-b">
-                                <div class="sm-line">
-                                    <div>
-                                        <label class="sm-lab" for="markersAgentEnabled">Plex helper
-                                            <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top"
-                                                    title="Runs next to Plex on another machine. Writes chapter image references and intro or credits markers. Each feature is enabled separately."><i class="bi bi-info-circle"></i></button>
-                                        </label>
-                                        <div class="sm-hint">Runs next to Plex on another machine. <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Shared by chapter thumbnails and Intro & Credits." data-explain-title="Plex helper" data-explain-template="infoEditPlexHelperTpl"><i class="bi bi-info-circle"></i></button>
-<template id="infoEditPlexHelperTpl">
-    <p>Shared by chapter thumbnails and Intro &amp; Credits when Plex runs on another machine. Intro &amp; Credits can stay off.</p>
+                                <div class="sm-fld">
+                                    <label class="sm-lab" for="markersPlexDatabase">Plex database
+                                        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top"
+                                                title="Where Plex's database is opened from: by this app, or by a node on the Plex machine." data-explain-title="Plex database" data-explain-template="infoEditPlexDatabaseTpl"><i class="bi bi-info-circle"></i></button>
+<template id="infoEditPlexDatabaseTpl">
+    <p>Intro &amp; Credits, chapter thumbnails, loudness and Library Health counts read or write Plex's own database, which has to be on a local disk of the machine Plex runs on.</p>
+    <p><strong>Open it from this app</strong> when this app runs on the same machine as Plex. Pick a <strong>Plex database node</strong> when Plex runs on another machine or on Windows: the node opens the database there. Add one on the <a href="/nodes">Nodes</a> page.</p>
 </template>
-                                        </div>
-                                    </div>
-                                    <div class="form-check form-switch markers-switch mb-0">
-                                        <input class="form-check-input" type="checkbox" role="switch" id="markersAgentEnabled">
-                                    </div>
+                                    </label>
+                                    <select class="form-select" id="markersPlexDatabase">
+                                        <option value="">Open it from this app</option>
+                                    </select>
+                                    <div class="sm-hint">Pick a node when Plex runs on another machine or on Windows.</div>
                                 </div>
-                                <div class="d-none" id="markersPlexAgentFields">
-                                    <div class="sm-row2">
-                                        <div class="sm-fld">
-                                            <label class="sm-lab" for="markersAgentUrl">Address</label>
-                                            <input type="url" class="form-control font-monospace" id="markersAgentUrl"
-                                                   placeholder="http://plex-host.lan:9494" autocomplete="off">
-                                        </div>
-                                        <div class="sm-fld">
-                                            <label class="sm-lab" for="markersAgentToken">Shared key
-                                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top"
-                                                        title="The same key is set on both sides. It is never written to the logs."><i class="bi bi-info-circle"></i></button>
-                                            </label>
-                                            <input type="password" class="form-control" id="markersAgentToken"
-                                                   autocomplete="new-password">
-                                        </div>
-                                    </div>
-                                    <div id="markersAgentState" class="sm-hint mt-2"></div>
-                                </div>
+                                <div id="markersAgentState" class="sm-hint d-none" role="status"></div>
                             </div></div>
                         </section>
 
@@ -911,7 +892,7 @@
                                     </div>
                                 </div>
                                 <div class="sm-warnline d-none" id="loudnessHelperHint">
-                                    <i class="bi bi-exclamation-triangle-fill"></i><span>The Plex helper does not support loudness analysis. Use a local Plex database to enable it.</span>
+                                    <i class="bi bi-exclamation-triangle-fill"></i><span>A Plex database node does not support loudness analysis yet. Pick "Open it from this app" on the Connection tab to use it.</span>
                                 </div>
                                 <div class="sm-hint" id="loudnessLibrariesPointer">
                                     Choose movie and TV libraries on the <a href="#" class="loudness-libraries-link">Libraries</a> tab. <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Music libraries are not supported." data-explain-title="Loudness libraries" data-explain-template="infoEditLoudnessLibsTpl"><i class="bi bi-info-circle"></i></button>
