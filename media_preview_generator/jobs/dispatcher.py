@@ -119,8 +119,9 @@ class JobTracker:
         self.active_checks = 0
         self.active_processing = 0
         self.check_queue: deque = deque(items)
-        # Checking threads append to its right end without a lock; only the dispatch loop takes from (or puts back
-        # at) its left end, so the loop never iterates it directly (see ``JobDispatcher._claim_worker``).
+        # Checking threads append to its right end without a lock, so the dispatch loop never iterates it directly.
+        # The dispatch loop takes files out of it under ``_counts_lock``, because ``cancel`` clears it from a web
+        # thread under that lock (see ``JobDispatcher._claim_worker``), and puts files back at its left end.
         self.item_queue: deque = deque()
         # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
         # how often each one's node dropped it or never took its start, the node that last did (its retry goes
@@ -569,14 +570,33 @@ def _queue_head(queue: deque) -> list:
 
     Checking threads append to the queue's right end without a lock, and even a copy made in C can be interrupted
     (a garbage collection running finalizers lets another thread in), raising "deque mutated during iteration". An
-    append never moves the head, so copying again is always right. Only the dispatch thread takes from the left end,
-    so the copy's indices stay valid for deletes.
+    append never moves the head, so copying again is always right. A cancel can clear the queue after the copy, so
+    a delete by the copy's index checks the file is still there first (``_take_queued``).
     """
     while True:
         try:
             return list(itertools.islice(queue, EXCLUDED_SCAN_LIMIT))
         except RuntimeError:
             continue
+
+
+def _take_queued(tracker: JobTracker, index: int | None, item: Any = None) -> Any:
+    """Take a file off ``tracker.item_queue``: the first one (``index`` None), or ``item`` when it is still at ``index``.
+
+    Under the tracker's ``_counts_lock``, which ``JobTracker.cancel`` clears the queue under: a cancel landing after
+    the caller looked at the queue leaves nothing to take, and appends never move a file's index.
+
+    Returns:
+        The file taken, or None when it is no longer there.
+    """
+    queue = tracker.item_queue
+    with tracker._counts_lock:
+        if index is None:
+            return queue.popleft() if queue else None
+        if index < len(queue) and queue[index] is item:
+            del queue[index]
+            return item
+        return None
 
 
 class JobDispatcher:
@@ -1124,7 +1144,8 @@ class JobDispatcher:
 
         A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped goes to
         a worker elsewhere when one is free, else back to that node. One that no configured worker can run any more is
-        taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed).
+        taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed). A worker claimed
+        for a file a cancel has since cleared off the queue is given back.
 
         Args:
             tracker: The job.
@@ -1136,7 +1157,13 @@ class JobDispatcher:
         pool = self.worker_pool
         if not tracker.excluded_nodes and not tracker.dropped_on:
             worker = pool._find_available_worker(claim=True, kind=tracker.kind)
-            return None if worker is None else (worker, tracker.item_queue.popleft())
+            if worker is None:
+                return None
+            item = _take_queued(tracker, None)
+            if item is None:
+                worker.is_busy = False
+                return None
+            return worker, item
         head = _queue_head(tracker.item_queue)
         for index, item in enumerate(head):
             excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
@@ -1149,12 +1176,15 @@ class JobDispatcher:
             if worker is None:
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
             if worker is not None:
-                del tracker.item_queue[index]
+                if _take_queued(tracker, index, item) is None:
+                    worker.is_busy = False
+                    return None
                 return worker, item
             if not excluded:
                 return None  # no free worker for this kind at all
             if not pool.can_run_outside(tracker.kind, excluded):
-                del tracker.item_queue[index]
+                if _take_queued(tracker, index, item) is None:
+                    return None
                 tracker.active_processing += 1
                 stranded.append((tracker, item, f"not visible on {', '.join(excluded.values())}"))
                 return None

@@ -331,6 +331,49 @@ class TestClaimWorker:
         assert [i.canonical_path for i in tracker.item_queue] == ["/m/1.mkv", *appended]
         assert stranded == []
 
+    @staticmethod
+    def _cancel_after_the_claim(pool: WorkerPool, tracker: JobTracker) -> None:
+        """A web thread cancels the job right after the pool claims a worker, before the file leaves the queue."""
+        find = pool._find_available_worker
+
+        def find_then_cancel(*args, **kwargs):
+            worker = find(*args, **kwargs)
+            if worker is not None:
+                tracker.cancel()
+            return worker
+
+        pool._find_available_worker = find_then_cancel
+
+    @pytest.mark.parametrize("excluded", [False, True], ids=["plain-queue", "files-some-nodes-cant-see"])
+    def test_a_cancel_between_the_claim_and_taking_the_file_frees_the_worker(self, excluded):
+        pool = _pool(("a", "A"))
+        tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
+        if excluded:
+            tracker.excluded_nodes = {"/m/1.mkv": {"b": "B"}}
+        self._cancel_after_the_claim(pool, tracker)
+
+        assert JobDispatcher(pool)._claim_worker(tracker, []) is None
+        assert not pool.workers[0].is_busy and pool.workers[0].is_available()
+        assert not tracker.item_queue and tracker.failed == 2
+
+    def test_a_cancel_and_a_new_file_between_the_claim_and_taking_it_takes_neither(self):
+        pool = _pool(("a", "A"))
+        tracker = self._tracker("/m/1.mkv")
+        tracker.excluded_nodes = {"/m/1.mkv": {"b": "B"}}
+        find = pool._find_available_worker
+
+        def find_then_cancel_and_append(*args, **kwargs):
+            worker = find(*args, **kwargs)
+            tracker.cancel()
+            tracker.item_queue.extend(_items("/m/late.mkv"))
+            return worker
+
+        pool._find_available_worker = find_then_cancel_and_append
+
+        assert JobDispatcher(pool)._claim_worker(tracker, []) is None
+        assert [i.canonical_path for i in tracker.item_queue] == ["/m/late.mkv"]
+        assert not pool.workers[0].is_busy
+
     def test_a_copy_interrupted_by_an_append_is_made_again(self):
         class AppendedDuringFirstCopy(deque):
             copies = 0
