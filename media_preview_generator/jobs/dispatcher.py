@@ -119,6 +119,8 @@ class JobTracker:
         self.active_checks = 0
         self.active_processing = 0
         self.check_queue: deque = deque(items)
+        # Checking threads append to its right end without a lock; only the dispatch loop takes from (or puts back
+        # at) its left end, so the loop never iterates it directly (see ``JobDispatcher._claim_worker``).
         self.item_queue: deque = deque()
         # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
         # how often each one's node dropped it or never took its start, the node that last did (its retry goes
@@ -977,8 +979,8 @@ class JobDispatcher:
         count as a drop (up to ``MAX_NODE_START_FAILURES``). Either way the node gets no new file until it checks ready
         again, and this file's retry prefers another node or this app. A node that can't see it is left out for that
         file and it goes back for another worker; once no configured worker outside the nodes that can't see it
-        remains, it fails. The queue and ``active_processing`` change together under ``_trackers_lock``, so a parking
-        snapshot never misses the file.
+        remains, it fails. The file goes back on the queue and ``active_processing`` drops together under
+        ``_trackers_lock``, so a parking snapshot never misses the file.
 
         Args:
             worker: The worker that gave it back.
@@ -1106,7 +1108,11 @@ class JobDispatcher:
         if not tracker.excluded_nodes and not tracker.dropped_on:
             worker = pool._find_available_worker(claim=True, kind=tracker.kind)
             return None if worker is None else (worker, tracker.item_queue.popleft())
-        for index, item in enumerate(itertools.islice(tracker.item_queue, EXCLUDED_SCAN_LIMIT)):
+        # Checking threads append to the queue's right end without a lock, so iterating the deque itself can raise
+        # "deque mutated during iteration". list(islice(...)) copies the head in C, atomically with respect to those
+        # appends; only this thread takes from the left end, so the indices stay valid for the deletes below.
+        head = list(itertools.islice(tracker.item_queue, EXCLUDED_SCAN_LIMIT))
+        for index, item in enumerate(head):
             excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
             dropped_on = tracker.dropped_on.get(item.canonical_path)
             worker = None

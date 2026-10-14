@@ -292,3 +292,51 @@ class TestClaimWorker:
         ]
         assert not tracker.item_queue and tracker.active_processing == 1
         assert not pool.workers[0].is_busy
+
+    def test_a_check_thread_appending_while_the_queue_is_scanned_never_breaks_the_claim(self):
+        pool = _pool(("a", "A"))
+        busy_b = Worker(9, "CPU", node_id="b", node_name="B")
+        busy_b.is_busy = True  # file 1 could still run on B, so it stays queued
+        pool.workers.append(busy_b)
+        tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
+        tracker.excluded_nodes = {"/m/1.mkv": {"a": "A"}}
+        find = pool._find_available_worker
+        appended: list[str] = []
+
+        def find_while_a_check_thread_appends(*args, **kwargs):
+            # A checking thread appends without the dispatcher's lock; do it mid-scan, deterministically.
+            appended.append(f"/m/new{len(appended)}.mkv")
+            tracker.item_queue.extend(_items(appended[-1]))
+            return find(*args, **kwargs)
+
+        pool._find_available_worker = find_while_a_check_thread_appends
+        stranded: list = []
+
+        worker, item = JobDispatcher(pool)._claim_worker(tracker, stranded)
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/2.mkv")
+        assert [i.canonical_path for i in tracker.item_queue] == ["/m/1.mkv", *appended]
+        assert stranded == []
+
+    def test_concurrent_appends_during_claims_never_raise(self):
+        pool = _pool(("a", "A"))
+        tracker = self._tracker(*(f"/m/{n}.mkv" for n in range(64)))
+        tracker.excluded_nodes = {f"/m/{n}.mkv": {"a": "A"} for n in range(64)}
+        pool.workers.append(Worker(9, "CPU", node_id="b", node_name="B"))
+        pool.workers[1].is_busy = True  # every file waits for B, so each claim scans the whole head
+        dispatcher = JobDispatcher(pool)
+        stop = threading.Event()
+
+        def check_thread():
+            n = 0
+            while not stop.is_set():
+                tracker.item_queue.extend(_items(f"/m/late{n}.mkv"))
+                n += 1
+
+        appender = threading.Thread(target=check_thread, daemon=True)
+        appender.start()
+        try:
+            for _ in range(300):
+                assert dispatcher._claim_worker(tracker, []) is None
+        finally:
+            stop.set()
+            appender.join(timeout=5)
