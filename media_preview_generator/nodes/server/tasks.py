@@ -79,11 +79,17 @@ def _is_cancellation(exc: BaseException) -> bool:
     return False
 
 
-def _json_scalar(value: object) -> object:
+def _json_value(value: object) -> object:
+    """``value`` as JSON can carry it: lists and dicts kept (the app reads ``args`` and ``fallbacks`` as lists),
+    non-finite floats as None, anything else as its text."""
     if value is None or isinstance(value, bool | int | str):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    if isinstance(value, list | tuple):
+        return [_json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_value(v) for k, v in value.items()}
     return str(value)
 
 
@@ -176,7 +182,7 @@ class NodeTask:
             value = float(percent)
         except (TypeError, ValueError):
             value = 0.0
-        update = {str(k): _json_scalar(v) for k, v in extra.items()}
+        update = {str(k): _json_value(v) for k, v in extra.items()}
         with self._lock:
             self._progress = {**self._progress, **update, "percent": value if math.isfinite(value) else 0.0}
 
