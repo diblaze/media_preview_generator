@@ -331,6 +331,21 @@ class TestClaimWorker:
         assert [i.canonical_path for i in tracker.item_queue] == ["/m/1.mkv", *appended]
         assert stranded == []
 
+    def test_a_copy_interrupted_by_an_append_is_made_again(self):
+        class AppendedDuringFirstCopy(deque):
+            copies = 0
+
+            def __iter__(self):
+                AppendedDuringFirstCopy.copies += 1
+                if AppendedDuringFirstCopy.copies == 1:
+                    raise RuntimeError("deque mutated during iteration")
+                return super().__iter__()
+
+        queue = AppendedDuringFirstCopy(["/m/1.mkv", "/m/2.mkv"])
+
+        assert dispatcher_mod._queue_head(queue) == ["/m/1.mkv", "/m/2.mkv"]
+        assert AppendedDuringFirstCopy.copies == 2
+
     def test_concurrent_appends_during_claims_never_raise(self):
         pool = _pool(("a", "A"))
         tracker = self._tracker(*(f"/m/{n}.mkv" for n in range(64)))

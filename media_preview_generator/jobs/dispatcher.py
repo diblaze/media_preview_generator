@@ -564,6 +564,21 @@ class JobTracker:
         }
 
 
+def _queue_head(queue: deque) -> list:
+    """Copy the first EXCLUDED_SCAN_LIMIT queued files.
+
+    Checking threads append to the queue's right end without a lock, and even a copy made in C can be interrupted
+    (a garbage collection running finalizers lets another thread in), raising "deque mutated during iteration". An
+    append never moves the head, so copying again is always right. Only the dispatch thread takes from the left end,
+    so the copy's indices stay valid for deletes.
+    """
+    while True:
+        try:
+            return list(itertools.islice(queue, EXCLUDED_SCAN_LIMIT))
+        except RuntimeError:
+            continue
+
+
 class JobDispatcher:
     """Coordinates item dispatch across multiple concurrent jobs.
 
@@ -1122,10 +1137,7 @@ class JobDispatcher:
         if not tracker.excluded_nodes and not tracker.dropped_on:
             worker = pool._find_available_worker(claim=True, kind=tracker.kind)
             return None if worker is None else (worker, tracker.item_queue.popleft())
-        # Checking threads append to the queue's right end without a lock, so iterating the deque itself can raise
-        # "deque mutated during iteration". list(islice(...)) copies the head in C, atomically with respect to those
-        # appends; only this thread takes from the left end, so the indices stay valid for the deletes below.
-        head = list(itertools.islice(tracker.item_queue, EXCLUDED_SCAN_LIMIT))
+        head = _queue_head(tracker.item_queue)
         for index, item in enumerate(head):
             excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
             dropped_on = tracker.dropped_on.get(item.canonical_path)
