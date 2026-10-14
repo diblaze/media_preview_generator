@@ -2273,7 +2273,7 @@ class TestWhatTheUserSees:
         assert len(reasons) == 1 and "the GPU crashed (exit code" in reasons[0], reasons
 
     def test_a_helper_that_cant_be_spawned_gets_no_driver_hint(self, loguru_caplog):
-        pool = th.TextDetectorPool(cpu_limit=lambda: 1)
+        pool = th.TextDetectorPool(cpu_limit=lambda: 1, vulkan_info=lambda: None)
         pool._gpu_failed("cuda:0", th.HelperStartError("couldn't start: [Errno 2] no python", plain=th.NOT_SPAWNED))
         (warning,) = warnings_in(loguru_caplog)
         assert "couldn't be started while starting up" in warning and "GPU HANG" not in warning
