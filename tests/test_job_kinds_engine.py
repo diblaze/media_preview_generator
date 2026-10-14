@@ -798,6 +798,7 @@ def test_counts_carried_from_before_a_restart_show_in_live_progress_and_the_resu
         "completed": expected_total,
         "failed": 0,
         "failed_paths": [],
+        "node_failures": {},
         "total": expected_total,
         "cancelled": False,
         "outcome": expected_outcome,
