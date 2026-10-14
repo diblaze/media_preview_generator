@@ -21,6 +21,7 @@ from media_preview_generator.nodes.executor import (
     current_placement,
 )
 from media_preview_generator.nodes.registry import (
+    STATE_DISABLED,
     STATE_OFFLINE,
     STATE_READY,
     NodeCapacity,
@@ -245,30 +246,42 @@ OFF_HOURS = {"mode": "scheduled", "windows": [{"days": list(range(7)), "start": 
 ALWAYS = {"mode": "always", "windows": []}
 
 
-def _group(gid: str, *, node: str | None = None, kinds=("previews",), availability=ALWAYS, enabled=True) -> dict:
-    member = {"id": "m1", "resource": "cpu", "device": None, "count": 1, "job_types": list(kinds)}
+def _group(
+    gid: str,
+    *,
+    node: str | None = None,
+    kinds=("previews",),
+    availability=ALWAYS,
+    enabled=True,
+    device: str | None = None,
+) -> dict:
+    resource = "gpu" if device else "cpu"
+    member = {"id": "m1", "resource": resource, "device": device, "count": 1, "job_types": list(kinds)}
     if node is not None:
         member["node"] = node
     return {"id": gid, "name": gid, "enabled": enabled, "availability": availability, "members": [member]}
 
 
 class TestCanRunOutsideWithGroups:
-    """Every enabled member that supports the kind counts, whatever its hours or its node's state right now: the file
-    waits for it instead of failing."""
+    """Every enabled member that supports the kind and can come back counts, whatever its hours or whether its node
+    answers right now: the file waits for it instead of failing. A member on a node turned off or removed, or on a
+    GPU this app doesn't have, never comes back on its own, so a file waiting for it would wait forever."""
 
     @pytest.fixture(autouse=True)
     def registry(self):
         fake = _Registry()
         fake.set("a", STATE_READY, seen_now=True)
         fake.set("b", STATE_OFFLINE, seen_now=False)
+        fake.set("off", STATE_DISABLED, seen_now=False)
         set_registry(fake)
         yield fake
         set_registry(None)
 
     @staticmethod
     def _can_run_outside_a(*groups: dict) -> bool:
-        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
-        pool.reconcile_groups([_group("nas", node="a"), *groups], [], now=NOON)
+        gpus = [("INTEL", DEVICE, {"name": "Arc"})]
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=gpus)
+        pool.reconcile_groups([_group("nas", node="a"), *groups], gpus, now=NOON)
         return pool.can_run_outside("previews", {"a"})
 
     @pytest.mark.parametrize(
@@ -282,6 +295,10 @@ class TestCanRunOutsideWithGroups:
             (_group("local", kinds=("loudness",)), False),
             (_group("nas-night", node="a", availability=OFF_HOURS), False),
             (None, False),
+            (_group("turned-off-node", node="off"), False),
+            (_group("removed-node", node="gone"), False),
+            (_group("local-gpu", device="/dev/dri/renderD129"), False),
+            (_group("local-gpu", device=DEVICE), True),
         ],
         ids=[
             "this-app-off-hours",
@@ -292,10 +309,30 @@ class TestCanRunOutsideWithGroups:
             "this-app-other-kind",
             "excluded-node-off-hours",
             "nothing-else",
+            "turned-off-node",
+            "removed-node",
+            "this-app-gpu-missing",
+            "this-app-gpu-detected",
         ],
     )
     def test_members_that_count(self, other, expected):
         assert self._can_run_outside_a(*([other] if other else [])) is expected
+
+    def test_a_node_the_registry_cant_answer_for_still_counts(self, registry, monkeypatch):
+        real_view = registry.view
+
+        def view(node_id: str) -> NodeView | None:
+            if node_id == "b":
+                raise RuntimeError("registry busy")
+            return real_view(node_id)
+
+        monkeypatch.setattr(registry, "view", view)
+        assert self._can_run_outside_a(_group("other-node", node="b")) is True
+
+    def test_only_members_that_cant_come_back_left_is_false(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.reconcile_groups([_group("off", node="off")], [], now=NOON)
+        assert pool.can_run_outside("previews", {"a"}) is False
 
 
 class TestSuspectNodes:

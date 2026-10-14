@@ -68,6 +68,22 @@ class NodeHardware:
         view = self.views.get(node_id)
         return getattr(view, "state", None) if view is not None else None
 
+    def node_can_come_back(self, node_id: str) -> bool:
+        """Whether a node may give its members capacity again without a settings change.
+
+        A node that is offline or still being checked comes back on its own, and so may one the registry couldn't
+        answer for; a node turned off on the Nodes page, or no longer configured, doesn't.
+        """
+        from ..nodes.registry import STATE_DISABLED
+
+        if node_id not in self.views:
+            return False
+        view = self.views[node_id]
+        if view is None:
+            capacity = self.capacities.get(node_id)
+            return capacity is not None and capacity.reason == _REASON_NODE_UNKNOWN
+        return getattr(view, "state", None) != STATE_DISABLED
+
     def node_ref(self, node_id: str | None) -> dict | None:
         """``{"id", "name"}`` for a worker status row; ``None`` for this app."""
         return {"id": node_id, "name": self.node_name(node_id)} if node_id else None

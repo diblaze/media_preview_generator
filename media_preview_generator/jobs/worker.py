@@ -1317,15 +1317,19 @@ class WorkerPool:
     def can_run_outside(self, kind: str, exclude_nodes: Collection[str]) -> bool:
         """Whether the configured workers can still run ``kind`` somewhere other than ``exclude_nodes``.
 
-        True while nothing at all is configured for the kind (the item waits, as any item does); False only when every
-        configured slot for it is on an excluded node. Busy slots, members outside their hours and members on a node
-        that is offline right now all count: they come back, so the item waits for them instead of failing.
+        True while nothing at all is configured for the kind (the item waits, as any item does); False when every
+        configured slot for it that can come back is on an excluded node. Busy slots, members outside their hours and
+        members on a node that is offline right now count: they come back, so the item waits for them instead of
+        failing. Members on a node turned off on the Nodes page or no longer configured, and this app's members on a
+        GPU it hasn't detected, don't count: nothing brings them back without a settings or hardware change, so an
+        item waiting for them would never finish.
 
         Args:
             kind: The job kind.
             exclude_nodes: Node ids that can't run the item.
         """
         from ..worker_groups import supports_job
+        from .node_members import member_detected
 
         with self._workers_lock:
             if self._policies is None:
@@ -1337,11 +1341,24 @@ class WorkerPool:
                     and (w.allowed_job_types is None or kind in w.allowed_job_types)
                 ]
             else:
-                nodes = [
-                    policy.get("node")
+                devices = {device for _gpu, device, _info in self.selected_gpus}
+                configured = [
+                    policy
                     for policy in self._policies.values()
                     if policy.get("enabled", True) and policy.get("count", 0) > 0 and supports_job(policy, kind)
                 ]
+                if not configured:
+                    return True
+                nodes = [
+                    policy.get("node")
+                    for policy in configured
+                    if (
+                        self._node_hardware.node_can_come_back(policy["node"])
+                        if policy.get("node")
+                        else member_detected(policy, devices, self._node_hardware)
+                    )
+                ]
+                return any(node is None or node not in exclude_nodes for node in nodes)
             return not nodes or any(node is None or node not in exclude_nodes for node in nodes)
 
     def has_capacity_for(self, kind: str) -> bool:
