@@ -23,7 +23,7 @@ from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.nodes.server import plex_db as plex_db_role
 from tests.library_health.plex_fixture import SD_FLAG, build_plex_db, write_bif
 from tests.library_health.test_plex import _FULL_LOUDNESS, _THUMB, _cell, _cfg, _episode, _lib, _movie, _with_chapters
-from tests.markers.test_plex_db_publisher import _mountinfo
+from tests.markers.test_plex_db_publisher import _mountinfo, linux_mount_table
 from tests.nodes.plex_db_harness import NODE_URL, TOKEN, FlaskSession, node_app
 
 AUTH = {"Authorization": f"Bearer {TOKEN}", plex_remote.PROTOCOL_HEADER: str(plex_remote.AGENT_PROTOCOL)}
@@ -121,6 +121,7 @@ class TestWhenTheNodeCantCount:
         loudness = _cell(result, "1", Feature.LOUDNESS)
         assert loudness.state == CellState.UNAVAILABLE and "1.2.0 or newer" in loudness.reason
 
+    @linux_mount_table
     def test_a_database_on_a_network_share_on_the_node_is_an_error_naming_it(
         self, monkeypatch, node_folder, tmp_path, cfg
     ):

@@ -25,7 +25,7 @@ from media_preview_generator.markers.publishers.plex_chapters import CHAPTER_CAP
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.nodes.server import plex_db as plex_db_role
 from tests.loudness.test_plex_db import BEFORE, FIELDS, FILE, FIX, PLEX_ANALYSED, PLEX_ITEM_TRIGGERS
-from tests.markers.test_plex_db_publisher import _mountinfo
+from tests.markers.test_plex_db_publisher import _mountinfo, linux_mount_table
 from tests.nodes.plex_db_harness import NODE_URL, TOKEN, FlaskSession, node_app
 
 MACHINE = "plex-a"
@@ -200,7 +200,8 @@ class TestWritesAreTheLocalWrites:
         source = tmp_path / "local.mkv"
         source.write_bytes(b"old")
         fingerprint = loudness_db.SourceFingerprint.read(str(source))
-        source.write_bytes(b"new")
+        # A different size: Windows may not move the modified time for a rewrite within the same clock tick.
+        source.write_bytes(b"replaced")
         with pytest.raises(loudness_db.SourceChangedError):
             loudness_db.write_stream(db, 11, FIELDS, deadline=_deadline(), source=fingerprint)
         assert "/v1/loudness/write" not in session.paths
@@ -315,6 +316,7 @@ class TestTheNodeProvesWhichPlexItWrites:
         assert ei.value.state is Capability.UNREACHABLE
         assert session.paths == []
 
+    @linux_mount_table
     def test_a_database_on_a_network_share_on_the_node_writes_nothing(self, folder, tmp_path):
         node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path, fs="nfs4")).test_client()
         db, _ = _remote(node)
