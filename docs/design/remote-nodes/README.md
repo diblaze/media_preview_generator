@@ -297,15 +297,18 @@ Worker group member: `{"id", "resource", "device", "count", "job_types", "node":
 
 ### 10.4 Nodes REST API (Lane B backend ⇄ Lane B UI)
 
-All under `/api`, `@setup_or_auth_required`. A node's key never comes back; posting `"****"` keeps the stored key.
-Errors are `{"error": "<sentence>"}` with 400 (bad input), 404 (unknown node) or 502 (the node couldn't be asked).
+All under `/api`, `@api_token_required`: a signed-in session or the API token, even before setup is complete (the
+setup wizard doesn't use these routes, and they send stored keys out). A node's key never comes back; posting `"****"`
+keeps the stored key, but only for the address it was saved with: a probe or `PUT` that names another address with
+`"****"` (or, for `PUT`, no key) is a 400 asking for the key to be typed. Errors are `{"error": "<sentence>"}` with 400
+(bad input), 404 (unknown node) or 502 (the node couldn't be asked).
 
 | Route | Body | Answer |
 |---|---|---|
 | `GET /nodes` | – | `{"nodes": [NODE_ROW], "app_version"}` |
-| `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key |
+| `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key when `url` is its saved address (400 otherwise) |
 | `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
-| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW` |
+| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact) |
 | `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
 | `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health |

@@ -89,6 +89,10 @@ class FakeNode:
 @pytest.fixture
 def nodes(client, monkeypatch):
     client.application.config["WTF_CSRF_ENABLED"] = False
+    # Signed in after setup: every /api/nodes route needs a session or the API token (TestAuth).
+    _sm().complete_setup()
+    with client.session_transaction() as session:
+        session["authenticated"] = True
     fakes: dict[str, FakeNode] = {}
 
     def fake(url: str) -> FakeNode:
@@ -217,6 +221,35 @@ class TestListAndProbe:
         resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id})
         assert resp.get_json()["info"]["already_added"] is None and keys == ["node-key"]
 
+    def test_probe_with_the_mask_at_its_own_address_with_a_trailing_slash_uses_the_stored_key(
+        self, client, nodes, monkeypatch
+    ):
+        node_id = _add(client).get_json()["id"]
+        asked = []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: asked.append((url, key)) or nodes(url))
+        body = {"url": "http://nuc:9494/", "key": "****", "id": node_id}
+        assert client.post("/api/nodes/probe", json=body).get_json()["ok"] is True
+        assert asked == [("http://nuc:9494", "node-key")]
+
+    def test_probe_with_the_mask_at_another_address_never_sends_the_stored_key(self, client, nodes, monkeypatch):
+        node_id = _add(client).get_json()["id"]
+        asked, pinged = [], []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: asked.append((url, key)) or nodes(url))
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: pinged.append((url, key)) or ("connected", ""))
+        body = {"url": "http://attacker:9494", "key": "****", "id": node_id}
+        resp = client.post("/api/nodes/probe", json=body)
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == api_nodes.KEY_FOR_NEW_ADDRESS
+        assert asked == [] and pinged == []
+
+    def test_probe_of_another_address_with_a_typed_key_sends_that_key(self, client, nodes, monkeypatch):
+        node_id = _add(client).get_json()["id"]
+        asked = []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: asked.append((url, key)) or nodes(url))
+        body = {"url": "http://moved:9494", "key": "typed-key", "id": node_id}
+        assert client.post("/api/nodes/probe", json=body).status_code == 200
+        assert asked == [("http://moved:9494", "typed-key")]
+
     def test_probe_of_a_saved_node_says_when_a_different_node_answers(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         nodes("http://nuc:9494").info_answer = _info(uid="uid-other")
@@ -315,9 +348,30 @@ class TestUpdate:
         node_id = _add(client).get_json()["id"]
         client.post(f"/api/nodes/{node_id}/check")
         nodes("http://moved:9494").info_answer = NodeUnreachableError("slow")
-        row = client.put(f"/api/nodes/{node_id}", json={"url": "http://moved:9494"}).get_json()
+        row = client.put(f"/api/nodes/{node_id}", json={"url": "http://moved:9494", "key": "node-key"}).get_json()
         assert row["url"] == "http://moved:9494"
         assert row["state"] in ("connecting", "offline")
+
+    def test_a_new_address_forgets_which_node_answered_at_the_old_one(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        assert _sm().nodes[0]["node_uid"] == "uid-1"
+        nodes("http://moved:9494").info_answer = NodeUnreachableError("slow")
+        client.put(f"/api/nodes/{node_id}", json={"url": "http://moved:9494", "key": "node-key"})
+        assert _sm().nodes[0]["node_uid"] is None
+
+    @pytest.mark.parametrize("key", [None, "****"], ids=["no-key", "mask"])
+    def test_a_new_address_without_a_typed_key_is_refused(self, client, nodes, key):
+        node_id = _add(client).get_json()["id"]
+        body = {"url": "http://attacker:9494", **({"key": key} if key else {})}
+        resp = client.put(f"/api/nodes/{node_id}", json=body)
+        assert resp.status_code == 400 and resp.get_json()["error"] == api_nodes.KEY_FOR_NEW_ADDRESS
+        assert (_sm().nodes[0]["url"], _sm().nodes[0]["node_uid"]) == ("http://nuc:9494", "uid-1")
+
+    def test_the_same_address_with_the_mask_keeps_the_key_and_the_node_id(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        resp = client.put(f"/api/nodes/{node_id}", json={"url": "http://nuc:9494/", "key": "****"})
+        assert resp.status_code == 200
+        assert (_sm().nodes[0]["key"], _sm().nodes[0]["node_uid"]) == ("node-key", "uid-1")
 
     def test_turning_it_off(self, client, nodes):
         node_id = _add(client).get_json()["id"]
@@ -332,6 +386,17 @@ class TestUpdate:
 
 
 class TestDelete:
+    def test_a_list_that_wont_save_is_a_400_not_a_500(self, client, nodes, monkeypatch):
+        node_id = _add(client).get_json()["id"]
+
+        def refuse(nodes_list, expected_revision=None):
+            raise ValueError("The node's name must be at most 80 characters")
+
+        monkeypatch.setattr(type(_sm()), "update_nodes", lambda self, n, expected_revision=None: refuse(n))
+        resp = client.delete(f"/api/nodes/{node_id}")
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "The node's name must be at most 80 characters"}
+
     def test_a_node_nothing_uses_is_removed(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         resp = client.delete(f"/api/nodes/{node_id}")
@@ -447,7 +512,33 @@ class TestHealthAndLog:
         assert client.get(f"/api/nodes/{node_id}/log").status_code == 502
 
 
-def test_every_route_needs_auth_once_setup_is_done(client, nodes):
-    _sm().complete_setup()
-    assert client.get("/api/nodes").status_code == 401
-    assert client.post("/api/nodes/probe", json={}).status_code == 401
+class TestAuth:
+    """Every route sends stored keys out or reaches nodes, so none is open, not even before setup is complete."""
+
+    ROUTES = [
+        ("get", "/api/nodes"),
+        ("post", "/api/nodes/probe"),
+        ("post", "/api/nodes"),
+        ("put", "/api/nodes/n1"),
+        ("delete", "/api/nodes/n1"),
+        ("post", "/api/nodes/n1/check"),
+        ("post", "/api/nodes/n1/test-access"),
+        ("get", "/api/nodes/n1/health"),
+        ("get", "/api/nodes/n1/log"),
+        ("post", "/api/nodes/n1/rescan-gpus"),
+    ]
+
+    @pytest.mark.parametrize("setup_complete", [False, True], ids=["before-setup", "after-setup"])
+    @pytest.mark.parametrize(("method", "path"), ROUTES)
+    def test_an_unauthenticated_caller_is_refused(self, client, monkeypatch, setup_complete, method, path):
+        client.application.config["WTF_CSRF_ENABLED"] = False
+        monkeypatch.setattr(type(_sm()), "is_setup_complete", lambda self: setup_complete)
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: pytest.fail("a node was asked"))
+        body = {"id": "n1", "url": "http://attacker:9494", "key": "****"}
+        resp = getattr(client, method)(path, json=body) if method != "get" else client.get(path)
+        assert resp.status_code == 401
+
+    def test_the_api_token_is_accepted_before_setup(self, client, nodes, monkeypatch, auth_headers):
+        monkeypatch.setattr(type(_sm()), "is_setup_complete", lambda self: False)
+        fresh = client.application.test_client()
+        assert fresh.get("/api/nodes", headers=auth_headers).status_code == 200

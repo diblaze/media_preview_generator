@@ -1,6 +1,9 @@
 """REST API behind the Nodes page (spec §10.4).
 
-Keys never come back: a node's key is stored, sent to the node, and nothing else. Posting ``****`` keeps it.
+Keys never come back: a node's key is stored, sent to the node, and nothing else. Posting ``****`` keeps it, but only
+for the address it was saved with: a stored key is never sent to an address someone just typed. Every route needs a
+signed-in session or the API token, even before setup is complete (the setup wizard doesn't use them), because they
+send stored keys out.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from ...nodes.mappings import default_mappings_for, run_test_access
 from ...nodes.readiness import node_readiness
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
 from ...nodes.settings import KEY_MASK, find_node, normalise_key, normalise_mappings, normalise_url, validate_node
-from ..auth import setup_or_auth_required
+from ..auth import api_token_required
 from ..settings_manager import get_settings_manager
 from . import api
 
@@ -31,6 +34,7 @@ LOG_LINES_MAX = 2000
 # Probe error kinds beyond the protocol's request-level ones: nothing answered, or another node than the one saved.
 KIND_UNREACHABLE = "unreachable"
 KIND_DIFFERENT_NODE = "different_node"
+KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
 
 
 def _app_version() -> str:
@@ -108,6 +112,11 @@ def _not_found(node_id: str):
     return jsonify({"error": f"No node with id {node_id}"}), 404
 
 
+def _same_address(url: str, record: dict) -> bool:
+    """Whether a normalised address is the one the record was saved with."""
+    return url == normalise_url(record.get("url"))[0]
+
+
 def _probe_error(kind: str, message: str) -> dict[str, Any]:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
@@ -171,11 +180,11 @@ def _probe(url: str, key: str) -> dict[str, Any]:
     except NodeProtocolError:
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
-            return _probe_error(protocol.KIND_AUTH, "The Plex helper refused this key.")
+            return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
         if state != AGENT_CONNECTED:
             return _probe_error(
                 protocol.KIND_PROTOCOL,
-                "Something answered at this address, but not as a node or a Plex helper this app can use.",
+                "Something answered at this address, but not as a node this app can use.",
             )
         return {
             "ok": True,
@@ -205,7 +214,7 @@ def _json_body() -> dict:
 
 
 @api.route("/nodes", methods=["GET"])
-@setup_or_auth_required
+@api_token_required
 def list_nodes():
     """Every node as ``NODE_ROW`` and this app's version."""
     sm = get_settings_manager()
@@ -215,7 +224,7 @@ def list_nodes():
 
 
 @api.route("/nodes/probe", methods=["POST"])
-@setup_or_auth_required
+@api_token_required
 def probe_node():
     """Add node step 1: what answers at this address with this key. Nothing is saved."""
     data = _json_body()
@@ -224,7 +233,11 @@ def probe_node():
         return jsonify({"error": err}), 400
     sm = get_settings_manager()
     record = find_node(sm.nodes, data.get("id")) if data.get("id") else None
-    stored = str(record.get("key") or "") if record and data.get("key") == KEY_MASK else ""
+    stored = ""
+    if record and data.get("key") == KEY_MASK:
+        if not _same_address(url, record):
+            return jsonify({"error": KEY_FOR_NEW_ADDRESS}), 400
+        stored = str(record.get("key") or "")
     key, err = normalise_key(data.get("key"), stored)
     if key is None:
         return jsonify({"error": err}), 400
@@ -247,7 +260,7 @@ def probe_node():
 
 
 @api.route("/nodes", methods=["POST"])
-@setup_or_auth_required
+@api_token_required
 def create_node():
     """Add a node. 409 when the node answering at that address is already added."""
     data = _json_body()
@@ -278,7 +291,7 @@ def create_node():
 
 
 @api.route("/nodes/<node_id>", methods=["PUT"])
-@setup_or_auth_required
+@api_token_required
 def update_node(node_id: str):
     """Change a node's name, address, key, on/off switch or mappings."""
     data = {k: v for k, v in _json_body().items() if k in ("name", "url", "key", "enabled", "path_mappings")}
@@ -288,6 +301,10 @@ def update_node(node_id: str):
         existing = find_node(nodes, node_id)
         if existing is None:
             return _not_found(node_id)
+        if "url" in data and data.get("key") in (None, KEY_MASK):
+            new_url = normalise_url(data["url"])[0]
+            if new_url is not None and not _same_address(new_url, existing):
+                return jsonify({"error": KEY_FOR_NEW_ADDRESS}), 400
         others = [n for n in nodes if n is not existing]
         record, err = validate_node(data, existing=existing, others=others)
         if record is None:
@@ -304,7 +321,7 @@ def update_node(node_id: str):
 
 
 @api.route("/nodes/<node_id>", methods=["DELETE"])
-@setup_or_auth_required
+@api_token_required
 def delete_node(node_id: str):
     """Remove a node; refused while a worker group member or a Plex server uses it."""
     sm = get_settings_manager()
@@ -318,13 +335,16 @@ def delete_node(node_id: str):
         if used_by:
             names = ", ".join(u["name"] or u["id"] for u in used_by)
             return jsonify({"error": f"{existing.get('name')} is still used by {names}", "used_by": used_by}), 409
-        sm.update_nodes([n for n in nodes if n is not existing])
+        try:
+            sm.update_nodes([n for n in nodes if n is not existing])
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
     logger.info("Removed node {}", existing.get("name"))
     return jsonify({"ok": True})
 
 
 @api.route("/nodes/<node_id>/check", methods=["POST"])
-@setup_or_auth_required
+@api_token_required
 def check_node(node_id: str):
     """Run a health check now and answer with the fresh ``NODE_ROW``."""
     if get_registry().check_now(node_id) is None:
@@ -333,7 +353,7 @@ def check_node(node_id: str):
 
 
 @api.route("/nodes/<node_id>/test-access", methods=["POST"])
-@setup_or_auth_required
+@api_token_required
 def test_node_access(node_id: str):
     """Sample every enabled library and ask the node to find each file (saved mappings, or the posted ones)."""
     sm = get_settings_manager()
@@ -357,7 +377,7 @@ def test_node_access(node_id: str):
 
 
 @api.route("/nodes/<node_id>/health", methods=["GET"])
-@setup_or_auth_required
+@api_token_required
 def node_health(node_id: str):
     """The node's Setup Health envelope."""
     sm = get_settings_manager()
@@ -375,7 +395,7 @@ def node_health(node_id: str):
 
 
 @api.route("/nodes/<node_id>/log", methods=["GET"])
-@setup_or_auth_required
+@api_token_required
 def node_log(node_id: str):
     """The node's own last N log lines, oldest first, as ``{time, level, message}``."""
     record = find_node(get_settings_manager().nodes, node_id)
@@ -394,7 +414,7 @@ def node_log(node_id: str):
 
 
 @api.route("/nodes/<node_id>/rescan-gpus", methods=["POST"])
-@setup_or_auth_required
+@api_token_required
 def rescan_node_gpus(node_id: str):
     """Ask the node to detect its GPUs again and answer with the fresh ``NODE_ROW``."""
     if get_registry().rescan_gpus(node_id) is None:
