@@ -684,11 +684,6 @@ def _dispatch_processable_items(
     existing = get_dispatcher()
     if existing is not None:
         worker_pool = existing.worker_pool
-        logger.info(
-            "Multi-server {}: reusing shared worker pool ({} worker(s))",
-            label,
-            len(worker_pool._snapshot_workers()),
-        )
     else:
         sel = list(selected_gpus or [])
         # ``config.gpu_threads`` can be > 0 while no GPU is actually
@@ -705,8 +700,13 @@ def _dispatch_processable_items(
     dispatcher = get_dispatcher(worker_pool)
     # Another job may have created the dispatcher since the check above; its pool is the one that runs, so it's
     # the one to register (an unused pool registered here would be what Settings saves resize).
+    created = existing is None and dispatcher.worker_pool is worker_pool
     worker_pool = dispatcher.worker_pool
     refresh_worker_groups(worker_pool, config, selected_gpus, force=True)
+    if created:
+        worker_pool.log_created()
+    else:
+        logger.info("Multi-server {}: reusing shared worker pool ({})", label, worker_pool.size_summary())
 
     # Reconcile the (possibly reused/stale) pool to the current GPU config —
     # the same hook the webhook path uses so worker counts track settings.

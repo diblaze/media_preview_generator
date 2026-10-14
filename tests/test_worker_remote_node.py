@@ -357,3 +357,15 @@ class TestNodeWorkerConstruction:
         assert worker.placement == Placement("n1", "n1")
         assert worker.group_resource == ("node:n1:cpu" if resource == "cpu" else "node:n1:gpu:cuda:0")
         assert worker.worker_type == resource.upper()
+
+
+class TestPoolSizeSummary:
+    def test_workers_on_nodes_are_counted_apart_from_this_apps(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=1, selected_gpus=[])
+        pool.workers.append(_node_gpu_worker())
+        pool.workers.append(Worker(7, "CPU", node_id="n2", node_name="lab-cpu"))
+        assert pool.size_summary() == "3 worker(s): 0 GPU + 1 CPU here, 1 GPU + 1 CPU on nodes"
+
+    def test_a_pool_with_no_node_workers_says_nothing_about_nodes(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=2, selected_gpus=[])
+        assert pool.size_summary() == "2 worker(s): 0 GPU + 2 CPU"

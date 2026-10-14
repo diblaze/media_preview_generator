@@ -1788,6 +1788,7 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
     from .group_runtime import refresh_worker_groups
 
     selected = list(selected_gpus or [])
+    created = False
     with _dispatcher_lock:
         if _dispatcher is None:
             pool = WorkerPool(
@@ -1796,12 +1797,15 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
                 selected_gpus=selected,
             )
             _dispatcher = JobDispatcher(pool)
+            created = True
         existing = _dispatcher
     if not refresh_worker_groups(existing.worker_pool, config, selected, force=True) and selected:
         try:
             existing.worker_pool.reconcile_gpu_workers(selected)
         except Exception as exc:
             logger.debug("Could not reconcile GPU workers: {}", exc)
+    if created:
+        existing.worker_pool.log_created()
     return existing
 
 

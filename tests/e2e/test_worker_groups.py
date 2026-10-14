@@ -876,3 +876,23 @@ def test_editor_at_390px_has_no_horizontal_scroll_and_44px_targets(
             .map(([name]) => name)"""
     )
     assert small == []
+
+
+@pytest.mark.parametrize(
+    ("nodes", "expected"),
+    [
+        (None, "Scheduled now: CPU 0 · GPU 0. Weekly peak: CPU 0 · GPU 0."),
+        (
+            {"nodes_current": {"cpu": 1, "gpu": 1}, "nodes_peak": {"cpu": 1, "gpu": 2}},
+            "Scheduled now: CPU 0 · GPU 0 here, 1 GPU + 1 CPU on nodes. "
+            "Weekly peak: CPU 0 · GPU 0 here, 2 GPU + 1 CPU on nodes.",
+        ),
+    ],
+    ids=["no-node-members", "workers-on-nodes"],
+)
+def test_capacity_line_counts_node_workers_apart_from_this_apps(
+    authed_page: Page, app_url: str, group_api: dict, nodes: dict | None, expected: str
+) -> None:
+    group_api["state"]["capacity"].update(current={"cpu": 0, "gpu": 0}, peak={"cpu": 0, "gpu": 0}, **(nodes or {}))
+    settings_page(authed_page, app_url)
+    expect(authed_page.locator("#workerGroupCapacity")).to_contain_text(expected)

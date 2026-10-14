@@ -1115,14 +1115,8 @@ class WorkerPool:
         self._suspect_nodes: dict[str, tuple[float, float | None]] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
-
-        logger.info(
-            "Created fresh worker pool — {} worker(s): {} GPU + {} CPU "
-            "(subsequent jobs reuse this pool, you'll see 'Reusing existing worker pool' instead)",
-            len(self.workers),
-            gpu_workers,
-            cpu_workers,
-        )
+        # The "Created fresh worker pool" line comes from whoever made it, once its worker groups are applied:
+        # members on nodes only get their workers then.
 
     def has_busy_workers(self) -> bool:
         """Check if any workers are currently busy."""
@@ -1133,6 +1127,30 @@ class WorkerPool:
         """Return a stable snapshot of workers for safe iteration."""
         with self._workers_lock:
             return list(self.workers)
+
+    def size_summary(self) -> str:
+        """The pool's size for the job log: ``"3 worker(s): 1 GPU + 0 CPU here, 1 GPU + 1 CPU on nodes"``.
+
+        The part about nodes is there only when a worker runs on one.
+        """
+        workers = self._snapshot_workers()
+
+        def count(worker_type: str, on_node: bool) -> int:
+            return sum(1 for w in workers if w.worker_type == worker_type and (w.node_id is not None) == on_node)
+
+        text = f"{len(workers)} worker(s): {count('GPU', False)} GPU + {count('CPU', False)} CPU"
+        node_gpu, node_cpu = count("GPU", True), count("CPU", True)
+        if node_gpu or node_cpu:
+            text += f" here, {node_gpu} GPU + {node_cpu} CPU on nodes"
+        return text
+
+    def log_created(self) -> None:
+        """Log that this pool was just made, with its size once its worker groups are applied."""
+        logger.info(
+            "Created fresh worker pool — {} (subsequent jobs reuse this pool, you'll see 'reusing shared worker pool' "
+            "instead)",
+            self.size_summary(),
+        )
 
     def reconcile_groups(
         self, groups: list[dict], selected_gpus: list | None, *, now=None, revision: int | None = None
