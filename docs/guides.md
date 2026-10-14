@@ -1230,12 +1230,12 @@ first time you turn it on for a Plex server:
 ### Plex on another machine: the Plex marker agent
 
 If this app and Plex run on different machines, run the **Plex marker agent** next to Plex. It is a small container of
-its own (`plex-marker-agent/` in the repository, image `ghcr.io/stevezau/plex-marker-agent`) with Plex's config folder
+its own (`nodes/plex-db/` in the repository, image `ghcr.io/stevezau/plex-marker-agent`) with Plex's config folder
 mounted. The app asks it to do the database write on Plex's machine. It is the only supported way to write markers to a
 Plex on another machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine,
 don't run it.
 
-1. Run the agent as its [README](https://github.com/stevezau/media_preview_generator/blob/dev/plex-marker-agent/README.md) says: the compose file, the settings (`AGENT_TOKEN`,
+1. Run the agent as its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md) says: the compose file, the settings (`AGENT_TOKEN`,
    `PLEX_CONFIG`, `PUID`/`PGID`) and the key.
 2. In the app: **Servers → your Plex → Edit → Connection → Plex helper**. Switch it on, enter its **Address**
    (for example `http://plex-host.lan:9494`) and the **Shared key**, the same value as `AGENT_TOKEN`. The key is masked
@@ -1247,6 +1247,7 @@ don't run it.
 
 For Intro & Credits, the agent writes the marker rows of one item into Plex's library database. A compatible agent
 also supports [chapter thumbnails](#plex-chapter-thumbnails), updating only existing chapter image references.
+Version 1.2.0 or newer also writes [loudness](plex-loudness-normalization.md) and runs Library Health's database counts.
 It refuses a database that isn't
 on a local disk of its own machine, a database schema it doesn't know, and a Plex that has no marker list yet, with the
 same messages a same-machine setup gives. Chapter registration does not require a marker list. While it isn't answering, markers wait in this app and the next Intro &
