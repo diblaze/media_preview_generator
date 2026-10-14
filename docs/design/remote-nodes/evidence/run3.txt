@@ -1,0 +1,8 @@
+node_gpus: [["NVIDIA", "cuda:0", "Quadro P5000", "ok"]]
+node_gpu_detect_s: 0.83
+access_checks: [[true, "/mnt/nas/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv"], [false, "LookupError: no node mapping covers /elsewhere/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv"], [false, "FileExistsError: different file at /mnt/nas/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv: size 775560700 vs 775560701, mtime_ns 1771246996454097483 vs 177124699645409
+task_with_wrong_mapping: {"status": "file_not_visible", "error": "FileNotFoundError: node can't see /mnt/wrong/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv", "seconds": 0.0}
+Traceback (most recent call last):
+  File "/proto/proto_master.py", line 228, in <module>
+  File "/proto/proto_master.py", line 129, in main
+UnboundLocalError: cannot access local variable 't0' where it is not associated with a value

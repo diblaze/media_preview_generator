@@ -1,0 +1,65 @@
+name: windows-probe (throwaway)
+on:
+  push:
+    branches: [probe/windows-nodes]
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install app without deps (like the Plex helper image) + helper deps
+        shell: pwsh
+        run: |
+          pip install --no-deps -e .
+          pip install -r plex-marker-agent/requirements.txt
+      - name: Probe
+        shell: pwsh
+        run: python probe/windows_probe.py
+      - name: Import the Plex helper itself
+        shell: pwsh
+        continue-on-error: true
+        run: python -c "import sys; sys.path.insert(0, 'plex-marker-agent'); import plex_marker_agent; print('helper import ok')"
+      - name: PyInstaller self-contained build of a tiny Flask+sqlite node
+        shell: pwsh
+        run: |
+          pip install pyinstaller
+          pyinstaller --onedir --noconfirm --name tinynode probe/tiny_node.py | Out-Null
+          $size = (Get-ChildItem dist/tinynode -Recurse | Measure-Object Length -Sum).Sum / 1MB
+          "dist size MB: {0:N1}" -f $size
+          $p = Start-Process -PassThru dist/tinynode/tinynode.exe
+          Start-Sleep 5
+          (Invoke-WebRequest http://127.0.0.1:8765/v1/info -UseBasicParsing).Content
+          Stop-Process $p.Id
+      - name: Scheduled task at logon (runner is admin; also check a non-admin user)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          schtasks /Create /TN probe-node /TR "C:\Windows\System32\cmd.exe /c exit" /SC ONLOGON /F
+          "admin create rc=$LASTEXITCODE"
+          schtasks /Delete /TN probe-node /F | Out-Null
+          $pw = ConvertTo-SecureString "P@ssw0rd!$(Get-Random)" -AsPlainText -Force
+          New-LocalUser -Name probeuser -Password $pw | Out-Null
+          $cred = New-Object System.Management.Automation.PSCredential("probeuser", $pw)
+          $out = Join-Path $env:RUNNER_TEMP "st.txt"
+          Start-Process -Wait -Credential $cred -FilePath cmd.exe -ArgumentList "/c schtasks /Create /TN probe-user /TR C:\Windows\System32\cmd.exe /SC ONLOGON /F > $out 2>&1 & echo rc=%errorlevel% >> $out" -WorkingDirectory C:\Windows\Temp
+          Get-Content $out
+  plexdb-tests-on-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install app with dev extras
+        shell: pwsh
+        run: pip install -e ".[dev]"
+      - name: Run the Plex DB + helper tests on Windows with the shim
+        shell: pwsh
+        continue-on-error: true
+        env:
+          PYTHONPATH: probe
+        run: |
+          python -m pytest -p winshim --no-cov -n 0 -q -p no:cacheprovider tests/markers/test_plex_db_publisher.py tests/test_plex_marker_agent.py tests/test_plex_chapters.py 2>&1 | Select-Object -Last 80
