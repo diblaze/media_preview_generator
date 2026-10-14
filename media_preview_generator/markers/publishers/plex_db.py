@@ -97,6 +97,11 @@ STALE_READ_WAIT_S = 5.0
 # How long a read-only caller trusts a READY file check (database found, local, writable, held open by Plex). Writes and
 # ``capability()`` prove it again; only a READY answer is kept.
 LOCAL_CHECK_TRUST_S = 60.0
+# Per database (``PlexDatabase.trust_key``), not per publisher: a publisher is built for every file, so a cache on it
+# never hit. When a READY file check was made, and when a read last found the tested schema.
+_ready_file_checks: dict[object, tuple[float, CapabilityReport]] = {}
+_schema_read_ok_at: dict[object, float] = {}
+_trust_guard = threading.Lock()
 # Check servers reads Plex items back one read-only connection each, like a single file's read-back, and leaves this
 # process's lock on the database free this long between them, so a write from another job waiting for it gets it.
 READ_BACK_PAUSE_S = 0.001
@@ -1094,6 +1099,10 @@ class PlexDatabase(ABC):
     # publisher's record of what is ours is treated as unknown after a failure (``MarkerPublisher.atomic_writes``).
     atomic_writes: bool = True
 
+    def trust_key(self) -> object | None:
+        """What identifies this database for the read-side trust caches; None never caches (the default)."""
+        return None
+
     @abstractmethod
     def file_checks(self, *, deadline: float) -> CapabilityReport:
         """Check the database file itself: found, on a local disk, writable, and open in Plex's process."""
@@ -1157,6 +1166,26 @@ class LocalPlexDb(PlexDatabase):
         self._path = path_provider
         self._label = label
         self._mountinfo_path = mountinfo_path
+
+    def trust_key(self) -> object | None:
+        """The database file's identity (``_lock_key``), shared by every publisher of it; None without a folder."""
+        db = self._path()
+        return ("local", _lock_key(db)) if db else None
+
+    def _check_schema_for_read(self, conn: sqlite3.Connection) -> None:
+        """:meth:`_check_schema` for a read, skipped while a read found the tested schema in the last
+        ``LOCAL_CHECK_TRUST_S``. Writes and ``db_checks`` always check."""
+        key = self.trust_key()
+        now = time.monotonic()
+        if key is not None:
+            with _trust_guard:
+                checked_at = _schema_read_ok_at.get(key)
+            if checked_at is not None and now - checked_at < LOCAL_CHECK_TRUST_S:
+                return
+        self._check_schema(conn)
+        if key is not None:
+            with _trust_guard:
+                _schema_read_ok_at[key] = now
 
     def _connect(self, *, read_only: bool, timeout: float) -> sqlite3.Connection:
         mode = "ro" if read_only else "rw"
@@ -1383,7 +1412,7 @@ class LocalPlexDb(PlexDatabase):
         """
         try:
             with self._database(read_only=True, deadline=deadline) as conn:
-                self._check_schema(conn)
+                self._check_schema_for_read(conn)
                 tag_id = self._marker_tag_id(conn)
                 parts = self._item_parts(conn, rating_key)
                 stale = _types_not_made_for_file(self._item_rows(conn, rating_key, tag_id), parts)
@@ -1474,7 +1503,7 @@ class LocalPlexDb(PlexDatabase):
             try:
                 with self._database(read_only=True, deadline=time.monotonic() + timeout_s) as conn:
                     if tag_id is None:
-                        self._check_schema(conn)
+                        self._check_schema_for_read(conn)
                         tag_id = self._marker_tag_id(conn)
                     shown, parts = self._shown_in(
                         conn, tag_id, ask.rating_key, ask.ours, ask.kept_types, ask.item_files
@@ -1791,7 +1820,6 @@ class PlexMarkerPublisher(MarkerPublisher):
         self._ui_details = ui_details
         self._db_timeout_s = db_timeout_s
         self._db = db or LocalPlexDb(self.db_path, label=config.name, mountinfo_path=mountinfo_path)
-        self._file_checks_ready: tuple[float, CapabilityReport] | None = None
         # A write through the Plex marker agent can fail with its answer lost after the transaction committed, so
         # that publisher is not atomic and its record of what is ours is unknown after a failure.
         self.atomic_writes = self._db.atomic_writes
@@ -1849,14 +1877,19 @@ class PlexMarkerPublisher(MarkerPublisher):
             return CapabilityReport(Capability.DISABLED, "Intro & Credits is off for this server")
         if not settings.db_write_confirmed_at:
             return CapabilityReport(Capability.NEEDS_CONFIRMATION, "Confirm the Plex database write to turn this on")
-        proven = self._file_checks_ready
+        key = self._db.trust_key()
+        with _trust_guard:
+            proven = _ready_file_checks.get(key) if key is not None else None
         if trust_recent and proven is not None and time.monotonic() - proven[0] < LOCAL_CHECK_TRUST_S:
             report = proven[1]
         else:
-            self._file_checks_ready = None
             report = self._db.file_checks(deadline=deadline)
-            if report.ready:
-                self._file_checks_ready = (time.monotonic(), report)
+            if key is not None:
+                with _trust_guard:
+                    if report.ready:
+                        _ready_file_checks[key] = (time.monotonic(), report)
+                    else:
+                        _ready_file_checks.pop(key, None)
         return self._another_plexs_agent(report) or report
 
     def _another_plexs_agent(self, report: CapabilityReport) -> CapabilityReport | None:

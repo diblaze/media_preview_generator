@@ -1318,3 +1318,15 @@ def make_gate(monkeypatch):
         return job_gate.JobGate(kind_capacity_provider)
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def _fresh_plex_db_trust():
+    """Each test starts with no trusted Plex database file or schema check (they are kept per process)."""
+    from media_preview_generator.markers.publishers import plex_db
+
+    plex_db._ready_file_checks.clear()
+    plex_db._schema_read_ok_at.clear()
+    yield
+    plex_db._ready_file_checks.clear()
+    plex_db._schema_read_ok_at.clear()

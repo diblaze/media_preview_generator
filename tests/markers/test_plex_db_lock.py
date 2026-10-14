@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from unittest.mock import MagicMock
@@ -229,6 +230,21 @@ class TestLocalCheckTrust:
         assert not pub._local_checks(deadline=_deadline(5)).ready
         assert pub.item_missing("7") is None
 
+    def test_publishers_of_one_database_share_the_trust(self, tmp_path):
+        first = self._pub(tmp_path)
+        second = _publisher(tmp_path, tmp_path / "plex")
+        second._db = first._db
+        assert first.item_missing("7") is False
+        assert second.item_missing("7") is False
+        assert first._db.file_checks.call_count == 1
+
+    def test_a_database_without_a_trust_key_checks_every_time(self, tmp_path):
+        pub = self._pub(tmp_path)
+        pub._db.trust_key.return_value = None
+        pub.item_missing("7")
+        pub.item_missing("7")
+        assert pub._db.file_checks.call_count == 2
+
     def test_the_settings_are_still_read_live(self, tmp_path):
         current = [ServerMarkersSettings(True, None, "2026-09-13T00:00:00+00:00", "restore")]
         pub = self._pub(tmp_path, provider=lambda: current[0])
@@ -236,3 +252,38 @@ class TestLocalCheckTrust:
         current[0] = ServerMarkersSettings(False, None, "2026-09-13T00:00:00+00:00", "restore")
         assert pub.item_missing("7") is None
         assert pub._db.file_checks.call_count == 1
+
+
+class TestSchemaCheckForReads:
+    def _db(self, tmp_path):
+        path = tmp_path / "plex.db"
+        sqlite3.connect(path).close()
+        return plex_db.LocalPlexDb(lambda: str(path))
+
+    def test_a_read_skips_the_schema_check_within_60_seconds(self, tmp_path, monkeypatch):
+        db = self._db(tmp_path)
+        calls = []
+        monkeypatch.setattr(plex_db.LocalPlexDb, "_check_schema", staticmethod(lambda conn: calls.append(conn)))
+        now = [1000.0]
+        monkeypatch.setattr(plex_db.time, "monotonic", lambda: now[0])
+        db._check_schema_for_read(MagicMock())
+        now[0] += 59
+        db._check_schema_for_read(MagicMock())
+        assert len(calls) == 1
+        now[0] += 2
+        db._check_schema_for_read(MagicMock())
+        assert len(calls) == 2
+
+    def test_a_failed_schema_check_is_not_remembered(self, tmp_path, monkeypatch):
+        db = self._db(tmp_path)
+        calls = []
+
+        def check(conn):
+            calls.append(conn)
+            raise PublishError("Plex database looks different from the tested version")
+
+        monkeypatch.setattr(plex_db.LocalPlexDb, "_check_schema", staticmethod(check))
+        for _ in range(2):
+            with pytest.raises(PublishError):
+                db._check_schema_for_read(MagicMock())
+        assert len(calls) == 2
