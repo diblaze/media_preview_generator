@@ -76,11 +76,12 @@ def steady_state(tmp_path, mock_config, monkeypatch):
             CREATE TABLE tags(id INTEGER PRIMARY KEY,tag_type INTEGER);
             CREATE TABLE taggings(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,tag_id INTEGER,
                 "index" INTEGER,time_offset INTEGER,end_time_offset INTEGER,thumb_url TEXT,extra_data TEXT);
-            CREATE TABLE media_items(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,deleted_at INTEGER,proxy_type INTEGER);
+            CREATE TABLE media_items(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,deleted_at INTEGER,proxy_type INTEGER,duration INTEGER);
+            CREATE TABLE media_streams(id INTEGER PRIMARY KEY,media_part_id INTEGER,stream_type_id INTEGER);
             CREATE TABLE media_parts(id INTEGER PRIMARY KEY,media_item_id INTEGER,file TEXT,hash TEXT,size INTEGER,
                 updated_at INTEGER,deleted_at INTEGER,extra_data TEXT);
             INSERT INTO tags VALUES(9,9);
-            INSERT INTO media_items VALUES(10,1,NULL,NULL);
+            INSERT INTO media_items VALUES(10,1,NULL,NULL,NULL);
             INSERT INTO taggings VALUES(1,1,9,1,0,1000,'',NULL);
             INSERT INTO taggings VALUES(2,1,9,2,1000,2000,'',NULL);
         """)

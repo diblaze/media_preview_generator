@@ -48,12 +48,13 @@ def backend(tmp_path, monkeypatch):
             CREATE TABLE tags(id INTEGER PRIMARY KEY,tag_type INTEGER);
             CREATE TABLE taggings(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,tag_id INTEGER,
                 "index" INTEGER,time_offset INTEGER,end_time_offset INTEGER,thumb_url TEXT,extra_data TEXT);
-            CREATE TABLE media_items(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,deleted_at INTEGER,proxy_type INTEGER);
+            CREATE TABLE media_items(id INTEGER PRIMARY KEY,metadata_item_id INTEGER,deleted_at INTEGER,proxy_type INTEGER,duration INTEGER);
+            CREATE TABLE media_streams(id INTEGER PRIMARY KEY,media_part_id INTEGER,stream_type_id INTEGER);
             CREATE TABLE media_parts(id INTEGER PRIMARY KEY,media_item_id INTEGER,file TEXT,hash TEXT,size INTEGER,
                 updated_at INTEGER,deleted_at INTEGER,extra_data TEXT);
             INSERT INTO tags VALUES(9,9);
             INSERT INTO tags VALUES(12,12);
-            INSERT INTO media_items VALUES(10,1,NULL,NULL);
+            INSERT INTO media_items VALUES(10,1,NULL,NULL,NULL);
             INSERT INTO taggings VALUES(1,1,9,1,0,10000,'','chapter data');
             INSERT INTO taggings VALUES(2,1,9,2,10000,20000,'','chapter data');
             INSERT INTO taggings VALUES(3,1,12,0,500,5000,'','marker data');
@@ -92,6 +93,16 @@ def rows(backend):
 def mutate(backend, sql, args=()):
     with contextlib.closing(sqlite3.connect(plex_db.plex_db_path(str(backend.folder)), isolation_level=None)) as conn:
         conn.execute(sql, args)
+
+
+def test_a_part_is_analysed_only_with_a_duration_and_audio_or_video_streams(backend):
+    assert read(backend).analysed is False
+    mutate(backend, "UPDATE media_items SET duration=5000 WHERE id=10")
+    assert read(backend).analysed is False
+    mutate(backend, "INSERT INTO media_streams VALUES(1,20,3)")
+    assert read(backend).analysed is False
+    mutate(backend, "INSERT INTO media_streams VALUES(2,20,2)")
+    assert read(backend).analysed is True
 
 
 def test_register_changes_only_existing_chapter_thumb_urls_and_is_idempotent(backend):
@@ -259,7 +270,7 @@ OWN_CHAPTERS = pv_chapters(0.0, 10.004)
 def add_second_version(backend, *, first=OWN_CHAPTERS, second=None):
     """Version 10 (the fixture's) gets ``first`` as its own chapters; version 11 gets ``second``."""
     mutate(backend, "UPDATE media_parts SET extra_data=? WHERE id=20", (first,))
-    mutate(backend, "INSERT INTO media_items VALUES(11,1,NULL,NULL)")
+    mutate(backend, "INSERT INTO media_items VALUES(11,1,NULL,NULL,NULL)")
     mutate(
         backend,
         "INSERT INTO media_parts(id,media_item_id,file,hash,size,updated_at,deleted_at,extra_data) "
@@ -335,7 +346,7 @@ def test_multi_version_thumbs_at_this_version_proceed_even_if_own_chapters_diffe
 
 def test_multi_version_thumbs_from_deleted_version_claims_when_chapters_match(backend):
     add_second_version(backend)
-    mutate(backend, "INSERT INTO media_items VALUES(12,1,100,NULL)")
+    mutate(backend, "INSERT INTO media_items VALUES(12,1,100,NULL,NULL)")
     mutate(backend, "UPDATE taggings SET thumb_url='/library/media/12/chapterImages/1?mpgChapter=x' WHERE id=1")
     assert read(backend).media_id == 10
 

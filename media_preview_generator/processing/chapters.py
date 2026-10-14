@@ -197,7 +197,8 @@ def prepare_chapters(
 
     Args:
         trust_server_hash: Bulk scans only. Use Plex's hash for the part at this exact path
-            when its byte size matches, instead of reading the file (the same rule as BIF paths).
+            when its byte size matches, instead of reading the file (the same rule as BIF paths), and take Plex's
+            empty chapter list as "no chapters" without probing the file.
         regenerate: Ignore a stored "unsupported source" or "failed before" stamp so an explicit regeneration retries the file.
         source_fingerprint: The caller's own stat of this file, when it just took one; saves a second stat.
         reuse_recent_checks: Covers only the read-side checks (a recent Plex identity and database check are reused);
@@ -240,7 +241,13 @@ def prepare_chapters(
             plan.target = None
             plan.outcome = ChapterOutcome("skipped", message=stamped)
             return plan
-        if not plan.target.chapters:
+        if not plan.target.chapters and trust_server_hash and plan.target.analysed:
+            # Plex writes the part's size and hash when it scans a file but chapters only when it analyses it, so an
+            # empty list means "no chapters" only once the part has a duration and audio/video streams (``analysed``).
+            # Probing every analysed chapterless file on every scan cost 38k probes on one library, none ever finding
+            # chapters Plex lacked. Scanned-only parts, webhooks and targeted jobs keep the probe below.
+            plan.outcome = ChapterOutcome("none", message="No chapters")
+        elif not plan.target.chapters:
             if cancel_check and cancel_check():
                 raise CancellationError("Chapter metadata check cancelled")
             source_metadata = probe_media(canonical_path, ffprobe=ffprobe_path_for(config.ffmpeg_path), timeout_s=5)

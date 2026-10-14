@@ -642,6 +642,74 @@ def test_empty_plex_rows_require_positive_source_chapter_check(plan, config, mon
     assert probe.call_args.kwargs["timeout_s"] == 5
 
 
+def test_a_library_scan_trusts_plexs_empty_chapter_list_without_probing(plan, config, monkeypatch):
+    plan.server.path_mappings = []
+    monkeypatch.setattr(
+        "media_preview_generator.servers.plex_chapters.resolve_chapter_target",
+        lambda *_a, **_kw: replace(plan.target, chapters=(), analysed=True),
+    )
+    probe = MagicMock(return_value=SimpleNamespace(chapters=(object(),), duration_ms=2000))
+    monkeypatch.setattr(chapters, "probe_media", probe)
+    result = chapters.prepare_chapters(
+        plan.server,
+        SimpleNamespace(output={"plex_config_folder": str(plan.folder.parent)}),
+        plan.canonical_path,
+        config,
+        trust_server_hash=True,
+    )
+    assert result.outcome.status == "none"
+    assert result.outcome.message == "No chapters"
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize("analysed", [False, "agent_without_signal"])
+def test_a_library_scan_probes_a_part_plex_scanned_but_not_analysed(plan, config, monkeypatch, analysed):
+    plan.server.path_mappings = []
+    target = replace(plan.target, chapters=())
+    if analysed is False:
+        target = replace(target, analysed=False)
+    else:
+        from media_preview_generator.markers.publishers.plex_chapters import target_from_json, target_to_json
+
+        wire = target_to_json(target)
+        del wire["analysed"]
+        target = target_from_json(wire)
+    assert target.analysed is False
+    monkeypatch.setattr(
+        "media_preview_generator.servers.plex_chapters.resolve_chapter_target", lambda *_a, **_kw: target
+    )
+    probe = MagicMock(return_value=SimpleNamespace(chapters=(), duration_ms=2000))
+    monkeypatch.setattr(chapters, "probe_media", probe)
+    result = chapters.prepare_chapters(
+        plan.server,
+        SimpleNamespace(output={"plex_config_folder": str(plan.folder.parent)}),
+        plan.canonical_path,
+        config,
+        trust_server_hash=True,
+    )
+    assert result.outcome.status == "none"
+    probe.assert_called_once()
+
+
+def test_a_library_scan_still_waits_when_plex_indexed_a_different_size(plan, config, monkeypatch):
+    plan.server.path_mappings = []
+    monkeypatch.setattr(
+        "media_preview_generator.servers.plex_chapters.resolve_chapter_target",
+        lambda *_a, **_kw: replace(plan.target, chapters=(), source_size=plan.target.source_size + 1),
+    )
+    probe = MagicMock()
+    monkeypatch.setattr(chapters, "probe_media", probe)
+    result = chapters.prepare_chapters(
+        plan.server,
+        SimpleNamespace(output={"plex_config_folder": str(plan.folder.parent)}),
+        plan.canonical_path,
+        config,
+        trust_server_hash=True,
+    )
+    assert result.outcome.status == "waiting"
+    probe.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", ["timeout", "source_changed", "cancel"])
 def test_empty_plex_rows_never_complete_after_probe_failure_or_source_race(plan, config, monkeypatch, failure):
     from media_preview_generator.markers.probe import ProbeTimeoutError

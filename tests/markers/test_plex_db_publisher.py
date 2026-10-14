@@ -2546,14 +2546,15 @@ class TestLockTimeouts:
         db = _make_db(folder)
         pub = _publisher(tmp_path, folder)
         inside, release = threading.Event(), threading.Event()
-        real_extra = plex_db._tagging_extra
+        real_begin = plex_db.LocalPlexDb._begin_write
 
-        def paused_extra(marker, final):
+        # Only the write connection is exclusive; the read before it is shared and wouldn't keep a second writer out.
+        def paused_begin(conn, deadline):
+            real_begin(conn, deadline)
             inside.set()
             release.wait(10)
-            return real_extra(marker, final)
 
-        monkeypatch.setattr(plex_db, "_tagging_extra", paused_extra)
+        monkeypatch.setattr(plex_db.LocalPlexDb, "_begin_write", staticmethod(paused_begin))
         writer = threading.Thread(target=_write_one, args=(pub, [INTRO]))
         writer.start()
         assert inside.wait(5)

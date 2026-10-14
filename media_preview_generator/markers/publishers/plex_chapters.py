@@ -95,6 +95,9 @@ class ChapterTarget:
     source_updated_at: int | None
     chapters: tuple[Chapter, ...]
     machine_identifier: str
+    # Plex has analysed this part (duration and audio/video streams recorded); chapters are written at that step, so
+    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False.
+    analysed: bool = False
 
 
 def _target_changes(before: ChapterTarget, after: ChapterTarget) -> tuple[str, ...]:
@@ -102,7 +105,7 @@ def _target_changes(before: ChapterTarget, after: ChapterTarget) -> tuple[str, .
     changed = [
         field.name
         for field in fields(ChapterTarget)
-        if field.name != "chapters" and getattr(before, field.name) != getattr(after, field.name)
+        if field.name not in {"chapters", "analysed"} and getattr(before, field.name) != getattr(after, field.name)
     ]
     if len(before.chapters) != len(after.chapters):
         changed.append("chapters.count")
@@ -162,6 +165,7 @@ def target_from_json(raw: Any) -> ChapterTarget:
         None if raw["source_updated_at"] is None else _integer(raw["source_updated_at"]),
         chapters,
         _text(raw["machine_identifier"]),
+        raw.get("analysed") is True,
     )
     if (
         not _valid_bundle_hash(target.bundle_hash, target.source_size)
@@ -245,7 +249,8 @@ class LocalChapters:
         required = {
             "tags": {"id", "tag_type"},
             "taggings": {"id", "metadata_item_id", "tag_id", "index", "time_offset", "end_time_offset", "thumb_url"},
-            "media_items": {"id", "metadata_item_id", "deleted_at", "proxy_type"},
+            "media_items": {"id", "metadata_item_id", "deleted_at", "proxy_type", "duration"},
+            "media_streams": {"id", "media_part_id", "stream_type_id"},
             "media_parts": {"id", "media_item_id", "file", "hash", "size", "updated_at", "deleted_at", "extra_data"},
         }
         for table, columns in required.items():
@@ -304,7 +309,9 @@ class LocalChapters:
         conn: sqlite3.Connection, source_path: str, machine_identifier: str, item_id_hint: int | None
     ) -> ChapterTarget:
         rows = conn.execute(
-            "SELECT mi.metadata_item_id, mi.id, mp.id, mp.hash, mp.file, mp.size, mp.updated_at, mp.extra_data "
+            "SELECT mi.metadata_item_id, mi.id, mp.id, mp.hash, mp.file, mp.size, mp.updated_at, mp.extra_data, "
+            "mi.duration > 0 AND EXISTS (SELECT 1 FROM media_streams ms WHERE ms.media_part_id=mp.id "
+            "AND ms.stream_type_id IN (1, 2)) "
             "FROM media_parts mp JOIN media_items mi ON mi.id=mp.media_item_id "
             "WHERE mp.file=? AND mp.deleted_at IS NULL AND mi.deleted_at IS NULL "
             "AND (mi.proxy_type IS NULL OR mi.proxy_type=0)",
@@ -358,6 +365,7 @@ class LocalChapters:
                 row[6],
                 tuple(Chapter(*c) for c in chapters),
                 machine_identifier,
+                bool(row[8]),
             )
             return target_from_json(target_to_json(target))
         except ValueError as exc:

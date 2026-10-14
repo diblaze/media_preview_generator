@@ -103,6 +103,8 @@ class LoudnessContext:
     # The job's pin (``job_runner.server_pin``): only this server; None = every server with loudness on.
     server_id: str | None = None
     deleted_paths: frozenset[str] = frozenset()
+    # Library scans only (``trusts_server_hash``): Plex's part hash stands in for reading the file when the size matches.
+    trust_server_hash: bool = False
     _dbs: dict[str, LocalPlexDb] = field(default_factory=dict)
     # server id → (why it can't be written, "" when it can; when that was found)
     _ready: dict[str, tuple[str, float]] = field(default_factory=dict)
@@ -214,13 +216,29 @@ def _read_source(path: str) -> SourceFingerprint | None:
         return None
 
 
+# Sources whose jobs list a whole library (started by hand or by a schedule), not files a sender just reported.
+_LIBRARY_SCAN_SOURCES = frozenset({"manual", "schedule"})
+
+
+def trusts_server_hash(cfg: dict) -> bool:
+    """Whether the job may use Plex's part hash without reading the file: a library scan, not a webhook, a picked
+    file list or a retry, where Plex may not have rescanned the file yet. An unknown source reads the file."""
+    return cfg.get("source") in _LIBRARY_SCAN_SOURCES and not cfg.get("file_paths") and not cfg.get("retry_attempt")
+
+
 def _lookup(
-    ctx: LoudnessContext, cfg: ServerConfig, path: str, source: SourceFingerprint | None = None
+    ctx: LoudnessContext,
+    cfg: ServerConfig,
+    path: str,
+    source: SourceFingerprint | None = None,
+    *,
+    trust_server_hash: bool = False,
 ) -> tuple[dict | None, list[AudioStream], list[AudioStream]]:
     """The file's audio streams in the server's Plex and those without loudness yet; or, instead, the server's row when
     there's nothing to analyse there (not in Plex yet, no audio track, the database unreadable just then).
 
-    ``source`` is the file's identity the caller already read; the one re-stat at the end proves it didn't change."""
+    ``source`` is the file's identity the caller already read; the one re-stat at the end proves it didn't change.
+    ``trust_server_hash`` skips reading the file when Plex's recorded size equals its current size."""
     try:
         db, why = ctx.db(cfg)
         if why:
@@ -232,9 +250,12 @@ def _lookup(
             source = source or SourceFingerprint.read(path)
             if any(not s.part_hash or s.part_size is None for s in streams):
                 raise SourceChangedError("Plex has not fully indexed the audio source; retry after its scan")
-            current_hash = calculate_plex_hash(path, fingerprint=source[1:])
+            current_hash = None if trust_server_hash else calculate_plex_hash(path, fingerprint=source[1:])
             source.verify()
-            if any(s.part_hash != current_hash or s.part_size != source.size for s in streams):
+            if any(
+                (current_hash is not None and s.part_hash != current_hash) or s.part_size != source.size
+                for s in streams
+            ):
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
         skipped = ctx.undecodable_keys()
         needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
@@ -303,7 +324,7 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
         return ItemOutcome(NO_OWNERS, "No Plex server has loudness on for its library")
     rows = []
     for cfg in servers:
-        row, streams, todo = _lookup(ctx, cfg, path, source)
+        row, streams, todo = _lookup(ctx, cfg, path, source, trust_server_hash=ctx.trust_server_hash)
         if row is not None:
             rows.append(row)
             if row["status"] == NOT_IN_LIBRARY:
@@ -761,6 +782,7 @@ def _run_loudness_pass(job_id: str) -> bool | None:
                     ffmpeg=loudness_ffmpeg,
                     freeze_check=job_freeze_check(jm, job_id),
                     server_id=server_pin(cfg),
+                    trust_server_hash=trusts_server_hash(cfg),
                     deleted_paths=confirmed_deleted_paths(
                         jm.get_all_jobs(),
                         registry,
