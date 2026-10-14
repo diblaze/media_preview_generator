@@ -43,6 +43,14 @@ REQUEUE_NODE_UNAVAILABLE = "node_unavailable"
 # The node never ran the task (it refused the connection or didn't answer the start): no drop counts against the file.
 REQUEUE_NODE_NOT_STARTED = "node_not_started"
 REQUEUE_NOT_VISIBLE = "not_visible"
+# What the "Started" line logged when a node takes a task calls each op.
+_OP_LABELS = {
+    protocol.OP_PREVIEW_FRAMES: "preview frames",
+    protocol.OP_LOUDNESS_ANALYZE: "loudness analysis",
+    protocol.OP_INTRO_FINGERPRINT: "season audio fingerprint",
+    protocol.OP_INTRO_END_PICTURE: "end-picture frames",
+    protocol.OP_CREDITS_FIND: "credit text",
+}
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,18 @@ def _device_label(registry: NodeRegistry, node_id: str, gpu: tuple[str, str] | N
     return "GPU"
 
 
+def placement_label(gpu: tuple[str, str] | None) -> str:
+    """``<node>/<GPUn|CPU>`` for the current thread's node, as the job log prefixes that node's lines; "" locally.
+
+    Args:
+        gpu: ``(type, device)`` on the node, or None for its CPU.
+    """
+    placement = current_placement()
+    if placement is None:
+        return ""
+    return f"{placement.node_name}/{_device_label(get_registry(), placement.node_id, gpu)}"
+
+
 def _report(what: str, fn: Callable[..., None], *args: str) -> None:
     """Tell the registry about the node; its failure must not hide the file's own error."""
     try:
@@ -254,6 +274,10 @@ class _TaskRun:
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         except NodeError as exc:
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
+        # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
+        logger.info(
+            "{}Started {}: {}", self._prefix, _OP_LABELS.get(spec["op"], spec["op"]), os.path.basename(spec["path"])
+        )
 
     def _drop_unanswered(self, client_task_id: str) -> None:
         try:

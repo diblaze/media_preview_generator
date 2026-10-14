@@ -1265,6 +1265,17 @@ class TestSourceLines:
         assert reading_line(source, on_gpu=on_gpu, device=device) == expected
 
     @pytest.mark.parametrize(
+        ("on_gpu", "node", "expected"),
+        [
+            (True, "lab-gpu/GPU0", "Reading credit text on lab-gpu/GPU0…"),
+            (False, "lab-cpu/CPU", "Reading credit text on lab-cpu/CPU…"),
+        ],
+        ids=["node-gpu", "node-cpu"],
+    )
+    def test_reading_line_on_a_node_names_it_as_its_own_lines_do(self, on_gpu, node, expected):
+        assert reading_line(Source.CREDITS_TEXT, on_gpu=on_gpu, device="Quadro P5000", node=node) == expected
+
+    @pytest.mark.parametrize(
         ("kwargs", "expected"),
         [
             ({"seconds": 13.2}, "Credit text: credits start at 41:48 (13 s)"),

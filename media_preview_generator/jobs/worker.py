@@ -316,6 +316,15 @@ class Worker:
         self._done_event: threading.Event | None = None
 
     @property
+    def log_tag(self) -> str:
+        """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
+        the prefix the node's own lines carry in the job log."""
+        if self.node_id is None:
+            return f"[GPU {self.gpu_index}]:" if self.worker_type == "GPU" else "[CPU]:"
+        device = "CPU" if self.worker_type != "GPU" else f"GPU{'' if self.gpu_index is None else self.gpu_index}"
+        return f"{self.node_name}/{device} ·"
+
+    @property
     def placement(self) -> Placement | None:
         """Where this worker's heavy steps run: its node, or None for this app."""
         if self.node_id is None:
@@ -1897,10 +1906,7 @@ class WorkerPool:
             if not worker.start_logged:
                 worker.start_logged = True
                 display_path = worker.media_file if worker.media_file else worker.media_title
-                if worker.worker_type == "GPU":
-                    logger.info("[GPU {}]: Started processing {}", worker.gpu_index, display_path)
-                else:
-                    logger.info("[CPU]: Started processing {}", display_path)
+                logger.info("{} Started processing {}", worker.log_tag, display_path)
 
             # Mark that FFmpeg has started outputting progress
             worker.ffmpeg_started = True
@@ -1913,18 +1919,13 @@ class WorkerPool:
             current_time = time.time()
             if current_time - worker.last_verbose_log_time >= 5.0:
                 worker.last_verbose_log_time = current_time
-                if worker.worker_type == "GPU":
-                    logger.info(
-                        "[GPU {}]: {} - {}% (speed={})",
-                        worker.gpu_index,
-                        worker.media_title,
-                        round(progress_percent, 1),
-                        worker.speed,
-                    )
-                else:
-                    logger.info(
-                        "[CPU]: {} - {}% (speed={})", worker.media_title, round(progress_percent, 1), worker.speed
-                    )
+                logger.info(
+                    "{} {} - {}% (speed={})",
+                    worker.log_tag,
+                    worker.media_title,
+                    round(progress_percent, 1),
+                    worker.speed,
+                )
 
     def shutdown(self) -> None:
         """Shutdown all workers gracefully."""
