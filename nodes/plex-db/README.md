@@ -42,7 +42,10 @@ written.
 
 The one file it writes outside Plex's folder is `/config/loudness-writes.jsonl` in its own volume: the undo record of
 each loudness write, kept beside the database because undo has to run there (see
-[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the command in this container).
+[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the command in this container). Keep `/config`
+on a volume (the compose file names one, `plex-db-node-config`): the node's loudness check reports not ready while
+`/config` is only the container's own layer, which an update throws away together with the undo record and the
+node's id.
 
 It will not:
 
@@ -72,13 +75,13 @@ chmod 600 .env
 docker compose up -d
 ```
 
-Then paste the address (`http://<this-machine>:9494`) and the same key into the app:
-**Servers → your Plex → Edit → Intro & Credits → Plex marker agent**.
-The helper can be configured there while Intro & Credits remains off. Chapter thumbnails use their own
+Then add it in the app: **Nodes → Add node**, with the address (`http://<this-machine>:9494`) and the same key,
+and choose it for the server in **Servers → your Plex → Edit → Connection → Plex database**.
+The node can be chosen there while Intro & Credits remains off. Chapter thumbnails use their own
 checkbox in the General tab and do not require marker consent or Plex Pass.
 
 Without compose — note `--env-file .env`, so the key comes out of the file you just wrote rather than an empty
-shell variable (an empty `AGENT_TOKEN` makes the agent exit on start and the container restart in a loop):
+shell variable (with an empty `AGENT_TOKEN` the node generates a key of its own, which the app doesn't have):
 
 ```bash
 # --user takes no .env value here; put the uid:gid that owns Plex's database in it yourself.
@@ -95,7 +98,7 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 
 | Setting | What it is |
 |---|---|
-| `AGENT_TOKEN` | The key both sides share. Required — the helper won't start without one. Never logged. (`NODE_KEY` is the node server's name for it; either works.) |
+| `AGENT_TOKEN` | The key both sides share: printable ASCII with no spaces. Never logged. (`NODE_KEY` is the node server's name for it; either works.) Compose requires it; without either, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. |
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
 | `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |

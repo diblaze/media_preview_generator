@@ -103,6 +103,33 @@ def _visible_mounts(mounts: list[_Mount]) -> list[_Mount]:
     return [m for m in mounts if m.mount_id not in covered and reachable(m)]
 
 
+def mount_of(path: str, *, mountinfo_path: str = "/proc/self/mountinfo") -> tuple[str, str | None] | None:
+    """Return ``(mount point, filesystem type)`` of the visible mount holding ``path``, or None.
+
+    Args:
+        path: Absolute path to look up.
+        mountinfo_path: The mountinfo file to read (tests pass their own).
+
+    Returns:
+        The longest visible mount point that contains ``path`` and its type; None when mountinfo can't be read or
+        holds no mount containing it.
+    """
+    try:
+        # surrogateescape: mount points are bytes; a non-UTF-8 name must still match os.fsdecode()'d paths.
+        with open(mountinfo_path, encoding="utf-8", errors="surrogateescape") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    target = os.path.normpath(path)
+    best: tuple[str, str | None] | None = None
+    for mount in _visible_mounts(_parse_mountinfo(lines)):
+        point = mount.mount_point
+        bounded = target == point or target.startswith(point.rstrip("/") + "/")
+        if bounded and (best is None or len(point) >= len(best[0])):
+            best = (point, mount.fs_type)
+    return best
+
+
 def filesystem_type(path: str, *, mountinfo_path: str = "/proc/self/mountinfo") -> str | None:
     """Return the filesystem type of the visible mount holding ``path``, or None.
 
@@ -113,20 +140,8 @@ def filesystem_type(path: str, *, mountinfo_path: str = "/proc/self/mountinfo") 
     Returns:
         The type of the longest visible mount point that contains ``path``; None when mountinfo can't be read.
     """
-    try:
-        # surrogateescape: mount points are bytes; a non-UTF-8 name must still match os.fsdecode()'d paths.
-        with open(mountinfo_path, encoding="utf-8", errors="surrogateescape") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return None
-    target = os.path.normpath(path)
-    best_len, best_fs = -1, None
-    for mount in _visible_mounts(_parse_mountinfo(lines)):
-        point = mount.mount_point
-        bounded = target == point or target.startswith(point.rstrip("/") + "/")
-        if bounded and len(point) >= best_len:
-            best_len, best_fs = len(point), mount.fs_type
-    return best_fs
+    found = mount_of(path, mountinfo_path=mountinfo_path)
+    return found[1] if found else None
 
 
 def is_network_filesystem(fs_type: str | None) -> bool:

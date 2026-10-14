@@ -166,3 +166,54 @@ class TestTheRouteRunsOnlyItsOwnQueries:
                 conn.close()
         else:
             assert response.status_code == 400
+
+
+class TestTheNodeIsBesideThisServersPlex:
+    """The app sends the server's ``machineIdentifier``; a node beside another Plex refuses to count."""
+
+    @staticmethod
+    def _claim(node_folder: Path, machine: str) -> None:
+        (node_folder / "Preferences.xml").write_text(f'<Preferences ProcessedMachineIdentifier="{machine}"/>')
+
+    @pytest.mark.parametrize(
+        ("node_machine", "asked", "status"),
+        [
+            ("plex-a", "plex-a", 200),
+            ("plex-b", "plex-a", 409),
+            ("", "plex-a", 200),
+            ("plex-b", "", 200),
+        ],
+        ids=["same-plex", "another-plex", "node-unknown", "app-unknown"],
+    )
+    def test_the_route_compares_the_identifiers(self, node_folder, tmp_path, node_machine, asked, status):
+        if node_machine:
+            self._claim(node_folder, node_machine)
+        node = node_app(str(node_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        body = {"section_ids": [1], "machine_identifier": asked, "deadline_s": 5}
+        response = node.post("/v1/library-health/rows", json=body, headers=AUTH)
+        assert response.status_code == status
+        if status == 409:
+            error = response.get_json()["error"]
+            assert error["state"] == "misconfigured" and "beside a different Plex" in error["message"]
+            assert "rows" not in (response.get_json().get("result") or {})
+
+    def test_a_machine_identifier_that_isnt_text_is_refused(self, node_folder, tmp_path):
+        node = node_app(str(node_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        body = {"section_ids": [1], "machine_identifier": 7}
+        assert node.post("/v1/library-health/rows", json=body, headers=AUTH).status_code == 400
+
+    @pytest.mark.parametrize(("server_identity", "counted"), [("plex-a", True), ("plex-b", False)])
+    def test_the_app_sends_the_servers_identifier(self, monkeypatch, node_folder, tmp_path, server_identity, counted):
+        self._claim(node_folder, "plex-a")
+        session = _through_node(monkeypatch, node_folder, tmp_path)
+        write_bif(tmp_path / "plex", "aa11")
+        cfg = _cfg(tmp_path, [_lib()], server_identity=server_identity)
+
+        result = _count(cfg)
+
+        assert session.bodies["/v1/library-health/rows"]["machine_identifier"] == server_identity
+        previews = _cell(result, "1", Feature.PREVIEWS)
+        if counted:
+            assert previews.state != CellState.ERROR
+        else:
+            assert previews.state == CellState.ERROR and "beside a different Plex" in previews.reason

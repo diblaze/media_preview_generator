@@ -43,9 +43,9 @@ from loguru import logger
 from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY, read_rows, section_ids_from_json
 from ...loudness import plex_db as loudness_db
 from ...loudness.guard import LoudnessPlexDb
-from ...markers.fs import filesystem_type, is_network_filesystem
+from ...markers.fs import filesystem_type, is_network_filesystem, mount_of
 from ...markers.publishers import plex_remote
-from ...markers.publishers.base import Capability, PublishError
+from ...markers.publishers.base import Capability, CapabilityReport, PublishError
 from ...markers.publishers.plex_chapters import (
     CHAPTER_CAPABILITY,
     LocalChapters,
@@ -53,6 +53,7 @@ from ...markers.publishers.plex_chapters import (
     target_to_json,
 )
 from ...markers.publishers.plex_db import LocalPlexDb, plex_db_path, publish_error_from_sqlite
+from ..protocol import sendable_key
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
 # numbers, so an image left behind on the Plex host is a message, never a wrong write.
@@ -79,6 +80,7 @@ DEFAULT_PORT = 9494
 # machineIdentifier its Plex reports, so a node set up beside the wrong Plex is refused instead of writing another
 # server's database. Read per request: it changes when a server is claimed.
 _MACHINE_ID_RE = re.compile(r'ProcessedMachineIdentifier="([^"]+)"')
+_ON_WINDOWS = os.name == "nt"
 # The folder the last register_plex_db call serves, for info_block() (one node process serves one Plex).
 _registered_config_dir = ""
 
@@ -98,6 +100,29 @@ def machine_identifier(config_dir: str) -> str:
         return ""
     found = _MACHINE_ID_RE.search(text)
     return found.group(1) if found else ""
+
+
+def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
+    """Why the loudness undo record wouldn't survive an update of this node, or "" when it would.
+
+    The record is ``<CONFIG_DIR>/loudness-writes.jsonl`` (``loudness.plex_db.write_log_path``). In a container whose
+    ``CONFIG_DIR`` is no mount of its own, it lives in the container's writable layer and goes with the container on
+    the next update (and so do the node's id and generated key). Windows keeps it under ``%LOCALAPPDATA%``, and a
+    Linux node outside a container keeps it on the machine's own disk; neither needs a volume.
+
+    Args:
+        mountinfo_path: For tests.
+    """
+    if _ON_WINDOWS:
+        return ""
+    folder = os.path.dirname(loudness_db.write_log_path())
+    found = mount_of(os.path.realpath(folder), mountinfo_path=mountinfo_path)
+    if found is None or found[0] != "/" or found[1] != "overlay":
+        return ""
+    return (
+        f"Mount a volume at {folder} on this Plex database node so the loudness undo record survives updates. "
+        "Loudness is not written until then."
+    )
 
 
 def agent_block() -> dict:
@@ -201,17 +226,21 @@ def _loudness_args(operation: str, body: dict) -> dict[str, Any]:
 
 
 def _check_key(key: str) -> bytes:
+    # The node server always hands over a key: NODE_KEY, AGENT_TOKEN, or the one it generated into node.json and
+    # printed once (``identity.load_identity``). Only a caller that builds the role itself can get here without one.
     shared_key = (key or "").strip()
     if not shared_key:
         raise SystemExit(
-            "Set AGENT_TOKEN (or NODE_KEY) to the same shared key you paste into the app; the Plex database role "
-            "won't start without one."
+            "The Plex database role was started without a key. Start it through the node server, which uses NODE_KEY "
+            "(or AGENT_TOKEN) or generates a key and prints it once, then paste that key into the app."
         )
-    # The app refuses to store a key that isn't printable ASCII (``markers/settings.py``), so a key with anything
-    # else in it could never match one the app sends: every request would be refused with a 401 that looks like a
+    # The app refuses to store a key outside printable ASCII without spaces (``nodes.protocol.sendable_key``), so
+    # such a key could never match one the app sends: every request would be refused with a 401 that looks like a
     # typo on the app's side. Said here once, at start, instead.
-    if not shared_key.isascii():
-        raise SystemExit("The shared key must be plain ASCII: the app can't send a key with any other character in it.")
+    if not sendable_key(shared_key):
+        raise SystemExit(
+            "The shared key must be printable ASCII with no spaces: the app can't send a key with any other character."
+        )
     return shared_key.encode("utf-8", "surrogateescape")
 
 
@@ -272,7 +301,7 @@ def register_plex_db(
                     "error": {
                         "kind": "protocol",
                         "message": (
-                            f"This Plex helper is version {AGENT_VERSION} and speaks protocol "
+                            f"This Plex database node is version {AGENT_VERSION} and speaks protocol "
                             f"{', '.join(str(p) for p in PROTOCOLS)}; the app asked for "
                             f"{request.headers.get(plex_remote.PROTOCOL_HEADER, 'none')}."
                         ),
@@ -425,7 +454,11 @@ def register_plex_db(
     def loudness_operation(operation: str) -> Any:
         """Loudness reads and writes, run with the app's own functions (``loudness.plex_db``) on a database proven
         to belong to the Plex whose identity the app sends. Writes compare against the snapshot the app took before
-        analysis, inside the write's transaction, exactly as the in-process writer does.
+        analysis, inside the write's transaction.
+
+        Unlike the in-process writer, the cancel and the source-file check can't run here while the write waits for
+        Plex's lock: the app checks both before each attempt and sends short deadlines, retrying while the database
+        is busy (``loudness.guard.RemoteLoudnessDb``), so a cancel or a changed file stops the write within one wait.
         """
         if operation not in LOUDNESS_OPERATIONS:
             return _bad_request("Unknown loudness operation")
@@ -443,7 +476,11 @@ def register_plex_db(
             if operation == "file_checks":
                 result["report"] = plex_remote.report_to_json(loudness.file_checks(deadline=deadline))
             elif operation == "check":
-                result["report"] = plex_remote.report_to_json(loudness.capability(deadline=deadline))
+                report = loudness.capability(deadline=deadline)
+                problem = undo_record_problem(mountinfo_path=mountinfo_path)
+                if report.state is Capability.READY and problem:
+                    report = CapabilityReport(Capability.MISCONFIGURED, problem)
+                result["report"] = plex_remote.report_to_json(report)
             elif operation == "streams":
                 streams, in_plex = loudness_db.read_streams(loudness, args["plex_paths"], deadline=deadline)
                 result["streams"] = [loudness_db.stream_to_json(s) for s in streams]
@@ -472,8 +509,24 @@ def register_plex_db(
 
     @bp.post("/v1/library-health/rows")
     def library_health_rows() -> Any:
-        """Library Health's fixed queries (``library_health.plex_rows``) for the sections the app names."""
+        """Library Health's fixed queries (``library_health.plex_rows``) for the sections the app names.
+
+        The app sends the ``machine_identifier`` its Plex reports; a node beside a different Plex refuses rather than
+        answer with another server's rows. An identifier either side can't read ("") is allowed, as on every route.
+        """
         body = request.get_json(silent=True) or {}
+        asked = body.get("machine_identifier", "")
+        if not isinstance(asked, str):
+            return _bad_request("machine_identifier must be a string")
+        here = machine_identifier(folder)
+        if asked and here and asked != here:
+            return _refused(
+                PublishError(
+                    "This Plex database node is beside a different Plex than the server the app asked about. Point "
+                    "the server at the node beside its own Plex.",
+                    state=Capability.MISCONFIGURED,
+                )
+            )
         try:
             section_ids = section_ids_from_json(body.get("section_ids"))
             want_markers, want_chapters = body.get("want_markers", False), body.get("want_chapters", False)
@@ -513,4 +566,5 @@ __all__ = [
     "info_block",
     "machine_identifier",
     "register_plex_db",
+    "undo_record_problem",
 ]

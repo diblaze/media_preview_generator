@@ -668,16 +668,20 @@ jobs:
       - name: Boot it and call it
         run: |
           set -euo pipefail
-          # A throwaway key for this one container, generated here and masked out of the log. The agent refuses to
-          # start without one, so booting it at all needs a value; it is never committed and never leaves this job.
+          # A throwaway key for this one container, generated here and masked out of the log. Without one the node
+          # would generate its own; passing it is how the calls below know it. Never committed, never leaves this job.
           token="$(openssl rand -hex 24)"
           echo "::add-mask::$token"
 
+          # A small Plex config folder (the 1.43 schema with one film, and Preferences.xml naming "ci-plex"), so the
+          # loudness and Library Health routes below run the app's own database code inside the image.
           config_dir="$RUNNER_TEMP/plex-config"
-          mkdir -p "$config_dir"
-          trap 'docker logs "$CONTAINER" 2>&1 | tail -40 || true; docker rm -f "$CONTAINER" >/dev/null 2>&1 || true' EXIT
+          python3 scripts/plex_db_node_fixture.py "$config_dir" ci-plex
+          trap 'docker logs "$CONTAINER" 2>&1 | tail -40 || true; docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true' EXIT
 
+          # As the user that owns the database, the way the README runs it beside Plex.
           docker run -d --name "$CONTAINER" \
+            --user "$(id -u):$(id -g)" \
             -e AGENT_TOKEN="$token" \
             -e PLEX_CONFIG_DIR=/plex \
             -v "$config_dir:/plex" \
@@ -708,7 +712,23 @@ jobs:
           curl -fsS http://127.0.0.1:9494/v1/health > health.json
           curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:9494/v1/ping > ping.json
           jq -e '.ok == true and (.agent.version | type == "string")' health.json > /dev/null
-          jq -e '.ok == true and (.result | has("db_present") and has("machine_identifier"))' ping.json > /dev/null
+          jq -e '.ok == true and .result.db_present == true and .result.machine_identifier == "ci-plex"' ping.json \
+            > /dev/null
+
+          # The loudness readiness check and Library Health's queries, on the fixture database. No Plex holds the
+          # database open here, so the loudness report isn't "ready"; that it answers with a report at all proves
+          # loudness's database modules load and run in the image.
+          auth=(-H "Authorization: Bearer $token" -H "X-Marker-Agent-Protocol: 1" -H "Content-Type: application/json")
+          curl -fsS "${auth[@]}" -d '{"machine_identifier": "ci-plex", "pms_version": "1.43.4.10903-ab12cd34", "deadline_s": 5}' \
+            http://127.0.0.1:9494/v1/loudness/check > loudness.json
+          jq -e '.ok == true and .result.capability == "loudness_v1" and (.result.report.state | type == "string")' \
+            loudness.json > /dev/null
+          curl -fsS "${auth[@]}" -d '{"section_ids": [1], "machine_identifier": "ci-plex", "deadline_s": 5}' \
+            http://127.0.0.1:9494/v1/library-health/rows > rows.json
+          jq -e '.ok == true and .result.capability == "library_health_v1" and (.result.rows.parts | length == 1)' \
+            rows.json > /dev/null
+          # The node's own folder is a volume (the image declares one), so the undo record survives a recreate.
+          docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$CONTAINER" | grep -qw /config
 
           # An unauthenticated call is refused and says nothing about this Plex.
           code="$(curl -s -o unauth.json -w '%{http_code}' http://127.0.0.1:9494/v1/ping)"

@@ -106,6 +106,21 @@ class TestKeyPrecedence:
         with pytest.raises(SystemExit, match="ASCII"):
             identity.load_identity(str(tmp_path))
 
+    @pytest.mark.parametrize("bad", ["has space", "trailing\u00a0nbsp"], ids=["space", "nbsp"])
+    def test_a_key_the_app_would_refuse_to_store_refuses_to_start(self, tmp_path, monkeypatch, bad):
+        """The app stores keys of characters 33..126 only (``nodes.settings.normalise_key``); a space passes
+        ``isprintable`` but no key the app sends could ever match it."""
+        monkeypatch.setenv("NODE_KEY", bad)
+
+        with pytest.raises(SystemExit, match="no spaces"):
+            identity.load_identity(str(tmp_path))
+
+    def test_every_character_the_app_accepts_is_accepted(self, tmp_path, monkeypatch):
+        every = "".join(chr(c) for c in range(33, 127))
+        monkeypatch.setenv("NODE_KEY", every)
+
+        assert identity.load_identity(str(tmp_path)).key == every
+
     def test_non_ascii_argument_refused(self, tmp_path):
         with pytest.raises(SystemExit):
             identity.load_identity(str(tmp_path), key="ключ")

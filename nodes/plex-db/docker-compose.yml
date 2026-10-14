@@ -14,8 +14,8 @@
 # rather than starting a node with nothing mounted. PUID/PGID do fall back to 1000:1000 — set them if Plex runs
 # as anyone else, because a node running as the wrong user starts and looks healthy but can write nothing.
 #
-# Then paste the same key, and this machine's address (http://<this-host>:9494), into the app:
-# Servers → your Plex → Edit → Connection → Plex helper.
+# Then add this machine's address (http://<this-host>:9494) and the same key in the app (Nodes → Add node), and choose
+# the node in Servers → your Plex → Edit → Connection → Plex database.
 #
 # Upgrading from the Plex marker agent: the service, container name, image and settings are the same, so replacing
 # the old compose file with this one and running `docker compose up -d` updates it in place.
@@ -39,7 +39,8 @@ services:
       # Plex's config folder on THIS host. Read-write: writing Plex's database is the job. It must be the same local
       # disk Plex itself uses — a copy or a network share is refused, not written.
       - ${PLEX_CONFIG:?set PLEX_CONFIG in .env to Plex's config folder on this host}:/plex
-      # The node's own folder: its id, and the undo record of every loudness write it makes.
+      # The node's own folder: its id, and the undo record of every loudness write it makes. Keep it a volume: the
+      # node's loudness check refuses while /config is only the container's own layer, which an update throws away.
       - plex-db-node-config:/config
     ports:
       # All interfaces by default, because the app that calls this is on another machine — that is the only reason
