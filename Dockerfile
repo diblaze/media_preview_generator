@@ -229,15 +229,15 @@ ENV PUID=1000 \
 # Tell s6-overlay to preserve environment variables
 ENV S6_KEEP_ENV=1
 
-# Expose web UI port
-EXPOSE 8080
+# Web UI port, and the node port for MODE=node
+EXPOSE 8080 9494
 
-# Health check for web UI — respects WEB_PORT env var
+# Health check for the web UI (WEB_PORT), or for a node's /v1/health (NODE_PORT) when MODE=node
 # Uses python3 stdlib instead of curl (one fewer binary dependency).
 # exec replaces the shell so Docker kills the Python process on timeout (no orphans).
 # timeout=5 ensures the process exits if the server is unresponsive.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD exec python3 -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('WEB_PORT', '8080') + '/api/health', timeout=5)"
+    CMD exec python3 -c "import urllib.request, os; node = os.environ.get('MODE') == 'node'; urllib.request.urlopen('http://localhost:' + (os.environ.get('NODE_PORT', '9494') + '/v1/health' if node else os.environ.get('WEB_PORT', '8080') + '/api/health'), timeout=5)"
 
 # Use LinuxServer's /init for PUID/PGID handling
 ENTRYPOINT ["/init", "/app/wrapper.sh"]

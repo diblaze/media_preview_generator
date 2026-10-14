@@ -1,0 +1,57 @@
+# A worker node: another machine lending the app its GPU (or CPU) for previews, loudness and intro/credits steps.
+#
+# It is the app's own image started with MODE=node. It only reads your media and sends results back; the app does
+# every write. Mount the media read-only, at any path you like: the app's Settings -> Nodes page maps its paths to
+# this machine's.
+#
+# Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
+# http://THIS_MACHINE:9494 and the key (NODE_KEY below, or the one the node prints once in `docker logs` on first
+# start when NODE_KEY isn't set).
+
+services:
+  media-preview-node:
+    # Use the same tag as your app: a worker node must run the app's exact version.
+    image: stevezzau/media_preview_generator:latest
+    container_name: media-preview-node
+    restart: unless-stopped
+    ports:
+      - "9494:9494"
+
+    # --- Intel / AMD GPU (VAAPI) ---
+    # Both use /dev/dri passthrough. Verify with: ls -la /dev/dri
+    devices:
+      - /dev/dri:/dev/dri
+
+    # --- NVIDIA GPU ---
+    # Comment out the 'devices' block above and uncomment the deploy block (and the two NVIDIA_* variables).
+    # Requires the NVIDIA Container Toolkit.
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    environment:
+      - MODE=node
+      # The key the app must send. Leave it out to have the node make one (printed once in `docker logs`).
+      - NODE_KEY=change-me-to-a-long-random-key
+      # The name the app shows for this node (default: the container's hostname).
+      - NODE_NAME=gpu-box
+      # - NODE_PORT=9494
+      # --- NVIDIA only ---
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=all
+      # User/group that can read your media (match your host user; Unraid: 99/100)
+      - PUID=1000
+      - PGID=1000
+      # - TZ=America/New_York
+
+    volumes:
+      # Your media, read-only: a node never writes next to your files.
+      - /path/to/your/media:/media:ro
+      # The node's id (and generated key, when NODE_KEY isn't set) and logs.
+      - /path/to/node/config:/config:rw
+      - /etc/localtime:/etc/localtime:ro
