@@ -3291,7 +3291,8 @@ class TestMigrateToV24:
             True,
         )
         assert node["node_uid"] is None and node["path_mappings"] == [] and node["added_at"]
-        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+        # The helper's own url/token stay beside node_id: a build from before nodes still finds its helper.
+        assert _agent_of(settings_manager, 0) == {**self.HELPER, "node_id": node["id"]}
         assert settings_manager.nodes_revision == 1
         assert notes and notes[0].startswith("v24:")
         assert "Nodes page" in _USER_FACING_NOTES[24]
@@ -3306,7 +3307,7 @@ class TestMigrateToV24:
 
         node = settings_manager.get("nodes")[0]
         assert node["enabled"] is False
-        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": node["id"]}
+        assert _agent_of(settings_manager, 0) == {**agent, "node_id": node["id"]}
 
     @pytest.mark.parametrize(
         "agent",
@@ -3320,7 +3321,7 @@ class TestMigrateToV24:
 
         assert _migrate_to_v24(settings_manager) == []
         assert settings_manager.get("nodes") is None
-        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+        assert _agent_of(settings_manager, 0) == {**agent, "node_id": None}
 
     def test_servers_without_a_markers_block_and_other_vendors_are_untouched(self, settings_manager):
         from media_preview_generator.upgrade import _migrate_to_v24
@@ -3348,9 +3349,9 @@ class TestMigrateToV24:
         assert [n["name"] for n in nodes] == ["Plex helper (Home)", "Plex helper (Home) 2"]
         # The shared node is on because one of its servers had it on.
         assert nodes[0]["enabled"] is True
-        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": nodes[0]["id"]}
-        assert _agent_of(settings_manager, 1) == {"enabled": True, "node_id": nodes[0]["id"]}
-        assert _agent_of(settings_manager, 2) == {"enabled": True, "node_id": nodes[1]["id"]}
+        assert _agent_of(settings_manager, 0) == {**servers[0]["markers"]["plex"]["agent"], "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 1) == {**servers[1]["markers"]["plex"]["agent"], "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 2) == {**servers[2]["markers"]["plex"]["agent"], "node_id": nodes[1]["id"]}
 
     def test_a_second_run_changes_nothing(self, settings_manager):
         from media_preview_generator.upgrade import _migrate_to_v24
@@ -3361,6 +3362,49 @@ class TestMigrateToV24:
 
         assert _migrate_to_v24(settings_manager) == []
         assert settings_manager.get_all() == before
+
+    def test_a_re_run_on_a_rolled_back_block_reuses_the_node_at_that_address(self, settings_manager):
+        """A build from before nodes saved the server again (dropping node_id); the next upgrade reuses the node."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+        node_id = settings_manager.get("nodes")[0]["id"]
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert [n["id"] for n in settings_manager.get("nodes")] == [node_id]
+        assert _agent_of(settings_manager, 0)["node_id"] == node_id
+
+    def test_a_long_server_name_is_cut_so_the_node_name_fits(self, settings_manager):
+        from media_preview_generator.nodes.settings import NAME_MAX_LEN, validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        long_name = "A" * 75 + " Plex"
+        servers = [
+            _plex_entry("p1", long_name, self.HELPER),
+            _plex_entry("p2", long_name, {"enabled": True, "url": "http://other:9494", "token": "other-key"}),
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        names = [n["name"] for n in settings_manager.get("nodes")]
+        assert all(len(name) <= NAME_MAX_LEN for name in names)
+        assert names[0].startswith("Plex helper (AAAA") and names[0].endswith("…)")
+        assert names[1].endswith("…) 2") and len({n.casefold() for n in names}) == 2
+        assert validate_nodes(settings_manager.get("nodes"))[1] == ""
+
+    def test_a_migrated_long_name_leaves_the_nodes_list_editable(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "B" * 120, self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.nodes
+        nodes[0]["enabled"] = False
+        settings_manager.update_nodes(nodes)
+        assert settings_manager.nodes[0]["enabled"] is False
 
     def test_the_migrated_settings_pass_node_validation_and_resolve_the_address(self, settings_manager):
         from media_preview_generator.markers.settings import load_server
