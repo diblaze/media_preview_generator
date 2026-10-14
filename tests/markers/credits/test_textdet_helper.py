@@ -275,7 +275,10 @@ class TestGpuVerdicts:
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "cpu"
         warnings = warnings_in(loguru_caplog)
         assert len(warnings) == 1
-        assert "cuda:0" in warnings[0] and "the GPU was finding different boxes than the CPU" in warnings[0]
+        assert "cuda:0" in warnings[0]
+        assert "read on the CPU until the app restarts" in warnings[0]
+        assert "the GPU got 3 of 31 test pictures wrong" in warnings[0]
+        assert "GPU HANG" not in warnings[0]  # a small difference, not a blank one: no driver hint
 
     def test_a_software_adapter_moves_the_device_to_the_cpu_for_good_without_a_warning(
         self, envs, clock, loguru_caplog
@@ -349,7 +352,8 @@ class TestGpuFailures:
         assert env.backends()[-1] == ("cuda:0", "webgpu", not self_tested)
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "webgpu"
         (warning,) = warnings_in(loguru_caplog)
-        assert warning.startswith("Credit text detection on cuda:0: its GPU helper ")
+        assert warning.startswith("Credits on cuda:0: the GPU ")
+        assert "(None)" not in warning and "GPU HANG" in warning
         assert f"the GPU is tried again in {th.GPU_RETRY_BASE_S:g} s" in warning
         assert "back on the GPU after 1 failed request" in " ".join(infos_in(loguru_caplog))
 
@@ -406,7 +410,8 @@ class TestGpuFailures:
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "webgpu"
         warnings = warnings_in(loguru_caplog)
         assert len(warnings) == 2  # the first failure of each streak
-        assert all(w.startswith("Credit text detection on cuda:0: its GPU helper failed") for w in warnings)
+        assert warnings[0].startswith("Credits on cuda:0: the GPU crashed (exit code 9) while reading credits.")
+        assert all(w.startswith("Credits on cuda:0: the GPU ") for w in warnings)
         recoveries = [m for m in infos_in(loguru_caplog) if "back on the GPU" in m]
         assert recoveries == [
             "Credit text detection on cuda:0: back on the GPU after 3 failed requests",
@@ -425,7 +430,9 @@ class TestGpuFailures:
         assert self._detect(env) == ANSWER
         assert env.backends()[-1] == ("cuda:0", "webgpu", False)
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "webgpu"
-        assert any("came up on the CPU" in m and "software renderer" in m for m in warnings_in(loguru_caplog))
+        assert any("couldn't start its GPU session while starting up" in m for m in warnings_in(loguru_caplog))
+        (details,) = _bug_report_details(loguru_caplog)
+        assert "came up on the CPU" in details["error"] and "software renderer" in details["error"]
 
 
 class TestCpuFallbackOnTheWorkerRow:
@@ -434,9 +441,14 @@ class TestCpuFallbackOnTheWorkerRow:
     @pytest.mark.parametrize(
         ("gpu", "modes", "requests", "reason"),
         [
-            ("NVIDIA", {"webgpu": ["crash-on-request", "ok"]}, 1, "its GPU helper failed"),
-            ("NVIDIA", {"webgpu": ["bad-ready", "ok"]}, 2, "its GPU helper couldn't start"),  # then its back-off
-            ("NVIDIA", {"webgpu": "selftest-cpu"}, 2, "other text boxes than the CPU"),  # the verdict, every request
+            (
+                "NVIDIA",
+                {"webgpu": ["crash-on-request", "ok"]},
+                1,
+                "the GPU crashed (exit code 9) while reading credits",
+            ),
+            ("NVIDIA", {"webgpu": ["bad-ready", "ok"]}, 2, "the GPU gave an unreadable answer while starting up"),
+            ("NVIDIA", {"webgpu": "selftest-cpu"}, 2, "failed its accuracy check"),  # the verdict, every request
             ("APPLE", {}, 1, "no WebGPU path"),
         ],
         ids=["request-failed", "start-failed-then-cool-down", "boxes-differ", "no-webgpu-path"],
@@ -448,7 +460,7 @@ class TestCpuFallbackOnTheWorkerRow:
         for _ in range(requests):
             assert env.pool.detect_boxes(PLANES, gpu=gpu, gpu_device_path=device, on_cpu=reported.append) == ANSWER
         assert len(reported) == requests
-        assert all(r.startswith("Credit text detection on the CPU: ") and reason in r for r in reported)
+        assert all(r.startswith("Credits read on the CPU: ") and reason in r for r in reported)
 
     def test_a_request_read_on_the_gpu_or_by_a_cpu_worker_reports_nothing(self, envs):
         env = envs()
@@ -1115,7 +1127,7 @@ def test_the_self_test_compares_the_boxes_at_640x360_too(large_shift, use_gpu):
     assert (result.same_boxes, result.same_boxes_large, result.use_gpu) == (True, not large_shift, use_gpu)
     assert result.gpu_ms == pytest.approx(5.0)  # timed on the 320x180 frames only: what the helper mostly serves
     if not use_gpu:
-        assert result.cpu_reason() == "the GPU was finding different boxes than the CPU at 640x360"
+        assert result.cpu_reason() == "the GPU got 1 of 5 test pictures wrong"
 
 
 def test_the_self_tests_larger_frames_are_the_detectors_larger_reading():
@@ -1322,13 +1334,24 @@ def test_the_logged_ratio_is_the_median_per_round_ratio(gpu_rounds_s, cpu_rounds
 @pytest.mark.parametrize(
     ("result", "reason"),
     [
-        (th.SelfTest(1.0, 10.0, 0.1, False), "the GPU was finding different boxes than the CPU"),
-        (th.SelfTest(20.0, 10.0, 2.0, False, False), "the GPU was finding different boxes than the CPU"),
-        (th.SelfTest(1.0, 10.0, 0.1, True, False), "the GPU was finding different boxes than the CPU at 640x360"),
+        (th.SelfTest(1.0, 10.0, 0.1, False, pictures=31, wrong=3), "the GPU got 3 of 31 test pictures wrong"),
+        (
+            th.SelfTest(20.0, 10.0, 2.0, False, False, pictures=31, wrong=4, blank=1),
+            "the GPU got 4 of 31 test pictures wrong (1 with no text at all)",
+        ),
+        (
+            th.SelfTest(1.0, 10.0, 0.1, True, False, pictures=31, wrong=1, blank=1),
+            "the GPU got 1 of 31 test pictures wrong (it found no text in it)",
+        ),
+        (
+            th.SelfTest(1.0, 10.0, 0.1, False, pictures=31, wrong=2, blank=2),
+            "the GPU got 2 of 31 test pictures wrong (it found no text in both)",
+        ),
+        (th.SelfTest(1.0, 10.0, 0.1, False), "the GPU got the test pictures wrong"),
     ],
-    ids=["different-boxes", "different-at-both-sizes", "different-at-640x360"],
+    ids=["no-blank", "some-blank", "one-blank", "all-blank", "no-counts"],
 )
-def test_the_cpu_reason_says_which_boxes_differed(result, reason):
+def test_the_cpu_reason_counts_the_pictures_the_gpu_got_wrong(result, reason):
     assert result.cpu_reason() == reason
 
 
@@ -1509,6 +1532,10 @@ class TestHelperProcessBackendChoice:
                 "same_boxes": True,
                 "same_boxes_large": True,
                 "same_text": True,
+                "pictures": 31,
+                "wrong": 0,
+                "blank": 0,
+                "examples": (),
             },
             "reason": "",
         }
@@ -1530,6 +1557,10 @@ class TestHelperProcessBackendChoice:
                 "same_boxes": True,
                 "same_boxes_large": True,
                 "same_text": True,
+                "pictures": 31,
+                "wrong": 0,
+                "blank": 0,
+                "examples": (),
             },
             "reason": "",
         }
@@ -1585,7 +1616,7 @@ class TestHelperProcessBackendChoice:
         stub = StubTextDet(clock, gpu_ms=1.0, cpu_ms=10.0, gpu_counts=[99] * th.SELFTEST_FRAMES)
         detector, ready = self._start(stub)
         assert detector.backend == "cpu"
-        assert ready["reason"] == "the GPU was finding different boxes than the CPU"
+        assert ready["reason"] == "the GPU got 28 of 31 test pictures wrong"
         assert ready["selftest"]["same_boxes"] is False
 
     def test_a_gpu_that_finds_the_same_boxes_elsewhere_serves_from_the_cpu(self, clock):
@@ -1595,14 +1626,14 @@ class TestHelperProcessBackendChoice:
         stub = StubTextDet(clock, gpu_ms=1.0, cpu_ms=10.0, gpu_shift=40)
         detector, ready = self._start(stub)
         assert detector.backend == "cpu"
-        assert ready["reason"] == "the GPU was finding different boxes than the CPU"
+        assert ready["reason"] == "the GPU got 19 of 31 test pictures wrong"
         assert ready["selftest"]["same_boxes"] is False
 
     def test_a_gpu_that_finds_other_boxes_at_640x360_serves_from_the_cpu(self, clock):
         stub = StubTextDet(clock, gpu_ms=1.0, cpu_ms=10.0, gpu_large_shift=40)
         detector, ready = self._start(stub)
         assert detector.backend == "cpu"
-        assert ready["reason"] == "the GPU was finding different boxes than the CPU at 640x360"
+        assert ready["reason"] == "the GPU got 7 of 31 test pictures wrong"
         assert (ready["selftest"]["same_boxes"], ready["selftest"]["same_boxes_large"]) == (True, False)
 
     def test_a_self_test_that_fails_part_way_through_serves_from_the_cpu(self, clock):
@@ -1990,7 +2021,8 @@ class TestReadingACard:
         text = env.pool.read_text(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append)
         assert text == [["0 boxes read on cpu"], ["9 boxes read on cpu"]]
         assert len(reasons) == 1
-        assert reasons[0].startswith("Credit text detection on the CPU: its GPU helper failed")
+        assert reasons[0].startswith("Credits read on the CPU: the GPU crashed")
+        assert "(None)" not in reasons[0]
         assert env.pool.backend_of("NVIDIA", "cuda:0") == "cpu"  # waiting out the back-off, as for boxes
 
     def test_a_gpu_that_reads_other_words_than_the_cpu_moves_to_the_cpu_for_good(self, envs):
@@ -2044,7 +2076,7 @@ def test_the_self_test_needs_the_same_words_too():
     cpu = _Reads("NAME 0 cpu.", [1] * 4, 0.002, clock)
     result = th.self_test(gpu, cpu, frames, clock=clock, warmup=1, read_frames=card)
     assert (result.same_boxes, result.same_text, result.use_gpu) == (True, False, False)
-    assert result.cpu_reason() == "the GPU was reading different words than the CPU"
+    assert result.cpu_reason() == "the GPU got 1 of 5 test pictures wrong"
     same = th.self_test(cpu, cpu, frames, clock=clock, warmup=1, read_frames=card)
     assert same.same_text and same.use_gpu
 
@@ -2068,7 +2100,7 @@ def test_a_gpu_whose_reads_differ_serves_from_the_cpu_in_the_helper_process(monk
     engine, ready = th._start_detector(StubTextDet(clock), rec, _helper_args())
     assert engine.backend == "cpu"
     assert ready["backend"] == "cpu" and ready["selftest"]["same_text"] is False
-    assert ready["reason"] == "the GPU was reading different words than the CPU"
+    assert ready["reason"] == "the GPU got 3 of 31 test pictures wrong"
     # Both models on each side: the recognition model's GPU session on the same EP device, a CPU session beside it.
     assert len(rec.webgpu_sessions) == 1 and rec.cpu_sessions == [("/m/rec.onnx", 2)]
 
@@ -2099,3 +2131,210 @@ def test_the_helper_process_serves_a_read_request_with_its_words(monkeypatch):
     out = io.BytesIO()
     assert th._serve(Engine(), out, 5.0) == 0
     assert json.loads(out.getvalue()) == {"id": 7, "text": [["4x6"], ["4x6"]]}
+
+
+class _Blank(FakeDetector):
+    """A detector that finds nothing in the frames at ``blank_at`` and reads nothing there either."""
+
+    def __init__(self, *args, blank_at=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blank_at = blank_at
+
+    def detect(self, frames):
+        found = super().detect(frames)
+        return [() if i in self.blank_at else boxes for i, boxes in enumerate(found)]
+
+
+class TestSelfTestCounts:
+    """How many test pictures the GPU got wrong, and how many of those it found no text in."""
+
+    COUNTS = [1, 2, 3, 4, 5]
+
+    def _run(self, gpu, **kwargs):
+        clock = FakeClock()
+        frames = np.zeros((len(self.COUNTS), 180, 320), np.uint8)
+        cpu = FakeDetector(self.COUNTS, 0.01, clock)
+        gpu.clock = clock
+        return th.self_test(gpu, cpu, frames, clock=clock, warmup=1, **kwargs)
+
+    def test_a_gpu_that_finds_nothing_in_two_pictures_is_a_driver_suspect(self):
+        result = self._run(_Blank(self.COUNTS, 0.01, None, blank_at=(1, 3)))
+        assert (result.pictures, result.wrong, result.blank) == (5, 2, 2)
+        assert result.driver_suspect is True
+        assert result.same_boxes is False and result.use_gpu is False
+        assert "2 of 5" in result.cpu_reason() and "no text" in result.cpu_reason()
+
+    def test_a_gpu_that_shifts_the_boxes_is_not_a_driver_suspect(self):
+        result = self._run(FakeDetector(self.COUNTS, 0.01, None, shift=40))
+        assert (result.pictures, result.wrong, result.blank) == (5, 5, 0)
+        assert result.driver_suspect is False
+        assert result.cpu_reason() == "the GPU got 5 of 5 test pictures wrong"
+
+    def test_a_wrong_picture_counts_once_however_many_rounds_show_it(self):
+        result = self._run(_Blank(self.COUNTS, 0.01, None, blank_at=(0,)))
+        assert (result.wrong, result.blank) == (1, 1)
+        assert result.cpu_reason() == "the GPU got 1 of 5 test pictures wrong (it found no text in it)"
+
+    def test_a_picture_the_gpu_has_no_answer_for_is_wrong_and_blank(self):
+        result = self._run(FakeDetector(self.COUNTS[:3], 0.01, None))
+        assert (result.wrong, result.blank, result.same_boxes) == (2, 2, False)
+
+    def test_a_mix_of_blank_and_shifted_pictures_says_how_many_had_no_text(self):
+        gpu = _Blank(self.COUNTS, 0.01, None, shift=40, blank_at=(4,))
+        result = self._run(gpu)
+        assert (result.wrong, result.blank) == (5, 1)
+        assert result.driver_suspect is False
+        assert result.cpu_reason() == "the GPU got 5 of 5 test pictures wrong (1 with no text at all)"
+
+    def test_the_larger_and_read_pictures_are_counted_after_the_small_ones(self):
+        gpu = _Reads("NAME gpu.", self.COUNTS, 0.01, None, large_shift=40)
+        cpu = _Reads("NAME cpu.", self.COUNTS, 0.01, None)
+        clock = FakeClock()
+        gpu.clock = cpu.clock = clock
+        frames = np.zeros((5, 180, 320), np.uint8)
+        large = np.zeros((2, 360, 640), np.uint8)
+        card = np.zeros((1, 720, 1280), np.uint8)
+        result = th.self_test(gpu, cpu, frames, clock=clock, warmup=1, large_frames=large, read_frames=card)
+        assert (result.same_boxes, result.same_boxes_large, result.same_text) == (True, False, False)
+        assert (result.pictures, result.wrong, result.blank) == (8, 3, 0)
+
+
+def _debugs_in(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+
+
+def _bug_report_details(caplog) -> list[dict]:
+    prefix = "Credit text details for a bug report: "
+    return [
+        json.loads(r.getMessage()[len(prefix) :])
+        for r in caplog.records
+        if r.levelname == "INFO" and r.getMessage().startswith(prefix)
+    ]
+
+
+class TestWhatTheUserSees:
+    """The plain-English reasons, hints and the public read of a device's self-test verdict."""
+
+    def test_a_crashed_gpu_helper_is_reported_in_plain_words_with_the_technical_text_at_debug(
+        self, envs, loguru_caplog
+    ):
+        env = envs(modes={"webgpu": "crash-on-request"})
+        reasons: list[str] = []
+        assert env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append) == ANSWER
+        assert reasons == [
+            "Credits read on the CPU: the GPU crashed (exit code 9) while reading credits. It's tried again shortly."
+        ]
+        (warning,) = warnings_in(loguru_caplog)
+        assert "(None)" not in warning and "exited" not in warning
+        assert 'check the host\'s kernel log for "GPU HANG"' in warning
+        assert "the GPU is tried again in 5 s" in warning
+        # What a bug report needs is at INFO, so it is in the log a user attaches without debug logging.
+        (details,) = _bug_report_details(loguru_caplog)
+        assert details["device"] == "cuda:0"
+        assert details["failed"] == "crashed (exit code 9) while reading credits"
+        assert details["error"].startswith("the helper exited (9)")
+        assert {"vulkan", "kernel", "onnxruntime", "webgpu_ep"} <= details.keys()
+
+    def test_only_the_first_failure_in_a_row_logs_the_details_the_rest_go_to_debug(self, envs, clock, loguru_caplog):
+        env = envs(modes={"webgpu": "crash-on-request"})
+        env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0")
+        clock.advance(th.GPU_RETRY_BASE_S + 1)
+        env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0")
+        assert len(_bug_report_details(loguru_caplog)) == 1
+        assert "Credit text GPU error on cuda:0: the helper exited (9)" in _debugs_in(loguru_caplog)
+
+    def test_a_helper_killed_by_a_signal_names_the_signal(self):
+        assert th._exit_plain(-9) == "crashed (killed by SIGKILL)"
+        assert th._exit_plain(-999) == "crashed (killed by 999)"
+        assert th._exit_plain(3) == "crashed (exit code 3)"
+        assert th._exit_plain(0) == "exited"
+        assert th._exit_plain(None) == "stopped answering"
+
+    def test_a_helper_that_ends_its_output_just_before_it_is_reaped_still_gets_its_exit_code(self, tmp_path):
+        # The race behind #403's "(None)": the output ends while poll() still says the process runs.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(9)"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        proc.poll = lambda: None
+        with open(tmp_path / "stderr", "w+b") as stderr:
+            helper = th._Helper(proc, stderr, 5.0)
+            with pytest.raises(th.HelperError) as caught:
+                helper.read_message(5.0)
+        assert caught.value.plain == "crashed (exit code 9)"
+        assert str(caught.value).startswith("the helper exited (9)")
+        assert caught.value.waited_for_exit
+
+    def test_a_helper_that_exited_between_requests_is_named_plainly(self, envs):
+        env = envs(modes={"webgpu": ["crash-after-reply", "ok"]})
+        reasons: list[str] = []
+        assert env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append) == ANSWER
+        assert env.procs[0].wait(timeout=10) is not None
+        assert env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append) == ANSWER
+        assert len(reasons) == 1 and "the GPU crashed (exit code" in reasons[0], reasons
+
+    def test_a_helper_that_cant_be_spawned_gets_no_driver_hint(self, loguru_caplog):
+        pool = th.TextDetectorPool(cpu_limit=lambda: 1)
+        pool._gpu_failed("cuda:0", th.HelperStartError("couldn't start: [Errno 2] no python", plain=th.NOT_SPAWNED))
+        (warning,) = warnings_in(loguru_caplog)
+        assert "couldn't be started while starting up" in warning and "GPU HANG" not in warning
+        pool._gpu_failed("cuda:1", th.HelperError("the helper exited (-6)", plain="crashed (killed by SIGABRT)"))
+        assert 'kernel log for "GPU HANG"' in warnings_in(loguru_caplog)[-1]
+
+    def test_secrets_in_a_helpers_error_are_masked_in_the_bug_report_line(self, loguru_caplog):
+        pool = th.TextDetectorPool(cpu_limit=lambda: 1, vulkan_info=lambda: None)
+        pool._gpu_failed("cuda:0", th.HelperError("the helper exited (1): X-Plex-Token=abcdef123456", plain="x"))
+        (details,) = _bug_report_details(loguru_caplog)
+        assert "abcdef123456" not in details["error"]
+
+    def test_a_gpu_that_returns_nothing_where_the_cpu_found_text_points_to_the_driver(self, envs, loguru_caplog):
+        env = envs(modes={"webgpu": "selftest-blank"})
+        reasons: list[str] = []
+        assert env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append) == ANSWER
+        assert reasons == ["Credits read on the CPU: this GPU failed its accuracy check. Previews still use the GPU."]
+        (warning,) = warnings_in(loguru_caplog)
+        assert "read on the CPU until the app restarts" in warning
+        assert "the GPU got 2 of 31 test pictures wrong (it found no text in both)" in warning
+        assert 'for "GPU HANG"' in warning and "Previews still use the GPU." in warning
+        (details,) = _bug_report_details(loguru_caplog)
+        assert details["device"] == "cuda:0" and details["selftest"]["wrong"] == 2
+        assert details["selftest"]["examples"]
+        assert env.pool.credits_on_cpu() == [
+            {
+                "key": "cuda:0",
+                "reason": "the GPU got 2 of 31 test pictures wrong (it found no text in both)",
+                "driver_suspect": True,
+                "selftest": {
+                    "gpu_ms": 9.0,
+                    "cpu_ms": 18.0,
+                    "ratio": 0.5,
+                    "same_boxes": False,
+                    "pictures": 31,
+                    "wrong": 2,
+                    "blank": 2,
+                    "examples": [{"size": "320x180", "frame": 0, "gpu": "()", "cpu": "((40, 30, 120, 44),)"}],
+                },
+            }
+        ]
+
+    def test_a_gpu_that_finds_other_boxes_gets_the_wrong_place_hint_not_the_driver_one(self, envs, loguru_caplog):
+        env = envs(modes={"webgpu": "selftest-cpu"})
+        env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0")
+        (warning,) = warnings_in(loguru_caplog)
+        assert "GPU HANG" not in warning
+        assert "could put credits markers in the wrong place" in warning
+        (device,) = env.pool.credits_on_cpu()
+        assert (device["key"], device["driver_suspect"]) == ("cuda:0", False)
+
+    def test_only_a_self_test_verdict_is_listed(self, envs):
+        env = envs(modes={"webgpu": "software-adapter"})
+        env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0")
+        env.pool.detect_boxes(PLANES, gpu="APPLE", gpu_device_path="videotoolbox")
+        assert env.pool.backend_of("NVIDIA", "cuda:0") == "cpu"
+        assert env.pool.credits_on_cpu() == []
+
+    def test_the_module_function_reads_the_pool_without_creating_one(self, monkeypatch):
+        monkeypatch.setattr(th, "_pool", None)
+        assert th.credits_on_cpu_devices() == []
+        assert th._pool is None
+        monkeypatch.setattr(th, "_pool", SimpleNamespace(credits_on_cpu=lambda: [{"key": "cuda:0"}]))
+        assert th.credits_on_cpu_devices() == [{"key": "cuda:0"}]

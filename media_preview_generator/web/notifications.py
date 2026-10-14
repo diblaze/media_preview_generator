@@ -14,6 +14,8 @@ Current sources:
   explicit TZ env var, sourced from ``api_system._get_timezone_info``.
 - ``gpu_keeps_failing_<device>`` — one per GPU whose last files all ran on
   the CPU, sourced from ``jobs.gpu_fallback``.
+- ``credits_on_cpu_<device>`` — one per GPU whose credit text self-test failed, so its credits are read on the CPU,
+  sourced from ``markers.credits.textdet_helper``.
 - ``library_health_not_showing`` / ``library_health_check_failed`` — from the
   last Library health check (stored results; nothing is re-counted here).
 
@@ -24,6 +26,7 @@ cleared on restart); permanent dismissals live in ``settings.json``.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from typing import Any
 
@@ -39,6 +42,8 @@ MEDIA_MOUNT_UNHEALTHY_ID = "media_mount_unhealthy"
 LIBRARY_HEALTH_NOT_SHOWING_ID = "library_health_not_showing"
 LIBRARY_HEALTH_CHECK_FAILED_ID = "library_health_check_failed"
 
+CREDITS_ON_CPU_ID_PREFIX = "credits_on_cpu_"
+
 # Cards that can be hidden until the next restart but never for good: the problem they report comes and goes, and a
 # permanent dismissal would hide the next occurrence too. An id stored by an older version is ignored.
 SESSION_ONLY_DISMISSAL_IDS = frozenset({MEDIA_MOUNT_UNHEALTHY_ID, LIBRARY_HEALTH_CHECK_FAILED_ID})
@@ -46,7 +51,11 @@ SESSION_ONLY_DISMISSAL_IDS = frozenset({MEDIA_MOUNT_UNHEALTHY_ID, LIBRARY_HEALTH
 
 def is_session_only_dismissal(notification_id_value: str) -> bool:
     """Whether a card can only be hidden until the next restart (the GPU cards are per device, so not a fixed id)."""
-    return notification_id_value in SESSION_ONLY_DISMISSAL_IDS or is_gpu_notification_id(notification_id_value)
+    return (
+        notification_id_value in SESSION_ONLY_DISMISSAL_IDS
+        or is_gpu_notification_id(notification_id_value)
+        or notification_id_value.startswith(CREDITS_ON_CPU_ID_PREFIX)
+    )
 
 
 # Image names recognised by the deprecation banner. The deprecated image was
@@ -307,6 +316,60 @@ def _build_unhealthy_media_mounts_notification() -> dict[str, Any] | None:
     }
 
 
+def _credits_on_cpu_devices() -> list[dict[str, Any]]:
+    try:
+        from ..markers.credits.textdet_helper import credits_on_cpu_devices
+
+        return credits_on_cpu_devices()
+    except Exception as exc:  # noqa: BLE001 - a card source must never break the bell
+        logger.debug("Couldn't read the credits-on-CPU devices for notifications: {}", exc)
+        return []
+
+
+def _credits_on_cpu_notification_id(key: str) -> str:
+    return CREDITS_ON_CPU_ID_PREFIX + re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+
+
+def _build_credits_on_cpu_notifications() -> list[dict[str, Any]]:
+    """One warning card per GPU whose credit text self-test failed, so its credits are read on the CPU until restart."""
+    from markupsafe import escape
+
+    devices = _credits_on_cpu_devices()
+    if not devices:
+        return []
+    names = {state.key: state.name for state in get_gpu_fallback_tracker().states()}
+    cards = []
+    for device in devices:
+        key = device["key"]
+        name = names.get(key) or key
+        driver_suspect = bool(device.get("driver_suspect"))
+        body = (
+            f"<p class='{'mb-1' if driver_suspect else 'mb-0'}'>In its accuracy check, {escape(device['reason'])}. "
+            "A GPU that reads text wrong could put credits markers in the wrong place, so credits on this GPU are "
+            "read on the CPU until the app restarts. That's slower, but the markers are just as accurate. "
+            "Previews still use the GPU.</p>"
+        )
+        if driver_suspect:
+            body += (
+                "<p class='mb-0 small text-muted'>This usually points to a GPU driver problem. Check the host's "
+                'kernel log for GPU hangs (<code>dmesg | grep -iE "i915|amdgpu|GPU HANG"</code>), then restart '
+                "the app.</p>"
+            )
+        cards.append(
+            {
+                "id": _credits_on_cpu_notification_id(key),
+                "severity": "warning",
+                "title": f"Credits are being read on the CPU on {name}",
+                "body_html": body,
+                "dismissable": True,
+                "permanent_dismissable": False,
+                "source": "credits_text_selftest",
+                "device": key,
+            }
+        )
+    return cards
+
+
 def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     """One warning card per GPU whose last ``GPU_FALLBACK_STREAK`` files all needed the CPU fallback.
 
@@ -315,8 +378,15 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     """
     from markupsafe import escape
 
+    from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
+
     cards = []
+    credits_keys = {device["key"] for device in _credits_on_cpu_devices()}
     for state in get_gpu_fallback_tracker().flagged():
+        # The credits card already explains a streak of credits fallbacks, and "check the GPU driver" is wrong for
+        # them; a streak whose last file fell back for another reason (a preview decode) still gets this card.
+        if state.key in credits_keys and (state.last_reason or "").startswith(CREDITS_ON_CPU_PREFIX):
+            continue
         body = (
             f"<p class='mb-0'>{escape(state.name)} couldn't process the last {GPU_FALLBACK_STREAK} files, so they "
             f"ran on the CPU (slower). Last reason: {escape(state.last_reason or 'GPU processing failed')}. "
@@ -432,6 +502,7 @@ def _notification_sources() -> list[dict[str, Any] | None]:
         _build_unhealthy_media_mounts_notification(),
         _build_library_health_not_showing_notification(),
         _build_library_health_check_failed_notification(),
+        *_build_credits_on_cpu_notifications(),
         *_build_gpu_keeps_failing_notifications(),
     ]
 

@@ -111,3 +111,89 @@ class TestGpuKeepsFailingNotification:
         assert is_session_only_dismissal(notification_id(KEY)) is True
         assert is_session_only_dismissal(notif_mod.MEDIA_MOUNT_UNHEALTHY_ID) is True
         assert is_session_only_dismissal(notif_mod.VULKAN_SOFTWARE_FALLBACK_ID) is False
+
+
+CREDITS_DEVICE = {
+    "key": KEY,
+    "reason": "the GPU got 2 of 31 test pictures wrong (it found no text in both)",
+    "driver_suspect": True,
+    "selftest": {},
+}
+
+
+@pytest.fixture
+def credits_devices(monkeypatch):
+    from media_preview_generator.markers.credits import textdet_helper
+
+    devices: list[dict] = []
+    monkeypatch.setattr(textdet_helper, "credits_on_cpu_devices", lambda: list(devices))
+    return devices
+
+
+class TestCreditsOnCpuNotification:
+    def test_absent_while_no_device_failed_its_self_test(self, credits_devices):
+        assert notif_mod._build_credits_on_cpu_notifications() == []
+
+    def test_a_driver_suspect_card_has_the_hint_and_the_gpus_friendly_name(self, credits_devices):
+        get_gpu_fallback_tracker().record(KEY, "Intel UHD Graphics 770", fell_back=False, reason=None)
+        credits_devices.append(CREDITS_DEVICE)
+        (card,) = notif_mod._build_credits_on_cpu_notifications()
+        assert card == {
+            "id": "credits_on_cpu__dev_dri_renderD128",
+            "severity": "warning",
+            "title": "Credits are being read on the CPU on Intel UHD Graphics 770",
+            "body_html": (
+                "<p class='mb-1'>In its accuracy check, the GPU got 2 of 31 test pictures wrong (it found no text in "
+                "both). A GPU that reads text wrong could put credits markers in the wrong place, so credits on "
+                "this GPU are read on the CPU until the app restarts. That's slower, but the markers are just as "
+                "accurate. Previews still use the GPU.</p>"
+                "<p class='mb-0 small text-muted'>This usually points to a GPU driver problem. Check the host's "
+                'kernel log for GPU hangs (<code>dmesg | grep -iE "i915|amdgpu|GPU HANG"</code>), then restart the '
+                "app.</p>"
+            ),
+            "dismissable": True,
+            "permanent_dismissable": False,
+            "source": "credits_text_selftest",
+            "device": KEY,
+        }
+
+    def test_without_a_driver_suspicion_there_is_no_hint_and_the_key_names_the_gpu(self, credits_devices):
+        credits_devices.append({**CREDITS_DEVICE, "driver_suspect": False, "reason": "the GPU got 3 of 31 <wrong>"})
+        (card,) = notif_mod._build_credits_on_cpu_notifications()
+        assert card["title"] == f"Credits are being read on the CPU on {KEY}"
+        assert card["body_html"].startswith("<p class='mb-0'>In its accuracy check, the GPU got 3 of 31 &lt;wrong&gt;.")
+        assert "driver problem" not in card["body_html"]
+
+    def test_the_card_is_in_the_active_list_and_hidden_only_for_the_session(self, credits_devices):
+        credits_devices.append(CREDITS_DEVICE)
+        card_id = notif_mod._build_credits_on_cpu_notifications()[0]["id"]
+        assert is_session_only_dismissal(card_id)
+        assert card_id in [n["id"] for n in build_active_notifications()]
+        # A stored permanent dismissal is ignored, as for the GPU streak card.
+        assert card_id in [n["id"] for n in build_active_notifications(dismissed_permanent=[card_id])]
+        dismiss_session(card_id)
+        assert card_id not in [n["id"] for n in build_active_notifications()]
+
+    def test_the_streak_card_for_the_same_gpu_is_suppressed_but_another_gpu_still_shows(self, credits_devices):
+        credits_devices.append(CREDITS_DEVICE)
+        credits = "Credits read on the CPU: this GPU failed its accuracy check. Previews still use the GPU."
+        _flag(KEY, "GPU A", reason=credits)
+        _flag("/dev/dri/renderD129", "GPU B", reason=credits)
+        assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == ["/dev/dri/renderD129"]
+
+    def test_a_preview_streak_on_the_same_gpu_still_shows_its_card(self, credits_devices):
+        # The credits card says previews still use the GPU; a streak last fed by a preview decode failing says
+        # otherwise, so its own card must not be hidden.
+        credits_devices.append(CREDITS_DEVICE)
+        _flag(KEY, "GPU A", reason="Credits read on the CPU: this GPU failed its accuracy check.", n=4)
+        _flag(KEY, "GPU A", reason="hevc not supported", n=1)
+        assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == [KEY]
+
+    def test_a_failing_read_gives_no_cards(self, monkeypatch):
+        from media_preview_generator.markers.credits import textdet_helper
+
+        def boom():
+            raise RuntimeError("no pool")
+
+        monkeypatch.setattr(textdet_helper, "credits_on_cpu_devices", boom)
+        assert notif_mod._build_credits_on_cpu_notifications() == []

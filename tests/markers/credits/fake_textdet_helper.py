@@ -5,7 +5,8 @@ frame, ``"<n> boxes read on <backend>"``.
     python fake_textdet_helper.py --backend cpu|webgpu --mode MODE [--idle-exit-s S] [--no-selftest]
 
 Modes: ok, slow (each answer takes 0.5 s), held (each answer waits until the file $FAKE_RELEASE_FILE exists),
-selftest-cpu (the self-test found other boxes than the CPU),
+selftest-cpu (the self-test found other boxes than the CPU, 3 of 31 pictures wrong), selftest-blank (the same,
+but the GPU found no text in the 2 pictures it got wrong),
 software-adapter (WebGPU would run on llvmpipe), session-failed (the WebGPU session failed: not a verdict on the GPU),
 crash-on-request, crash-after-reply, idle-exit-on-request, idle-exit-slow-shutdown
 (closes its pipes on a request, then takes 0.5 s to exit 75, so the answer stream ends before poll() has a code),
@@ -24,6 +25,18 @@ import sys
 import time
 
 import numpy as np
+
+SELFTEST_COUNTS = {
+    "ok": {"same_boxes": True, "pictures": 31, "wrong": 0, "blank": 0},
+    "selftest-cpu": {"same_boxes": False, "pictures": 31, "wrong": 3, "blank": 0},
+    "selftest-blank": {
+        "same_boxes": False,
+        "pictures": 31,
+        "wrong": 2,
+        "blank": 2,
+        "examples": [{"size": "320x180", "frame": 0, "gpu": "()", "cpu": "((40, 30, 120, 44),)"}],
+    },
+}
 
 
 def boxes_for_plane(plane):
@@ -55,17 +68,18 @@ def main() -> int:
         out.flush()
         time.sleep(3600)
     webgpu = args.backend == "webgpu"
-    on_cpu = webgpu and args.mode in ("selftest-cpu", "software-adapter", "session-failed")
+    on_cpu = webgpu and args.mode in ("selftest-cpu", "selftest-blank", "software-adapter", "session-failed")
     backend = "cpu" if on_cpu else args.backend
     selftest = (
         None
         if (not webgpu or args.no_selftest or args.mode in ("software-adapter", "session-failed"))
-        else {"gpu_ms": 9.0, "cpu_ms": 18.0, "ratio": 0.5, "same_boxes": args.mode != "selftest-cpu"}
+        else {"gpu_ms": 9.0, "cpu_ms": 18.0, "ratio": 0.5, **SELFTEST_COUNTS.get(args.mode, SELFTEST_COUNTS["ok"])}
     )
     ready = {"ready": True, "backend": backend, "selftest": selftest, "reason": ""}
     if on_cpu:
         ready["reason"] = {
-            "selftest-cpu": "the GPU was finding different boxes than the CPU",
+            "selftest-cpu": "the GPU got 3 of 31 test pictures wrong",
+            "selftest-blank": "the GPU got 2 of 31 test pictures wrong (it found no text in both)",
             "software-adapter": "WebGPU would run on llvmpipe (LLVM 19.1.1, 256 bits), a software renderer, "
             "not on this GPU",
             "session-failed": "the WebGPU session failed: RuntimeError: the device was lost",

@@ -30,10 +30,12 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import importlib.metadata
 import importlib.util
 import json
 import math
 import os
+import platform
 import queue
 import select
 import signal
@@ -51,6 +53,7 @@ from typing import Any, BinaryIO
 import numpy as np
 from loguru import logger
 
+from ...utils import redact_secrets
 from ..locks import KeyedLocks
 from .cards import READ_SCALE
 from .devices import choose_ep_device, pin_env_to_gpu, worker_pci_bus_id
@@ -62,6 +65,7 @@ DEFAULT_MODEL_PATH = "/app/models/ch_PP-OCRv4_det_infer.onnx"
 REC_MODEL_ENV = "MEDIA_PREVIEW_TEXTREC_MODEL"
 DEFAULT_REC_MODEL_PATH = "/app/models/latin_PP-OCRv5_rec_mobile.onnx"
 CPU_KEY = "cpu"
+CREDITS_ON_CPU_PREFIX = "Credits read on the CPU"
 # ONNX Runtime threads per helper. Each CPU worker's request gets a helper of its own, so a small number keeps the
 # total in line with the worker count the user chose.
 THREADS = 2
@@ -76,6 +80,8 @@ SELFTEST_READ_FRAMES = 3
 # GPU/CPU pairs, each run back to back. Every round's boxes must match, so a backend whose answers vary from run to
 # run fails; the median of the rounds' own GPU/CPU time ratios goes in the log as information and decides nothing.
 SELFTEST_ROUNDS = 7
+# Wrong frames the self-test keeps, each side's answer, for the bug-report details line.
+SELFTEST_EXAMPLES = 3
 # After a GPU helper fails, the requests of the next GPU_RETRY_BASE_S are read on the CPU before the GPU is tried
 # again, the wait doubling with each failure in a row up to GPU_RETRY_MAX_S; a success resets it. Every failure costs
 # the request that tries the GPU: a failing start seconds of driver setup (up to START_TIMEOUT_S when it hangs), a
@@ -96,6 +102,8 @@ CHECK_RETRY_S = 600.0
 CLOSE_GRACE_S = 5.0
 KILL_WAIT_S = 5.0
 EXIT_CODE_WAIT_S = 2.0
+# How much of a failed helper's stderr goes into its error (the debug log and the bug-report details line).
+STDERR_TAIL_BYTES = 1000
 # After a stuck write is killed, how long the writer thread may take to unwind its EPIPE before close() gives up
 # on it and hands the process to the reaper.
 WRITER_UNWIND_S = 1.0
@@ -123,7 +131,24 @@ class TextDetState(str, Enum):
 
 
 class HelperError(Exception):
-    """A helper process didn't start, answer or read a request."""
+    """A helper process didn't start, answer or read a request.
+
+    ``str(exc)`` is the technical message (for the debug log); ``plain`` finishes the sentence "the GPU ..." for people.
+    """
+
+    def __init__(self, message: str, *, plain: str | None = None, waited_for_exit: bool = False) -> None:
+        """Keep the technical message and, when there is one, its plain-English form.
+
+        Args:
+            message: What went wrong, with the details a developer wants.
+            plain: The same in a few plain words that follow "the GPU", or None when there is nothing better than
+                "failed".
+            waited_for_exit: The raiser already waited ``EXIT_CODE_WAIT_S`` for the helper to exit, so the caller
+                needn't wait again (it holds the device's lock meanwhile).
+        """
+        super().__init__(message)
+        self.plain = plain
+        self.waited_for_exit = waited_for_exit
 
 
 class HelperStartError(HelperError):
@@ -233,6 +258,10 @@ class SelfTest:
         same_boxes: Every frame's boxes matched, corner for corner, in every round.
         same_boxes_large: Every larger frame's boxes matched too (``SELFTEST_LARGE_SCALE``), or none were compared.
         same_text: Every card-sized frame read the same words (``SELFTEST_READ_FRAMES``), or none were compared.
+        pictures: How many frames were compared (small, larger and card-sized).
+        wrong: How many of them the GPU answered differently from the CPU, in at least one round.
+        blank: Of the wrong ones, how many the GPU found nothing in while the CPU found text.
+        examples: The first few wrong frames, each side's answer as short text, for a bug report.
     """
 
     gpu_ms: float
@@ -241,6 +270,10 @@ class SelfTest:
     same_boxes: bool
     same_boxes_large: bool = True
     same_text: bool = True
+    pictures: int = 0
+    wrong: int = 0
+    blank: int = 0
+    examples: tuple[dict[str, Any], ...] = ()
 
     @property
     def use_gpu(self) -> bool:
@@ -249,13 +282,59 @@ class SelfTest:
         which one read it."""
         return self.same_boxes and self.same_boxes_large and self.same_text
 
+    @property
+    def driver_suspect(self) -> bool:
+        """Every wrong frame was empty on the GPU while the CPU found text: that points to a driver problem or a hang,
+        not to a small numeric difference."""
+        return _driver_suspect(asdict(self))
+
     def cpu_reason(self) -> str:
-        """Why this result keeps the CPU (for the helper's ready line and the log)."""
-        if not self.same_boxes:
-            return "the GPU was finding different boxes than the CPU"
-        if not self.same_boxes_large:
-            return "the GPU was finding different boxes than the CPU at 640x360"
-        return "the GPU was reading different words than the CPU"
+        """Why this result keeps the CPU, in plain words (for the helper's ready line and the log)."""
+        if self.wrong == 0:
+            return "the GPU got the test pictures wrong"
+        wrong_of = f"the GPU got {self.wrong} of {self.pictures} test pictures wrong"
+        if self.blank == self.wrong:
+            return f"{wrong_of} (it found no text in {_all_of(self.wrong)})"
+        if self.blank:
+            return f"{wrong_of} ({self.blank} with no text at all)"
+        return wrong_of
+
+
+def _all_of(count: int) -> str:
+    return {1: "it", 2: "both"}.get(count, f"all {count}")
+
+
+def _driver_suspect(selftest: dict[str, Any] | None) -> bool:
+    """Whether a self-test's counts (``asdict(SelfTest)``) show the GPU answering nothing where the CPU found text."""
+    if not selftest:
+        return False
+    wrong = selftest.get("wrong") or 0
+    return wrong > 0 and selftest.get("blank") == wrong
+
+
+def _compare_frames(
+    gpu_frames: Any, cpu_frames: Any, *, size: str = "", examples: list[dict[str, Any]] | None = None
+) -> tuple[set[int], set[int]]:
+    """The indexes of the frames whose answers differ, and of those the GPU left empty where the CPU found something.
+
+    A frame one side has no answer for counts as empty on that side. Wrong frames not yet in ``examples`` are added to
+    it, up to ``SELFTEST_EXAMPLES``, labelled with ``size``.
+    """
+    gpu_frames, cpu_frames = list(gpu_frames), list(cpu_frames)
+    wrong: set[int] = set()
+    blank: set[int] = set()
+    for index in range(max(len(gpu_frames), len(cpu_frames))):
+        gpu_frame = gpu_frames[index] if index < len(gpu_frames) else ()
+        cpu_frame = cpu_frames[index] if index < len(cpu_frames) else ()
+        if index >= min(len(gpu_frames), len(cpu_frames)) or gpu_frame != cpu_frame:
+            wrong.add(index)
+            if not any(gpu_frame) and any(cpu_frame):
+                blank.add(index)
+            noted = examples is not None and any(e["size"] == size and e["frame"] == index for e in examples)
+            if examples is not None and not noted and len(examples) < SELFTEST_EXAMPLES:
+                examples.append({"size": size, "frame": index, "gpu": str(gpu_frame)[:160],
+                                 "cpu": str(cpu_frame)[:160]})  # fmt: skip
+    return wrong, blank
 
 
 def self_test(
@@ -308,23 +387,46 @@ def self_test(
 
     gpu_times: list[float] = []
     cpu_times: list[float] = []
-    same_boxes = True
+    wrong_small: set[int] = set()
+    blank_small: set[int] = set()
+    examples: list[dict[str, Any]] = []
     for _ in range(rounds):
         gpu_boxes, gpu_ms = timed(gpu)
         cpu_boxes, cpu_ms = timed(cpu)
         gpu_times.append(gpu_ms)
         cpu_times.append(cpu_ms)
-        same_boxes = same_boxes and list(gpu_boxes) == list(cpu_boxes)
+        wrong, blank = _compare_frames(gpu_boxes, cpu_boxes, size="320x180", examples=examples)
+        wrong_small |= wrong
+        blank_small |= blank
     ratios = [g / c if c > 0 else math.inf for g, c in zip(gpu_times, cpu_times, strict=True)]
-    same_large = large_frames is None or list(gpu.detect(large_frames)) == list(cpu.detect(large_frames))
-    same_text = read_frames is None or list(gpu.read(read_frames)) == list(cpu.read(read_frames))
+    wrong_large: set[int] = set()
+    blank_large: set[int] = set()
+    if large_frames is not None:
+        wrong_large, blank_large = _compare_frames(
+            gpu.detect(large_frames), cpu.detect(large_frames), size="640x360", examples=examples
+        )
+    wrong_read: set[int] = set()
+    blank_read: set[int] = set()
+    if read_frames is not None:
+        wrong_read, blank_read = _compare_frames(
+            gpu.read(read_frames), cpu.read(read_frames), size="card words", examples=examples
+        )
+    compared = (
+        len(frames)
+        + len(large_frames if large_frames is not None else ())
+        + len(read_frames if read_frames is not None else ())
+    )
     return SelfTest(
         round(median(gpu_times), 2),
         round(median(cpu_times), 2),
         round(median(ratios), 4),
-        same_boxes,
-        same_large,
-        same_text,
+        not wrong_small,
+        not wrong_large,
+        not wrong_read,
+        compared,
+        len(wrong_small) + len(wrong_large) + len(wrong_read),
+        len(blank_small) + len(blank_large) + len(blank_read),
+        tuple(examples),
     )
 
 
@@ -348,13 +450,33 @@ class HelperSpec:
     env: dict[str, str]
 
 
+UNREADABLE = "gave an unreadable answer"
+NOT_SPAWNED = "couldn't be started"
+STOPPED_READING = "stopped reading requests"
+
+
+def _exit_plain(code: int | None) -> str:
+    """A helper's exit code as the words that follow "the GPU" (negative: killed by that signal)."""
+    if code is None:
+        return "stopped answering"
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = str(-code)
+        return f"crashed (killed by {name})"
+    if code > 0:
+        return f"crashed (exit code {code})"
+    return "exited"
+
+
 def _report_cpu_fallback(on_cpu: Callable[[str], None] | None, reason: str | None) -> None:
     """Tell the worker a GPU worker's request is read on the CPU (its row's fallback flag). Never raises: the row is
     only a display, and the request still has to be read."""
     if on_cpu is None or not reason:
         return
     try:
-        on_cpu(f"Credit text detection on the CPU: {reason}")
+        on_cpu(f"{CREDITS_ON_CPU_PREFIX}: {reason}")
     except Exception as exc:  # noqa: BLE001 - see docstring
         logger.debug("Couldn't show the text detection CPU fallback on the worker row: {}", exc)
 
@@ -443,15 +565,21 @@ class _Helper:
         try:
             line = self._lines.get(timeout=timeout_s)
         except queue.Empty:
-            raise HelperError(f"no answer within {timeout_s:g} s") from None
+            raise HelperError(
+                f"no answer within {timeout_s:g} s", plain=f"didn't answer within {timeout_s:g} s"
+            ) from None
         if not line:
-            raise HelperError(f"the helper exited ({self.proc.poll()}){self._stderr_tail()}")
+            # The reader thread ends the stream before the process is reaped, so poll() alone would say None.
+            code = self.wait_exit(EXIT_CODE_WAIT_S)
+            raise HelperError(
+                f"the helper exited ({code}){self._stderr_tail()}", plain=_exit_plain(code), waited_for_exit=True
+            )
         try:
             message = json.loads(line)
         except ValueError:
-            raise HelperError(f"unreadable answer {line[:80]!r}") from None
+            raise HelperError(f"unreadable answer {line[:80]!r}", plain=UNREADABLE) from None
         if not isinstance(message, dict):
-            raise HelperError(f"unreadable answer {line[:80]!r}")
+            raise HelperError(f"unreadable answer {line[:80]!r}", plain=UNREADABLE)
         return message
 
     def request(self, planes: np.ndarray, *, read: bool = False) -> list[tuple[Box, ...]] | list[list[str]]:
@@ -474,16 +602,16 @@ class _Helper:
         self.last_used = _monotonic()
         answer = reply.get("text" if read else "boxes")
         if reply.get("id") != self._next_id or "error" in reply or not isinstance(answer, list) or len(answer) != count:
-            raise HelperError(f"bad answer: {str(reply.get('error') or reply)[:200]}")
+            raise HelperError(f"bad answer: {str(reply.get('error') or reply)[:200]}", plain=UNREADABLE)
         if read:
             if not all(isinstance(frame, list) and all(isinstance(line, str) for line in frame) for frame in answer):
-                raise HelperError("bad answer: a frame's text isn't a list of strings")
+                raise HelperError("bad answer: a frame's text isn't a list of strings", plain=UNREADABLE)
             return answer
         try:
             return [tuple((int(a), int(b), int(c), int(d)) for a, b, c, d in frame) for frame in answer]
         except (TypeError, ValueError) as exc:
             # A frame's entry that isn't four numbers per box would otherwise reach rule J as a row it can't read.
-            raise HelperError(f"bad answer: boxes aren't four numbers each ({exc})") from exc
+            raise HelperError(f"bad answer: boxes aren't four numbers each ({exc})", plain=UNREADABLE) from exc
 
     def _write(self, data: bytes, deadline: float) -> None:
         failed: list[BaseException] = []
@@ -506,9 +634,9 @@ class _Helper:
             # The kill closes the read end, so the write is about to fail with EPIPE. Waiting for that here keeps
             # close() from finding a writer that is merely unwinding and warning about a process that is already dead.
             writer.join(WRITER_UNWIND_S)
-            raise HelperError(f"the helper didn't read a request within {budget:g} s")
+            raise HelperError(f"the helper didn't read a request within {budget:g} s", plain=STOPPED_READING)
         if failed:
-            raise HelperError(f"couldn't send the frames: {failed[0]}")
+            raise HelperError(f"couldn't send the frames: {failed[0]}", plain=STOPPED_READING)
 
     def exit_code(self) -> int | None:
         """The helper's exit code, or None while it runs."""
@@ -528,7 +656,7 @@ class _Helper:
         with contextlib.suppress(OSError, ValueError):
             self._stderr.seek(0, os.SEEK_END)
             size = self._stderr.tell()
-            self._stderr.seek(max(0, size - 300))
+            self._stderr.seek(max(0, size - STDERR_TAIL_BYTES))
             tail = self._stderr.read().decode("utf-8", "replace").strip()
             return f": {tail}" if tail else ""
         return ""
@@ -595,7 +723,7 @@ def _start(spec: HelperSpec, *, command: Callable[[HelperSpec], list[str]], pope
                      start_new_session=True)  # fmt: skip
     except OSError as exc:
         stderr_file.close()
-        raise HelperStartError(f"couldn't start: {exc}") from exc
+        raise HelperStartError(f"couldn't start: {exc}", plain=NOT_SPAWNED) from exc
     helper = _Helper(proc, stderr_file, request_timeout_s)
     try:
         ready = helper.read_message(start_timeout_s)
@@ -606,9 +734,16 @@ def _start(spec: HelperSpec, *, command: Callable[[HelperSpec], list[str]], pope
         helper.close(0)
         if isinstance(exc, HelperStartError):
             raise
-        raise HelperStartError(str(exc)) from exc
+        raise HelperStartError(str(exc), plain=exc.plain) from exc
     helper.ready = ready
     return helper
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _vulkan_device_info() -> Any:
@@ -633,12 +768,16 @@ class _GpuState:
         failures: Failed attempts on the GPU in a row (a crash, a hang, a start that failed).
         retry_at: ``_monotonic`` time before which the GPU isn't tried again after a start failed.
         cpu_reason: Why its requests are read on the CPU now: the verdict's reason, or the start failure's.
+        selftest: The self-test's counts when a mismatch gave the CPU verdict (``asdict(SelfTest)``), else None.
+        selftest_reason: The helper's plain sentence for that mismatch (``SelfTest.cpu_reason``).
     """
 
     verdict: str | None = None
     failures: int = 0
     retry_at: float = 0.0
     cpu_reason: str = ""
+    selftest: dict[str, Any] | None = None
+    selftest_reason: str = ""
 
 
 class TextDetectorPool:
@@ -820,6 +959,25 @@ class TextDetectorPool:
                 return "cpu"
             return state.verdict
 
+    def credits_on_cpu(self) -> list[dict[str, Any]]:
+        """The GPU devices whose credits are read on the CPU because their self-test found other results than the
+        CPU's, in key order.
+
+        Returns:
+            One dict per device: ``key``, ``reason`` (the helper's plain sentence), ``driver_suspect`` and ``selftest``.
+        """
+        with self._guard:
+            return [
+                {
+                    "key": key,
+                    "reason": state.selftest_reason,
+                    "driver_suspect": _driver_suspect(state.selftest),
+                    "selftest": dict(state.selftest),
+                }
+                for key, state in sorted(self._gpus.items())
+                if state.verdict == "cpu" and state.selftest is not None
+            ]
+
     def reconcile_cpu_helpers(self) -> None:
         """Bring the CPU helpers to the saved CPU worker count now: idle ones beyond it stop at once, busy ones when
         their request ends, and a higher count lets waiting requests start helpers (a settings save calls this; every
@@ -911,27 +1069,50 @@ class TextDetectorPool:
                 )
             return True
         if ready.get("failed") or before == "webgpu":
-            raise HelperStartError(f"it came up on the CPU: {reason}")
+            raise HelperStartError(f"it came up on the CPU: {reason}", plain="couldn't start its GPU session")
         # Only a self-test that found other boxes than the CPU's comes back with its results and the CPU.
-        self._use_cpu(key, reason, boxes_differ=ready.get("selftest") is not None)
+        selftest = ready.get("selftest")
+        self._use_cpu(key, reason, boxes_differ=selftest is not None, selftest=selftest)
+        if selftest is not None:
+            self._log_bug_report_details(key, pci=pci_bus_id, selftest=selftest)
         return False
 
-    def _use_cpu(self, key: str, reason: str, *, boxes_differ: bool = False) -> None:
-        """Keep the device's text detection on the CPU for the process: its GPU can't run it, or answers differently."""
+    def _use_cpu(
+        self, key: str, reason: str, *, boxes_differ: bool = False, selftest: dict[str, Any] | None = None
+    ) -> None:
+        """Keep the device's text detection on the CPU for the process: its GPU can't run it, or answers differently.
+
+        Args:
+            key: The device key.
+            reason: Why, as the helper or the checks above put it.
+            boxes_differ: The self-test found other results than the CPU's.
+            selftest: The self-test's counts (``asdict(SelfTest)``) when ``boxes_differ``.
+        """
         with self._guard:
             state = self._gpus.setdefault(key, _GpuState())
             already = state.verdict == "cpu"
             state.verdict = "cpu"
             if not already:
-                state.cpu_reason = "this GPU finds other text boxes than the CPU" if boxes_differ else reason
+                state.cpu_reason = (
+                    "this GPU failed its accuracy check. Previews still use the GPU." if boxes_differ else reason
+                )
+                state.selftest = (selftest or {}) if boxes_differ else None
+                state.selftest_reason = reason if boxes_differ else ""
         if already:
             return
         if boxes_differ:
+            hint = (
+                'That usually points to a GPU driver problem: check the host\'s kernel log for "GPU HANG".'
+                if _driver_suspect(selftest)
+                else "A GPU that reads text differently could put credits markers in the wrong place, so it isn't "
+                "used for credits."
+            )
             logger.warning(
-                "Credit text detection on {} runs on the CPU for the rest of this run of the app: {}. A credits answer "
-                "mustn't depend on which device read the file, so a GPU that finds other text boxes isn't used",
+                "Credits on {}: read on the CPU until the app restarts. In its accuracy check, {}. {} "
+                "Previews still use the GPU.",
                 key,
                 reason,
+                hint,
             )
         else:
             logger.info("Credit text detection on {}: CPU ({})", key, reason)
@@ -945,8 +1126,9 @@ class TextDetectorPool:
         Returns:
             Why this request is read on the CPU.
         """
-        what = "couldn't start" if isinstance(exc, HelperStartError) else "failed"
-        reason = f"its GPU helper {what} ({exc})"
+        plain = exc.plain or "failed"
+        when = "while starting up" if isinstance(exc, HelperStartError) else "while reading credits"
+        reason = f"the GPU {plain} {when}. It's tried again shortly."
         with self._guard:
             state = self._gpus.setdefault(key, _GpuState())
             state.failures += 1
@@ -954,14 +1136,45 @@ class TextDetectorPool:
             back_off = min(GPU_RETRY_BASE_S * 2 ** min(failures - 1, 32), GPU_RETRY_MAX_S)
             state.retry_at = _monotonic() + back_off
             state.cpu_reason = reason
+        # A helper that couldn't even be spawned is this container, not the GPU driver.
+        hint = (
+            ""
+            if plain == NOT_SPAWNED
+            else " If this keeps happening, it's usually the GPU driver: check the host's kernel log for \"GPU HANG\"."
+        )
         log = logger.warning if failures == 1 else logger.debug
         log(
-            "Credit text detection on {}: {}; this request is read on the CPU and the GPU is tried again in {:g} s",
+            "Credits on {}: the GPU {} {}. This file is read on the CPU and the GPU is tried again in {:g} s.{}",
             key,
-            reason,
+            plain,
+            when,
             back_off,
+            hint,
         )
+        error = redact_secrets(str(exc))
+        if failures == 1:
+            self._log_bug_report_details(key, failed=f"{plain} {when}", error=error)
+        else:
+            logger.debug("Credit text GPU error on {}: {}", key, error)
         return reason
+
+    def _log_bug_report_details(self, key: str, **details: Any) -> None:
+        """One INFO line with what a bug report about this device's credit text needs: the event's own details plus
+        the host's kernel, the Vulkan device the app found, and the ONNX Runtime versions. INFO, so it is in the log a
+        user attaches without turning on debug logging. Never raises: it is only a log line."""
+        try:
+            vulkan = getattr(self._vulkan_info(), "device", None)
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            vulkan = f"unknown ({type(exc).__name__})"
+        fields = {
+            "device": key,
+            **details,
+            "vulkan": vulkan,
+            "kernel": platform.release(),
+            "onnxruntime": _package_version("onnxruntime"),
+            "webgpu_ep": _package_version("onnxruntime-ep-webgpu"),
+        }
+        logger.info("Credit text details for a bug report: {}", json.dumps(fields, default=str))
 
     def _gpu_worked(self, key: str) -> None:
         with self._guard:
@@ -1147,14 +1360,14 @@ class TextDetectorPool:
                 return None  # a GPU helper that came up on the CPU for good: the request goes to a CPU helper
             try:
                 return helper.request(planes, read=read)
-            except HelperError:
-                code = helper.wait_exit(EXIT_CODE_WAIT_S)
+            except HelperError as exc:
+                code = helper.exit_code() if exc.waited_for_exit else helper.wait_exit(EXIT_CODE_WAIT_S)
                 self._drop(key)
                 if code != IDLE_EXIT_CODE:
                     raise
                 if attempt == 2:
                     # Two idle exits in a row is not the idle timer: something ends the helper on every request.
-                    raise HelperError("the helper went idle twice in a row") from None
+                    raise HelperError("the helper went idle twice in a row", plain="kept stopping") from None
         return None  # pragma: no cover - the loop always returns or raises
 
     def _helper(
@@ -1188,7 +1401,7 @@ class TextDetectorPool:
                 helper = None
                 # A CPU helper is started again whatever it exited with, so both of its codes take this same path.
                 if not _is_cpu_helper_key(key) and code != IDLE_EXIT_CODE:
-                    raise HelperError(f"it exited {code} between requests")
+                    raise HelperError(f"it exited {code} between requests", plain=_exit_plain(code))
             elif _monotonic() - helper.last_used > IDLE_EXIT_S - IDLE_RESTART_MARGIN_S:
                 self._drop(key)  # about to leave on its idle timer: start a new one rather than race it
                 helper = None
@@ -1254,6 +1467,16 @@ def reconcile_textdet_cpu_helpers() -> None:
         pool = _pool
     if pool is not None:
         pool.reconcile_cpu_helpers()
+
+
+def credits_on_cpu_devices() -> list[dict[str, Any]]:
+    """The process pool's GPU devices whose credits are read on the CPU after a self-test mismatch.
+
+    Starts no pool: before any text detection there is nothing to report.
+    """
+    with _pool_lock:
+        pool = _pool
+    return pool.credits_on_cpu() if pool is not None else []
 
 
 def _configured_cpu_workers() -> int:

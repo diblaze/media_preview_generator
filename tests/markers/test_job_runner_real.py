@@ -1169,7 +1169,9 @@ class TestCreditTextOnTheWorkers:
     def test_text_detection_read_on_the_cpu_on_a_gpu_worker_shows_on_the_worker_row(self, engine, setup):
         # The GPU helper failed this request: the pool reads it on the CPU and says so through the worker's callback.
         def on_the_cpu(planes, **kwargs):
-            kwargs["on_cpu"]("Credit text detection on the CPU: its GPU helper failed (the helper exited (-9))")
+            kwargs["on_cpu"](
+                "Credits read on the CPU: the GPU crashed (killed by SIGKILL) on this file. It's tried again shortly."
+            )
             return [()] * len(planes)
 
         setup.pool.detect_boxes.side_effect = on_the_cpu
@@ -1178,7 +1180,8 @@ class TestCreditTextOnTheWorkers:
         worker = self._worker()
         assert worker.fallback_active is True
         assert (
-            worker.fallback_reason == "Credit text detection on the CPU: its GPU helper failed (the helper exited (-9))"
+            worker.fallback_reason
+            == "Credits read on the CPU: the GPU crashed (killed by SIGKILL) on this file. It's tried again shortly."
         )
         assert job.status is JobStatus.COMPLETED and _outcome(engine.jm, job.id) == {"markers_none": 1}
         assert self._released(engine)

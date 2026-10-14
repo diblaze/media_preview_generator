@@ -771,7 +771,7 @@ class TestFileBlocks:
         ctx = _job(store, media, _plex(media), on_worker=True)
 
         def detect(*args, fallback_callback=None, **kwargs):
-            fallback_callback("Credit text detection on the CPU: the GPU ran out of memory")
+            fallback_callback("Credits read on the CPU: the GPU ran out of memory")
             ctx.monotonic.advance(20)
             return [TEXT_CREDITS]
 
@@ -781,11 +781,11 @@ class TestFileBlocks:
              gpu_worker=True, worker_name="GPU Worker 1", fallback_callback=shown.append)  # fmt: skip
 
         assert (
-            f"{EPISODE} · Credit text: credits start at 21:31 (20 s; credit text detection on the CPU: the GPU "
+            f"{EPISODE} · Credit text: credits start at 21:31 (20 s; credits read on the CPU: the GPU "
             "ran out of memory)"
         ) in _messages(job_log)
         # The worker row still hears of it.
-        assert shown == ["Credit text detection on the CPU: the GPU ran out of memory"]
+        assert shown == ["Credits read on the CPU: the GPU ran out of memory"]
 
     def test_a_failed_write_logs_the_block_at_warning(self, store, media, job_log):
         plex = ready_publisher()
@@ -1270,8 +1270,8 @@ class TestSourceLines:
             ({"seconds": 13.2}, "Credit text: credits start at 41:48 (13 s)"),
             ({"seconds": 0.46}, "Credit text: credits start at 41:48 (0.5 s)"),
             (
-                {"seconds": 95, "fallback": "Credit text detection on the CPU: no GPU memory"},
-                "Credit text: credits start at 41:48 (1 min 35 s; credit text detection on the CPU: no GPU memory)",
+                {"seconds": 95, "fallback": "Credits read on the CPU: no GPU memory"},
+                "Credit text: credits start at 41:48 (1 min 35 s; credits read on the CPU: no GPU memory)",
             ),
             (
                 {"seconds": 40, "gpu_read_nothing": True},
