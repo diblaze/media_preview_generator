@@ -1,0 +1,791 @@
+"""E2E: the Nodes page (list, Add node, node dialog) and the Plex server's "Plex database" selector.
+
+Every /api/nodes* route is mocked with ``page.route``, so these run against the page alone. Screenshots go to
+``MPG_UX_EVIDENCE_DIR`` when it is set (else the test's tmp dir).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Locator, Page, Route, expect
+
+from .conftest import accept_app_confirm, expect_modal_shown, watch_modal_shown
+from .test_info_icons import _AUDIT_JS, MORE
+from .test_intro_credits_server_tab import (
+    _mock_server_page,
+    _open_tab,
+    _plex_ready_details,
+    _plex_server,
+    _save_and_read_put,
+    _status,
+)
+
+APP_VERSION = "5.2.0"
+PHONE = {"width": 390, "height": 844}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _complete_setup(complete_setup) -> None:
+    return complete_setup
+
+
+def _capture(locator: Locator, filename: str, tmp_path: Path) -> None:
+    evidence = Path(os.environ.get("MPG_UX_EVIDENCE_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
+    locator.screenshot(path=str(evidence / filename), animations="disabled")
+
+
+def _fulfill(route: Route, body: object, status: int = 200) -> None:
+    route.fulfill(status=status, content_type="application/json", body=json.dumps(body))
+
+
+def _node(node_id: str, name: str, state: str = "ready", **overrides) -> dict:
+    node = {
+        "id": node_id,
+        "name": name,
+        "url": f"http://{name}.lan:9494",
+        "enabled": True,
+        "state": state,
+        "reason": "",
+        "version": APP_VERSION,
+        "roles": ["worker"],
+        "legacy": False,
+        "platform": {"os": "linux", "arch": "x86_64", "python": "3.12"},
+        "gpus": [],
+        "cpu": {"cores": 8, "load1": 0.4, "ram_total": 32e9, "ram_available": 20e9},
+        "busy": 0,
+        "last_seen": time.time() - 3,
+        "path_mappings": [],
+        "used_by": {"groups": [], "servers": []},
+    }
+    node.update(overrides)
+    return node
+
+
+def _four_nodes() -> list[dict]:
+    """The mockup's four: a GPU worker, a Windows Plex database node, an access problem and an offline worker."""
+    return [
+        _node(
+            "n-storage",
+            "storage",
+            gpus=[{"type": "NVIDIA", "device": "cuda:0", "name": "Quadro P5000", "status": "ok"}],
+            cpu={"cores": 24, "load1": 3.1, "ram_total": 64e9, "ram_available": 40e9},
+            busy={"running": 2, "workers": 7},
+            path_mappings=[{"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"}],
+            used_by={"groups": [{"id": "g1", "name": "GPU box"}], "servers": []},
+        ),
+        _node(
+            "n-pc",
+            "gaming-pc",
+            url="http://host.docker.internal:9494",
+            roles=["plex_db"],
+            platform={"os": "windows", "arch": "AMD64", "python": "3.12"},
+            reason="Plex has it open · local disk",
+            cpu={},
+            used_by={"groups": [], "servers": [{"id": "plex-1", "name": "Home"}]},
+        ),
+        _node("n-nuc", "nuc", "access_problem", reason="TV Shows not found at /media/tv", busy="workers paused"),
+        _node(
+            "n-old",
+            "old-laptop",
+            "offline",
+            url="http://192.168.1.40:9494",
+            reason="since 14:02 · next try in 4 min",
+            gpus=[{"type": "NVIDIA", "device": "cuda:0", "name": "GTX 1650", "status": "ok"}],
+            last_seen=time.time() - 600,
+        ),
+    ]
+
+
+class NodesApi:
+    """Routes every /api/nodes* call to canned answers and records what the page sent."""
+
+    def __init__(self, page: Page, nodes: list[dict]) -> None:
+        self.nodes = nodes
+        self.calls: list[tuple[str, str, object]] = []
+        self.probe_answer: dict = {"ok": True, "info": _probe_info()}
+        self.create_answer: tuple[int, dict] | None = None
+        self.test_answers: list[dict] = []
+        self.health_answer: dict = {"overall_ok": True, "sections": []}
+        self.log_answer: dict = {"lines": ["14:01:02 INFO node started", "14:01:03 INFO 1 GPU found"]}
+        self.delete_answer: tuple[int, dict] = (200, {"ok": True})
+        page.route("**/api/nodes**", self._handle)
+
+    def bodies(self, method: str, suffix: str) -> list:
+        return [body for m, path, body in self.calls if m == method and path.endswith(suffix)]
+
+    def _find(self, node_id: str) -> dict:
+        return next(n for n in self.nodes if n["id"] == node_id)
+
+    def _handle(self, route: Route) -> None:
+        request = route.request
+        path = request.url.split("/api", 1)[1].split("?", 1)[0]
+        body = request.post_data_json if request.post_data else None
+        # Recorded before answering: tests wait for the response, so the body is there when they look.
+        self.calls.append((request.method, path, body))
+        parts = path.strip("/").split("/")
+        if parts == ["nodes"] and request.method == "GET":
+            return _fulfill(route, {"nodes": self.nodes, "app_version": APP_VERSION})
+        if parts == ["nodes", "probe"]:
+            return _fulfill(route, self.probe_answer)
+        if parts == ["nodes"] and request.method == "POST":
+            if self.create_answer:
+                status, answer = self.create_answer
+                return _fulfill(route, answer, status)
+            info = self.probe_answer.get("info") or {}
+            row = _node("n-new", body["name"], roles=list((info.get("node") or {}).get("roles") or ["worker"]))
+            row["url"] = body["url"]
+            row["path_mappings"] = [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}]
+            self.nodes.append(row)
+            return _fulfill(route, row)
+        node = self._find(parts[1])
+        if len(parts) == 2 and request.method == "PUT":
+            node.update({k: v for k, v in body.items() if k != "key"})
+            return _fulfill(route, node)
+        if len(parts) == 2 and request.method == "DELETE":
+            status, answer = self.delete_answer
+            if status == 200:
+                self.nodes.remove(node)
+            return _fulfill(route, answer, status)
+        action = parts[2]
+        if action == "check":
+            return _fulfill(route, node)
+        if action == "rescan-gpus":
+            node["gpus"] = [{"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4070", "status": "ok"}]
+            return _fulfill(route, node)
+        if action == "test-access":
+            return _fulfill(route, self.test_answers.pop(0) if self.test_answers else {"libraries": []})
+        if action == "health":
+            return _fulfill(route, self.health_answer)
+        if action == "log":
+            return _fulfill(route, self.log_answer)
+        return _fulfill(route, {"error": "unexpected"}, 404)
+
+
+def _probe_info(roles: list[str] | None = None, version: str = APP_VERSION, version_match: bool = True) -> dict:
+    return {
+        "node": {"id": "uid-1", "name": "storage", "version": version, "protocols": [1], "roles": roles or ["worker"]},
+        "version_match": version_match,
+        "platform": {"os": "linux", "arch": "x86_64", "python": "3.12"},
+        "worker": {
+            "gpus": [{"type": "NVIDIA", "device": "GPU0", "name": "Quadro P5000", "status": "ok"}],
+            "cpu": {"cores": 24, "load1": 0.5, "ram_total": 64e9, "ram_available": 50e9},
+            "temp": {"path": "/tmp", "free_bytes": 41e9},
+            "busy": 0,
+            "notes": [{"title": "Credit text", "chip": "CPU on this GPU", "message": "Vulkan reports no hardware GPU"}],
+        },
+    }
+
+
+def _library(name: str, app_root: str, ok: bool, node_root: str, **extra) -> dict:
+    files = [
+        {
+            "path": f"{app_root}/file{i}.mkv",
+            "ok": ok,
+            "kind": None if ok else "missing",
+            "message": "",
+            "node_path": f"{node_root}/file{i}.mkv",
+        }
+        for i in range(3)
+    ]
+    return {"server": "Home", "library": name, "app_root": app_root, "checked": 3, "ok": ok, "files": files, **extra}
+
+
+def _open_nodes(page: Page, app_url: str, nodes: list[dict], path: str = "/nodes") -> NodesApi:
+    api = NodesApi(page, nodes)
+    page.goto(f"{app_url}{path}")
+    expect(page.locator("#nodeList")).not_to_contain_text("Loading nodes", timeout=10000)
+    return api
+
+
+def _open_add(page: Page) -> Locator:
+    watch_modal_shown(page, "addNodeModal")
+    page.locator("#nodesAddBtn").click()
+    expect_modal_shown(page, "addNodeModal")
+    return page.locator("#addNodeModal")
+
+
+def _open_node(page: Page, node_id: str) -> Locator:
+    watch_modal_shown(page, "nodeModal")
+    page.locator(f"#node-{node_id} .nd-open").click()
+    expect_modal_shown(page, "nodeModal")
+    return page.locator("#nodeModal")
+
+
+def _node_tab(page: Page, tab: str) -> Locator:
+    page.locator(f'#nodeModal .sm-rail [data-tab="{tab}"]').click()
+    pane = page.locator(f"#node-tab-{tab}")
+    expect(pane).to_be_visible()
+    return pane
+
+
+@pytest.mark.e2e
+class TestNodeList:
+    def test_each_state_gets_its_chip_colour_and_button(self, authed_page: Page, app_url: str) -> None:
+        states = {
+            "ready": ("✓ Ready", "ok", "Open"),
+            "update_needed": ("Update needed", "warn", "Fix"),
+            "access_problem": ("Access problem", "warn", "Fix"),
+            "gpu_lost": ("GPU lost", "warn", "Fix"),
+            "offline": ("Offline", "bad", "Open"),
+            "key_refused": ("Key refused", "bad", "Fix"),
+            "connecting": ("Connecting…", "off", "Open"),
+            "disabled": ("Turned off", "off", "Open"),
+        }
+        nodes = [_node(f"n-{i}", f"node{i}", state, reason=f"why {i}") for i, state in enumerate(states)]
+        _open_nodes(authed_page, app_url, nodes)
+
+        for i, (chip, tone, button) in enumerate(states.values()):
+            row = authed_page.locator(f"#node-n-{i}")
+            expect(row).to_have_attribute("data-tone", tone)
+            pill = row.locator(".nd-status .pill")
+            expect(pill).to_have_text(chip)
+            if tone == "off":
+                expect(pill).to_have_class("pill")
+            else:
+                expect(pill).to_have_class(f"pill {tone}")
+            expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
+            expect(row.locator(".nd-open")).to_have_text(button)
+
+    def test_rows_show_roles_hardware_busy_and_who_uses_them(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+
+        storage = authed_page.locator("#node-n-storage")
+        expect(storage.locator(".nd-url")).to_have_text("http://storage.lan:9494")
+        expect(storage.locator(".nd-chips")).to_contain_text("Worker")
+        expect(storage.locator(".nd-chips")).to_contain_text("Quadro P5000")
+        expect(storage.locator(".nd-chips")).to_contain_text("24 CPU")
+        expect(storage.locator(".nd-chips")).to_contain_text("2 of 7 workers busy")
+        expect(storage.locator(".nd-chips")).to_contain_text('used by worker group "GPU box"')
+        expect(storage.locator(".nd-status")).to_contain_text(f"v{APP_VERSION} · seen")
+
+        pc = authed_page.locator("#node-n-pc")
+        expect(pc.locator(".nd-chips")).to_contain_text("Plex database")
+        expect(pc.locator(".nd-chips")).to_contain_text("Windows")
+        expect(pc.locator(".nd-chips")).to_contain_text('used by Plex server "Home"')
+        expect(pc.locator(".nd-chips")).not_to_contain_text("Worker")
+        expect(pc.locator(".nd-ico i")).to_have_class("bi bi-windows")
+
+    def test_empty_list_explains_nodes_and_links_the_docs(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, [])
+        empty = authed_page.locator(".nd-empty")
+        expect(empty).to_contain_text("No nodes yet")
+        expect(empty).to_contain_text("lend its GPU or CPU")
+        expect(empty.locator("a")).to_have_attribute(
+            "href", "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
+        )
+        expect(authed_page.locator("#nodesCheckNow")).to_be_disabled()
+        watch_modal_shown(authed_page, "addNodeModal")
+        empty.locator(".nd-add").click()
+        expect_modal_shown(authed_page, "addNodeModal")
+
+    def test_check_now_checks_every_node(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        with authed_page.expect_response(lambda r: r.url.endswith("/api/nodes") and r.request.method == "GET"):
+            authed_page.locator("#nodesCheckNow").click()
+        checked = sorted(path for method, path, _ in api.calls if method == "POST" and path.endswith("/check"))
+        assert checked == [f"/nodes/{n}/check" for n in ("n-nuc", "n-old", "n-pc", "n-storage")]
+        expect(authed_page.locator("#nodesCheckNow")).to_have_text("Check now")
+
+    def test_list_is_polled(self, authed_page: Page, app_url: str) -> None:
+        authed_page.clock.install()
+        nodes = _four_nodes()
+        _open_nodes(authed_page, app_url, nodes)
+        nodes[3]["state"] = "ready"
+        nodes[3]["reason"] = ""
+        authed_page.clock.run_for(10_500)
+        expect(authed_page.locator("#node-n-old .nd-status .pill")).to_have_text("✓ Ready")
+
+    def test_the_url_hash_opens_that_node(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes(), path="/nodes#node-n-nuc")
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+        expect(authed_page.locator("#nodeModalName")).to_have_text("nuc")
+        expect(authed_page.locator("#nodeModalState")).to_have_text("Access problem")
+
+    def test_fix_opens_the_tab_with_the_fix(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-nuc")
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+        assert authed_page.evaluate("() => window.location.hash") == "#node-n-nuc"
+
+    def test_settings_menu_opens_the_page(self, authed_page: Page, app_url: str) -> None:
+        NodesApi(authed_page, [])
+        authed_page.goto(f"{app_url}/")
+        authed_page.locator("#navSettingsDropdown").hover()
+        authed_page.locator("#navSettingsMenu .dropdown-item", has_text="Nodes").click()
+        authed_page.wait_for_url(f"{app_url}/nodes")
+        expect(authed_page.locator("#navSettingsDropdown")).to_have_class("nav-link dropdown-toggle active")
+        expect(authed_page.locator('#navSettingsMenu .dropdown-item[href="/nodes"]')).to_have_attribute(
+            "aria-current", "page"
+        )
+
+    def test_phone_width_fits(self, authed_page: Page, app_url: str) -> None:
+        authed_page.set_viewport_size(PHONE)
+        _open_nodes(authed_page, app_url, _four_nodes())
+        assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        _open_node(authed_page, "n-storage")
+        assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        _node_tab(authed_page, "media")
+        expect(authed_page.locator("#nodeMediaEditor .nd-app")).to_be_visible()
+
+    def test_info_icons_follow_the_app_rule(self, authed_page: Page, app_url: str) -> None:
+        nodes = _four_nodes()
+        nodes[1]["legacy"] = True
+        _open_nodes(authed_page, app_url, nodes)
+        _open_add(authed_page)
+        icons = authed_page.evaluate(_AUDIT_JS)
+        assert len(icons) >= 8
+        for icon in icons:
+            assert icon["hint"], icon
+            if icon["hasDetail"]:
+                assert icon["hint"].endswith(f" {MORE}") and icon["pointerClass"], icon
+            else:
+                assert "click for" not in icon["hint"].lower() and not icon["pointerClass"], icon
+
+
+@pytest.mark.e2e
+class TestAddNode:
+    def test_connect_save_test_access_use_suggestion_and_save(
+        self, authed_page: Page, app_url: str, tmp_path: Path
+    ) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, _four_nodes()[:1])
+        modal = _open_add(page)
+        expect(page.locator("#addNodeStepLabel")).to_have_text("Step 1 of 2")
+        page.locator("#addNodeName").fill("nas")
+        page.locator("#addNodeUrl").fill("http://nas.lan:9494")
+        page.locator("#addNodeKey").fill("secret-key")
+        expect(page.locator("#addNodeUrl")).to_have_attribute("placeholder", "http://host.lan:9494")
+        expect(page.locator("#addNodeKey")).to_have_attribute("type", "password")
+
+        page.locator("#addNodeConnect").click()
+
+        probe = page.locator("#addNodeProbe")
+        expect(probe).to_contain_text("✓ Connected")
+        expect(probe).to_contain_text(f"version {APP_VERSION} · same as this app")
+        expect(probe).to_contain_text("GPU0 · Quadro P5000 · test decode ✓")
+        expect(probe).to_contain_text("24 CPU cores")
+        expect(probe).to_contain_text("41 GB free temp")
+        expect(probe).to_contain_text("CPU on this GPU")
+        expect(probe).to_contain_text("Vulkan reports no hardware GPU")
+        assert api.bodies("POST", "/nodes/probe") == [{"url": "http://nas.lan:9494", "key": "secret-key"}]
+        assert not api.bodies("POST", "/nodes"), "Connect must not save"
+
+        next_btn = page.locator("#addNodeNext")
+        expect(next_btn).to_have_text("Next: where it sees your media →")
+        next_btn.click()
+
+        expect(page.locator("#addNodeStep2")).to_be_visible()
+        assert api.bodies("POST", "/nodes") == [
+            {"name": "nas", "url": "http://nas.lan:9494", "key": "secret-key", "path_mappings": []}
+        ]
+        expect(page.locator("#addNodeStepLabel")).to_have_text("Step 2 of 2")
+        expect(modal.locator(".nd-map-head h3")).to_have_text("Where nas sees your media")
+        expect(page.locator("#addNodeCancel")).to_have_text("Finish later")
+        # Pre-filled from what the saved node came back with.
+        editor = page.locator("#addNodeMappings")
+        expect(editor.locator(".nd-app").first).to_have_value("/data/TV Shows")
+        expect(editor.locator(".nd-node").first).to_have_value("/mnt/nas/tv")
+        editor.locator(".nd-add-row").click()
+        editor.locator(".nd-app").nth(1).fill("/data/Movies")
+        editor.locator(".nd-node").nth(1).fill("/mnt/nas/Movies")
+
+        api.test_answers = [
+            {
+                "libraries": [
+                    _library("Movies", "/data/Movies", True, "/mnt/nas/Movies"),
+                    _library(
+                        "TV Shows",
+                        "/data/TV Shows",
+                        False,
+                        "/mnt/nas/tv",
+                        nearby={"/mnt/nas": ["Movies", "TV Shows", "downloads"]},
+                        suggestion={"from": "/mnt/nas/tv", "to": "/mnt/nas/TV Shows"},
+                    ),
+                ]
+            },
+            {
+                "libraries": [
+                    _library("Movies", "/data/Movies", True, "/mnt/nas/Movies"),
+                    _library("TV Shows", "/data/TV Shows", True, "/mnt/nas/TV Shows"),
+                ]
+            },
+        ]
+        editor.locator(".nd-test").click()
+
+        rows = editor.locator(".nd-map-row")
+        expect(rows.nth(0).locator(".nd-chip-slot")).to_have_text("✗ TV Shows 0/3")
+        expect(rows.nth(1).locator(".nd-chip-slot")).to_have_text("✓ Movies 3/3")
+        card = editor.locator('.nd-fail[data-library="TV Shows"]')
+        expect(card).to_contain_text("TV Shows: not found on the node.")
+        expect(card).to_contain_text("Tried /mnt/nas/tv/file0.mkv")
+        expect(card).to_contain_text("Folders the node does see under /mnt/nas:")
+        expect(card.locator(".pill")).to_have_text(["Movies", "TV Shows", "downloads"])
+        assert api.bodies("POST", "/nodes/n-new/test-access") == [
+            {
+                "path_mappings": [
+                    {"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"},
+                    {"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"},
+                ]
+            }
+        ]
+        _capture(modal.locator(".modal-content"), "nodes-add-step2-failed-library.png", tmp_path)
+
+        with page.expect_response(lambda r: r.url.endswith("/test-access")):
+            card.locator(".nd-use").click()
+
+        expect(editor.locator(".nd-node").first).to_have_value("/mnt/nas/TV Shows")
+        expect(rows.nth(0).locator(".nd-chip-slot")).to_have_text("✓ TV Shows 3/3")
+        expect(editor.locator(".nd-map-results")).to_contain_text("The node sees every library, same files.")
+
+        page.locator("#addNodeFinish").click()
+        expect(modal).to_be_hidden(timeout=5000)
+        assert api.bodies("PUT", "/nodes/n-new") == [
+            {
+                "path_mappings": [
+                    {"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/TV Shows"},
+                    {"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"},
+                ]
+            }
+        ]
+        expect(page.locator("#node-n-new")).to_be_visible()
+
+    def test_plex_database_node_skips_the_media_step(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        modal = _open_add(authed_page)
+        api.probe_answer = {"ok": True, "info": {**_probe_info(roles=["plex_db"]), "worker": {}}}
+        api.probe_answer["info"]["plex_db"] = {"config_dir": "C:\\Plex", "db_present": True}
+        authed_page.locator("#addNodeUrl").fill("http://pc:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeProbe")).to_contain_text("✓ Database found")
+        # The node's own name fills an empty Name field.
+        expect(authed_page.locator("#addNodeName")).to_have_value("storage")
+        expect(authed_page.locator("#addNodeStepLabel")).to_have_text("")
+        expect(authed_page.locator("#addNodeNext")).to_have_text("Add node")
+
+        authed_page.locator("#addNodeNext").click()
+
+        expect(modal).to_be_hidden(timeout=5000)
+        assert api.bodies("POST", "/nodes")[0]["name"] == "storage"
+        assert not [c for c in api.calls if c[1].endswith("/test-access")]
+
+    def test_version_mismatch_warns_update_needed(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.probe_answer = {"ok": True, "info": _probe_info(version="5.1.0", version_match=False)}
+        authed_page.locator("#addNodeUrl").fill("http://nas:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        probe = authed_page.locator("#addNodeProbe")
+        expect(probe.locator(".pill.warn").first).to_have_text("Update needed")
+        expect(probe).to_contain_text(f"version 5.1.0; this app is {APP_VERSION}")
+
+    @pytest.mark.parametrize(
+        ("kind", "text"),
+        [
+            ("auth", "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set."),
+            ("unreachable", "Nothing answered at this address. Check the address and port"),
+            ("protocol", "not as a node this app can use. Update the node"),
+        ],
+    )
+    def test_probe_errors_are_plain_words(self, authed_page: Page, app_url: str, kind: str, text: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.probe_answer = {"ok": False, "error": {"kind": kind, "message": "raw detail"}}
+        authed_page.locator("#addNodeUrl").fill("http://nas:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text(text)
+        expect(authed_page.locator("#addNodeNext")).to_be_hidden()
+
+    def test_missing_fields_are_flagged_inline(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeUrl")).to_have_class("form-control font-monospace is-invalid")
+        expect(authed_page.locator("#addNodeError")).to_contain_text("Enter the node's address")
+        assert not api.bodies("POST", "/nodes/probe")
+
+    def test_already_added_node_is_named(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.create_answer = (409, {"error": "already added", "name": "storage"})
+        authed_page.locator("#addNodeUrl").fill("http://nas:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        authed_page.locator("#addNodeNext").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text('This node is already added as "storage"')
+        expect(authed_page.locator("#addNodeStep1")).to_be_visible()
+
+
+@pytest.mark.e2e
+class TestNodeDialog:
+    def test_overview_shows_hardware_and_rescans_gpus(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        overview = authed_page.locator("#nodeOverview")
+        expect(overview).to_contain_text("✓ Ready")
+        expect(overview).to_contain_text("same as this app")
+        expect(overview).to_contain_text("24 cores · load 3.1")
+        expect(overview).to_contain_text("40 GB free of 64 GB")
+        expect(overview).to_contain_text("2 of 7 workers busy")
+        expect(authed_page.locator("#nodeGpuList")).to_contain_text("Quadro P5000")
+        expect(authed_page.locator("#nodeGpuList")).to_contain_text("✓ Working")
+
+        authed_page.locator("#nodeRescanGpus").click()
+
+        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 GPU")
+        expect(authed_page.locator("#nodeGpuList")).to_contain_text("RTX 4070")
+        assert api.bodies("POST", "/nodes/n-storage/rescan-gpus") == [None]
+
+    def test_plex_database_node_has_no_media_tab(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-pc")
+        expect(authed_page.locator('#nodeModal [data-tab="media"]')).to_be_hidden()
+        expect(authed_page.locator("#nodeGpuSection")).to_be_hidden()
+
+    def test_media_tab_saves_mappings(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        expect(pane.locator(".nd-node").first).to_have_value("/mnt/nas/Movies")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        expect(authed_page.locator("#nodeMediaResult")).to_have_text("Not saved yet")
+        authed_page.locator("#nodeSaveMappings").click()
+        expect(authed_page.locator("#nodeMediaResult")).to_have_text("Saved")
+        assert api.bodies("PUT", "/nodes/n-storage") == [
+            {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
+        ]
+
+    def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
+        api = NodesApi(authed_page, _four_nodes())
+        api.health_answer = {
+            "overall_ok": False,
+            "sections": [
+                {
+                    "id": "access",
+                    "title": "Libraries",
+                    "checks": [
+                        {
+                            "id": "lib_tv",
+                            "label": "TV Shows isn't visible on this node",
+                            "ok": False,
+                            "severity": "critical",
+                            "tooltip": "0 of 3 files found at the mapped path.",
+                            "current": "/data/TV Shows → /media/tv",
+                            "recommended": "/data/TV Shows → /media/TV Shows",
+                            "fix_tab": "media",
+                        },
+                        {"id": "lib_movies", "label": "Movies visible, same files", "ok": True, "severity": "critical"},
+                    ],
+                },
+                {
+                    "id": "use",
+                    "title": "Use",
+                    "checks": [
+                        {
+                            "id": "no_group",
+                            "label": "Not in any worker group yet",
+                            "ok": False,
+                            "severity": "recommended",
+                            "reason": "Its 8 CPU cores sit idle until a group uses them.",
+                            "help_url": "/settings#section-workers",
+                            "help_label": "Open Workers",
+                        },
+                        {"id": "hidden", "label": "Internal detail", "ok": True, "severity": "info"},
+                    ],
+                },
+            ],
+        }
+        authed_page.goto(f"{app_url}/nodes")
+        expect(authed_page.locator("#node-n-nuc")).to_be_visible()
+        _open_node(authed_page, "n-nuc")
+        _node_tab(authed_page, "health")
+
+        expect(authed_page.locator("#nodeHealthTitle")).to_have_text("nuc · Setup Health")
+        expect(authed_page.locator("#nodeHealthSummary .pill")).to_have_text(["1 must fix", "1 recommended"])
+        expect(authed_page.locator("#nodeHealthTabBadge")).to_have_text("1")
+        must = authed_page.locator('.readiness-bucket[data-tier="critical"]')
+        expect(must.locator("summary")).to_contain_text("Must fix")
+        expect(must).to_contain_text("TV Shows isn't visible on this node")
+        expect(must.locator(".readiness-current")).to_contain_text("/data/TV Shows → /media/tv")
+        expect(must.locator(".readiness-recommended")).to_contain_text("/data/TV Shows → /media/TV Shows")
+        recommended = authed_page.locator('.readiness-bucket[data-tier="recommended"]')
+        expect(recommended).to_contain_text("Its 8 CPU cores sit idle")
+        expect(recommended.locator("a", has_text="Open Workers")).to_have_attribute("href", "/settings#section-workers")
+        good = authed_page.locator('.readiness-bucket[data-tier="ok"]')
+        expect(good).to_contain_text("Movies visible, same files")
+        expect(authed_page.locator("#nodeHealthBody")).not_to_contain_text("Internal detail")
+
+        must.locator(".nd-health-fix").click()
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+
+    def test_log_tab_shows_the_node_log(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "log")
+        expect(authed_page.locator("#nodeLog")).to_have_text("14:01:02 INFO node started\n14:01:03 INFO 1 GPU found")
+        api.log_answer = {"lines": ["14:05:00 INFO later"]}
+        authed_page.locator("#nodeLogRefresh").click()
+        expect(authed_page.locator("#nodeLog")).to_have_text("14:05:00 INFO later")
+        assert any("/log" in path for _, path, _ in api.calls)
+
+    def test_settings_save_keeps_the_masked_key(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        expect(authed_page.locator("#nodeSetKey")).to_have_value("****")
+        authed_page.locator("#nodeSetName").fill("storage-2")
+        authed_page.locator("label[for='nodeSetEnabled']").click()
+        authed_page.locator("#nodeSettingsSave").click()
+        expect(authed_page.locator("#nodeSettingsResult")).to_have_text("Saved")
+        assert api.bodies("PUT", "/nodes/n-storage") == [
+            {"name": "storage-2", "url": "http://storage.lan:9494", "key": "****", "enabled": False}
+        ]
+        expect(authed_page.locator("#nodeModalName")).to_have_text("storage-2")
+        expect(authed_page.locator("#node-n-storage .nd-name")).to_have_text("storage-2")
+
+    def test_remove_refused_while_in_use_names_the_users(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.delete_answer = (
+            409,
+            {
+                "error": "in use",
+                "used_by": [{"kind": "group", "name": "GPU box"}, {"kind": "server", "name": "Home"}],
+            },
+        )
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeRemove").click()
+        accept_app_confirm(authed_page)
+        expect(authed_page.locator("#nodeRemoveResult")).to_have_text(
+            'Still in use by worker group "GPU box", Plex server "Home". Take it out of those first.'
+        )
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+
+    def test_remove_drops_the_row(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-old")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeRemove").click()
+        accept_app_confirm(authed_page)
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#node-n-old")).to_have_count(0)
+        assert [c[1] for c in api.calls if c[0] == "DELETE"] == ["/nodes/n-old"]
+
+
+@pytest.mark.e2e
+class TestPlexDatabaseSelector:
+    def _open(self, page: Page, app_url: str, agent: dict | None, details: dict | None = None) -> dict:
+        server = _plex_server()
+        if agent is not None:
+            server["markers"]["plex"]["agent"] = agent
+        captured = _mock_server_page(page, server, _status(server, "ready", "", details or _plex_ready_details()))
+        NodesApi(page, _four_nodes())
+        _open_tab(page, app_url, server, tab="general")
+        # The node list has answered once the gaming-pc entry is there.
+        expect(page.locator("#markersPlexDatabase option[value='n-pc']")).to_be_attached(timeout=5000)
+        return captured
+
+    def test_lists_only_plex_database_nodes(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, None)
+        # storage, nuc and old-laptop are worker-only nodes: not a route to Plex's database.
+        expect(authed_page.locator("#markersPlexDatabase option")).to_have_text(
+            ["Open it from this app", "Through a Plex database node: gaming-pc", "Add a Plex database node…"]
+        )
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
+        expect(authed_page.locator("#markersAgentState")).to_be_hidden()
+
+    def test_choosing_a_node_saves_enabled_and_node_id(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, None)
+        authed_page.locator("#markersPlexDatabase").select_option("n-pc")
+        expect(authed_page.locator("#markersAgentState")).to_contain_text("Save to use gaming-pc")
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["markers"]["plex"]["agent"] == {"enabled": True, "node_id": "n-pc"}
+
+    def test_opening_from_this_app_saves_it_off(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, {"enabled": True, "node_id": "n-pc"})
+        authed_page.locator("#markersPlexDatabase").select_option("")
+        expect(authed_page.locator("#markersAgentState")).to_be_hidden()
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["markers"]["plex"]["agent"] == {"enabled": False, "node_id": None}
+
+    def test_untouched_server_without_a_route_posts_no_agent(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, None)
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert "agent" not in body["markers"]["plex"]
+
+    def test_status_line_names_the_node_and_its_version(self, authed_page: Page, app_url: str) -> None:
+        details = {**_plex_ready_details(), "agent": {"state": "connected", "version": APP_VERSION, "url": "x"}}
+        self._open(authed_page, app_url, {"enabled": True, "node_id": "n-pc"}, details)
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("n-pc")
+        state = authed_page.locator("#markersAgentState")
+        expect(state).to_contain_text("✓ Connected")
+        expect(state).to_contain_text(f"gaming-pc · v{APP_VERSION}")
+        expect(state.locator("#markersAgentCheckBtn")).to_be_visible()
+
+    @pytest.mark.parametrize(
+        ("agent_state", "badge"),
+        [("unreachable", "Can't reach it"), ("rejected", "Key refused"), ("incompatible", "Update needed")],
+    )
+    def test_status_line_keeps_the_problem_badges(
+        self, authed_page: Page, app_url: str, agent_state: str, badge: str
+    ) -> None:
+        details = {**_plex_ready_details(), "agent": {"state": agent_state}}
+        self._open(authed_page, app_url, {"enabled": True, "node_id": "n-pc"}, details)
+        expect(authed_page.locator("#markersAgentState")).to_contain_text(badge)
+
+    def test_a_node_no_longer_listed_stays_selected(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, {"enabled": True, "node_id": "n-gone"})
+        select = authed_page.locator("#markersPlexDatabase")
+        expect(select).to_have_value("n-gone")
+        expect(select.locator("option[value='n-gone']")).to_contain_text("not on the Nodes page any more")
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["markers"]["plex"]["agent"] == {"enabled": True, "node_id": "n-gone"}
+
+    def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(self, authed_page: Page, app_url: str) -> None:
+        self._open(authed_page, app_url, None)
+        with authed_page.context.expect_page() as opened:
+            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+        new_page = opened.value
+        new_page.wait_for_load_state("domcontentloaded")
+        assert new_page.url.endswith("/nodes#add")
+        new_page.close()
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
+
+    def test_setup_health_link_lands_on_the_selector(self, authed_page: Page, app_url: str) -> None:
+        server = _plex_server()
+        _mock_server_page(authed_page, server, _status(server, "ready", "", _plex_ready_details()))
+        NodesApi(authed_page, _four_nodes())
+        check = {
+            "id": "chapters_helper",
+            "label": "Chapter thumbnails need Plex's database",
+            "ok": False,
+            "severity": "recommended",
+            "reason": "Plex runs on another machine.",
+            "actions": {},
+            "note": {"text": "Pick a Plex database node on the Connection tab.", "configure_plex_helper": True},
+        }
+        section = {"id": "chapters", "title": "Chapters", "checks": [check]}
+        envelope = {"vendor": "plex", "overall_ok": False, "sections": [section]}
+        authed_page.route("**/api/servers/*/previews-readiness", lambda route: _fulfill(route, envelope))
+        _open_tab(authed_page, app_url, server, tab="health")
+
+        authed_page.locator(".chapter-helper-link").click()
+
+        expect(authed_page.locator("#edit-tab-general")).to_be_visible()
+        expect(authed_page.locator("#markersPlexDatabase")).to_be_in_viewport()
+
+
+@pytest.mark.e2e
+def test_nodes_page_screenshot(authed_page: Page, app_url: str, tmp_path: Path) -> None:
+    authed_page.set_viewport_size({"width": 1440, "height": 900})
+    _open_nodes(authed_page, app_url, _four_nodes())
+    expect(authed_page.locator(".nd-row")).to_have_count(4)
+    _capture(authed_page.locator(".nodes-page"), "nodes-page.png", tmp_path)

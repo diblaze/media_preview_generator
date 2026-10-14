@@ -39,6 +39,8 @@ MENUS = {
         "page": "/settings",
         "items": [
             ("Workers", "section-workers", "Workers: groups, job permissions and availability"),
+            # Not a section: the Nodes page sits in this list under Workers (its "anchor" is its address).
+            ("Nodes", "/nodes", "Nodes: other machines that lend this app their GPU, CPU or Plex database"),
             (
                 "Global pause schedule",
                 "section-worker-quiet-hours",
@@ -58,7 +60,12 @@ MENUS = {
     },
 }
 OTHER = {"automation": "settings", "settings": "automation"}
-SECTION_LINKS = [(name, text, anchor) for name, menu in MENUS.items() for text, anchor, _ in menu["items"]]
+SECTION_LINKS = [
+    (name, text, anchor)
+    for name, menu in MENUS.items()
+    for text, anchor, _ in menu["items"]
+    if not anchor.startswith("/")
+]
 # Tools lists pages rather than sections: (text, href, aria-label), and its word opens the first of them.
 TOOLS = {
     "toggle": "#navToolsDropdown",
@@ -138,7 +145,9 @@ def _texts(name: str) -> list[str]:
 def _hrefs(name: str) -> list[str]:
     if name == "tools":
         return [href for _, href, _ in TOOLS["items"]]
-    return [f"{MENUS[name]['page']}#{anchor}" for _, anchor, _ in MENUS[name]["items"]]
+    return [
+        anchor if anchor.startswith("/") else f"{MENUS[name]['page']}#{anchor}" for _, anchor, _ in MENUS[name]["items"]
+    ]
 
 
 def _others(name: str) -> list[str]:
@@ -167,6 +176,8 @@ def _expect_landed(page: Page, anchor: str) -> None:
 def _expect_current(page: Page, name: str, anchor: str | None) -> None:
     """Only the item for ``anchor`` (none when None) is marked current."""
     for _, item_anchor, _ in MENUS[name]["items"]:
+        if item_anchor.startswith("/"):
+            continue
         item = page.locator(f'{MENUS[name]["list"]} .dropdown-item[data-anchor="{item_anchor}"]')
         if item_anchor == anchor:
             expect(item).to_have_class(ACTIVE)
