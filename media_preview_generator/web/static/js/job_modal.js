@@ -1379,11 +1379,13 @@ function _renderRetryReasonSubtitle(attempts) {
     const chapterWaitCounts = new Map();  // server_name -> attempts that waited on chapter thumbnails
     let unresolvedAttempts = 0;
     let staleAttempts = 0;
+    let nodeFailedAttempts = 0;
     for (const a of children) {
         const r = a.retry_reason;
         if (r && typeof r === 'object') {
             if ((r.unresolved | 0) > 0) unresolvedAttempts += 1;
             if ((r.stale_paths | 0) > 0) staleAttempts += 1;
+            if ((r.node_failed | 0) > 0) nodeFailedAttempts += 1;
             const chapterWaits = r.chapter_waits_by_server || {};
             for (const name of Object.keys(chapterWaits)) {
                 if (name) chapterWaitCounts.set(name, (chapterWaitCounts.get(name) || 0) + 1);
@@ -1436,6 +1438,9 @@ function _renderRetryReasonSubtitle(attempts) {
     }
     if (staleAttempts > 0) {
         phrases.push("file(s) were missing on disk");
+    }
+    if (nodeFailedAttempts > 0) {
+        phrases.push("a node couldn't run file(s)");
     }
 
     if (phrases.length === 0) return hide();

@@ -98,6 +98,18 @@ def _not_found_message(not_found: int, total: int, *, nothing_succeeded: bool, r
     return f"{not_found} of {total} items skipped (file not found locally) — check path mapping configuration"
 
 
+def _node_failure_clauses(node_failed: dict[str, str]) -> list[str]:
+    """``"N failed: node X unavailable (...)"`` per distinct reason, most files first.
+
+    Args:
+        node_failed: Path -> why its node couldn't run it.
+    """
+    counts: dict[str, int] = {}
+    for why in node_failed.values():
+        counts[why] = counts.get(why, 0) + 1
+    return [f"{n} failed: {why}" for why, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 def _file_problem_clauses(failure_count: int, outcome: dict | None, *, retry_scheduled: bool) -> list[str]:
     """What a finished job says about files that failed or weren't on disk, each count once.
 
@@ -1388,6 +1400,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
                     resolution = result.get("webhook_resolution", {})
                     unresolved_paths = resolution.get("unresolved_paths") or []
+                    # Found and owned, but their node couldn't run them: the dispatcher already wrote their failed
+                    # rows, so they get no "not found" row or path-mapping hint, only a retry.
+                    node_failed: dict[str, str] = resolution.get("node_failed") or {}
                     total_paths = resolution.get("total_paths", 0)
                     resolved_count = resolution.get("resolved_count", 0)
                     path_hints = resolution.get("path_hints") or []
@@ -1581,6 +1596,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     for pp in pending_registration_paths:
                         if pp not in retry_paths:
                             retry_paths.append(pp)
+                    for np_ in node_failed:
+                        if np_ not in retry_paths:
+                            retry_paths.append(np_)
 
                     def _spawn_retry_job(paths, attempt, retry_reason=None):
                         """Create and start a retry job for unresolved webhook paths.
@@ -1794,6 +1812,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             "pending_by_server": dict(pending_by_server),
                             "chapter_waits_by_server": dict(chapter_waits_by_server),
                         }
+                        if node_failed:
+                            retry_reason["node_failed"] = len(node_failed)
 
                         if is_retry and retry_attempt < effective_max:
                             next_attempt = retry_attempt + 1
@@ -1802,6 +1822,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} unresolved")
+                            reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
@@ -1827,6 +1848,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} not found on any server")
+                            reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
