@@ -32,13 +32,13 @@ from loguru import logger
 from ...plex_client import VIDEO_EXTENSIONS
 from ...shutdown import is_shutting_down
 from ..decide import intro_chapter_length_ms, intro_chapter_limit_ms
-from ..external_ids import ids_from_path, is_extra, same_show_names, season_folder_number
+from ..external_ids import FolderNames, ids_from_path, is_extra, same_show_names, season_folder_number
 from ..freeze import Freeze
 from ..missing import library_folders
 from ..models import Candidate, FileIdentity, MarkerType, Source
 from ..probe import MediaProbe, ProbeError, ProbeStalledError, probe_media
 from ..progress import StepProgress, WorkerProgress
-from ..season_cache import SeasonResults
+from ..season_cache import SeasonCache, SeasonResults
 from ..sources.chapters import CHAPTER_RULES_VERSION, chapter_candidates
 from ..speed import FILM_FPS, PAL_FPS, match_speed, playback_speed, retime_factor
 from ..store import PAIR_VERSION_STEP, EndPictureKey
@@ -238,9 +238,23 @@ def _entry_names(folder: str, unreadable: set[str] | None) -> list[str]:
         return []
 
 
-def _show_folders(show: str, configs: Iterable[ServerConfig], unreadable: set[str] | None) -> set[str]:
+def _folder_names(folder: str, unreadable: set[str] | None, listings: SeasonCache | None) -> FolderNames:
+    """A folder's names, from the job's recent listing of it when its mtime hasn't moved (``listings``)."""
+    try:
+        if listings is None:
+            return FolderNames(os.listdir(folder))
+        return listings.listing(folder, lambda: FolderNames(os.listdir(folder)))
+    except OSError as exc:
+        _listing_failed(folder, exc, unreadable)  # not found: the show, or its folder, isn't on that disk
+        return FolderNames(())
+
+
+def _show_folders(
+    show: str, configs: Iterable[ServerConfig], unreadable: set[str] | None, listings: SeasonCache | None = None
+) -> set[str]:
     """A show folder and the same show's folders at its place under the other folders of each library holding it, and
-    of each library holding one of those (so every folder of the show finds the same set, whichever libraries hold it)."""
+    of each library holding one of those (so every folder of the show finds the same set, whichever libraries hold it).
+    The folders holding shows are listed through ``listings`` when given."""
     libraries = [
         {os.path.normpath(folder) for folder, _mapping_root in folders if folder} - {"/"}
         for folders in library_folders(configs)
@@ -262,7 +276,7 @@ def _show_folders(show: str, configs: Iterable[ServerConfig], unreadable: set[st
                 if parent in listed:
                     continue
                 listed.add(parent)
-                for entry in same_show_names(name, _entry_names(parent, unreadable)):
+                for entry in same_show_names(name, _folder_names(parent, unreadable, listings)):
                     other = os.path.join(parent, entry)
                     if other not in found and os.path.isdir(other):  # not "Show {tvdb-1}.nfo" beside the folder
                         found.add(other)
@@ -293,7 +307,10 @@ def _distinct(folders: Iterable[str], first: str | None = None) -> tuple[str, ..
 
 
 def season_folders(
-    canonical_path: str, configs: Iterable[ServerConfig], unreadable: set[str] | None = None
+    canonical_path: str,
+    configs: Iterable[ServerConfig],
+    unreadable: set[str] | None = None,
+    listings: SeasonCache | None = None,
 ) -> tuple[str, ...]:
     """The folders a file's season is kept in: its own, and the same show's folders for that season on the library's
     other disks.
@@ -314,6 +331,9 @@ def season_folders(
         unreadable: Gains each folder looked in that is there but can't be read right now (a stale network handle, an
             I/O error): the season can't be told then. A missing folder is only one the show isn't in, and one that
             can't be read for good (no permission, logged) holds nothing of it.
+        listings: The job's cache the folders holding shows are listed through (:meth:`SeasonCache.listing`: a recent
+            listing of an unchanged folder stands for up to its ``ttl_s``, even if the folder can't be read meanwhile);
+            None lists them now.
 
     Returns:
         The file's own folder first, then the others sorted.
@@ -323,8 +343,8 @@ def season_folders(
         return (own,)
     number = season_folder_number(os.path.basename(own))
     if number is None:
-        return _distinct(_show_folders(own, configs, unreadable), own)
-    shows = _show_folders(os.path.dirname(own), configs, unreadable)
+        return _distinct(_show_folders(own, configs, unreadable, listings), own)
+    shows = _show_folders(os.path.dirname(own), configs, unreadable, listings)
     return _distinct(_numbered_season_folders(shows, number, unreadable), own)
 
 
@@ -400,7 +420,10 @@ def _same_season(target: FolderVideo, videos: Sequence[FolderVideo]) -> dict[str
 
 
 def previous_season_files(
-    canonical_path: str, configs: Iterable[ServerConfig] = (), unreadable: set[str] | None = None
+    canonical_path: str,
+    configs: Iterable[ServerConfig] = (),
+    unreadable: set[str] | None = None,
+    listings: SeasonCache | None = None,
 ) -> tuple[str, ...]:
     """The first episodes (by episode number, then path; at most 4) of the season numbered one lower than this file's,
     in the same show's folders on every disk of the library (:func:`season_folders`).
@@ -409,6 +432,7 @@ def previous_season_files(
         canonical_path: Local path of one episode.
         configs: The servers' configs (none: the file's own show folder only).
         unreadable: As for :func:`season_folders`.
+        listings: As for :func:`season_folders`.
 
     Returns:
         Their paths; empty for specials, a first season, a folder that isn't named like a season, or a path not in
@@ -418,7 +442,7 @@ def previous_season_files(
     number = season_folder_number(os.path.basename(folder))
     if number is None or number <= 1 or not os.path.isabs(folder) or os.path.normpath(folder) != folder:
         return ()
-    shows = _show_folders(os.path.dirname(folder), configs, unreadable)
+    shows = _show_folders(os.path.dirname(folder), configs, unreadable, listings)
     videos = [
         video
         for previous in _distinct(_numbered_season_folders(shows, number - 1, unreadable))
@@ -976,9 +1000,10 @@ def _signature_paths(
     group: SeasonGroup,
     configs: Iterable[ServerConfig],
     unreadable: set[str] | None = None,
+    listings: SeasonCache | None = None,
 ) -> tuple[str, ...]:
     if len(group.episodes) == 1:
-        return group.episodes + previous_season_files(canonical_path, configs, unreadable)
+        return group.episodes + previous_season_files(canonical_path, configs, unreadable, listings)
     return group.episodes
 
 
@@ -1065,7 +1090,7 @@ class _SeasonView:
 
     def _read_videos(self) -> tuple[tuple[FolderVideo, ...], frozenset[str]]:
         unreadable: set[str] = set()
-        folders = season_folders(self.canonical_path, self.configs, unreadable)
+        folders = season_folders(self.canonical_path, self.configs, unreadable, self._ctx.seasons)
         self._entry.watch(folders)
         videos = tuple(video for folder in folders for video in folder_videos(folder, unreadable))
         if unreadable:
@@ -1074,7 +1099,7 @@ class _SeasonView:
 
     def _read_previous(self) -> tuple[tuple[str, ...], frozenset[str]]:
         unreadable: set[str] = set()
-        previous = previous_season_files(self.canonical_path, self.configs, unreadable)
+        previous = previous_season_files(self.canonical_path, self.configs, unreadable, self._ctx.seasons)
         if unreadable:
             self._ctx.seasons.forget(self._folder, self._entry)
         return previous, frozenset(unreadable)
@@ -1106,7 +1131,7 @@ class _SeasonView:
             if path == self.canonical_path and len(group.episodes) == 1:
                 paths = group.episodes + self.previous_season()
             else:
-                paths = _signature_paths(path, group, self.configs, self.unreadable)
+                paths = _signature_paths(path, group, self.configs, self.unreadable, self._ctx.seasons)
             results.signatures[path] = _signature(self._ctx, paths, on_disk=results.items)
         return results.signatures[path]
 
@@ -1615,7 +1640,11 @@ def _previous_season_points(
     """The previous season's files a lone episode is matched with: current records with a cached fingerprint that
     isn't empty (each record is added to ``records``)."""
     previous: dict[str, np.ndarray] = {}
-    listed = previous_season_files(canonical_path, _server_configs(ctx)) if previous_files is None else previous_files
+    listed = (
+        previous_season_files(canonical_path, _server_configs(ctx), listings=ctx.seasons)
+        if previous_files is None
+        else previous_files
+    )
     for path in listed:
         member = _current_record(ctx, path)
         cached = _cached_points(ctx, member)
@@ -1755,7 +1784,7 @@ def detect_season_audio(
                 logger.info("Season audio leaves out {} this time: {}", os.path.basename(member.canonical_path), exc)
                 return None
             if not ((cancel_check and cancel_check()) or is_shutting_down()):
-                attempted = _signature(ctx, _signature_paths(rec.canonical_path, group, configs))
+                attempted = _signature(ctx, _signature_paths(rec.canonical_path, group, configs, listings=ctx.seasons))
                 ctx.store.set_detector_failure(rec.id, Source.SEASON_AUDIO, attempted)
             raise DetectorUnavailableError(str(exc), this_file=True) from exc
         if found is None and own_file:
@@ -1834,7 +1863,9 @@ def detect_season_audio(
     # this answer due.
     matched = {path: member for path, member in records.items() if path not in left_out}
     rates = matching.rates if matching is not None else None
-    signature = _signature(ctx, _signature_paths(rec.canonical_path, group, configs), matched, rates=rates)
+    signature = _signature(
+        ctx, _signature_paths(rec.canonical_path, group, configs, listings=ctx.seasons), matched, rates=rates
+    )
     return DetectorAnswer(tuple(candidates), signature)
 
 

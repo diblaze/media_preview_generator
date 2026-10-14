@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from media_preview_generator.markers.external_ids import (
+    FolderNames,
     ids_from_path,
     ids_from_server_dict,
     is_extra,
@@ -515,6 +516,21 @@ class TestShowKey:
     def test_a_name_spelled_with_a_sharp_s_is_found_as_spelled(self):
         # Its key is casefolded ("weissensee"); the listing is searched for the word as spelled.
         assert same_show_names("Weißensee (2010)", ["Other (2010)", "WEIßENSEE (2010)"]) == ["WEIßENSEE (2010)"]
+
+    @pytest.mark.parametrize("name", ["Alias (2001) {tvdb-75930}", "Alias (2001)", "2001", "Line\nBreak (2001)"])
+    def test_a_folders_names_joined_once_find_what_the_list_finds(self, name):
+        entries = [
+            "Alias {tvdb-75930}",
+            "ALIAS (2001)",
+            "2001",
+            "Line\nBreak (2001)",
+            "Other {tvdb-75930}",
+            "Alias Grace",
+        ]
+        folder = FolderNames(entries)
+        assert same_show_names(name, folder) == same_show_names(name, entries)
+        assert same_show_names(name, folder) == same_show_names(name, folder)  # reusable
+        assert sorted(folder.names()) == sorted(entries)
 
 
 class TestIdsFromServerDict:

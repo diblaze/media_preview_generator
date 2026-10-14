@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -21,6 +23,106 @@ from tests.markers.pipeline_helpers import _run
 from tests.markers.test_season_followups import _season_ctx
 
 show = test_season.show
+
+
+def _settled(folder, *, changed_s_ago: float = 3600.0) -> None:
+    """Date a folder's mtime back: one changed in the last two minutes is never kept."""
+    when = time.time_ns() - int(changed_s_ago * 1e9)
+    os.utime(folder, ns=(when, when))
+
+
+class TestListing:
+    def _counted(self, folder):
+        reads = []
+
+        def read():
+            reads.append(1)
+            return sorted(os.listdir(folder))
+
+        return reads, read
+
+    def test_a_listing_is_reused_while_the_folder_is_unchanged_and_the_time_isnt_up(self, tmp_path):
+        now = [0.0]
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: now[0])
+        reads, read = self._counted(tmp_path)
+        (tmp_path / "Show A").mkdir()
+        _settled(tmp_path)
+        assert cache.listing(str(tmp_path), read) == ["Show A"]
+        now[0] = 59.9
+        assert cache.listing(str(tmp_path), read) == ["Show A"]
+        assert len(reads) == 1
+        now[0] = 60.0
+        cache.listing(str(tmp_path), read)
+        assert len(reads) == 2
+
+    @pytest.mark.parametrize("change", ["added", "removed", "renamed"])
+    def test_a_show_added_removed_or_renamed_is_seen_with_no_time_passed(self, tmp_path, change):
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        _reads, read = self._counted(tmp_path)
+        (tmp_path / "Show A").mkdir()
+        _settled(tmp_path)
+        cache.listing(str(tmp_path), read)
+        if change == "added":
+            (tmp_path / "Show B").mkdir()
+        elif change == "removed":
+            (tmp_path / "Show A").rmdir()
+        else:
+            (tmp_path / "Show A").rename(tmp_path / "Show B")
+        expected = {"added": ["Show A", "Show B"], "removed": [], "renamed": ["Show B"]}[change]
+        assert cache.listing(str(tmp_path), read) == expected
+
+    def test_a_folder_changed_lately_is_never_kept(self, tmp_path):
+        # A show added in the same mtime tick as the listing (coarse timestamps) would leave the mtime as it was.
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        reads, read = self._counted(tmp_path)
+        for ago in (0.0, 30.0, -30.0):  # -30: a disk whose clock runs ahead
+            _settled(tmp_path, changed_s_ago=ago)
+            cache.listing(str(tmp_path), read)
+            cache.listing(str(tmp_path), read)
+        assert len(reads) == 6
+
+    def test_another_folder_at_the_same_path_with_the_same_mtime_is_listed_again(self, tmp_path):
+        folder = tmp_path / "TV Shows"
+        folder.mkdir()
+        (folder / "Show A").mkdir()
+        _settled(folder)
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        _reads, read = self._counted(folder)
+        assert cache.listing(str(folder), read) == ["Show A"]
+        mtime = os.stat(folder).st_mtime_ns
+        folder.rename(tmp_path / "old")
+        folder.mkdir()  # a remount: another directory where the folder was
+        (folder / "Show B").mkdir()
+        os.utime(folder, ns=(mtime, mtime))
+        assert cache.listing(str(folder), read) == ["Show B"]
+
+    def test_nothing_is_kept_without_a_ttl(self, tmp_path):
+        cache = SeasonCache()
+        _settled(tmp_path)
+        reads, read = self._counted(tmp_path)
+        cache.listing(str(tmp_path), read)
+        cache.listing(str(tmp_path), read)
+        assert len(reads) == 2
+
+    def test_a_folder_that_cant_be_stat_or_read_is_never_kept(self, tmp_path):
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        _settled(tmp_path)
+        missing = str(tmp_path / "gone")
+        with pytest.raises(FileNotFoundError):
+            cache.listing(missing, lambda: os.listdir(missing))
+        reads = []
+
+        def flaky():
+            reads.append(1)
+            if len(reads) == 1:
+                raise OSError(errno.EIO, "stale")
+            return ["Show A"]
+
+        with pytest.raises(OSError):
+            cache.listing(str(tmp_path), flaky)
+        assert cache.listing(str(tmp_path), flaky) == ["Show A"]
+        assert cache.listing(str(tmp_path), flaky) == ["Show A"]
+        assert len(reads) == 2
 
 
 class TestSeasonCache:
@@ -68,6 +170,41 @@ class TestSeasonCache:
         for t in threads:
             t.join()
         assert len(builds) == 1 and seen == [("videos", "complete")] * 8
+
+    def test_a_slow_build_keeps_no_one_waiting_for_another_fact_or_the_results(self):
+        entry = SeasonCache(ttl_s=60.0).entry("/s1")
+        building, release = threading.Event(), threading.Event()
+
+        def slow():
+            building.set()
+            release.wait(5)
+            return "videos"
+
+        slow_thread = threading.Thread(target=lambda: entry.once("videos", slow))
+        slow_thread.start()
+        building.wait(5)
+        got = []
+        asker = threading.Thread(
+            target=lambda: got.append((entry.once("previous", lambda: "previous"), entry.results(0).generation))
+        )
+        asker.start()
+        asker.join(2)
+        answered_meanwhile = not asker.is_alive()
+        release.set()
+        slow_thread.join()
+        asker.join()
+        assert answered_meanwhile and got == [("previous", 0)]
+        assert entry.once("videos", lambda: "built again") == "videos"
+
+    def test_a_build_that_raises_stores_nothing_and_the_next_asker_builds(self):
+        entry = SeasonCache(ttl_s=60.0).entry("/s1")
+
+        def fails():
+            raise OSError(errno.EIO, "stale")
+
+        with pytest.raises(OSError):
+            entry.once("videos", fails)
+        assert entry.once("videos", lambda: "videos") == "videos"
 
     def test_results_start_empty_once_the_stores_generation_moves(self):
         entry = SeasonCache(ttl_s=60.0).entry("/s1")

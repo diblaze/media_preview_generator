@@ -16,10 +16,12 @@ import pytest
 from media_preview_generator.markers.audio import POINT_S, season
 from media_preview_generator.markers.models import FileIdentity, Source
 from media_preview_generator.markers.pipeline import DetectorUnavailableError
+from media_preview_generator.markers.season_cache import SeasonCache
 from media_preview_generator.servers.base import Library, ServerType
 from tests.markers.audio.helpers import DUR, INTRO, N_POINTS, SEASON_RAW, Audio, season_spec
 from tests.markers.fakes import FakeRegistry, ready_publisher, server_config
 from tests.markers.pipeline_helpers import _ctx, _run
+from tests.markers.test_season_cache import _settled
 
 SHOW = "Lioness (2023) {tvdb-1}"
 OFFSETS = {e: at for e, at in zip(range(1, 9), (510, 300, 720, 95, 610, 410, 880, 160), strict=True)}
@@ -248,6 +250,97 @@ class TestSeasonFolders:
         unreadable: set[str] = set()
         folders = season.season_folders(e1, [_library(str(disks[0]), str(disks[1]))], unreadable)
         assert folders == (os.path.dirname(e1),) and unreadable == set()
+
+
+class TestListedThroughTheJobsCache:
+    """A job lists the library folders holding shows once for all its seasons, and again once one changes."""
+
+    def _counting(self, monkeypatch, folders):
+        listed = []
+        real_listdir = os.listdir
+
+        def counting(folder):
+            if str(folder) in folders:
+                listed.append(str(folder))
+            return real_listdir(folder)
+
+        monkeypatch.setattr(season.os, "listdir", counting)
+        return listed
+
+    def test_the_library_folders_are_listed_once_for_every_season_of_the_job(self, disks, monkeypatch):
+        paths = [_episodes(disks[0], n, 1)[0] for n in (1, 2, 3)] + [_episodes(disks[1], n, 2)[0] for n in (1, 2, 3)]
+        paths.append(_episodes(disks[1], 1, 1, show="Other (2020) {tvdb-2}")[0])
+        configs = [_library(str(disks[0]), str(disks[1]))]
+        expected = [(season.season_folders(p, configs), season.previous_season_files(p, configs)) for p in paths]
+        for disk in disks:
+            _settled(disk)
+        listed = self._counting(monkeypatch, {str(d) for d in disks})
+        cache = SeasonCache(ttl_s=60.0)
+        got = [
+            (season.season_folders(p, configs, None, cache), season.previous_season_files(p, configs, None, cache))
+            for p in paths
+        ]
+        assert got == expected
+        assert sorted(listed) == sorted(str(d) for d in disks)
+
+    def test_a_show_new_on_another_disk_is_found_by_the_next_season_with_no_time_passed(self, disks):
+        (e1,) = _episodes(disks[0], 1, 1)
+        configs = [_library(str(disks[0]), str(disks[1]))]
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        for disk in disks:
+            _settled(disk)
+        assert season.season_folders(e1, configs, None, cache) == (os.path.dirname(e1),)
+        (e2,) = _episodes(disks[1], 1, 2)
+        assert season.season_folders(e1, configs, None, cache) == (os.path.dirname(e1), os.path.dirname(e2))
+
+    def test_a_folder_that_cant_be_read_for_now_is_reported_every_time(self, disks, monkeypatch):
+        (e1,) = _episodes(disks[0], 1, 1)
+        (e2,) = _episodes(disks[1], 1, 2)
+        real_listdir = os.listdir
+        stale = [True]
+
+        def failing(folder):
+            if str(folder) == str(disks[1]) and stale[0]:
+                raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+            return real_listdir(folder)
+
+        monkeypatch.setattr(season.os, "listdir", failing)
+        configs = [_library(str(disks[0]), str(disks[1]))]
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: 0.0)
+        for disk in disks:
+            _settled(disk)
+        for _ in range(2):
+            unreadable: set[str] = set()
+            assert season.season_folders(e1, configs, unreadable, cache) == (os.path.dirname(e1),)
+            assert unreadable == {str(disks[1])}
+        stale[0] = False
+        unreadable = set()
+        assert season.season_folders(e1, configs, unreadable, cache) == (os.path.dirname(e1), os.path.dirname(e2))
+        assert unreadable == set()
+
+    def test_a_disk_that_goes_stale_after_its_listing_keeps_that_listing_for_the_jobs_time(self, disks, monkeypatch):
+        # As if the season were checked just before the disk went stale: the show isn't there, so nothing waits on it.
+        (e1,) = _episodes(disks[0], 1, 1)
+        configs = [_library(str(disks[0]), str(disks[1]))]
+        now = [0.0]
+        cache = SeasonCache(ttl_s=60.0, clock=lambda: now[0])
+        for disk in disks:
+            _settled(disk)
+        assert season.season_folders(e1, configs, set(), cache) == (os.path.dirname(e1),)
+        real_listdir = os.listdir
+
+        def failing(folder):
+            if str(folder) == str(disks[1]):
+                raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+            return real_listdir(folder)
+
+        monkeypatch.setattr(season.os, "listdir", failing)
+        unreadable: set[str] = set()
+        assert season.season_folders(e1, configs, unreadable, cache) == (os.path.dirname(e1),)
+        assert unreadable == set()
+        now[0] = 60.0
+        assert season.season_folders(e1, configs, unreadable, cache) == (os.path.dirname(e1),)
+        assert unreadable == {str(disks[1])}
 
 
 class TestSeasonGroupAcrossDisks:

@@ -130,7 +130,21 @@ def show_key(name: str) -> tuple[str, str]:
     return "name", _bare_name(name)
 
 
-def same_show_names(name: str, entries: Iterable[str]) -> list[str]:
+class FolderNames:
+    """A folder's entry names, joined once for :func:`same_show_names`' scan (a TV library's folder, listed for every
+    season of a job, can hold thousands of shows)."""
+
+    def __init__(self, entries: Iterable[str]) -> None:
+        listed = list(entries)
+        self.text = "\n".join(entry for entry in listed if "\n" not in entry)
+        self.with_newline = [entry for entry in listed if "\n" in entry]
+
+    def names(self) -> list[str]:
+        """Every entry name."""
+        return (self.text.split("\n") if self.text else []) + self.with_newline
+
+
+def same_show_names(name: str, entries: Iterable[str] | FolderNames) -> list[str]:
     """The entries of a folder that are the same show as ``name`` (the same :func:`show_key`).
 
     Only an entry holding the key's id, or the longest word of the name (one with a letter, so not the year), can be:
@@ -138,7 +152,7 @@ def same_show_names(name: str, entries: Iterable[str]) -> list[str]:
 
     Args:
         name: A show folder's name.
-        entries: Names in another folder.
+        entries: Names in another folder, or its :class:`FolderNames`.
 
     Returns:
         The matching entries.
@@ -150,15 +164,15 @@ def same_show_names(name: str, entries: Iterable[str]) -> list[str]:
         hint = max(lettered, key=len) if lettered else ""
     else:
         hint = key[1]
-    listed = list(entries)
+    folder = entries if isinstance(entries, FolderNames) else FolderNames(entries)
     if not hint:
-        return [entry for entry in listed if show_key(entry) == key]
+        return [entry for entry in folder.names() if show_key(entry) == key]
     could_be = re.compile(re.escape(hint), re.IGNORECASE)
     # One scan of the listing joined by newlines, then each hit's line (a name holding a newline is checked alone).
-    text = "\n".join(entry for entry in listed if "\n" not in entry)
+    text = folder.text
     line_starts = sorted({text.rfind("\n", 0, hit.start()) + 1 for hit in could_be.finditer(text)})
     found = [_line_at(text, at) for at in line_starts]
-    found += [entry for entry in listed if "\n" in entry]
+    found += folder.with_newline
     return [entry for entry in found if show_key(entry) == key]
 
 
