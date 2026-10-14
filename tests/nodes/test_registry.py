@@ -422,3 +422,25 @@ def test_get_registry_is_a_singleton_and_set_registry_replaces_it():
     assert reg.get_registry() is first
     reg.set_registry(None)
     assert reg.get_registry() is not first
+
+
+def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
+    import media_preview_generator.web.app as app_mod
+
+    calls = []
+
+    class Stub:
+        def start(self):
+            calls.append("start")
+
+        def stop(self):
+            calls.append("stop")
+
+    # The autouse conftest fixture replaced the starter on this same monkeypatch; undo puts the real one back.
+    monkeypatch.undo()
+    stub = Stub()
+    reg.set_registry(stub)
+    registered = []
+    monkeypatch.setattr(app_mod.atexit, "register", registered.append)
+    app_mod._start_node_registry()
+    assert calls == ["start"] and registered == [stub.stop]
