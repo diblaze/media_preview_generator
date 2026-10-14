@@ -261,3 +261,54 @@ def test_default_mappings_are_one_row_per_top_library_folder(tmp_path):
         {"app_prefix": movies, "node_prefix": movies},
         {"app_prefix": tv, "node_prefix": tv},
     ]
+
+
+class TestAStalledMount:
+    """A directory read on a stalled network mount blocks in the kernel; Test access answers anyway."""
+
+    def test_a_library_that_hangs_times_out_and_the_others_are_still_checked(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        _video(tmp_path / "media" / "Movies" / "a.mkv")
+        stalled = tmp_path / "media" / "TV"
+        stalled.mkdir(parents=True)
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                    {"id": "2", "name": "TV", "remote_paths": ["/plexmedia/TV"]},
+                ],
+            )
+        ]
+        release = threading.Event()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(stalled):
+                release.wait(30)  # stands in for a read stuck on a dead NFS server
+            return real_scandir(path)
+
+        monkeypatch.setattr(nm.os, "scandir", scandir)
+        monkeypatch.setattr(nm, "SAMPLE_BUDGET_S", 0.5)
+        client = FakeClient()
+        started = time.monotonic()
+        try:
+            result = nm.run_test_access(client, [PathMapping(str(tmp_path / "media"), "/mnt/media")], servers)
+        finally:
+            release.set()
+        assert time.monotonic() - started < 5
+        movies, tv = result["libraries"]
+        assert (movies["checked"], movies["ok"], movies["error"]) == (1, True, None)
+        assert (tv["checked"], tv["ok"]) == (0, False)
+        assert tv["error"] == f"Timed out reading {stalled} (no answer within 0.5 s)"
+        assert [f["path"] for f in client.requests[0][1]] == [str(tmp_path / "media" / "Movies" / "a.mkv")]
+
+    def test_a_walk_still_going_at_the_deadline_stops_between_reads(self, tmp_path):
+        import time
+
+        _video(tmp_path / "lib" / "a" / "x.mkv")
+        sampling = nm._Sampling()
+        nm._sample_into(sampling, str(tmp_path / "lib"), limit=3, walk_limit=500, deadline=time.monotonic() - 1)
+        assert sampling.timed_out is True and sampling.found == []
