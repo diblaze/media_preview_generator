@@ -1,0 +1,794 @@
+<title>Remote Worker Nodes</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600&display=swap">
+<style>
+/* Layout: one reading column; each diagram sits in its own scrollable frame. Blue = master, amber = node. */
+:root {
+  --bg: #F3F5F8; --surface: #FFFFFF; --fg: #15202B; --fg-2: #4C5A68; --line: #C7D0DA;
+  --m: #2B59A8; --m-bg: #E7EDF8; --n: #A35F0D; --n-bg: #FBEFDF;
+  --bad: #B3261E; --bad-bg: #FBE8E6; --good: #1E7548; --good-bg: #E2F2E8;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --cond: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0F151B; --surface: #17202A; --fg: #E5EAF0; --fg-2: #A2AFBC; --line: #34424F;
+  --m: #84A9EA; --m-bg: #1A2940; --n: #E6A75C; --n-bg: #33261A;
+  --bad: #F28B82; --bad-bg: #3A1F1C; --good: #6DCB99; --good-bg: #16301F; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0F151B; --surface: #17202A; --fg: #E5EAF0; --fg-2: #A2AFBC; --line: #34424F;
+  --m: #84A9EA; --m-bg: #1A2940; --n: #E6A75C; --n-bg: #33261A;
+  --bad: #F28B82; --bad-bg: #3A1F1C; --good: #6DCB99; --good-bg: #16301F; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--sans); }
+.wrap { max-width: 1060px; margin: 0 auto; padding-block: 40px 80px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+h1, h2 { font-family: var(--cond); font-weight: 600; text-wrap: balance; letter-spacing: -0.01em; }
+h1 { font-size: 2.2rem; line-height: 1.15; margin: 0 0 12px; }
+h2 { font-size: 1.45rem; margin: 56px 0 10px; padding-top: 18px; border-top: 1px solid var(--line); }
+h3 { font-size: 1rem; font-weight: 600; margin: 0 0 6px; }
+p { margin: 0 0 12px; max-width: 70ch; }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+.lede { font-size: 1.08rem; color: var(--fg-2); max-width: 68ch; }
+.eyebrow { font: 500 0.72rem var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-2); margin-bottom: 8px; }
+.key { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 18px 0 0; font-size: 0.85rem; color: var(--fg-2); }
+.key span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; display: inline-block; }
+.sw.m { background: var(--m-bg); border-color: var(--m); }
+.sw.n { background: var(--n-bg); border-color: var(--n); }
+.sw.b { background: var(--bad-bg); border-color: var(--bad); }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px; margin: 26px 0 0; }
+nav.toc a { font-size: 0.84rem; color: var(--fg); text-decoration: none; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); }
+nav.toc a:hover, nav.toc a:focus-visible { border-color: var(--m); color: var(--m); outline: none; }
+
+figure { margin: 18px 0 8px; }
+.frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.frame svg { display: block; width: 100%; min-width: 760px; height: auto; color: var(--fg-2); }
+figcaption { font-size: 0.86rem; color: var(--fg-2); margin-top: 8px; max-width: 80ch; }
+
+/* SVG roles */
+svg text { fill: var(--fg); font-family: var(--sans); font-size: 12.5px; }
+svg .t-sub { fill: var(--fg-2); font-size: 11px; }
+svg .t-mono { font-family: var(--mono); font-size: 11px; }
+svg .t-head { font-weight: 600; font-size: 13px; }
+svg .t-m { fill: var(--m); } svg .t-n { fill: var(--n); } svg .t-bad { fill: var(--bad); } svg .t-good { fill: var(--good); }
+svg .bx { fill: var(--surface); stroke: var(--line); stroke-width: 1.2; }
+svg .bx-m { fill: var(--m-bg); stroke: var(--m); stroke-width: 1.3; }
+svg .bx-n { fill: var(--n-bg); stroke: var(--n); stroke-width: 1.3; }
+svg .bx-bad { fill: var(--bad-bg); stroke: var(--bad); stroke-width: 1.3; }
+svg .bx-good { fill: var(--good-bg); stroke: var(--good); stroke-width: 1.3; }
+svg .bx-ghost { fill: none; stroke: var(--n); stroke-width: 1.2; stroke-dasharray: 5 4; }
+svg .bx-inner { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+svg .ar { stroke: var(--fg-2); stroke-width: 1.5; fill: none; }
+svg .ar-n { stroke: var(--n); stroke-width: 1.6; fill: none; }
+svg .ar-m { stroke: var(--m); stroke-width: 1.6; fill: none; }
+svg .ar-dash { stroke-dasharray: 5 4; }
+svg .life { stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 3 4; }
+svg .mk { fill: var(--fg-2); } svg .mk-n { fill: var(--n); } svg .mk-m { fill: var(--m); } svg .mk-bad { fill: var(--bad); } svg .mk-good { fill: var(--good); }
+svg .ar-bad { stroke: var(--bad); stroke-width: 1.6; fill: none; stroke-dasharray: 6 4; }
+svg .ar-good { stroke: var(--good); stroke-width: 1.6; fill: none; }
+svg .bx-vm { fill: none; stroke: var(--fg-2); stroke-width: 1.2; stroke-dasharray: 4 4; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 16px 0; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.card ul { margin: 4px 0 10px; padding-left: 18px; font-size: 0.9rem; }
+.card li { margin: 2px 0; }
+.lab { font: 500 0.7rem var(--mono); letter-spacing: 0.07em; text-transform: uppercase; display: block; margin-top: 6px; }
+.lab.n { color: var(--n); } .lab.m { color: var(--m); }
+.api { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font: 0.84rem/1.75 var(--mono); }
+.api div { white-space: nowrap; }
+.api b { font-weight: 500; color: var(--m); display: inline-block; min-width: 4.2em; }
+.api i { font-style: normal; color: var(--fg-2); font-family: var(--sans); }
+
+.conf { display: grid; gap: 10px; margin: 16px 0; }
+.row { display: grid; grid-template-columns: 9.5em 1fr; gap: 14px; align-items: start; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.row > div { min-width: 0; }
+.chip { font: 500 0.72rem var(--mono); letter-spacing: 0.05em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; text-align: center; border: 1px solid; }
+.chip.hi { color: var(--good); background: var(--good-bg); border-color: var(--good); }
+.chip.md { color: var(--n); background: var(--n-bg); border-color: var(--n); }
+.chip.lo { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
+.row p { margin: 0; font-size: 0.92rem; }
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 14px 0; display: grid; gap: 10px; }
+.steps li { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px 12px 52px; position: relative; font-size: 0.93rem; }
+.steps li::before { content: counter(s); position: absolute; left: 16px; top: 11px; font: 600 1.05rem var(--cond); color: var(--m); }
+.decide { display: grid; gap: 10px; margin: 14px 0; }
+.decide div { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--m); border-radius: 6px; padding: 12px 16px; font-size: 0.93rem; }
+.never { background: var(--bad-bg); border: 1px solid var(--bad); border-radius: 8px; padding: 12px 16px; font-size: 0.92rem; }
+.never ul { margin: 6px 0 0; padding-left: 18px; }
+@media (max-width: 560px) { .row { grid-template-columns: 1fr; } h1 { font-size: 1.8rem; } }
+</style>
+<style>
+/* App-native mockups: the app's own dark tokens, deliberately single-theme (the app defaults to dark). */
+.app { --a-bg:#1a1a2e; --a-panel:#252538; --a-inset:#2e2e40; --a-line:rgba(255,255,255,.08); --a-line2:rgba(255,255,255,.14);
+  --a-text:#d8dce6; --a-em:#e8eaf2; --a-muted:#a3a8bd; --a-faint:#9499b0; --a-accent:#e5a00d; --a-accent-soft:rgba(229,160,13,.14);
+  --a-ok:#4fbf8f; --a-bad:#f1858e; --a-run:#74adff; --a-prev:#5b9dff; --a-intro:#b49cff; --a-loud:#36d1c4;
+  --a-mono: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  background: var(--a-bg); color: var(--a-text); font: 13px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  border-radius: 10px; padding: 16px; border: 1px solid #0d0d18; overflow-x: auto; color-scheme: dark; }
+.app * { box-sizing: border-box; }
+.app-inner { min-width: 720px; display: grid; gap: 12px; }
+.app h4 { margin: 0; font-size: 17px; font-weight: 600; color: var(--a-em); }
+.app .bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.app .muted { color: var(--a-muted); } .app .faint { color: var(--a-faint); font-size: 12px; }
+.app .card { background: linear-gradient(rgba(255,255,255,.045), rgba(255,255,255,.02)); border: 1px solid var(--a-line); border-radius: 12px; padding: 14px 16px; }
+.app .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--a-line2); background: transparent; color: var(--a-text); font: inherit; cursor: default; white-space: nowrap; }
+.app .btn.pri { background: #d19610; color: #1a1203; border-color: #d19610; font-weight: 600; }
+.app .btn.sm { height: 26px; padding: 0 9px; font-size: 12px; }
+.app .pill { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid; white-space: nowrap; }
+.app .ok { color: var(--a-ok); background: rgba(79,191,143,.14); border-color: rgba(79,191,143,.35); }
+.app .bad { color: var(--a-bad); background: rgba(241,133,142,.14); border-color: rgba(241,133,142,.35); }
+.app .warn { color: var(--a-accent); background: var(--a-accent-soft); border-color: rgba(229,160,13,.35); }
+.app .run { color: var(--a-run); background: rgba(116,173,255,.14); border-color: rgba(116,173,255,.35); }
+.app .off { color: var(--a-muted); background: rgba(255,255,255,.05); border-color: var(--a-line2); }
+.app .role { color: var(--a-em); background: var(--a-inset); border-color: var(--a-line2); font-weight: 500; }
+.app .mono { font-family: var(--a-mono); font-size: 12px; }
+.app .nodes { display: grid; gap: 8px; }
+.app .node { display: grid; grid-template-columns: 26px 1.3fr 1.6fr 1fr auto; gap: 12px; align-items: center; background: var(--a-panel); border: 1px solid var(--a-line); border-radius: 10px; padding: 10px 14px; }
+.app .node.alert { border-color: rgba(229,160,13,.45); } .app .node.down { border-color: rgba(241,133,142,.45); }
+.app .ico { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; background: var(--a-inset); color: var(--a-muted); font-size: 13px; }
+.app .nm { font-weight: 600; color: var(--a-em); font-size: 14px; } .app .sub { font-size: 12px; color: var(--a-muted); }
+.app .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: none; border: 0; border-radius: 0; padding: 0; }
+.app .field { display: grid; gap: 4px; } .app .field label { font-size: 12px; font-weight: 600; color: var(--a-muted); }
+.app .input { height: 34px; border-radius: 8px; border: 1px solid var(--a-line2); background: var(--a-inset); color: var(--a-em); padding: 0 10px; display: flex; align-items: center; font-family: var(--a-mono); font-size: 12px; }
+.app .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; } .app .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.app .map { display: grid; grid-template-columns: 1fr 22px 1fr 150px; gap: 8px; align-items: center; }
+.app .bucket { border-left: 3px solid; padding: 4px 0 4px 12px; display: grid; gap: 8px; }
+.app .bucket.b-bad { border-color: var(--a-bad); } .app .bucket.b-warn { border-color: var(--a-accent); } .app .bucket.b-ok { border-color: var(--a-ok); }
+.app .bh { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.app .chk { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; background: var(--a-panel); border: 1px solid var(--a-line); border-radius: 8px; padding: 9px 12px; }
+.app .diff { font-family: var(--a-mono); font-size: 12px; } .app .diff s { color: var(--a-bad); } .app .diff b { color: var(--a-ok); font-weight: 500; }
+.app .ii { display: inline-grid; place-items: center; width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--a-muted); color: var(--a-muted); font-size: 10px; font-style: normal; margin-left: 4px; }
+.app .wk { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.app .wcard { background: var(--a-panel); border: 1px solid var(--a-line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
+.app .wtop { display: flex; align-items: center; gap: 6px; } .app .wtop strong { color: var(--a-em); font-size: 13px; }
+.app .prog { height: 5px; background: var(--a-inset); border-radius: 3px; overflow: hidden; } .app .prog i { display: block; height: 100%; background: var(--a-run); }
+.app .metrics { display: flex; gap: 14px; font-size: 12px; color: var(--a-muted); } .app .metrics b { color: var(--a-text); font-weight: 500; }
+.app .member { display: grid; grid-template-columns: 2.2fr 70px 2fr; gap: 10px; align-items: center; background: var(--a-panel); border: 1px solid var(--a-line); border-radius: 8px; padding: 8px 10px; }
+.app .sel { height: 30px; border-radius: 7px; border: 1px solid var(--a-line2); background: var(--a-inset); padding: 0 10px; display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; color: var(--a-em); }
+.app .jt { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--a-line2); }
+.app .jt.p { color: var(--a-prev); border-color: rgba(91,157,255,.4); } .app .jt.i { color: var(--a-intro); border-color: rgba(180,156,255,.4); } .app .jt.l { color: var(--a-loud); border-color: rgba(54,209,196,.4); }
+.app .menu { background: var(--a-panel); border: 1px solid var(--a-line2); border-radius: 10px; padding: 6px; box-shadow: 0 6px 16px rgba(0,0,0,.22); display: grid; gap: 2px; font-size: 12.5px; }
+.app .menu .opt { padding: 6px 10px; border-radius: 6px; display: flex; justify-content: space-between; gap: 10px; } .app .menu .opt.hi { background: var(--a-accent-soft); }
+.app .menu .grp { padding: 6px 10px 2px; font-size: 11px; color: var(--a-faint); text-transform: uppercase; letter-spacing: .05em; }
+.app .log { background: #0b0b14; border: 1px solid var(--a-line); border-radius: 12px; padding: 10px 12px; font: 12.5px/1.65 var(--a-mono); color: #d9d9e6; overflow-x: auto; white-space: pre; }
+.app .log .i { color: #20c997; } .app .log .w { color: #ffc107; } .app .log .n { color: #e6a75c; }
+.app .bell { width: 380px; background: var(--a-panel); border: 1px solid var(--a-line2); border-radius: 10px; box-shadow: 0 6px 16px rgba(0,0,0,.22); }
+.app .ntf { display: grid; grid-template-columns: 18px 1fr; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--a-line); }
+.app .ntf:first-child { border-top: 0; }
+.app .ntf strong { color: var(--a-em); font-size: 12.5px; display: block; } .app .ntf a { color: var(--a-accent); font-size: 12px; }
+.app .sec-h { font-size: 12px; font-weight: 600; color: var(--a-muted); text-transform: uppercase; letter-spacing: .05em; }
+.mock-cap { font-size: .86rem; color: var(--fg-2); margin: 8px 0 0; max-width: 80ch; }
+.mocks { display: grid; grid-template-columns: minmax(0, 1fr); gap: 26px; margin-top: 14px; }
+.mock { min-width: 0; }
+.mock h3 { margin-bottom: 8px; }
+.stack { display: grid; gap: 10px; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin: 14px 0; }
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.box h3 { margin-bottom: 4px; }
+.box ul { margin: 6px 0 0; padding-left: 18px; font-size: .92rem; } .box li { margin: 3px 0; }
+.box.m { border-top: 3px solid var(--m); } .box.n { border-top: 3px solid var(--n); } .box.x { border-top: 3px solid var(--bad); }
+.case { display: grid; grid-template-columns: minmax(150px, 1fr) 2.2fr; gap: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.case > div { padding: 12px 16px; min-width: 0; } .case > div:first-child { background: var(--n-bg); font-weight: 600; font-size: .95rem; }
+.case p { margin: 0 0 4px; font-size: .92rem; } .case p:last-child { margin: 0; }
+.case .ev { font-size: .82rem; color: var(--fg-2); }
+.cases { display: grid; gap: 10px; margin: 14px 0; }
+.proof { display: grid; gap: 8px; margin: 14px 0; }
+.proof div { display: grid; grid-template-columns: 70px 1fr; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: .92rem; }
+.proof b.p { color: var(--good); font: 600 .78rem var(--mono); } .proof b.f { color: var(--n); font: 600 .78rem var(--mono); }
+.summary { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--m); border-radius: 8px; padding: 14px 18px; margin: 22px 0 0; }
+.summary ol { margin: 6px 0 0; padding-left: 20px; } .summary li { margin: 4px 0; }
+@media (max-width: 560px) { .case { grid-template-columns: 1fr; } .proof div { grid-template-columns: 1fr; } }
+</style>
+
+<div class="wrap">
+  <div class="eyebrow">Media Preview Generator · design proposal v3 · 15 Oct 2026</div>
+  <h1>Remote Worker Nodes</h1>
+  <p class="lede">Add other machines to the app. A <b>worker node</b> lends its GPU or CPU to the same queue. A <b>Plex database node</b> does Plex-database work on the machine where Plex runs, which is the fix for Plex on Windows (#407). The main app stays in charge of everything. Nodes only do the work they're handed.</p>
+  <div class="summary"><b>How it works, in five steps</b>
+    <ol>
+      <li>Run the node (Docker on Linux, or a small native install on Windows for the Plex database), then paste its address and key into the app's new <b>Nodes</b> page.</li>
+      <li>The app checks the node: version, GPUs, and whether it can see your media at the paths you mapped. Problems show up in the node's own Setup Health.</li>
+      <li>Add the node's GPU or CPU to a worker group, the same way as a local device. Schedules and job types work unchanged.</li>
+      <li>When a node worker picks up a file, the app sends just the heavy FFmpeg step to it and gets small results back: frames, numbers or timestamps. The app writes every output itself.</li>
+      <li>If a node can't see a file, drops out, or loses its GPU, the file goes to another worker and the node is flagged with a clear message.</li>
+    </ol>
+  </div>
+  <div class="key">
+    <span><i class="sw m"></i>The app (main container)</span>
+    <span><i class="sw n"></i>Node</span>
+    <span><i class="sw b"></i>Never reachable from a node</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#types">1 · Node types</a><a href="#who">2 · Who does what</a><a href="#overview">3 · Big picture</a>
+    <a href="#connect">4 · Connecting</a><a href="#paths">5 · Path mappings</a><a href="#groups">6 · Worker groups</a>
+    <a href="#gpus">7 · GPUs &amp; monitoring</a><a href="#run">8 · Running a file</a><a href="#errors">9 · When things go wrong</a>
+    <a href="#logs">10 · Logs</a><a href="#health">11 · Node Setup Health</a><a href="#windows">12 · Windows</a>
+    <a href="#ui">13 · UI mockups</a><a href="#proof">14 · What I tested</a><a href="#confidence">15 · Confidence</a>
+    <a href="#build">16 · Build order</a><a href="#decide">17 · To approve</a>
+  </nav>
+
+  <h2 id="types">1 · Node types</h2>
+  <p>Each node has one or two roles. The Nodes page shows them as chips.</p>
+  <div class="grid">
+    <div class="card"><h3>Worker node</h3>
+      <span class="lab n">Does</span><ul><li>FFmpeg/GPU work for previews, loudness, intros and credits</li><li>Reads media, read-only</li></ul>
+      <span class="lab m">Runs on</span><ul><li>Linux Docker: the same image as the app, started as a node</li><li>Windows: in Docker Desktop (NVIDIA GPUs only)</li></ul>
+      <span class="lab m">Used through</span><ul><li>Worker groups</li></ul></div>
+    <div class="card"><h3>Plex database node</h3>
+      <span class="lab n">Does</span><ul><li>Intro &amp; Credits and chapter writes (today's Plex helper)</li><li><b>New:</b> loudness writes and Library Health counts</li></ul>
+      <span class="lab m">Runs on</span><ul><li>Linux: today's small Plex helper image</li><li><b>New:</b> native Windows, about 25 MB, no Docker, no Python install</li></ul>
+      <span class="lab m">Used through</span><ul><li>A Plex server's Connection tab</li></ul></div>
+    <div class="card"><h3>Both roles in one node</h3>
+      <span class="lab n">When</span><ul><li>Plex runs on Linux, on a box with a spare GPU</li></ul>
+      <span class="lab m">How</span><ul><li>One worker-node container with Plex's config folder mounted gets both chips</li></ul>
+      <span class="lab m">Not in the first version</span><ul><li>A native Windows <em>worker</em> (see section 12 for why)</li></ul></div>
+  </div>
+
+  <h2 id="who">2 · Who does what</h2>
+  <p>Nodes are just workers. The app decides what runs, where, when and how often, and does every write.</p>
+  <div class="two">
+    <div class="box m"><h3>The app</h3><ul>
+      <li>Holds the queue, schedules, worker groups and retries</li>
+      <li>Talks to Plex, Emby and Jellyfin, and holds every token</li>
+      <li>Checks a file before work: stat, ffprobe, Plex hash, "already done?"</li>
+      <li>Builds BIFs and trickplay from returned frames, and writes every output</li>
+      <li>Owns markers.db, the loudness state and the job logs</li>
+      <li>Stores each node's path mappings and settings</li>
+      <li>Watches node health and raises alerts</li></ul></div>
+    <div class="box n"><h3>A worker node</h3><ul>
+      <li>Runs one step it's handed: frame extraction, a loudness pass, an audio fingerprint, the end-picture check, or credits detection</li>
+      <li>Maps the path, checks it's the same file, then runs FFmpeg on its own GPU or CPU</li>
+      <li>Reports progress, log lines and its own GPU/CPU fallbacks</li>
+      <li>Returns frames, numbers or timestamps, then deletes its temp files</li>
+      <li>Reports its GPUs, version and health when asked</li></ul></div>
+    <div class="box x"><h3>A node never</h3><ul>
+      <li>Gets a Plex, Emby or Jellyfin token or URL</li>
+      <li>Writes outside its own temp folder (worker) or Plex's database (Plex database node)</li>
+      <li>Decides what to work on, or retries by itself</li>
+      <li>Sends back a path that the app then writes to</li>
+      <li>Opens a file outside its mapped folders</li></ul></div>
+  </div>
+
+  <h2 id="overview">3 · Big picture</h2>
+    <figure>
+    <div class="frame">
+      <svg viewBox="0 0 1000 580" role="img" aria-label="The app talks to media servers, writes outputs and sends tasks to two worker nodes and database calls to a Plex database node on a Windows PC; worker nodes read media read-only.">
+        <defs>
+          <marker id="b-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="b-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+        </defs>
+        <text x="95" y="44" text-anchor="middle" class="t-sub">MEDIA SERVERS</text>
+        <rect x="20" y="60" width="150" height="40" rx="6" class="bx"/><text x="95" y="85" text-anchor="middle">Plex</text>
+        <rect x="20" y="110" width="150" height="40" rx="6" class="bx"/><text x="95" y="135" text-anchor="middle">Emby</text>
+        <rect x="20" y="160" width="150" height="40" rx="6" class="bx"/><text x="95" y="185" text-anchor="middle">Jellyfin</text>
+        <rect x="20" y="320" width="150" height="56" rx="6" class="bx"/><text x="95" y="344" text-anchor="middle">Plex config dir</text><text x="95" y="363" text-anchor="middle" class="t-mono t-sub">Media/localhost/…</text>
+        <rect x="20" y="400" width="150" height="60" rx="6" class="bx-bad"/><text x="95" y="424" text-anchor="middle" class="t-bad t-head">Nodes never</text><text x="95" y="443" text-anchor="middle" class="t-bad">reach this column</text>
+        <line x1="228" y1="130" x2="172" y2="130" class="ar" marker-start="url(#b-a)" marker-end="url(#b-a)"/><text x="200" y="122" text-anchor="middle" class="t-sub">API</text>
+        <line x1="248" y1="357" x2="172" y2="350" class="ar" marker-end="url(#b-a)"/><text x="205" y="340" text-anchor="middle" class="t-sub">BIF</text>
+
+        <rect x="230" y="20" width="330" height="436" rx="10" class="bx-m"/>
+        <text x="248" y="45" class="t-head t-m">The app · main container</text>
+        <rect x="250" y="60" width="290" height="34" rx="5" class="bx-inner"/><text x="395" y="82" text-anchor="middle">Web UI · Nodes page · settings</text>
+        <rect x="250" y="102" width="290" height="40" rx="5" class="bx-inner"/><text x="395" y="118" text-anchor="middle">Plex database access</text><text x="395" y="134" text-anchor="middle" class="t-sub">local folder, or a Plex database node</text>
+        <rect x="250" y="150" width="290" height="34" rx="5" class="bx-inner"/><text x="395" y="172" text-anchor="middle">Queue · worker groups · schedules</text>
+        <rect x="250" y="192" width="140" height="40" rx="5" class="bx-inner"/><text x="320" y="216" text-anchor="middle">Local GPU worker</text>
+        <rect x="400" y="192" width="140" height="40" rx="5" class="bx-inner"/><text x="470" y="216" text-anchor="middle">Local CPU worker</text>
+        <rect x="250" y="240" width="140" height="48" rx="5" class="bx-n"/><text x="320" y="260" text-anchor="middle">Remote worker</text><text x="320" y="278" text-anchor="middle" class="t-mono t-n">storage·GPU0</text>
+        <rect x="400" y="240" width="140" height="48" rx="5" class="bx-n"/><text x="470" y="260" text-anchor="middle">Remote worker</text><text x="470" y="278" text-anchor="middle" class="t-mono t-n">nuc·CPU</text>
+        <rect x="250" y="298" width="290" height="34" rx="5" class="bx-inner"/><text x="395" y="320" text-anchor="middle">Job logic: checks · decisions</text>
+        <rect x="250" y="340" width="290" height="34" rx="5" class="bx-inner"/><text x="395" y="362" text-anchor="middle">Publishers: BIF · sidecar · trickplay</text>
+        <rect x="250" y="382" width="290" height="34" rx="5" class="bx-inner"/><text x="395" y="404" text-anchor="middle">Frame cache · markers.db · job logs</text>
+        <text x="395" y="440" text-anchor="middle" class="t-sub">Holds every token. Decides everything.</text>
+
+        <rect x="640" y="20" width="340" height="168" rx="10" class="bx"/>
+        <text x="656" y="42" class="t-head">gaming-pc · Windows</text>
+        <rect x="655" y="74" width="140" height="38" rx="5" class="bx-inner"/><text x="725" y="98" text-anchor="middle">Plex Media Server</text>
+        <rect x="655" y="126" width="140" height="48" rx="5" class="bx-inner"/><text x="725" y="146" text-anchor="middle">Plex database</text><text x="725" y="164" text-anchor="middle" class="t-sub">local NTFS</text>
+        <line x1="725" y1="113" x2="725" y2="124" class="ar" marker-end="url(#b-a)"/>
+        <rect x="815" y="54" width="152" height="120" rx="8" class="bx-n"/>
+        <text x="891" y="78" text-anchor="middle" class="t-head t-n">Plex DB node</text><text x="891" y="99" text-anchor="middle">native Windows</text><text x="891" y="118" text-anchor="middle">no Docker</text><text x="891" y="137" text-anchor="middle" class="t-sub">runs as Plex's user</text>
+        <line x1="813" y1="150" x2="797" y2="150" class="ar-n" marker-end="url(#b-n)"/>
+        <polyline points="562,122 600,122 600,64 813,64" class="ar-n" marker-end="url(#b-n)"/>
+        <text x="706" y="58" text-anchor="middle" class="t-sub t-n">markers · chapters · loudness · counts</text>
+
+        <rect x="640" y="214" width="340" height="110" rx="10" class="bx-n"/>
+        <text x="656" y="237" class="t-head t-n">storage</text><text x="964" y="237" text-anchor="end" class="t-sub">worker node · Docker</text>
+        <text x="656" y="262">GPU0 Quadro P5000 · 24 CPU cores</text><text x="656" y="283">FFmpeg · credit text detector</text><text x="656" y="304" class="t-mono t-sub">media at /mnt/nas (read-only)</text>
+        <line x1="562" y1="258" x2="638" y2="258" class="ar-n" marker-start="url(#b-n)" marker-end="url(#b-n)"/><text x="600" y="250" text-anchor="middle" class="t-sub t-n">tasks</text>
+
+        <rect x="640" y="342" width="250" height="96" rx="10" class="bx-n"/>
+        <text x="656" y="365" class="t-head t-n">nuc</text><text x="874" y="365" text-anchor="end" class="t-sub">worker node</text>
+        <text x="656" y="390">CPU only · 8 cores</text><text x="656" y="412" class="t-mono t-sub">media at /media (read-only)</text>
+        <polyline points="562,276 610,276 610,390 638,390" class="ar-n" marker-start="url(#b-n)" marker-end="url(#b-n)"/><text x="624" y="383" text-anchor="middle" class="t-sub t-n">tasks</text>
+
+        <rect x="230" y="500" width="750" height="60" rx="8" class="bx"/>
+        <text x="605" y="525" text-anchor="middle" class="t-head">Media library · NAS or local disks</text><text x="605" y="545" text-anchor="middle" class="t-sub">each machine mounts it at its own path</text>
+        <line x1="395" y1="458" x2="395" y2="498" class="ar" marker-start="url(#b-a)" marker-end="url(#b-a)"/><text x="405" y="484" class="t-sub">stat · probe · hash · sidecars</text>
+        <line x1="765" y1="498" x2="765" y2="440" class="ar-n" marker-end="url(#b-n)"/><text x="775" y="474" class="t-sub t-n">read-only</text>
+        <line x1="935" y1="498" x2="935" y2="326" class="ar-n" marker-end="url(#b-n)"/><text x="925" y="474" text-anchor="end" class="t-sub t-n">read-only</text>
+      </svg>
+    </div>
+    <figcaption>Amber shows everything new. Worker nodes get tasks and read media. The Plex database node gets database calls and needs no media. Nothing a node runs can reach the servers or the Plex config folder.</figcaption>
+  </figure>
+
+
+  <h2 id="connect">4 · Connecting and staying connected</h2>
+  <p>Add a node by pasting its address and key, as with today's Plex helper. The node makes the key on first start and keeps it in its config folder, so a restart doesn't change it. The node also has a fixed ID, so the app notices if a different machine answers at the same address.</p>
+    <figure>
+    <div class="frame">
+      <svg viewBox="0 0 980 390" role="img" aria-label="Node states: from Ready a node can go Offline, Update needed, Key refused, Access problem or GPU lost; each returns to Ready when its check passes again.">
+        <defs><marker id="s-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker></defs>
+        <rect x="20" y="160" width="150" height="50" rx="8" class="bx"/><text x="95" y="190" text-anchor="middle" class="t-head">Connecting</text>
+        <rect x="250" y="160" width="150" height="50" rx="8" class="bx-good"/><text x="325" y="190" text-anchor="middle" class="t-head t-good">Ready</text>
+        <line x1="172" y1="185" x2="246" y2="185" class="ar" marker-end="url(#s-a)"/><text x="209" y="177" text-anchor="middle" class="t-sub">answers</text>
+        <rect x="700" y="20" width="260" height="50" rx="8" class="bx-bad"/><text x="714" y="41" class="t-head t-bad">Offline</text><text x="714" y="59" class="t-sub">running file → back in queue · retries</text>
+        <rect x="700" y="90" width="260" height="50" rx="8" class="bx-n"/><text x="714" y="111" class="t-head t-n">Update needed</text><text x="714" y="129" class="t-sub">workers idle until versions match</text>
+        <rect x="700" y="160" width="260" height="50" rx="8" class="bx-bad"/><text x="714" y="181" class="t-head t-bad">Key refused</text><text x="714" y="199" class="t-sub">workers idle · re-enter the key</text>
+        <rect x="700" y="230" width="260" height="50" rx="8" class="bx-n"/><text x="714" y="251" class="t-head t-n">Access problem</text><text x="714" y="269" class="t-sub">workers paused · fix the path mapping</text>
+        <rect x="700" y="300" width="260" height="50" rx="8" class="bx-n"/><text x="714" y="321" class="t-head t-n">GPU lost</text><text x="714" y="339" class="t-sub">GPU members paused · CPU carries on</text>
+        <line x1="402" y1="180" x2="698" y2="45" class="ar" marker-end="url(#s-a)"/><text x="548" y="104" text-anchor="middle" class="t-sub">3 asks fail (~12 s)</text>
+        <line x1="402" y1="182" x2="698" y2="115" class="ar" marker-end="url(#s-a)"/><text x="590" y="132" text-anchor="middle" class="t-sub">version differs</text>
+        <line x1="402" y1="185" x2="698" y2="185" class="ar" marker-end="url(#s-a)"/><text x="590" y="178" text-anchor="middle" class="t-sub">401 from node</text>
+        <line x1="402" y1="188" x2="698" y2="255" class="ar" marker-end="url(#s-a)"/><text x="590" y="243" text-anchor="middle" class="t-sub">3 files not visible</text>
+        <line x1="402" y1="190" x2="698" y2="325" class="ar" marker-end="url(#s-a)"/><text x="530" y="275" text-anchor="middle" class="t-sub">GPU stops answering</text>
+        <text x="490" y="378" text-anchor="middle" class="t-sub">Each state goes back to Ready by itself once its check passes again (checked every 30 s, or press "Check now").</text>
+      </svg>
+    </div>
+    <figcaption>The state shows as a coloured chip on the Nodes page, on that node's worker-group members, and in a bell alert. Each one says what to do.</figcaption>
+  </figure>
+
+  <ul>
+    <li><b>Health check:</b> the app asks every node for its status every 30 seconds. While a node is offline the gap grows to at most 5 minutes, and a "Check now" button forces it.</li>
+    <li><b>While a file runs:</b> the app's worker asks for progress every 1–2 seconds. Three failed asks in a row (about 12 seconds when tested) means the node is gone. The file goes back in the queue once.</li>
+    <li><b>Node restarts mid-file:</b> its in-memory tasks are gone, so the app gets "unknown task" and puts the file back in the queue.</li>
+    <li><b>App restarts mid-file:</b> the node stops any task the app hasn't asked about for 60 seconds, so nothing runs for nobody. The app's own job recovery then picks the file up again.</li>
+    <li><b>Same version on both sides:</b> the node says its version and protocol. A mismatch shows "Update needed" and the node's workers stay idle. Watchtower usually fixes it within the hour.</li>
+  </ul>
+
+  <h2 id="paths">5 · Path mappings, per node</h2>
+  <p>Each node gets its own mapping rows, stored in the app: <em>path on this app</em> → <em>path on the node</em>. The app sends its own path with every task. The node translates it and checks that it's the same file before starting.</p>
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 990 250" role="img" aria-label="A file path goes from the Plex path to the app's path to the node's path; the node checks it is inside its mapped roots and matches the app's size and modified time before running.">
+        <defs><marker id="p-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker></defs>
+        <rect x="20" y="40" width="170" height="78" rx="6" class="bx"/>
+        <text x="34" y="62" class="t-sub">PLEX REPORTS</text><text x="34" y="84" class="t-mono">/media/tv/Show/</text><text x="34" y="102" class="t-mono">S01E01.mkv</text>
+        <rect x="280" y="40" width="170" height="78" rx="6" class="bx-m"/>
+        <text x="294" y="62" class="t-sub t-m">APP SEES</text><text x="294" y="84" class="t-mono">/data/media/tv/Show/</text><text x="294" y="102" class="t-mono">S01E01.mkv</text>
+        <rect x="540" y="40" width="170" height="78" rx="6" class="bx-n"/>
+        <text x="554" y="62" class="t-sub t-n">NODE OPENS</text><text x="554" y="84" class="t-mono">/mnt/nas/tv/Show/</text><text x="554" y="102" class="t-mono">S01E01.mkv</text>
+        <rect x="800" y="40" width="170" height="78" rx="6" class="bx-n"/>
+        <text x="814" y="62" class="t-sub t-n">NODE CHECKS</text><text x="814" y="84">inside mapped roots?</text><text x="814" y="102">size + mtime match?</text>
+        <line x1="192" y1="79" x2="276" y2="79" class="ar" marker-end="url(#p-a)"/><text x="235" y="70" text-anchor="middle" class="t-sub">server map</text><text x="235" y="96" text-anchor="middle" class="t-sub">(exists)</text>
+        <line x1="452" y1="79" x2="536" y2="79" class="ar" marker-end="url(#p-a)"/><text x="495" y="70" text-anchor="middle" class="t-sub">node map</text><text x="495" y="96" text-anchor="middle" class="t-sub">(new)</text>
+        <line x1="712" y1="79" x2="796" y2="79" class="ar" marker-end="url(#p-a)"/><text x="755" y="70" text-anchor="middle" class="t-sub">stat</text>
+        <rect x="620" y="170" width="160" height="50" rx="6" class="bx-good"/><text x="700" y="191" text-anchor="middle" class="t-good t-head">✓ run the task</text><text x="700" y="209" text-anchor="middle" class="t-sub">FFmpeg starts</text>
+        <rect x="810" y="170" width="160" height="50" rx="6" class="bx-bad"/><text x="890" y="191" text-anchor="middle" class="t-bad t-head">✗ fail at once</text><text x="890" y="209" text-anchor="middle" class="t-sub">"storage can't see file"</text>
+        <polyline points="860,120 860,145 700,145 700,166" class="ar" marker-end="url(#p-a)"/><text x="770" y="140" text-anchor="middle" class="t-sub">yes</text>
+        <line x1="890" y1="120" x2="890" y2="166" class="ar" marker-end="url(#p-a)"/><text x="902" y="150" class="t-sub">no</text>
+        <text x="20" y="188" class="t-sub">Set on the app's Nodes page:</text>
+        <text x="20" y="208" class="t-mono">storage:  /data/media → /mnt/nas</text>
+        <text x="20" y="226" class="t-sub">sent with every task; the node stores nothing</text>
+      </svg>
+    </div>
+    <figcaption>The size and modified-time check catches a wrong mapping, an empty or stale mount, or a different copy of the file before FFmpeg starts. The roots check means a node only opens files under its mapped folders, even if someone has its key.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Same-file check:</b> size and modified time to the nanosecond. Device and inode numbers are deliberately not compared, because they differ between machines even for the same file (measured: ZFS vs NFS vs Docker vs mergerfs).</li>
+    <li><b>Test access button:</b> takes 3 real files from each library (from the server's library folders), runs them through both mappings, and checks them on the node. Results are per library, for example "Movies 3/3 ✓, TV Shows 0/3 ✗ not at /mnt/tv/…".</li>
+    <li><b>Suggestions:</b> when a whole library fails, the node lists the top folders under its mount, so the editor can suggest the right prefix.</li>
+    <li><b>Plex database nodes need no media mapping.</b> They work on Plex's database, not on media files.</li>
+  </ul>
+
+  <h2 id="groups">6 · Worker groups with nodes</h2>
+  <p>Groups don't change. A group <em>member</em> gains a <code>node</code> field. One group can mix local devices and devices from several nodes, and each device keeps its own budget.</p>
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 980 440" role="img" aria-label="Two groups with local and node members map to per-device budgets, which become live workers that the dispatcher fills.">
+        <defs>
+          <marker id="g-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="g-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+        </defs>
+        <text x="20" y="28" class="t-sub">GROUPS (settings)</text><text x="420" y="28" class="t-sub">DEVICE BUDGETS</text><text x="720" y="28" class="t-sub">LIVE WORKERS</text>
+        <rect x="20" y="40" width="330" height="150" rx="8" class="bx"/>
+        <text x="35" y="62" class="t-head">Group "Previews"</text><text x="35" y="80" class="t-sub">jobs: previews, loudness · all week</text>
+        <rect x="35" y="92" width="300" height="36" rx="5" class="bx-m"/><text x="47" y="114" class="t-mono">local · Intel iGPU · ×2</text>
+        <rect x="35" y="136" width="300" height="36" rx="5" class="bx-n"/><text x="47" y="158" class="t-mono">node storage · RTX 3090 · ×3</text>
+        <rect x="20" y="210" width="330" height="150" rx="8" class="bx"/>
+        <text x="35" y="232" class="t-head">Group "Markers overnight"</text><text x="35" y="250" class="t-sub">jobs: intros, credits · 01:00–07:00</text>
+        <rect x="35" y="262" width="300" height="36" rx="5" class="bx-n"/><text x="47" y="284" class="t-mono">node storage · CPU · ×4</text>
+        <rect x="35" y="306" width="300" height="36" rx="5" class="bx-m"/><text x="47" y="328" class="t-mono">local · CPU · ×2</text>
+
+        <rect x="420" y="92" width="230" height="36" rx="5" class="bx-m"/><text x="535" y="114" text-anchor="middle" class="t-mono">gpu:renderD128</text>
+        <rect x="420" y="136" width="230" height="36" rx="5" class="bx-n"/><text x="535" y="158" text-anchor="middle" class="t-mono">node:storage:gpu:0</text>
+        <rect x="420" y="262" width="230" height="36" rx="5" class="bx-n"/><text x="535" y="284" text-anchor="middle" class="t-mono">node:storage:cpu</text>
+        <rect x="420" y="306" width="230" height="36" rx="5" class="bx-m"/><text x="535" y="328" text-anchor="middle" class="t-mono">cpu</text>
+        <line x1="337" y1="110" x2="416" y2="110" class="ar" marker-end="url(#g-a)"/>
+        <line x1="337" y1="154" x2="416" y2="154" class="ar-n" marker-end="url(#g-n)"/>
+        <line x1="337" y1="280" x2="416" y2="280" class="ar-n" marker-end="url(#g-n)"/>
+        <line x1="337" y1="324" x2="416" y2="324" class="ar" marker-end="url(#g-a)"/>
+
+        <rect x="720" y="92" width="240" height="36" rx="5" class="bx-m"/><text x="840" y="114" text-anchor="middle">Local GPU · 1, 2</text>
+        <rect x="720" y="136" width="240" height="36" rx="5" class="bx-n"/><text x="840" y="158" text-anchor="middle">storage GPU0 · 1, 2, 3</text>
+        <rect x="720" y="262" width="240" height="36" rx="5" class="bx-n"/><text x="840" y="284" text-anchor="middle">storage CPU · 1–4 (01–07)</text>
+        <rect x="720" y="306" width="240" height="36" rx="5" class="bx-m"/><text x="840" y="328" text-anchor="middle">Local CPU · 1, 2</text>
+        <line x1="652" y1="110" x2="716" y2="110" class="ar" marker-end="url(#g-a)"/>
+        <line x1="652" y1="154" x2="716" y2="154" class="ar-n" marker-end="url(#g-n)"/>
+        <line x1="652" y1="280" x2="716" y2="280" class="ar-n" marker-end="url(#g-n)"/>
+        <line x1="652" y1="324" x2="716" y2="324" class="ar" marker-end="url(#g-a)"/>
+        <text x="535" y="210" text-anchor="middle" class="t-sub">groups using the same device</text><text x="535" y="226" text-anchor="middle" class="t-sub">share its budget (as today)</text>
+
+        <rect x="20" y="388" width="940" height="38" rx="6" class="bx-m"/>
+        <text x="490" y="412" text-anchor="middle">Dispatcher: next item → idle worker whose member allows that job type · GPU before CPU · offline node = budget 0</text>
+      </svg>
+    </div>
+    <figcaption>The group editor's device picker lists node devices next to local ones, labelled with the node name. An offline or out-of-date node counts as zero capacity, the same as a group outside its schedule, and the "will this run" estimate treats it that way.</figcaption>
+  </figure>
+  <ul>
+    <li>The device picker lists "This app" devices first, then each node's devices labelled with the node name.</li>
+    <li>Schedules, job types and worker counts work per member, exactly as today. Loudness stays CPU-only, as today.</li>
+    <li>A node that is offline, out of date, key-refused or failing access gives its members zero capacity. The group shows the reason ("storage offline") and the "will this run" estimate counts it as zero.</li>
+    <li>Removing a node leaves its members visible with "node removed", so nothing disappears silently.</li>
+  </ul>
+
+  <h2 id="gpus">7 · GPU detection and monitoring</h2>
+  <div class="two">
+    <div class="box n"><h3>What a node reports</h3><ul>
+      <li>GPUs from the app's own detection code (took 0.7–1.3 s, JSON-safe)</li>
+      <li>FFmpeg version and hardware decoders</li>
+      <li>The credit-text GPU self-test result for each GPU</li>
+      <li>CPU cores, memory, free temp space, load</li>
+      <li>Busy slots, running tasks, version, uptime</li></ul></div>
+    <div class="box"><h3>How the app uses it</h3><ul>
+      <li>The Nodes page and the group device picker</li>
+      <li>"GPU lost" when a GPU disappears or stops passing its test decode</li>
+      <li>The existing per-GPU alerts ("keeps failing", "credits on CPU"), now with the node name</li>
+      <li>"Rescan GPUs" asks the node to detect again</li></ul></div>
+  </div>
+  <p><b>Seen during testing:</b> a host-level systemd reload made the running node container lose its NVIDIA GPU ("Failed to initialize NVML"), while new containers still saw it. So a node re-checks its GPUs every 5 minutes and after any GPU error. A lost GPU pauses that node's GPU members with "restart the node container" as the fix. CPU members keep working.</p>
+
+  <h2 id="run">8 · Running one file on a node</h2>
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 980 640" role="img" aria-label="Sequence for one preview: app checks, node extracts frames while the app polls, node returns frames, app builds the BIF and publishes to Plex.">
+        <defs>
+          <marker id="r-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="r-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+          <marker id="r-m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-m"/></marker>
+        </defs>
+        <rect x="25" y="14" width="150" height="44" rx="6" class="bx-m"/><text x="100" y="41" text-anchor="middle" class="t-head t-m">Dispatcher</text>
+        <rect x="255" y="14" width="170" height="44" rx="6" class="bx-m"/><text x="340" y="33" text-anchor="middle" class="t-head t-m">Remote worker</text><text x="340" y="50" text-anchor="middle" class="t-sub">thread on master</text>
+        <rect x="555" y="14" width="170" height="44" rx="6" class="bx-n"/><text x="640" y="41" text-anchor="middle" class="t-head t-n">Node · storage</text>
+        <rect x="805" y="14" width="150" height="44" rx="6" class="bx"/><text x="880" y="41" text-anchor="middle" class="t-head">Plex</text>
+        <line x1="100" y1="58" x2="100" y2="625" class="life"/><line x1="340" y1="58" x2="340" y2="625" class="life"/><line x1="640" y1="58" x2="640" y2="625" class="life"/><line x1="880" y1="58" x2="880" y2="625" class="life"/>
+
+        <line x1="100" y1="96" x2="336" y2="96" class="ar-m" marker-end="url(#r-m)"/><text x="220" y="88" text-anchor="middle">item: path + servers</text>
+        <rect x="215" y="124" width="250" height="32" rx="5" class="bx-m"/><text x="340" y="145" text-anchor="middle">stat · fresh? · frame cache? (as today)</text>
+
+        <line x1="340" y1="190" x2="636" y2="190" class="ar-m" marker-end="url(#r-m)"/>
+        <text x="490" y="182" text-anchor="middle" class="t-mono">POST /v1/tasks  op=preview.frames</text>
+        <text x="490" y="206" text-anchor="middle" class="t-sub">path · interval · quality · HDR · device GPU0</text>
+        <rect x="505" y="220" width="270" height="32" rx="5" class="bx-n"/><text x="640" y="241" text-anchor="middle">map path · check file · FFmpeg on GPU0</text>
+
+        <line x1="340" y1="284" x2="636" y2="284" class="ar-m" marker-end="url(#r-m)"/><text x="490" y="276" text-anchor="middle" class="t-mono">GET /v1/tasks/42   every 2 s</text>
+        <line x1="640" y1="326" x2="344" y2="326" class="ar-n ar-dash" marker-end="url(#r-n)"/><text x="490" y="318" text-anchor="middle">37% · 4.1× · new log lines</text>
+        <text x="490" y="342" text-anchor="middle" class="t-sub">→ worker table + job log ("storage/GPU0: …")</text>
+
+        <line x1="340" y1="376" x2="636" y2="376" class="ar-m ar-dash" marker-end="url(#r-m)"/><text x="490" y="368" text-anchor="middle"><tspan class="t-mono">cancel</tspan> / <tspan class="t-mono">pause</tspan>  only if you stop the job</text>
+
+        <line x1="640" y1="420" x2="344" y2="420" class="ar-n" marker-end="url(#r-n)"/><text x="490" y="412" text-anchor="middle">done → frames.tar (274 JPEGs · 4.5 MB)</text>
+        <rect x="205" y="446" width="270" height="32" rx="5" class="bx-m"/><text x="340" y="467" text-anchor="middle">frame cache · pack BIF · Plex hash</text>
+
+        <line x1="340" y1="512" x2="876" y2="512" class="ar-m" marker-end="url(#r-m)"/><text x="610" y="504" text-anchor="middle">write index-sd.bif into config dir · refresh item</text>
+        <line x1="336" y1="556" x2="104" y2="556" class="ar-m ar-dash" marker-end="url(#r-m)"/><text x="220" y="548" text-anchor="middle">outcome: generated</text><text x="220" y="572" text-anchor="middle" class="t-sub">on storage·GPU0</text>
+        <rect x="530" y="588" width="220" height="30" rx="5" class="bx-n"/><text x="640" y="608" text-anchor="middle">deletes its temp frames</text>
+      </svg>
+    </div>
+    <figcaption>Because frames come back to the app, the existing BIF packer, Jellyfin tile builder and frame cache run unchanged. One extraction still serves Plex, Emby and Jellyfin. The node does not need to know which servers exist.</figcaption>
+  </figure>
+  <p>Every job type works the same way. The app keeps its own logic and only the heavy step travels:</p>
+  <div class="grid">
+    <div class="card"><h3>Previews</h3><span class="lab n">Node</span><ul><li>Frame extraction</li></ul><span class="lab m">Back to the app</span><ul><li>JPEG frames (about 4 MB per episode)</li></ul></div>
+    <div class="card"><h3>Loudness</h3><span class="lab n">Node</span><ul><li>ebur128 analysis</li></ul><span class="lab m">Back to the app</span><ul><li>Six values per stream</li></ul></div>
+    <div class="card"><h3>Intros</h3><span class="lab n">Node</span><ul><li>Audio fingerprint, end-picture decode</li></ul><span class="lab m">Back to the app</span><ul><li>About 15 KB of points; 60 tiny frames</li></ul></div>
+    <div class="card"><h3>Credits</h3><span class="lab n">Node</span><ul><li>Tail decode and text detection together</li></ul><span class="lab m">Back to the app</span><ul><li>Start and end times, and any CPU-fallback reasons</li></ul></div>
+  </div>
+
+  <h2 id="errors">9 · When things go wrong</h2>
+  <div class="cases">
+    <div class="case"><div>The node can't see the file</div><div>
+      <p>The mapping is wrong, the mount is stale, or a different copy is there. The node refuses in under a second, before FFmpeg starts.</p>
+      <p><b>The file goes to the next eligible worker</b>, another node or a local device, never back to the same node. If every eligible worker can't see it, the file is marked failed: "not visible on storage, nuc".</p>
+      <p>After 3 different files fail on one node within 10 minutes, the node becomes <b>Access problem</b>. Its workers pause and an alert names the library and the path it tried.</p>
+      <p class="ev">Tested: wrong mapping, different file and path traversal were all refused, with reasons.</p></div></div>
+    <div class="case"><div>The node drops out mid-file</div><div>
+      <p>After 3 failed asks (about 12 seconds), the file goes <b>back in the queue once</b> and isn't counted. A second drop counts it as failed: "node unavailable twice".</p>
+      <p class="ev">Tested in a spike against the real dispatcher: one drop gave 3/3 succeeded and 0 failed; two drops gave exactly one failed row. 1,119 existing worker, dispatcher and parking tests passed.</p></div></div>
+    <div class="case"><div>The GPU fails on a file</div><div>
+      <p>The same rule as local workers: the node retries on <b>its own CPU</b>. The app never takes the work over itself.</p></div></div>
+    <div class="case"><div>The node loses its GPU</div><div>
+      <p>GPU members pause with "GPU lost: restart the node container". CPU members carry on.</p></div></div>
+    <div class="case"><div>Wrong version or wrong key</div><div>
+      <p>"Update needed" or "Key refused". The node's workers stay idle and the Nodes page says exactly what to change.</p></div></div>
+    <div class="case"><div>You cancel or pause the job</div><div>
+      <p>The app tells the node, and the node stops or freezes its own FFmpeg.</p><p class="ev">Tested: cancel stopped FFmpeg on the node in 0.63 s.</p></div></div>
+    <div class="case"><div>Worker hours close mid-file</div><div>
+      <p>As today, the running file finishes. If the node goes silent, the drop rule above ends the wait, so parking can't hang on a dead node.</p></div></div>
+  </div>
+
+  <h2 id="logs">10 · Logs</h2>
+  <ul>
+    <li><b>Job log:</b> the node sends its log lines with each progress reply. The app's worker thread writes them into the job log as they arrive, prefixed with the node and device: <code>storage/GPU0 · Extracting frames…</code>. The worker writing them itself matters, because the job log only accepts lines from that thread.</li>
+    <li><b>Per-file results</b> show the worker as "storage · GPU0", so it's always clear where a file ran.</li>
+    <li><b>Node log:</b> each node keeps its own rolling log. The Nodes page has a "View log" button that reads it through the node API, so there's no SSH to the node.</li>
+    <li><b>FFmpeg failure files</b> stay on the node. The app gets the summary and a pointer to the node log.</li>
+  </ul>
+
+  <h2 id="health">11 · Node Setup Health</h2>
+  <p>This uses the same Must fix / Recommended / All good layout as server Setup Health, with current → recommended values.</p>
+  <div class="two">
+    <div class="box x"><h3>Must fix</h3><ul>
+      <li>Can't reach the node</li><li>Key refused</li><li>Version differs from the app</li>
+      <li>A library isn't visible at the mapped path</li><li>A GPU used by a worker group is missing or failing</li>
+      <li>Plex database node: database not found, on a network drive, or not writable by this user</li></ul></div>
+    <div class="box n"><h3>Recommended</h3><ul>
+      <li>Credit text falls back to the CPU on this GPU</li><li>Under 2 GB free in the node's temp folder</li>
+      <li>The node isn't in any worker group yet</li><li>Plex database node: Plex isn't running, so changes wait until it is</li></ul></div>
+    <div class="box"><h3>All good</h3><ul>
+      <li>Reachable, key accepted, same version</li><li>Every library visible, same files</li>
+      <li>GPUs pass their test decode</li><li>Plex database node: database on a local disk, open by Plex, writable</li></ul></div>
+  </div>
+
+  <h2 id="windows">12 · Windows</h2>
+  <figure>
+    <div class="frame">
+      <svg viewBox="0 0 980 370" role="img" aria-label="On a Windows PC, the app in Docker Desktop cannot open Plex's database over the 9p mount, so it calls a native Plex database node next to Plex, which opens the database locally.">
+        <defs>
+          <marker id="w-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="w-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-n"/></marker>
+          <marker id="w-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-bad"/></marker>
+          <marker id="w-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-good"/></marker>
+        </defs>
+        <rect x="20" y="16" width="940" height="336" rx="10" class="bx"/>
+        <text x="38" y="42" class="t-head">Windows PC</text>
+        <rect x="50" y="62" width="190" height="50" rx="6" class="bx"/><text x="145" y="84" text-anchor="middle" class="t-head">Plex Media Server</text><text x="145" y="102" text-anchor="middle" class="t-sub">native Windows app</text>
+        <rect x="50" y="170" width="190" height="72" rx="6" class="bx"/><text x="145" y="194" text-anchor="middle" class="t-head">Plex database</text><text x="145" y="213" text-anchor="middle" class="t-mono t-sub">library.db + -wal + -shm</text><text x="145" y="231" text-anchor="middle" class="t-sub">local NTFS disk</text>
+        <line x1="145" y1="114" x2="145" y2="168" class="ar" marker-start="url(#w-a)" marker-end="url(#w-a)"/><text x="155" y="146" class="t-sub">-shm in RAM · locks</text>
+
+        <rect x="300" y="130" width="222" height="112" rx="8" class="bx-n"/>
+        <text x="411" y="154" text-anchor="middle" class="t-head t-n">Plex database node</text>
+        <text x="411" y="176" text-anchor="middle">native · starts at logon</text>
+        <text x="411" y="195" text-anchor="middle">runs as Plex's user</text>
+        <text x="411" y="216" text-anchor="middle" class="t-good">same machine → WAL works</text>
+        <line x1="298" y1="206" x2="243" y2="206" class="ar-good" marker-end="url(#w-g)"/><text x="270" y="198" text-anchor="middle" class="t-sub t-good">SQLite</text>
+
+        <rect x="640" y="56" width="300" height="230" rx="8" class="bx-vm"/>
+        <text x="656" y="80" class="t-sub">DOCKER DESKTOP · LINUX VM</text>
+        <rect x="668" y="100" width="250" height="60" rx="6" class="bx-m"/><text x="793" y="126" text-anchor="middle" class="t-head t-m">Media Preview Generator</text><text x="793" y="145" text-anchor="middle" class="t-sub">app container</text>
+        <rect x="668" y="206" width="250" height="58" rx="6" class="bx-bad"/><text x="793" y="230" text-anchor="middle" class="t-bad">Plex folder via 9p mount</text><text x="793" y="250" text-anchor="middle" class="t-sub">SQLite here → "disk I/O error"</text>
+        <line x1="666" y1="150" x2="524" y2="150" class="ar-n" marker-start="url(#w-n)" marker-end="url(#w-n)"/>
+        <text x="583" y="142" text-anchor="middle" class="t-sub t-n">HTTP + key</text><text x="583" y="168" text-anchor="middle" class="t-sub">all DB work</text>
+
+        <polyline points="666,236 600,236 600,316 145,316 145,246" class="ar-bad" marker-end="url(#w-b)"/>
+        <text x="372" y="302" text-anchor="middle" class="t-bad">✗ today: SQLite over 9p can't share the -shm map or locks</text>
+      </svg>
+    </div>
+    <figcaption>The red path is today's #407 failure. The amber path is the fix. Library Health already says "only previews are counted" on 9p (shipped a4413c1b), and the writers already refuse 9p.</figcaption>
+  </figure>
+  <p><b>The Plex database node on Windows, proven on a real Windows runner:</b></p>
+  <ul>
+    <li>A live SQLite WAL connection locks exactly byte 128 of <code>-shm</code>, the same byte as on Linux. Checking it with a quick lock attempt tells "Plex has it open" from "nobody has it open".</li>
+    <li>That quick lock doesn't break Plex. A new connection opening during the lock just waited for it, with no error.</li>
+    <li>Restart Manager lists the processes holding the database open without taking any lock. It also lists our own process, which has to be filtered out. This is the safer check to use first.</li>
+    <li>Drive type: local disk = fixed (3); mapped drive and UNC path = remote (4). A <code>subst</code> drive reports fixed, the same as the disk underneath.</li>
+    <li>Today's helper code fails on Windows only at the Linux-only parts: <code>fcntl</code>, the mount check, user IDs and some signal names.</li>
+    <li>A self-contained build (PyInstaller, Flask + SQLite) is 25 MB and ran on a clean runner.</li>
+    <li><b>Install detail:</b> a normal user can't create a logon task ("Access is denied"). So the node starts from the user's Startup entry instead, which needs no admin. The firewall rule needs one admin prompt, and only when the app runs on a different machine.</li>
+  </ul>
+    <p><b>The app's own Plex database code on Windows:</b> I ran the existing Plex database tests on the Windows runner with a small Windows layer (lock check, drive type, no <code>fcntl</code>). <b>874 passed, 39 failed, 6 skipped.</b></p>
+  <ul>
+    <li><b>23 failures are the tests, not the code.</b> They fake Linux mount files to simulate NFS, Docker and so on, and the Windows layer doesn't read those fakes. They need Windows versions of the same cases.</li>
+    <li><b>16 failures are real porting work.</b> 2 are the SQLite address breaking on special characters in a Windows path. 14 are "item not found" in the marker write tests, most likely because Plex on Windows stores paths as <code>D:\…</code>. Both are in phase 3's scope.</li>
+  </ul>
+
+  <p><b>Why no native Windows <em>worker</em> in the first version:</b></p>
+  <ul>
+    <li>Windows needs a different GPU stack: d3d11va, QSV and AMF instead of VAAPI, and HDR tone-mapping through libplacebo or OpenCL.</li>
+    <li>The loudness FFmpeg is a patched Linux build, and pausing uses Linux signals.</li>
+    <li>Windows users with NVIDIA can run a worker node in Docker Desktop today. Intel and AMD GPUs on Windows would need the native worker, so it's a later phase, not a blocker.</li>
+  </ul>
+
+  <h2 id="ui">13 · UI mockups</h2>
+  <p>These use the app's own dark theme, colours and wording. The names "storage", "nuc" and "gaming-pc" are examples.</p>
+  <div class="mocks">    <div class="mock"><h3>A · Nodes page <span class="muted" style="font-weight:400">(Settings → Nodes)</span></h3>
+      <div class="app"><div class="app-inner">
+        <div class="bar"><h4>Nodes</h4><span class="row"><span class="btn">⟳ Check now</span><span class="btn pri">＋ Add node</span></span></div>
+        <div class="faint">Other machines that lend this app their GPU or CPU, or open Plex's database where Plex runs.</div>
+        <div class="nodes">
+          <div class="node"><div class="ico">▣</div>
+            <div><div class="nm">storage</div><div class="sub mono">http://storage.lan:9595</div></div>
+            <div class="row"><span class="pill role">Worker</span><span class="pill off">Quadro P5000</span><span class="pill off">24 CPU</span><span class="faint">2 of 7 workers busy</span></div>
+            <div class="row"><span class="pill ok">✓ Ready</span><span class="faint">v5.2.0 · seen 3 s ago</span></div>
+            <span class="btn sm">Open</span></div>
+          <div class="node"><div class="ico">⊞</div>
+            <div><div class="nm">gaming-pc</div><div class="sub mono">http://host.docker.internal:9494</div></div>
+            <div class="row"><span class="pill role">Plex database</span><span class="pill off">Windows</span><span class="faint">used by Plex server "Home"</span></div>
+            <div class="row"><span class="pill ok">✓ Ready</span><span class="faint">Plex has it open · local disk</span></div>
+            <span class="btn sm">Open</span></div>
+          <div class="node alert"><div class="ico">▣</div>
+            <div><div class="nm">nuc</div><div class="sub mono">http://nuc.lan:9595</div></div>
+            <div class="row"><span class="pill role">Worker</span><span class="pill off">8 CPU</span><span class="faint">workers paused</span></div>
+            <div class="row"><span class="pill warn">Access problem</span><span class="faint">TV Shows not found at /media/tv</span></div>
+            <span class="btn sm">Fix</span></div>
+          <div class="node down"><div class="ico">▣</div>
+            <div><div class="nm">old-laptop</div><div class="sub mono">http://192.168.1.40:9595</div></div>
+            <div class="row"><span class="pill role">Worker</span><span class="pill off">GTX 1650</span><span class="faint">1 file moved back to the queue</span></div>
+            <div class="row"><span class="pill bad">Offline</span><span class="faint">since 14:02 · next try in 4 min</span></div>
+            <span class="btn sm">Open</span></div>
+        </div>
+      </div></div>
+      <p class="mock-cap">One row per node: its role chips, hardware, how busy it is, and its state chip with the one thing to know. Colours match the rest of the app: green ready, amber needs attention, red down.</p></div>
+
+    <div class="mock"><h3>B · Add node</h3>
+      <div class="app"><div class="app-inner" style="max-width:760px">
+        <div class="bar"><h4>Add node</h4><span class="faint">Step 1 of 2</span></div>
+        <div class="grid3">
+          <div class="field"><label>Name</label><div class="input" style="font-family:inherit">storage</div></div>
+          <div class="field"><label>Address <i class="ii">i</i></label><div class="input">http://storage.lan:9595</div></div>
+          <div class="field"><label>Key <i class="ii">i</i></label><div class="input">•••••••••••••••••••</div></div>
+        </div>
+        <div class="faint">The key is printed in the node's log on first start, and on its status page. It is never written to this app's logs.</div>
+        <div class="card" style="display:grid;gap:8px">
+          <div class="row"><span class="pill ok">✓ Connected</span><span class="faint">version 5.2.0 · same as this app</span></div>
+          <div class="row"><span class="sec-h">Found</span><span class="pill role">Worker</span><span class="pill off">GPU0 · Quadro P5000 · test decode ✓</span><span class="pill off">24 CPU cores</span><span class="pill off">41 GB free temp</span></div>
+          <div class="row"><span class="sec-h">Credit text</span><span class="pill warn">CPU on this GPU</span><span class="faint">Vulkan reports no hardware GPU</span></div>
+        </div>
+        <div class="bar"><span class="btn">Cancel</span><span class="btn pri">Next: where it sees your media →</span></div>
+      </div></div>
+      <p class="mock-cap">Connect first, then show what the node found. Problems that don't block (like credits on the CPU) are shown now, not discovered later.</p></div>
+
+    <div class="mock"><h3>C · Path mappings and Test access <span class="muted" style="font-weight:400">(step 2, and the node's Media tab)</span></h3>
+      <div class="app"><div class="app-inner">
+        <div class="bar"><h4>Where storage sees your media</h4><span class="btn">▶ Test access</span></div>
+        <div class="map faint"><span>Path on this app</span><span></span><span>Path on the node</span><span></span></div>
+        <div class="map"><div class="input">/data/Movies</div><span class="muted">→</span><div class="input">/mnt/nas/Movies</div><span class="pill ok">✓ Movies 3/3</span></div>
+        <div class="map"><div class="input">/data/TV Shows</div><span class="muted">→</span><div class="input">/mnt/nas/tv</div><span class="pill bad">✗ TV Shows 0/3</span></div>
+        <div class="card" style="display:grid;gap:6px">
+          <div><b style="color:var(--a-bad)">TV Shows: not found on the node.</b> <span class="muted">Tried</span> <span class="mono">/mnt/nas/tv/Teen Titans (2003)/…S04E10….mkv</span></div>
+          <div class="row"><span class="faint">Folders the node does see under /mnt/nas:</span><span class="pill off mono">Movies</span><span class="pill off mono">TV Shows</span><span class="pill off mono">downloads</span></div>
+          <div class="row"><span class="diff"><s>/mnt/nas/tv</s> → <b>/mnt/nas/TV Shows</b></span><span class="btn sm pri">Use this</span></div>
+        </div>
+        <div class="faint">Test access takes 3 real files from each library and checks the node sees each one with the same size and modified time.</div>
+      </div></div>
+      <p class="mock-cap">Mapping errors are found at setup, per library, with the exact path tried and a suggested fix. They don't show up later as a failed file.</p></div>
+
+    <div class="mock"><h3>D · Node Setup Health</h3>
+      <div class="app"><div class="app-inner" style="max-width:780px">
+        <div class="bar"><h4>nuc · Setup Health</h4><span class="row"><span class="pill bad">1 must fix</span><span class="pill warn">1 recommended</span></span></div>
+        <div class="bucket b-bad"><div class="bh" style="color:var(--a-bad)">Must fix</div>
+          <div class="chk"><div><b>TV Shows isn't visible on this node</b><i class="ii">i</i><div class="diff">mapping <s>/data/TV Shows → /media/tv</s> → <b>/data/TV Shows → /media/TV Shows</b></div></div><span class="btn sm pri">Fix</span></div></div>
+        <div class="bucket b-warn"><div class="bh" style="color:var(--a-accent)">Recommended</div>
+          <div class="chk"><div><b>Not in any worker group yet</b><i class="ii">i</i><div class="faint">Its 8 CPU cores sit idle until a group uses them.</div></div><span class="btn sm">Open Workers</span></div></div>
+        <div class="bucket b-ok"><div class="bh" style="color:var(--a-ok)">All good</div>
+          <div class="chk"><div><b>Reachable · key accepted · version 5.2.0</b></div><span class="pill ok">✓</span></div>
+          <div class="chk"><div><b>Movies visible, same files</b> <span class="faint">3/3</span></div><span class="pill ok">✓</span></div></div>
+      </div></div>
+      <p class="mock-cap">The same buckets and current → recommended layout as server Setup Health, so it reads the same everywhere.</p></div>
+
+    <div class="mock"><h3>E · Workers page: a group with node devices</h3>
+      <div class="app"><div class="app-inner">
+        <div class="bar"><h4>Edit group · Night GPUs</h4><span class="faint">01:00 – 07:00 · every day</span></div>
+        <div class="member"><div class="sel"><span>storage · Quadro P5000</span><span class="muted">▾</span></div><div class="input" style="justify-content:center">3</div><div class="row"><span class="jt p">Previews</span><span class="jt i">Intro &amp; credits</span></div></div>
+        <div class="member"><div class="sel"><span>This app · Intel UHD 770</span><span class="muted">▾</span></div><div class="input" style="justify-content:center">2</div><div class="row"><span class="jt p">Previews</span></div></div>
+        <div class="member"><div class="sel"><span>old-laptop · GTX 1650</span><span class="muted">▾</span></div><div class="input" style="justify-content:center">1</div><div class="row"><span class="jt p">Previews</span><span class="pill bad">node offline · 0 now</span></div></div>
+        <div class="grid2">
+          <div class="menu">
+            <div class="grp">This app</div><div class="opt">Intel UHD 770<span class="faint">GPU</span></div><div class="opt">CPU<span class="faint">16 cores</span></div>
+            <div class="grp">storage · Ready</div><div class="opt hi">Quadro P5000<span class="faint">GPU</span></div><div class="opt">CPU<span class="faint">24 cores</span></div>
+            <div class="grp">nuc · Access problem</div><div class="opt">CPU<span class="pill warn">fix access first</span></div>
+          </div>
+          <div class="faint" style="align-self:center">The device list puts this app first, then each node by name with its state. A device on an unhealthy node can still be picked, but the member shows why it has zero workers right now.</div>
+        </div>
+      </div></div>
+      <p class="mock-cap">Nothing new to learn: a node's GPU is just another device in the picker, and schedules, counts and job types work as they do today.</p></div>
+
+    <div class="mock"><h3>F · Dashboard workers</h3>
+      <div class="app"><div class="app-inner">
+        <div class="bar"><span class="row"><strong style="color:var(--a-em);font-size:15px">Night GPUs</strong><span class="faint">5 of 6 working</span></span><span class="faint">01:00 – 07:00</span></div>
+        <div class="wk">
+          <div class="wcard"><div class="wtop"><span class="pill role">storage</span><strong>Quadro P5000 · 1</strong></div><div class="faint">Teen Titans (2003) · S04E10</div><div class="prog"><i style="width:62%"></i></div><div class="metrics"><span>Speed <b>30.4×</b></span><span>ETA <b>0:17</b></span><span class="jt p">Previews</span></div></div>
+          <div class="wcard"><div class="wtop"><span class="pill role">storage</span><strong>Quadro P5000 · 2</strong></div><div class="faint">Andor · S01E03</div><div class="prog"><i style="width:28%"></i></div><div class="metrics"><span>Speed <b>27.9×</b></span><span>ETA <b>0:41</b></span><span class="jt i">Intro &amp; credits</span></div></div>
+          <div class="wcard"><div class="wtop"><strong>Intel UHD 770 · 1</strong></div><div class="faint">Dune: Part Two</div><div class="prog"><i style="width:81%"></i></div><div class="metrics"><span>Speed <b>18.2×</b></span><span>ETA <b>1:05</b></span><span class="jt p">Previews</span></div></div>
+          <div class="wcard" style="border-color:rgba(241,133,142,.4)"><div class="wtop"><span class="pill role">old-laptop</span><strong>GTX 1650 · 1</strong><span class="pill bad">Offline</span></div><div class="faint">The Bear · S02E06 moved back to the queue</div><div class="metrics"><span>since 14:02</span></div></div>
+        </div>
+      </div></div>
+      <p class="mock-cap">Remote workers look like local ones, with a node chip in front. An offline node's card says what happened to its file.</p></div>
+
+    <div class="mock"><h3>G · Job log and per-file results</h3>
+      <div class="app"><div class="app-inner">
+<div class="log">[01:12:03] <span class="i">INFO</span>  Teen Titans (2003) · S04E10 · <span class="n">storage/GPU0</span> picked up
+[01:12:03] <span class="i">INFO</span>  Teen Titans (2003) · S04E10 · <span class="n">storage/GPU0</span> · mapped to /mnt/nas/TV Shows/…S04E10….mkv
+[01:12:04] <span class="i">INFO</span>  Teen Titans (2003) · S04E10 · <span class="n">storage/GPU0</span> · Extracting frames (NVIDIA, 30.4×)
+[01:12:49] <span class="i">INFO</span>  Teen Titans (2003) · S04E10 · 274 frames back from storage (4.5 MB) · building BIF
+[01:12:50] <span class="i">INFO</span>  Teen Titans (2003) · S04E10 · Published to Plex "Home"
+[01:13:10] <span class="w">WARNING</span> The Bear · S02E06 · <span class="n">old-laptop/GPU0</span> stopped answering · moved back to the queue (1st time)
+[01:13:11] <span class="i">INFO</span>  The Bear · S02E06 · <span class="n">storage/GPU0</span> picked up
+[01:14:02] <span class="w">WARNING</span> Andor · S01E05 · <span class="n">nuc/CPU</span> can't see the file at /media/tv/… · trying another worker</div>
+      </div></div>
+      <p class="mock-cap">Every step of every file, live, with the node and device on each line. Moves between workers are logged at the moment they happen.</p></div>
+
+    <div class="mock"><h3>H · Alerts, and a Plex server's database setting</h3>
+      <div class="app"><div class="app-inner">
+        <div class="grid2" style="align-items:start">
+          <div class="bell">
+            <div class="ntf"><span style="color:var(--a-accent)">▲</span><div><strong>nuc can't see your TV Shows library</strong><span class="faint">0 of 3 files found at /media/tv. Its workers are paused.</span><br><a>Fix the mapping</a></div></div>
+            <div class="ntf"><span style="color:var(--a-bad)">⬣</span><div><strong>old-laptop is offline</strong><span class="faint">Since 14:02. 1 file went back to the queue.</span><br><a>Open node</a></div></div>
+            <div class="ntf"><span style="color:var(--a-accent)">▲</span><div><strong>storage lost its GPU</strong><span class="faint">NVIDIA stopped answering inside the node container. Restart the node container; CPU work continues.</span><br><a>Show details</a></div></div>
+          </div>
+          <div class="card" style="display:grid;gap:10px">
+            <div class="sec-h">Plex server "Home" · Connection</div>
+            <div class="field"><label>Plex database <i class="ii">i</i></label>
+              <div class="sel"><span>Through a Plex database node: gaming-pc</span><span class="muted">▾</span></div></div>
+            <div class="faint">Used for Intro &amp; Credits, chapter thumbnails, loudness and Library Health counts. Use a node when Plex runs on another machine or on Windows.</div>
+            <div class="row"><span class="pill ok">✓ Connected</span><span class="mono faint">gaming-pc · v5.2.0</span><span class="faint">Plex has the database open · local disk · writable</span><span class="btn sm">Check again</span></div>
+          </div>
+        </div>
+      </div></div>
+      <p class="mock-cap">Alerts name the node, the problem and the one action. The Plex server picks its database route in one place, replacing today's separate "Plex helper" fields. Existing helper setups carry over automatically.</p></div>
+</div>
+
+  <h2 id="proof">14 · What I tested</h2>
+  <p>A throwaway prototype node (the app image plus a small API) ran the app's real code against a real 22-minute 1080p HEVC episode. The "app" side had the media at <code>/data</code> and the node had it at <code>/mnt/nas</code>. Windows behaviour was tested on GitHub's Windows runner.</p>
+  <div class="proof">    <div><b class="p">SAME</b><span><b>Previews, CPU.</b> 274 frames. Same JPEGs byte for byte, same BIF. 217.6 s on the app, 207.5 s on the node. Frames came back as one 3.8 MB file in 0.09 s.</span></div>
+    <div><b class="p">SAME</b><span><b>Previews, NVIDIA GPU</b> (Quadro P5000). Same frames, same BIF. 52.5 s on the app, 45.8 s on the node. 4.5 MB back.</span></div>
+    <div><b class="p">SAME</b><span><b>Loudness.</b> Same numbers (−23.00 LUFS and the rest), using the patched loudness FFmpeg inside the node.</span></div>
+    <div><b class="p">SAME</b><span><b>Intro fingerprint</b> (3,845 points, 15 KB) and <b>end-picture frames</b> (60). Identical on both sides.</span></div>
+    <div><b class="p">SAME</b><span><b>Credits, as one whole step.</b> Same result on both sides. CPU 26.9 s vs 25.3 s, GPU 16.6 s vs 15.6 s. The node also passed back why credit text used the CPU ("Vulkan reports no hardware GPU"), so that message can still reach the job log.</span></div>
+    <div><b class="p">PASS</b><span><b>Cancel.</b> FFmpeg on the node stopped 0.63 s after cancel was pressed.</span></div>
+    <div><b class="p">PASS</b><span><b>Wrong key</b> refused (401). <b>Access checks</b> refused an unmapped path, a different file at the same path (size/time differ), a <code>../</code> escape, and a missing file. A task with a wrong mapping failed in 0.0 s, before any work started.</span></div>
+    <div><b class="p">PASS</b><span><b>Same file, seen through different mounts.</b> Size and modified time matched on ZFS, NFS 4.2, a Docker bind mount and mergerfs. Device and inode numbers did <em>not</em> match, so the design compares size and time only.</span></div>
+    <div><b class="p">PASS</b><span><b>Node killed mid-file.</b> The app called it unavailable after 12 s (3 failed asks). After a node restart, it no longer knew the old task, which is what tells the app to requeue.</span></div>
+    <div><b class="p">PASS</b><span><b>Put back in the queue, in the real job code</b> (throwaway branch, not kept). One drop: 3 of 3 files still finished, 0 failed. Two drops on the same file: exactly one failed row. 1,119 existing worker, dispatcher and pause tests still passed.</span></div>
+    <div><b class="p">PASS</b><span><b>GPU detection on a node</b> takes 0.7–1.3 s and its result travels fine as JSON.</span></div>
+    <div><b class="f">FOUND</b><span><b>A node can lose its GPU while running.</b> A host service reload made the running node say "Failed to initialize NVML". New containers were fine and a restart fixed it. That's why nodes re-check their GPUs every 5 minutes and after any GPU error, and why "GPU lost" is its own state.</span></div>
+    <div><b class="p">PASS</b><span><b>Windows</b> (GitHub runner): the lock check, Restart Manager, drive types, the 25 MB build, and the logon-task check that ruled out a scheduled task (section 12). The Startup entry itself is checked in the beta.</span></div>
+    <div><b class="f">FIX</b><span><b>Prototype rough edges the real build must get right:</b> cancel was reported as "failed" (must say cancelled), and an unknown task returned an error 500 (must be 404).</span></div>
+</div>
+
+  <h2 id="confidence">15 · How confident I am</h2>
+  <div class="conf">    <div class="row"><span class="chip hi">High</span><div><p><b>Heavy steps on a node give the same result.</b> Every step was run both ways on a real file and compared byte for byte. The app's existing functions run unchanged on the node.</p></div></div>
+    <div class="row"><span class="chip hi">High</span><div><p><b>Path mappings, file checks and the key.</b> Every bad case I could think of was refused before work started, and size + time are stable across every mount type here.</p></div></div>
+    <div class="row"><span class="chip hi">High</span><div><p><b>Dropped node → back in the queue.</b> Measured on a killed node, and the queue change was proved inside the real job code with the existing tests green.</p></div></div>
+    <div class="row"><span class="chip hi">High</span><div><p><b>Plex database node on Linux.</b> It's today's Plex helper with two more calls, and the helper is already live.</p></div></div>
+    <div class="row"><span class="chip md">Medium</span><div><p><b>Windows Plex database node.</b> Locking, drive type and packaging are proven on a Windows runner. 16 real porting failures remain (Windows paths), and it hasn't touched a real Plex on Windows yet. That needs the beta with the #407 reporter.</p></div></div>
+    <div class="row"><span class="chip md">Medium</span><div><p><b>Fitting nodes into worker groups and the dashboard.</b> I know every place the code assumes a local device (about 12). It's careful work, not unknown work.</p></div></div>
+    <div class="row"><span class="chip md">Medium</span><div><p><b>Docker Desktop on Windows reaching a native node</b> (<code>host.docker.internal</code>). Not tested; checked during the beta.</p></div></div>
+    <div class="row"><span class="chip lo">Not v1</span><div><p><b>Native Windows worker</b> for Intel/AMD GPUs. Possible later, but it's a separate FFmpeg and GPU build.</p></div></div>
+</div>
+
+  <h2 id="build">16 · Build order</h2>
+  <ol class="steps">
+    <li><b>Node basics:</b> node mode, key, API, health checks, the Nodes page, Add node and node Setup Health. No job runs on a node yet.</li>
+    <li><b>Plex database node on Linux:</b> today's Plex helper becomes this role, plus loudness writes and Library Health counts.</li>
+    <li><b>Windows Plex database node:</b> the Windows platform layer, the 25 MB build and the Startup install, then a beta with the #407 reporter.</li>
+    <li><b>Executor seam in the app, local only:</b> no change in behaviour, proved by the full test suite and markers_eval.</li>
+    <li><b>Worker nodes for previews:</b> path mappings, Test access, node devices in groups, putting files back in the queue, and the error rules in section 9.</li>
+    <li><b>Worker nodes for loudness and markers.</b></li>
+    <li><b>Docs and release.</b> An architecture review runs on every phase above.</li>
+  </ol>
+
+  <h2 id="decide">17 · What I need you to approve</h2>
+  <div class="decide">    <div><b>Two node roles, one Nodes page, one way to connect.</b> A node is a <em>worker</em> (does the heavy steps) or a <em>Plex database</em> node (opens Plex's database where Plex runs), or both. The Plex helper becomes the database role and existing helper setups carry over.</div>
+    <div><b>Nodes are grunt workers.</b> The app keeps the queue, schedules, retries, tokens, mappings and every write. A node runs one step and sends back frames, numbers or timestamps.</div>
+    <div><b>The app calls the node, with a key the node makes.</b> Both must run the same version; otherwise the node sits idle and says "Update needed".</div>
+    <div><b>Path mappings live in the app, per node.</b> Checked with size + modified time, and tested per library when you add the node.</div>
+    <div><b>A dropped node puts its file back in the queue once.</b> A second drop on the same file marks it failed.</div>
+    <div><b>"Can't see the file" tries the next worker.</b> Three different files missing within 10 minutes marks the node "Access problem" and pauses it.</div>
+    <div><b>A GPU problem falls back to the node's own CPU,</b> never to the app's.</div>
+    <div><b>The Plex database node comes first</b> (Linux, then Windows for #407), before worker nodes.</div>
+    <div><b>Windows ships as a self-contained build started from the user's Startup entry,</b> running as Plex's user. No Python, no admin except one firewall prompt.</div>
+    <div><b>No native Windows worker in v1.</b> Windows + NVIDIA users can run a worker node in Docker Desktop.</div>
+</div>
+</div>
