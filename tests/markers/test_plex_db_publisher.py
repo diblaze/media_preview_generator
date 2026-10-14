@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +37,7 @@ from media_preview_generator.markers.publishers.plex_db import (
     plex_db_path,
 )
 from media_preview_generator.markers.settings import ServerMarkersSettings
+from media_preview_generator.nodes.server import winplatform
 from media_preview_generator.servers.base import ServerConfig, ServerType
 
 T = MarkerType
@@ -78,6 +78,15 @@ CREDITS_ROW_EXTRA = '{"pv:version":"4","url":"pv%3Aversion=4"}'
 CREDITS_FINAL_ROW_EXTRA = '{"pv:final":"1","pv:version":"4","url":"pv%3Afinal=1&pv%3Aversion=4"}'
 _JOURNAL_MODE = "delete"
 PLEX_VERSION = "1.43.4.10903-e5521bd8c"
+ON_WINDOWS = sys.platform == "win32"
+# What a test's database folder reports as its filesystem: the fake mount table's root, or the Windows volume's own.
+LOCAL_FS = "ntfs" if ON_WINDOWS else "ext4"
+# These tests write a Linux mount table (/proc/self/mountinfo) to stand for the disk the database is on. Windows has
+# none: there the drive type decides, and TestWindowsDrives refuses the same setups through it.
+linux_mount_table = pytest.mark.skipif(
+    ON_WINDOWS, reason="simulates a Linux mount table; Windows decides by drive type (TestWindowsDrives)"
+)
+windows_only = pytest.mark.skipif(not ON_WINDOWS, reason="Windows drive types and locks")
 
 
 @pytest.fixture(autouse=True, params=["delete", "wal"])
@@ -772,7 +781,7 @@ class TestCapability:
             ({"enabled": False}, True, Capability.DISABLED),
             ({"confirmed": None}, True, Capability.NEEDS_CONFIRMATION),
             ({}, False, Capability.MISCONFIGURED),
-            ({"fs": "nfs4"}, True, Capability.NEEDS_LOCAL_DB),
+            pytest.param({"fs": "nfs4"}, True, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table),
             ({"plex_pass": False}, True, Capability.NEEDS_PASS),
             ({}, "no-tag", Capability.NEEDS_PLEX_DETECTION_ONCE),
             ({}, True, Capability.READY),
@@ -786,7 +795,7 @@ class TestCapability:
         report = _publisher(tmp_path, folder, **kwargs).capability()
         assert report.state is state, report.message
         if state is Capability.READY:
-            assert report.details["fs_type"] == "ext4" and report.details["db_path"].endswith(
+            assert report.details["fs_type"] == LOCAL_FS and report.details["db_path"].endswith(
                 "com.plexapp.plugins.library.db"
             )
             # Plex unreachable: prefs aren't fetched (no second connection attempt just for UI details).
@@ -917,11 +926,14 @@ class TestWriteGuards:
         [
             ({"enabled": False}, Capability.DISABLED),
             ({"confirmed": None}, Capability.NEEDS_CONFIRMATION),
-            ({"fs": "nfs4"}, Capability.NEEDS_LOCAL_DB),
-            ({"fs": "fakeowner"}, Capability.NEEDS_LOCAL_DB),
-            ({"fs": "vboxsf"}, Capability.NEEDS_LOCAL_DB),  # unknown type
-            ({"mountinfo_path": "/nonexistent/mountinfo"}, Capability.NEEDS_LOCAL_DB),  # type can't be told
-            ({"stacked_nfs": True}, Capability.NEEDS_LOCAL_DB),
+            pytest.param({"fs": "nfs4"}, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table),
+            pytest.param({"fs": "fakeowner"}, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table),
+            pytest.param({"fs": "vboxsf"}, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table),  # unknown type
+            # The type can't be told.
+            pytest.param(
+                {"mountinfo_path": "/nonexistent/mountinfo"}, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table
+            ),
+            pytest.param({"stacked_nfs": True}, Capability.NEEDS_LOCAL_DB, marks=linux_mount_table),
         ],
         ids=["disabled", "unconfirmed", "nfs4", "fakeowner", "unknown-fs", "no-mountinfo", "nfs-stacked-on-ext4"],
     )
@@ -950,6 +962,7 @@ class TestWriteGuards:
         assert ei.value.state is Capability.MISCONFIGURED
         assert not os.path.exists(plex_db_path(str(folder)))
 
+    @linux_mount_table
     def test_symlinked_config_folder_is_judged_by_its_real_mount(self, tmp_path):
         nas = tmp_path / "nas"
         _make_db(nas / "Plex Media Server")
@@ -965,7 +978,9 @@ class TestWriteGuards:
         assert ei.value.state is Capability.NEEDS_LOCAL_DB
 
     def test_config_folder_with_uri_special_characters(self, tmp_path):
-        folder = tmp_path / "Plex #2 ?x=1 100%" / "Plex Media Server"
+        # Windows forbids "?" in a name; "#", "%" and "&" still mean something in a URI there.
+        name = "Plex #2 &x=1 100%" if ON_WINDOWS else "Plex #2 ?x=1 100%"
+        folder = tmp_path / name / "Plex Media Server"
         db = _make_db(folder)
         pub = _publisher(tmp_path, folder)
         assert pub.capability().state is Capability.READY
@@ -1196,7 +1211,7 @@ class TestAnUndecidedVersionNeverHoldsTheItemBack:
     def _publisher(self, tmp_path, disks: tuple[str, ...]):
         folder = tmp_path / "Plex Media Server"
         db = _make_db(folder, parts=(("/plexmedia/tv/A.mkv", None), ("/plexmedia/tv/B.mkv", None)))
-        mappings = [{"plex_prefix": "/plexmedia", "local_prefix": str(tmp_path / disk)} for disk in disks]
+        mappings = [{"plex_prefix": "/plexmedia", "local_prefix": (tmp_path / disk).as_posix()} for disk in disks]
         return db, _publisher(tmp_path, folder, mappings=mappings, sibling_markers=lambda _path: None)
 
     @pytest.mark.parametrize(
@@ -1219,7 +1234,7 @@ class TestAnUndecidedVersionNeverHoldsTheItemBack:
             (tmp_path / "disk1" / "tv" / "A.mkv").unlink()
             (tmp_path / "disk1" / "tv").rmdir()
         db, pub = self._publisher(tmp_path, disks_mapped)
-        path = str(tmp_path / "disk1" / "tv" / "A.mkv")
+        path = (tmp_path / "disk1" / "tv" / "A.mkv").as_posix()
         assert _write_one(pub, [INTRO], path=path) == [INTRO]
         assert _rows(db, "SELECT time_offset, end_time_offset FROM taggings") == [(11_000, 37_000)]
         assert not hasattr(pub, "last_unchecked_versions")  # nothing for the job to wait on or retry
@@ -1232,10 +1247,24 @@ class TestAnUndecidedVersionNeverHoldsTheItemBack:
         pub = _publisher(
             tmp_path,
             folder,
-            mappings=[{"plex_prefix": "/plexmedia", "local_prefix": str(tmp_path / "disk1")}],
+            mappings=[{"plex_prefix": "/plexmedia", "local_prefix": (tmp_path / "disk1").as_posix()}],
             sibling_markers=lambda _path: late,
         )
-        assert _write_one(pub, [INTRO], path=str(tmp_path / "disk1" / "tv" / "A.mkv")) == [INTRO]
+        assert _write_one(pub, [INTRO], path=(tmp_path / "disk1" / "tv" / "A.mkv").as_posix()) == [INTRO]
+        assert _rows(db, "SELECT time_offset, end_time_offset FROM taggings") == [(11_000, 37_000)]
+
+    def test_a_windows_plex_s_paths_find_the_app_s_file(self, tmp_path, disks):
+        # Plex on Windows stores D:\ paths; the app maps them onto its own (forward-slash) paths.
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder, parts=((r"D:\Media\tv\A.mkv", None), (r"D:\Media\tv\B.mkv", None)))
+        local = (tmp_path / "disk1").as_posix()
+        pub = _publisher(
+            tmp_path,
+            folder,
+            mappings=[{"plex_prefix": "D:\\Media", "local_prefix": local}],
+            sibling_markers=lambda _p: None,
+        )
+        assert _write_one(pub, [INTRO], path=f"{local}/tv/A.mkv") == [INTRO]
         assert _rows(db, "SELECT time_offset, end_time_offset FROM taggings") == [(11_000, 37_000)]
 
 
@@ -1294,6 +1323,7 @@ class TestCapabilityDetails:
         assert report.details["detection"] == {"intro": None, "credits": None}
         assert report.details["plex_pass"] is None
 
+    @linux_mount_table
     def test_network_share_report_names_the_filesystem(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         _make_db(folder)
@@ -1376,6 +1406,7 @@ class TestLockDomain:
         with _another_process_holding(db):
             assert _publisher(tmp_path, folder).capability().state is Capability.NEEDS_LOCAL_DB
 
+    @pytest.mark.skipif(ON_WINDOWS, reason="a POSIX lock rule; Windows locks belong to the handle that took them")
     def test_closing_any_descriptor_on_the_shm_drops_our_connection_s_lock(self, tmp_path):
         # Why every connection and the probe share one per-path lock: this is the kernel's POSIX-lock rule.
         _folder, db = self._db(tmp_path)
@@ -1398,6 +1429,31 @@ class TestLockDomain:
             assert held()
             os.close(os.open(f"{db}-shm", os.O_RDONLY))
             assert not held()
+        finally:
+            conn.close()
+
+    @windows_only
+    def test_closing_another_handle_on_the_shm_keeps_our_connection_s_lock(self, tmp_path):
+        # Why the Windows probe may open and close the -shm while one of our connections is open elsewhere.
+        _folder, db = self._db(tmp_path)
+        checker = (
+            "import sys\n"
+            "from media_preview_generator.nodes.server import winplatform\n"
+            "print(winplatform.dms_lock_held(sys.argv[1]))\n"
+        )
+
+        def held() -> bool:
+            out = subprocess.run(
+                [sys.executable, "-c", checker, f"{db}-shm"], capture_output=True, text=True, check=True
+            )
+            return out.stdout.strip() == "True"
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("SELECT COUNT(*) FROM taggings").fetchall()
+            assert held()
+            os.close(os.open(f"{db}-shm", os.O_RDONLY))
+            assert held()
         finally:
             conn.close()
 
@@ -2127,10 +2183,17 @@ class TestNotMadeForThisFile:
             lock.release()
         assert answers == [None]
 
+    @linux_mount_table
     def test_the_publisher_cant_tell_without_its_database(self, tmp_path):
         folder, _db = self._item(tmp_path, self.BONES_INTRO)
         pub = _publisher(tmp_path, folder, redetect="keep_plex", fs="nfs4")
         assert pub.types_not_made_for_file("7") is None
+
+    @windows_only
+    def test_the_publisher_cant_tell_without_its_database_on_windows(self, tmp_path, monkeypatch):
+        folder, _db = self._item(tmp_path, self.BONES_INTRO)
+        monkeypatch.setattr(winplatform, "drive_type", lambda _path: winplatform.DRIVE_REMOTE)
+        assert _publisher(tmp_path, folder, redetect="keep_plex").types_not_made_for_file("7") is None
 
     @pytest.mark.parametrize(
         ("wanted", "kept_before", "kept"),
@@ -2344,7 +2407,7 @@ class TestSqliteErrors:
         assert ei.value.state is Capability.UNREACHABLE
         assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+    @pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root bypasses file permissions")
     @pytest.mark.parametrize("target", ["db", "folder", "shm"])
     def test_files_this_app_cannot_write_are_misconfigured(self, tmp_path, target):
         folder = tmp_path / "Plex Media Server"
@@ -2353,7 +2416,12 @@ class TestSqliteErrors:
         if target == "shm":
             path.write_bytes(b"")
         mode = path.stat().st_mode
-        path.chmod(0o555 if target == "folder" else 0o444)
+        denied_folder = ON_WINDOWS and target == "folder"
+        if denied_folder:
+            user = os.environ["USERNAME"]
+            subprocess.run(["icacls", str(path), "/deny", f"{user}:(WD,AD)"], check=True, capture_output=True)
+        else:
+            path.chmod(0o555 if target == "folder" else 0o444)
         try:
             pub = _publisher(tmp_path, folder)
             report = pub.capability()
@@ -2362,7 +2430,10 @@ class TestSqliteErrors:
                 _write_one(pub, [INTRO])
             assert ei.value.state is Capability.MISCONFIGURED
         finally:
-            path.chmod(mode)
+            if denied_folder:
+                subprocess.run(["icacls", str(path), "/remove:d", user], check=True, capture_output=True)
+            else:
+                path.chmod(mode)
         assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
 
     @pytest.mark.parametrize(
@@ -2680,8 +2751,9 @@ class TestLockTimeouts:
         return db, results
 
     # Production: another program held Plex's write lock for 30.8 s against a 30 s wait; four files failed. Scaled
-    # down 1:120 so the test takes seconds: the job wait keeps its ratio to the old one.
-    SCALE = 120
+    # down 1:120 so the test takes seconds: the job wait keeps its ratio to the old one. A Windows runner commits in up
+    # to ~0.7 s (four writes alone outlast the 1:120 wait), so there it is scaled 1:20.
+    SCALE = 20 if ON_WINDOWS else 120
     OLD_WAIT_S = 30.0
     HELD_S = 30.8
 
@@ -2930,7 +3002,7 @@ class TestLockSerialisation:
             [sys.executable, "-c", _HOLDER, str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
         )
         assert proc.stdout.readline().strip() == "ready"
-        os.kill(proc.pid, signal.SIGKILL)
+        proc.kill()  # SIGKILL; TerminateProcess on Windows
         proc.wait(10)
         assert os.path.exists(f"{db}-shm")
         pub = _publisher(tmp_path, folder)
@@ -2940,6 +3012,7 @@ class TestLockSerialisation:
         assert ei.value.state is Capability.UNREACHABLE
         assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
 
+    @pytest.mark.skipif(ON_WINDOWS, reason="fcntl; Windows has its own lock query (the test below)")
     def test_a_failing_lock_query_is_not_a_holder(self, tmp_path, monkeypatch):
         folder = tmp_path / "Plex Media Server"
         db = _make_db(folder, journal_mode="wal")
@@ -2949,6 +3022,15 @@ class TestLockSerialisation:
 
         with _another_process_holding(db):
             monkeypatch.setattr(plex_db.fcntl, "fcntl", failing_fcntl)
+            assert _publisher(tmp_path, folder).capability().state is Capability.NEEDS_LOCAL_DB
+
+    @windows_only
+    def test_lock_queries_that_cannot_answer_are_not_a_holder_on_windows(self, tmp_path, monkeypatch):
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder, journal_mode="wal")
+        with _another_process_holding(db):
+            monkeypatch.setattr(winplatform, "restart_manager_holders", lambda _path: None)
+            monkeypatch.setattr(winplatform, "dms_lock_held", lambda _path: None)
             assert _publisher(tmp_path, folder).capability().state is Capability.NEEDS_LOCAL_DB
 
     def test_probe_takes_the_database_lock_itself(self, tmp_path):
@@ -3848,7 +3930,8 @@ class TestReadBackMany:
         finished = {}
 
         def read_back():
-            reader.shows_many(self._items(range(1, 101)))
+            # Longer on Windows, whose runner commits the write in up to ~0.7 s.
+            reader.shows_many(self._items(range(1, 301 if ON_WINDOWS else 101)))
             finished["read"] = time.monotonic()
 
         thread = threading.Thread(target=read_back)
@@ -3948,3 +4031,69 @@ class TestMarkerRowsUseTheItemIndex:
             plan = " ".join(row[3] for row in plans.execute(f"EXPLAIN QUERY PLAN {statement}"))
             assert "index_taggings_on_metadata_item_id" in plan, (statement, plan)
         plans.close()
+
+
+def _unc(path: Path) -> Path:
+    """``path`` through this machine's administrative share: the same file, on a network drive."""
+    drive, rest = os.path.splitdrive(str(path))
+    unc = Path(rf"\\localhost\{drive[0]}${rest}")
+    if not unc.is_dir():
+        pytest.skip("the administrative share isn't reachable here")
+    return unc
+
+
+@windows_only
+class TestWindowsDrives:
+    """What the mount-table tests refuse on Linux, refused through the drive type on Windows."""
+
+    def test_a_database_on_a_network_drive_is_refused(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder)
+        pub = _publisher(tmp_path, _unc(folder))
+        report = pub.capability()
+        assert report.state is Capability.NEEDS_LOCAL_DB and "network share (network drive)" in report.message
+        assert report.details["fs_type"] == "network drive"
+        pub._server.get_server_status.assert_not_called()
+        with pytest.raises(PublishError) as ei:
+            _write_one(pub, [INTRO])
+        assert ei.value.state is Capability.NEEDS_LOCAL_DB
+        assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
+
+    def test_a_symlinked_config_folder_is_judged_by_where_it_points(self, tmp_path):
+        nas = tmp_path / "nas"
+        _make_db(nas / "Plex Media Server")
+        (tmp_path / "config").symlink_to(_unc(nas), target_is_directory=True)
+        report = _publisher(tmp_path, tmp_path / "config" / "Plex Media Server").capability()
+        assert report.state is Capability.NEEDS_LOCAL_DB and report.details["fs_type"] == "network drive"
+
+    @pytest.mark.parametrize(
+        ("kind", "label"),
+        [
+            (winplatform.DRIVE_UNKNOWN, "unknown drive"),
+            (winplatform.DRIVE_REMOVABLE, "removable drive"),
+            (winplatform.DRIVE_RAMDISK, "ram disk"),
+        ],
+        ids=["unknown", "removable", "ramdisk"],
+    )
+    def test_a_drive_that_isnt_a_fixed_disk_is_refused(self, tmp_path, monkeypatch, kind, label):
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder)
+        monkeypatch.setattr(winplatform, "drive_type", lambda _path: kind)
+        pub = _publisher(tmp_path, folder)
+        report = pub.capability()
+        assert report.state is Capability.NEEDS_LOCAL_DB and f"local disk ({label})" in report.message
+        with pytest.raises(PublishError):
+            _write_one(pub, [INTRO])
+        assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
+
+    def test_an_unwritable_database_names_the_windows_users(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db = _make_db(folder)
+        db.chmod(0o444)
+        try:
+            report = _publisher(tmp_path, folder).capability()
+        finally:
+            db.chmod(0o666)
+        assert report.state is Capability.MISCONFIGURED
+        assert os.environ["USERNAME"].lower() in report.details["writer_uid"].lower()
+        assert "\\" in report.details["db_owner_uid"]

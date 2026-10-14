@@ -165,7 +165,10 @@ FFMPEG_IO_ERROR_EXIT = 251
 # The signals FFmpeg dies of on the file itself. A crash is deterministic: the same file crashes the same way on every
 # scan. Any other signal (SIGTERM, SIGINT, SIGHUP, the stall watchdog's or an OOM kill's SIGKILL) stopped it from
 # outside, wherever it was. Popen reports a signal as -n; a wrapper shell as 128+n.
-_CRASH_SIGNALS = frozenset({signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS, signal.SIGFPE, signal.SIGILL})
+# By name: Windows has no SIGBUS, and the Plex database tests import this module there too (windows-node.yml).
+_CRASH_SIGNALS = frozenset(
+    getattr(signal, name) for name in ("SIGSEGV", "SIGABRT", "SIGBUS", "SIGFPE", "SIGILL") if hasattr(signal, name)
+)
 
 # FFmpeg's statement that it has no decoder at all for the stream it was asked to decode (previews decode only video).
 # Not "unknown codec": FFmpeg also prints that for audio and subtitle streams of files whose video decodes fine.
