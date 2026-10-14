@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -25,6 +26,8 @@ from typing import Any
 from loguru import logger
 
 from ..protocol import (
+    CLIENT_TASK_ID_FIELD,
+    CLIENT_TASK_ID_PATTERN,
     KIND_CANCELLED,
     KIND_FAILED,
     KIND_FILE_NOT_VISIBLE,
@@ -110,6 +113,16 @@ def parse_mappings(raw: object) -> list[PathMapping]:
         return [PathMapping.from_json(row) for row in raw]
     except ValueError as exc:
         raise TaskSpecError(str(exc)) from exc
+
+
+def _client_task_id(spec: dict) -> str | None:
+    value = spec.get(CLIENT_TASK_ID_FIELD)
+    if value is None:
+        return None
+    # It names the task in URLs and its temp dir, so only plain id characters.
+    if not isinstance(value, str) or not re.fullmatch(CLIENT_TASK_ID_PATTERN, value):
+        raise TaskSpecError(f"{CLIENT_TASK_ID_FIELD} must be 16-64 letters, digits, '-' or '_'")
+    return value
 
 
 def _parse_gpu(raw: object) -> tuple[str, str] | None:
@@ -295,6 +308,9 @@ class TaskTable:
         Args:
             spec: The request body.
 
+        A spec carrying ``client_task_id`` gets that as its id; a repeated start with the same id answers the task
+        already there (running or finished) and starts nothing.
+
         Returns:
             The task id (the op is still running).
 
@@ -314,10 +330,16 @@ class TaskTable:
         optional_int(spec, "mtime_ns")
         mappings = parse_mappings(spec.get("mapping"))
         gpu = _parse_gpu(spec.get("gpu"))
-        task_id = uuid.uuid4().hex
+        task_id = _client_task_id(spec) or uuid.uuid4().hex
+        with self._lock:
+            if task_id in self._tasks:
+                return task_id
         temp_dir = tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
+            if task_id in self._tasks:  # The same start, twice at once: the first one runs.
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return task_id
             self._tasks[task_id] = task
         threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True).start()
         return task_id

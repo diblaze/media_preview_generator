@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import tarfile
 import threading
 
@@ -12,7 +13,7 @@ from loguru import logger
 
 from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.nodes import executor, protocol
-from media_preview_generator.nodes.client import NodeAuthError, NodeUnknownTaskError
+from media_preview_generator.nodes.client import NodeAuthError, NodeTimeoutError, NodeUnknownTaskError
 from media_preview_generator.nodes.executor import (
     FileNotVisibleError,
     NodeTaskCancelledError,
@@ -107,7 +108,9 @@ class TestStartAndResult:
 
         assert result == {"points": 1}
         stat = os.stat(media)
+        assert re.fullmatch(r"[0-9a-f]{32}", client.spec["client_task_id"])
         assert client.spec == {
+            "client_task_id": client.spec["client_task_id"],
             "op": protocol.OP_INTRO_FINGERPRINT,
             "path": media,
             "size": stat.st_size,
@@ -235,6 +238,32 @@ class TestNodeDrops:
         assert raised.value.started is False
         assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_a_start_whose_answer_timed_out_is_cancelled_on_the_node_by_its_client_id(self, media):
+        client = ScriptedClient([running()], start_error=NodeTimeoutError("http://n didn't answer in time"))
+        registry = _install(client)
+        with pytest.raises(NodeUnavailableError, match="couldn't start") as raised:
+            _run(media)
+        assert raised.value.started is False
+        assert client.deleted == [client.started_with["client_task_id"]]
+        assert client.named("poll") == []
+        assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_each_task_gets_its_own_client_id(self, media):
+        ids = []
+        for _ in range(2):
+            client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+            _install(client)
+            _run(media)
+            ids.append(client.spec["client_task_id"])
+        assert ids[0] != ids[1]
+
+    def test_a_refused_start_never_reached_the_node_so_nothing_is_cancelled(self, media):
+        client = ScriptedClient([running()], start_error=unreachable())
+        _install(client)
+        with pytest.raises(NodeUnavailableError):
+            _run(media)
+        assert client.deleted == []
 
     def test_a_removed_node_never_ran_the_task(self, media):
         set_registry(FakeRegistry({}))

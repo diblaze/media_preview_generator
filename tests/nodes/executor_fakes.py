@@ -65,9 +65,12 @@ class ScriptedClient:
         self.start_error = start_error
         self.calls: list[tuple] = []
         self.spec: dict | None = None
+        self.started_with: dict | None = None
+        self.deleted: list[str] = []
 
     def start_task(self, spec: dict) -> str:
         self.calls.append(("start",))
+        self.started_with = spec
         if self.start_error is not None:
             raise self.start_error
         self.spec = spec
@@ -97,6 +100,7 @@ class ScriptedClient:
 
     def delete_task(self, task_id: str) -> None:
         self.calls.append(("delete",))
+        self.deleted.append(task_id)
 
     def named(self, name: str) -> list[tuple]:
         return [c for c in self.calls if c[0] == name]

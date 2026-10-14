@@ -84,7 +84,7 @@ package version; the Plex database role also keeps the agent's `"agent"` block f
 | `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at}`, `plex_db {config_dir, db_present, machine_identifier}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
-| `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` |
+| `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |
 | `GET /v1/tasks/<id>?log_from=N` | – | `TASK_STATE`; 404 `{"error":{"kind":"unknown_task"}}` when the node doesn't know it |
 | `POST /v1/tasks/<id>/cancel` | – | `{"ok": true}` |
 | `POST /v1/tasks/<id>/pause` / `resume` | – | `{"ok": true}` — the op's `pause_check()` follows it, exactly as a local pause |
@@ -96,7 +96,11 @@ package version; the Plex database role also keeps the agent's `"agent"` block f
 returns, made JSON-safe.
 
 `TASK_SPEC = {"op", "path", "size", "mtime_ns", "mapping": [{"app_prefix", "node_prefix"}], "gpu": {"type",
-"device"} | null, "params": {...}}` — `path` is the **app's** path; the node maps it.
+"device"} | null, "params": {...}, "client_task_id"?}` — `path` is the **app's** path; the node maps it.
+`client_task_id` (optional, 16-64 of `[A-Za-z0-9_-]`; the app sends a fresh uuid hex per task) becomes the task id. A
+repeated start with an id the node already has answers that task and starts nothing, so a start whose answer was lost
+can't run twice. When the app's start times out after reaching the node, it sends `DELETE /v1/tasks/<client_task_id>`
+(404 = it never started), so FFmpeg doesn't keep running there until the unpolled-task expiry.
 
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.

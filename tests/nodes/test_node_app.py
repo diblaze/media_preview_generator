@@ -247,6 +247,21 @@ class TestTaskRoutes:
         assert deleted.status_code == 200 and deleted.get_json()["ok"] is True
         assert after.status_code == 404 and after.get_json()["error"]["kind"] == protocol.KIND_UNKNOWN_TASK
 
+    def test_a_repeated_start_with_the_same_client_id_answers_the_same_task(self, make_app, media):
+        runs = []
+        client = make_app(ops={"test.op": lambda *a: runs.append(1) or {}}).test_client()
+        client_id = "fedcba9876543210fedcba9876543210"
+        spec = {"op": "test.op", "path": "/data/a.mkv", "client_task_id": client_id,
+                "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}  # fmt: skip
+
+        first = client.post("/v1/tasks", headers=HEADERS, json=spec)
+        _wait_done(client, client_id)
+        again = client.post("/v1/tasks", headers=HEADERS, json=spec)
+
+        assert (first.status_code, first.get_json()["id"]) == (202, client_id)
+        assert (again.status_code, again.get_json()["id"]) == (202, client_id)
+        assert runs == [1]
+
     def test_no_artifact_is_404_request(self, make_app, media):
         client = make_app(ops={"test.op": lambda *a: {}}).test_client()
         spec = {"op": "test.op", "path": "/data/a.mkv", "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}

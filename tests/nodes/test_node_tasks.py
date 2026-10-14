@@ -180,6 +180,10 @@ class TestSpecValidation:
             {"mapping": [{"app_prefix": "/data"}]},
             {"gpu": {"type": "NVIDIA"}},
             {"params": []},
+            {"client_task_id": 5},
+            {"client_task_id": "short"},
+            {"client_task_id": "../../etc/passwd-0123456789"},
+            {"client_task_id": "x" * 65},
         ],
     )
     def test_malformed_spec_is_refused(self, make_table, media, change):
@@ -191,6 +195,57 @@ class TestSpecValidation:
     def test_non_object_spec_is_refused(self, make_table):
         with pytest.raises(tasks.TaskSpecError):
             make_table({}).start([])
+
+
+class TestClientTaskId:
+    CLIENT_ID = "0123456789abcdef0123456789abcdef"
+
+    def test_the_clients_id_is_the_task_id(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {"ok": 1}})
+        assert table.start(_spec(media, client_task_id=self.CLIENT_ID)) == self.CLIENT_ID
+        assert _finished(table, self.CLIENT_ID)["result"] == {"ok": 1}
+
+    def test_a_repeated_start_returns_the_same_task_and_runs_the_op_once(self, make_table, media):
+        runs = []
+        release = threading.Event()
+
+        def op(ctx, node_path, params):
+            runs.append(ctx.temp_dir)
+            release.wait(WAIT_S)
+            return {}
+
+        table = make_table({"test.op": op})
+        first = table.start(_spec(media, client_task_id=self.CLIENT_ID))
+        _until(lambda: runs)
+        again = table.start(_spec(media, client_task_id=self.CLIENT_ID))
+        release.set()
+        _finished(table, first)
+
+        assert first == again == self.CLIENT_ID
+        assert len(runs) == 1
+        temp_root = os.path.dirname(runs[0])
+        assert [n for n in os.listdir(temp_root) if n.startswith(tasks.TASK_DIR_PREFIX)] == [os.path.basename(runs[0])]
+
+    def test_without_a_client_id_each_start_is_a_new_task(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {}})
+        assert table.start(_spec(media)) != table.start(_spec(media))
+
+    def test_deleting_by_the_client_id_cancels_a_task_whose_start_answer_was_lost(self, make_table, media):
+        seen = {}
+
+        def op(ctx, node_path, params):
+            seen["temp"] = ctx.temp_dir
+            _until(ctx.cancel_check)
+            return {}
+
+        table = make_table({"test.op": op})
+        table.start(_spec(media, client_task_id=self.CLIENT_ID))
+        _until(lambda: "temp" in seen)
+
+        assert table.delete(self.CLIENT_ID)
+
+        _until(lambda: not os.path.exists(seen["temp"]))
+        assert self.CLIENT_ID not in table
 
 
 class TestCancelAndPause:

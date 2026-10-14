@@ -30,6 +30,11 @@ class NodeUnreachableError(NodeError):
     """No answer: connection refused, timed out, DNS, TLS, or a 5xx from something in between."""
 
 
+class NodeTimeoutError(NodeUnreachableError):
+    """The request reached the node but no answer came in time: unlike a refused connection, the node may have acted
+    on it."""
+
+
 class NodeAuthError(NodeError):
     """The node refused the key (401)."""
 
@@ -89,6 +94,8 @@ class NodeClient:
                 headers=self._headers() if auth else None,
                 timeout=(CONNECT_TIMEOUT_S, read_timeout),
             )
+        except requests.ReadTimeout as exc:
+            raise NodeTimeoutError(f"{self._address.base} didn't answer in time: {type(exc).__name__}") from exc
         except requests.RequestException as exc:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
         if response.status_code == 401:
@@ -140,7 +147,7 @@ class NodeClient:
         return self._call("POST", protocol.ROUTE_ACCESS_CHECK, json=body, read_timeout=30.0)
 
     def start_task(self, spec: dict) -> str:
-        """``POST /v1/tasks``; returns the task id."""
+        """``POST /v1/tasks``; returns the task id (the spec's ``client_task_id`` when it carries one)."""
         body = self._call("POST", protocol.ROUTE_TASKS, json=spec)
         task_id = body.get("id")
         if not isinstance(task_id, str) or not task_id:

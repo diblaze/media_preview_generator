@@ -15,6 +15,7 @@ import io
 import os
 import tarfile
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -25,7 +26,7 @@ from loguru import logger
 
 from ..processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, CodecNotSupportedError
 from . import protocol
-from .client import NodeClient, NodeError, NodeRequestError, NodeUnknownTaskError
+from .client import NodeClient, NodeError, NodeRequestError, NodeTimeoutError, NodeUnknownTaskError
 from .registry import NodeRegistry, get_registry
 
 # How often a running task is polled; a cancel or a pause flip is forwarded within one slice of it.
@@ -246,8 +247,21 @@ class _TaskRun:
             self._task_id = self._client.start_task(spec)
         except NodeRequestError as exc:
             raise NodeTaskError(protocol.KIND_REQUEST, f"{name} refused the task: {exc}") from exc
+        except NodeTimeoutError as exc:
+            # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
+            # running there beside the file's next try until the node's unpolled-task expiry.
+            self._drop_unanswered(spec[protocol.CLIENT_TASK_ID_FIELD])
+            raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         except NodeError as exc:
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
+
+    def _drop_unanswered(self, client_task_id: str) -> None:
+        try:
+            self._client.delete_task(client_task_id)
+        except NodeUnknownTaskError:
+            pass  # It never started.
+        except NodeError as exc:
+            logger.debug("{}couldn't cancel the unanswered start: {}", self._prefix, exc)
 
     def _cancel_requested(self) -> bool:
         return bool(self._cancel_check and self._cancel_check())
@@ -446,6 +460,7 @@ def run_on_node(
             placement.node_id, placement.node_name, f"{placement.node_name} is no longer configured", started=False
         ) from exc
     spec = {
+        protocol.CLIENT_TASK_ID_FIELD: uuid.uuid4().hex,
         "op": op,
         "path": app_path,
         "size": stat.st_size,

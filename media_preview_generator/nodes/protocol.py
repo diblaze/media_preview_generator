@@ -71,6 +71,12 @@ OP_INTRO_END_PICTURE = "intro.end_picture"
 OP_CREDITS_FIND = "credits.find"
 OPS = (OP_PREVIEW_FRAMES, OP_LOUDNESS_ANALYZE, OP_INTRO_FINGERPRINT, OP_INTRO_END_PICTURE, OP_CREDITS_FIND)
 
+# TASK_SPEC's optional ``client_task_id``: the app's own id for the task, which the node uses as the task id. A
+# repeated start with the same id answers the existing task instead of starting another, and the app can cancel a
+# task whose start answer it never got (``DELETE /v1/tasks/<client_task_id>``).
+CLIENT_TASK_ID_FIELD = "client_task_id"
+CLIENT_TASK_ID_PATTERN = r"[A-Za-z0-9_-]{16,64}"
+
 # A task nobody has polled for this long is cancelled and its temp dir removed: an app that restarted mid-task
 # never leaves work running on a node.
 TASK_UNPOLLED_EXPIRY_S = 60.0
