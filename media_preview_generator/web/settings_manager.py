@@ -25,6 +25,10 @@ class WorkerGroupsConflict(ValueError):
     """A group editor attempted to overwrite a newer saved configuration."""
 
 
+class NodesConflict(ValueError):
+    """A node editor attempted to overwrite a newer saved node list."""
+
+
 def _distribute_gpu_threads_into_dict(settings: dict[str, Any], value: int) -> None:
     """Distribute a total GPU worker count across enabled GPUs in ``gpu_config``.
 
@@ -331,6 +335,44 @@ class SettingsManager:
             if expected_revision is not None and expected_revision != revision:
                 raise WorkerGroupsConflict("Worker groups changed elsewhere. Reload them before applying your edits.")
             self.apply_changes(updates={"worker_groups": clean, "worker_groups_revision": revision + 1})
+            return revision + 1
+
+    @property
+    def nodes(self) -> list[dict[str, Any]]:
+        """An independent copy of the configured nodes (keys included; mask before sending anywhere)."""
+        with self._lock:
+            raw = self._settings.get("nodes")
+            return copy.deepcopy([n for n in raw if isinstance(n, dict)]) if isinstance(raw, list) else []
+
+    @property
+    def nodes_revision(self) -> int:
+        """Revision of the ``nodes`` list; the node registry re-reads it when this moves."""
+        return int(self.get("nodes_revision", 0))
+
+    def update_nodes(self, nodes: list[dict], expected_revision: int | None = None) -> int:
+        """Validate and persist the whole node list atomically.
+
+        Args:
+            nodes: Complete desired node list (stored records, keys unmasked).
+            expected_revision: Revision the editor loaded, or None for a read-modify-write under :meth:`locked`.
+
+        Returns:
+            The newly persisted revision.
+
+        Raises:
+            NodesConflict: The list changed since the editor loaded it.
+            ValueError: A record is invalid.
+        """
+        from ..nodes.settings import validate_nodes
+
+        clean, err = validate_nodes(nodes)
+        if clean is None:
+            raise ValueError(err)
+        with self._lock:
+            revision = self.nodes_revision
+            if expected_revision is not None and expected_revision != revision:
+                raise NodesConflict("Nodes changed elsewhere. Reload them before applying your edits.")
+            self.apply_changes(updates={"nodes": clean, "nodes_revision": revision + 1})
             return revision + 1
 
     # =========================================================================

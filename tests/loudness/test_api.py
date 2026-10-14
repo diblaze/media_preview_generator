@@ -73,6 +73,13 @@ def _add_plex(markers=None, loudness=None):
     return entry["id"]
 
 
+def _add_helper_node():
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    node = {"id": "n1", "name": "helper", "url": "http://helper:8765", "key": "test-helper-key-0123456789"}
+    get_settings_manager().set("nodes", [{**node, "enabled": True, "path_mappings": []}])
+
+
 def _saved():
     from media_preview_generator.web.settings_manager import get_settings_manager
 
@@ -114,7 +121,8 @@ def test_save_refuses_loudness_with_unsupported_helper(client):
 
 def test_enabling_helper_requires_turning_loudness_off(client):
     sid = _add_plex(loudness={"enabled": True})
-    helper = {"plex": {"agent": {"enabled": True, "url": "http://helper:8765", "token": "test-helper-key-0123456789"}}}
+    _add_helper_node()
+    helper = {"plex": {"agent": {"enabled": True, "node_id": "n1"}}}
     resp = client.put(f"/api/servers/{sid}", json={"markers": helper})
     assert resp.status_code == 400
     assert "helper does not support" in resp.get_json()["error"]

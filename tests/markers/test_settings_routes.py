@@ -319,7 +319,7 @@ def test_partial_plex_disable_keeps_confirmation_and_library_choice(client):
     assert stored["plex"] == {
         "db_write_confirmed_at": "2026-09-13T00:00:00+00:00",
         "on_plex_redetect": "keep_plex",
-        "agent": {"enabled": False, "url": "", "token": ""},
+        "agent": {"enabled": False, "node_id": None},
     }
 
     resp = client.put(f"/api/servers/{sid}", json={"markers": {"enabled": True}})
@@ -521,7 +521,23 @@ def test_create_server_validates_the_markers_block(client, server_type, markers,
     assert saved[0]["markers"] == expected
 
 
-def _plex_with_agent(client, token="stored-key"):
+def _node(node_id, name, key):
+    return {
+        "id": node_id,
+        "node_uid": None,
+        "name": name,
+        "url": f"http://{node_id}.lan:9494",
+        "key": key,
+        "enabled": True,
+        "path_mappings": [],
+        "added_at": "2026-10-15T00:00:00+00:00",
+    }
+
+
+def _plex_with_agent(client, node_id="n1"):
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    get_settings_manager().set("nodes", [_node("n1", "Plex box", "stored-key"), _node("n2", "Other", "other-key")])
     return _add_server(
         client,
         "plex",
@@ -531,7 +547,7 @@ def _plex_with_agent(client, token="stored-key"):
             "plex": {
                 "db_write_confirmed_at": None,
                 "on_plex_redetect": "restore",
-                "agent": {"enabled": True, "url": "http://plex-host.lan:9494", "token": token},
+                "agent": {"enabled": True, "node_id": node_id},
             },
         },
     )
@@ -542,29 +558,24 @@ def _plex_with_agent(client, token="stored-key"):
     [("get", "/api/servers"), ("get", "/api/servers/plex-1"), ("put", "/api/servers/plex-1")],
     ids=["list", "one", "save"],
 )
-def test_the_plex_marker_agents_key_never_leaves_the_app(client, method, path):
+def test_the_server_payload_names_the_plex_database_node_and_never_a_key(client, method, path):
     _plex_with_agent(client)
     resp = client.put(path, json={"name": "renamed"}) if method == "put" else client.get(path)
     assert resp.status_code == 200, resp.get_json()
     assert "stored-key" not in resp.get_data(as_text=True)
     entry = resp.get_json()
     server = entry["servers"][0] if "servers" in entry else entry
-    assert server["markers"]["plex"]["agent"] == {
-        "enabled": True,
-        "url": "http://plex-host.lan:9494",
-        "token": SECRET_MASK,
-    }
+    assert server["markers"]["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
 
 
-def test_saving_the_agent_back_with_the_mask_keeps_the_stored_key(client):
+def test_choosing_another_node_saves_it(client):
     from media_preview_generator.web.settings_manager import get_settings_manager
 
     sid = _plex_with_agent(client)
-    posted = {"plex": {"agent": {"enabled": True, "url": "http://moved:9494", "token": SECRET_MASK}}}
-    resp = client.put(f"/api/servers/{sid}", json={"markers": posted})
+    resp = client.put(f"/api/servers/{sid}", json={"markers": {"plex": {"agent": {"enabled": True, "node_id": "n2"}}}})
     assert resp.status_code == 200, resp.get_json()
     stored = get_settings_manager().get("media_servers")[0]["markers"]["plex"]
-    assert stored["agent"] == {"enabled": True, "url": "http://moved:9494", "token": "stored-key"}
+    assert stored["agent"] == {"enabled": True, "node_id": "n2"}
     # The rest of the Plex block is untouched by a save that only names the agent.
     assert stored["on_plex_redetect"] == "restore"
 
@@ -576,25 +587,26 @@ def test_a_save_that_only_changes_the_redetect_rule_leaves_the_agent_alone(clien
     resp = client.put(f"/api/servers/{sid}", json={"markers": {"plex": {"on_plex_redetect": "keep_plex"}}})
     assert resp.status_code == 200, resp.get_json()
     stored = get_settings_manager().get("media_servers")[0]["markers"]["plex"]
-    assert stored["agent"] == {"enabled": True, "url": "http://plex-host.lan:9494", "token": "stored-key"}
+    assert stored["agent"] == {"enabled": True, "node_id": "n1"}
     assert stored["on_plex_redetect"] == "keep_plex"
 
 
-def test_an_agent_address_that_isnt_one_is_refused_and_nothing_is_saved(client):
+def test_a_node_that_isnt_configured_is_refused_and_nothing_is_saved(client):
     from media_preview_generator.web.settings_manager import get_settings_manager
 
     sid = _plex_with_agent(client)
-    posted = {"plex": {"agent": {"enabled": True, "url": "notanaddress", "token": SECRET_MASK}}}
+    posted = {"plex": {"agent": {"enabled": True, "node_id": "gone"}}}
     resp = client.put(f"/api/servers/{sid}", json={"markers": posted})
-    assert resp.status_code == 400 and "agent.url" in resp.get_json()["error"]
+    assert resp.status_code == 400 and "isn't on the Nodes page" in resp.get_json()["error"]
     stored = get_settings_manager().get("media_servers")[0]["markers"]["plex"]
-    assert stored["agent"]["url"] == "http://plex-host.lan:9494"
+    assert stored["agent"]["node_id"] == "n1"
 
 
-def test_creating_a_server_with_an_agent_never_echoes_its_key(client):
+def test_creating_a_server_with_a_plex_database_node(client):
     from media_preview_generator.web.settings_manager import get_settings_manager
 
     get_settings_manager().set("media_servers", [])
+    get_settings_manager().set("nodes", [_node("n1", "Plex box", "brand-new-key")])
     body = {
         "type": "plex",
         "name": "plex",
@@ -607,23 +619,22 @@ def test_creating_a_server_with_an_agent_never_echoes_its_key(client):
             "plex": {
                 "db_write_confirmed_at": None,
                 "on_plex_redetect": "restore",
-                "agent": {"enabled": True, "url": "http://plex-host.lan:9494", "token": "brand-new-key"},
+                "agent": {"enabled": True, "node_id": "n1"},
             },
         },
     }
     resp = client.post("/api/servers", json=body)
     assert resp.status_code == 201, resp.get_json()
     assert "brand-new-key" not in resp.get_data(as_text=True)
-    assert resp.get_json()["markers"]["plex"]["agent"]["token"] == SECRET_MASK
     stored = get_settings_manager().get("media_servers")[0]["markers"]["plex"]["agent"]
-    assert stored == {"enabled": True, "url": "http://plex-host.lan:9494", "token": "brand-new-key"}
+    assert stored == {"enabled": True, "node_id": "n1"}
 
 
-def test_a_key_the_header_cant_carry_is_refused(client):
+def test_turning_it_on_without_choosing_a_node_is_refused(client):
     sid = _plex_with_agent(client)
-    posted = {"plex": {"agent": {"enabled": True, "url": "http://plex-host.lan:9494", "token": "key\u2019with-quote"}}}
+    posted = {"plex": {"agent": {"enabled": True, "node_id": None}}}
     resp = client.put(f"/api/servers/{sid}", json={"markers": posted})
-    assert resp.status_code == 400 and "agent.token" in resp.get_json()["error"]
+    assert resp.status_code == 400 and "Choose the node" in resp.get_json()["error"]
 
 
 def test_settings_get_returns_the_credits_window(client):

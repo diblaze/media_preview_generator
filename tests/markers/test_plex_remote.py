@@ -588,20 +588,27 @@ class TestWhichDatabaseHalfAServerGets:
         [
             (False, "", LocalPlexDb),
             (False, URL, LocalPlexDb),
-            (True, "", LocalPlexDb),
+            # On with no address (its node record is gone): still the agent half, which refuses every call,
+            # never this app's own copy of the folder, which Plex isn't reading.
+            (True, "", RemotePlexDb),
             (True, URL, RemotePlexDb),
         ],
         ids=["off-no-address", "off-with-address", "on-no-address", "on-with-address"],
     )
-    def test_the_agent_is_used_only_when_it_is_on_and_has_an_address(self, enabled, url, expected):
+    def test_the_agent_is_used_whenever_it_is_on(self, enabled, url, expected):
         settings = ServerMarkersSettings(
             True, None, "x", "restore", agent_enabled=enabled, agent_url=url, agent_token=TOKEN
         )
         database = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
         assert isinstance(database, expected)
 
-    def test_the_factory_gives_a_plex_server_with_an_agent_the_remote_half(self):
+    def test_the_factory_gives_a_plex_server_with_an_agent_the_remote_half(self, tmp_path):
         from media_preview_generator.markers.publishers.factory import publisher_for
+        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+        reset_settings_manager()
+        node = {"id": "n1", "name": "Plex box", "url": URL, "key": TOKEN, "enabled": True, "path_mappings": []}
+        get_settings_manager(str(tmp_path)).set("nodes", [node])
 
         config = ServerConfig(
             id="plex-1",
@@ -617,12 +624,14 @@ class TestWhichDatabaseHalfAServerGets:
                 "plex": {
                     "db_write_confirmed_at": "2026-09-13T00:00:00+00:00",
                     "on_plex_redetect": "restore",
-                    "agent": {"enabled": True, "url": URL, "token": TOKEN},
+                    "agent": {"enabled": True, "node_id": "n1"},
                 },
             },
         )
         publisher = publisher_for(MagicMock(), config)
+        reset_settings_manager()
         assert isinstance(publisher._db, RemotePlexDb)
+        assert publisher._db.agent_details()["url"] == URL
 
     def test_the_factory_gives_a_plex_server_without_one_the_local_half(self):
         from media_preview_generator.markers.publishers.factory import publisher_for

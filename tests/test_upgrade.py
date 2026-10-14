@@ -3254,6 +3254,149 @@ class TestMigrateToV23:
         assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[23]]
 
 
+def _plex_entry(server_id: str, name: str, agent: dict | None, server_type: str = "plex") -> dict:
+    entry: dict = {"id": server_id, "type": server_type, "name": name, "enabled": True, "url": "http://p:32400"}
+    if agent is not None:
+        entry["markers"] = {
+            "enabled": True,
+            "library_ids": None,
+            "plex": {"db_write_confirmed_at": "2026-01-01", "on_plex_redetect": "restore", "agent": agent},
+        }
+    return entry
+
+
+def _agent_of(settings_manager, index: int) -> dict:
+    return settings_manager.get("media_servers")[index]["markers"]["plex"]["agent"]
+
+
+class TestMigrateToV24:
+    """v24 moves every Plex helper's address and key into a ``nodes`` record the server points at."""
+
+    HELPER = {"enabled": True, "url": "http://helper.lan:9494/", "token": "helper-key"}
+
+    def test_an_enabled_helper_becomes_a_node_and_the_server_points_at_it(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+
+        notes = _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert (node["name"], node["url"], node["key"], node["enabled"]) == (
+            "Plex helper (Home)",
+            "http://helper.lan:9494",
+            "helper-key",
+            True,
+        )
+        assert node["node_uid"] is None and node["path_mappings"] == [] and node["added_at"]
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+        assert settings_manager.nodes_revision == 1
+        assert notes and notes[0].startswith("v24:")
+        assert "Nodes page" in _USER_FACING_NOTES[24]
+
+    def test_a_disabled_helper_with_an_address_keeps_its_node_switched_off(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {**self.HELPER, "enabled": False}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        node = settings_manager.get("nodes")[0]
+        assert node["enabled"] is False
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": node["id"]}
+
+    @pytest.mark.parametrize(
+        "agent",
+        [{"enabled": False, "url": "", "token": ""}, {"enabled": False, "url": "http://x:1", "token": ""}],
+        ids=["no-address", "no-key"],
+    )
+    def test_a_block_without_a_helper_points_at_no_node(self, settings_manager, agent):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get("nodes") is None
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+
+    def test_servers_without_a_markers_block_and_other_vendors_are_untouched(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [_plex_entry("p1", "Home", None), _plex_entry("j1", "JF", self.HELPER, server_type="jellyfin")]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get("media_servers") == servers
+        assert settings_manager.get("nodes") is None
+
+    def test_two_servers_sharing_one_helper_share_one_node(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [
+            _plex_entry("p1", "Home", {**self.HELPER, "enabled": False}),
+            _plex_entry("p2", "Cabin", {**self.HELPER, "url": "http://helper.lan:9494"}),
+            _plex_entry("p3", "Home", {"enabled": True, "url": "http://other:9494", "token": "other-key"}),
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert [n["name"] for n in nodes] == ["Plex helper (Home)", "Plex helper (Home) 2"]
+        # The shared node is on because one of its servers had it on.
+        assert nodes[0]["enabled"] is True
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 1) == {"enabled": True, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 2) == {"enabled": True, "node_id": nodes[1]["id"]}
+
+    def test_a_second_run_changes_nothing(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+        before = settings_manager.get_all()
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get_all() == before
+
+    def test_the_migrated_settings_pass_node_validation_and_resolve_the_address(self, settings_manager):
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.nodes.settings import validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+        from media_preview_generator.web import settings_manager as sm_mod
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+
+        assert validate_nodes(settings_manager.get("nodes"))[1] == ""
+        sm_mod._settings_manager = settings_manager
+        try:
+            loaded = load_server(settings_manager.get("media_servers")[0]["markers"], "plex")
+        finally:
+            sm_mod.reset_settings_manager()
+        assert (loaded.agent_enabled, loaded.agent_url, loaded.agent_token) == (
+            True,
+            "http://helper.lan:9494",
+            "helper-key",
+        )
+
+    def test_the_schema_step_runs_once_stamps_the_version_and_tells_the_user(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_schema
+
+        settings_manager.apply_changes(
+            updates={"_schema_version": 23, "media_servers": [_plex_entry("p1", "Home", self.HELPER)]}
+        )
+
+        _migrate_schema(settings_manager)
+
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 24
+        assert len(settings_manager.get("nodes")) == 1
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[24]]
+
+
 class TestUpgradedAutoPauseResumes:
     """A proven no-workers pause becomes capacity waiting after upgrading."""
 
