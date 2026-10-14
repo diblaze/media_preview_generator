@@ -431,6 +431,7 @@ class TestTheUndoRecordSurvivesAnUpdate:
         ],
         ids=["container-layer", "container-volume", "host-disk"],
     )
+    @linux_mount_table
     def test_the_readiness_check(self, folder, tmp_path, root_fs, config_mounted, ready):
         report = self._check(folder, tmp_path, root_fs=root_fs, config_mounted=config_mounted)
         if ready:
