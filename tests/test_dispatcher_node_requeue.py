@@ -197,8 +197,20 @@ class TestNodeDrops:
         assert tracker.outcome_counts == {"markers_published": 0, "failed": 1}
         (row,) = rows
         assert row.args[0] == "/m/a.mkv" and row.args[1].value == "failed"
-        assert row.args[2] == "node unavailable twice (NAS)"
+        assert row.args[2] == "node NAS unavailable (it dropped the file twice)"
+        # A webhook job reads these to word the file as the node's failure, never as one no server found.
+        assert tracker.get_result()["failed_paths"] == ["/m/a.mkv"]
+        assert tracker.get_result()["node_failures"] == {"/m/a.mkv": "node NAS unavailable (it dropped the file twice)"}
         assert tracker.active_processing == 0
+
+    def test_a_file_the_worker_itself_fails_is_not_a_node_failure(self):
+        def process(item, **_kwargs):
+            raise RuntimeError("the detector broke")
+
+        tracker, _ = _run(_pool(("n1", "NAS")), process, "/m/a.mkv")
+        assert (tracker.successful, tracker.failed) == (0, 1)
+        assert tracker.get_result()["failed_paths"] == ["/m/a.mkv"]
+        assert tracker.get_result()["node_failures"] == {}
 
     def test_starts_the_node_never_takes_dont_count_as_drops_but_are_capped(self, monkeypatch):
         monkeypatch.setattr(dispatcher_mod, "MAX_NODE_START_FAILURES", 3)
@@ -212,7 +224,8 @@ class TestNodeDrops:
         assert calls == ["n1", "n1", "n1"]
         assert (tracker.successful, tracker.failed) == (0, 1)
         (row,) = rows
-        assert row.args[2] == "the node couldn't start it 3 times (NAS)"
+        assert row.args[2] == "node NAS unavailable (it couldn't start the file 3 times)"
+        assert tracker.node_failures == {"/m/a.mkv": row.args[2]}
         assert tracker.node_drops == {}
         assert tracker.active_processing == 0
 
@@ -257,6 +270,7 @@ class TestNotVisible:
         assert (tracker.successful, tracker.failed) == (0, 1)
         (row,) = rows
         assert row.args[2] in ("not visible on A, B", "not visible on B, A")
+        assert tracker.node_failures == {"/m/1.mkv": row.args[2]}
         assert tracker.active_processing == 0
 
 

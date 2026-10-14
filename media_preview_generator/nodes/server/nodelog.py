@@ -46,7 +46,15 @@ class NodeLogBuffer:
         exc = record["exception"]
         if exc is not None and exc.type is not None:
             text += "\n" + "".join(traceback.format_exception(exc.type, exc.value, exc.traceback)).rstrip()
-        line = {"time": record["time"].isoformat(timespec="seconds"), "level": record["level"].name, "message": text}
+        when = record["time"]
+        # ``time`` is the node's own wall clock (its offset included); ``ts`` (epoch seconds) is the same instant with
+        # no zone to read, so the app shows it in its own time (protocol §3: added beside ``time``, not replacing it).
+        line = {
+            "time": when.isoformat(timespec="seconds"),
+            "ts": round(when.timestamp(), 3),
+            "level": record["level"].name,
+            "message": text,
+        }
         with self._lock:
             self._lines.append(line)
 
@@ -57,7 +65,7 @@ class NodeLogBuffer:
             count: How many lines.
 
         Returns:
-            Dicts with ``time``, ``level`` and ``message``.
+            Dicts with ``time`` (ISO 8601 with the node's offset), ``ts`` (epoch seconds), ``level`` and ``message``.
         """
         with self._lock:
             items = list(self._lines)

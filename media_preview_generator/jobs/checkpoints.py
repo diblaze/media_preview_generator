@@ -38,6 +38,11 @@ def _validate_accounting(snapshot: dict) -> None:
     failed = state.get("failed_paths", [])
     if not isinstance(failed, list) or any(not isinstance(path, str) for path in failed):
         raise ValueError("Invalid checkpoint failed work")
+    node_failures = state.get("node_failures", {})
+    if not isinstance(node_failures, dict) or any(
+        not isinstance(path, str) or not isinstance(why, str) for path, why in node_failures.items()
+    ):
+        raise ValueError("Invalid checkpoint node failures")
     if not isinstance(state.get("publishers_aggregate", {}), dict):
         raise ValueError("Invalid checkpoint publisher accounting")
 

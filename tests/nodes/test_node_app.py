@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import types
+from datetime import datetime
 
 import pytest
 
@@ -311,13 +312,18 @@ class TestLogRoute:
         from loguru import logger
 
         client = make_app().test_client()
+        before = time.time()
         for n in range(5):
             logger.info("node line {}", n)
 
         body = client.get("/v1/log?lines=2", headers=HEADERS).get_json()
 
         assert [line["message"] for line in body["lines"]] == ["node line 3", "node line 4"]
-        assert set(body["lines"][0]) == {"time", "level", "message"}
+        line = body["lines"][0]
+        assert set(line) == {"time", "ts", "level", "message"}
+        # ``ts`` is the instant with no zone to misread; ``time`` keeps the node's offset, and both are the same moment.
+        assert before - 1 <= line["ts"] <= time.time() + 1
+        assert abs(datetime.fromisoformat(line["time"]).timestamp() - line["ts"]) < 1
 
     def test_bad_lines_is_400(self, make_app):
         assert make_app().test_client().get("/v1/log?lines=x", headers=HEADERS).status_code == 400

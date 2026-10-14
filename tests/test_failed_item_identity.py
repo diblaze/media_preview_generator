@@ -96,6 +96,20 @@ class TestWebhookPhaseRetriesTheFailedPaths:
 
         assert result["unresolved_paths"] == ["/tv/b.mkv"]
 
+    def test_a_file_its_node_failed_is_not_unresolved_and_keeps_the_nodes_reason(self):
+        canonical_by_raw = {"/tv/a.mkv": "/data/tv/a.mkv", "/tv/b.mkv": "/data/tv/b.mkv"}
+        why = "node NAS unavailable (it dropped the file twice)"
+        result = self._run_phase(
+            list(canonical_by_raw),
+            canonical_by_raw,
+            {"completed": 0, "failed": 2, "cancelled": False, "outcome": {},
+             "failed_paths": ["/data/tv/a.mkv", "/data/tv/b.mkv"], "node_failures": {"/data/tv/b.mkv": why}},
+        )  # fmt: skip
+
+        assert result["unresolved_paths"] == ["/tv/a.mkv"]
+        assert result["node_failed"] == {"/tv/b.mkv": why}
+        assert result["resolved_count"] == 1
+
     def test_names_the_webhook_path_each_dispatched_file_came_from(self):
         """job_runner's retry scan reads file rows keyed by the path the file was dispatched under, and must
         resubmit the path the webhook sent for just the files still missing. The phase hands it that map."""

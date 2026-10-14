@@ -994,8 +994,10 @@
             return;
         }
         const lines = Array.isArray(r.data && r.data.lines) ? r.data.lines : [];
+        // The API gives each time in this app's own zone (ISO 8601); shown as the app's own log shows its times.
+        const shownTime = (time) => String(time || '').replace('T', ' ').replace(/(?:[+-]\d\d:\d\d|Z)$/, '');
         pre.textContent = lines.length
-            ? lines.map((line) => [line.time, line.level, line.message].filter(Boolean).join(' ')).join('\n')
+            ? lines.map((line) => [shownTime(line.time), line.level, line.message].filter(Boolean).join(' ')).join('\n')
             : 'No log lines yet.';
         pre.scrollTop = pre.scrollHeight;
     }

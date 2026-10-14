@@ -40,6 +40,7 @@ media_preview_generator/nodes/
   registry.py        NodeRegistry: configured nodes, their live state, the health loop, alerts
   mappings.py        app path <-> node path rules, Test access sampling and suggestions
   readiness.py       node Setup Health rows (same buckets as server Setup Health)
+  access_results.py  each node's last Test access, kept across restarts (<CONFIG_DIR>/node_access_results.json)
   executor.py        runs one op on a node for a remote worker: start, poll, log lines, cancel, errors
 media_preview_generator/web/routes/api_nodes.py      REST API behind the Nodes page
 media_preview_generator/web/templates/nodes.html     Nodes page (+ static/js/nodes.js)
@@ -90,7 +91,7 @@ package version; the Plex database role also keeps the agent's `"agent"` block f
 | `POST /v1/tasks/<id>/pause` / `resume` | – | `{"ok": true}` — the op's `pause_check()` follows it, exactly as a local pause |
 | `GET /v1/tasks/<id>/artifact` | – | the task's artifact (preview: a tar of the JPEGs) |
 | `DELETE /v1/tasks/<id>` | – | frees the task's temp dir |
-| `GET /v1/log?lines=N` | – | the node's last N log lines |
+| `GET /v1/log?lines=N` | – | `{"lines": [{time, ts, level, message}]}`, the node's last N lines oldest first: `time` ISO 8601 with the node's offset, `ts` epoch seconds (added later; an older node sends no `ts`) |
 
 `gpus[]` entries: `{"type", "device", "name", "status", "error"}` — the same tuple `gpu.detect.detect_all_gpus()`
 returns, made JSON-safe.
@@ -163,9 +164,10 @@ retry runs (on the **node's** CPU, see §6).
 * While a task runs the worker polls every 1 s; node log lines are written into the job log by the worker's own
   thread (job-log routing is by registered thread id), prefixed `<node>/<device> ·`.
 * **Node drops** (3 failed polls ≈ 12 s, or the node no longer knows the task): `NodeUnavailableError` → the item
-  goes back in the queue once; a second drop on the same item fails it ("node unavailable twice"). A start the node
-  never took (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most
-  5 times, then it fails). After either, the node gets no new file until the registry's next check of it comes back
+  goes back in the queue once; a second drop on the same item fails it ("node <name> unavailable (it dropped the
+  file twice)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
+  (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
+  then it fails). After either, the node gets no new file until the registry's next check of it comes back
   ready (60 s at most), and the item's retry goes to another node or this app when one is free.
 * **File not visible**: the item goes to the next eligible worker on a different node (or this app); when every
   eligible worker has failed it, the item fails "not visible on X, Y". Three different files not visible on one node
@@ -318,9 +320,9 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 | `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact) |
 | `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
-| `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health |
+| `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |
-| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601) |
+| `GET /nodes/<id>/log?lines=N` | – | `{"lines": [{time, level, message}]}`, oldest first (`time` ISO 8601 in this app's time zone, from the node's `ts`, else its `time`) |
 | `POST /nodes/<id>/rescan-gpus` | – | `NODE_ROW` |
 
 `NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform: {os, arch, python}, gpus:

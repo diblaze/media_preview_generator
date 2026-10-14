@@ -119,6 +119,16 @@ class TestPayload:
         capacity = client.get("/api/worker-groups").get_json()["capacity"]
         assert capacity["current"] == {"cpu": 0, "gpu": 1}
         assert capacity["peak"] == {"cpu": 0, "gpu": 1}
+        # Node members are counted apart, so Settings can say "... here, 2 GPU + 1 CPU on nodes".
+        assert capacity["nodes_current"] == {"cpu": 1, "gpu": 2}
+        assert capacity["nodes_peak"] == {"cpu": 1, "gpu": 2}
+
+    def test_node_members_on_an_offline_node_count_in_the_peak_but_not_now(self, client, registry):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        assert put(client, [mixed_group()]).status_code == 200
+        capacity = client.get("/api/worker-groups").get_json()["capacity"]
+        assert capacity["nodes_current"] == {"cpu": 0, "gpu": 0}
+        assert capacity["nodes_peak"] == {"cpu": 1, "gpu": 2}
 
     def test_registry_failure_leaves_an_empty_nodes_list(self, client, registry, monkeypatch):
         def broken():

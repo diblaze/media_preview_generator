@@ -946,17 +946,21 @@ def source_line(source: Source, view: _SourceView) -> str:
     return f"Checking {label}… {reason}"
 
 
-def reading_line(source: Source, *, on_gpu: bool, device: str = "") -> str:
-    """The line logged right before a long local read starts (a credit-text read, a season-audio fingerprint).
+def reading_line(source: Source, *, on_gpu: bool, device: str = "", node: str = "") -> str:
+    """The line logged right before a long read starts (a credit-text read, a season-audio fingerprint).
 
     Args:
         source: ``Source.CREDITS_TEXT`` or ``Source.SEASON_AUDIO``.
         on_gpu: Whether it reads on the worker's GPU.
         device: The GPU's name, when known; "" for the CPU or when it isn't known.
+        node: ``<node>/<GPUn|CPU>`` when a node reads it (``nodes.executor.placement_label``); "" for this app.
 
     Returns:
-        E.g. ``Reading credit text on the GPU (Intel UHD 770)…`` or ``Reading season audio on the CPU…``.
+        E.g. ``Reading credit text on the GPU (Intel UHD 770)…``, ``Reading season audio on the CPU…`` or, on a
+        node, ``Reading credit text on lab-gpu/GPU0…`` (the prefix that node's own lines carry).
     """
+    if node:
+        return f"Reading {_READING_LABEL[source]} on {node}…"
     where = f"GPU ({device})" if on_gpu and device else ("GPU" if on_gpu else "CPU")
     return f"Reading {_READING_LABEL[source]} on the {where}…"
 

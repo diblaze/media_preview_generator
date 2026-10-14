@@ -21,6 +21,7 @@ from typing import Any
 from loguru import logger
 
 from . import protocol
+from .access_results import AccessResultStore
 from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError
 from .protocol import PathMapping
 from .settings import find_node, node_mappings
@@ -274,8 +275,11 @@ class NodeRegistry:
         attempt_gap_s: float = ATTEMPT_GAP_S,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
+        access_store: AccessResultStore | None = None,
     ) -> None:
         self._revision_provider = revision_provider
+        # Keeps each node's last Test access across restarts; None keeps it in memory only.
+        self._access_store = access_store
         self._nodes_provider = nodes_provider
         self._client_factory = client_factory
         self._legacy_ping = legacy_ping
@@ -432,16 +436,20 @@ class NodeRegistry:
             node_id: The node.
             result: ``{"libraries": [...]}`` as ``mappings.run_test_access`` returns it.
         """
+        self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return
             live.access_result = copy.deepcopy(result)
-            live.access_checked_at = self._wall_clock()
+            live.access_checked_at = checked_at = self._wall_clock()
+            mappings, keep = copy.deepcopy(live.record.get("path_mappings")), set(self._nodes)
             if access_passed(result):
                 live.access_problem = ""
                 live.not_visible.clear()
             self._touch()
+        if self._access_store is not None:
+            self._access_store.save(node_id, mappings, result, checked_at, keep=keep)
 
     # ------------------------------------------------------------------ checks on demand
 
@@ -570,7 +578,15 @@ class NodeRegistry:
     def _merge(self, live: _Live | None, record: dict) -> _Live:
         """A node's live record after its stored record changed (or a new one for a new node)."""
         if live is None:
-            return _Live(record=copy.deepcopy(record), client=self._client_factory(record))
+            live = _Live(record=copy.deepcopy(record), client=self._client_factory(record))
+            stored = (
+                self._access_store.load(str(record.get("id")), record.get("path_mappings"))
+                if self._access_store
+                else None
+            )
+            if stored is not None:
+                live.access_result, live.access_checked_at = stored
+            return live
         old = live.record
         address_changed = (old.get("url"), old.get("key")) != (record.get("url"), record.get("key"))
         reconnect = (
@@ -591,6 +607,11 @@ class NodeRegistry:
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
                 live.different_node = False
+        if old.get("path_mappings") != record.get("path_mappings"):
+            # A test of other mappings says nothing about these.
+            live.access_result = live.access_checked_at = None
+            if self._access_store is not None:
+                self._access_store.forget(str(record.get("id")))
         return live
 
     # ------------------------------------------------------------------ state
@@ -860,7 +881,7 @@ def get_registry() -> NodeRegistry:
     global _registry
     with _registry_lock:
         if _registry is None:
-            _registry = NodeRegistry()
+            _registry = NodeRegistry(access_store=AccessResultStore())
         return _registry
 
 

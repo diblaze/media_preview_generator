@@ -78,6 +78,22 @@ class TestStatuses:
         assert seen["params"] == {"k": 1} and seen["gpu"] == ("NVIDIA", "cuda:0")
         assert os.path.isdir(seen["temp"]) and seen["temp"].startswith(table.temp_root)
 
+    def test_progress_keeps_lists_and_dicts_as_json_not_their_text(self, make_table, media):
+        def op(ctx, node_path, params):
+            ctx.progress(40, args=[4.0, (10, "1.5x"), float("nan")], fallbacks=["CPU"], extra={"k": float("inf")})
+            return {}
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["progress"] == {
+            "percent": 40.0,
+            "args": [4.0, [10, "1.5x"], None],
+            "fallbacks": ["CPU"],
+            "extra": {"k": None},
+        }
+
     def test_file_not_visible_runs_no_op(self, make_table, media):
         called = []
         table = make_table({"test.op": lambda *a: called.append(1) or {}})

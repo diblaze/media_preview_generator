@@ -316,6 +316,15 @@ class Worker:
         self._done_event: threading.Event | None = None
 
     @property
+    def log_tag(self) -> str:
+        """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
+        the prefix the node's own lines carry in the job log."""
+        if self.node_id is None:
+            return f"[GPU {self.gpu_index}]:" if self.worker_type == "GPU" else "[CPU]:"
+        device = "CPU" if self.worker_type != "GPU" else f"GPU{'' if self.gpu_index is None else self.gpu_index}"
+        return f"{self.node_name}/{device} ·"
+
+    @property
     def placement(self) -> Placement | None:
         """Where this worker's heavy steps run: its node, or None for this app."""
         if self.node_id is None:
@@ -1115,14 +1124,8 @@ class WorkerPool:
         self._suspect_nodes: dict[str, tuple[float, float | None]] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
-
-        logger.info(
-            "Created fresh worker pool — {} worker(s): {} GPU + {} CPU "
-            "(subsequent jobs reuse this pool, you'll see 'Reusing existing worker pool' instead)",
-            len(self.workers),
-            gpu_workers,
-            cpu_workers,
-        )
+        # The "Created fresh worker pool" line comes from whoever made it, once its worker groups are applied:
+        # members on nodes only get their workers then.
 
     def has_busy_workers(self) -> bool:
         """Check if any workers are currently busy."""
@@ -1133,6 +1136,30 @@ class WorkerPool:
         """Return a stable snapshot of workers for safe iteration."""
         with self._workers_lock:
             return list(self.workers)
+
+    def size_summary(self) -> str:
+        """The pool's size for the job log: ``"3 worker(s): 1 GPU + 0 CPU here, 1 GPU + 1 CPU on nodes"``.
+
+        The part about nodes is there only when a worker runs on one.
+        """
+        workers = self._snapshot_workers()
+
+        def count(worker_type: str, on_node: bool) -> int:
+            return sum(1 for w in workers if w.worker_type == worker_type and (w.node_id is not None) == on_node)
+
+        text = f"{len(workers)} worker(s): {count('GPU', False)} GPU + {count('CPU', False)} CPU"
+        node_gpu, node_cpu = count("GPU", True), count("CPU", True)
+        if node_gpu or node_cpu:
+            text += f" here, {node_gpu} GPU + {node_cpu} CPU on nodes"
+        return text
+
+    def log_created(self) -> None:
+        """Log that this pool was just made, with its size once its worker groups are applied."""
+        logger.info(
+            "Created fresh worker pool — {} (subsequent jobs reuse this pool, you'll see 'reusing shared worker pool' "
+            "instead)",
+            self.size_summary(),
+        )
 
     def reconcile_groups(
         self, groups: list[dict], selected_gpus: list | None, *, now=None, revision: int | None = None
@@ -1879,10 +1906,7 @@ class WorkerPool:
             if not worker.start_logged:
                 worker.start_logged = True
                 display_path = worker.media_file if worker.media_file else worker.media_title
-                if worker.worker_type == "GPU":
-                    logger.info("[GPU {}]: Started processing {}", worker.gpu_index, display_path)
-                else:
-                    logger.info("[CPU]: Started processing {}", display_path)
+                logger.info("{} Started processing {}", worker.log_tag, display_path)
 
             # Mark that FFmpeg has started outputting progress
             worker.ffmpeg_started = True
@@ -1895,18 +1919,13 @@ class WorkerPool:
             current_time = time.time()
             if current_time - worker.last_verbose_log_time >= 5.0:
                 worker.last_verbose_log_time = current_time
-                if worker.worker_type == "GPU":
-                    logger.info(
-                        "[GPU {}]: {} - {}% (speed={})",
-                        worker.gpu_index,
-                        worker.media_title,
-                        round(progress_percent, 1),
-                        worker.speed,
-                    )
-                else:
-                    logger.info(
-                        "[CPU]: {} - {}% (speed={})", worker.media_title, round(progress_percent, 1), worker.speed
-                    )
+                logger.info(
+                    "{} {} - {}% (speed={})",
+                    worker.log_tag,
+                    worker.media_title,
+                    round(progress_percent, 1),
+                    worker.speed,
+                )
 
     def shutdown(self) -> None:
         """Shutdown all workers gracefully."""

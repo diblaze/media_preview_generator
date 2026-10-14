@@ -357,3 +357,46 @@ class TestNodeWorkerConstruction:
         assert worker.placement == Placement("n1", "n1")
         assert worker.group_resource == ("node:n1:cpu" if resource == "cpu" else "node:n1:gpu:cuda:0")
         assert worker.worker_type == resource.upper()
+
+
+class TestPoolSizeSummary:
+    def test_workers_on_nodes_are_counted_apart_from_this_apps(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=1, selected_gpus=[])
+        pool.workers.append(_node_gpu_worker())
+        pool.workers.append(Worker(7, "CPU", node_id="n2", node_name="lab-cpu"))
+        assert pool.size_summary() == "3 worker(s): 0 GPU + 1 CPU here, 1 GPU + 1 CPU on nodes"
+
+    def test_a_pool_with_no_node_workers_says_nothing_about_nodes(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=2, selected_gpus=[])
+        assert pool.size_summary() == "2 worker(s): 0 GPU + 2 CPU"
+
+
+class TestNodeWorkerLogLines:
+    """A node worker's own progress lines carry the prefix its node's lines do (``NAS/GPU0 ·``), not ``[GPU 0]:``."""
+
+    @staticmethod
+    def _lines(worker: Worker, *calls: tuple) -> list[str]:
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        worker.media_title = "Film"
+        lines: list[str] = []
+        sink = worker_mod.logger.add(lambda m: lines.append(m.record["message"]), level="INFO", format="{message}")
+        try:
+            for args in calls:
+                pool._update_worker_progress(worker, *args, media_file="/m/film.mkv")
+        finally:
+            worker_mod.logger.remove(sink)
+        return lines
+
+    @pytest.mark.parametrize(
+        ("worker", "tag"),
+        [
+            (Worker(0, "GPU", "INTEL", DEVICE, 0, "Arc A380", node_id="n1", node_name="NAS"), "NAS/GPU0 ·"),
+            (Worker(1, "CPU", node_id="n2", node_name="lab-cpu"), "lab-cpu/CPU ·"),
+            (Worker(2, "GPU", "INTEL", DEVICE, 1, "Arc A380"), "[GPU 1]:"),
+            (Worker(3, "CPU"), "[CPU]:"),
+        ],
+        ids=["node-gpu", "node-cpu", "local-gpu", "local-cpu"],
+    )
+    def test_started_and_progress_lines_name_where_the_file_runs(self, worker, tag):
+        lines = self._lines(worker, (40.0, 4.0, 10.0, "3.0x", 2.0))
+        assert lines == [f"{tag} Started processing /m/film.mkv", f"{tag} Film - 40.0% (speed=3.0x)"]

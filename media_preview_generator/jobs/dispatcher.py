@@ -134,6 +134,9 @@ class JobTracker:
         self.failed = 0
         # Which files failed, so a multi-path webhook retries those and not the first N (guarded by _counts_lock).
         self.failed_paths: list[str] = []
+        # The failed files whose node couldn't run them (dropped them, never started them, or can't see them), with
+        # why: a webhook job words them as the node's failure, never as "not found on any server" (_counts_lock).
+        self.node_failures: dict[str, str] = {}
         self.cancelled = False
         if handlers is not None:
             self.outcome_counts: dict[str, int] = {key: 0 for key in handlers.outcome_keys}
@@ -205,6 +208,7 @@ class JobTracker:
             self.successful = int(carried_state.get("successful", 0))
             self.failed = int(carried_state.get("failed", 0))
             self.failed_paths = list(carried_state.get("failed_paths", []))
+            self.node_failures = dict(carried_state.get("node_failures", {}))
             self.outcome_counts.update(carried_state.get("outcome_counts", {}))
             self.publishers_aggregate = dict(carried_state.get("publishers_aggregate", {}))
             self.cpu_fallback_files = int(carried_state.get("cpu_fallback_files", 0))
@@ -239,6 +243,7 @@ class JobTracker:
         worker_display_name: str = "",
         title: str = "",
         canonical_path: str = "",
+        node_failure: str = "",
     ) -> None:
         """Record a completed item and fire per-job callbacks.
 
@@ -247,6 +252,7 @@ class JobTracker:
             worker_display_name: Display name of the worker for logging.
             title: Media title for logging.
             canonical_path: The item's file, recorded in ``failed_paths`` when it failed.
+            node_failure: Why its node couldn't run it, when that is why it failed (kept in ``node_failures``).
 
         """
         # Increment under the lock and capture the post-increment completion
@@ -258,6 +264,8 @@ class JobTracker:
                 self.failed += 1
                 if canonical_path:
                     self.failed_paths.append(canonical_path)
+                    if node_failure:
+                        self.node_failures[canonical_path] = node_failure
             is_done = (self.successful + self.failed) >= self.total_items
 
         # A raising callback must never prevent done_event.set() below — that
@@ -544,10 +552,12 @@ class JobTracker:
         """Return the per-job result dict: counts, failed paths, cancelled flag and outcome counts."""
         with self._counts_lock:
             failed_paths = list(self.failed_paths)
+            node_failures = dict(self.node_failures)
         return {
             "completed": self.successful,
             "failed": self.failed,
             "failed_paths": failed_paths,
+            "node_failures": node_failures,
             "total": self.total_items,
             "cancelled": self.cancelled,
             "outcome": dict(self.outcome_counts),
@@ -776,6 +786,7 @@ class JobDispatcher:
                             "successful": tracker.successful,
                             "failed": tracker.failed,
                             "failed_paths": tracker.failed_paths,
+                            "node_failures": tracker.node_failures,
                             "outcome_counts": tracker.outcome_counts,
                             "publishers_aggregate": tracker.publishers_aggregate,
                             "cpu_fallback_files": tracker.cpu_fallback_files,
@@ -999,11 +1010,14 @@ class JobDispatcher:
             if requeue.reason == REQUEUE_NODE_UNAVAILABLE:
                 tracker.node_drops[path] = tracker.node_drops.get(path, 0) + 1
                 if tracker.node_drops[path] >= MAX_NODE_DROPS:
-                    failure = f"node unavailable twice ({requeue.node_name})"
+                    failure = f"node {requeue.node_name} unavailable (it dropped the file twice)"
             elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
                 tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
                 if tracker.node_start_failures[path] >= MAX_NODE_START_FAILURES:
-                    failure = f"the node couldn't start it {MAX_NODE_START_FAILURES} times ({requeue.node_name})"
+                    failure = (
+                        f"node {requeue.node_name} unavailable "
+                        f"(it couldn't start the file {MAX_NODE_START_FAILURES} times)"
+                    )
             else:
                 excluded = tracker.excluded_nodes.setdefault(path, {})
                 excluded[requeue.node_id] = requeue.node_name
@@ -1024,7 +1038,7 @@ class JobDispatcher:
         if failure is None:
             return
         try:
-            self._record_failed_item(tracker, item, worker.display_name, failure)
+            self._record_failed_item(tracker, item, worker.display_name, failure, node_failure=True)
         finally:
             with self._trackers_lock:
                 tracker.active_processing = max(0, tracker.active_processing - 1)
@@ -1085,7 +1099,7 @@ class JobDispatcher:
             # Failed outside the locks: completion runs the job's callbacks.
             for tracker, item, reason in stranded:
                 try:
-                    self._record_failed_item(tracker, item, "", reason)
+                    self._record_failed_item(tracker, item, "", reason, node_failure=True)
                 finally:
                     with self._trackers_lock:
                         tracker.active_processing = max(0, tracker.active_processing - 1)
@@ -1227,7 +1241,9 @@ class JobDispatcher:
             worker.is_busy = False
         self._record_failed_item(tracker, item, worker.display_name, reason)
 
-    def _record_failed_item(self, tracker: JobTracker, item, worker_display_name: str, reason: str) -> None:
+    def _record_failed_item(
+        self, tracker: JobTracker, item, worker_display_name: str, reason: str, *, node_failure: bool = False
+    ) -> None:
         """Count an item the dispatcher itself failed: its outcome, its Files-panel row, its completion.
 
         Args:
@@ -1235,6 +1251,7 @@ class JobDispatcher:
             item: The :class:`ProcessableItem`.
             worker_display_name: The worker it was with ("" when none).
             reason: The row's reason.
+            node_failure: It failed because its node couldn't run it (``reason`` says how).
         """
         from ..processing.generator import _notify_file_result, failure_scope
 
@@ -1254,6 +1271,7 @@ class JobDispatcher:
                 worker_display_name,
                 getattr(item, "title", "") or item.canonical_path,
                 canonical_path=item.canonical_path,
+                node_failure=reason if node_failure else "",
             )
 
     def _get_next_check_item(self):
@@ -1770,6 +1788,7 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
     from .group_runtime import refresh_worker_groups
 
     selected = list(selected_gpus or [])
+    created = False
     with _dispatcher_lock:
         if _dispatcher is None:
             pool = WorkerPool(
@@ -1778,12 +1797,15 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
                 selected_gpus=selected,
             )
             _dispatcher = JobDispatcher(pool)
+            created = True
         existing = _dispatcher
     if not refresh_worker_groups(existing.worker_pool, config, selected, force=True) and selected:
         try:
             existing.worker_pool.reconcile_gpu_workers(selected)
         except Exception as exc:
             logger.debug("Could not reconcile GPU workers: {}", exc)
+    if created:
+        existing.worker_pool.log_created()
     return existing
 
 

@@ -684,11 +684,6 @@ def _dispatch_processable_items(
     existing = get_dispatcher()
     if existing is not None:
         worker_pool = existing.worker_pool
-        logger.info(
-            "Multi-server {}: reusing shared worker pool ({} worker(s))",
-            label,
-            len(worker_pool._snapshot_workers()),
-        )
     else:
         sel = list(selected_gpus or [])
         # ``config.gpu_threads`` can be > 0 while no GPU is actually
@@ -705,8 +700,13 @@ def _dispatch_processable_items(
     dispatcher = get_dispatcher(worker_pool)
     # Another job may have created the dispatcher since the check above; its pool is the one that runs, so it's
     # the one to register (an unused pool registered here would be what Settings saves resize).
+    created = existing is None and dispatcher.worker_pool is worker_pool
     worker_pool = dispatcher.worker_pool
     refresh_worker_groups(worker_pool, config, selected_gpus, force=True)
+    if created:
+        worker_pool.log_created()
+    else:
+        logger.info("Multi-server {}: reusing shared worker pool ({})", label, worker_pool.size_summary())
 
     # Reconcile the (possibly reused/stale) pool to the current GPU config —
     # the same hook the webhook path uses so worker counts track settings.
@@ -1565,6 +1565,27 @@ def _build_path_mapping_mismatch_hints(unresolved_paths: list[str], server_confi
     return hints
 
 
+def split_node_failures(
+    failed_paths: list[str], node_failures: dict[str, str], input_by_canonical: dict[str, str]
+) -> tuple[list[str], dict[str, str]]:
+    """Split a dispatch's failed files into the ones a webhook job reports unresolved and the ones a node failed.
+
+    A file whose node dropped it, never started it or can't see it was found and owned; reporting it as "not found
+    on any server" (with a path-mapping hint) blames the wrong thing.
+
+    Args:
+        failed_paths: The dispatch's failed files (canonical paths).
+        node_failures: Canonical path -> why its node couldn't run it.
+        input_by_canonical: Canonical path -> the path the webhook sent.
+
+    Returns:
+        The other failed files and the node-failed ones (path -> why), both keyed by the path the webhook sent.
+    """
+    others = [input_by_canonical.get(path, path) for path in failed_paths if path not in node_failures]
+    node_failed = {input_by_canonical.get(path, path): why for path, why in node_failures.items()}
+    return others, node_failed
+
+
 def _classify_processing_mode(config) -> str:
     """Decide which processing phase ``run_processing`` should execute.
 
@@ -1759,6 +1780,7 @@ def _run_webhook_paths_phase(
         canonical_to_input[canonical_path] = path
 
     unresolved: list[str] = list(no_owners)
+    node_failed: dict[str, str] = {}
     # Path-keyed mismatch hints. Built per-path so a
     # multi-path webhook with N different mismatches displays N
     # different hints — one per file_result row, not one borrowed
@@ -1799,12 +1821,13 @@ def _run_webhook_paths_phase(
         totals["cancelled"] = totals["cancelled"] or result["cancelled"]
         for k, v in (result.get("outcome") or {}).items():
             aggregate_outcome[k] = aggregate_outcome.get(k, 0) + v
-        failed_canonical_paths = result.get("failed_paths") or []
-        if failed_canonical_paths:
+        failed_inputs, node_failed = split_node_failures(
+            result.get("failed_paths") or [], result.get("node_failures") or {}, canonical_to_input
+        )
+        if failed_inputs:
             # Surface the RAW webhook-input path in the unresolved list so the
             # retry job's ``webhook_item_id_hints`` lookup (keyed by raw input)
             # finds its hint instead of paying a full reverse lookup per retry.
-            failed_inputs = [canonical_to_input.get(path, path) for path in failed_canonical_paths]
             unresolved.extend(failed_inputs)
             # Also build hints for FAILED items, not only no_owners. A path that owners exist for but every
             # publisher failed (e.g. publisher 5xx, source missing
@@ -1816,6 +1839,7 @@ def _run_webhook_paths_phase(
 
     return {
         "unresolved_paths": unresolved,
+        "node_failed": node_failed,
         "skipped_paths": [],
         "resolved_count": total_paths - len(unresolved),
         "total_paths": total_paths,
@@ -1980,8 +2004,12 @@ def run_processing(
                 resolution = dict(context["webhook_resolution"])
                 inputs = resolution.get("input_by_canonical", {})
                 unresolved = list(resolution.get("unresolved_paths", []))
-                unresolved.extend(inputs.get(path, path) for path in resumed.get("failed_paths", []))
+                failed_inputs, node_failed = split_node_failures(
+                    resumed.get("failed_paths", []), resumed.get("node_failures", {}), inputs
+                )
+                unresolved.extend(failed_inputs)
                 resolution["unresolved_paths"] = list(dict.fromkeys(unresolved))
+                resolution["node_failed"] = {**resolution.get("node_failed", {}), **node_failed}
                 resolution["resolved_count"] = max(0, resolution["total_paths"] - len(resolution["unresolved_paths"]))
                 result["webhook_resolution"] = resolution
             return result

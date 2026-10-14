@@ -773,7 +773,12 @@
             window._initBootstrapTooltips?.(mount);
         }
         const capacity = snapshot.capacity || {};
-        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}. ${timezoneLabel()}.` : '';
+        // Members on nodes are counted apart from this app's own hardware, and only named when there are any.
+        const nodesNow = capacity.nodes_current || {};
+        const nodesPeak = capacity.nodes_peak || {};
+        const onNodes = (nodesPeak.cpu || 0) + (nodesPeak.gpu || 0) > 0;
+        const nodePart = (counts) => onNodes ? ` here, ${counts.gpu || 0} GPU + ${counts.cpu || 0} CPU on nodes` : '';
+        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}${nodePart(nodesNow)}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}${nodePart(nodesPeak)}. ${timezoneLabel()}.` : '';
         renderRows(document.getElementById('workerGroupRows'));
         renderWeekOverview(draft || snapshot.groups);
         paintEditorPreview();

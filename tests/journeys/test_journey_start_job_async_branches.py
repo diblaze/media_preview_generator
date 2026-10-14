@@ -1844,6 +1844,53 @@ class TestStartJobAsyncSimplifiedPayload:
             f"Path-mapping mismatch hint did not surface in file_result reason; got {reason!r}"
         )
 
+    def test_a_file_its_node_failed_is_a_failure_not_a_file_no_server_found(self, app, tmp_path):
+        """A file a node dropped twice was found and owned: the lab run's job said "no configured library matches
+        it" and "5 not found on any server". Its failed row stays, it gets no "not found" row or hint, and the retry
+        line names the node."""
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes.job_runner import _start_job_async
+
+        path = "/media/tv/Show/S01E07.mkv"
+        why = "node lab-gpu unavailable (it dropped the file twice)"
+        runs: list[str] = []
+
+        def fake_run_processing(config, selected_gpus, **kwargs):
+            runs.append("run")
+            jm = get_job_manager()
+            target = (jm.get_job(kwargs.get("job_id") or "") or SimpleNamespace(config={})).config.get(
+                "parent_job_id"
+            ) or kwargs.get("job_id")
+            if target:
+                jm.record_file_result(target, path, "failed", why, "GPU 0")
+            return {
+                "outcome": {"generated": 0, "failed": 1},
+                "webhook_resolution": {
+                    "unresolved_paths": [],
+                    "node_failed": {path: why},
+                    "skipped_paths": [],
+                    "resolved_count": 1,
+                    "total_paths": 1,
+                    "path_hints": [],
+                },
+            }
+
+        with (
+            app.app_context(),
+            patch("media_preview_generator.jobs.orchestrator.run_processing", side_effect=fake_run_processing),
+            patch("media_preview_generator.processing.retry_queue.BACKOFF_SCHEDULE", [1, 1, 1, 1, 1]),
+        ):
+            jm = get_job_manager()
+            job = jm.create_job(library_name="TV", config={"source": "sonarr"})
+            _start_job_async(job.id, config_overrides={"webhook_paths": [path], "webhook_retry_count": 1})
+            logs = jm.get_logs(job.id) or []
+            rows = [r for r in jm.get_file_results(job.id) if r.get("file") == path]
+
+        assert not any("not found on any server" in line or "no configured library" in line for line in logs)
+        assert any(f"1 failed: {why}, retry scheduled in" in line for line in logs), logs
+        assert rows and all(r["outcome"] == "failed" for r in rows)
+        assert len(runs) == 2  # still retried once, as any failed webhook file is
+
     def test_multi_path_webhook_each_row_gets_its_own_hint(self, app, tmp_path):
         """Audit P4 — multi-path webhook with DIFFERENT mismatches per
         path: each file_result row must carry the hint for THAT path,

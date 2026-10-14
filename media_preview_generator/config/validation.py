@@ -366,8 +366,24 @@ def thread_totals_from_ui_settings(ui_settings: dict[str, Any]) -> tuple[int, in
     return gpu_threads, cpu_threads
 
 
+def node_worker_total(ui_settings: dict[str, Any]) -> int:
+    """How many workers the saved worker groups put on nodes at their weekly peak (0 without worker groups).
+
+    They aren't in ``thread_totals_from_ui_settings`` (that sizes this app's own pool), but they run jobs.
+
+    Args:
+        ui_settings: Settings dict (e.g. merged ``settings.json`` content).
+    """
+    if "worker_groups" not in ui_settings:
+        return 0
+    from ..worker_groups import configured_node_totals, validate_worker_groups
+
+    totals = configured_node_totals(validate_worker_groups(ui_settings["worker_groups"]))
+    return sum(gpu + cpu for gpu, cpu in totals.values())
+
+
 def validate_processing_thread_totals(ui_settings: dict[str, Any]) -> tuple[bool, str]:
-    """Check whether settings have any processing workers configured.
+    """Check whether settings have any processing workers configured, here or on a node.
 
     Args:
         ui_settings: Full or merged settings dict.
@@ -378,7 +394,7 @@ def validate_processing_thread_totals(ui_settings: dict[str, Any]) -> tuple[bool
 
     """
     gpu_t, cpu_t = thread_totals_from_ui_settings(ui_settings)
-    if cpu_t == 0 and gpu_t == 0:
+    if cpu_t == 0 and gpu_t == 0 and not node_worker_total(ui_settings):
         return (
             False,
             "No workers configured — jobs will remain pending until GPU or CPU workers are added.",

@@ -2897,6 +2897,16 @@ def _built_line(build: Callable[[], str]) -> str | None:
         return None
 
 
+def _node_label(gpu: str | None, gpu_device_path: str | None) -> str:
+    """``<node>/<GPUn|CPU>`` when this thread's reads run on a node, else ""."""
+    from ..nodes.executor import placement_label
+
+    try:
+        return placement_label(None if gpu is None else (gpu, gpu_device_path or ""))
+    except Exception:  # a log line's wording must never stop the read
+        return ""
+
+
 def _log_live(build: Callable[..., str], level: str = "INFO") -> None:
     """Log one line as the file's work happens, live. Never raises: a bug building it (an unexpected shape in a
     step's own data) mustn't fail the file or hold up another owner's write -- the same guard ``_log_file`` gives
@@ -3211,7 +3221,12 @@ def _attempt(
                 phases: list[str] = []
                 on_gpu = gpu is not None
                 device = worker_device(notes.worker) if on_gpu else ""
-                _log_live(lambda s=source, g=on_gpu, d=device: titled(title, reading_line(s, on_gpu=g, device=d)))
+                node = _node_label(gpu, gpu_device_path)
+                _log_live(
+                    lambda s=source, g=on_gpu, d=device, n=node: titled(
+                        title, reading_line(s, on_gpu=g, device=d, node=n)
+                    )
+                )
                 read_started = ctx.monotonic()
                 try:
                     unanswered = _run_detector(

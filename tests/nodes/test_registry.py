@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
 from media_preview_generator.nodes import registry as reg
+from media_preview_generator.nodes.access_results import AccessResultStore
 from media_preview_generator.nodes.client import NodeAuthError, NodeProtocolError, NodeUnreachableError
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
 
@@ -66,7 +68,7 @@ class Clock:
 
 
 class Harness:
-    def __init__(self, nodes=None):
+    def __init__(self, nodes=None, access_store=None):
         self.nodes = nodes if nodes is not None else [_record()]
         self.revision = 1
         self.clients: dict[str, FakeClient] = {}
@@ -85,6 +87,7 @@ class Harness:
             attempt_gap_s=0.0,
             clock=self.clock,
             wall_clock=lambda: 1_700_000_000.0,
+            access_store=access_store,
         )
 
     def _client(self, record):
@@ -480,3 +483,47 @@ def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
     monkeypatch.setattr(app_mod.atexit, "register", registered.append)
     app_mod._start_node_registry()
     assert calls == ["start"] and registered == [stub.stop]
+
+
+class TestAccessResultSurvivesRestart:
+    """The lab's app restart made every node's Setup Health ask for Test access again: the result lived in memory."""
+
+    RESULT = {"libraries": [{"server": "Home", "library": "TV", "checked": 3, "ok": True, "files": []}]}
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        return AccessResultStore(lambda: str(tmp_path))
+
+    def test_a_restarted_app_still_has_the_last_test_of_the_saved_mappings(self, store, tmp_path):
+        before = Harness(access_store=store)
+        before.registry.record_access_result("n1", self.RESULT)
+
+        after = Harness(access_store=store)  # a new process: nothing in memory
+
+        details = after.registry.details("n1")
+        assert details.access_result == self.RESULT
+        assert details.access_checked_at == 1_700_000_000.0
+        saved = json.loads((tmp_path / "node_access_results.json").read_text())
+        assert saved["n1"]["mappings"] == [{"app_prefix": "/data", "node_prefix": "/mnt"}]
+
+    def test_changing_the_nodes_mappings_forgets_its_result(self, store):
+        h = Harness(access_store=store)
+        h.registry.record_access_result("n1", self.RESULT)
+
+        h.change(path_mappings=[{"app_prefix": "/data", "node_prefix": "/volume1"}])
+
+        assert h.registry.details("n1").access_result is None
+        assert Harness(nodes=list(h.nodes), access_store=store).registry.details("n1").access_result is None
+
+    def test_a_result_saved_for_other_mappings_is_never_handed_out(self, store):
+        store.save("n1", [{"app_prefix": "/data", "node_prefix": "/old"}], self.RESULT, 1.0)
+        assert Harness(access_store=store).registry.details("n1").access_result is None
+
+    def test_removed_nodes_are_dropped_from_the_file_on_the_next_save(self, store, tmp_path):
+        store.save("gone", [], self.RESULT, 1.0)
+        Harness(access_store=store).registry.record_access_result("n1", self.RESULT)
+        assert set(json.loads((tmp_path / "node_access_results.json").read_text())) == {"n1"}
+
+    def test_an_unreadable_file_reads_as_untested(self, store, tmp_path):
+        (tmp_path / "node_access_results.json").write_text("{not json")
+        assert Harness(access_store=store).registry.details("n1").access_result is None

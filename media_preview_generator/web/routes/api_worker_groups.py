@@ -21,6 +21,7 @@ from ...worker_groups import (
     MAX_MEMBERS,
     application_timezone,
     configured_group_totals,
+    configured_node_totals,
     future_capacity,
     group_is_available,
     legacy_group_view,
@@ -267,6 +268,7 @@ def worker_group_payload(settings=None) -> dict:
                 }
             )
     gpu_peak, cpu_peak = configured_group_totals(groups)
+    node_peaks = configured_node_totals(groups).values()
     timezone = application_timezone()
     timezone_name = str(timezone)
     timezone_label = timezone_name
@@ -293,6 +295,16 @@ def worker_group_payload(settings=None) -> dict:
                 for resource in ("cpu", "gpu")
             },
             "peak": {"cpu": cpu_peak, "gpu": gpu_peak},
+            # Members on nodes, apart: "current"/"peak" are this app's own hardware.
+            "nodes_current": {
+                resource: sum(
+                    member["target"]
+                    for member in members_by_resource
+                    if member["resource"] == resource and member.get("node")
+                )
+                for resource in ("cpu", "gpu")
+            },
+            "nodes_peak": {"cpu": sum(cpu for _gpu, cpu in node_peaks), "gpu": sum(gpu for gpu, _cpu in node_peaks)},
         },
         "warnings": warnings,
         "processing_paused": paused,

@@ -531,11 +531,14 @@ def load_config(*, log_validation_errors: bool = True) -> Config:
 
     cpu_threads = get_value("cpu_threads", "CPU_THREADS", 1, int)
     worker_groups = None
+    # Workers on nodes: not in gpu_threads / cpu_threads (those size this app's own pool), but they run jobs.
+    node_workers = 0
     if "worker_groups" in ui_settings:
-        from ..worker_groups import configured_group_totals, validate_worker_groups
+        from ..worker_groups import configured_group_totals, configured_node_totals, validate_worker_groups
 
         worker_groups = validate_worker_groups(ui_settings["worker_groups"])
         gpu_threads, cpu_threads = configured_group_totals(worker_groups)
+        node_workers = sum(gpu + cpu for gpu, cpu in configured_node_totals(worker_groups).values())
 
     # Library-scanning concurrency. 0 = Auto (resolved by the orchestrator).
     # A positive value is clamped to [1, 256] so a typo can't spawn an absurd
@@ -677,11 +680,11 @@ def load_config(*, log_validation_errors: bool = True) -> Config:
                 logger.error("   {}. {}", i, error_msg)
         raise ConfigValidationError(validation_errors)
 
-    # Both CPU and GPU workers are 0 — not fatal; jobs will stay pending until the
+    # No worker here or on a node — not fatal; jobs will stay pending until the
     # user adds workers.  Log a visible warning so it's obvious in the container log.
-    if no_workers:
+    if no_workers and not node_workers:
         logger.warning(
-            "⚠️  Both cpu_threads and gpu_threads are 0 — jobs will remain pending until workers are configured."
+            "⚠️  No GPU or CPU workers, here or on a node — jobs will remain pending until workers are configured."
         )
         logger.info("💡 Open the Settings page in the web UI to add GPU or CPU workers.")
 

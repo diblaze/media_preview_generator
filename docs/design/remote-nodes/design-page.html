@@ -504,7 +504,7 @@ svg .bx-vm { fill: none; stroke: var(--fg-2); stroke-width: 1.2; stroke-dasharra
       <p>After 3 different files fail on one node within 10 minutes, the node becomes <b>Access problem</b>. Its workers pause and an alert names the library and the path it tried.</p>
       <p class="ev">Tested: wrong mapping, different file and path traversal were all refused, with reasons.</p></div></div>
     <div class="case"><div>The node drops out mid-file</div><div>
-      <p>After 3 failed asks (about 12 seconds), the file goes <b>back in the queue once</b> and isn't counted. A second drop counts it as failed: "node unavailable twice".</p>
+      <p>After 3 failed asks (about 12 seconds), the file goes <b>back in the queue once</b> and isn't counted. A second drop counts it as failed: "node NAS unavailable (it dropped the file twice)".</p>
       <p class="ev">Tested in a spike against the real dispatcher: one drop gave 3/3 succeeded and 0 failed; two drops gave exactly one failed row. 1,119 existing worker, dispatcher and parking tests passed.</p></div></div>
     <div class="case"><div>The GPU fails on a file</div><div>
       <p>The same rule as local workers: the node retries on <b>its own CPU</b>. The app never takes the work over itself.</p></div></div>

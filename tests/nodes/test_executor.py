@@ -428,6 +428,63 @@ class TestLogsAndProgress:
             logger.remove(sink)
         assert ("WARNING", "NAS/GPU0 · decode {braces} slow") in lines
 
+    @pytest.mark.parametrize(
+        ("op", "gpu", "expected"),
+        [
+            (protocol.OP_LOUDNESS_ANALYZE, None, "NAS/CPU · Started loudness analysis: S01E01.mkv"),
+            (protocol.OP_INTRO_FINGERPRINT, None, "NAS/CPU · Started season audio fingerprint: S01E01.mkv"),
+            (protocol.OP_INTRO_END_PICTURE, ("NVIDIA", "cuda:0"), "NAS/GPU0 · Started end-picture frames: S01E01.mkv"),
+            (protocol.OP_CREDITS_FIND, ("NVIDIA", "cuda:0"), "NAS/GPU0 · Started credit text: S01E01.mkv"),
+            (protocol.OP_PREVIEW_FRAMES, ("NVIDIA", "cuda:0"), "NAS/GPU0 · Started preview frames: S01E01.mkv"),
+        ],
+        ids=["loudness", "fingerprint", "end-picture", "credits", "previews"],
+    )
+    def test_a_started_line_names_the_node_as_soon_as_it_takes_the_task(self, media, op, gpu, expected):
+        """The lab's loudness log said "[CPU]: Started processing" only when the file was done, and markers steps on
+        a node never named it."""
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+
+        def first_poll(_client):
+            # Logged before the node is ever polled, so before any line or progress of the task.
+            assert expected in lines
+            return finished(protocol.STATUS_DONE, result={})
+
+        try:
+            _install(ScriptedClient([first_poll]))
+            with placed_on(PLACEMENT):
+                run_on_node(op, media, {}, gpu=gpu, cancel_check=None)
+        finally:
+            logger.remove(sink)
+        assert lines.count(expected) == 1
+
+    def test_no_started_line_when_the_node_never_took_the_task(self, media):
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+        try:
+            _install(ScriptedClient([finished(protocol.STATUS_DONE)], start_error=unreachable()))
+            with pytest.raises(NodeUnavailableError):
+                _run(media)
+        finally:
+            logger.remove(sink)
+        assert not [line for line in lines if "Started" in line]
+
+    def test_placement_label_is_the_prefix_of_the_nodes_lines(self):
+        _install(ScriptedClient([finished(protocol.STATUS_DONE)]))
+        assert executor.placement_label(None) == ""
+        with placed_on(PLACEMENT):
+            assert executor.placement_label(("NVIDIA", "cuda:0")) == "NAS/GPU0"
+            assert executor.placement_label(None) == "NAS/CPU"
+
+    def test_the_markers_reading_line_names_the_node_it_reads_on(self):
+        from media_preview_generator.markers.pipeline import _node_label
+
+        _install(ScriptedClient([finished(protocol.STATUS_DONE)]))
+        assert _node_label("NVIDIA", "cuda:0") == ""  # this app's own worker: "on the GPU (...)" as before
+        with placed_on(PLACEMENT):
+            assert _node_label("NVIDIA", "cuda:0") == "NAS/GPU0"
+            assert _node_label(None, None) == "NAS/CPU"
+
     def test_cpu_tasks_are_prefixed_cpu_and_unknown_levels_log_at_info(self, media):
         lines = []
         state = running(log=[{"seq": 0, "level": "LOUD", "message": "hi"}], next_log=1)
