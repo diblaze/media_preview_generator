@@ -3154,7 +3154,7 @@ function updateWorkerStatuses(workers, options = {}) {
             col.innerHTML = `
                 <article class="card workers-panel-card wk" data-card data-status="idle">
                     <div class="card-body">
-                        <div class="worker-card-heading wk-top"><span data-name-wrap class="kind"><i class="bi" data-icon aria-hidden="true"></i><strong data-name></strong></span><span class="worker-id wk-n" data-worker-id></span><span class="pill warn" data-status-badge hidden></span></div>
+                        <div class="worker-card-heading wk-top"><span data-name-wrap class="kind"><span class="node-chip" data-node-chip hidden></span><i class="bi" data-icon aria-hidden="true"></i><strong data-name></strong></span><span class="worker-id wk-n" data-worker-id></span><span class="pill warn" data-status-badge hidden></span></div>
                         <span class="pill warn d-none" data-fallback-badge><i class="bi bi-arrow-down-circle" aria-hidden="true"></i>CPU fallback</span>
                         <div class="small text-warning d-none" data-fallback-note><i class="bi bi-exclamation-triangle me-1"></i><span data-fallback-reason></span></div>
                         <div class="wk-idle-note" data-idle-note>Waiting for work</div>
@@ -3278,6 +3278,12 @@ function _patchWorkerCard(col, worker) {
         nameEl.textContent = kindName;
     }
     nameEl.title = worker.worker_name || '';
+    // A worker on a node shows the node's name in front, as every other place that names its device does.
+    const nodeChip = col.querySelector('[data-node-chip]');
+    const nodeName = worker.node ? worker.node.name || worker.node.id || '' : '';
+    if (nodeChip.textContent !== nodeName) nodeChip.textContent = nodeName;
+    nodeChip.hidden = !nodeName;
+    nodeChip.title = nodeName ? `Runs on node ${nodeName}` : '';
 
     // Fallback badge + note
     fallbackBadge.classList.toggle('d-none', !fallbackActive);
@@ -3292,11 +3298,17 @@ function _patchWorkerCard(col, worker) {
     }
 
     // Status badge: only the exceptional states get a pill; busy and idle show through the card style.
-    const workerStatus = paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
+    // A node that stopped answering outranks pause and retirement: it is why the card's file is not progressing.
+    const nodeDown = !!worker.node && !!worker.node_state && !['ready', 'gpu_lost'].includes(worker.node_state);
+    const nodeStateText = { offline: 'Offline', key_refused: 'Key refused', update_needed: 'Update needed', access_problem: 'Access problem', connecting: 'Connecting', disabled: 'Disabled' }[worker.node_state] || worker.node_state;
+    const workerStatus = nodeDown ? `Node ${String(nodeStateText).toLowerCase()}` : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
     if (statusEl.textContent !== workerStatus) {
         statusEl.textContent = workerStatus;
     }
-    statusEl.hidden = !(paused || worker.retiring);
+    const nodeBad = nodeDown && ['offline', 'key_refused'].includes(worker.node_state);
+    statusEl.classList.toggle('bad', nodeBad);
+    statusEl.classList.toggle('warn', !nodeBad);
+    statusEl.hidden = !(nodeDown || paused || worker.retiring);
     card.classList.toggle('worker-long-status', !!worker.retiring);
 
     const title = isProcessing ? worker.current_title || worker.current_file || 'Processing…' : '';
