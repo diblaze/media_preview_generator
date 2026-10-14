@@ -233,6 +233,34 @@ def test_open_db_is_the_local_database_with_agent_off_and_a_folder(tmp_path):
     assert isinstance(db, LocalPlexDb)
 
 
+def test_database_on_a_network_share_counts_previews_through_the_api_and_says_why(monkeypatch, tmp_path):
+    # Docker Desktop on Windows mounts Plex's folder over 9p, where SQLite can't map the WAL's -shm file: opening the
+    # database there fails with a bare "disk I/O error" on every library (#407).
+    root = ET.fromstring(
+        '<MediaContainer><Video ratingKey="7" type="movie" title="A"><Media>'
+        '<Part file="/m/a.mkv" indexes="sd"/></Media></Video></MediaContainer>'
+    )
+    server = MagicMock()
+    server._connect.return_value.query.return_value = root
+    monkeypatch.setattr(plex, "filesystem_type", lambda _path: "9p")
+    monkeypatch.setattr(plex, "_read_rows", MagicMock(side_effect=AssertionError("must not open the database")))
+
+    result = plex.count_plex(
+        _cfg(tmp_path, [_lib()]), server, nothing_found={}, cancel_check=lambda: False, progress=lambda *_: None
+    )
+
+    assert _cell(result, "1", Feature.PREVIEWS).done == 1
+    assert "network share (9p)" in result.access
+    loudness = _cell(result, "1", Feature.LOUDNESS)
+    assert loudness.state == CellState.UNAVAILABLE
+    assert "network share (9p)" in loudness.reason
+
+
+def test_database_on_a_local_disk_is_read_directly(monkeypatch, tmp_path):
+    monkeypatch.setattr(plex, "filesystem_type", lambda _path: "ext4")
+    assert plex._network_share(_cfg(tmp_path, [_lib()])) is None
+
+
 def test_show_library_uses_episode_type_and_movie_library_uses_movie_type(tmp_path):
     server = MagicMock()
     server._connect.return_value.query.return_value = ET.fromstring("<MediaContainer/>")

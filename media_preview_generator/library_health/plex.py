@@ -22,6 +22,7 @@ from ..config.paths import path_to_canonical_local
 from ..loudness import analyze
 from ..loudness.plex_db import has_analysis
 from ..loudness.undecodable import ffmpeg_identity, skipped_count_by_part_hash
+from ..markers.fs import filesystem_type, is_network_filesystem
 from ..markers.publishers.base import PublishError
 from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import plex_database
@@ -139,6 +140,19 @@ def _open_db(cfg: ServerConfig) -> LocalPlexDb | None:
     return None
 
 
+def _network_share(cfg: ServerConfig) -> str | None:
+    """The filesystem type when Plex's database is on a network share, else None.
+
+    SQLite can't read a database in WAL mode over a network share: on Docker Desktop's 9p mount of a Windows folder it
+    can't map the ``-shm`` file and fails with "disk I/O error", and over NFS or SMB it could read an inconsistent view.
+    """
+    path = PlexMarkerPublisher.db_path_for(cfg)
+    if not path:
+        return None
+    fs_type = filesystem_type(os.path.realpath(path))
+    return fs_type if is_network_filesystem(fs_type) else None
+
+
 def count_plex(
     cfg: ServerConfig,
     server: MediaServer,
@@ -164,14 +178,25 @@ def count_plex(
     """
     scopes = library_scopes(cfg)
     db = _open_db(cfg)
-    if db is not None:
+    share = _network_share(cfg) if db is not None else None
+    if db is not None and share is None:
         libraries, todo = _count_from_db(
             cfg, db, scopes, nothing_found=nothing_found, cancel_check=cancel_check, progress=progress
         )
         access = ACCESS_DIRECT
     else:
-        libraries, todo = _count_from_api(cfg, server, scopes, cancel_check=cancel_check, progress=progress)
-        access = ACCESS_API_ONLY
+        unavailable, access = NEEDS_DATABASE, ACCESS_API_ONLY
+        if share:
+            logger.warning(
+                "Library health: Plex's database on {} is on a network share ({}); counting previews through Plex's API",
+                cfg.name,
+                share,
+            )
+            unavailable = f"Can't read Plex's database over a network share ({share})"
+            access = f"Plex's database is on a network share ({share}), so only previews are counted"
+        libraries, todo = _count_from_api(
+            cfg, server, scopes, unavailable=unavailable, cancel_check=cancel_check, progress=progress
+        )
     return ServerResult(
         server_id=cfg.id, name=cfg.name, type=cfg.type.value, libraries=libraries, todo=todo, access=access
     )
@@ -491,6 +516,7 @@ def _count_from_api(
     server: MediaServer,
     scopes: list[LibraryScope],
     *,
+    unavailable: str,
     cancel_check: Callable[[], bool],
     progress: Callable[[str, int, int], None],
 ) -> tuple[list[LibraryResult], list[TodoFile]]:
@@ -501,7 +527,7 @@ def _count_from_api(
         if cancel_check():
             raise CheckCancelled()
         progress("Checking previews", number, len(scopes))
-        cells = _fixed_cells(scope, lambda: Cell(CellState.UNAVAILABLE, reason=NEEDS_DATABASE))
+        cells = _fixed_cells(scope, lambda: Cell(CellState.UNAVAILABLE, reason=unavailable))
         total = 0
         if scope.features.get(Feature.PREVIEWS) is None:
             cell = Cell(CellState.COUNTED)

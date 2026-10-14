@@ -480,6 +480,10 @@ Verify by opening the web UI and checking **Settings → Processing options → 
 > [!NOTE]
 > Treat WSL2 as best-effort. GPU vendor detection via `lspci` is unreliable inside WSL2, so the app leans on `nvidia-smi` instead and logs a note saying so. If GPU jobs misbehave, run the container on a Linux host.
 
+**Plex installed on Windows (not in Docker):** previews work. Intro & Credits, chapter thumbnails and loudness
+don't: they write to Plex's database, and Docker Desktop shares Windows folders through a network-style mount that the
+database can't be used over safely. Library health counts previews only.
+
 **AMD and Intel:** not accelerated under Docker. These rely on D3D11VA, a Windows-only framework that Docker Desktop's Linux VM cannot reach, so processing falls back to CPU. Add CPU workers in **Settings → Workers** to compensate, or run the container on a Linux host to use VAAPI/QuickSync.
 
 ### macOS
@@ -2123,7 +2127,8 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
 - **How long it takes.** Plex with access to its database takes seconds, even for 100,000+ files. Without that
-  access (for example, Plex reached through the marker helper), only previews are counted. Jellyfin Intro and
+  access (for example, Plex reached through the marker helper, or Plex's folder on a network share such as Docker
+  Desktop's mount of a Windows folder), only previews are counted. Jellyfin Intro and
   Credits and Emby previews take longer, because they need one request or one folder read per file. While a check
   runs, they show the last check's numbers.
 - **"N previews are made but Plex isn't showing them."** The preview file exists, but Plex hasn't re-read the video

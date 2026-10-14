@@ -523,7 +523,8 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
 - **How long it takes.** Plex with access to its database takes seconds, even for 100,000+ files. Without that
-  access (for example, Plex reached through the marker helper), only previews are counted. Jellyfin Intro and
+  access (for example, Plex reached through the marker helper, or Plex's folder on a network share such as Docker
+  Desktop's mount of a Windows folder), only previews are counted. Jellyfin Intro and
   Credits and Emby previews take longer, because they need one request or one folder read per file. While a check
   runs, they show the last check's numbers.
 - **"N previews are made but Plex isn't showing them."** The preview file exists, but Plex hasn't re-read the video

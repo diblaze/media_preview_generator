@@ -374,6 +374,10 @@ Verify by opening the web UI and checking **Settings → Processing options → 
 > [!NOTE]
 > Treat WSL2 as best-effort. GPU vendor detection via `lspci` is unreliable inside WSL2, so the app leans on `nvidia-smi` instead and logs a note saying so. If GPU jobs misbehave, run the container on a Linux host.
 
+**Plex installed on Windows (not in Docker):** previews work. Intro & Credits, chapter thumbnails and loudness
+don't: they write to Plex's database, and Docker Desktop shares Windows folders through a network-style mount that the
+database can't be used over safely. Library health counts previews only.
+
 **AMD and Intel:** not accelerated under Docker. These rely on D3D11VA, a Windows-only framework that Docker Desktop's Linux VM cannot reach, so processing falls back to CPU. Add CPU workers in **Settings → Workers** to compensate, or run the container on a Linux host to use VAAPI/QuickSync.
 
 ### macOS
