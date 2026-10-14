@@ -13,6 +13,7 @@ renames it ``jobs.json.imported.bak``.
 
 import json
 import os
+import queue
 import sqlite3
 import threading
 import uuid
@@ -2850,6 +2851,10 @@ class JobManager:
 
     def add_log(self, job_id: str, message: str) -> None:
         """Add a log message for a job (in-memory and append to file), secrets masked (``utils.redact_secrets``)."""
+        # The job's logged lines queued before this one come first. Not while this thread holds the manager's lock (a
+        # cancel's line): the sink's own appends need that lock, so waiting would deadlock.
+        if not self._lock._is_owned():  # type: ignore[attr-defined]
+            wait_for_job_log(job_id)
         message = redact_secrets(message)
         line = f"[{log_clock()}] {message}"
         log_path = os.path.join(self._job_logs_dir, f"{job_id}.log")
@@ -3474,6 +3479,84 @@ def _resolve_default_config_dir() -> str:
     Read lazily rather than at import so a test that sets ``CONFIG_DIR`` after this module loads still takes effect.
     """
     return os.environ.get("CONFIG_DIR", "/config")
+
+
+# Each running job's log sink by job id (JobLogSink registers itself, stop() takes it off).
+_job_log_sinks: dict[str, "JobLogSink"] = {}
+
+
+def wait_for_job_log(job_id: str) -> None:
+    """Return once every line the job's ``JobLogSink`` has queued so far is in its log (no sink: at once).
+
+    Args:
+        job_id: The job.
+    """
+    sink = _job_log_sinks.get(job_id)
+    if sink is not None:
+        sink.wait_for_queued()
+
+
+class JobLogSink:
+    """A job's own log handler sink (``logger.add(JobLogSink(...), ...)``, without ``enqueue``).
+
+    The logging thread only queues the line; one thread of the sink's own hands lines to ``JobManager.add_log`` in
+    order. Loguru's ``enqueue`` did the same through a cross-process pipe, pickling every record: about a tenth of a
+    done file's check. A line added to the job's log directly (``add_log`` from any other thread) first waits for the
+    lines queued before it, and ``logger.remove`` calls :meth:`stop`, which returns once every queued line is in.
+    """
+
+    def __init__(self, manager: JobManager, job_id: str) -> None:
+        """Start the sink's thread and register it for the job's direct log lines.
+
+        Args:
+            manager: The job manager whose log gets the lines.
+            job_id: The job.
+        """
+        self._manager = manager
+        self._job_id = job_id
+        self._lines: queue.SimpleQueue[str | threading.Event | None] = queue.SimpleQueue()
+        self._stopping = False
+        self._stop_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, name=f"job-log-{job_id[:8]}", daemon=True)
+        self._thread.start()
+        _job_log_sinks[job_id] = self
+
+    def write(self, message: Any) -> None:
+        """Queue one record's line (loguru's sink call)."""
+        record = message.record
+        self._lines.put(f"{record['level'].name} - {record['message']}")
+
+    def wait_for_queued(self) -> None:
+        """Return once every line queued so far is in the job's log."""
+        if threading.current_thread() is self._thread:
+            return
+        done = threading.Event()
+        with self._stop_lock:
+            # Queued before stop()'s end marker, or not at all (stop() itself waits for every line).
+            if self._stopping or not self._thread.is_alive():
+                return
+            self._lines.put(done)
+        done.wait(timeout=30)
+
+    def stop(self) -> None:
+        """Wait until every queued line is in the job's log, then end the thread (loguru calls it on remove)."""
+        with self._stop_lock:
+            self._stopping = True
+            self._lines.put(None)
+        self._thread.join(timeout=30)
+        # Kept registered until the lines are in, so another thread's direct line still lands after them.
+        if _job_log_sinks.get(self._job_id) is self:
+            _job_log_sinks.pop(self._job_id, None)
+
+    def _drain(self) -> None:
+        while (line := self._lines.get()) is not None:
+            if isinstance(line, threading.Event):
+                line.set()
+                continue
+            try:
+                self._manager.add_log(self._job_id, line)
+            except Exception as exc:
+                logger.debug("Could not add a line to job {}'s log: {}", self._job_id, exc)
 
 
 def get_job_manager(config_dir: str | None = None, socketio=None) -> JobManager:

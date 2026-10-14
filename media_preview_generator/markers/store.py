@@ -751,11 +751,16 @@ class MarkerStore:
             self._readers.clear()
 
     @contextmanager
-    def _reading(self) -> Iterator[sqlite3.Connection]:
+    def _reading(self, *, snapshot: bool = False) -> Iterator[sqlite3.Connection]:
         """A connection for a read-only block; reads never wait for the store lock or for a writer (WAL).
 
-        The block sees one snapshot (a read transaction spans it). A thread inside its own ``_tx`` gets the writing
-        connection under the lock instead, so it sees its own uncommitted writes.
+        A thread inside its own ``_tx`` gets the writing connection under the lock instead, so it sees its own
+        uncommitted writes. Each statement reads the latest commit; a block must read every row it asks for (no cursor
+        left part-read), or the connection's next borrower would keep reading that older commit.
+
+        Args:
+            snapshot: The block runs several statements that must agree: one read transaction spans them. A single
+                statement needs none, and the BEGIN and ROLLBACK cost a fifth of a done file's check.
 
         Yields:
             A connection no other thread uses until the block ends.
@@ -772,11 +777,15 @@ class MarkerStore:
             conn.execute("PRAGMA query_only=ON")
         healthy = False
         try:
-            conn.execute("BEGIN")
-            try:
+            if snapshot:
+                conn.execute("BEGIN")
+                try:
+                    yield conn
+                finally:
+                    healthy = self._end_read(conn)
+            else:
                 yield conn
-            finally:
-                healthy = self._end_read(conn)
+                healthy = True
         finally:
             with self._readers_lock:
                 pooled = healthy and not self._closed
@@ -1104,7 +1113,7 @@ class MarkerStore:
             Their records.
         """
         found: dict[int, FileRecord] = {}
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             for server_id, item_id in items:
                 for r in conn.execute(
                     "SELECT f.* FROM publish_state p JOIN files f ON f.id = p.file_id "
@@ -1123,7 +1132,7 @@ class MarkerStore:
         Returns:
             One per type it decided, needed review for or found nothing for; none when its length is unknown.
         """
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             row = conn.execute("SELECT duration_ms, updated_at FROM files WHERE id=?", (file_id,)).fetchone()
             if row is None or not row["duration_ms"]:
                 return []
@@ -2027,7 +2036,7 @@ class MarkerStore:
             "SELECT p.file_id, f.canonical_path, f.size, f.mtime_ns, f.missing_since FROM fingerprints p "
             "JOIN files f ON f.id = p.file_id WHERE p.file_id {} ? GROUP BY p.file_id ORDER BY p.file_id LIMIT ?"
         )
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             row = conn.execute("SELECT value FROM meta WHERE key=?", (_FINGERPRINT_CHECKED_UP_TO,)).fetchone()
             after = int(row["value"]) if row else 0
             batch = conn.execute(query.format(">"), (after, limit)).fetchall()
@@ -2098,7 +2107,7 @@ class MarkerStore:
         """
         if limit <= 0:
             return []
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             marked = self._cursor_batch(conn, "missing_since IS NOT NULL", _MISSING_CHECKED_UP_TO, max(1, limit // 2))
             on_disk = self._cursor_batch(conn, "missing_since IS NULL", _FILES_CHECKED_UP_TO, limit - len(marked))
         return [self._file(r) for r in (*marked, *on_disk)]
@@ -2462,7 +2471,7 @@ class MarkerStore:
 
     def get_item_publish_state(self, server_id: str, item_id: str) -> ItemPublishStateRow | None:
         """What this app last left on a server item, or None when it never published there."""
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             r = conn.execute(
                 "SELECT * FROM item_publish_state WHERE server_id=? AND item_id=?", (server_id, item_id)
             ).fetchone()
@@ -2580,7 +2589,7 @@ class MarkerStore:
         Returns:
             The items' rows, by item id (text order).
         """
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             rows = conn.execute(
                 "SELECT * FROM item_publish_state WHERE server_id=? AND status='written' ORDER BY item_id", (server_id,)
             ).fetchall()
@@ -2829,7 +2838,7 @@ class MarkerStore:
             re-reads so far reached.
         """
         marks = ",".join("?" * len(SERVER_SOURCES))
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             stored, typed, fetched = conn.execute(
                 "SELECT COUNT(*), COUNT(type), MAX(fetched_at) FROM evidence "
                 f"WHERE file_id=? AND origin=? AND source IN ({marks})",  # noqa: S608 - placeholders only
@@ -3027,7 +3036,7 @@ class MarkerStore:
         Returns:
             The end of the pause, or None when the series may be asked now.
         """
-        with self._reading() as conn:
+        with self._reading(snapshot=True) as conn:
             paused = conn.execute(
                 "SELECT paused_at FROM series_pauses WHERE source=? AND series_key=?", (source.value, series_key)
             ).fetchone()

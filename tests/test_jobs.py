@@ -1695,3 +1695,90 @@ class TestLogAppendsDoNotHoldTheManagerLock:
             assert not thread.is_alive()
         assert jm.get_job(job.id).status is JobStatus.CANCELLED
         assert any("Cancellation requested by user" in line for line in jm.get_logs(job.id))
+
+
+class TestJobLogSink:
+    """A job's logged lines reach its log in order, before any line added to it directly afterwards."""
+
+    def _record(self, text, level="INFO"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(record={"level": SimpleNamespace(name=level), "message": text})
+
+    def test_lines_arrive_in_order_and_a_direct_line_waits_for_them(self, config_dir):
+        from media_preview_generator.web.jobs import JobLogSink
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        sink = JobLogSink(jm, job.id)
+        for n in range(300):
+            sink.write(self._record(f"file {n}"))
+        jm.add_log(job.id, "INFO - Done")
+        lines = [line.split("] ", 1)[1] for line in jm.get_logs(job.id)]
+        assert lines[-301:] == [f"INFO - file {n}" for n in range(300)] + ["INFO - Done"]
+        sink.stop()
+
+    def test_stop_returns_once_every_line_is_in(self, config_dir):
+        from media_preview_generator.web.jobs import JobLogSink, _job_log_sinks
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        sink = JobLogSink(jm, job.id)
+        for n in range(100):
+            sink.write(self._record(f"line {n}"))
+        sink.stop()
+        assert jm.get_logs(job.id)[-1].endswith("INFO - line 99")
+        assert job.id not in _job_log_sinks
+
+    def test_a_cancel_logging_under_the_manager_lock_does_not_wait_for_the_sink(self, config_dir):
+        import threading
+
+        from media_preview_generator.web.jobs import JobLogSink
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        jm.start_job(job.id)
+        sink = JobLogSink(jm, job.id)
+        writer = threading.Thread(target=lambda: [sink.write(self._record(f"f {n}")) for n in range(500)])
+        writer.start()
+        canceller = threading.Thread(target=jm.cancel_job_if_active, args=(job.id,))
+        canceller.start()
+        canceller.join(5)
+        writer.join(5)
+        assert not canceller.is_alive()
+        sink.stop()
+        assert jm.get_job(job.id).status is JobStatus.CANCELLED
+
+    def test_removing_the_loguru_handler_drains_stops_and_unregisters_it(self, config_dir):
+        from loguru import logger as loguru_logger
+
+        from media_preview_generator.web.jobs import JobLogSink, _job_log_sinks
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        sink = JobLogSink(jm, job.id)
+        marker = f"sink-test-{job.id}"
+        handler_id = loguru_logger.add(
+            sink, format="{message}", level="INFO", filter=lambda record: record["extra"].get("t") == marker
+        )
+        bound = loguru_logger.bind(t=marker)
+        for n in range(200):
+            bound.info("line {}", n)
+        loguru_logger.remove(handler_id)
+        lines = [line.split("] ", 1)[1] for line in jm.get_logs(job.id)]
+        assert lines[-200:] == [f"INFO - line {n}" for n in range(200)]
+        assert not sink._thread.is_alive()
+        assert job.id not in _job_log_sinks
+
+    def test_a_direct_line_racing_the_stop_does_not_wait_out_the_timeout(self, config_dir):
+        import time
+
+        from media_preview_generator.web.jobs import JobLogSink
+
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Lib")
+        sink = JobLogSink(jm, job.id)
+        sink.stop()
+        started = time.monotonic()
+        sink.wait_for_queued()
+        assert time.monotonic() - started < 1

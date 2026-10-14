@@ -86,12 +86,32 @@ def test_other_thread_sees_a_committed_write(store):
     assert store.get_file(rec.canonical_path).duration_ms == 4242  # the pooled reader isn't left on an old snapshot
 
 
-def test_reader_is_returned_to_the_pool_after_an_error(store):
+def test_a_snapshot_reader_is_returned_to_the_pool_after_an_error(store):
     with pytest.raises(ValueError):
-        with store._reading():
+        with store._reading(snapshot=True):
             raise ValueError("boom")
     assert len(store._readers) == 1
     assert not store._readers[0].in_transaction
+
+
+def test_a_plain_reader_that_failed_is_closed_not_pooled(store):
+    # It may have left a cursor part-read, which would keep the next borrower on an older commit.
+    with pytest.raises(ValueError):
+        with store._reading() as conn:
+            raise ValueError("boom")
+    assert store._readers == []
+    with pytest.raises(Exception, match="closed"):
+        conn.execute("SELECT 1")
+
+
+def test_plain_reads_run_no_transaction_statements(store):
+    _add_file(store)
+    store.get_file("/nope")
+    (conn,) = store._readers
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    store.get_file("/nope")
+    assert [s.split()[0].upper() for s in statements] == ["SELECT"]
 
 
 def test_close_closes_pooled_readers(store):

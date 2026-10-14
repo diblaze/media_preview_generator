@@ -31,9 +31,11 @@ from ..utils import redact_secrets, redacted_traceback
 from ..web.job_gate import format_wait_message, get_job_gate, release_slot
 from ..web.jobs import (
     PAUSED_BY_SCHEDULE,
+    JobLogSink,
     JobStatus,
     WorkerStatus,
     get_job_manager,
+    wait_for_job_log,
 )
 from ..web.routes._helpers import _ensure_gpu_cache
 from ..web.routes.job_runner import (
@@ -959,7 +961,7 @@ def _log_missing(ctx: PipelineContext) -> None:
 def _log_summary(jm, job_id: str, outcome: dict[str, int], ctx: PipelineContext) -> None:
     """End the job's log with the totals line. Never raises."""
     try:
-        logger.complete()  # the files' lines, still queued for the job's log, come before these
+        wait_for_job_log(job_id)  # the files' lines, still queued for the job's log, come before these
         for line in ctx.summary_lines(outcome):
             jm.add_log(job_id, f"INFO - {line}")
     except Exception as exc:
@@ -1181,11 +1183,10 @@ def _run_intro_credits_pass(job_id: str) -> bool | None:
         return None
     register_job_thread(job_id)
     handler_id = loguru_logger.add(
-        lambda message: jm.add_log(job_id, f"{message.record['level'].name} - {message.record['message']}"),
+        JobLogSink(jm, job_id),
         level=str(settings.get("log_level", "INFO")).upper(),
         format="{message}",
         filter=lambda record: not record["extra"].get(JOB_LOG_SKIP) and is_job_thread_for(record["thread"].id, job_id),
-        enqueue=True,
     )
     cfg = dict(job.config or {})
     state = _PassState(cfg=cfg, listing_on_job=LISTING_CONFIG_KEY in cfg)
@@ -1624,7 +1625,7 @@ def _run_job(
         logger.debug("Couldn't describe what started job {}: {}", job_id, type(exc).__name__)
         trigger = ""
     logger.info("{}", start_line(job_id, len(items), trigger))
-    logger.complete()  # the lines added straight to the job's log below come after it
+    wait_for_job_log(job_id)  # the lines added straight to the job's log below come after it
     if not items:
         if listing is not None:
             jm.add_log(job_id, "INFO - Every server checked still shows what this app published")

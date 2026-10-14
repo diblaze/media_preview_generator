@@ -21,6 +21,7 @@ from ...processing.retry_queue import scaled_backoff_delay
 from ...scan_filters import FILTER_CONFIG_KEYS
 from ..job_gate import format_wait_message, release_slot
 from ..jobs import (
+    JobLogSink,
     JobStatus,
     WorkerStatus,
     get_job_manager,
@@ -722,12 +723,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                 logger.info("Job {} not started — global processing paused; job remains pending", job_id)
                 return
 
-            def log_sink(message):
-                """Capture log messages for this job."""
-                record = message.record
-                log_text = f"{record['level'].name} - {record['message']}"
-                job_manager.add_log(job_id, log_text)
-
             def job_thread_filter(record: dict) -> bool:
                 """Capture only THIS job's thread messages.
 
@@ -743,11 +738,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
             job_log_level = sm.get("log_level", "INFO").upper()
 
             log_handler_id = logger.add(
-                log_sink,
+                JobLogSink(job_manager, job_id),
                 level=job_log_level,
                 format="{message}",
                 filter=job_thread_filter,
-                enqueue=True,
             )
 
             job = job_manager.get_job(job_id)

@@ -51,7 +51,7 @@ from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import apply_inverse_path_mappings
 from ..utils import redact_secrets
 from ..web.job_gate import format_wait_message, get_job_gate, release_slot
-from ..web.jobs import JobStatus, get_job_manager
+from ..web.jobs import JobLogSink, JobStatus, get_job_manager
 from ..web.routes._helpers import _ensure_gpu_cache
 from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _inflight_lock
 from ..web.settings_manager import get_settings_manager
@@ -654,11 +654,10 @@ def _run_loudness_pass(job_id: str) -> bool | None:
         return None
     register_job_thread(job_id)
     handler_id = logger.add(
-        lambda message: jm.add_log(job_id, f"{message.record['level'].name} - {message.record['message']}"),
+        JobLogSink(jm, job_id),
         level=str(settings.get("log_level", "INFO")).upper(),
         format="{message}",
         filter=lambda record: not record["extra"].get(JOB_LOG_SKIP) and is_job_thread_for(record["thread"].id, job_id),
-        enqueue=True,
     )
     # Held from the gate until the files are submitted to the dispatcher (or the job ends first).
     slot = {"held": False}
