@@ -391,17 +391,28 @@ def test_journal_contains_database_and_row_identity(db, tmp_path):
     conn.close()
 
 
-def test_music_items_are_refused_without_mutation(db):
+@pytest.mark.parametrize(
+    ("metadata_type", "said"),
+    [
+        (10, "music isn't analysed"),
+        # A trailer used to be refused as music.
+        (12, "trailers and other extras aren't analysed"),
+        (13, "this item is neither (Plex type 13)"),
+    ],
+    ids=["music-track", "extra", "photo"],
+)
+def test_items_other_than_movies_and_episodes_are_refused_by_type_without_mutation(db, metadata_type, said):
     with sqlite3.connect(db._path()) as conn:
-        conn.execute("UPDATE metadata_items SET metadata_type = 10 WHERE id = 1")
+        conn.execute("UPDATE metadata_items SET metadata_type = ? WHERE id = 1", (metadata_type,))
     conn.close()
     for operation in (
         lambda: plex_db.read_streams(db, [FILE], deadline=1e12),
         lambda: plex_db.write_stream(db, 11, FIELDS, deadline=1e12),
         lambda: plex_db.mark_item(db, 1, deadline=1e12),
     ):
-        with pytest.raises(PublishError):
+        with pytest.raises(PublishError) as ei:
             operation()
+        assert str(ei.value) == f"Loudness analysis supports Plex movies and TV episodes; {said}"
     assert _extra(db, 11) == BEFORE
     assert _item_extra(db) is None
 

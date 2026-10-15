@@ -79,6 +79,36 @@ def test_check_sends_a_file_with_unanalysed_streams_to_a_worker(ctx, media):
     assert job.check_item(_item(media), ctx=ctx) is None
 
 
+@pytest.mark.parametrize(
+    "extra", ["Puffin Rock S01E34-trailer.mp4", "Trailers/Puffin Rock S01E34.mp4"], ids=["suffix", "folder"]
+)
+def test_a_trailer_or_other_extra_is_skipped_not_a_failed_music_file(ctx, db, media, extra):  # noqa: F811
+    # Lab: a movie's trailer, which Plex lists as an extra (metadata_type 12), failed the job as "music analysis is
+    # not supported"; markers skip the same files.
+    local = Path(media).parent / extra
+    local.parent.mkdir(exist_ok=True)
+    local.write_bytes(b"trailer")
+    conn = sqlite3.connect(db._path())
+    conn.execute("UPDATE metadata_items SET metadata_type = 12 WHERE id = 1")
+    conn.execute(
+        "UPDATE media_parts SET file = ?, hash = ?, size = ? WHERE id = 1",
+        (f"/data/kids/{extra}", calculate_plex_hash(str(local)), local.stat().st_size),
+    )
+    conn.commit()
+    conn.close()
+
+    outcome = job.check_item(_item(str(local)), ctx=ctx)
+
+    assert (outcome.outcome_key, outcome.message, outcome.publisher_rows) == (
+        job.SKIPPED,
+        "Extras aren't analysed for loudness",
+        [],
+    )
+    assert job.SKIPPED in job.OUTCOME_KEYS
+    # Neither a success nor a failure: a job of nothing else completes without an error or a warning.
+    assert job._completion({job.SKIPPED: 2}, []) == (0, None)
+
+
 def test_check_settles_a_missing_file_and_a_file_nobody_owns(ctx, tmp_path):
     assert job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx).outcome_key == job.FILE_NOT_FOUND
     with patch.object(job, "owners", return_value=[]):

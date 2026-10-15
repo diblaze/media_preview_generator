@@ -27,6 +27,7 @@ from ..jobs.group_runtime import admission_options, runtime_capacity, wait_for_c
 from ..jobs.orchestrator import _build_multi_server_registry, fold_publisher_rows_into_aggregate
 from ..jobs.parking import JobParked, park_if_unavailable
 from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
+from ..markers.external_ids import is_extra
 from ..markers.job_log import display_name, write_line
 from ..markers.job_runner import (
     build_items,
@@ -83,10 +84,23 @@ NO_OWNERS = "loudness_no_owners"
 NOT_IN_LIBRARY = "loudness_not_in_library"
 # Plex's database couldn't be written just then (Plex restarting, its lock busy): tried again later, like NOT_IN_LIBRARY.
 WAITING = "loudness_waiting"
+# A trailer or other extra (``external_ids.is_extra``): Plex reads no loudness for one, as markers check none.
+SKIPPED = "loudness_skipped"
+EXTRAS_NOT_ANALYSED = "Extras aren't analysed for loudness"
 FILE_NOT_FOUND = FileOutcome.FILE_NOT_FOUND.value
 SOURCE_GONE = FileOutcome.SOURCE_GONE.value
 FAILED = FileOutcome.FAILED.value
-OUTCOME_KEYS = (WRITTEN, UP_TO_DATE, NO_OWNERS, NOT_IN_LIBRARY, WAITING, FILE_NOT_FOUND, SOURCE_GONE, FAILED)
+OUTCOME_KEYS = (
+    WRITTEN,
+    UP_TO_DATE,
+    NO_OWNERS,
+    NOT_IN_LIBRARY,
+    WAITING,
+    SKIPPED,
+    FILE_NOT_FOUND,
+    SOURCE_GONE,
+    FAILED,
+)
 # A file's outcome from its per-server rows: the first of these any server has.
 _PRECEDENCE = (FAILED, WAITING, NOT_IN_LIBRARY, WRITTEN, UP_TO_DATE)
 # Read-only lookups share the dispatcher's checking threads with preview checks: half of them at most.
@@ -326,6 +340,9 @@ def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
 def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | None:
     """Check stage: settle a file with nothing to analyse; None sends it to a worker."""
     path = item.canonical_path
+    if is_extra(path):
+        # Plex refuses loudness for an extra's item, so asking it would only count the file as failed.
+        return ItemOutcome(SKIPPED, EXTRAS_NOT_ANALYSED)
     source = _read_source(path)
     if source is None:
         if os.path.normpath(path) in ctx.deleted_paths:

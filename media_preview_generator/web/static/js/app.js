@@ -1748,6 +1748,7 @@ const STATUS_META = {
     loudness_no_owners:      { label: 'No server with Loudness on', cls: 'bg-secondary', tip: 'No Plex server with Loudness turned on has this file' },
     loudness_not_in_library: { label: 'Not in Plex yet', cls: 'bg-info text-dark', tip: 'Plex had not added this file when it was checked. The job status shows whether another attempt is scheduled.' },
     loudness_waiting:        { label: 'Waiting for Plex', cls: 'bg-info text-dark', tip: 'Plex or the source file was temporarily unavailable or changed. The job status shows whether another attempt is scheduled.' },
+    loudness_skipped:        { label: 'Skipped', cls: 'bg-secondary', tip: 'The file is a trailer or other extra: extras aren\'t analysed for loudness' },
 };
 
 const JOB_KIND_INTRO_CREDITS = 'intro_credits';

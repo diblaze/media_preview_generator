@@ -271,9 +271,14 @@ _STREAM_SELECT = (
 )
 
 
+# What Plex calls an item loudness isn't read for, by its metadata_type (1 movie and 4 episode are).
+_NOT_ANALYSED = {10: "music isn't analysed", 12: "trailers and other extras aren't analysed"}
+
+
 def _audio_stream(row: tuple) -> AudioStream:
     if row[-1] not in (1, 4):
-        raise PublishError("Loudness analysis supports Plex movies and TV episodes; music analysis is not supported")
+        what = _NOT_ANALYSED.get(row[-1], f"this item is neither (Plex type {row[-1]})")
+        raise PublishError(f"Loudness analysis supports Plex movies and TV episodes; {what}")
     return AudioStream(
         row[0], int(row[1]), str(row[2] or ""), row[3], row[4], row[5], row[6], _marked(row[7]), *row[8:-1]
     )
