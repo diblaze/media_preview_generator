@@ -122,6 +122,8 @@ KIND_CODEC_NOT_SUPPORTED = "codec_not_supported"
 KIND_GPU_FAILED = "gpu_failed"
 KIND_CANCELLED = "cancelled"
 KIND_FAILED = "failed"
+# The node's temp folder filled up or went read-only mid-task: the node's condition, not the file's.
+KIND_TEMP_FOLDER = "temp_folder"
 KIND_AUTH = "auth"
 KIND_PROTOCOL = "protocol"
 KIND_UNKNOWN_TASK = "unknown_task"

@@ -167,8 +167,9 @@ it dies with a node run outside Docker (`utils.kill_with_parent`).
 
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
-`unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`, `task_deleted`, `node_stopping`, `rate_limited`.
+`unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, `temp_folder` (the node's temp folder
+filled up or went read-only mid-task: the app queues the file again with no drop counted and checks the node), plus
+request-level `auth`, `protocol`, `unknown_task`, `request`, `task_deleted`, `node_stopping`, `rate_limited`.
 
 Wrong keys: a caller (an IPv4 address, or an IPv6 address's /64) may send 20 at once, then one more every 3 s. Past
 that, every request from it (the Plex database role's too) answers 429 `rate_limited` with `Retry-After`, whatever

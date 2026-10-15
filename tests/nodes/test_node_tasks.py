@@ -246,7 +246,7 @@ class TestTempFolder:
 
         state = _finished(table, table.start(_spec(media)))
 
-        assert state["status"] == protocol.STATUS_FAILED
+        assert state["status"] == protocol.STATUS_FAILED and state["error"]["kind"] == protocol.KIND_TEMP_FOLDER
         message = state["error"]["message"]
         assert message.startswith("The node") and said in message and table.temp_root in message, message
         assert ("twice its frames' size" in message) == (code == errno.ENOSPC)

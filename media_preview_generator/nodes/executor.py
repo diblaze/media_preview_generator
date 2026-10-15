@@ -134,7 +134,8 @@ class NodeUnavailableError(Exception):
     Attributes:
         node_id: The node.
         node_name: Its name.
-        started: False when the node never ran the task (it didn't take the start), so the drop doesn't count.
+        started: False when the node never ran the task (it didn't take the start) or stopped it for its own temp
+            folder, so the drop doesn't count.
     """
 
     def __init__(self, node_id: str, node_name: str, message: str, *, started: bool = True) -> None:
@@ -531,6 +532,10 @@ class _TaskRun:
             _report("a GPU error", self._registry.report_gpu_error, node_id, device)
             if not error_type:
                 raise CodecNotSupportedError(message, kind=fallback_kind or FALLBACK_HWACCEL)
+        if kind == protocol.KIND_TEMP_FOLDER:
+            # The node's temp folder, not the file: as when it can't take a start, the file goes back in the queue
+            # with no drop counted and the node is checked now.
+            raise self._unavailable(f"{name} couldn't finish the task: {message}", started=False)
         raise NodeTaskError(kind or protocol.KIND_FAILED, message, error_type=error_type, extra=extra)
 
     def _download(self, dest: str) -> None:
