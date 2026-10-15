@@ -49,6 +49,11 @@ class TestSettingsLayout:
         ):
             expect(settings_page.locator(f'a[href="{href}"]')).to_be_visible()
 
+    def test_the_sidebar_links_to_the_nodes_page_after_workers(self, settings_page: Page) -> None:
+        links = settings_page.locator("#settings-sidebar a.nav-link")
+        assert links.evaluate_all("els => els.map(e => e.textContent.trim())")[:2] == ["Workers", "Nodes"]
+        expect(settings_page.locator('#settings-sidebar a[href="/nodes"]')).to_be_visible()
+
     def test_per_gpu_panel_renders_cards(self, settings_page: Page) -> None:
         # mock_system_status renders 2 GPUs by default.
         expect(settings_page.locator("#gpuDetecting")).to_be_hidden(timeout=3000)
@@ -186,6 +191,65 @@ class TestSettingsBackupsPanel:
         assert captured[0]["file"] == "settings.json"
         # Newest entry is the timestamped one.
         assert "20260201-100000" in (captured[0].get("backup") or "")
+
+    def test_a_backup_that_cant_be_read_cant_be_picked(self, authed_page: Page, app_url: str) -> None:
+        """The server refuses it (cut short, say), so it is marked and skipped, and a file with no other is left
+        without a Restore button to press."""
+
+        def backup(name: str, stamp: str, mtime: float, readable: bool) -> dict:
+            filename = f"{name}.{stamp}.bak"
+            return {
+                "filename": filename,
+                "path": f"/config/{filename}",
+                "timestamp": stamp,
+                "mtime": mtime,
+                "legacy": False,
+                "readable": readable,
+            }
+
+        def row(name: str, backups: list[dict]) -> dict:
+            return {
+                "name": name,
+                "live_path": f"/config/{name}",
+                "live_mtime": 1000.0,
+                "backups": backups,
+                "has_bak": True,
+                "bak_newer": False,
+            }
+
+        files = [
+            row(
+                "settings.json",
+                [
+                    backup("settings.json", "20260201-100000", 3000.0, False),
+                    backup("settings.json", "20260101-100000", 500.0, True),
+                ],
+            ),
+            row("schedules.json", [backup("schedules.json", "20260201-100000", 3000.0, False)]),
+        ]
+        mock_settings_get(authed_page)
+        mock_worker_groups(authed_page)
+        mock_setup_status(authed_page, complete=True, plex_authenticated=True)
+        mock_system_status(authed_page)
+        mock_settings_backups(authed_page, files)
+        capture_settings_save(authed_page)
+        captured = capture_settings_backups_restore(authed_page)
+        authed_page.goto(f"{app_url}/settings")
+        authed_page.wait_for_load_state("domcontentloaded")
+
+        panel = authed_page.locator("#backupRestorePanel")
+        cut_short = panel.locator('option[value="settings.json.20260201-100000.bak"]')
+        expect(cut_short).to_contain_text("(can't be read)", timeout=3000)
+        expect(cut_short).to_be_disabled()
+        expect(panel.locator('[data-restore-file="schedules.json"]')).to_be_disabled()
+        panel.locator('[data-restore-file="settings.json"]').click()
+        with authed_page.expect_response(
+            lambda r: r.request.method == "POST" and r.url.endswith("/api/settings/backups/restore"),
+            timeout=5000,
+        ) as req_info:
+            accept_app_confirm(authed_page)
+        req_info.value  # noqa: B018 — waiting for the response, not the request, means the mock has recorded the body
+        assert captured == [{"file": "settings.json", "backup": "settings.json.20260101-100000.bak"}]
 
 
 @pytest.mark.e2e

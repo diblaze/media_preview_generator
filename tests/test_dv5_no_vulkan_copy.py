@@ -101,47 +101,98 @@ class TestProbeLogs:
         assert len(hits) == 1, messages
         _assert_describes_wrong_colours(hits[0])
 
-    def test_all_strategies_failed_warning_names_the_fix(self) -> None:
-        from media_preview_generator.gpu.vulkan_probe import _probe_vulkan_device
+    def test_all_strategies_failed_warning_names_the_fix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        hit = _all_strategies_failed_line()
 
-        software = MagicMock(returncode=0, stderr=f"[Vulkan @ 0x1] Device 0 selected: {SOFTWARE_DEVICE}\n")
-        messages, sink_id = _capture_logs("WARNING")
-        try:
-            with (
-                patch("media_preview_generator.gpu.vulkan_probe._is_hwaccel_available", return_value=True),
-                patch("media_preview_generator.gpu.vulkan_probe.subprocess.run", return_value=software),
-                patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json", return_value=None),
-                patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json", return_value=None),
-                patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia", return_value=None),
-            ):
-                _probe_vulkan_device()
-        finally:
-            logger.remove(sink_id)
-
-        hits = [m for m in messages if "couldn't be detected" in m]
-        assert len(hits) == 1, messages
-        _assert_describes_wrong_colours(hits[0])
-        assert "NVIDIA_DRIVER_CAPABILITIES=all" in hits[0]
+        _assert_describes_wrong_colours(hit)
+        assert "NVIDIA_DRIVER_CAPABILITIES=all" in hit
 
     @pytest.mark.parametrize(
         ("device", "level"),
         [pytest.param(None, "INFO", id="no-vulkan"), pytest.param(SOFTWARE_DEVICE, "WARNING", id="software")],
     )
-    def test_first_probe_outcome_says_wrong_colours_and_names_the_fix(self, device: str | None, level: str) -> None:
-        from media_preview_generator.gpu.vulkan_probe import get_vulkan_device_info
+    def test_first_probe_outcome_says_wrong_colours_and_names_the_fix(
+        self, device: str | None, level: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        hit = _first_probe_line(device, level)
 
-        messages, sink_id = _capture_logs(level)
-        try:
-            with patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device", return_value=device):
-                get_vulkan_device_info()
-        finally:
-            logger.remove(sink_id)
+        _assert_describes_wrong_colours(hit)
+        assert "NVIDIA_DRIVER_CAPABILITIES=all" in hit
+        assert "hardware Vulkan driver" in hit
 
-        hits = [m for m in messages if "Dolby Vision" in m]
-        assert len(hits) == 1, messages
-        _assert_describes_wrong_colours(hits[0])
-        assert "NVIDIA_DRIVER_CAPABILITIES=all" in hits[0]
-        assert "hardware Vulkan driver" in hits[0]
+    @pytest.mark.parametrize(
+        ("caps", "already_asked"),
+        [
+            pytest.param(None, False, id="caps-unset"),
+            pytest.param("compute,video,utility", False, id="caps-without-graphics"),
+            pytest.param("all", True, id="caps-all"),
+            pytest.param("compute,video,utility,graphics", True, id="caps-with-graphics"),
+        ],
+    )
+    @pytest.mark.parametrize("surface", ["all-strategies-failed", "no-vulkan", "software"])
+    def test_the_fix_doesnt_ask_for_a_capability_the_container_already_has(
+        self, surface: str, caps: str | None, already_asked: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if caps is None:
+            monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        else:
+            monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", caps)
+
+        if surface == "all-strategies-failed":
+            hit = _all_strategies_failed_line()
+        elif surface == "no-vulkan":
+            hit = _first_probe_line(None, "INFO")
+        else:
+            hit = _first_probe_line(SOFTWARE_DEVICE, "WARNING")
+
+        assert ("set NVIDIA_DRIVER_CAPABILITIES=all" in hit) is not already_asked, hit
+        assert (RUNTIME_FIX in hit) is already_asked, hit
+        assert "on Intel/AMD, pass /dev/dri into the container" in hit
+
+
+RUNTIME_FIX = (
+    "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
+    "with --runtime=nvidia"
+)
+
+
+def _all_strategies_failed_line() -> str:
+    from media_preview_generator.gpu.vulkan_probe import _probe_vulkan_device
+
+    software = MagicMock(returncode=0, stderr=f"[Vulkan @ 0x1] Device 0 selected: {SOFTWARE_DEVICE}\n")
+    messages, sink_id = _capture_logs("WARNING")
+    try:
+        with (
+            patch("media_preview_generator.gpu.vulkan_probe._is_hwaccel_available", return_value=True),
+            patch("media_preview_generator.gpu.vulkan_probe.subprocess.run", return_value=software),
+            patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json", return_value=None),
+            patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json", return_value=None),
+            patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia", return_value=None),
+        ):
+            _probe_vulkan_device()
+    finally:
+        logger.remove(sink_id)
+
+    hits = [m for m in messages if "couldn't be detected" in m]
+    assert len(hits) == 1, messages
+    return hits[0]
+
+
+def _first_probe_line(device: str | None, level: str) -> str:
+    from media_preview_generator.gpu.vulkan_probe import get_vulkan_device_info
+
+    messages, sink_id = _capture_logs(level)
+    try:
+        with patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device", return_value=device):
+            get_vulkan_device_info()
+    finally:
+        logger.remove(sink_id)
+
+    hits = [m for m in messages if "Dolby Vision" in m]
+    assert len(hits) == 1, messages
+    return hits[0]
 
 
 def _diag(*, has_graphics: bool = True, icd_path: str | None = "/etc/vulkan/icd.d/nvidia_icd.json", glvkspirv=True):
@@ -223,15 +274,14 @@ class TestDashboardWarning:
         assert notification is not None
         _assert_describes_wrong_colours(notification["title"])
 
-    def test_debug_bundle_intro_says_wrong_colours(self) -> None:
-        from media_preview_generator.web.routes.api_vulkan import get_vulkan_debug
-
+    def test_debug_bundle_intro_says_wrong_colours(self, client, auth_headers) -> None:
         with (
             patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device", return_value=SOFTWARE_DEVICE),
             patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment", return_value=_diag()),
         ):
-            body, status, _headers = get_vulkan_debug()
+            response = client.get("/api/system/vulkan/debug", headers=auth_headers)
 
-        assert status == 200
+        body = response.get_data(as_text=True)
+        assert response.status_code == 200
         intro = body.split("--- Probe result ---", 1)[0]
         _assert_describes_wrong_colours(intro)

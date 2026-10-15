@@ -229,6 +229,21 @@ class TestExpandPathMappingCandidates:
         assert "F:/Videos/TV Shows/Show/S01E01.mkv" in candidates
         assert "/data/tv/Show/S01E01.mkv" in candidates
 
+    @pytest.mark.parametrize("prefix", ["D:\\Media", "D:/Media"])
+    def test_expand_candidates_include_a_windows_servers_own_backslashed_path(self, prefix):
+        """Plex on Windows stores ``D:\\Media\\TV\\...``; the chapter lookup asks for that exact path."""
+        candidates = expand_path_mapping_candidates(
+            "/data/TV/Show/S01E01.mkv", [{"plex_prefix": prefix, "local_prefix": "/data"}]
+        )
+        assert r"D:\Media\TV\Show\S01E01.mkv" in candidates
+        assert "D:/Media/TV/Show/S01E01.mkv" in candidates
+
+    def test_expand_candidates_never_add_backslashes_for_linux_servers(self):
+        candidates = expand_path_mapping_candidates(
+            "/data/TV/Show/S01E01.mkv", [{"plex_prefix": "/media", "local_prefix": "/data"}]
+        )
+        assert candidates == ["/data/TV/Show/S01E01.mkv", "/media/TV/Show/S01E01.mkv"]
+
     @pytest.mark.parametrize(
         "row",
         [
@@ -1031,6 +1046,20 @@ class TestLoadConfig:
         assert config.plex_token == "test_token"
         assert config.plex_verify_ssl is True
 
+    # Workers on a node aren't in gpu_threads / cpu_threads (this app's own pool) but run jobs: no warning then.
+    @pytest.mark.parametrize(
+        ("worker_groups", "warned"),
+        [
+            (None, True),
+            (
+                [{"id": "n", "name": "Nodes", "enabled": True, "availability": {"mode": "always", "windows": []},
+                  "members": [{"id": "c", "resource": "cpu", "device": None, "count": 1,
+                               "job_types": ["previews"], "node": "lab-cpu"}]}],
+                False,
+            ),
+        ],
+        ids=["no-workers-anywhere", "workers-only-on-a-node"],
+    )  # fmt: skip
     @patch("shutil.which")
     @patch("subprocess.run")
     @patch("os.path.exists")
@@ -1049,6 +1078,9 @@ class TestLoadConfig:
         mock_exists,
         mock_run,
         mock_which,
+        worker_groups,
+        warned,
+        loguru_caplog,
     ):
         """Both CPU and GPU totals zero must return a valid Config (not crash/exit)."""
         from media_preview_generator.config import clear_config_cache
@@ -1095,6 +1127,7 @@ class TestLoadConfig:
                         "ffmpeg_threads": 2,
                     }
                 ],
+                **({"worker_groups": worker_groups} if worker_groups else {}),
             }
         )
         clear_config_cache()
@@ -1103,6 +1136,7 @@ class TestLoadConfig:
         assert config is not None
         assert config.gpu_threads == 0
         assert config.cpu_threads == 0
+        assert ("jobs will remain pending" in loguru_caplog.text) is warned
 
     @pytest.mark.parametrize("over", [0, 1], ids=["at-maximum", "one-above"])
     @patch("shutil.which")
@@ -2136,6 +2170,19 @@ class TestValidateProcessingThreadTotals:
         )
         assert ok is False
         assert "pending" in msg.lower()
+
+    def test_accepts_zero_workers_here_when_a_node_has_some(self):
+        node_group = {
+            "id": "n",
+            "name": "Nodes",
+            "enabled": True,
+            "availability": {"mode": "always", "windows": []},
+            "members": [
+                {"id": "g", "resource": "gpu", "device": "cuda:0", "count": 1, "job_types": ["previews"], "node": "x"}
+            ],
+        }
+        assert validate_processing_thread_totals({"worker_groups": [node_group]}) == (True, "")
+        assert validate_processing_thread_totals({"worker_groups": [{**node_group, "enabled": False}]})[0] is False
 
     def test_accepts_zero_cpu_when_gpu_has_workers(self):
         ok, msg = validate_processing_thread_totals(

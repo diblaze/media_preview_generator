@@ -14,6 +14,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, cast
 
 from loguru import logger
@@ -26,6 +27,7 @@ from ..jobs.group_runtime import admission_options, runtime_capacity, wait_for_c
 from ..jobs.orchestrator import _build_multi_server_registry, fold_publisher_rows_into_aggregate
 from ..jobs.parking import JobParked, park_if_unavailable
 from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
+from ..markers.external_ids import is_extra
 from ..markers.job_log import display_name, write_line
 from ..markers.job_runner import (
     build_items,
@@ -41,6 +43,9 @@ from ..markers.outcomes import FileOutcome
 from ..markers.ownership import owning_servers
 from ..markers.publishers.base import Capability, DatabaseBusyError, PublishError, cancellable_waits
 from ..markers.publishers.plex_db import BUSY_TIMEOUT_S, LocalPlexDb
+from ..markers.publishers.plex_remote import saved_server_node_id
+from ..nodes import remote_ops
+from ..nodes.executor import current_placement
 from ..output.plex_hash import calculate_plex_hash
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
 from ..processing.multi_server import source_replaced_reason
@@ -57,10 +62,12 @@ from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _infli
 from ..web.settings_manager import get_settings_manager
 from . import analyze, chain, undecodable
 from .deleted_sources import confirmed_deleted_paths
-from .guard import GuardedLoudnessDb, create_loudness_db
+from .guard import GuardedLoudnessDb, RemoteLoudnessDb, create_loudness_db
 from .inputs import load_file_input
 from .plex_db import (
+    PLEX_TYPE_EXTRA,
     AudioStream,
+    NotAnalysedError,
     SourceChangedError,
     SourceFingerprint,
     mark_item,
@@ -79,12 +86,26 @@ NO_OWNERS = "loudness_no_owners"
 NOT_IN_LIBRARY = "loudness_not_in_library"
 # Plex's database couldn't be written just then (Plex restarting, its lock busy): tried again later, like NOT_IN_LIBRARY.
 WAITING = "loudness_waiting"
+# A trailer or other extra, as Plex lists it (``plex_db.PLEX_TYPE_EXTRA``), or by its path (``external_ids.is_extra``)
+# when Plex doesn't list the file: Plex reads no loudness for one, as markers check none.
+SKIPPED = "loudness_skipped"
+EXTRAS_NOT_ANALYSED = "Extras aren't analysed for loudness"
 FILE_NOT_FOUND = FileOutcome.FILE_NOT_FOUND.value
 SOURCE_GONE = FileOutcome.SOURCE_GONE.value
 FAILED = FileOutcome.FAILED.value
-OUTCOME_KEYS = (WRITTEN, UP_TO_DATE, NO_OWNERS, NOT_IN_LIBRARY, WAITING, FILE_NOT_FOUND, SOURCE_GONE, FAILED)
+OUTCOME_KEYS = (
+    WRITTEN,
+    UP_TO_DATE,
+    NO_OWNERS,
+    NOT_IN_LIBRARY,
+    WAITING,
+    SKIPPED,
+    FILE_NOT_FOUND,
+    SOURCE_GONE,
+    FAILED,
+)
 # A file's outcome from its per-server rows: the first of these any server has.
-_PRECEDENCE = (FAILED, WAITING, NOT_IN_LIBRARY, WRITTEN, UP_TO_DATE)
+_PRECEDENCE = (FAILED, WAITING, NOT_IN_LIBRARY, WRITTEN, UP_TO_DATE, SKIPPED)
 # Read-only lookups share the dispatcher's checking threads with preview checks: half of them at most.
 CHECK_SHARE = 0.5
 # A database that wasn't writable (Plex restarting, its lock busy) is checked again after this long.
@@ -105,7 +126,7 @@ class LoudnessContext:
     deleted_paths: frozenset[str] = frozenset()
     # Library scans only (``trusts_server_hash``): Plex's part hash stands in for reading the file when the size matches.
     trust_server_hash: bool = False
-    _dbs: dict[str, LocalPlexDb] = field(default_factory=dict)
+    _dbs: dict[str, LocalPlexDb | RemoteLoudnessDb] = field(default_factory=dict)
     # server id → (why it can't be written, "" when it can; when that was found)
     _ready: dict[str, tuple[str, float]] = field(default_factory=dict)
     _states: dict[str, Capability] = field(default_factory=dict)
@@ -158,24 +179,32 @@ class LoudnessContext:
         except Exception as exc:
             logger.warning("Couldn't ask {} to scan the folder of {}: {}", cfg.name, path, exc)
 
-    def db(self, cfg: ServerConfig) -> tuple[LocalPlexDb, str]:
+    def db(self, cfg: ServerConfig) -> tuple[LocalPlexDb | RemoteLoudnessDb, str]:
         """The server's Plex database, and "" when it can be written or why not.
 
         A writable answer holds for the job; any other is asked again after ``RECHECK_S``, so a moment when Plex was
-        restarting doesn't fail a whole library.
+        restarting doesn't fail a whole library. A Plex database node this app refused (``details["node_refused"]``:
+        turned off, or its new id held) is asked again for the next file: the Nodes page or the registry's next check
+        lifts that at any moment, and the refusal costs no request.
         """
         with self._locks_lock:
             lock = self._locks.setdefault(cfg.id, threading.Lock())
         with lock:
             db = self._dbs.get(cfg.id)
             if db is None:
-                db = self._dbs[cfg.id] = create_loudness_db(cfg, self.registry.get(cfg.id))
+                # Kept for the job: the saved server's node is read per request, so a re-pointed server stops it.
+                db = self._dbs[cfg.id] = create_loudness_db(
+                    cfg, self.registry.get(cfg.id), live_node_id=partial(saved_server_node_id, cfg.id)
+                )
             known = self._ready.get(cfg.id)
             if known is None or (known[0] and time.monotonic() - known[1] > RECHECK_S):
                 report = db.file_checks(deadline=time.monotonic() + BUSY_TIMEOUT_S)
                 self._states[cfg.id] = report.state
                 known = ("" if report.state is Capability.READY else report.message, time.monotonic())
-                self._ready[cfg.id] = known
+                if report.details.get("node_refused"):
+                    self._ready.pop(cfg.id, None)
+                else:
+                    self._ready[cfg.id] = known
             return db, known[0]
 
 
@@ -259,15 +288,27 @@ def _lookup(
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
         skipped = ctx.undecodable_keys()
         needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
-        if streams and not needed and all(s.item_marked for s in streams) and isinstance(db, GuardedLoudnessDb):
+        if (
+            streams
+            and not needed
+            and all(s.item_marked for s in streams)
+            and isinstance(db, GuardedLoudnessDb | RemoteLoudnessDb)
+        ):
             # verify_streams requires complete loudness on every stream it is given, which undecodable ones never have.
             db.verify_streams([s for s in streams if not undecodable.is_skipped(s, skipped)])
             cast(SourceFingerprint, source).verify()
     except (DatabaseBusyError, SourceChangedError, OSError) as exc:
         return _row(cfg, WAITING, str(exc)), [], []
+    except NotAnalysedError as exc:
+        if exc.plex_type == PLEX_TYPE_EXTRA:
+            return _row(cfg, SKIPPED, EXTRAS_NOT_ANALYSED), [], []
+        return _row(cfg, FAILED, f"Couldn't read the file's audio streams in Plex: {exc}"), [], []
     except PublishError as exc:
         status = WAITING if exc.state is Capability.UNREACHABLE else FAILED
         return _row(cfg, status, f"Couldn't read the file's audio streams in Plex: {exc}"), [], []
+    if not in_plex and is_extra(path):
+        # Plex ignores some extras (samples) and lists the rest as extras: waiting for it to add one would only retry.
+        return _row(cfg, SKIPPED, EXTRAS_NOT_ANALYSED), [], []
     if not in_plex:
         return _row(cfg, NOT_IN_LIBRARY, "Plex hasn't added this file yet"), [], []
     if not streams:
@@ -300,6 +341,7 @@ def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
     its folder is gone for good and queues no retry; any other may still be copying in, so a webhook's job retries it."""
     replaced = source_replaced_reason(path, ctx.registry)
     if replaced is None:
+        write_line(f"{display_name(path)}: not on disk")
         return ItemOutcome(FILE_NOT_FOUND, "Not on disk")
     logger.bind(**{JOB_LOG_SKIP: True}).info(
         "Source file {} is no longer on disk and a newer file took its place ({}); skipping without a retry. "
@@ -317,7 +359,9 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
     source = _read_source(path)
     if source is None:
         if os.path.normpath(path) in ctx.deleted_paths:
-            return ItemOutcome(SOURCE_GONE, "Skipped: import webhook confirmed this absent source was deleted")
+            deleted = "Skipped: import webhook confirmed this absent source was deleted"
+            write_line(f"{display_name(path)}: {deleted}")
+            return ItemOutcome(SOURCE_GONE, deleted)
         return _not_on_disk(path, ctx)
     servers = owners(path, ctx.registry, ctx.server_id)
     if not servers:
@@ -334,7 +378,10 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
             return None
         else:
             rows.append(_row(cfg, UP_TO_DATE))
-    return _settle(rows)
+    outcome = _settle(rows)
+    if outcome.outcome_key == SKIPPED:
+        write_line(f"{display_name(path)}: extras aren't analysed for loudness")
+    return outcome
 
 
 def _stream_progress_reporter(
@@ -447,8 +494,10 @@ def process_item(
                     break
                 if phase_callback:
                     phase_callback(f"Loudness {start + 1}-{start + len(group)}/{len(ordered)}")
+                # A remote worker measures on its node; the writes below stay here.
+                run_many = remote_ops.loudness_run_many if current_placement() else analyze.run_many
                 try:
-                    batch_fields = analyze.run_many(
+                    batch_fields = run_many(
                         ctx.ffmpeg,
                         path,
                         [(index, same[0].codec, same[0].duration_ms) for index, same in group],
@@ -496,7 +545,8 @@ def process_item(
                         errors.append(f"stream {index} ({same[0].codec}): {fields}")
                         continue
                     if fields is None:
-                        fields = analyze.run(
+                        run_one = remote_ops.loudness_run if current_placement() else analyze.run
+                        fields = run_one(
                             ctx.ffmpeg,
                             path,
                             index,
@@ -561,7 +611,7 @@ def process_item(
                 except PublishError as exc:
                     target = waiting if exc.state is Capability.UNREACHABLE else errors
                     target.append(f"marking item {item_id}: {exc}")
-        if not errors and not waiting and isinstance(db, GuardedLoudnessDb):
+        if not errors and not waiting and isinstance(db, GuardedLoudnessDb | RemoteLoudnessDb):
             try:
                 current, _ = read_streams(
                     db,
@@ -600,7 +650,8 @@ def _settle(rows: list[dict]) -> ItemOutcome:
     try again keeps it for the retry, else written beats up to date."""
     statuses = {r["status"] for r in rows}
     key = next(k for k in _PRECEDENCE if k in statuses)
-    message = "; ".join(r["message"] for r in rows if r["status"] == key and r["message"])
+    # Two servers saying the same thing ("Extras aren't analysed for loudness") say it once.
+    message = "; ".join(dict.fromkeys(r["message"] for r in rows if r["status"] == key and r["message"]))
     return ItemOutcome(key, message, publisher_rows=rows)
 
 

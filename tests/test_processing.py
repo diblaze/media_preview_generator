@@ -638,10 +638,11 @@ class TestMultiServerGuards:
         """Audit A3/A4 — when a webhook arrives in source view
         (``/data/Movies/X.mkv``), gets translated to a server-view
         canonical (``/data_disk/Movies/X.mkv``), and dispatch reports
-        a FAILED outcome, the unresolved_paths list must store the
+        a FAILED outcome, the failed_paths list must store the
         RAW webhook input (``/data/...``), not the translated
         canonical. Retry jobs key webhook_item_id_hints by the raw
         input; a mixed-namespace list silently drops hints on retry.
+        The file was found, so it isn't in unresolved_paths ("not found on any server").
         """
         config = _make_config(tmp_path, webhook_paths=["/data/Movies/X.mkv"])
 
@@ -679,17 +680,13 @@ class TestMultiServerGuards:
         # FAILED outcome must be reported against the RAW input
         # ``/data/Movies/X.mkv`` so retry hint keying still works.
         resolution = result.get("webhook_resolution") or {}
-        unresolved = resolution.get("unresolved_paths") or []
-        assert "/data/Movies/X.mkv" in unresolved, (
-            f"FAILED dispatch must surface the raw webhook input in unresolved_paths "
-            f"so retry hint keying matches; got {unresolved!r}. "
+        failed = resolution.get("failed_paths") or []
+        assert failed == ["/data/Movies/X.mkv"], (
+            f"FAILED dispatch must surface the raw webhook input in failed_paths "
+            f"so retry hint keying matches; got {failed!r}. "
             "Audit A3/A4: a mixed-namespace list silently breaks the retry flow."
         )
-        # And the canonical (translated) form must NOT be in the list
-        # — that's the namespace-mixing bug the audit flagged.
-        assert "/data_disk/Movies/X.mkv" not in unresolved, (
-            f"Server-view canonical leaked into unresolved_paths; namespace mixing. got {unresolved!r}"
-        )
+        assert resolution.get("unresolved_paths") == []
 
     def test_vendor_hint_dispatches_even_when_library_cache_stale(self, tmp_path):
         """Audit A2 — when a webhook arrives with a vendor item-id hint

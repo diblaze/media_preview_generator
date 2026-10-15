@@ -6,7 +6,6 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +13,7 @@ import pytest
 from media_preview_generator.jobs.dispatcher import JobDispatcher
 from media_preview_generator.jobs.worker import WorkerPool
 from media_preview_generator.loudness import job
+from media_preview_generator.markers.publishers.base import CapabilityReport
 from media_preview_generator.output.plex_hash import calculate_plex_hash
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
@@ -79,6 +79,130 @@ def test_check_sends_a_file_with_unanalysed_streams_to_a_worker(ctx, media):
     assert job.check_item(_item(media), ctx=ctx) is None
 
 
+@pytest.mark.parametrize(
+    "extra", ["Puffin Rock S01E34-trailer.mp4", "Trailers/Puffin Rock S01E34.mp4"], ids=["suffix", "folder"]
+)
+def test_a_trailer_or_other_extra_is_skipped_not_a_failed_music_file(ctx, db, media, extra):  # noqa: F811
+    # Lab: a movie's trailer, which Plex lists as an extra (metadata_type 12), failed the job as "music analysis is
+    # not supported"; markers skip the same files.
+    local = Path(media).parent / extra
+    local.parent.mkdir(exist_ok=True)
+    local.write_bytes(b"trailer")
+    conn = sqlite3.connect(db._path())
+    conn.execute("UPDATE metadata_items SET metadata_type = 12 WHERE id = 1")
+    conn.execute(
+        "UPDATE media_parts SET file = ?, hash = ?, size = ? WHERE id = 1",
+        (f"/data/kids/{extra}", calculate_plex_hash(str(local)), local.stat().st_size),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=ctx)
+
+    assert (outcome.outcome_key, outcome.message) == (job.SKIPPED, "Extras aren't analysed for loudness")
+    assert [(row["server_id"], row["status"]) for row in outcome.publisher_rows] == [("plex1", job.SKIPPED)]
+    # The job log names each file as it happens: a skipped extra wrote no line at all.
+    write_line.assert_called_once_with(f"{job.display_name(str(local))}: extras aren't analysed for loudness")
+    assert job.SKIPPED in job.OUTCOME_KEYS
+    # Neither a success nor a failure: a job of nothing else completes without an error or a warning.
+    assert job._completion({job.SKIPPED: 2}, []) == (0, None)
+
+
+def _plex_lists(db, local: Path, plex_path: str, metadata_type: int) -> None:  # noqa: F811
+    conn = sqlite3.connect(db._path())
+    conn.execute("UPDATE metadata_items SET metadata_type = ? WHERE id = 1", (metadata_type,))
+    conn.execute(
+        "UPDATE media_parts SET file = ?, hash = ?, size = ? WHERE id = 1",
+        (plex_path, calculate_plex_hash(str(local)), local.stat().st_size),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _flat_library(db, folder: str, local: Path) -> tuple[job.LoudnessContext, ServerConfig]:  # noqa: F811
+    cfg = ServerConfig(
+        id="plex1",
+        type=ServerType.PLEX,
+        name="Plex",
+        enabled=True,
+        url="http://plex",
+        auth={},
+        libraries=[Library(id="7", name="Home Videos", remote_paths=(f"/data/{folder}",), enabled=True, kind="movie")],
+        path_mappings=[{"remote_prefix": f"/data/{folder}", "local_prefix": str(local.parent)}],
+        loudness={"enabled": True, "library_ids": None},
+        markers={"plex": {"db_write_confirmed_at": "2026-09-29T00:00:00Z"}},
+    )
+    c = job.LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
+    c._dbs[cfg.id], c._ready[cfg.id] = db, ("", time.monotonic())
+    return c, cfg
+
+
+@pytest.mark.parametrize("folder", ["Other", "Shorts", "Trailers"])
+def test_a_movie_in_a_library_folder_named_like_an_extras_folder_is_analysed(db, tmp_path, folder):  # noqa: F811
+    """Lab (5.1.0 analysed these): a flat "Home Videos" library at /data/Other had every movie skipped as an extra,
+    from its folder's name alone, though Plex lists each as a movie."""
+    local = tmp_path / folder / "Birthday Party 2019.mp4"
+    local.parent.mkdir()
+    local.write_bytes(b"home video")
+    _plex_lists(db, local, f"/data/{folder}/Birthday Party 2019.mp4", 1)
+    c, cfg = _flat_library(db, folder, local)
+    with patch.object(job, "owners", return_value=[cfg]), patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert outcome is None  # its audio has no loudness yet: a worker analyses it
+    write_line.assert_not_called()
+
+
+def test_a_file_plex_lists_as_an_extra_is_skipped_whatever_its_path(db, tmp_path):  # noqa: F811
+    local = tmp_path / "Movies" / "Heat (1995) behind the camera.mp4"
+    local.parent.mkdir()
+    local.write_bytes(b"featurette")
+    _plex_lists(db, local, "/data/Movies/Heat (1995) behind the camera.mp4", 12)
+    c, cfg = _flat_library(db, "Movies", local)
+    with patch.object(job, "owners", return_value=[cfg]), patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert (outcome.outcome_key, outcome.message) == (job.SKIPPED, job.EXTRAS_NOT_ANALYSED)
+    write_line.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [("Heat (1995)-sample.mkv", job.SKIPPED), ("Heat (1995).mkv", job.NOT_IN_LIBRARY)],
+    ids=["extra-by-its-name", "feature"],
+)
+def test_a_file_plex_doesnt_list_is_judged_an_extra_by_its_path(db, tmp_path, name, key):  # noqa: F811
+    """Plex ignores samples and adds the rest later: only a file that looks like an extra isn't waited for."""
+    local = tmp_path / "Movies" / name
+    local.parent.mkdir()
+    local.write_bytes(b"x")
+    c, cfg = _flat_library(db, "Movies", local)
+    with (
+        patch.object(job, "owners", return_value=[cfg]),
+        patch.object(job, "write_line"),
+        patch.object(c, "request_plex_scan") as scan,
+    ):
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert outcome.outcome_key == key
+    assert scan.called is (key == job.NOT_IN_LIBRARY)
+
+
+def test_an_extras_refusal_from_a_plex_database_node_keeps_its_type():
+    from media_preview_generator.loudness.plex_db import PLEX_TYPE_EXTRA, NotAnalysedError
+    from media_preview_generator.markers.publishers import plex_remote
+
+    sent = NotAnalysedError("trailers and other extras aren't analysed", plex_type=PLEX_TYPE_EXTRA)
+    error = plex_remote.error_from_json(plex_remote.error_to_json(sent))
+    assert type(error) is NotAnalysedError and (error.plex_type, str(error)) == (PLEX_TYPE_EXTRA, str(sent))
+
+
+def test_every_outcome_a_job_records_is_in_the_references_table():
+    # A script keyed on docs/reference.md's "File outcomes" table needs a meaning for every value a job can record.
+    reference = Path(job.__file__).resolve().parents[2] / "docs" / "reference.md"
+    text = reference.read_text(encoding="utf-8")
+    table = text.split("loudness worker is free. File outcomes:", 1)[1].split("### Plex loudness Endpoints", 1)[0]
+    assert [key for key in job.OUTCOME_KEYS if f"| `{key}` |" not in table] == []
+
+
 def test_check_settles_a_missing_file_and_a_file_nobody_owns(ctx, tmp_path):
     assert job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx).outcome_key == job.FILE_NOT_FOUND
     with patch.object(job, "owners", return_value=[]):
@@ -120,9 +244,23 @@ def test_a_date_named_file_replaced_in_its_folder_is_skipped_not_retried(tmp_pat
 
 
 def test_a_missing_file_nothing_replaced_is_still_not_found(ctx, tmp_path):
-    with patch.object(job, "source_replaced_reason", return_value=None):
-        outcome = job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx)
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    with (
+        patch.object(job, "source_replaced_reason", return_value=None),
+        patch.object(job, "write_line") as write_line,
+    ):
+        outcome = job.check_item(_item(gone), ctx=ctx)
     assert outcome.outcome_key == job.FILE_NOT_FOUND
+    write_line.assert_called_once_with("Anna Pigeon S01E10: not on disk")
+
+
+def test_a_missing_file_an_import_webhook_deleted_gets_its_job_log_line(ctx, tmp_path):
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    ctx.deleted_paths = frozenset({gone})
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(gone), ctx=ctx)
+    assert outcome.outcome_key == job.SOURCE_GONE
+    write_line.assert_called_once_with(f"Anna Pigeon S01E10: {outcome.message}")
 
 
 def test_worker_analyses_each_stream_once_and_writes_it(ctx, db, media):  # noqa: F811
@@ -195,6 +333,22 @@ def test_an_unready_database_keeps_the_file_for_the_retry_without_analysing(ctx,
     assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING
 
 
+@pytest.mark.parametrize("capability_known", [False, True], ids=["first-request", "mid-job"])
+def test_a_plex_database_node_that_does_not_answer_keeps_the_file_waiting(media, capability_known):
+    """A node that is restarting or unplugged is a Plex this app can't reach now: retried, never a failed file."""
+    from .test_guard import _remote_loudness_db
+
+    cfg = _cfg(media)
+    c = job.LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
+    c._dbs[cfg.id] = _remote_loudness_db(capability_known=capability_known)
+    if capability_known:
+        c._ready[cfg.id] = ("", time.monotonic())
+    with patch.object(job, "owners", return_value=[cfg]):
+        outcome = job.check_item(_item(media), ctx=c)
+    assert outcome.outcome_key == job.WAITING, outcome
+    assert "Can't reach the Plex database node" in outcome.message and "Markers" not in outcome.message
+
+
 def test_a_busy_database_read_keeps_the_file_for_the_retry(ctx, media):
     with patch.object(job, "read_streams", side_effect=job.DatabaseBusyError("Plex's database is busy")):
         assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING
@@ -260,7 +414,7 @@ def test_an_unwritable_database_is_asked_again_later_a_writable_one_is_kept(medi
     answers = iter([job.Capability.UNREACHABLE, job.Capability.READY])
 
     def checks(self, *, deadline):
-        return SimpleNamespace(state=next(answers), message="Plex is restarting")
+        return CapabilityReport(next(answers), "Plex is restarting")
 
     with (
         patch.object(job, "create_loudness_db", return_value=job.LocalPlexDb(lambda: "unused")),
@@ -801,3 +955,91 @@ def test_worker_stops_after_a_retryable_write_error_without_analysing_the_next_g
     assert outcome.outcome_key == job.WAITING
     assert str(error) in outcome.message
     assert not job.read_streams(db, [FILE], deadline=1e12)[0][0].item_marked
+
+
+def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import protocol, remote_ops
+    from media_preview_generator.nodes.executor import Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append((op, app_path, params, kwargs["gpu"]))
+        return {"results": [{"index": index, "fields": FIELDS} for index, _codec, _ms in params["tracks"]]}
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with (
+        patch.object(job.analyze, "run_many") as run_many,
+        patch.object(job.analyze, "run") as run,
+        placed_on(Placement("n1", "NAS")),
+    ):
+        outcome = job.process_item(_item(media), ctx=ctx, gpu="intel")
+    run_many.assert_not_called()
+    run.assert_not_called()
+    assert calls == [
+        (
+            protocol.OP_LOUDNESS_ANALYZE,
+            media,
+            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True},
+            None,
+        )
+    ]
+    assert outcome.outcome_key == job.WRITTEN
+    assert all(json.loads(v)["ln:loudness"] == FIELDS["ln:loudness"] for v in _streams(db).values())
+
+
+def test_a_streams_own_error_in_a_node_batch_is_kept_as_locally(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append(params)
+        return {
+            "results": [{"index": 1, "fields": FIELDS}, {"index": 2, "error_type": "LoudnessError", "message": "x"}]
+        }
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with placed_on(Placement("n1", "NAS")):
+        outcome = job.process_item(_item(media), ctx=ctx)
+    # A single-track run would fail the same way, so stream 2 isn't run again.
+    assert [p["batch"] for p in calls] == [True]
+    assert outcome.outcome_key == job.FAILED and "stream 2 (aac): x" in outcome.message
+
+
+def test_a_failed_node_batch_is_retried_one_track_at_a_time_on_the_node(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import NodeTaskError, Placement, placed_on
+
+    calls = []
+
+    def run_on_node(op, app_path, params, **kwargs):
+        calls.append(params)
+        if params["batch"]:
+            raise NodeTaskError("failed", "reports can't be attributed", error_type="LoudnessError")
+        return {"fields": FIELDS}
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    with placed_on(Placement("n1", "NAS")):
+        outcome = job.process_item(_item(media), ctx=ctx)
+    assert [(p["batch"], p["tracks"]) for p in calls] == [
+        (True, [[1, "aac", 424000], [2, "aac", 424000]]),
+        (False, [[1, "aac", 424000]]),
+        (False, [[2, "aac", 424000]]),
+    ]
+    assert outcome.outcome_key == job.WRITTEN
+
+
+def test_a_node_drop_leaves_the_file_unwritten_for_the_worker_to_give_back(ctx, db, media, monkeypatch):  # noqa: F811
+    from media_preview_generator.nodes import remote_ops
+    from media_preview_generator.nodes.executor import NodeUnavailableError, Placement, placed_on
+
+    def run_on_node(op, app_path, params, **kwargs):
+        raise NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+
+    monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    before = _streams(db)
+    with placed_on(Placement("n1", "NAS")), pytest.raises(NodeUnavailableError):
+        job.process_item(_item(media), ctx=ctx)
+    assert _streams(db) == before

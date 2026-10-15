@@ -22,9 +22,13 @@ function loadNotifications() {
     fetch('/api/system/notifications')
         .then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
+            // Before setup is finished the API answers with the setup page (a redirect to HTML): nothing to show.
+            var type = r.headers.get('content-type') || '';
+            if (r.redirected || type.indexOf('application/json') === -1) return null;
             return r.json();
         })
         .then(function (data) {
+            if (data === null) return;
             var notifications = (data && data.notifications) || [];
             renderNotifications(notifications);
         })
@@ -124,7 +128,7 @@ function renderNotifications(notifications) {
         var action = notif.action;
         if (action && typeof action.href === 'string' && action.href.charAt(0) === '/' && action.href.charAt(1) !== '/') {
             var go = document.createElement('a');
-            go.className = 'btn btn-sm btn-outline-warning';
+            go.className = 'btn btn-sm btn-outline-warning text-nowrap';
             go.href = action.href;
             go.textContent = action.label || 'Open';
             actions.appendChild(go);

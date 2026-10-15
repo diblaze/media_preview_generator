@@ -17,7 +17,8 @@ CPU worker groups, alongside previews and Intro & Credits, and stores the measur
 the completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
-supported: Plex's music analysis includes album gain and fades that this video feature does not produce.
+supported: Plex's music analysis includes album gain and fades that this video feature does not produce. Trailers and
+other extras are skipped, because Plex doesn't take loudness for them.
 
 Loudness is off by default for each Plex server. When you enable it, all supported movie and TV libraries are selected
 by default; you can narrow that selection on the **Libraries** tab.
@@ -28,8 +29,10 @@ unlock the playback feature. See Plex's [Audio Track Enhancements for Video](htt
 
 ## Turning it on
 
-1. Run this app on the same machine as Plex and mount Plex's config folder locally. Plex must be running. Loudness
-   supports Plex **1.43.4.x or 1.43.5.x**. It does not work through the Plex helper or a network-mounted database.
+1. Run this app on the same machine as Plex and mount Plex's config folder locally, or run the
+   [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node) (version 1.2.0 or newer) beside a Plex on
+   another machine. Plex must be running. Loudness supports Plex **1.43.4.x or 1.43.5.x**. A network-mounted
+   database is refused.
 2. Under **Servers → Edit → Processing → Loudness**, switch on **Analyse loudness for this server**.
 3. On the **Libraries** tab, choose movie and TV libraries in the **Loudness** column. Both start on; music and other
    non-video libraries cannot be selected.
@@ -121,14 +124,21 @@ to the journal. Undo only replays confirmed writes: a crash or rollback cannot m
 If saving the confirmation fails, the database write remains and the app warns; keep the journal for recovery, because
 that unconfirmed record will not be replayed automatically.
 
-To restore the affected tracks and items, stop Plex and run, in the app's container:
+Through a Plex database node, the node keeps this record instead, in its own `/config` (the Windows node: in
+`%LOCALAPPDATA%\MediaPreviewGenerator\node`), because undo has to run beside the database file.
+
+To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
 ```
-docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \
+docker exec -it media-preview-generator python3 -m media_preview_generator.loudness.undo \
   --db "/path/to/com.plexapp.plugins.library.db" --log /config/loudness-writes.jsonl
 ```
 
 `--db` is Plex's database as the container sees it. Add `--dry-run` to count what would be restored first.
+
+On the Windows Plex database node there is no container: stop Plex and run
+`PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
+`--dry-run` first). It finds its own record, and Plex's database from that record.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are

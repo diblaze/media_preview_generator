@@ -19,6 +19,7 @@ Complete reference for all configuration options and REST API endpoints.
 - [Configuration Priority](#configuration-priority)
 - [Media Servers](#media-servers)
 - [Processing Options](#processing-options)
+- [Nodes](#nodes)
 - [Environment Variables](#environment-variables)
 - [Web Interface Settings](#web-interface-settings)
 - [Webhook Settings](#webhook-settings)
@@ -116,8 +117,8 @@ Per-vendor notes:
 Plex's `output.chapter_thumbnails` setting is a JSON boolean, default `false`.
 The API rejects strings such as `"false"` and numeric values. The **Chapter thumbnails** section in
 **Servers → Edit → Processing** controls it. It adds chapter images to existing Previews jobs and updates existing
-chapter image references in Plex's database. It requires a supported local Plex database or a compatible configured
-Plex helper; Intro & Credits can stay off. Currently supported: Plex Media Server **1.43.4.x or 1.43.5.x**.
+chapter image references in Plex's database. It requires a supported local Plex database, or a Plex database node beside
+a Plex on another machine; Intro & Credits can stay off. Currently supported: Plex Media Server **1.43.4.x or 1.43.5.x**.
 See the [chapter thumbnail guide](guides.md#plex-chapter-thumbnails) for setup and retry behavior.
 
 > **Runtime state, not persisted.** Whether Jellyfin's Media Preview Bridge plugin is installed
@@ -163,6 +164,7 @@ worker count and allowed jobs.
 | `device` | GPU device identifier for a GPU member. `null` for CPU. |
 | `count` | Integer 1–64. Remove the member to use zero. |
 | `job_types` | At least one of `previews`, `intro_credits`, `loudness`. GPU members cannot take `loudness`. |
+| `node` | The `id` of a [node](#nodes) to run this member's workers on that machine's CPU or GPU. Left out for this app's own devices. One member per device on each machine. |
 
 On a group with exactly one member, `GET` also echoes that member's `resource`, `device`, `count` and `job_types` at the
 group level (read-only, kept for older clients). `PUT` accepts a group without `members` that carries those four
@@ -171,7 +173,47 @@ is rejected with `400`.
 
 Up to 64 groups. An empty list is valid and means no workers. Overlapping windows in one group form a union;
 different groups and devices add their counts. A save is refused when the weekly peak would exceed 64 CPU or 64 GPU
-workers. These are worker slots, not CPU cores.
+workers on one machine (this app, or any one node). These are worker slots, not CPU cores.
+
+## Nodes
+
+Other machines that run work for this app, added on the **Nodes** page (see the
+[remote nodes guide](guides.md#remote-nodes)). A worker node runs the files sent to it; a Plex database node opens
+Plex's database for a Plex on another machine or on Windows. Stored in `settings.json["nodes"]`, a list of:
+
+| Field | Rules |
+|---|---|
+| `id` | Made by the app. Worker group members (`node`) and Plex servers (`markers.plex.agent.node_id`) use it. A record written into the file without one gets one when the app starts. |
+| `node_uid` | The id the machine reported last; recorded by the app, never posted. Each request to a Plex database node names it, so another machine answering at that address refuses the request and writes nothing. |
+| `name` | 1–80 characters, no line breaks, tabs or hidden characters. Unique: names that look the same (`Café`, `CAFÉ`) count as one. |
+| `url` | `http` or `https` address, e.g. `http://nuc.lan:9494`. A trailing `/` is dropped and the scheme and host are lower-cased. 400 for a query string, fragment, username or password, or a host name that can't be used. |
+| `key` | The node's key: its `NODE_KEY`, or the key it printed in its log on first start. Up to 200 printable ASCII characters, no spaces. Never returned or logged; posting `****` (or leaving it out) keeps the stored key. |
+| `enabled` | Boolean. A node turned off is never checked and gets no work. |
+| `path_mappings` | Up to 50 rows of `{"app_prefix", "node_prefix"}`: a folder as this app sees it (starts with `/`) and the same folder as the node sees it (a Windows path such as `D:\Media` is fine). |
+| `added_at` | When it was added. |
+
+`nodes_revision` goes up by one on every change. A node that a worker group member or a Plex server uses can't be
+removed (`409`, naming what uses it).
+
+### A node's own settings
+
+Environment variables of the node's container (the app's image started with `MODE=node`, or the
+[Plex database node](#plex-marker-agent) image). See the [remote nodes guide](guides.md#remote-nodes).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MODE` | | `node` starts the app's image as a node instead of the app. |
+| `NODE_NAME` | the hostname | The name the node reports; Add node suggests it. |
+| `NODE_ROLES` | `worker` | `worker`, `plex_db`, or both: `worker,plex_db`. |
+| `NODE_KEY` | made on first start | The key the app sends: 16 to 200 printable ASCII characters, no spaces. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
+| `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. `::` listens on IPv6 only. |
+| `NODE_PORT` | `9494` | The port the node listens on inside the container; change the published port (`-p`) to match. |
+| `NODE_TEMP_DIR` | `/tmp/mpg-node` | Where a worker node makes a folder for each file it is sent. Point it at a bigger or faster disk, or at a volume in a read-only container. |
+| `FILE__<NAME>` | | Sets `<NAME>` to the contents of the file it names (a Docker secret), e.g. `FILE__NODE_KEY=/run/secrets/node_key`. |
+| `PUID` / `PGID` | `1000` | The user the node runs as: one that can read your media and, for the Plex database role, owns Plex's database. The Plex database image reads them only through its compose file; with `docker run`, use `--user <uid>:<gid>`. |
+| `PLEX_CONFIG_DIR` | | Plex database role: Plex's config folder as the container sees it. The database path is derived from it; the app never sends a path. |
+| `CONFIG_DIR` | `/config` | The node's own folder: its id, its key and the loudness undo record. Mount it so they survive an update. |
+| `LOG_LEVEL` | `INFO` | How much the node logs; `DEBUG` for more. |
 
 ### Per-GPU tuning (gpu_config)
 
@@ -300,6 +342,7 @@ These are not migrated to settings.json and remain in effect:
 | `PLEX_DATA_ROOT` | `/` | Restricts where Plex config folders can be validated. Defaults to the whole filesystem; set it to e.g. `/plex` to refuse anything outside that root. |
 | `MEDIA_ROOT` | `/` | Same as `PLEX_DATA_ROOT` but for media paths (manual jobs, the inspector, the file picker). |
 | `RATELIMIT_STORAGE_URL` | `memory://` | Backend for rate-limit counters. The default in-memory store is fine for a single container. |
+| `REQUESTS_CA_BUNDLE` | Built-in list | A certificate file the app trusts for https instead of its built-in list, e.g. for a [node behind https](guides.md#a-node-behind-a-reverse-proxy) with your own certificate. Keep the public authorities in it: it applies to every https connection. |
 | `CONFIG_BACKUP_KEEP` | `10` | Snapshots kept per config file. Used only until you set it in **Settings → Backups**. 1–100. |
 | `CONFIG_BACKUP_MAX_AGE_DAYS` | `0` | Drop snapshots older than this many days (`0` = off). Used only until you set it in **Settings → Backups**. 0–365. |
 
@@ -460,7 +503,7 @@ is separate from the Previews column's `libraries[].enabled`.
   "plex": {
     "db_write_confirmed_at": null,
     "on_plex_redetect": "restore",
-    "agent": {"enabled": false, "url": "", "token": ""}
+    "agent": {"enabled": false, "node_id": null}
   }
 }
 ```
@@ -476,29 +519,29 @@ An Emby server's block has `"emby": {"on_emby_redetect": "restore"}` in place of
 | `emby.on_emby_redetect` | `"restore"` \| `"keep_emby"` | `"restore"` | Edit → Processing → Intro & Credits "When Emby has its own markers": `restore` is "Use ours", `keep_emby` is "Keep Emby's". Markers from Emby's own intro detection (Emby Premiere) or another plugin: `restore` has the Media Preview Bridge for Emby plugin replace them with ours (`ReplaceOwn`); `keep_emby` leaves a type Emby has markers of and shows ours only for the other types (row message e.g. "1 marker(s); keeping Emby's intro"). The plugin still stores ours for a kept type and shows them once Emby's are gone; the next job that checks the file records them as ours again (or writes them, when it finds none of Emby's left). Remembered per server item in `markers.db`. **A marker you adjust or lock in the Inspector overrides this setting for its type**: it is sent with `ReplaceOwn` anyway and the row says "Replaced Emby's own marker…". |
 | `plex.db_write_confirmed_at` | ISO-8601 timestamp \| `null` | `null` | Set once the one-time "Send intro & credits markers to Plex?" confirmation is accepted. Clearing it while `enabled` stays `true` in the same request is rejected (400) — send `enabled: false` in the same PUT to revoke. |
 | `plex.on_plex_redetect` | `"restore"` \| `"keep_plex"` | `"restore"` | Edit → Processing → Intro & Credits "When Plex has its own markers": `restore` is "Use ours", `keep_plex` is "Keep Plex's". What a job does when Plex shows markers of a decided type that aren't ours: `restore` writes ours over them; `keep_plex` keeps Plex's markers of that type on every later run (forced ones included) until the setting is switched to `restore` or Plex has none of that type left (row message e.g. "Keeping Plex's credits", or "1 marker(s); keeping Plex's credits"). Under `keep_plex`, "not ours" means not what the job would write and not what the item record says this app left there, so markers on an item with no record of that type (a first publish, a reset `markers.db`, a re-added server) are kept too. Decided per type, and remembered per server item in `markers.db`. Markers that are gone are written again either way. A type whose every Plex marker can't be right for the file (it starts or ends after the file does, or has no length) is never kept: the file is read for that type and ours are written. A type whose Plex markers were made for an earlier file at the path (no `pv:` record of them on the file Plex has now, and older than its `media_parts.updated_at`) doesn't stop the file being read and isn't a second opinion; ours replaces it when the file gives an answer (row message e.g. "Replaced Plex's intro: it was detected for an earlier file"), and it is kept when it gives none. **A marker you adjust or lock in the Inspector overrides this setting for its type**: its rows and `pv:` key are written over Plex's own and the row says "Replaced Plex's own marker…". |
-| `plex.agent` | object | `{"enabled": false, "url": "", "token": ""}` | Edit → Connection → Plex helper: a [Plex marker agent](#plex-marker-agent) beside a Plex on another machine, which does the database write there. Plex servers only. |
-| `plex.agent.enabled` | bool | `false` | `true` needs `url` and `token` set (400 otherwise: "Set the Plex marker agent's address and shared key before turning it on"). The database-write confirmation (`plex.db_write_confirmed_at`) still applies. |
-| `plex.agent.url` | string | `""` | `http` or `https` address, e.g. `http://plex-host.lan:9494`. A trailing `/` is dropped. 400 for a query string, fragment, or a username/password in it. |
-| `plex.agent.token` | string | `""` | The key both sides share (the agent's `AGENT_TOKEN`). Printable ASCII, no spaces. `GET`/`POST` return a set key as `****`; posting `****` (or leaving `token` out) keeps the stored key. Never logged. |
+| `plex.agent` | object | `{"enabled": false, "node_id": null}` | Edit → Connection → Plex database: which [Plex database node](#plex-marker-agent) opens this Plex's database, for a Plex on another machine or on Windows. Plex servers only. The node's address and key are on its record in [`nodes`](#nodes). |
+| `plex.agent.enabled` | bool | `false` | `false`: this app opens Plex's database itself. `true`: the node named by `node_id` does, for Intro & Credits, chapter thumbnails, loudness and Library Health counts. `true` needs `node_id` (400 otherwise: "Choose the node that opens this Plex server's database before turning it on"). The database-write confirmation (`plex.db_write_confirmed_at`) still applies. |
+| `plex.agent.node_id` | string \| `null` | `null` | The `id` of a node in `nodes`. A newly chosen node must still be on the Nodes page and, once it has answered, have its Plex database role on (400 otherwise). Kept while `enabled` is `false`. An older block holding `url` and `token` becomes a node when the app upgrades. |
 
-### Plex marker agent
+### Plex database node <a id="plex-marker-agent"></a>
 
-The small container for a Plex on another machine (`plex-marker-agent/`, image `ghcr.io/stevezau/plex-marker-agent`). Its
-setup, compose file, build steps, version rules and endpoint contract are in its
-[README](https://github.com/stevezau/media_preview_generator/blob/dev/plex-marker-agent/README.md); the app side is `media_preview_generator/markers/publishers/plex_remote.py`.
-The agent's own settings:
+The small container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`),
+added on the Nodes page and chosen per server in `plex.agent`. Its setup, compose file, build steps and version rules
+are in its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md); the app
+side is `media_preview_generator/markers/publishers/plex_remote.py`. Its settings are a node's own
+([A node's own settings](#a-nodes-own-settings)), plus:
 
 | Variable | Notes |
 |---|---|
-| `AGENT_TOKEN` | Required. The key both sides share (Bearer token); it is what the app's `plex.agent.token` must equal. Never logged. |
-| `PLEX_CONFIG_DIR` | Plex's config folder as the agent's container sees it. The database path is derived from it; the app never sends a path. |
-| `PLEX_CONFIG` | Compose only: Plex's config folder on the agent's host, mounted at `/plex`. Required. |
-| `AGENT_PORT` | Port to listen on. Default `9494`. |
+| `AGENT_TOKEN` | The key's name from the Plex marker agent; still works when `NODE_KEY` isn't set. |
+| `AGENT_PORT` | The port's name from the Plex marker agent; still works when `NODE_PORT` isn't set. |
+| `PLEX_CONFIG` | Compose only: Plex's config folder on the node's host, mounted at `/plex`. Required. |
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
-| `PUID` / `PGID` | The user that owns Plex's database. Default `1000`. |
 
-Every request carries `Authorization: Bearer <AGENT_TOKEN>` and `X-Marker-Agent-Protocol: 1`, and every answer carries
-the agent's version and the protocols it speaks; a mismatch in either direction is refused before anything is written.
+Every request carries the key and the protocol the app speaks, and every answer carries the node's version and the
+protocols it speaks; a mismatch in either direction is refused before anything is written. Once the app has recorded
+the node's id (`node_uid`), every request names it too (protocol 2): another machine given the same key and address
+refuses the request before anything is written, and the app checks the node again while that work waits.
 
 ### Job kind `intro_credits`
 
@@ -676,7 +719,7 @@ libraries only).
 **Response:** `200` with `server_id`, `server_type`, `enabled`, `settings` (as stored), `capability` (`{state,
 message, details, warning}`, checked as if Intro & Credits were already on — one of `ready`, `disabled`,
 `needs_confirmation`, `needs_plugin`, `plugin_outdated`, `needs_pass`, `needs_local_db`,
-`agent_unavailable` (the Plex marker agent didn't answer, refused the key, is the wrong version or is beside another Plex),
+`agent_unavailable` (the Plex database node didn't answer, refused the key, is the wrong version or is beside another Plex),
 `needs_plex_detection_once`, `unsupported_schema`, `unreachable`, `misconfigured`, or `unknown` when the check itself
 failed; `warning` is `""` unless a `ready` Plex couldn't confirm Plex Pass, in which case jobs wait instead of
 writing; on Emby, `needs_plugin` carries `details.catalog_listed`: `true` when Emby's plugin catalog lists the plugin,
@@ -901,14 +944,14 @@ or low"}`. `503` when the config directory isn't writable (checked before the bo
 
 ## Plex loudness
 
-Audio loudness analysis on this app's eligible CPU worker groups ([Plex loudness](plex-loudness-normalization.md)). Plex servers only; set up in **Servers → Edit → Processing → Loudness**;
+Audio loudness analysis on eligible CPU worker groups (this app's or its nodes') ([Plex loudness](plex-loudness-normalization.md)). Plex servers only; set up in **Servers → Edit → Processing → Loudness**;
 off until turned on per server.
 
 ### Per-server settings (`media_servers[].loudness`)
 
 | Key | Type | Notes |
 |---|---|---|
-| `enabled` | bool | Default `false`. Independent of Intro & Credits and its write confirmation. Requires a local Plex 1.43.4.x or 1.43.5.x database on the same machine; the Plex helper (`markers.plex.agent.enabled`) is unsupported. Setup Health checks readiness. |
+| `enabled` | bool | Default `false`. Independent of Intro & Credits and its write confirmation. Requires Plex 1.43.4.x or 1.43.5.x, with its database on this machine, or a Plex database node (`markers.plex.agent`, version 1.2.0 or newer) beside a Plex on another machine. Setup Health checks readiness. |
 | `library_ids` | array of strings \| `null` | Libraries it goes to. `null` = every movie and TV library. An explicit list selects video libraries only; known music and other non-video types are refused. |
 
 ### Job kind `loudness`
@@ -926,7 +969,9 @@ loudness worker is free. File outcomes:
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
 | `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
+| `loudness_skipped` | Plex lists the file as a trailer or other extra. Plex doesn't take loudness for extras. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
+| `skipped_source_gone` | The file isn't on disk because a newer file replaced it, or an import webhook said it was deleted. No retry. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |
 
 ### Plex loudness Endpoints
@@ -1322,7 +1367,7 @@ All endpoints use the normal session/API authentication and are also available d
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, current `capacity`, `warnings` and global pause state |
+| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, `nodes` (each added node's id, name, state and reason, with its GPUs and CPU cores, for the device picker; never its address or key), current `capacity`, `warnings` and global pause state |
 | PUT | `/api/worker-groups` | Replace the complete group list with `{"groups":[...],"revision":N}`. `400` rejects invalid configuration; `409` means another change advanced the revision. Reload and reconcile before resubmitting. |
 | POST | `/api/worker-groups/{id}/scale` | Atomic saved adjustment: exactly `{"delta":1}`, `{"delta":-1}` or `{"enabled":true/false}`. `delta` works on single-member groups; on a group with several members it returns `409` (use the member route). `404` for an unknown group, `400` for an invalid action or capacity limit. |
 | POST | `/api/worker-groups/{id}/members/{member_id}/scale` | Add or remove one worker on one device: exactly `{"delta":1}` or `{"delta":-1}`. `404` for an unknown group or member, `409` when the group is disabled, `400` outside 1–64 workers or past a capacity limit. |
@@ -1366,6 +1411,31 @@ the separate master hold.
 Persisted pending capacity waits and their saved checkpoints are restored independently of
 `auto_requeue_on_restart`. Pending dependency followers also retain their waiting state. This does not clear manual,
 schedule or global holds. Ordinary interrupted running jobs continue to follow the automatic crash-requeue setting.
+
+### Nodes Endpoints
+
+API token or session, like every other route. A `NODE_ROW` is a node's `id`, `name`, `url`, `enabled`, `state` and
+plain `reason`, `version`, `roles`, `legacy` (an older Plex database node that only answers `/v1/ping`), `platform`,
+`gpus`, `cpu`, `busy`, `last_seen`, `checking` (a check is running or queued), `path_mappings`, `used_by`
+(`{"groups": [...], "servers": [...]}`), `to_fix` (`{"must_fix": n, "recommended": n}`, its Setup Health counts) and
+`edit_tag`. It never holds the key.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/nodes` | Every node as a `NODE_ROW`, and this app's `app_version`. |
+| POST | `/api/nodes/probe` | `{"url", "key"}` (and `id` to reuse a saved node's key with `****`): what answers there. Nothing is saved. |
+| POST | `/api/nodes` | Add a node (the [`nodes`](#nodes) fields). `201` with its row; `400` for an invalid field; `409` when the machine answering there is already added. |
+| PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. With the row's `edit_tag`, `409` when the node was saved from somewhere else since that row was read. |
+| DELETE | `/api/nodes/{id}` | Remove it. `409` with `used_by` while a worker group member or a Plex server uses it. |
+| POST | `/api/nodes/check` | Check every turned-on node in the background; `202` at once. Each row's `checking` is `true` until its check ends. |
+| POST | `/api/nodes/{id}/check` | Check it in the background; `202` at once. Its row's `checking` is `true` until the check ends. |
+| POST | `/api/nodes/{id}/rescan-gpus` | Ask it to detect its GPUs again; answers with the fresh row. |
+| POST | `/api/nodes/{id}/test-access` | Sample every enabled library and ask the node to find each file, with its saved `path_mappings` or posted ones. |
+| GET | `/api/nodes/{id}/suggested-mappings` | Rows to pre-fill for a node with none saved: one per library folder, the same path on the node. |
+| GET | `/api/nodes/{id}/health` | Its Setup Health. |
+| GET | `/api/nodes/{id}/log` | Its last `lines` (1–2000, default 200) log lines, oldest first, as `{time, level, message}`. |
+
+An unknown `id` is `404`.
 
 ### Processing state (global pause)
 
@@ -2061,7 +2131,7 @@ unless noted.
 | POST | `/api/jobs/cancel-bulk` | Cancel several waiting, paused or running jobs. Body `{"job_ids": ["..."]}` (1 to 500 ids, otherwise `400`). Finished and unknown jobs are skipped. Returns `{"cancelled": [ids], "skipped": [{"id": "...", "reason": "not_found" \| "not_active (<status>)"}]}`. |
 | POST | `/api/jobs/clear` | Delete finished jobs. Optional body `{"statuses": ["completed", "failed", "cancelled"]}` (default: all three), or `{"job_ids": ["..."]}` to delete only those jobs (not both). With `job_ids`, only finished jobs are removed; others come back in `skipped`. Returns `{"success": true, "cleared": N}`; the `job_ids` form also returns `removed` (ids deleted, including finished retry rows of a cleared chain head) and `skipped` (`[{"id": "...", "reason": "not_found" \| "not_finished (<status>)" \| "retry_in_progress"}]`). |
 | GET | `/api/jobs/stats` | Counts of visible jobs: `total`, `pending`, `running`, `completed`, `failed`, `cancelled` (retry attempts are not counted separately) |
-| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
+| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`, and `node` (`{"id", "name"}`), `node_state` and `node_cause` (why an offline node is offline: `restarting`, `rate_limited`...) for a node's worker, `null` for this app's). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
 | POST | `/api/workers/add` · `/api/workers/remove` | Scaling by type: `{"worker_type":"CPU"\|"GPU","count":N,"group_id":"..."}`. Changes a saved group; omit `group_id` only when exactly one group matches the resource. Ambiguous selection returns `409`. Busy removed workers finish their current file. |
 | POST | `/api/jobs/{id}/workers/add` · `/api/jobs/{id}/workers/remove` | Aliases of the above for a running job; select the group as above. Changes the shared saved group, not a temporary allocation exclusive to that job. |
 
@@ -2080,7 +2150,7 @@ unless noted.
 | POST | `/api/settings/validate-plex-config-folder` | Pre-flight a Plex config folder (looks for `Cache/Media/Metadata`). Body `{"path": "..."}` |
 | POST | `/api/settings/validate-jellyfin-config-folder` | Pre-flight a Jellyfin config folder. Body `{"path": "..."}` |
 | GET | `/api/settings/backups` | List the backups of each config file (`settings.json`, `schedules.json`, `webhook_history.json`, `setup_state.json`) |
-| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. |
+| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. A backup that can't be read, or one a newer version saved, is refused with `409` and nothing changes. |
 | POST | `/api/setup/skip` | Skip the setup wizard (advanced — saves `setup_complete=true` with minimal state) |
 | POST | `/api/setup/validate-paths` | Pre-flight wizard path fields in bulk |
 | POST | `/api/setup/preview-file-path` | Resolve one real file against draft mappings and report container file/read-access status; does not save or start processing |

@@ -28,12 +28,12 @@ import glob
 import json
 import os
 import subprocess
-import tempfile
 import threading
 from dataclasses import dataclass
 
 from loguru import logger
 
+from ..utils import is_node_mode, scratch_dir
 from .ffmpeg_capabilities import _is_hwaccel_available, ffmpeg_binary
 
 _VULKAN_DEVICE_CACHE: str | None = None
@@ -51,9 +51,34 @@ DV5_NO_VULKAN_EFFECT = (
     "Dolby Vision Profile 5 thumbnails will have the wrong colours, a green and purple tint (no tone mapping); "
     "everything else (regular previews, HDR10, other Dolby Vision) is unaffected."
 )
-DV5_NO_VULKAN_FIX = (
-    "To fix: on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability) and restart; "
-    "on Intel/AMD, pass /dev/dri into the container so it can use a hardware Vulkan driver."
+
+
+def dv5_no_vulkan_fix() -> str:
+    """How to give this container a hardware Vulkan driver, without telling it to set what it already has.
+
+    With ``graphics`` (or ``all``) already asked for, ``--gpus all`` on a Docker that hands GPUs over through CDI
+    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it.
+    """
+    caps = os.environ.get("NVIDIA_DRIVER_CAPABILITIES", "").lower()
+    if caps == "all" or "graphics" in caps:
+        nvidia = (
+            "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
+            "with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out)"
+        )
+    else:
+        nvidia = "on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability)"
+    return (
+        f"To fix: {nvidia} and restart; on Intel/AMD, pass /dev/dri into the container so it can use a hardware "
+        "Vulkan driver."
+    )
+
+
+# A node has no dashboard and its diagnostic bundle isn't shown anywhere; its console has the loader's lines at DEBUG.
+_NODE_VULKAN_HELP = "If that doesn't help, file a GitHub issue with this node's docker logs taken at LOG_LEVEL=DEBUG."
+
+_DASHBOARD_VULKAN_HELP = (
+    "If that doesn't help, open Settings → Processing Options → GPU device tuning in the dashboard: it says why "
+    "each GPU can't use Vulkan and has a 'Copy diagnostic bundle' button ({size} bytes captured) for a GitHub issue."
 )
 
 # Candidate paths the Vulkan loader searches for the NVIDIA ICD JSON. The
@@ -480,8 +505,9 @@ def _probe_vulkan_device() -> str | None:
     #     {"file_format_version":"1.0.0",
     #      "ICD":{"library_path":"libEGL_nvidia.so.0"}}
     #
-    # We write that verbatim to ``{tempdir}/plex_previews_nvidia_egl_
-    # vendor.json`` and set ``__EGL_VENDOR_LIBRARY_FILENAMES`` at it.
+    # We write that verbatim to ``{scratch_dir()}/plex_previews_nvidia_egl_
+    # vendor.json`` (a node's NODE_TEMP_DIR: run read-only it may have no
+    # writable system temp) and set ``__EGL_VENDOR_LIBRARY_FILENAMES`` at it.
     # The library_path stays bare so the dynamic loader resolves it via
     # the standard search path (exactly what NVIDIA's own Dockerfile
     # does).  Gated on ``libEGL_nvidia.so*`` actually being present in
@@ -490,7 +516,7 @@ def _probe_vulkan_device() -> str | None:
     if nvidia_egl_vendor is None:
         libegl_nvidia = _find_libegl_nvidia()
         if libegl_nvidia:
-            synth_vendor_path = os.path.join(tempfile.gettempdir(), "plex_previews_nvidia_egl_vendor.json")
+            synth_vendor_path = os.path.join(scratch_dir(), "plex_previews_nvidia_egl_vendor.json")
             synth_payload = {
                 "file_format_version": "1.0.0",
                 "ICD": {"library_path": "libEGL_nvidia.so.0"},
@@ -563,13 +589,17 @@ def _probe_vulkan_device() -> str | None:
     # once per probe (first call to get_vulkan_device_info), and only
     # when everything else has already failed — i.e. the user DOES have
     # a real problem worth seeing in the main log.
+    if is_node_mode():
+        more_help = _NODE_VULKAN_HELP
+    else:
+        more_help = _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
+    tried = " even after trying NVIDIA-specific fixes" if nvidia_icd or nvidia_egl_vendor else ""
     logger.warning(
-        "Vulkan hardware setup couldn't be detected on this container, even after trying NVIDIA-specific fixes. "
-        "{} {} If that doesn't help, open Settings → System in the dashboard and click "
-        "'Copy Vulkan diagnostic bundle' ({} bytes captured), or include it when filing a GitHub issue.",
+        "Vulkan hardware setup couldn't be detected on this container{}. {} {} {}",
+        tried,
         DV5_NO_VULKAN_EFFECT,
-        DV5_NO_VULKAN_FIX,
-        len(_VULKAN_DEBUG_BUFFER),
+        dv5_no_vulkan_fix(),
+        more_help,
     )
     if _VULKAN_DEBUG_BUFFER:
         # Surface the last few informative lines to the main log at
@@ -603,16 +633,18 @@ def _run_first_vulkan_probe() -> None:
         logger.info(
             "Vulkan not available in this container. {} {}",
             DV5_NO_VULKAN_EFFECT,
-            DV5_NO_VULKAN_FIX,
+            dv5_no_vulkan_fix(),
         )
     elif _is_software_vulkan_device(probe_device):
+        more_help = (
+            _NODE_VULKAN_HELP if is_node_mode() else _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
+        )
         logger.warning(
-            "Vulkan picked a software rasterizer ({}) instead of your GPU. {} {} "
-            "Settings → System in the dashboard has GPU-specific steps and a diagnostic bundle "
-            "you can attach to a GitHub issue.",
+            "Vulkan picked a software rasterizer ({}) instead of your GPU. {} {} {}",
             probe_device,
             DV5_NO_VULKAN_EFFECT,
-            DV5_NO_VULKAN_FIX,
+            dv5_no_vulkan_fix(),
+            more_help,
         )
     else:
         via = ""

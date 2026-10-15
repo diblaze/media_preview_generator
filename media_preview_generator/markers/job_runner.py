@@ -1120,6 +1120,8 @@ def worker_cards(jm) -> Callable[[list], None]:
                     fallback_active=bool(w.get("fallback_active", False)),
                     fallback_reason=w.get("fallback_reason"),
                     fallback_title=w.get("fallback_title", "") or "",
+                    node=w.get("node"),
+                    node_state=w.get("node_state"),
                     fallback_until=w.get("fallback_until"),
                 ),
             )

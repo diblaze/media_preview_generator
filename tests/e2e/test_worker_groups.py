@@ -67,7 +67,15 @@ def group_api(authed_page: Page) -> dict:
                     "state": "busy",
                     "next_available_at": None,
                     "members": [
-                        {"id": "m-cpu", "resource": "cpu", "device": None, "desired": 2, "available": 0, "busy": 2}
+                        {
+                            "id": "m-cpu",
+                            "resource": "cpu",
+                            "device": None,
+                            "desired": 2,
+                            "target": 2,
+                            "available": 0,
+                            "busy": 2,
+                        }
                     ],
                 },
                 {
@@ -79,7 +87,15 @@ def group_api(authed_page: Page) -> dict:
                     "state": "available",
                     "next_available_at": None,
                     "members": [
-                        {"id": "m-gpu", "resource": "gpu", "device": "nvidia0", "desired": 2, "available": 1, "busy": 1}
+                        {
+                            "id": "m-gpu",
+                            "resource": "gpu",
+                            "device": "nvidia0",
+                            "desired": 2,
+                            "target": 2,
+                            "available": 1,
+                            "busy": 1,
+                        }
                     ],
                 },
             ]
@@ -465,6 +481,21 @@ def test_saving_window_union_and_add_duplicate_remove(authed_page: Page, app_url
     page.locator("#workerGroupApply").click()
     expect(page.locator("#workerGroupRows .worker-group-row")).to_have_count(2)
     assert len(group_api["writes"][-1][2]["groups"]) == 2
+
+
+def test_a_duplicated_group_has_its_own_member_ids_so_notes_stay_with_the_original(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    settings_page(authed_page, app_url)
+    page = authed_page
+    page.locator('[data-edit="cpu-night"]').click()
+    page.locator('[data-member="m-cpu"] [data-pick]').select_option("nvidia0")
+    expect(page.locator('[data-member="m-cpu"]')).to_contain_text("Loudness removed")
+
+    page.locator("#workerGroupDuplicate").click()
+
+    expect(page.locator('[data-member="m-cpu"]')).to_have_count(0)
+    expect(page.locator("#workerGroupEditor")).not_to_contain_text("Loudness removed")
 
 
 def test_api_failure_keeps_configuration_uneditable(authed_page: Page, app_url: str) -> None:
@@ -876,3 +907,97 @@ def test_editor_at_390px_has_no_horizontal_scroll_and_44px_targets(
             .map(([name]) => name)"""
     )
     assert small == []
+
+
+@pytest.mark.parametrize(
+    ("nodes", "expected"),
+    [
+        (None, "Scheduled now: CPU 0 · GPU 0. Weekly peak: CPU 0 · GPU 0."),
+        (
+            {"nodes_current": {"cpu": 1, "gpu": 1}, "nodes_peak": {"cpu": 1, "gpu": 2}},
+            "Scheduled now: CPU 0 · GPU 0 here, 1 GPU + 1 CPU on nodes. "
+            "Weekly peak: CPU 0 · GPU 0 here, 2 GPU + 1 CPU on nodes.",
+        ),
+    ],
+    ids=["no-node-members", "workers-on-nodes"],
+)
+def test_capacity_line_counts_node_workers_apart_from_this_apps(
+    authed_page: Page, app_url: str, group_api: dict, nodes: dict | None, expected: str
+) -> None:
+    group_api["state"]["capacity"].update(current={"cpu": 0, "gpu": 0}, peak={"cpu": 0, "gpu": 0}, **(nodes or {}))
+    settings_page(authed_page, app_url)
+    expect(authed_page.locator("#workerGroupCapacity")).to_contain_text(expected)
+
+
+def _with_nas_node(group_api: dict, gpu_status: str = "ok") -> None:
+    """A node "nas" with its CPU and its one GPU in the first group, next to this app's CPU."""
+    group_api["state"]["nodes"] = [
+        {
+            "id": "nas",
+            "name": "nas-node",
+            "state": "ready",
+            "reason": "",
+            "devices": [{"device": "cuda:0", "name": "Quadro P5000", "type": "NVIDIA", "status": gpu_status}],
+            "cpu_cores": 8,
+        }
+    ]
+    group_api["state"]["groups"][0]["members"] += [
+        {"id": "m-ncpu", "resource": "cpu", "device": None, "count": 1, "job_types": ["loudness"], "node": "nas"},
+        {"id": "m-ngpu", "resource": "gpu", "device": "cuda:0", "count": 1, "job_types": ["previews"], "node": "nas"},
+    ]
+
+
+def test_the_device_picker_leaves_out_a_plex_database_node(authed_page: Page, app_url: str, group_api: dict) -> None:
+    """The picker offered "plex-db · CPU" next to the worker nodes, and Add device could pick it."""
+    group_api["state"]["nodes"] = [
+        {
+            "id": "nas",
+            "name": "nas-node",
+            "state": "ready",
+            "reason": "",
+            "roles": ["worker"],
+            "devices": [],
+            "cpu_cores": 8,
+        },
+        {
+            "id": "pdb",
+            "name": "plex-db",
+            "state": "ready",
+            "reason": "",
+            "roles": ["plex_db"],
+            "devices": [],
+            "cpu_cores": 4,
+        },
+    ]
+    settings_page(authed_page, app_url)
+    page = authed_page
+    page.locator('[data-edit="cpu-night"]').click()
+    picker = page.locator('[data-member="m-cpu"] [data-pick]')
+    expect(picker.locator('option[value="node:nas:cpu"]')).to_have_count(1)
+    expect(picker.locator('option[value^="node:pdb:"]')).to_have_count(0)
+    expect(picker.locator("optgroup", has_text="plex-db")).to_have_count(0)
+    # This app's GPU, then the worker node's CPU; nothing is left after that.
+    page.locator("#workerGroupAddDevice").click()
+    page.locator("#workerGroupAddDevice").click()
+    expect(page.locator("#workerGroupMembers .mrow")).to_have_count(3)
+    expect(page.locator("#workerGroupAddDevice")).to_be_disabled()
+    picked = page.locator("#workerGroupMembers [data-pick]").evaluate_all("els => els.map(e => e.value)")
+    assert picked == ["cpu", "nvidia0", "node:nas:cpu"], picked
+
+
+def test_each_machines_cpu_and_gpu_get_their_own_colour(authed_page: Page, app_url: str, group_api: dict) -> None:
+    _with_nas_node(group_api)
+    _add_gpu_member(group_api)
+    settings_page(authed_page, app_url)
+    row = authed_page.locator('#workerGroupRows [data-group-id="cpu-night"]')
+    colours = row.locator(".mchip").evaluate_all("chips => chips.map(c => c.style.getPropertyValue('--c'))")
+    assert len(colours) == 4 and len(set(colours)) == 4, colours
+
+
+def test_a_node_gpu_that_failed_its_test_says_so_instead_of_not_found(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    _with_nas_node(group_api, gpu_status="failed")
+    settings_page(authed_page, app_url)
+    chip = authed_page.locator('#workerGroupRows [data-group-id="cpu-night"] .mchip', has_text="P5000")
+    expect(chip).to_have_attribute("title", re.compile("GPU failed its test on this node"))

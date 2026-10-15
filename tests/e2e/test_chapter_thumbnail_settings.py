@@ -42,7 +42,11 @@ def test_chapter_toggle_persists_without_enabling_markers_or_losing_helper_key(b
         saved = json.loads((Path(config_dir) / "settings.json").read_text())["media_servers"][0]
         assert saved["output"]["chapter_thumbnails"] is desired
         assert saved["markers"]["enabled"] is False
-        assert saved["markers"]["plex"]["agent"]["token"] == "chapter-ui-fixture-key-0123456789"
+        # Migration v24 moved the helper onto a node: the key lives on the node the server points at.
+        settings = json.loads((Path(config_dir) / "settings.json").read_text())
+        node_id = saved["markers"]["plex"]["agent"]["node_id"]
+        (node,) = [n for n in settings["nodes"] if n["id"] == node_id]
+        assert node["key"] == "chapter-ui-fixture-key-0123456789"
     page.reload()
     page.locator(".edit-server-btn[data-id='plex-edit-test']").click()
     page.locator("[data-bs-target='#edit-tab-processing']").click()

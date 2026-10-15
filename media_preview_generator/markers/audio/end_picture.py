@@ -88,17 +88,20 @@ class GpuAttemptFailedError(frames.FrameDecodeError):
 class ReadFailedError(Exception):
     """ffprobe or ffmpeg couldn't read one file for the check: an error, a non-zero exit or a timeout. Not proof that it
     has nothing to compare, so never a pass: the caller remembers the file for a while and reads it again later, unless
-    only the GPU's attempt failed (the worker's CPU rerun of the file must not be refused for it).
+    only the GPU's attempt failed (the worker's CPU rerun of the file must not be refused for it) or only the worker's
+    node can't see it (another worker may).
 
     Attributes:
         path: The file.
         gpu_attempt: Only the worker's GPU decode failed (:class:`GpuAttemptFailedError`); the CPU hasn't tried.
+        not_visible: The worker's node can't see the partner (``nodes.executor.FileNotVisibleError``).
     """
 
-    def __init__(self, path: str, message: str, *, gpu_attempt: bool = False) -> None:
+    def __init__(self, path: str, message: str, *, gpu_attempt: bool = False, not_visible: bool = False) -> None:
         super().__init__(message)
         self.path = path
         self.gpu_attempt = gpu_attempt
+        self.not_visible = not_visible
 
 
 def is_early(start_s: float) -> bool:
@@ -398,7 +401,7 @@ class Reader:
         own_shift = own_starts.audio_offset_s
         partner_shift = offset_s + partner_starts.audio_offset_s
         own = self._decoded(target, own_starts, times, own_shift)
-        theirs = self._decoded(partner, partner_starts, times, partner_shift)
+        theirs = self._decoded(partner, partner_starts, times, partner_shift, partner=True)
         return share_alike(times, own, own_shift, theirs, partner_shift)
 
     def _read_starts(self, path: str) -> StreamStarts:
@@ -417,34 +420,45 @@ class Reader:
                 raise self._fail(path, exc) from exc
         return self._starts[path]
 
-    def _decoded(self, path: str, starts: StreamStarts, times: Sequence[float], shift_s: float) -> Frames:
+    def _decoded(
+        self, path: str, starts: StreamStarts, times: Sequence[float], shift_s: float, *, partner: bool = False
+    ) -> Frames:
         if path in self._failed:
             raise self._failed[path]
         start_s, length_s = window(times, shift_s)
         key = (path, start_s, length_s)
         if key not in self._frames:
+            from ...nodes import remote_ops
+            from ...nodes.executor import FileNotVisibleError, current_placement, reading_other_file
+
+            decode = remote_ops.decode_frames if current_placement() else decode_frames
             try:
-                self._frames[key] = decode_frames(
-                    path,
-                    start_s,
-                    length_s,
-                    ffmpeg=self._ffmpeg,
-                    gpu=self._gpu,
-                    gpu_device_path=self._gpu_device_path,
-                    container_start_s=starts.container_s,
-                    cancel_check=self._cancel_check,
-                    download_format=frames.DOWNLOAD_FORMATS.get(starts.pix_fmt or ""),
-                    **self._worker,
-                )
+                with reading_other_file(partner):
+                    self._frames[key] = decode(
+                        path,
+                        start_s,
+                        length_s,
+                        ffmpeg=self._ffmpeg,
+                        gpu=self._gpu,
+                        gpu_device_path=self._gpu_device_path,
+                        container_start_s=starts.container_s,
+                        cancel_check=self._cancel_check,
+                        download_format=frames.DOWNLOAD_FORMATS.get(starts.pix_fmt or ""),
+                        **self._worker,
+                    )
             except frames.DecodeCancelledError as exc:
                 raise CheckUnavailableError("cancelled") from exc
             except frames.FrameDecodeError as exc:  # a timeout or a non-zero exit on the CPU included
                 raise self._fail(path, exc) from exc
+            except FileNotVisibleError as exc:
+                if not partner:
+                    raise  # the worker hands the episode back for a worker that can see it
+                raise self._fail(path, exc, not_visible=True) from exc
         return self._frames[key]
 
-    def _fail(self, path: str, exc: Exception) -> ReadFailedError:
+    def _fail(self, path: str, exc: Exception, *, not_visible: bool = False) -> ReadFailedError:
         gpu_attempt = isinstance(exc, GpuAttemptFailedError)
         where = " on the GPU" if gpu_attempt else ""
         logger.info("The end-picture check couldn't read {}{}: {}", os.path.basename(path), where, exc)
-        self._failed[path] = ReadFailedError(path, str(exc), gpu_attempt=gpu_attempt)
+        self._failed[path] = ReadFailedError(path, str(exc), gpu_attempt=gpu_attempt, not_visible=not_visible)
         return self._failed[path]

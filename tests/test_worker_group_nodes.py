@@ -1,0 +1,703 @@
+"""Worker group members that run on a remote node: schema, runtime slots, capacity, parking and status rows."""
+
+from __future__ import annotations
+
+import time
+from collections import deque
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
+from media_preview_generator.jobs import parking
+from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
+from media_preview_generator.jobs.group_runtime import capacity_wait_message, refresh_worker_groups
+from media_preview_generator.jobs.node_members import NODE_GPU_FFMPEG_THREADS, read_node_hardware, worker_node_id
+from media_preview_generator.jobs.worker import WorkerPool
+from media_preview_generator.nodes.executor import FileNotVisibleError, current_placement
+from media_preview_generator.nodes.registry import (
+    STATE_GPU_LOST,
+    STATE_OFFLINE,
+    STATE_READY,
+    NodeCapacity,
+    NodeRegistry,
+    NodeView,
+    set_registry,
+)
+from media_preview_generator.processing.types import ProcessableItem
+from media_preview_generator.web.settings_manager import reset_settings_manager
+from media_preview_generator.worker_groups import (
+    configured_group_totals,
+    configured_node_totals,
+    group_resource_key,
+    member_policies,
+    validate_worker_groups,
+)
+
+LOCAL_GPU = [("nvidia", "cuda:0", {"name": "Local RTX", "ffmpeg_threads": 3})]
+NODE_GPU = {"type": "nvidia", "device": "cuda:0", "name": "Quadro P5000", "status": "ok"}
+NODES = {"storage": "storage", "nuc": "nuc"}
+
+
+class FakeRegistry(NodeRegistry):
+    """In-memory registry: each node has a view and a capacity; ``revision`` bumps on every change."""
+
+    # A plain class attribute shadows NodeRegistry's read-only property so the fake can bump it directly.
+    revision = 0
+
+    def __init__(self) -> None:
+        self.revision = 0
+        self._views: dict[str, NodeView] = {}
+        self._capacity: dict[str, NodeCapacity] = {}
+        self.reads = 0
+        self.waiting: list[list[str]] = []
+
+    def put(
+        self,
+        node_id: str,
+        *,
+        state: str = STATE_READY,
+        gpus: tuple = (NODE_GPU,),
+        reason: str = "",
+        name=None,
+        roles: tuple = ("worker",),
+        cause: str = "",
+    ) -> None:
+        self._views[node_id] = NodeView(
+            id=node_id,
+            name=name or node_id,
+            url=f"http://{node_id}:9494",
+            enabled=True,
+            state=state,
+            reason=reason,
+            version="1",
+            roles=tuple(roles),
+            gpus=tuple(gpus),
+            cpu_cores=24,
+            legacy=False,
+            last_seen=None,
+            cause=cause,
+        )
+        ready = state == STATE_READY
+        self._capacity[node_id] = NodeCapacity(cpu=ready or state == STATE_GPU_LOST, gpu=ready, reason=reason)
+        self.revision += 1
+
+    def remove(self, node_id: str) -> None:
+        self._views.pop(node_id, None)
+        self._capacity.pop(node_id, None)
+        self.revision += 1
+
+    def views(self) -> list[NodeView]:
+        return list(self._views.values())
+
+    def view(self, node_id: str) -> NodeView | None:
+        self.reads += 1
+        return self._views.get(node_id)
+
+    def capacity(self, node_id: str) -> NodeCapacity:
+        return self._capacity.get(node_id, NodeCapacity(False, False, "node removed"))
+
+    def work_waiting(self, node_ids) -> None:
+        self.waiting.append(sorted(node_ids))
+
+
+@pytest.fixture
+def registry():
+    fake = FakeRegistry()
+    set_registry(fake)
+    yield fake
+    set_registry(None)
+
+
+def member(mid, resource="cpu", device=None, count=1, kinds=None, node=None):
+    raw = {
+        "id": mid,
+        "resource": resource,
+        "device": device,
+        "count": count,
+        "job_types": kinds or (["previews", "intro_credits"] if resource == "gpu" else ["previews", "loudness"]),
+    }
+    if node is not None:
+        raw["node"] = node
+    return raw
+
+
+def group(gid, *members, enabled=True):
+    return {
+        "id": gid,
+        "name": gid,
+        "enabled": enabled,
+        "availability": {"mode": "always", "windows": []},
+        "members": list(members),
+    }
+
+
+class TestSchema:
+    def test_node_field_is_kept_for_node_members_and_absent_for_local_ones(self):
+        clean = validate_worker_groups(
+            [group("g", member("a"), member("b", "gpu", "cuda:0", node="storage"))], nodes=NODES
+        )
+        local, remote = clean[0]["members"]
+        assert "node" not in local
+        assert remote["node"] == "storage"
+
+    def test_empty_node_means_this_app(self):
+        clean = validate_worker_groups([group("g", member("a", node=""))], nodes=NODES)
+        assert "node" not in clean[0]["members"][0]
+
+    def test_unknown_node_is_refused_with_a_plain_message_when_saving(self):
+        with pytest.raises(ValueError, match="node gone is not added. Add it under Nodes"):
+            validate_worker_groups([group("g", member("a", node="gone"))], nodes=NODES)
+
+    def test_unknown_node_is_kept_when_reading_saved_settings(self):
+        clean = validate_worker_groups([group("g", member("a", node="gone"))])
+        assert clean[0]["members"][0]["node"] == "gone"
+
+    @pytest.mark.parametrize("bad", [5, " storage", "x" * 129])
+    def test_malformed_node_is_refused(self, bad):
+        with pytest.raises(ValueError, match="choose a node"):
+            validate_worker_groups([group("g", member("a", node=bad))])
+
+    def test_node_gpu_member_needs_a_device(self):
+        with pytest.raises(ValueError, match="choose a GPU device"):
+            validate_worker_groups([group("g", member("a", "gpu", None, node="storage"))], nodes=NODES)
+
+    def test_loudness_on_a_node_gpu_is_refused_and_on_a_node_cpu_is_allowed(self):
+        with pytest.raises(ValueError, match=r"storage · cuda:0\): Plex loudness requires CPU"):
+            validate_worker_groups(
+                [group("g", member("a", "gpu", "cuda:0", kinds=["loudness"], node="storage"))], nodes=NODES
+            )
+        clean = validate_worker_groups([group("g", member("a", kinds=["loudness"], node="storage"))], nodes=NODES)
+        assert clean[0]["members"][0]["job_types"] == ["loudness"]
+
+    def test_duplicates_are_keyed_per_node(self):
+        same_device_everywhere = group(
+            "g",
+            member("local-cpu"),
+            member("local-gpu", "gpu", "cuda:0"),
+            member("storage-cpu", node="storage"),
+            member("storage-gpu", "gpu", "cuda:0", node="storage"),
+            member("nuc-cpu", node="nuc"),
+        )
+        assert len(validate_worker_groups([same_device_everywhere], nodes=NODES)[0]["members"]) == 5
+        with pytest.raises(ValueError, match="storage · cuda:0 appears twice"):
+            validate_worker_groups(
+                [
+                    group(
+                        "g", member("a", "gpu", "cuda:0", node="storage"), member("b", "gpu", "cuda:0", node="storage")
+                    )
+                ],
+                nodes=NODES,
+            )
+        with pytest.raises(ValueError, match="storage · CPU appears twice"):
+            validate_worker_groups(
+                [group("g", member("a", node="storage"), member("b", node="storage"))],
+                nodes=NODES,
+            )
+
+    def test_node_workers_have_their_own_peak_cap_not_the_apps(self):
+        groups = [
+            group("local", member("a", count=64)),
+            group("storage", member("a", count=64, node="storage")),
+            group("nuc", member("a", count=64, node="nuc")),
+        ]
+        clean = validate_worker_groups(groups, nodes=NODES)
+        assert configured_group_totals(clean) == (0, 64)
+        assert configured_node_totals(clean) == {"storage": (0, 64), "nuc": (0, 64)}
+        groups.append(group("more", member("a", count=1, node="storage")))
+        with pytest.raises(ValueError, match="exceed capacity on node storage: peak CPU 65/64"):
+            validate_worker_groups(groups, nodes=NODES)
+
+    def test_member_policies_copy_node_and_resource_keys_never_collide(self):
+        policies = member_policies(
+            [
+                group(
+                    "g",
+                    member("a"),
+                    member("b", "gpu", "cuda:0"),
+                    member("c", node="storage"),
+                    member("d", "gpu", "cuda:0", node="storage"),
+                    member("e", node="nuc"),
+                )
+            ]
+        )
+        assert [p["node"] for p in policies] == [None, None, "storage", "storage", "nuc"]
+        assert [group_resource_key(p) for p in policies] == [
+            "cpu",
+            "gpu:cuda:0",
+            "node:storage:cpu",
+            "node:storage:gpu:cuda:0",
+            "node:nuc:cpu",
+        ]
+
+
+def node_groups(*, gpu_count=2, cpu_count=1, node="storage"):
+    return [
+        group(
+            "night",
+            member("ngpu", "gpu", "cuda:0", count=gpu_count, node=node),
+            member("ncpu", count=cpu_count, kinds=["previews", "loudness"], node=node),
+            member("lgpu", "gpu", "cuda:0", count=1),
+        )
+    ]
+
+
+def by_member(pool):
+    rows: dict[str, list] = {}
+    for worker in pool.workers:
+        rows.setdefault(worker.member_id, []).append(worker)
+    return rows
+
+
+class TestReconcile:
+    def test_ready_node_gets_workers_with_its_own_gpu_and_resource_keys(self, registry):
+        registry.put("storage", name="Storage box")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        rows = by_member(pool)
+        assert len(rows["ngpu"]) == 2 and len(rows["ncpu"]) == 1 and len(rows["lgpu"]) == 1
+        gpu_worker = rows["ngpu"][0]
+        assert (gpu_worker.worker_type, gpu_worker.gpu, gpu_worker.gpu_device, gpu_worker.gpu_name) == (
+            "GPU",
+            "nvidia",
+            "cuda:0",
+            "Quadro P5000",
+        )
+        assert (gpu_worker.node_id, gpu_worker.node_name) == ("storage", "Storage box")
+        assert gpu_worker.ffmpeg_threads == NODE_GPU_FFMPEG_THREADS
+        assert gpu_worker.group_resource == "node:storage:gpu:cuda:0"
+        assert rows["ncpu"][0].group_resource == "node:storage:cpu"
+        assert (rows["ncpu"][0].worker_type, rows["ncpu"][0].node_id) == ("CPU", "storage")
+        local = rows["lgpu"][0]
+        assert (worker_node_id(local), local.group_resource, local.ffmpeg_threads) == (None, "gpu:cuda:0", 3)
+        assert pool._resource_targets == {"node:storage:gpu:cuda:0": 2, "node:storage:cpu": 1, "gpu:cuda:0": 1}
+
+    def test_job_log_names_a_node_worker_by_its_node_and_device_and_a_local_one_by_number(self, registry):
+        registry.put("storage", name="Storage box")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        rows = by_member(pool)
+        gpu_group = rows["ngpu"][0].group_name
+        assert {w.display_name for w in rows["ngpu"]} == {f"{gpu_group} · Storage box/GPU{rows['ngpu'][0].gpu_index}"}
+        assert rows["ncpu"][0].display_name == f"{rows['ncpu'][0].group_name} · Storage box/CPU"
+        local = rows["lgpu"][0]
+        assert local.display_name == f"{local.group_name} · {local.worker_id + 1}"
+
+    def test_node_gpu_with_the_same_device_string_does_not_share_the_local_budget(self, registry):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(gpu_count=1), LOCAL_GPU)
+        local = pool._find_available_worker(kind="previews", claim=True)
+        remote = pool._find_available_worker(kind="previews", claim=True)
+        assert {local.group_resource, remote.group_resource} == {"gpu:cuda:0", "node:storage:gpu:cuda:0"}
+
+    def test_offline_node_gives_zero_workers_with_its_reason(self, registry):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        assert set(by_member(pool)) == {"lgpu"}
+        rows = {row["member_id"]: row for row in pool.member_snapshots()}
+        assert (rows["ngpu"]["state"], rows["ngpu"]["reason"], rows["ngpu"]["target"]) == (
+            "node_unavailable",
+            "node offline",
+            0,
+        )
+        assert (rows["ncpu"]["state"], rows["ncpu"]["reason"]) == ("node_unavailable", "node offline")
+        assert rows["ngpu"]["node_name"] == "storage"
+        assert (rows["lgpu"]["state"], rows["lgpu"]["reason"], rows["lgpu"]["node_name"]) == ("active", "", None)
+
+    def test_gpu_lost_keeps_only_the_nodes_cpu_members(self, registry):
+        registry.put("storage", state=STATE_GPU_LOST, reason="GPU lost")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        assert set(by_member(pool)) == {"ncpu", "lgpu"}
+        rows = {row["member_id"]: row for row in pool.member_snapshots()}
+        assert (rows["ngpu"]["state"], rows["ngpu"]["reason"]) == ("node_unavailable", "GPU lost")
+        assert rows["ncpu"]["state"] == "active"
+
+    def test_node_gpu_missing_from_the_nodes_list_gets_zero(self, registry):
+        registry.put("storage", gpus=({**NODE_GPU, "device": "cuda:1"},))
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(node_groups(), [])
+        rows = {row["member_id"]: row for row in pool.member_snapshots()}
+        assert (rows["ngpu"]["state"], rows["ngpu"]["reason"]) == ("node_unavailable", "GPU not found on this node")
+        assert rows["lgpu"]["state"] == "hardware_unavailable"
+
+    def test_failed_node_gpu_gets_zero(self, registry):
+        registry.put("storage", gpus=({**NODE_GPU, "status": "failed"},))
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(node_groups(), [])
+        assert "ngpu" not in by_member(pool)
+
+    def test_removed_node_reads_as_node_removed(self, registry):
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(node_groups(), [])
+        rows = {row["member_id"]: row for row in pool.member_snapshots()}
+        assert (rows["ncpu"]["state"], rows["ncpu"]["reason"]) == ("node_unavailable", "node removed")
+
+    def test_node_going_offline_retires_idle_slots_and_finishes_busy_ones(self, registry):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        groups = [group("g", member("ncpu", count=2, node="storage"))]
+        pool.reconcile_groups(groups, [])
+        busy, idle = pool.workers
+        busy.is_busy = True
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool.reconcile_groups(groups, [])
+        assert pool.workers == [busy] and busy._pending_removal
+        registry.put("storage")
+        pool.reconcile_groups(groups, [])
+        assert busy in pool.workers and not busy._pending_removal and len(pool.workers) == 2
+
+    def test_registry_failure_on_one_node_leaves_local_workers_running(self, registry, monkeypatch):
+        def broken(node_id):
+            raise RuntimeError("registry down")
+
+        monkeypatch.setattr(registry, "capacity", broken)
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        assert set(by_member(pool)) == {"lgpu"}
+        rows = {row["member_id"]: row for row in pool.member_snapshots()}
+        assert rows["ncpu"]["reason"] == "node status unavailable"
+
+    def test_local_only_groups_never_read_the_registry(self, registry):
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups([group("g", member("a"), member("b", "gpu", "cuda:0"))], LOCAL_GPU)
+        assert registry.reads == 0
+        assert read_node_hardware(member_policies([group("g", member("a"))])).revision is None
+
+
+class TestRevisionRefresh:
+    @pytest.fixture
+    def saved(self, monkeypatch):
+        state = {"groups": node_groups(), "revision": 1}
+        monkeypatch.setattr(
+            "media_preview_generator.jobs.group_runtime.current_group_policy",
+            lambda config=None: (state["groups"], state["revision"]),
+        )
+        return state
+
+    def test_registry_revision_bump_reconciles_inside_the_one_second_throttle(self, registry, saved):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        assert refresh_worker_groups(pool, force=True)
+        assert {"ngpu", "ncpu"} <= set(by_member(pool))
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        assert refresh_worker_groups(pool)
+        assert not ({"ngpu", "ncpu"} & set(by_member(pool)))
+
+    def test_unchanged_revision_stays_throttled(self, registry, saved, monkeypatch):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        refresh_worker_groups(pool, force=True)
+        calls = []
+        monkeypatch.setattr(pool, "reconcile_groups", lambda *a, **k: calls.append(1))
+        refresh_worker_groups(pool)
+        assert calls == []
+
+    def test_revision_bump_is_ignored_when_no_member_uses_a_node(self, registry, saved, monkeypatch):
+        saved["groups"] = [group("g", member("a"))]
+        pool = WorkerPool(0, 0, [])
+        refresh_worker_groups(pool, force=True)
+        calls = []
+        monkeypatch.setattr(pool, "reconcile_groups", lambda *a, **k: calls.append(1))
+        registry.put("storage")
+        refresh_worker_groups(pool)
+        assert calls == []
+
+    def test_no_member_on_a_node_never_creates_or_reads_the_registry(self, saved):
+        # Every dispatch pass refreshes: with no node configured it must not build the registry (whose revision
+        # syncs from settings under the settings lock) or read it, as before nodes existed.
+        from media_preview_generator.nodes import registry as registry_mod
+
+        set_registry(None)
+        saved["groups"] = [group("g", member("a"))]
+        pool = WorkerPool(0, 0, [])
+        refresh_worker_groups(pool, force=True)
+        for _ in range(5):
+            refresh_worker_groups(pool)
+        assert registry_mod._registry is None
+
+
+class TestCapacityAndParking:
+    def test_all_capacity_on_an_offline_node_reads_node_unavailable(self, registry):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("ncpu", count=3, node="storage"))], [])
+        capacity = pool.capacity_for("previews")
+        assert (capacity["configured"], capacity["open"], capacity["reason"]) == (3, 0, "node_unavailable")
+        assert capacity["detail"] == "storage: node offline"
+        assert capacity_wait_message(capacity) == "Waiting for a node — storage: node offline"
+
+    def test_a_job_waiting_only_for_nodes_asks_for_them_to_be_checked_soon(self, registry):
+        """Its back-off kept a node that was back reading offline for minutes while the job waited."""
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("a", node="storage"), member("b", node="nuc"))], [])
+
+        assert pool.capacity_for("previews")["reason"] == "node_unavailable"
+
+        assert registry.waiting == [["nuc", "storage"]]
+
+    @pytest.mark.parametrize(
+        ("opening", "until"),
+        [
+            ("2026-10-16T03:00:00+11:00", "03:00"),
+            ("2026-10-15T16:00:00+00:00", "03:00"),  # shown in the app's time zone, whatever zone it came in
+            ("2026-10-18T03:00:00+11:00", "Sun 03:00"),
+            ("2026-11-02T03:00:00+11:00", "2026-11-02 03:00"),
+            ("soon", "soon"),
+        ],
+        ids=["within-a-day", "another-zone", "within-a-week", "further", "unreadable"],
+    )
+    def test_the_off_hours_wait_says_when_in_the_apps_time_zone(self, monkeypatch, opening, until):
+        # The job's wait read "until 2026-10-16T03:00:00+11:00".
+        from media_preview_generator import worker_groups
+
+        monkeypatch.setenv("TZ", "Australia/Sydney")
+        now = datetime.fromisoformat("2026-10-15T22:00:00+11:00")
+        monkeypatch.setattr(worker_groups, "local_now", lambda now_=None: now)
+
+        message = capacity_wait_message({"reason": "off_hours", "next_opening": opening})
+
+        assert message == f"Waiting for worker availability until {until}"
+
+    def test_mixed_local_and_offline_node_keeps_the_hardware_reason(self, registry):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(node_groups(), [])
+        capacity = pool.capacity_for("previews")
+        assert (capacity["open"], capacity["reason"], capacity["detail"]) == (0, "hardware", "")
+        assert registry.waiting == []
+
+    def test_ready_node_capacity_is_open(self, registry):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("ncpu", count=3, node="storage"))], [])
+        capacity = pool.capacity_for("loudness")
+        assert (capacity["open"], capacity["available"], capacity["reason"]) == (3, 3, "ready")
+
+    def test_job_parks_when_its_only_capacity_is_on_an_offline_node(self, registry, monkeypatch):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("ncpu", count=2, node="storage"))], [])
+        monkeypatch.setattr(parking, "refresh_worker_groups", lambda pool: True)
+        dispatcher = MagicMock()
+        dispatcher.worker_pool = pool
+        dispatcher.park_snapshot.return_value = None
+        parking.park_if_unavailable(dispatcher, MagicMock(park_requested=False), MagicMock(), "job-1", "previews", dict)
+        dispatcher.request_park.assert_called_once_with("job-1")
+
+    def test_job_keeps_running_when_the_node_is_ready(self, registry, monkeypatch):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("ncpu", count=2, node="storage"))], [])
+        monkeypatch.setattr(parking, "refresh_worker_groups", lambda pool: True)
+        dispatcher = MagicMock()
+        dispatcher.worker_pool = pool
+        parking.park_if_unavailable(dispatcher, MagicMock(park_requested=False), MagicMock(), "job-1", "previews", dict)
+        dispatcher.request_park.assert_not_called()
+
+
+def _two_node_groups(*, nuc_availability: dict | None = None) -> list[dict]:
+    """Intro & Credits on one CPU of storage and one of nuc, each in its own group."""
+    nuc = group("night", member("b", node="nuc", kinds=["intro_credits"]))
+    if nuc_availability is not None:
+        nuc["availability"] = nuc_availability
+    return [group("day", member("a", node="storage", kinds=["intro_credits"])), nuc]
+
+
+def _hours_from_now(start: int, end: int) -> dict:
+    """A schedule open only from ``start`` to ``end`` hours from now, so it is closed now."""
+    now = datetime.now()
+    return {
+        "mode": "scheduled",
+        "windows": [
+            {
+                "days": [now.weekday()],
+                "start": (now + timedelta(hours=start)).strftime("%H:%M"),
+                "end": (now + timedelta(hours=end)).strftime("%H:%M"),
+            }
+        ],
+    }
+
+
+class TestWaitingForAnAwayNode:
+    """A file only an away node can see: the kind still has open capacity elsewhere, so the job never parks."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_settings_manager()
+        reset_dispatcher()
+        yield
+        reset_settings_manager()
+        reset_dispatcher()
+
+    @staticmethod
+    def _tracker(*excluded: dict[str, str] | None) -> JobTracker:
+        """A job whose queued files are left out on ``excluded`` (one per file; None for none)."""
+        tracker = JobTracker(job_id="j", items=[], config=MagicMock(), registry=MagicMock(), kind="intro_credits")
+        items = [
+            ProcessableItem(canonical_path=f"/m/{i}.mkv", server_id="s1", title=str(i)) for i in range(len(excluded))
+        ]
+        tracker.item_queue = deque(items)
+        tracker.excluded_nodes = {
+            item.canonical_path: nodes for item, nodes in zip(items, excluded, strict=True) if nodes
+        }
+        return tracker
+
+    def test_the_banner_names_the_offline_node_the_job_waits_for_then_runs_the_file_there(self, registry):
+        registry.put("storage")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        groups = _two_node_groups()
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(groups, [])
+        seen: list[str] = []
+
+        def process(item, **_kwargs):
+            node = current_placement().node_id
+            seen.append(node)
+            if node == "storage":
+                raise FileNotVisibleError(node, "storage", "missing", f"{item.canonical_path} isn't there")
+            return ItemOutcome("markers_published", "ok")
+
+        messages: list[str] = []
+        handlers = KindHandlers(
+            check_fn=lambda item, *, cancel_check: None, process_fn=process, outcome_keys=("markers_published",)
+        )
+        config = MagicMock(scan_workers=1, regenerate_thumbnails=False, server_id_filter=None, worker_groups=groups)
+        dispatcher = JobDispatcher(pool)
+        try:
+            with (
+                patch("media_preview_generator.processing.generator._notify_file_result"),
+                patch("media_preview_generator.jobs.worker._notify_file_result"),
+                patch("media_preview_generator.web.jobs.get_job_manager"),
+            ):
+                tracker = dispatcher.submit_items(
+                    "j1",
+                    [ProcessableItem(canonical_path="/m/sintel.mp4", server_id="s1", title="Sintel")],
+                    config,
+                    MagicMock(),
+                    kind="intro_credits",
+                    handlers=handlers,
+                    callbacks={"progress_callback": lambda _done, _total, message, **_k: messages.append(message)},
+                )
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and "Waiting for a node — nuc: node offline" not in messages:
+                    time.sleep(0.05)
+                assert messages[-1] == "Waiting for a node — nuc: node offline", messages
+                assert seen == ["storage"] and not pool.has_busy_workers()
+
+                registry.put("nuc")
+                pool.reconcile_groups(groups, [])
+                assert tracker.wait(timeout=10)
+        finally:
+            dispatcher.shutdown()
+        assert seen == ["storage", "nuc"] and tracker.successful == 1
+        assert messages[-1] == "1/1 completed"
+
+    def test_an_off_hours_member_is_waited_for_until_it_opens(self, registry):
+        registry.put("storage")
+        registry.put("nuc")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(_two_node_groups(nuc_availability=_hours_from_now(2, 3)), [])
+
+        wait = JobDispatcher(pool)._node_wait(self._tracker({"storage": "storage"}))
+
+        assert wait.startswith("Waiting for worker availability until "), wait
+
+    def test_no_wait_is_shown_while_any_file_or_worker_can_still_go(self, registry):
+        registry.put("storage")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(_two_node_groups(), [])
+        dispatcher = JobDispatcher(pool)
+        assert dispatcher._node_wait(self._tracker({"storage": "storage"})) != ""
+
+        # A file left out on nuc can run on storage, which is open (busy or not, it's an ordinary wait).
+        assert dispatcher._node_wait(self._tracker({"nuc": "nuc"})) == ""
+        # A file no node has left out can run on any worker.
+        assert dispatcher._node_wait(self._tracker({"storage": "storage"}, None)) == ""
+        # A file of the job is running.
+        running = self._tracker({"storage": "storage"})
+        running.active_processing = 1
+        assert dispatcher._node_wait(running) == ""
+
+
+class TestWorkerStatuses:
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_dispatcher()
+        yield
+        reset_dispatcher()
+
+    def test_node_workers_are_named_after_their_node_and_carry_a_node_field(self, registry):
+        registry.put("storage", name="Storage box")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        statuses = {(s["member_id"], s["worker_name"]): s for s in JobDispatcher(pool)._build_worker_statuses()}
+        names = sorted(name for _, name in statuses)
+        assert names == [
+            "GPU Worker 1 (Local RTX)",
+            "Storage box · CPU Worker 1",
+            "Storage box · GPU Worker 1 (Quadro P5000)",
+            "Storage box · GPU Worker 2 (Quadro P5000)",
+        ]
+        remote = statuses[("ngpu", "Storage box · GPU Worker 1 (Quadro P5000)")]
+        assert remote["node"] == {"id": "storage", "name": "Storage box"}
+        assert remote["node_state"] == "ready"
+        assert remote["group_resource"] == "node:storage:gpu:cuda:0"
+        local = statuses[("lgpu", "GPU Worker 1 (Local RTX)")]
+        assert (local["node"], local["node_state"]) == (None, None)
+
+    def test_busy_worker_on_a_node_that_went_offline_reports_the_state(self, registry):
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        groups = [group("g", member("ncpu", count=1, node="storage"))]
+        pool.reconcile_groups(groups, [])
+        pool.workers[0].is_busy = True
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        pool.reconcile_groups(groups, [])
+        (status,) = JobDispatcher(pool)._build_worker_statuses()
+        assert (status["node_state"], status["retiring"]) == ("offline", True)
+
+    @pytest.mark.parametrize("cause", ["restarting", "rate_limited", "unreachable"])
+    def test_a_worker_on_an_offline_node_carries_why_it_is_offline(self, registry, cause):
+        """The dashboard card called a restarting node "offline": it only had the state to go by."""
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        groups = [group("g", member("ncpu", count=1, node="storage"))]
+        pool.reconcile_groups(groups, [])
+        pool.workers[0].is_busy = True
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline", cause=cause)
+        pool.reconcile_groups(groups, [])
+        (status,) = JobDispatcher(pool)._build_worker_statuses()
+        assert (status["node_state"], status["node_cause"]) == ("offline", cause)
+
+
+def test_a_renamed_node_shows_its_new_name_on_workers_already_running(registry):
+    registry.put("storage", name="Old name")
+    pool = WorkerPool(0, 0, LOCAL_GPU)
+    groups = [group("g", member("ncpu", count=1, node="storage"))]
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    registry.put("storage", name="New name")
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    assert pool.workers[0].node_name == "New name"
+    assert pool.workers[0].placement.node_name == "New name"
+
+
+def test_a_node_gpu_list_reordered_updates_the_running_workers_gpu_index(registry):
+    other = {"type": "intel", "device": "/dev/dri/renderD128", "name": "UHD", "status": "ok"}
+    registry.put("storage", gpus=(NODE_GPU, other))
+    pool = WorkerPool(0, 0, LOCAL_GPU)
+    groups = [group("g", member("ngpu", "gpu", "cuda:0", count=1, node="storage", kinds=["previews"]))]
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    registry.put("storage", gpus=(other, NODE_GPU))
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    assert pool.workers[0].gpu_index == 1

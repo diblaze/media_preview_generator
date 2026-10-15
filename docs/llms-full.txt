@@ -37,8 +37,8 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 - GPUs: NVIDIA (CUDA), Intel and AMD (VAAPI) on Linux; only NVIDIA on Windows (WSL2); none on macOS. Without a GPU it runs on CPU workers.
 - HDR10, HLG and HDR10+ are tone-mapped; Dolby Vision 7 and 8 use their HDR10 layer; Dolby Vision 5 needs a hardware Vulkan driver in the container.
 - Frame interval 1-60 s (default 10; Plex's own default is 2); thumbnail quality 1-10 (default 4; lower = sharper).
-- Intro & Credits: finds intros and end credits and writes Skip Intro / Skip Credits markers to Plex (needs Plex Pass on the server and for viewers; the app runs on the Plex machine or uses the Plex marker agent), Jellyfin 10.11/12.0 and Emby 4.9/4.10 (via the app's plugins; Skip Intro on Emby needs Premiere). Off until turned on per server.
-- Remote processing: previews can run on another machine with access to shared media and the required writable output mounts. The Plex helper supports marker and chapter operations beside Plex. Loudness instead requires this app on the same machine as Plex with a local database; helper and network-mounted databases are unsupported.
+- Intro & Credits: finds intros and end credits and writes Skip Intro / Skip Credits markers to Plex (needs Plex Pass on the server and for viewers; the app runs on the Plex machine or uses a Plex database node), Jellyfin 10.11/12.0 and Emby 4.9/4.10 (via the app's plugins; Skip Intro on Emby needs Premiere). Off until turned on per server.
+- Remote processing: previews can run on another machine with access to shared media and the required writable output mounts. A Plex database node beside Plex handles markers, chapter thumbnails, loudness and Library Health counts; network-mounted databases are unsupported.
 
 # Full documentation
 
@@ -430,7 +430,7 @@ docker run -d \
 ```
 
 > [!TIP]
-> **Why `NVIDIA_DRIVER_CAPABILITIES=all`?** Dolby Vision Profile 5 videos need the NVIDIA Vulkan driver to be tone-mapped; the `all` value is what makes that driver available inside the container. Without it, the app skips tone mapping for those files and their thumbnails come out with a green and purple tint. (The older `compute,video,utility` setting is fine for everything except Dolby Vision Profile 5.)
+> **Why `NVIDIA_DRIVER_CAPABILITIES=all`?** Dolby Vision Profile 5 videos need the NVIDIA Vulkan driver to be tone-mapped; the `all` value is what makes that driver available inside the container. Without it, the app skips tone mapping for those files and their thumbnails come out with a green and purple tint. (The older `compute,video,utility` setting is fine for everything except Dolby Vision Profile 5.) If the dashboard still warns that those thumbnails will have the wrong colours, add `--runtime=nvidia` on Linux: with `--gpus all` alone, some Docker setups leave that driver out.
 
 > [!TIP]
 > **Multi-GPU?** Hosts with two or more NVIDIA cards are detected automatically — each card appears as a separate row in **Settings → Processing options → GPU device tuning** with its own **FFmpeg threads per worker** setting. You choose which card each worker group uses in **Settings → Workers**.
@@ -808,7 +808,7 @@ Facts tagged with a reference such as P1 link to their source, and the Sources l
 | **Servers covered** | Plex, Emby and Jellyfin, any mix and number. One decode per file. | Plex | Jellyfin | Emby |
 | **HDR / Dolby Vision** | Tone-maps HDR10, HLG, HDR10+. Dolby Vision 7/8 uses the HDR10 layer. Dolby Vision 5 needs a GPU with a hardware Vulkan driver; on NVIDIA that means the `graphics` capability. | Plex staff: not tone-mapped on all systems. Users report washed-out HDR and green Dolby Vision. [P3][p3] | Tone-mapped only if transcoding tone mapping is on. [J3][j3] Green Dolby Vision is still user-reported in 2026. [J4][j4] | Tone mapping is done in Emby's core (user reports). [E3][e3] |
 | **Output location** | Each server's own location: Plex data folder; Emby BIF next to the video; Jellyfin tiles next to the video, or in Jellyfin's data folder with the plugin | BIF files in Plex's data folder [P4][p4] [P2][p2] | Jellyfin's data folder, or next to the video when "save with media" is on [J1][j1] | Next to the video or in Emby's metadata folder [E4][e4] |
-| **Skip Intro / Skip Credits** | Plex, Emby and Jellyfin, detected once per file. Plex needs Plex Pass on the server and for viewers, and the app runs on the Plex machine or uses the Plex marker agent. Skip Intro on Emby still needs Premiere. Emby and Jellyfin need this app's plugin. [Details](https://mediapreviewgenerator.dev/skip-intro-credits/) | TV intros, and credits on episodes and movies. Needs Plex Pass for the server's admin and for each viewer (or their Plex Home). [P7][p7] [P8][p8] | No detection of its own. Jellyfin 10.10 and later store skip segments that a plugin makes, and its web player offers to skip them. Jellyfin's own plugin makes them from chapter names. [J6][j6] | Detects TV intros, one season at a time. Skip Intro is an Emby Premiere feature. [E7][e7] [E5][e5] |
+| **Skip Intro / Skip Credits** | Plex, Emby and Jellyfin, detected once per file. Plex needs Plex Pass on the server and for viewers, and the app runs on the Plex machine or uses a Plex database node beside Plex. Skip Intro on Emby still needs Premiere. Emby and Jellyfin need this app's plugin. [Details](https://mediapreviewgenerator.dev/skip-intro-credits/) | TV intros, and credits on episodes and movies. Needs Plex Pass for the server's admin and for each viewer (or their Plex Home). [P7][p7] [P8][p8] | No detection of its own. Jellyfin 10.10 and later store skip segments that a plugin makes, and its web player offers to skip them. Jellyfin's own plugin makes them from chapter names. [J6][j6] | Detects TV intros, one season at a time. Skip Intro is an Emby Premiere feature. [E7][e7] [E5][e5] |
 | **Setup** | Docker container, GPU passthrough, mounts, path mappings if paths differ, server sign-in | One setting | Per-library setting plus trickplay options | Per-library setting |
 | **Price** | Free, MIT licence | Free. No Plex Pass needed. [P5][p5] | Free, open source | Free. No Emby Premiere needed. [E5][e5] |
 
@@ -953,7 +953,7 @@ If that is fast enough, stop here. The built-in needs no extra software.
 - **It uses the GPU.** Decoding and downscaling happen on the GPU. If a file won't decode there, the same worker redoes it on the CPU ([CPU fallback](https://mediapreviewgenerator.dev/guides/#automatic-gpu--cpu-fallback)).
 - **It works on several files at once.** You set up worker groups: a group holds the GPUs and CPU you choose, each with its own worker count and allowed jobs, and the group has its hours.
 - **It works per file, when the file arrives.** Triggers include Sonarr and Radarr webhooks, Plex's own webhook (Plex Pass), a "Recently Added" poll (no Plex Pass), schedules, or a manual pick. See [Previews as soon as Sonarr or Radarr imports a file](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/).
-- **It can run on another machine.** It needs network access to Plex, and the Plex data folder mounted read-write.
+- **It can use another machine's GPU.** Add that machine as a [worker node](https://mediapreviewgenerator.dev/guides/#remote-nodes), or run the app there with network access to Plex and the Plex data folder mounted read-write.
 
 Once it is running, set Plex's **Settings → Library → Generate video preview thumbnails** to **Never**, so Plex doesn't do the same work again. Setup steps are in [Generate Plex preview thumbnails with a GPU](https://mediapreviewgenerator.dev/plex-preview-thumbnails-gpu/).
 
@@ -1117,7 +1117,7 @@ Hardware decoding is not a guaranteed win. A Jellyfin core team member [has said
 ## When to move it off Jellyfin
 
 - A large backlog still takes days after tuning.
-- You want the decoding done on another machine or a different GPU.
+- You want the decoding done on another machine ([remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes)) or a different GPU.
 - You want trickplay made per file as soon as Sonarr or Radarr imports it ([how](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/)).
 - You also run Plex or Emby on the same files. Media Preview Generator decodes each file once and writes each server's format.
 
@@ -1348,7 +1348,7 @@ Washed-out, grey or green preview thumbnails come from frames taken from HDR vid
 
 - HDR10, HLG and HDR10+ are tone-mapped to SDR.
 - Dolby Vision Profiles 7 and 8 are read through their HDR10 layer.
-- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`.
+- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`, and on some Docker setups `--runtime=nvidia` as well.
 
 ## Why the built-ins get it wrong
 
@@ -1384,6 +1384,8 @@ docker run -d \
 
 In Docker Compose, set `NVIDIA_DRIVER_CAPABILITIES=all` under `environment:`. `compute,video,utility,graphics` also works if you prefer the minimum. Restart the container after changing it.
 
+If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out.
+
 Intel and AMD need no extra step beyond passing `/dev/dri`, which also brings the Mesa Vulkan driver.
 
 **Without a hardware Vulkan driver,** the app can't run the Profile 5 tone-mapping path. It logs a warning and extracts those frames without tone mapping, so their thumbnails come out with a green and purple tint. If only a software Vulkan driver is found (the usual case on NVIDIA without the `graphics` capability), the bell menu also shows a notification. With no Vulkan at all, the log is the only sign. For a diagnostic bundle to attach to a GitHub issue, use `GET /api/system/vulkan/debug`.
@@ -1415,13 +1417,13 @@ Dolby Vision Profile 5 is the slowest format to process. How long it takes depen
 # Skip Intro and Skip Credits detection for Plex, Emby and Jellyfin
 Source: https://mediapreviewgenerator.dev/skip-intro-credits/
 
-Set up Skip Intro and Skip Credits for Plex, Jellyfin and Emby. Check subscriptions, helper or plugin requirements, then inspect one file.
+Set up Skip Intro and Skip Credits for Plex, Jellyfin and Emby. Check subscriptions, node or plugin requirements, then inspect one file.
 
 Media Preview Generator detects where each file's intro and end credits are and sends those points to Plex, Emby and Jellyfin, so viewers get a skip button. It detects each file once and sends the same answer to every server that has the file. On Jellyfin and Emby it works through its own plugin. It runs in the same Docker container that makes your preview thumbnails, and it stays off until you turn it on for a server.
 
 ## What viewers get, and what each server needs
 
-- **Plex.** Skip Intro and Skip Credits buttons. The server needs Plex Pass, and so do viewers, or a Plex Home whose admin has it: without it, Plex hides skip buttons altogether. Plex has no way for another app to add markers, so the app writes them into Plex's own database and asks you to confirm once per server first. That only works on the Plex machine, so either run the app there or run the small [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) container next to Plex.
+- **Plex.** Skip Intro and Skip Credits buttons. The server needs Plex Pass, and so do viewers, or a Plex Home whose admin has it: without it, Plex hides skip buttons altogether. Plex has no way for another app to add markers, so the app writes them into Plex's own database and asks you to confirm once per server first. That only works on the Plex machine, so either run the app there or run a small [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) container next to Plex.
 - **Jellyfin 10.11 or 12.0.** Jellyfin has no intro detection of its own: it shows skip segments that a plugin provides ([Jellyfin docs](https://jellyfin.org/docs/general/server/metadata/media-segments/)). This app's [Media Preview Bridge plugin](https://mediapreviewgenerator.dev/guides/#jellyfin-the-media-preview-bridge-plugin), the same one trickplay uses, is that plugin. Viewers get Skip Intro and Skip Credits, plus Skip Recap and Skip Preview.
 - **Emby 4.9 or 4.10.** Skip Intro, and Skip Credits through Emby's Up Next prompt. It works through this app's [Media Preview Bridge for Emby plugin](https://mediapreviewgenerator.dev/guides/#emby-the-media-preview-bridge-for-emby-plugin). Skip Intro also needs Emby Premiere, which is Emby's rule; the credits prompt works without it. Emby has no credits end, so skipping credits goes to the end of the file, past any scene after the credits.
 
@@ -1434,9 +1436,8 @@ Plex and Emby can have markers of their own. With **Use ours**, the default, the
 3. Review detection sources under **Settings → Intro & Credits**, then start an Intro & Credits job for the libraries you chose. [The full guide](https://mediapreviewgenerator.dev/guides/#intro--credits) explains source choices and publishing rules.
 4. Open **Tools → Inspector** and inspect a known episode or movie. Compare the detected positions with the video and each server's published result. Adjust or lock a marker when needed; an uncertain result may intentionally have no skip button.
 
-To process away from Plex, the [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent)
-must run beside Plex. This is different from [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/), which
-requires a local database and does not support the helper or network-mounted databases.
+To process away from Plex, a [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node)
+must run beside Plex.
 
 ## How it detects intros and credits
 
@@ -1482,7 +1483,8 @@ CPU worker groups, alongside previews and Intro & Credits, and stores the measur
 the completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
-supported: Plex's music analysis includes album gain and fades that this video feature does not produce.
+supported: Plex's music analysis includes album gain and fades that this video feature does not produce. Trailers and
+other extras are skipped, because Plex doesn't take loudness for them.
 
 Loudness is off by default for each Plex server. When you enable it, all supported movie and TV libraries are selected
 by default; you can narrow that selection on the **Libraries** tab.
@@ -1493,8 +1495,10 @@ unlock the playback feature. See Plex's [Audio Track Enhancements for Video](htt
 
 ## Turning it on
 
-1. Run this app on the same machine as Plex and mount Plex's config folder locally. Plex must be running. Loudness
-   supports Plex **1.43.4.x or 1.43.5.x**. It does not work through the Plex helper or a network-mounted database.
+1. Run this app on the same machine as Plex and mount Plex's config folder locally, or run the
+   [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) (version 1.2.0 or newer) beside a Plex on
+   another machine. Plex must be running. Loudness supports Plex **1.43.4.x or 1.43.5.x**. A network-mounted
+   database is refused.
 2. Under **Servers → Edit → Processing → Loudness**, switch on **Analyse loudness for this server**.
 3. On the **Libraries** tab, choose movie and TV libraries in the **Loudness** column. Both start on; music and other
    non-video libraries cannot be selected.
@@ -1586,14 +1590,21 @@ to the journal. Undo only replays confirmed writes: a crash or rollback cannot m
 If saving the confirmation fails, the database write remains and the app warns; keep the journal for recovery, because
 that unconfirmed record will not be replayed automatically.
 
-To restore the affected tracks and items, stop Plex and run, in the app's container:
+Through a Plex database node, the node keeps this record instead, in its own `/config` (the Windows node: in
+`%LOCALAPPDATA%\MediaPreviewGenerator\node`), because undo has to run beside the database file.
+
+To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
 ```
-docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \
+docker exec -it media-preview-generator python3 -m media_preview_generator.loudness.undo \
   --db "/path/to/com.plexapp.plugins.library.db" --log /config/loudness-writes.jsonl
 ```
 
 `--db` is Plex's database as the container sees it. Add `--dry-run` to count what would be restored first.
+
+On the Windows Plex database node there is no container: stop Plex and run
+`PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
+`--dry-run` first). It finds its own record, and Plex's database from that record.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are
@@ -1623,6 +1634,7 @@ Guides for the web interface, automation and webhooks, HDR handling, and trouble
 
 - [Web Interface](https://mediapreviewgenerator.dev/guides/#web-interface)
 - [Setup Health (per-check toggles & explanations)](https://mediapreviewgenerator.dev/guides/previews-readiness/)
+- [Remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes)
 - [Webhook Integration](https://mediapreviewgenerator.dev/guides/#webhook-integration)
 - [Auto-trigger from Plex (no Sonarr/Radarr)](https://mediapreviewgenerator.dev/guides/#auto-trigger-from-plex-no-sonarrradarr)
 - [Intro & Credits](https://mediapreviewgenerator.dev/guides/#intro--credits)
@@ -1883,7 +1895,7 @@ On the Dashboard, each device row in the **Workers** panel has a **−** / **+**
 - A group's card shows its state: **Available**, **Workers busy**, **Outside hours**, **Finishing current files** or **Globally paused**. No open workers means waiting for capacity, not a global pause: current files can still finish.
 - Counts from different open groups add, including groups that use the same device. Overlapping windows within one group
   do not multiply its workers. Finishing files still use the shared resource budget, so a newly opened group may
-  wait for them. The weekly peak is limited to 64 CPU and 64 GPU workers across groups; the editor shows the current and peak totals.
+  wait for them. The weekly peak is limited to 64 CPU and 64 GPU workers per machine (this app, and each node on its own), across groups; the editor shows the current and peak totals.
 
 There are three separate timing controls:
 
@@ -1930,8 +1942,8 @@ chapter timestamp rather than repeatedly retrying it. The app preserves the sour
    default. Enabling it lets this app write chapter images and update their references in Plex's database; it does
    not change your videos, create chapters, or change chapter times.
 2. Open **Setup Health**. The app needs a supported, positively identified Plex database on the same machine, or a
-   compatible [Plex helper](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) beside Plex. If a helper is needed,
-   **Configure Plex helper** takes you directly to the shared connection controls. **Intro & Credits can stay off**.
+   compatible [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) beside Plex. If one is needed,
+   pick it under **Edit → Connection → Plex database**. **Intro & Credits can stay off**.
 3. In Plex's **Settings → Library → Generate chapter thumbnails**, select **Never** to avoid Plex repeating the work
    and replacing these images. This Plex setting affects all its libraries. The app checks it but does not change it.
 4. Run your usual **Previews** job. Existing schedules and webhooks also include chapters while the toggle is on;
@@ -2126,8 +2138,8 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
   library. Chapters starts preview jobs for exactly those files; previews that already exist are skipped.
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
-- **How long it takes.** Plex with access to its database takes seconds, even for 100,000+ files. Without that
-  access (for example, Plex reached through the marker helper, or Plex's folder on a network share such as Docker
+- **How long it takes.** Plex with access to its database, directly or through a Plex database node, takes
+  seconds, even for 100,000+ files. Without it (for example, Plex's folder on a network share such as Docker
   Desktop's mount of a Windows folder), only previews are counted. Jellyfin Intro and
   Credits and Emby previews take longer, because they need one request or one folder read per file. While a check
   runs, they show the last check's numbers.
@@ -2245,6 +2257,129 @@ Login and API endpoints are rate-limited to protect against brute force. See [Re
 ### Real-Time Updates
 
 The dashboard streams live job progress over WebSocket (Flask-SocketIO, `/jobs` namespace). See [Reference — WebSocket Events](https://mediapreviewgenerator.dev/reference/#websocket-events) for the event table and payloads.
+
+---
+
+## Remote nodes
+
+A **node** is another machine that helps this app. The app stays in charge: it keeps the queue, the schedules, your
+server tokens and every write to your servers. A node runs one heavy step it is handed and sends the result back.
+
+A node has one or both roles:
+
+- **Worker**: lends its GPU or CPU for video previews, Intro & Credits detection and loudness. It needs to read your
+  media; it never gets a server token and writes nothing outside its own temp folder.
+- **Plex database**: runs where Plex runs (Linux or Windows) and opens Plex's database for Intro & Credits, chapter
+  thumbnails, loudness and Library Health counts. It replaces the separate Plex marker agent.
+
+### Running a worker node
+
+Use the app's own image, the **same tag** as the app, started with `MODE=node`:
+
+```bash
+docker run -d --name media-preview-node -p 9494:9494 \
+  -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
+  --device /dev/dri:/dev/dri \
+  -v /path/to/media:/media:ro -v /path/to/node/config:/config \
+  stevezzau/media_preview_generator:latest
+```
+
+- `NODE_NAME` is the name the app shows for it.
+- Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
+  they are.
+- Pass the GPU the same way you pass it to the app: for NVIDIA, `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`
+  (Dolby Vision tone mapping needs the second; if the node's log still says Dolby Vision Profile 5 thumbnails will
+  have the wrong colours, also add `--runtime=nvidia`). Keep `--device /dev/dri:/dev/dri` only
+  if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
+  gathering device information").
+- The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
+  made by `openssl rand -hex 24`, or keep it in a file and set `FILE__NODE_KEY` to that file's path.
+- A compose file is in [`nodes/worker/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/worker/docker-compose.yml).
+
+### Adding it
+
+1. **Settings → Nodes → Add node**: a name, the node's address (`http://machine:9494`) and its key.
+2. **Media**: for each library, the folder this app uses and the folder the node sees the same files at.
+   **Test access** picks 3 real files per library and checks the node sees each one with the same size and
+   modified time (within 2 seconds, for shares that store coarser times). A wrong mapping shows the exact path tried.
+   A library with no mapping row is skipped: the node never takes its files, so other workers do. To leave one
+   library to other workers, remove its mapping row.
+3. **Settings → Workers**: add the node's GPU or CPU to a worker group. Devices are listed under **This app** first,
+   then under each node's name. Hours, job types and worker counts work as for this app's devices.
+
+The node card shows its state: **Ready**, **Connecting…** (not checked yet), **Offline**, **Key refused**,
+**Update needed**, **FFmpeg missing**, **Temp folder problem**, **Access problem**, **GPU lost**, **Added twice** (the
+same machine at two addresses) or **Turned off**. Only a ready node gets work; a node that lost its GPU keeps its CPU
+workers. Each node also has its own **Setup Health** and **Log** tabs.
+
+If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
+at its mapped path goes to another worker, and fails only when no other worker can run it.
+
+### Updating a node
+
+When you update this app, update every **worker node** to the same image tag: until then its card says **Update
+needed** and it gets no work. Pull the new image and recreate the container with the same settings, keeping its
+`/config`: `docker compose pull && docker compose up -d`, or `docker pull`, then
+`docker stop media-preview-node && docker rm media-preview-node` and the same `docker run` again. Watchtower can update
+nodes too, like the app.
+
+A **Plex database node** only has to be new enough: its Setup Health says when it isn't. On Linux, set its image tag
+to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
+and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays.
+An install from before nodes has no `/config` volume: add `-v plex-db-node-config:/config` (or the compose file's
+`volumes:` line) when you update, or it writes no loudness. On Windows, download the newest release and run its
+`install.ps1` again, with the options you installed with (`-Port`, `-PlexConfigDir`): the key stays.
+
+### Removing a node
+
+Open the node and click **Remove** on its **Settings** tab. A node that a worker group or a Plex server still uses
+can't be removed until you take it out of them. The node itself keeps running: stop and delete its container
+(`docker compose down` in its folder, or `docker rm -f media-preview-node`) and, if you won't add it again, its
+`/config` folder.
+
+A Plex database node keeps the undo record of its loudness writes in that `/config` (`loudness-writes.jsonl`; on
+Windows, in `%LOCALAPPDATA%\MediaPreviewGenerator\node`). Keep it, or [undo](https://mediapreviewgenerator.dev/plex-loudness-normalization/#undoing-it)
+those writes first. On Windows, remove the node with its `uninstall.ps1`, which keeps the record.
+
+### Plex on another machine
+
+Run a Plex database node beside Plex: the [Linux image](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)
+or the [Windows build](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md). Add it
+under **Settings → Nodes**, then pick it in **Servers → your Plex → Edit → Connection → Plex database**. A Plex
+marker agent you already set up is moved to the Nodes page on upgrade and keeps working.
+
+### One node with both roles
+
+On the machine that runs Plex, one container can be the worker and the Plex database node. Start the app's image
+as a worker node (above) and add `-e NODE_ROLES=worker,plex_db`, Plex's config folder and where it is inside the
+container:
+
+```bash
+docker run -d --name media-preview-node -p 9494:9494 \
+  -e MODE=node -e NODE_NAME=plex-box -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
+  -e PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server" \
+  --device /dev/dri:/dev/dri \
+  -v /path/to/media:/media:ro -v /path/to/plex/config:/plex -v /path/to/node/config:/config \
+  stevezzau/media_preview_generator:latest
+```
+
+- Keep `--device /dev/dri:/dev/dri` only if the machine has an Intel or AMD GPU.
+- Set `PUID`/`PGID` to the user Plex runs as: the node has to write Plex's database as that user.
+- Don't mount Plex's config folder read-only.
+- Add it once under **Settings → Nodes**, then use it both in a worker group and as your Plex's **Plex database**.
+
+### A node behind a reverse proxy
+
+The node sees every request through a proxy as coming from the proxy's address, and its limits are per address:
+after too many wrong keys it holds back everyone using that proxy for a while, and one address can only hold so many
+connections open. Route only this app to the node through the proxy, and give anything else that reaches it the right
+key.
+
+Over https with a certificate of your own (self-signed, or from your own certificate authority), this app has to
+trust it. Put a file holding the usual public authorities plus yours in the app's container (for example your
+host's `/etc/ssl/certs/ca-certificates.crt` with your certificate added at the end) and set `REQUESTS_CA_BUNDLE` to
+its path. It replaces the app's built-in list for every https connection, Plex, Emby and Jellyfin included, so keep
+the public authorities in it.
 
 ---
 
@@ -2780,9 +2915,9 @@ Plex has no API or plugin system for markers, so this app writes them directly i
 exact place Plex stores its own. Because that's unsupported by Plex, it's **opt-in with a one-time confirmation** the
 first time you turn it on for a Plex server:
 
-- **The app must run on the same machine as Plex, or you run the Plex marker agent next to Plex.** SQLite's write
+- **The app must run on the same machine as Plex, or you run a Plex database node next to Plex.** SQLite's write
   mode (WAL) doesn't work over a network filesystem, so a network-mounted database stays read-only. See
-  [Plex on another machine](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent).
+  [Plex on another machine](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node).
 - **Map Plex's config folder into both containers from the identical host path.** On unRAID specifically, don't mix
   `/mnt/user` and `/mnt/cache` between the two containers — even though both paths can reach the same files, Plex and
   this app must open the database through the exact same path for the app's same-host proof to succeed.
@@ -2810,7 +2945,7 @@ first time you turn it on for a Plex server:
   isn't used as a second opinion. When the file gives an answer, ours replaces Plex's marker (row message e.g.
   "Replaced Plex's intro: it was detected for an earlier file"); when it gives none, **Keep Plex's** keeps Plex's,
   which is still the closest there is. The job log marks those markers **(made for an earlier file)**. When Plex's
-  database can't tell this time (busy, or an older Plex marker agent), every Plex marker counts as before and the next
+  database can't tell this time (busy, or an older Plex database node), every Plex marker counts as before and the next
   run asks again.
 - **Don't turn off a library's own *Intro markers* / *Credits markers* setting** (Edit library → Advanced). While
   it is off, Plex hides every skip marker of that type in the library, ours included, so nobody sees a skip button
@@ -2831,26 +2966,34 @@ first time you turn it on for a Plex server:
 - Tested against Plex 1.43. If a future Plex update changes the database's shape, the app stops writing and shows a
   message rather than guessing.
 
-### Plex on another machine: the Plex marker agent
+### Plex on another machine: the Plex database node
 
-If this app and Plex run on different machines, run the **Plex marker agent** next to Plex. It is a small container of
-its own (`plex-marker-agent/` in the repository, image `ghcr.io/stevezau/plex-marker-agent`) with Plex's config folder
-mounted. The app asks it to do the database write on Plex's machine. It is the only supported way to write markers to a
-Plex on another machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine,
-don't run it.
+If this app and Plex run on different machines, run a **Plex database node** next to Plex, with Plex's config
+folder mounted: the Linux image in [`nodes/plex-db/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)
+(image `ghcr.io/stevezau/plex-marker-agent`, formerly the Plex marker agent) or the Windows build in
+[`nodes/windows/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md). The app asks
+it to do the database write on Plex's machine. It is the only supported way to write markers to a Plex on another
+machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine, don't run it.
 
-1. Run the agent as its [README](https://github.com/stevezau/media_preview_generator/blob/dev/plex-marker-agent/README.md) says: the compose file, the settings (`AGENT_TOKEN`,
-   `PLEX_CONFIG`, `PUID`/`PGID`) and the key.
-2. In the app: **Servers → your Plex → Edit → Connection → Plex helper**. Switch it on, enter its **Address**
-   (for example `http://plex-host.lan:9494`) and the **Shared key**, the same value as `AGENT_TOKEN`. The key is masked
-   once saved. The one-time database-write confirmation applies when enabling Intro & Credits. Chapter thumbnails
-   have their own opt-in under General and can use this connection while Intro & Credits is off.
-3. The line under the address shows the state: **Connected**, **Can't reach it**, **Key refused** or **Update needed**.
-   **Check again** asks now. The agent has its own version, and a version the app doesn't accept is refused on the first
-   call, in either direction, with a message saying which side to update.
+1. Run the node as its README says: the compose file, the settings (`NODE_KEY`, `PLEX_CONFIG`, `PUID`/`PGID`) and
+   the key. An install from the Plex marker agent days keeps its `AGENT_TOKEN`.
+2. In the app: **Settings → Nodes → Add node** with its address (for example `http://plex-host.lan:9494`) and key.
+   See [Remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes).
+3. **Servers → your Plex → Edit → Connection → Plex database**: pick the node. The one-time database-write
+   confirmation applies when enabling Intro & Credits. Chapter thumbnails have their own opt-in under Processing and can
+   use this node while Intro & Credits is off.
+4. The node's card on the Nodes page shows its state (**Ready**, **Connecting…**, **Offline**, **Key refused**,
+   **Update needed**, **Turned off**). A version the app doesn't accept is refused on the first call, in either
+   direction, with a message saying which side to update. On the server's **Connection** tab, a node that reports a
+   new id and can't show it sits beside the same Plex shows **Not confirmed**, and gets nothing until you type its key
+   again on its Settings tab.
 
-For Intro & Credits, the agent writes the marker rows of one item into Plex's library database. A compatible agent
+A Plex database node set up before this version is moved to the Nodes page on upgrade and keeps working. For
+loudness it needs a `/config` volume: see [Updating a node](https://mediapreviewgenerator.dev/guides/#updating-a-node).
+
+For Intro & Credits, the node writes the marker rows of one item into Plex's library database. A compatible node
 also supports [chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails), updating only existing chapter image references.
+Version 1.2.0 or newer also writes [loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/) and runs Library Health's database counts.
 It refuses a database that isn't
 on a local disk of its own machine, a database schema it doesn't know, and a Plex that has no marker list yet, with the
 same messages a same-machine setup gives. Chapter registration does not require a marker list. While it isn't answering, markers wait in this app and the next Intro &
@@ -3175,18 +3318,19 @@ table covers every state the check can report, using its exact wording:
 | Log line "season_audio had no answer for \<file\> this time: Not fingerprinting \<episode\>: N earlier fingerprint ffmpegs are still stuck reading their files" | Earlier fingerprint reads stalled on the media mount and can't be stopped until it answers; no more are started meanwhile, so episodes that still need fingerprinting get no season audio answer (nothing is held against the files) | Check the media mount (NFS/SMB) is responding. It clears on its own once the stuck reads finish; the next run matches the season |
 | A file fails with "Couldn't read the file: Not reading \<path\>: N earlier ffprobes are still stuck reading their files", or a log line "season_audio (or credits_text) had no answer for \<file\> this time: … Not reading \<path\>: N earlier ffprobes are still stuck reading their files" | Earlier ffprobe reads stalled on the media mount; until they finish no new ffprobe is started, so new files can't be checked | Check the media mount is responding; it clears on its own once the stuck reads finish, and the files are tried again on the next run |
 | *(Plex)* Red "✕ Not active" next to Plex Pass: "This Plex server has no Plex Pass, so Plex won't show any markers." | Plex hides all markers — even ones already in its database — without Plex Pass | Add Plex Pass to this Plex server |
-| *(Plex)* "Plex's database is on a network share (…). The app must run on the same machine as Plex to write markers; Plex stays read-only." | SQLite's write mode doesn't work over NFS/SMB/CIFS | Run this app on the same machine as Plex, or run the [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) next to Plex. With an agent, the same kind of message means the *agent's* mount is a network share |
+| *(Plex)* "Plex's database is on a network share (…). The app must run on the same machine as Plex to write markers; Plex stays read-only." | SQLite's write mode doesn't work over NFS/SMB/CIFS | Run this app on the same machine as Plex, or run a [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) next to Plex. When the message says "where the Plex database node runs", the node's mount is the network share |
 | *(Plex)* "Plex's database is on a filesystem this app doesn't recognise as a local disk (…); Plex stays read-only." | The app couldn't prove the folder is a real local disk, so it refuses to risk Plex's database | Check the mount; open an issue if it's genuinely local |
 | *(Plex)* "Plex is running, but not with the database file this app sees at …. Mount the exact folder Plex uses, on the same machine (on unRAID, the same /mnt/cache or /mnt/user path Plex uses)." | The app proves it shares Plex's live database lock before ever writing; this Plex has a different copy open | Map Plex's config folder into both containers from the identical host path |
 | *(Plex)* "Plex doesn't have its database open through this folder right now (Plex is stopped, or this app sees a different path to the file). Markers are only written while Plex is running." | Same same-host proof, failing because nothing has the database open | Start Plex; recheck the mounted path |
 | *(Plex)* "Plex hasn't created its marker tag yet. Run Plex's own intro or credits detection once on any item, then try again." | Markers reuse a database row Plex creates itself the first time it ever writes a marker | Run Plex's own intro or credits analysis once on any item, then recheck |
 | *(Jellyfin)* Amber "Update needed" badge, "— installed 1.0.0.0" (the version the plugin reports; "installed version unknown" when it doesn't say) + **Update** button; the job's rows say "Update Media Preview Bridge (installed …) to get markers support" | An older plugin build predates the markers feature | Click **Update** |
 | *(Plex)* "Plex \[…\] data has an unknown shape; not writing markers." / "Plex's database has more than one marker tag row, so it's unclear which one Plex serves; not writing markers." | A future Plex version changed its database in a way the app doesn't recognise | Check for an app update; report your Plex version in an issue |
-| *(Plex)* "Plex's database was busy (held by another program) for N s; trying again on the next run" (or "Plex is busy writing its database; trying again on the next run (database is locked)", or "Another Intro & Credits task is still using this Plex database; trying again on the next run", or "Another Intro & Credits task is still checking this Plex server; trying again on the next run") | Another program kept Plex's database locked for longer than a job waits (2 minutes, or 10 seconds for a file on a GPU or CPU worker when the job retries it): Plex itself during a big scan or database optimize, or a tool that writes to Plex's database (Kometa and the like) | Nothing, usually. In a job the file's row says "this job tries again in a few minutes" instead, and the job does, on the usual retry schedule (**Settings → Processing options → Retry policy**). Only a file still refused after the last retry stays **Failed**, for Check servers' next day. Cancelling the job stops its wait within a second when this app opens Plex's database itself; through the [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) the agent's own wait (up to 2 minutes) runs out first. If it keeps happening, schedule that tool outside your Intro & Credits runs |
+| *(Plex)* "Plex's database was busy (held by another program) for N s; trying again on the next run" (or "Plex is busy writing its database; trying again on the next run (database is locked)", or "Another task is still using this Plex database; trying again on the next run", or "Another Intro & Credits task is still checking this Plex server; trying again on the next run") | Another program kept Plex's database locked for longer than a job waits (2 minutes, or 10 seconds for a file on a GPU or CPU worker when the job retries it): Plex itself during a big scan or database optimize, or a tool that writes to Plex's database (Kometa and the like) | Nothing, usually. In a job the file's row says "this job tries again in a few minutes" instead, and the job does, on the usual retry schedule (**Settings → Processing options → Retry policy**). Only a file still refused after the last retry stays **Failed**, for Check servers' next day. Cancelling the job stops its wait within a second when this app opens Plex's database itself; through a [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) the node's own wait (up to 2 minutes) runs out first. If it keeps happening, schedule that tool outside your Intro & Credits runs |
 | *(Jellyfin)* "Can't reach this Jellyfin server" / "Can't reach the Media Preview Bridge markers endpoint on this Jellyfin server" | A transient connection problem | Confirm the server is up and reachable; recheck |
 | *(Jellyfin)* "Jellyfin rejected this server's credentials; reconnect it" | The stored token/login no longer works | Reconnect the server from the Servers page |
 | *(Jellyfin)* "Jellyfin refused the Media Preview Bridge markers endpoint; this server's API key or user needs administrator rights" | The connected account isn't an administrator | Reconnect with an admin account or API key |
-| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." | A `PUID`/`PGID` mismatch between the two containers | Set this container's `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." (or "The Plex database node (user N) can't write …. Run the node as …") | A `PUID`/`PGID` mismatch between the two containers | Set this container's (or the node's) `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "… can't write …, though it runs as the user that owns Plex's database: the folder is read-only." | Plex's config folder is mounted read-only (`:ro`) or its folder doesn't allow writes | Mount it read-write |
 | *(Plex)* "Disk full: Plex's database can't take any writes (…)." | The disk holding Plex's database is full | Free up space on that disk |
 | Status block fails to load: "Couldn't check this server's Intro & Credits status" (Processing tab) or "Couldn't read this server's Intro & Credits state (…)" (Inspector row) | An unexpected error while checking (e.g. `markers.db` unreadable) — one server's failure never blocks the rest of the page | Reload; check the logs for the exception type named in the message |
 
@@ -3299,7 +3443,9 @@ You don't have to do anything for these — the container handles them on startu
 >
 > **Fix:** add `-e NVIDIA_DRIVER_CAPABILITIES=all` to your `docker run` command (or set it in the `environment:` block of your compose file) and restart the container. `all` is what the official NVIDIA Vulkan images use. If you prefer minimum privilege, `compute,video,utility,graphics` works too.
 >
-> If the in-app warning banner persists after the restart, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
+> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out.
+>
+> If the banner persists after that, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
 
 ---
 
@@ -3330,7 +3476,7 @@ Use this table to diagnose common failures quickly.
 | Job warning: "N file(s) still weren't indexed by the media server after N retries, so no more retries are queued. The next scheduled scan will pick them up." | The media server hadn't added the file to its library by the last retry | Nothing, if you have a scheduled scan: it picks the file up once the server has it. Otherwise raise **Retry count** or **Initial retry delay** (Settings → Retry policy), or check the file is under a library folder the server scans. |
 | Radarr/Sonarr cannot reach webhook URL | Network routing or hostname issue | Use host IP or reachable Docker hostname (not `localhost`), then verify firewall and port `8080`. |
 | New job starts after I paused | Global pause not set or UI not refreshed | Use **Pause** in the **Workers** header. Global pause is persisted and pauses in-flight processing. Group reductions and closing worker hours instead let current files finish. |
-| DV Profile 5 thumbnails have a green and purple tint, and the log warns that no working Vulkan device was found | The container can't reach a hardware Vulkan device, so the app skips Profile 5 tone mapping and extracts plain frames instead | Pass an iGPU to the container with `--device /dev/dri:/dev/dri` (Intel/AMD), or for NVIDIA set `NVIDIA_DRIVER_CAPABILITIES=all` so the NVIDIA Vulkan driver gets injected. Most users already pass `/dev/dri` for hardware video acceleration, which brings the Vulkan driver along for free. |
+| DV Profile 5 thumbnails have a green and purple tint, and the log warns that no working Vulkan device was found | The container can't reach a hardware Vulkan device, so the app skips Profile 5 tone mapping and extracts plain frames instead | Pass an iGPU to the container with `--device /dev/dri:/dev/dri` (Intel/AMD), or for NVIDIA set `NVIDIA_DRIVER_CAPABILITIES=all` so the NVIDIA Vulkan driver gets injected; if they're still tinted, also start the container with `--runtime=nvidia`. Most users already pass `/dev/dri` for hardware video acceleration, which brings the Vulkan driver along for free. |
 
 ### Validate Plex Config Path
 
@@ -3492,12 +3638,12 @@ manager.
 
 **Registration:** checks that this app can safely update the image references on Plex's existing chapters.
 It requires a supported Plex version and database schema, a positive server identity match, and a writer on
-Plex's machine. A safe local database connection works directly; when Plex is on another machine, configure
-the compatible Plex helper beside it. A network-mounted database alone is not enough.
+Plex's machine. A safe local database connection works directly; when Plex is on another machine, pick a
+compatible Plex database node beside it. A network-mounted database alone is not enough.
 
-The failure row gives the reason. **Configure Plex helper** opens the shared connection controls under
-**Intro & Credits**; you can enter the helper address and key while Intro & Credits stays off.
-See the [helper setup guide](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent).
+The failure row gives the reason. **Choose the Plex database** opens the **Plex database** selector under
+**Edit → Connection**; you can pick a node while Intro & Credits stays off.
+See [Plex on another machine](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node).
 This check reads capability only and does not change chapter rows.
 
 **Plex's own generation:** reads the server-wide **Generate chapter thumbnails** preference
@@ -3519,7 +3665,7 @@ See [Plex chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-cha
 ## Plex loudness
 *Plex only — shown when this app's loudness analysis is on*
 
-**Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
+**Writer readiness:** checks that this app can safely store loudness measurements in Plex's database.
 Select the movie and TV libraries this app should analyse in the server's loudness settings.
 
 **Plex's own analysis:** recommends setting the server-wide **Analyze audio tracks for loudness** schedule to
@@ -3824,15 +3970,15 @@ other row says what to change and where.
   leave the library's own setting on.
 - **Plex's library database isn't on this machine** (critical) / **…is on this machine**. Markers are written into
   Plex's database, which is only safe from the machine the file is on. Run this app on the Plex machine, or run the
-  [Plex marker agent](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) next to Plex. With an agent
-  switched on the row reads **The Plex marker agent isn't on the machine with Plex's database**, means the agent's
-  container, and its badge reads **Fix on the agent**: mount Plex's config folder into it from one of that machine's
-  own disks.
-- **The Plex marker agent** (critical), shown only when an agent is switched on for this server. **…is connected**,
-  or one of: **isn't answering** (markers wait, nothing is lost), **refused this app's key** (set the same shared key
-  on both sides), **and this app are different versions** (the Processing → Intro & Credits section says which to update), **is
+  [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) next to Plex. With a node
+  picked the row reads **The Plex database node isn't on the machine with Plex's database**, and its badge reads
+  **Fix on the node**: give the node Plex's config folder from one of that machine's own disks.
+- **The Plex database node** (critical), shown only when a node is picked for this server. **…is connected**,
+  or one of: **isn't answering** (markers wait, nothing is lost), **refused this app's key** (set the same key on
+  the node and on the Nodes page), **and this app are different versions** (the message says which to update), **is
   beside a different Plex** (check the address: markers would have gone into the wrong database). While it is red,
-  no marker reaches this server, and its badge reads **Fix on the agent** instead of **Change in Plex UI**.
+  no marker reaches this server, and its badge reads **Fix on the node** instead of **Change in Plex UI**. A node
+  that is turned off on the Nodes page, or that no longer exists, reads **Fix in this app**.
 - **TV Shows — skip buttons are hidden** (critical, one row per library, named after it) / **Plex shows skip buttons
   in your Intro & Credits libraries**. Each library Intro & Credits goes to has its own *Intro markers* and *Credits
   markers* setting in Plex (Edit library → Advanced; only TV libraries have the intro one). While one is off, Plex
@@ -3903,8 +4049,8 @@ server that owns it, in the format that server expects.
 ## Connect and check your servers
 
 1. [Install the container](https://mediapreviewgenerator.dev/getting-started/) where you want the processing to run. Its media paths and output mounts must reach the same files your servers use.
-2. Open **Servers → Add Server**, choose Plex, Emby or Jellyfin, and complete the connection flow. Click **Test connection**, then **Save server**. Repeat for each server. The **Connection** tab of **Edit** holds authentication and Plex helper settings.
-3. Click **Edit** on a server card, then open **Libraries** to choose which libraries get previews. Use the **Processing** tab for that server's chapter thumbnails, Intro & Credits and, on a supported local Plex server, loudness.
+2. Open **Servers → Add Server**, choose Plex, Emby or Jellyfin, and complete the connection flow. Click **Test connection**, then **Save server**. Repeat for each server. The **Connection** tab of **Edit** holds authentication and the Plex database choice.
+3. Click **Edit** on a server card, then open **Libraries** to choose which libraries get previews. Use the **Processing** tab for that server's chapter thumbnails, Intro & Credits and, on a supported Plex server, loudness.
 4. Check the **Path mappings** tab when the server and container use different paths. Open **Setup Health** for each server and resolve the relevant output and library checks.
 5. Process one shared movie or episode with **Process a file or folder** on the Dashboard. Expand **All jobs → Job details** to check results for each server, then inspect the output in its player. **Open logs and files** preserves the per-file result when one server is waiting or failed.
 
@@ -3913,15 +4059,18 @@ a writable output mount or a plugin before it can use the result.
 
 ## Offload preview generation to another machine
 
-The container can run on a separate GPU machine while Plex, Emby or Jellyfin stays on the media
+The simplest way is a [worker node](https://mediapreviewgenerator.dev/guides/#remote-nodes): the app stays where it is and hands the heavy work to
+the other machine's GPU, which only needs to read your media. The app keeps every write.
+
+The container itself can also run on a separate GPU machine while Plex, Emby or Jellyfin stays on the media
 server. Both machines must reach the same source files, and the container needs network access to
 each server's API. Map the server's media paths to the paths inside this container.
 
 - **Plex previews:** mount Plex's data folder read-write for BIF output. The media mount may be read-only. Follow [the Plex mount checks](https://mediapreviewgenerator.dev/guides/previews-readiness/#plex-config-folder).
 - **Emby previews:** the container needs write access beside each video for the BIF sidecar.
 - **Jellyfin trickplay:** the default writes beside the video. [Off-media mode](https://mediapreviewgenerator.dev/guides/previews-readiness/#jellyfin-config-folder) needs a writable Jellyfin config mount and the Media Preview Bridge plugin; the media may then stay read-only.
-- **Plex markers and chapter thumbnails:** the relevant [Plex helper setup](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-marker-agent) supports operations that must happen beside Plex. Check each feature's requirements before enabling it.
-- **Plex loudness:** this is a same-machine exception. It requires local Plex 1.43.4.x or 1.43.5.x database access; helper and network-mounted database configurations are unsupported. See [Plex loudness requirements](https://mediapreviewgenerator.dev/plex-loudness-normalization/).
+- **Plex markers and chapter thumbnails:** a [Plex database node](https://mediapreviewgenerator.dev/guides/#plex-on-another-machine-the-plex-database-node) supports operations that must happen beside Plex. Check each feature's requirements before enabling it.
+- **Plex loudness:** it requires Plex 1.43.4.x or 1.43.5.x database access, either local or through a Plex database node (version 1.2.0 or newer); network-mounted databases are unsupported. See [Plex loudness requirements](https://mediapreviewgenerator.dev/plex-loudness-normalization/).
 
 Start with one file and watch both the worker's activity and each server's saved result. A network
 share, slow disk or server indexing delay can be the limit even when the GPU has spare capacity.
@@ -4397,6 +4546,7 @@ Complete reference for all configuration options and REST API endpoints.
 - [Configuration Priority](https://mediapreviewgenerator.dev/reference/#configuration-priority)
 - [Media Servers](https://mediapreviewgenerator.dev/reference/#media-servers)
 - [Processing Options](https://mediapreviewgenerator.dev/reference/#processing-options)
+- [Nodes](https://mediapreviewgenerator.dev/reference/#nodes)
 - [Environment Variables](https://mediapreviewgenerator.dev/reference/#environment-variables)
 - [Web Interface Settings](https://mediapreviewgenerator.dev/reference/#web-interface-settings)
 - [Webhook Settings](https://mediapreviewgenerator.dev/reference/#webhook-settings)
@@ -4494,8 +4644,8 @@ Per-vendor notes:
 Plex's `output.chapter_thumbnails` setting is a JSON boolean, default `false`.
 The API rejects strings such as `"false"` and numeric values. The **Chapter thumbnails** section in
 **Servers → Edit → Processing** controls it. It adds chapter images to existing Previews jobs and updates existing
-chapter image references in Plex's database. It requires a supported local Plex database or a compatible configured
-Plex helper; Intro & Credits can stay off. Currently supported: Plex Media Server **1.43.4.x or 1.43.5.x**.
+chapter image references in Plex's database. It requires a supported local Plex database, or a Plex database node beside
+a Plex on another machine; Intro & Credits can stay off. Currently supported: Plex Media Server **1.43.4.x or 1.43.5.x**.
 See the [chapter thumbnail guide](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails) for setup and retry behavior.
 
 > **Runtime state, not persisted.** Whether Jellyfin's Media Preview Bridge plugin is installed
@@ -4541,6 +4691,7 @@ worker count and allowed jobs.
 | `device` | GPU device identifier for a GPU member. `null` for CPU. |
 | `count` | Integer 1–64. Remove the member to use zero. |
 | `job_types` | At least one of `previews`, `intro_credits`, `loudness`. GPU members cannot take `loudness`. |
+| `node` | The `id` of a [node](https://mediapreviewgenerator.dev/reference/#nodes) to run this member's workers on that machine's CPU or GPU. Left out for this app's own devices. One member per device on each machine. |
 
 On a group with exactly one member, `GET` also echoes that member's `resource`, `device`, `count` and `job_types` at the
 group level (read-only, kept for older clients). `PUT` accepts a group without `members` that carries those four
@@ -4549,7 +4700,47 @@ is rejected with `400`.
 
 Up to 64 groups. An empty list is valid and means no workers. Overlapping windows in one group form a union;
 different groups and devices add their counts. A save is refused when the weekly peak would exceed 64 CPU or 64 GPU
-workers. These are worker slots, not CPU cores.
+workers on one machine (this app, or any one node). These are worker slots, not CPU cores.
+
+## Nodes
+
+Other machines that run work for this app, added on the **Nodes** page (see the
+[remote nodes guide](https://mediapreviewgenerator.dev/guides/#remote-nodes)). A worker node runs the files sent to it; a Plex database node opens
+Plex's database for a Plex on another machine or on Windows. Stored in `settings.json["nodes"]`, a list of:
+
+| Field | Rules |
+|---|---|
+| `id` | Made by the app. Worker group members (`node`) and Plex servers (`markers.plex.agent.node_id`) use it. A record written into the file without one gets one when the app starts. |
+| `node_uid` | The id the machine reported last; recorded by the app, never posted. Each request to a Plex database node names it, so another machine answering at that address refuses the request and writes nothing. |
+| `name` | 1–80 characters, no line breaks, tabs or hidden characters. Unique: names that look the same (`Café`, `CAFÉ`) count as one. |
+| `url` | `http` or `https` address, e.g. `http://nuc.lan:9494`. A trailing `/` is dropped and the scheme and host are lower-cased. 400 for a query string, fragment, username or password, or a host name that can't be used. |
+| `key` | The node's key: its `NODE_KEY`, or the key it printed in its log on first start. Up to 200 printable ASCII characters, no spaces. Never returned or logged; posting `****` (or leaving it out) keeps the stored key. |
+| `enabled` | Boolean. A node turned off is never checked and gets no work. |
+| `path_mappings` | Up to 50 rows of `{"app_prefix", "node_prefix"}`: a folder as this app sees it (starts with `/`) and the same folder as the node sees it (a Windows path such as `D:\Media` is fine). |
+| `added_at` | When it was added. |
+
+`nodes_revision` goes up by one on every change. A node that a worker group member or a Plex server uses can't be
+removed (`409`, naming what uses it).
+
+### A node's own settings
+
+Environment variables of the node's container (the app's image started with `MODE=node`, or the
+[Plex database node](https://mediapreviewgenerator.dev/reference/#plex-marker-agent) image). See the [remote nodes guide](https://mediapreviewgenerator.dev/guides/#remote-nodes).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MODE` | | `node` starts the app's image as a node instead of the app. |
+| `NODE_NAME` | the hostname | The name the node reports; Add node suggests it. |
+| `NODE_ROLES` | `worker` | `worker`, `plex_db`, or both: `worker,plex_db`. |
+| `NODE_KEY` | made on first start | The key the app sends: 16 to 200 printable ASCII characters, no spaces. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
+| `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. `::` listens on IPv6 only. |
+| `NODE_PORT` | `9494` | The port the node listens on inside the container; change the published port (`-p`) to match. |
+| `NODE_TEMP_DIR` | `/tmp/mpg-node` | Where a worker node makes a folder for each file it is sent. Point it at a bigger or faster disk, or at a volume in a read-only container. |
+| `FILE__<NAME>` | | Sets `<NAME>` to the contents of the file it names (a Docker secret), e.g. `FILE__NODE_KEY=/run/secrets/node_key`. |
+| `PUID` / `PGID` | `1000` | The user the node runs as: one that can read your media and, for the Plex database role, owns Plex's database. The Plex database image reads them only through its compose file; with `docker run`, use `--user <uid>:<gid>`. |
+| `PLEX_CONFIG_DIR` | | Plex database role: Plex's config folder as the container sees it. The database path is derived from it; the app never sends a path. |
+| `CONFIG_DIR` | `/config` | The node's own folder: its id, its key and the loudness undo record. Mount it so they survive an update. |
+| `LOG_LEVEL` | `INFO` | How much the node logs; `DEBUG` for more. |
 
 ### Per-GPU tuning (gpu_config)
 
@@ -4678,6 +4869,7 @@ These are not migrated to settings.json and remain in effect:
 | `PLEX_DATA_ROOT` | `/` | Restricts where Plex config folders can be validated. Defaults to the whole filesystem; set it to e.g. `/plex` to refuse anything outside that root. |
 | `MEDIA_ROOT` | `/` | Same as `PLEX_DATA_ROOT` but for media paths (manual jobs, the inspector, the file picker). |
 | `RATELIMIT_STORAGE_URL` | `memory://` | Backend for rate-limit counters. The default in-memory store is fine for a single container. |
+| `REQUESTS_CA_BUNDLE` | Built-in list | A certificate file the app trusts for https instead of its built-in list, e.g. for a [node behind https](https://mediapreviewgenerator.dev/guides/#a-node-behind-a-reverse-proxy) with your own certificate. Keep the public authorities in it: it applies to every https connection. |
 | `CONFIG_BACKUP_KEEP` | `10` | Snapshots kept per config file. Used only until you set it in **Settings → Backups**. 1–100. |
 | `CONFIG_BACKUP_MAX_AGE_DAYS` | `0` | Drop snapshots older than this many days (`0` = off). Used only until you set it in **Settings → Backups**. 0–365. |
 
@@ -4838,7 +5030,7 @@ is separate from the Previews column's `libraries[].enabled`.
   "plex": {
     "db_write_confirmed_at": null,
     "on_plex_redetect": "restore",
-    "agent": {"enabled": false, "url": "", "token": ""}
+    "agent": {"enabled": false, "node_id": null}
   }
 }
 ```
@@ -4854,29 +5046,29 @@ An Emby server's block has `"emby": {"on_emby_redetect": "restore"}` in place of
 | `emby.on_emby_redetect` | `"restore"` \| `"keep_emby"` | `"restore"` | Edit → Processing → Intro & Credits "When Emby has its own markers": `restore` is "Use ours", `keep_emby` is "Keep Emby's". Markers from Emby's own intro detection (Emby Premiere) or another plugin: `restore` has the Media Preview Bridge for Emby plugin replace them with ours (`ReplaceOwn`); `keep_emby` leaves a type Emby has markers of and shows ours only for the other types (row message e.g. "1 marker(s); keeping Emby's intro"). The plugin still stores ours for a kept type and shows them once Emby's are gone; the next job that checks the file records them as ours again (or writes them, when it finds none of Emby's left). Remembered per server item in `markers.db`. **A marker you adjust or lock in the Inspector overrides this setting for its type**: it is sent with `ReplaceOwn` anyway and the row says "Replaced Emby's own marker…". |
 | `plex.db_write_confirmed_at` | ISO-8601 timestamp \| `null` | `null` | Set once the one-time "Send intro & credits markers to Plex?" confirmation is accepted. Clearing it while `enabled` stays `true` in the same request is rejected (400) — send `enabled: false` in the same PUT to revoke. |
 | `plex.on_plex_redetect` | `"restore"` \| `"keep_plex"` | `"restore"` | Edit → Processing → Intro & Credits "When Plex has its own markers": `restore` is "Use ours", `keep_plex` is "Keep Plex's". What a job does when Plex shows markers of a decided type that aren't ours: `restore` writes ours over them; `keep_plex` keeps Plex's markers of that type on every later run (forced ones included) until the setting is switched to `restore` or Plex has none of that type left (row message e.g. "Keeping Plex's credits", or "1 marker(s); keeping Plex's credits"). Under `keep_plex`, "not ours" means not what the job would write and not what the item record says this app left there, so markers on an item with no record of that type (a first publish, a reset `markers.db`, a re-added server) are kept too. Decided per type, and remembered per server item in `markers.db`. Markers that are gone are written again either way. A type whose every Plex marker can't be right for the file (it starts or ends after the file does, or has no length) is never kept: the file is read for that type and ours are written. A type whose Plex markers were made for an earlier file at the path (no `pv:` record of them on the file Plex has now, and older than its `media_parts.updated_at`) doesn't stop the file being read and isn't a second opinion; ours replaces it when the file gives an answer (row message e.g. "Replaced Plex's intro: it was detected for an earlier file"), and it is kept when it gives none. **A marker you adjust or lock in the Inspector overrides this setting for its type**: its rows and `pv:` key are written over Plex's own and the row says "Replaced Plex's own marker…". |
-| `plex.agent` | object | `{"enabled": false, "url": "", "token": ""}` | Edit → Connection → Plex helper: a [Plex marker agent](https://mediapreviewgenerator.dev/reference/#plex-marker-agent) beside a Plex on another machine, which does the database write there. Plex servers only. |
-| `plex.agent.enabled` | bool | `false` | `true` needs `url` and `token` set (400 otherwise: "Set the Plex marker agent's address and shared key before turning it on"). The database-write confirmation (`plex.db_write_confirmed_at`) still applies. |
-| `plex.agent.url` | string | `""` | `http` or `https` address, e.g. `http://plex-host.lan:9494`. A trailing `/` is dropped. 400 for a query string, fragment, or a username/password in it. |
-| `plex.agent.token` | string | `""` | The key both sides share (the agent's `AGENT_TOKEN`). Printable ASCII, no spaces. `GET`/`POST` return a set key as `****`; posting `****` (or leaving `token` out) keeps the stored key. Never logged. |
+| `plex.agent` | object | `{"enabled": false, "node_id": null}` | Edit → Connection → Plex database: which [Plex database node](https://mediapreviewgenerator.dev/reference/#plex-marker-agent) opens this Plex's database, for a Plex on another machine or on Windows. Plex servers only. The node's address and key are on its record in [`nodes`](https://mediapreviewgenerator.dev/reference/#nodes). |
+| `plex.agent.enabled` | bool | `false` | `false`: this app opens Plex's database itself. `true`: the node named by `node_id` does, for Intro & Credits, chapter thumbnails, loudness and Library Health counts. `true` needs `node_id` (400 otherwise: "Choose the node that opens this Plex server's database before turning it on"). The database-write confirmation (`plex.db_write_confirmed_at`) still applies. |
+| `plex.agent.node_id` | string \| `null` | `null` | The `id` of a node in `nodes`. A newly chosen node must still be on the Nodes page and, once it has answered, have its Plex database role on (400 otherwise). Kept while `enabled` is `false`. An older block holding `url` and `token` becomes a node when the app upgrades. |
 
-### Plex marker agent
+### Plex database node
 
-The small container for a Plex on another machine (`plex-marker-agent/`, image `ghcr.io/stevezau/plex-marker-agent`). Its
-setup, compose file, build steps, version rules and endpoint contract are in its
-[README](https://github.com/stevezau/media_preview_generator/blob/dev/plex-marker-agent/README.md); the app side is `media_preview_generator/markers/publishers/plex_remote.py`.
-The agent's own settings:
+The small container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`),
+added on the Nodes page and chosen per server in `plex.agent`. Its setup, compose file, build steps and version rules
+are in its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md); the app
+side is `media_preview_generator/markers/publishers/plex_remote.py`. Its settings are a node's own
+([A node's own settings](https://mediapreviewgenerator.dev/reference/#a-nodes-own-settings)), plus:
 
 | Variable | Notes |
 |---|---|
-| `AGENT_TOKEN` | Required. The key both sides share (Bearer token); it is what the app's `plex.agent.token` must equal. Never logged. |
-| `PLEX_CONFIG_DIR` | Plex's config folder as the agent's container sees it. The database path is derived from it; the app never sends a path. |
-| `PLEX_CONFIG` | Compose only: Plex's config folder on the agent's host, mounted at `/plex`. Required. |
-| `AGENT_PORT` | Port to listen on. Default `9494`. |
+| `AGENT_TOKEN` | The key's name from the Plex marker agent; still works when `NODE_KEY` isn't set. |
+| `AGENT_PORT` | The port's name from the Plex marker agent; still works when `NODE_PORT` isn't set. |
+| `PLEX_CONFIG` | Compose only: Plex's config folder on the node's host, mounted at `/plex`. Required. |
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
-| `PUID` / `PGID` | The user that owns Plex's database. Default `1000`. |
 
-Every request carries `Authorization: Bearer <AGENT_TOKEN>` and `X-Marker-Agent-Protocol: 1`, and every answer carries
-the agent's version and the protocols it speaks; a mismatch in either direction is refused before anything is written.
+Every request carries the key and the protocol the app speaks, and every answer carries the node's version and the
+protocols it speaks; a mismatch in either direction is refused before anything is written. Once the app has recorded
+the node's id (`node_uid`), every request names it too (protocol 2): another machine given the same key and address
+refuses the request before anything is written, and the app checks the node again while that work waits.
 
 ### Job kind `intro_credits`
 
@@ -5054,7 +5246,7 @@ libraries only).
 **Response:** `200` with `server_id`, `server_type`, `enabled`, `settings` (as stored), `capability` (`{state,
 message, details, warning}`, checked as if Intro & Credits were already on — one of `ready`, `disabled`,
 `needs_confirmation`, `needs_plugin`, `plugin_outdated`, `needs_pass`, `needs_local_db`,
-`agent_unavailable` (the Plex marker agent didn't answer, refused the key, is the wrong version or is beside another Plex),
+`agent_unavailable` (the Plex database node didn't answer, refused the key, is the wrong version or is beside another Plex),
 `needs_plex_detection_once`, `unsupported_schema`, `unreachable`, `misconfigured`, or `unknown` when the check itself
 failed; `warning` is `""` unless a `ready` Plex couldn't confirm Plex Pass, in which case jobs wait instead of
 writing; on Emby, `needs_plugin` carries `details.catalog_listed`: `true` when Emby's plugin catalog lists the plugin,
@@ -5279,14 +5471,14 @@ or low"}`. `503` when the config directory isn't writable (checked before the bo
 
 ## Plex loudness
 
-Audio loudness analysis on this app's eligible CPU worker groups ([Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/)). Plex servers only; set up in **Servers → Edit → Processing → Loudness**;
+Audio loudness analysis on eligible CPU worker groups (this app's or its nodes') ([Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/)). Plex servers only; set up in **Servers → Edit → Processing → Loudness**;
 off until turned on per server.
 
 ### Per-server settings (`media_servers[].loudness`)
 
 | Key | Type | Notes |
 |---|---|---|
-| `enabled` | bool | Default `false`. Independent of Intro & Credits and its write confirmation. Requires a local Plex 1.43.4.x or 1.43.5.x database on the same machine; the Plex helper (`markers.plex.agent.enabled`) is unsupported. Setup Health checks readiness. |
+| `enabled` | bool | Default `false`. Independent of Intro & Credits and its write confirmation. Requires Plex 1.43.4.x or 1.43.5.x, with its database on this machine, or a Plex database node (`markers.plex.agent`, version 1.2.0 or newer) beside a Plex on another machine. Setup Health checks readiness. |
 | `library_ids` | array of strings \| `null` | Libraries it goes to. `null` = every movie and TV library. An explicit list selects video libraries only; known music and other non-video types are refused. |
 
 ### Job kind `loudness`
@@ -5304,7 +5496,9 @@ loudness worker is free. File outcomes:
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
 | `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
+| `loudness_skipped` | Plex lists the file as a trailer or other extra. Plex doesn't take loudness for extras. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
+| `skipped_source_gone` | The file isn't on disk because a newer file replaced it, or an import webhook said it was deleted. No retry. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |
 
 ### Plex loudness Endpoints
@@ -5700,7 +5894,7 @@ All endpoints use the normal session/API authentication and are also available d
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, current `capacity`, `warnings` and global pause state |
+| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, `nodes` (each added node's id, name, state and reason, with its GPUs and CPU cores, for the device picker; never its address or key), current `capacity`, `warnings` and global pause state |
 | PUT | `/api/worker-groups` | Replace the complete group list with `{"groups":[...],"revision":N}`. `400` rejects invalid configuration; `409` means another change advanced the revision. Reload and reconcile before resubmitting. |
 | POST | `/api/worker-groups/{id}/scale` | Atomic saved adjustment: exactly `{"delta":1}`, `{"delta":-1}` or `{"enabled":true/false}`. `delta` works on single-member groups; on a group with several members it returns `409` (use the member route). `404` for an unknown group, `400` for an invalid action or capacity limit. |
 | POST | `/api/worker-groups/{id}/members/{member_id}/scale` | Add or remove one worker on one device: exactly `{"delta":1}` or `{"delta":-1}`. `404` for an unknown group or member, `409` when the group is disabled, `400` outside 1–64 workers or past a capacity limit. |
@@ -5744,6 +5938,31 @@ the separate master hold.
 Persisted pending capacity waits and their saved checkpoints are restored independently of
 `auto_requeue_on_restart`. Pending dependency followers also retain their waiting state. This does not clear manual,
 schedule or global holds. Ordinary interrupted running jobs continue to follow the automatic crash-requeue setting.
+
+### Nodes Endpoints
+
+API token or session, like every other route. A `NODE_ROW` is a node's `id`, `name`, `url`, `enabled`, `state` and
+plain `reason`, `version`, `roles`, `legacy` (an older Plex database node that only answers `/v1/ping`), `platform`,
+`gpus`, `cpu`, `busy`, `last_seen`, `checking` (a check is running or queued), `path_mappings`, `used_by`
+(`{"groups": [...], "servers": [...]}`), `to_fix` (`{"must_fix": n, "recommended": n}`, its Setup Health counts) and
+`edit_tag`. It never holds the key.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/nodes` | Every node as a `NODE_ROW`, and this app's `app_version`. |
+| POST | `/api/nodes/probe` | `{"url", "key"}` (and `id` to reuse a saved node's key with `****`): what answers there. Nothing is saved. |
+| POST | `/api/nodes` | Add a node (the [`nodes`](https://mediapreviewgenerator.dev/reference/#nodes) fields). `201` with its row; `400` for an invalid field; `409` when the machine answering there is already added. |
+| PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. With the row's `edit_tag`, `409` when the node was saved from somewhere else since that row was read. |
+| DELETE | `/api/nodes/{id}` | Remove it. `409` with `used_by` while a worker group member or a Plex server uses it. |
+| POST | `/api/nodes/check` | Check every turned-on node in the background; `202` at once. Each row's `checking` is `true` until its check ends. |
+| POST | `/api/nodes/{id}/check` | Check it in the background; `202` at once. Its row's `checking` is `true` until the check ends. |
+| POST | `/api/nodes/{id}/rescan-gpus` | Ask it to detect its GPUs again; answers with the fresh row. |
+| POST | `/api/nodes/{id}/test-access` | Sample every enabled library and ask the node to find each file, with its saved `path_mappings` or posted ones. |
+| GET | `/api/nodes/{id}/suggested-mappings` | Rows to pre-fill for a node with none saved: one per library folder, the same path on the node. |
+| GET | `/api/nodes/{id}/health` | Its Setup Health. |
+| GET | `/api/nodes/{id}/log` | Its last `lines` (1–2000, default 200) log lines, oldest first, as `{time, level, message}`. |
+
+An unknown `id` is `404`.
 
 ### Processing state (global pause)
 
@@ -6439,7 +6658,7 @@ unless noted.
 | POST | `/api/jobs/cancel-bulk` | Cancel several waiting, paused or running jobs. Body `{"job_ids": ["..."]}` (1 to 500 ids, otherwise `400`). Finished and unknown jobs are skipped. Returns `{"cancelled": [ids], "skipped": [{"id": "...", "reason": "not_found" \| "not_active (<status>)"}]}`. |
 | POST | `/api/jobs/clear` | Delete finished jobs. Optional body `{"statuses": ["completed", "failed", "cancelled"]}` (default: all three), or `{"job_ids": ["..."]}` to delete only those jobs (not both). With `job_ids`, only finished jobs are removed; others come back in `skipped`. Returns `{"success": true, "cleared": N}`; the `job_ids` form also returns `removed` (ids deleted, including finished retry rows of a cleared chain head) and `skipped` (`[{"id": "...", "reason": "not_found" \| "not_finished (<status>)" \| "retry_in_progress"}]`). |
 | GET | `/api/jobs/stats` | Counts of visible jobs: `total`, `pending`, `running`, `completed`, `failed`, `cancelled` (retry attempts are not counted separately) |
-| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
+| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`, and `node` (`{"id", "name"}`), `node_state` and `node_cause` (why an offline node is offline: `restarting`, `rate_limited`...) for a node's worker, `null` for this app's). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
 | POST | `/api/workers/add` · `/api/workers/remove` | Scaling by type: `{"worker_type":"CPU"\|"GPU","count":N,"group_id":"..."}`. Changes a saved group; omit `group_id` only when exactly one group matches the resource. Ambiguous selection returns `409`. Busy removed workers finish their current file. |
 | POST | `/api/jobs/{id}/workers/add` · `/api/jobs/{id}/workers/remove` | Aliases of the above for a running job; select the group as above. Changes the shared saved group, not a temporary allocation exclusive to that job. |
 
@@ -6458,7 +6677,7 @@ unless noted.
 | POST | `/api/settings/validate-plex-config-folder` | Pre-flight a Plex config folder (looks for `Cache/Media/Metadata`). Body `{"path": "..."}` |
 | POST | `/api/settings/validate-jellyfin-config-folder` | Pre-flight a Jellyfin config folder. Body `{"path": "..."}` |
 | GET | `/api/settings/backups` | List the backups of each config file (`settings.json`, `schedules.json`, `webhook_history.json`, `setup_state.json`) |
-| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. |
+| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. A backup that can't be read, or one a newer version saved, is refused with `409` and nothing changes. |
 | POST | `/api/setup/skip` | Skip the setup wizard (advanced — saves `setup_complete=true` with minimal state) |
 | POST | `/api/setup/validate-paths` | Pre-flight wizard path fields in bulk |
 | POST | `/api/setup/preview-file-path` | Resolve one real file against draft mappings and report container file/read-access status; does not save or start processing |
@@ -6580,7 +6799,7 @@ Not with Plex itself: Plex documents no GPU option for this job. Media Preview G
 
 ### How do I make Jellyfin trickplay generation faster?
 
-Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, on another machine if you like, and tell Jellyfin about them. [More: Faster Jellyfin trickplay](https://mediapreviewgenerator.dev/jellyfin-trickplay-gpu/)
+Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](https://mediapreviewgenerator.dev/jellyfin-trickplay-gpu/)
 
 ### Does Emby's thumbnail extraction use the GPU?
 
@@ -6668,7 +6887,7 @@ Yes. The app supports Plex, Emby, and Jellyfin — alone or in any combination. 
 
 Yes, on Plex, Emby and Jellyfin, once you turn it on for each server. What each server needs:
 
-- **Plex**: needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the same machine as Plex, or the Plex marker agent runs there for it.
+- **Plex**: needs Plex Pass on the server, and for viewers (or their Plex Home). The app runs on the same machine as Plex, or a Plex database node runs there for it.
 - **Jellyfin** 10.11 or 12.0: the Media Preview Bridge plugin.
 - **Emby** 4.9 or 4.10: the Media Preview Bridge for Emby plugin. Skip Intro also needs Emby Premiere, which is Emby's rule; Skip Credits doesn't.
 

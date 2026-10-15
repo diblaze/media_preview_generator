@@ -46,6 +46,7 @@ from ..config.paths import expand_path_mapping_candidates
 from ..markers.external_ids import ids_from_path, is_extra
 from ..markers.fs import gone_from_disk
 from ..markers.missing import disk_roots, library_folders
+from ..nodes import executor, remote_ops
 from ..output import BifBundle, EmbyBifAdapter, JellyfinTrickplayAdapter, PlexBundleAdapter
 from ..output.base import OutputAdapter
 from ..output.journal import (
@@ -64,9 +65,12 @@ from .generator import (
     NO_DECODER_SUMMARY,
     CancellationError,
     CodecNotSupportedError,
+    WorkingFolderError,
+    _clean_output_images,
     _cleanup_temp_directory,
     generate_images,
     gpu_fallback_announcement,
+    working_folder_failure,
 )
 from .plex_refresh import enqueue_plex_refresh, wait_for_plex_refresh
 
@@ -808,7 +812,7 @@ def _try_reuse_existing_bif(
         publishers: ``[(server, adapter, item_id_hint), ...]`` from the
             normal publisher resolution step.
         canonical_path: The source media file we're trying to publish.
-        out_dir: Frame-cache slot to unpack into. Must be safe to overwrite.
+        out_dir: Frame-cache slot to unpack into; its JPEGs are removed first.
         probe_bundle_factory: Zero-arg callable returning a placeholder
             :class:`BifBundle` for ``compute_output_paths`` (the Plex bundle
             path reads the canonical_path and, for bulk scans, the server hash).
@@ -881,6 +885,8 @@ def _try_reuse_existing_bif(
                 continue
             try:
                 os.makedirs(out_dir, exist_ok=True)
+                # BIF writers pack every .jpg in the folder: frames a stopped run or a failed unpack left would follow.
+                _clean_output_images(out_dir)
                 count = unpack_bif_to_jpegs(candidate_str, out_dir)
             except Exception as exc:
                 logger.warning(
@@ -2015,6 +2021,10 @@ def _process_canonical_path_previews(
     cache_hit: bool = False
     cleanup_path: str | None = None
     generation_lock = None
+    # The extraction and a sibling BIF's unpack empty the cache slot first. Until frames are stored again, an entry left
+    # from before (a regenerate skips the lookup) describes frames that are gone, and frames written since have no
+    # entry, so a run that stops short drops the entry and the slot folder.
+    slot_emptied = False
 
     # Acquire the per-path lock first (when caching is on) so the
     # subsequent cache.get / frame_dir_for / os.makedirs can't raise
@@ -2071,6 +2081,7 @@ def _process_canonical_path_previews(
             # publisher means *its* BIF is stale, so unpacking it would
             # serve frames from the previous source-file revision.
             unpack_dest = str(cache.frame_dir_for(canonical_path))
+            slot_emptied = True
             recovered = _try_reuse_existing_bif(
                 publishers,
                 canonical_path,
@@ -2092,6 +2103,7 @@ def _process_canonical_path_previews(
                     extraction_key=extraction_key,
                     source_fingerprint=source_fingerprint,
                 )
+                slot_emptied = False
                 _phase("Reusing sibling BIF")
                 logger.info(
                     "Frames: REUSED from existing BIF for {} ({} frames, no FFmpeg)",
@@ -2124,8 +2136,11 @@ def _process_canonical_path_previews(
                 gpu_device_path or "-",
                 tmp_path,
             )
+            # A remote worker's frames come from its node; everything around them stays here.
+            extract = remote_ops.generate_images if executor.current_placement() else generate_images
+            slot_emptied = use_frame_cache
             try:
-                gen_result = generate_images(
+                gen_result = extract(
                     canonical_path,
                     tmp_path,
                     gpu,
@@ -2148,6 +2163,15 @@ def _process_canonical_path_previews(
                 # worker's CancellationError handler records it cleanly.
                 logger.info("Frame extraction cancelled for {} — stopping this file.", canonical_path)
                 raise
+            except (executor.NodeUnavailableError, executor.FileNotVisibleError):
+                raise  # not this file's failure: the worker gives it back to the queue
+            except WorkingFolderError as exc:
+                # The folder's condition, not the file's: no traceback, and nothing of the run is published.
+                message = working_folder_failure(exc, getattr(config, "tmp_folder", None))
+                logger.error("{}: {}", canonical_path, message)
+                return MultiServerResult(
+                    canonical_path=canonical_path, status=MultiServerStatus.FAILED, message=message
+                )
             except Exception as exc:
                 if not os.path.isfile(canonical_path):
                     # It passed the up-front check and went away since (an upgrade replacing it mid-run).
@@ -2164,7 +2188,7 @@ def _process_canonical_path_previews(
                     "This file will be marked failed and skipped — the rest of the queue keeps running. "
                     "Common causes: corrupt video file, unsupported codec, or a crash inside FFmpeg's "
                     "hardware acceleration. The traceback above shows the exact failure; if it keeps "
-                    "happening on the same file try toggling hardware acceleration off in Settings → Processing Options → GPU Configuration.",
+                    "happening on the same file try toggling hardware acceleration off in Settings → Processing Options → GPU device tuning.",
                     canonical_path,
                     type(exc).__name__,
                     exc,
@@ -2231,6 +2255,7 @@ def _process_canonical_path_previews(
                 extraction_key=extraction_key,
                 source_fingerprint=source_fingerprint,
             )
+            slot_emptied = False
 
         # ``width``/``height`` are documentation-only on BifBundle —
         # adapters that need real frame dimensions (Jellyfin tile-grid)
@@ -2409,6 +2434,8 @@ def _process_canonical_path_previews(
         # entries persist for TTL so subsequent webhooks hit them.
         if cleanup_path is not None:
             _cleanup_temp_directory(cleanup_path)
+        if slot_emptied:
+            cache.invalidate(canonical_path)
         # Release the generation lock so waiting concurrent dispatchers
         # for the same canonical path can wake up and hit the now-
         # populated cache.
@@ -2480,10 +2507,6 @@ def process_canonical_path(
 
     from .chapters import ChapterOutcome, _failure, chapter_work_needed, prepare_chapters, publish_chapters
 
-    # Retry jobs complete the still-missing artifacts, even when their
-    # original dispatch was an explicit regeneration.
-    force = regenerate and retry_attempt == 0
-    options["regenerate"] = force
     plans = {}
     planning_failures = {}
 
@@ -2506,7 +2529,7 @@ def process_canonical_path(
                     item_id_hint=bare_hint,
                     cancel_check=cancel_check,
                     trust_server_hash=_is_bulk_scan(source, config),
-                    regenerate=force,
+                    regenerate=regenerate,
                     source_fingerprint=fingerprint,
                     reuse_recent_checks=True,
                 )
@@ -2547,7 +2570,7 @@ def process_canonical_path(
         prepare(result.canonical_path)
     if plans:
         preparing_chapters()
-    needs_chapters = any(chapter_work_needed(plan, regenerate=force) for plan in plans.values())
+    needs_chapters = any(chapter_work_needed(plan, regenerate=regenerate) for plan in plans.values())
     if check_only and not needs_chapters:
         needs_chapters = any(
             publisher.plex_refresh_requested
@@ -2616,13 +2639,13 @@ def process_canonical_path(
                         item_id_hint=plan.target.rating_key if plan.target else None,
                         cancel_check=cancel_check,
                         trust_server_hash=_is_bulk_scan(source, config),
-                        regenerate=force,
+                        regenerate=regenerate,
                     )
-                    had_work = chapter_work_needed(plan, regenerate=force)
+                    had_work = chapter_work_needed(plan, regenerate=regenerate)
                     outcome = publish_chapters(
                         plan,
                         config,
-                        regenerate=force,
+                        regenerate=regenerate,
                         cancel_check=cancel_check,
                         pause_check=pause_check,
                         ffmpeg_threads_override=ffmpeg_threads_override,

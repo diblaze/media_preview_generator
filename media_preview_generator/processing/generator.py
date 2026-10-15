@@ -13,6 +13,9 @@ Public API consumed elsewhere:
 - :class:`ProcessingResult` — outcome enum used by counters/UI badges
 - :class:`CodecNotSupportedError`, :class:`CancellationError` — sentinel
   exceptions the worker catches to drive its in-place GPU→CPU fallback
+- :class:`WorkingFolderError` — FFmpeg couldn't write the thumbnails (a full
+  or read-only working folder, or one this user may not write to); nothing of
+  that run is published
 - :func:`generate_images` — the per-item entry point
 - :func:`generate_bif` — pure JPG-folder → BIF packer used by output
   adapters that need a BIF without going through the FFmpeg pipeline
@@ -24,8 +27,10 @@ Public API consumed elsewhere:
 import array
 import contextlib
 import contextvars
+import errno
 import glob
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -37,7 +42,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+import xml.etree.ElementTree as ET
+from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
 from typing import Any, Protocol
 
@@ -45,6 +51,7 @@ from loguru import logger
 
 from ..config import Config
 from ..shutdown import is_shutting_down
+from ..utils import cpu_workers_hint, debug_logging_hint, gpu_details_hint, is_node_mode, working_folder_hint
 from .ffmpeg_runner import GPU_CANT_DECODE_LINE, STALL_WATCHDOG_LINE
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
@@ -52,6 +59,7 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
     build_hdr10_zscale_chain,
+    rotation_filter,
 )
 from .hdr_detection import (
     is_dolby_vision,
@@ -162,10 +170,43 @@ FFMPEG_SIGNALLED_EXIT = 255
 # AVERROR(EIO): a read or write failed. A GPU decoder or an OpenCL filter that fails exits with it too; only the stderr
 # tells the two apart (``_was_interrupted``).
 FFMPEG_IO_ERROR_EXIT = 251
+# The errors a thumbnail write fails with when the folder is the problem: full, over its quota, read-only, or not
+# writable by the user this runs as (PUID/PGID). FFmpeg exits with AVERROR(errno), which the OS reports in 8 bits
+# (Linux, macOS) or 32 (Windows): ENOSPC 228, EROFS 226. Only a write fails with those two (the video is only read), so
+# their exit codes are the working folder's, never the file's. EDQUOT's 134 is also a wrapper shell's SIGABRT, so only
+# its text in the stderr counts. A video this user may not read exits EACCES's 243 too, so a permission error is the
+# folder's only on a line about the output, or when the folder itself refuses a new file.
+FOLDER_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES, errno.EPERM})
+# The ones that say this user may not write there, rather than that the folder can't take a write.
+FOLDER_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
+_FOLDER_WRITE_EXITS = {
+    exit_code: code for code in (errno.ENOSPC, errno.EROFS) for exit_code in (256 - code, 2**32 - code)
+}
+# Their text as FFmpeg prints it (glibc's words; macOS spells EDQUOT's "Disc"). Not os.strerror: Windows has no EDQUOT,
+# and its stand-in's text there is "Unknown error", which any failed run may print.
+_FOLDER_WRITE_TEXT = {
+    errno.ENOSPC: ("No space left on device",),
+    errno.EROFS: ("Read-only file system",),
+    errno.EDQUOT: ("Disk quota exceeded", "Disc quota exceeded"),
+    errno.EACCES: ("Permission denied",),
+    errno.EPERM: ("Operation not permitted",),
+}
+# A line about writing the output: FFmpeg 6.1+ prefixes them [out#N/image2] and [vost#N:M/mjpeg], older builds name
+# the call that failed.
+_OUTPUT_SIDE_RE = re.compile(r"^\[(?:out#|vost#|image2 )|av_interleaved_write_frame\(\)|Error writing trailer")
+# FFmpeg's image2 muxer couldn't create a frame file. It reports that as AVERROR(EIO), exit 251, whatever the real error:
+# a full btrfs, ZFS or XFS folder refuses the new file itself, and so do a read-only one and one this user may not write
+# to (stock FFmpeg 8.0.1 into a chmod 555 folder).
+_FRAME_FILE_NOT_CREATED_RE = re.compile(r"^\[image2 @ [^\]]*\] Could not open file")
+# What the check that asks the folder why writes: a few thumbnails' worth.
+_WRITE_CHECK_BYTES = 1 << 16
 # The signals FFmpeg dies of on the file itself. A crash is deterministic: the same file crashes the same way on every
 # scan. Any other signal (SIGTERM, SIGINT, SIGHUP, the stall watchdog's or an OOM kill's SIGKILL) stopped it from
 # outside, wherever it was. Popen reports a signal as -n; a wrapper shell as 128+n.
-_CRASH_SIGNALS = frozenset({signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS, signal.SIGFPE, signal.SIGILL})
+# By name: Windows has no SIGBUS, and the Plex database tests import this module there too (windows-node.yml).
+_CRASH_SIGNALS = frozenset(
+    getattr(signal, name) for name in ("SIGSEGV", "SIGABRT", "SIGBUS", "SIGFPE", "SIGILL") if hasattr(signal, name)
+)
 
 # FFmpeg's statement that it has no decoder at all for the stream it was asked to decode (previews decode only video).
 # Not "unknown codec": FFmpeg also prints that for audio and subtitle streams of files whose video decodes fine.
@@ -176,6 +217,45 @@ NO_DECODER_PHRASE = "no decoder found for"
 # say the phrase above. The wording in the brackets depends on the build.
 _KEYFRAME_OPTION_UNUSED_RE = re.compile(r"Codec AVOption skip_frame(?::v)? \(.*\) is not a decoding option")
 _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
+# The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
+# in software, nor GPU frames in a format the chain wasn't built for.
+_FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
+# A GPU decoder's own verdict that the GPU lacks the video's codec or profile, after which FFmpeg decodes it in software:
+# NVDEC's for a profile it can't decode (VP8 on Pascal, H.264 High 10 / 4:2:2 / 4:4:4, HEVC 4:2:2) and for H.263,
+# VAAPI's for a codec or profile the driver lacks (MPEG-4 part 2, H.263, VP8 on a UHD 770; H.264 High 10 only at
+# -loglevel debug). Lowercase, as matched.
+_GPU_LACKS_CODEC_VERDICTS = (
+    "hardware is lacking required capabilities",
+    "unsupported codec id",
+    "no support for codec",
+    "not supported for hardware decode",
+)
+# FFmpeg's line after any GPU decoder set-up that failed, the decoder's own verdict that it lacks the codec included.
+_HWACCEL_INIT_FAILED = "hwaccel initialisation returned error"
+# The input's video codec and pixel format as FFmpeg lists them:
+# "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), ...".
+_INPUT_VIDEO_STREAM_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)(?:[^,]*, (\w+))?")
+# Pixel formats other than 4:2:0 (4:2:2, 4:4:4, 4:4:0, RGB, grey). FFmpeg offers most GPU decoders 4:2:0 video only and
+# decodes the rest in software without a word: MPEG-2 4:2:2 on NVDEC and VAAPI, VP9 4:4:4 on NVDEC (jellyfin-ffmpeg
+# 8.1.3 on a Quadro P5000, a TITAN RTX and a UHD 770). Where a GPU does decode one (HEVC 4:4:4 on the TITAN RTX, HEVC
+# 4:2:2 and VP9 4:4:4 on the UHD 770) the GPU scaler takes its frames, so frames of such a video refused by that scaler
+# were decoded in software.
+_NOT_4_2_0_PIXEL_FORMAT_RE = re.compile(r"yuvj?a?4(?:22|44|40)p|gbra?p|gray")
+# The codecs FFmpeg has a GPU decoder for, by ``-hwaccel``: libavcodec's *_nvdec, *_vaapi, *_d3d11va and *_videotoolbox
+# hwaccels (jellyfin-ffmpeg 8.1.3 has the same NVDEC and VAAPI ones). It decodes any other codec in software without a
+# word at -loglevel info: ProRes on CUDA and VAAPI, H.263 and VVC on CUDA, MPEG-1 on VAAPI, DivX 3 and WMV 7/8 on all.
+_GPU_DECODABLE_CODECS = {
+    "cuda": frozenset(
+        {"av1", "h264", "hevc", "mjpeg", "mpeg1video", "mpeg2video", "mpeg4", "vc1", "vp8", "vp9", "wmv3"}
+    ),
+    "vaapi": frozenset(
+        {"av1", "h263", "h264", "hevc", "mjpeg", "mpeg2video", "mpeg4", "vc1", "vp8", "vp9", "vvc", "wmv3"}
+    ),
+    "d3d11va": frozenset({"av1", "h264", "hevc", "mpeg2video", "vc1", "vp9", "wmv3"}),
+    "videotoolbox": frozenset({"av1", "h263", "h264", "hevc", "mpeg1video", "mpeg2video", "mpeg4", "prores", "vp9"}),
+}
+# H.264 profiles FFmpeg offers no VAAPI or D3D11VA decoder for. NVDEC tries them and says it lacks the capabilities.
+_H264_SOFTWARE_ONLY_CHROMA = ("4:2:2", "4:4:4")
 NO_DECODER_SUMMARY = "This file's video can't be decoded by any device (unknown or protected codec)"
 
 # A failure log keeps this many lines from each end: one file's stderr reached 280,594 lines (21 MB).
@@ -192,11 +272,13 @@ FALLBACK_STOPPED_PART_WAY = "stopped_part_way"
 FALLBACK_IO_ERROR = "io_error"
 FALLBACK_STALL = "stall"
 FALLBACK_SIGNAL = "signal"
-# Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder.
-_IO_ERROR_PLACES = (
-    "the disk or network share the video is on, and that the working folder (Settings → Advanced) isn't full and "
-    "is writable"
-)
+
+
+def _io_error_places() -> str:
+    """Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder."""
+    folder, _move = working_folder_hint()
+    return f"the disk or network share the video is on, and that {folder} isn't full and is writable"
+
 
 # ---------------------------------------------------------------------------
 # Failure tracker — collects per-file failure info for end-of-run summary
@@ -455,6 +537,56 @@ class CodecNotSupportedError(Exception):
         self.kind = kind
 
 
+class WorkingFolderError(OSError):
+    """FFmpeg couldn't write the thumbnails: the folder they go to is full, over its quota, read-only, or not writable
+    by the user this runs as.
+
+    Not the file's failure, nor the device's: the run's frames are deleted and no other device or filter chain is
+    tried. An ``OSError`` with the errno (``FOLDER_WRITE_ERRNOS``) and the folder, so a node reports it as its temp
+    folder's problem.
+    """
+
+
+def working_folder_failure(exc: OSError, tmp_folder: str | None = None) -> str:
+    """The sentence a file that couldn't be written to the working folder fails with: the folder, why, and the fix.
+
+    Args:
+        exc: The error, with the folder as its ``filename``.
+        tmp_folder: The app's working folder (``Config.tmp_folder``), where a bigger disk goes (``working_folder_hint``).
+
+    Returns:
+        The sentence.
+    """
+    folder, move = working_folder_hint(tmp_folder)
+    where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
+    why = exc.strerror or os.strerror(exc.errno or 0)
+    if exc.errno == errno.EROFS:
+        state = "is read-only"
+    elif exc.errno in FOLDER_PERMISSION_ERRNOS:
+        state = "can't be written to"
+    else:
+        state = "is full"
+    fix = folder_write_fix(exc.errno)
+    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or {move}."
+
+
+def folder_write_fix(code: int | None) -> str:
+    """What to do about a working folder that refused a thumbnail write, by why it refused.
+
+    Args:
+        code: The errno (``FOLDER_WRITE_ERRNOS``).
+
+    Returns:
+        The fix, worded to start a sentence.
+    """
+    if code == errno.EROFS:
+        return "Make it writable"
+    if code in FOLDER_PERMISSION_ERRNOS:
+        user = "the node's user" if is_node_mode() else "the app's user"
+        return f"Let {user} write to it (in Docker, check PUID and PGID)"
+    return "Free up space there"
+
+
 def gpu_fallback_announcement(kind: str, video_file: str) -> str:
     """The INFO line saying a file is retried on the CPU, worded by why its GPU run was handed off.
 
@@ -473,7 +605,7 @@ def gpu_fallback_announcement(kind: str, video_file: str) -> str:
     if kind == FALLBACK_IO_ERROR:
         return (
             f"FFmpeg hit an I/O error on {video_file} on the GPU — retrying on CPU automatically. If this keeps "
-            f"happening, check {_IO_ERROR_PLACES}."
+            f"happening, check {_io_error_places()}."
         )
     if kind == FALLBACK_STOPPED_PART_WAY:
         return f"The GPU run for {video_file} stopped part-way — retrying on CPU automatically, from the start."
@@ -502,15 +634,15 @@ def gpu_fallback_advice(kind: str) -> str:
             "a slow or failing read slows the CPU retry too."
         )
     if kind == FALLBACK_IO_ERROR:
-        return f"No action needed for one file. If it keeps happening, check {_IO_ERROR_PLACES}."
+        return f"No action needed for one file. If it keeps happening, check {_io_error_places()}."
     if kind == FALLBACK_CODEC:
         return (
             "No action needed — the file will still get a preview, it'll just be slower. If this happens for many "
-            "files, your GPU may not support the codec; consider raising CPU worker count under Settings → CPU."
+            f"files, your GPU may not support the codec; consider raising CPU worker count under {cpu_workers_hint()}."
         )
     return (
         "No action needed — the file will still get a preview, it'll just be slower. If this happens for many files, "
-        "check the GPU driver under Settings → Processing Options → GPU Configuration."
+        f"check the GPU driver under {gpu_details_hint()}."
     )
 
 
@@ -541,7 +673,9 @@ def video_has_no_decoder(stderr_lines: list[str]) -> bool:
     )
 
 
-def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None = None) -> str:
+def _diagnose_ffmpeg_exit_code(
+    returncode: int, stderr_lines: list[str] | None = None, output_folder: str | None = None
+) -> str:
     """Classify FFmpeg exit codes into actionable diagnostics.
 
     Known signal exit codes are explicitly mapped. Values greater than 128
@@ -552,7 +686,9 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
         returncode: FFmpeg process exit code
         stderr_lines: That run's stderr, when the caller has it. It tells a video no device can decode
             (``no_decoder``) from other failures, and exit 251 from a GPU error (``gpu_error``) from a disk's
-            (``io_error``).
+            (``io_error``). A thumbnail write the folder refused (``folder_write_error``) is told by the exit code
+            too.
+        output_folder: The folder the run wrote to, so a permission error can be checked against it.
 
     Returns:
         str: Diagnostic classification string
@@ -572,6 +708,9 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
     }
     if returncode in known_signals:
         return f"signal:{known_signals[returncode]}"
+
+    if _folder_write_errno(returncode, stderr_lines or [], output_folder) is not None:
+        return "folder_write_error"
 
     if stderr_lines and video_has_no_decoder(stderr_lines):
         return "no_decoder"
@@ -638,13 +777,95 @@ def _was_interrupted(returncode: int, stderr_lines: list[str]) -> bool:
     return returncode == FFMPEG_SIGNALLED_EXIT or _is_signal_killed(returncode)
 
 
+def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder: str | None = None) -> int | None:
+    """Why a run couldn't write its thumbnails, when the folder was the problem (``FOLDER_WRITE_ERRNOS``).
+
+    Told by the exit code, or by the error's text on a line about the output: a full folder may cut off the stderr
+    log too, and older FFmpeg builds exit 1 after a failed write. Not by the text alone on any line: Mesa says
+    "Read-only file system" about its shader cache on a read-only root, and the run is fine, and a video this user may
+    not read says "Permission denied" on an input line. When FFmpeg couldn't create a frame file it says only
+    "I/O error", so the folder itself is asked (:func:`_folder_refuses_new_files`).
+
+    Args:
+        returncode: FFmpeg exit code.
+        stderr_lines: That run's stderr.
+        output_folder: The folder the run wrote to, so it can be asked; None to judge by the exit code and text alone.
+
+    Returns:
+        The errno, or None when the run didn't fail on writing.
+    """
+    if returncode <= 0:
+        return None
+    code = _FOLDER_WRITE_EXITS.get(returncode)
+    if code is not None:
+        return code
+    output_lines = [line for line in _without_metadata_tags(stderr_lines) if _OUTPUT_SIDE_RE.search(line)]
+    for code, texts in _FOLDER_WRITE_TEXT.items():
+        if any(text in line for text in texts for line in output_lines):
+            if code == errno.EPERM:
+                # AVERROR(EPERM) is -1, FFmpeg's catch-all, so "Operation not permitted" also ends an encoder's bare
+                # failure: the folder's only when it refuses a new file now.
+                return None if output_folder is None else _folder_refuses_new_files(output_folder)
+            return code
+    if (
+        output_folder is not None
+        and returncode == FFMPEG_IO_ERROR_EXIT
+        and any(_FRAME_FILE_NOT_CREATED_RE.match(line) for line in stderr_lines)
+    ):
+        return _folder_refuses_new_files(output_folder)
+    return None
+
+
+def _folder_refuses_new_files(folder: str) -> int | None:
+    """Whether ``folder`` is full, over its quota, read-only or not writable by this user now, found by writing a small
+    file there and removing it.
+
+    Args:
+        folder: The folder FFmpeg couldn't create a frame file in, its frames not yet deleted.
+
+    Returns:
+        The errno (``FOLDER_WRITE_ERRNOS``), or None when the file was written or failed for another reason.
+    """
+    path = os.path.join(folder, f".write-check-{uuid.uuid4().hex}")
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, bytes(_WRITE_CHECK_BYTES))
+        # NFS only reports a full disk once the bytes are flushed.
+        os.fsync(fd)
+    except OSError as exc:
+        return exc.errno if exc.errno in FOLDER_WRITE_ERRNOS else None
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                os.remove(path)
+    return None
+
+
 def _io_cut_off(returncode: int, stderr_lines: list[str]) -> bool:
     """An I/O error (exit 251) that isn't a GPU error: the video's disk or share, or the working folder, failed."""
     return returncode == FFMPEG_IO_ERROR_EXIT and _was_interrupted(returncode, stderr_lines)
 
 
+def hwaccel_in(args: Sequence[str]) -> str | None:
+    """The GPU decoder an FFmpeg command asks for (``-hwaccel``: ``cuda``, ``vaapi``…), or None for software decode.
+
+    Args:
+        args: An FFmpeg command, or the arguments before its ``-i``.
+
+    Returns:
+        The value after ``-hwaccel``, or None when there is none.
+    """
+    for flag, value in itertools.pairwise(args):
+        if flag == "-hwaccel":
+            return value
+    return None
+
+
 def _gpu_hand_off(
-    rc: int, stderr_lines: list[str], stderr_lines_all: list[str], *, stopped_part_way: bool
+    rc: int, stderr_lines: list[str], stderr_lines_all: list[str], *, stopped_part_way: bool, hwaccel: str | None
 ) -> tuple[str, str] | None:
     """Whether a failed GPU run goes to the CPU, and why.
 
@@ -653,6 +874,7 @@ def _gpu_hand_off(
         stderr_lines: The last run's stderr (with ``STALL_WATCHDOG_LINE`` when the watchdog stopped it).
         stderr_lines_all: Every run's stderr.
         stopped_part_way: A run's frames were discarded, or a run was cut off, before this point.
+        hwaccel: The GPU decoder the run asked for (``hwaccel_in``).
 
     Returns:
         ``(kind, reason)`` for the hand-off (``FALLBACK_*``), or None when the CPU wouldn't do better.
@@ -673,11 +895,17 @@ def _gpu_hand_off(
     )
     if should_fallback and reason == "codec error":
         return FALLBACK_CODEC, reason
+    if _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel, stderr_lines_all):
+        return FALLBACK_CODEC, "codec error"
+    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
     # Judged on the last run's own stderr: a GPU error in an earlier tier's run doesn't make this run's plain 251 one.
     if _io_cut_off(rc, stderr_lines):
         return FALLBACK_IO_ERROR, "I/O error"
     if should_fallback and reason == "hardware accelerator runtime error":
         return FALLBACK_HWACCEL, reason
+    # The GPU decoded the frames, so its filter chain failed on them (a 10-bit surface into an 8-bit chain).
+    if frames_refused:
+        return FALLBACK_HWACCEL, "the GPU's filters couldn't take the decoded frames"
     if should_fallback:
         return FALLBACK_SIGNAL, reason or "signal kill"
     if rc == FFMPEG_SIGNALLED_EXIT:
@@ -685,6 +913,62 @@ def _gpu_hand_off(
     if stopped_part_way:
         return FALLBACK_STOPPED_PART_WAY, "GPU run stopped part-way"
     return None
+
+
+def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None, stderr_lines_all: list[str]) -> bool:
+    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software, without a
+    word (ProRes, WMV, DivX 3 on NVIDIA, MPEG-2 4:2:2…) or after the decoder said the GPU lacks the codec or profile
+    (``_GPU_LACKS_CODEC_VERDICTS``: VP8, H.264 High 10 or H.263 on NVIDIA, MPEG-4 part 2 on VAAPI…), and the GPU
+    scaler refused those frames.
+
+    A normal hand-off to the CPU, and the same on every run: full-frame decode asks the same decoder.
+
+    Args:
+        rc: The run's exit code.
+        stderr_lines: The run's stderr.
+        hwaccel: The GPU decoder the run asked for (``hwaccel_in``).
+        stderr_lines_all: Every run's stderr so far, this one's included.
+
+    Returns:
+        True for a codec the GPU lacks. False otherwise, and for a driver error in any run: a decoder whose GPU
+        set-up failed in the driver falls back to software and ends the same way. FFmpeg's generic set-up failure line
+        after the decoder's own verdict isn't one: the verdict says why, as in ``classify_cpu_fallback_reason``. False
+        too for a run that asked for no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its
+        frames is theirs.
+    """
+    if rc == 0 or hwaccel is None or not any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines):
+        return False
+    stderr_text = " ".join(stderr_lines).lower()
+    if any(verdict in stderr_text for verdict in _GPU_LACKS_CODEC_VERDICTS):
+        return not _detect_hwaccel_runtime_error(
+            [line for line in stderr_lines_all if _HWACCEL_INIT_FAILED not in line.lower()]
+        )
+    return _decoded_in_software(stderr_lines, hwaccel) and not _detect_hwaccel_runtime_error(stderr_lines_all)
+
+
+def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
+    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec, profile and pixel format.
+
+    Args:
+        stderr_lines: One FFmpeg run's stderr, with FFmpeg's listing of the input.
+        hwaccel: The GPU decoder the run asked for (``-hwaccel``); None decodes everything in software.
+
+    Returns:
+        True when FFmpeg has no ``hwaccel`` decoder for the input's video (ProRes on CUDA or VAAPI, DivX 3, WMV 7/8,
+        H.264 4:2:2 or 4:4:4 on VAAPI), or the video isn't 4:2:0 (MPEG-2 4:2:2, VP9 4:4:4: true of a run whose frames
+        the GPU scaler refused, see ``_NOT_4_2_0_PIXEL_FORMAT_RE``); False when it has one, or the listing is missing.
+    """
+    for line in stderr_lines:
+        found = _INPUT_VIDEO_STREAM_RE.match(line)
+        if found is None or "(attached pic)" in line:
+            continue
+        codec = found.group(1)
+        if hwaccel is None or _NOT_4_2_0_PIXEL_FORMAT_RE.match(found.group(2) or ""):
+            return True
+        if codec == "h264":
+            return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
+        return codec not in _GPU_DECODABLE_CODECS.get(hwaccel, frozenset())
+    return False
 
 
 def _without_metadata_tags(stderr_lines: list[str]) -> list[str]:
@@ -984,12 +1268,14 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
         "unknown decoder",
         "decoder not found",
         "could not find codec",
-        "unsupported codec id",
         # Hardware decoder specific errors (clearly indicate hardware decoder limitations)
         "hardware decoder not found",
         "hardware decoder unavailable",
         "hwaccel decoder not found",
         "hwaccel decoder unavailable",
+        # The GPU decoder's own verdicts. FFmpeg prints the generic "hwaccel initialisation returned error" right after
+        # them, so they have to win over that driver error.
+        *_GPU_LACKS_CODEC_VERDICTS,
         # Generic codec errors (check these carefully - only in GPU context after failure)
         "unsupported codec",
         "codec not supported",
@@ -1020,7 +1306,8 @@ def _detect_hwaccel_runtime_error(stderr_lines: list[str]) -> bool:
 
     These errors indicate that the hardware decoder started successfully but
     hit a driver-level failure at runtime (surface sync errors, transfer
-    failures, etc.).  They are distinct from codec-not-found errors and
+    failures, etc.), or that the GPU couldn't start the decode at all (its
+    device can't be set up).  They are distinct from codec-not-found errors and
     typically produce non-standard exit codes (e.g. 251).
 
     Retrying on CPU almost always succeeds because these are driver bugs,
@@ -1052,6 +1339,10 @@ def _detect_hwaccel_runtime_error(stderr_lines: list[str]) -> bool:
         "failed to get hw frames constraints",
         "failed to initialise vaapi connection",
         "failed to create surface",
+        # The decoder's GPU device couldn't be set up, so nothing decoded: FFmpeg 7+ says "Hardware device setup failed
+        # for decoder", older builds "Device setup failed for decoder on input stream". A running container that lost
+        # its GPU (NVML "Unknown Error" after a host daemon-reload) exits 187 after "cuInit(0) failed".
+        "device setup failed for decoder",
         # OpenCL filters (Intel and AMD tone-map Dolby Vision Profile 5 in OpenCL); these often end in exit 251. Not a
         # bare "opencl": at -loglevel debug a working run names OpenCL on many lines (platforms, devices, formats).
         "failed to enqueue kernel",
@@ -1500,6 +1791,152 @@ def _has_duplicate_thumbnails(output_folder: str, threshold: float = KEYFRAME_DU
     return dup_pairs > len(paths) * threshold
 
 
+# NVDEC on a Pascal card (a Quadro P5000, driver 580) hands VP9 Profile 2 (10/12-bit) frames back at a quarter of their
+# values and FFmpeg reports success, so every thumbnail is green with no red or blue: SDR comes out 0,130,0 and after
+# HDR tone mapping red and blue stay under 50 while green never drops below 59. A pixel counts as green-only when red
+# and blue are both at most _GREEN_ONLY_MAX_RED_BLUE and green leads them by _GREEN_ONLY_MIN_LEAD; such frames are 99.9%
+# green-only. Of 7,900 real thumbnails (lab films, Green Lantern, Avatar, The Matrix, Wicked...) one came to 98.8% and
+# seven more passed 50%, all far apart, so the first, middle and last all have to be; a false alarm costs a CPU rerun.
+_GREEN_ONLY_MAX_RED_BLUE = 64
+_GREEN_ONLY_MIN_LEAD = 40
+_GREEN_ONLY_SHARE = 0.98
+
+
+def _thumbnails_lost_their_colour(output_folder: str) -> bool:
+    """Whether a run's thumbnails came out green-only, as a GPU decoder that lost the colours leaves them.
+
+    Only the first, middle and last thumbnails are read, each at a quarter of its size: all three have to be, so real
+    green footage (a forest, a green screen) never counts. A thumbnail that can't be read counts as not green-only.
+
+    Args:
+        output_folder: The run's folder of ``img-*.jpg`` thumbnails.
+
+    Returns:
+        True when every one read is green-only.
+    """
+    # Local: only this check needs them, and only once a GPU run has made thumbnails.
+    import numpy as np
+    from PIL import Image
+
+    paths = sorted(glob.glob(os.path.join(glob.escape(output_folder), "img-*.jpg")))
+    if not paths:
+        return False
+    for path in {paths[0], paths[len(paths) // 2], paths[-1]}:
+        try:
+            with Image.open(path) as image:
+                image.draft("RGB", (image.width // 4, image.height // 4))
+                rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+        except (OSError, ValueError):
+            return False
+        red_or_blue = np.maximum(rgb[..., 0], rgb[..., 2])
+        green_only = (red_or_blue <= _GREEN_ONLY_MAX_RED_BLUE) & (rgb[..., 1] >= red_or_blue + _GREEN_ONLY_MIN_LEAD)
+        if green_only.mean() < _GREEN_ONLY_SHARE:
+            return False
+    return True
+
+
+_FFPROBE_TRANSFER_TO_MEDIAINFO = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
+_FFPROBE_FALLBACK_TIMEOUT_S = 30
+
+
+def _video_details_from_ffprobe(video_file: str) -> dict[str, str]:
+    """The HDR and rotation details of the first video stream, in MediaInfo's field names; empty if ffprobe can't say.
+
+    Args:
+        video_file: The file.
+
+    Returns:
+        ``Transfer_characteristics`` (PQ or HLG), ``HDR_format`` (Dolby Vision) and ``Rotation`` (clockwise degrees),
+        for those the stream declares.
+    """
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", video_file]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFPROBE_FALLBACK_TIMEOUT_S, check=False)
+        stream = json.loads(proc.stdout or "{}")["streams"][0]
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError, TypeError):
+        return {}
+    details: dict[str, str] = {}
+    transfer = _FFPROBE_TRANSFER_TO_MEDIAINFO.get(str(stream.get("color_transfer")))
+    for side_data in stream.get("side_data_list") or []:
+        if "dv_profile" in side_data:
+            details["HDR_format"] = "Dolby Vision"
+            # Profile 5 (compatibility id 0) has no HDR10/HLG base layer: MediaInfo declares no transfer for it.
+            transfer = {0: None, 1: "PQ", 4: "HLG"}.get(side_data.get("dv_bl_signal_compatibility_id"), transfer)
+        if "rotation" in side_data:
+            # ffprobe's angle is counter-clockwise; MediaInfo's is clockwise.
+            with contextlib.suppress(TypeError, ValueError):
+                details["Rotation"] = str(round(-float(side_data["rotation"])) % 360)
+    if transfer:
+        details["Transfer_characteristics"] = transfer
+    return details
+
+
+def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
+    """The file's details as MediaInfo reads them; a file it can't read gets its HDR and rotation from ffprobe, and
+    one warning.
+
+    MediaInfo copies a tag into its XML as it is, so a title holding U+FFFF makes the XML unreadable and pymediainfo
+    raises ``ParseError``. FFmpeg reads the file fine, so it is processed on what ffprobe says about its HDR and
+    rotation (an HDR file is still tone mapped) rather than failed over a tag.
+
+    Args:
+        video_file: The file.
+        **parse_options: Passed on to ``MediaInfo.parse`` (``parse_speed``).
+
+    Returns:
+        The file's details, or a video track holding ffprobe's HDR and rotation when MediaInfo's answer can't be read.
+
+    Raises:
+        OSError: The file is missing, or the MediaInfo library can't be loaded.
+        RuntimeError: MediaInfo couldn't open the file.
+    """
+    try:
+        return MediaInfo.parse(video_file, **parse_options)
+    except ET.ParseError as exc:
+        logger.warning(
+            "MediaInfo couldn't read the details of {} ({}); using what ffprobe says about its HDR and rotation.",
+            video_file,
+            exc,
+        )
+        fields = "".join(f"<{name}>{value}</{name}>" for name, value in _video_details_from_ffprobe(video_file).items())
+        return MediaInfo(f'<Mediainfo><File><track type="Video">{fields}</track></File></Mediainfo>')
+
+
+def display_rotation(media_info: MediaInfo) -> int:
+    """How far clockwise the video is shown turned from how it is stored, as MediaInfo reads it (a phone's portrait
+    video stored landscape is 90).
+
+    MediaInfo reads it from MP4 and MOV (where phones write it) but not from Matroska, and doesn't say when the turn
+    is mirrored too: on a GPU a rotated Matroska file's thumbnails stay as stored, and a mirrored one's stay mirrored.
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        0, 90, 180 or 270; 0 for any other angle (FFmpeg turns those only on the CPU, with ``rotate``).
+    """
+    tracks = media_info.video_tracks
+    try:
+        degrees = round(float(getattr(tracks[0], "rotation", None) or 0)) % 360 if tracks else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return degrees if degrees in (90, 180, 270) else 0
+
+
+def is_greyscale_h264(media_info: MediaInfo) -> bool:
+    """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
+    4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        True for an AVC video track whose colour space is luma only.
+    """
+    tracks = media_info.video_tracks
+    return bool(tracks) and tracks[0].format == "AVC" and tracks[0].color_space == "Y"
+
+
 def generate_images(
     video_file: str,
     output_folder: str,
@@ -1530,8 +1967,25 @@ def generate_images(
 
     Returns:
         Tuple of ``(success, image_count, hw_used, seconds, speed, error_summary)``.
+
+    Raises:
+        CodecNotSupportedError: The GPU couldn't produce the preview (the worker reruns the file on the CPU).
+        CancellationError: The job was cancelled.
+        WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota,
+            read-only, or not writable by this user); none of them are kept.
     """
-    media_info = MediaInfo.parse(video_file)
+    media_info = read_media_info(video_file)
+    if gpu == "NVIDIA" and is_greyscale_h264(media_info):
+        # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
+        # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.
+        logger.info(
+            "{} is greyscale H.264, which this GPU decodes into the wrong colours; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        raise CodecNotSupportedError(
+            f"GPU processing skipped (the GPU decodes greyscale H.264 into the wrong colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
 
     # Filter primitives.  The final vf chain is assembled inside
@@ -1612,22 +2066,28 @@ def generate_images(
                 #    rasterizer (llvmpipe/lavapipe) produces a green
                 #    overlay on DV5 output.  Probe the Vulkan state
                 #    first and drop to the DV-safe filter when software.
-                from ..gpu.vulkan_probe import get_vulkan_device_info
+                from ..gpu.vulkan_probe import dv5_no_vulkan_fix, get_vulkan_device_info
 
                 vulkan_info = get_vulkan_device_info()
                 vk_device = vulkan_info.device
                 vk_is_software = vulkan_info.is_software
                 if vk_is_software or vk_device is None:
+                    # A node has no dashboard: the fix is for its own container, so it is said here.
+                    how_to_fix = (
+                        dv5_no_vulkan_fix()
+                        if is_node_mode()
+                        else "See the dashboard notification centre for steps to enable Vulkan."
+                    )
                     logger.warning(
                         "Dolby Vision Profile 5 file {} (hdr_format={!r}, transfer={!r}) needs a real GPU "
                         "with Vulkan to produce correctly-coloured thumbnails. No working Vulkan device was found "
                         "(detected device: {!r}), so this file's thumbnails will have the wrong colours, "
-                        "a green and purple tint. The file is still processed. See the dashboard "
-                        "notification centre for steps to enable Vulkan.",
+                        "a green and purple tint. The file is still processed. {}",
                         video_file,
                         hdr_fmt,
                         transfer,
                         vk_device,
+                        how_to_fix,
                     )
                     dv5_software_fallback = True
                 else:
@@ -1677,11 +2137,14 @@ def generate_images(
                             and gpu_device_path.startswith("/dev/dri/")
                         )
                         path_kind = DV5_PATH_VAAPI_VULKAN if use_vaapi_dv5_path else DV5_PATH_LIBPLACEBO
+                    # The VAAPI paths' frames stay on the GPU until their download, which FFmpeg doesn't turn
+                    # upright; the libplacebo path uploads frames FFmpeg has already turned.
+                    turn = rotation_filter(display_rotation(media_info)) if path_kind != DV5_PATH_LIBPLACEBO else None
                     libplacebo_vf = build_dv5_vf(
                         path_kind=path_kind,
                         tonemap_algorithm=config.tonemap_algorithm,
                         fps_value=fps_value,
-                        base_scale=base_scale,
+                        base_scale=f"{turn},{base_scale}" if turn else base_scale,
                     )
             elif is_dolby_vision(hdr_fmt):
                 # Dolby Vision Profile 7/8/10 with an HDR10 or HLG
@@ -1727,7 +2190,8 @@ def generate_images(
     # _run_ffmpeg had, so the retry cascade below reads identically.
     from .ffmpeg_runner import create_ffmpeg_runner
 
-    _run_ffmpeg = create_ffmpeg_runner(
+    last_command: list[str] = []
+    run_ffmpeg_once = create_ffmpeg_runner(
         video_file=video_file,
         output_folder=output_folder,
         gpu=gpu,
@@ -1744,7 +2208,25 @@ def generate_images(
         base_scale=base_scale,
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
+        last_command=last_command,
+        rotation=display_rotation(media_info),
     )
+
+    def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:
+        """One FFmpeg run, on any tier. A run the folder refused to write ends the file at once, frames deleted.
+
+        Whatever it wrote stops wherever the folder filled up, its last frame cut short. Another tier or the CPU
+        writes to the same folder, and a short preview would be marked fresh, so later scans would skip it.
+
+        Raises:
+            WorkingFolderError: The folder is full, over its quota, read-only, or not writable by this user.
+        """
+        rc, seconds, speed, run_stderr = run_ffmpeg_once(*args, **kwargs)
+        refused = _folder_write_errno(rc, run_stderr, output_folder)
+        if refused is not None:
+            _clean_output_images(output_folder)
+            raise WorkingFolderError(refused, _FOLDER_WRITE_TEXT[refused][0], output_folder)
+        return rc, seconds, speed, run_stderr
 
     # DV Profile 5 paths cannot use -skip_frame (RPU side-data has
     # inter-frame dependencies). Everything else attempts skip_frame
@@ -1921,8 +2403,13 @@ def generate_images(
     retry_rc = rc
     retry_stderr_lines = stderr_lines
 
-    # Not after the decoder said it can't decode the file (on this GPU, or at all): full-frame decode asks the same one.
-    cant_decode = GPU_CANT_DECODE_LINE in stderr_lines or video_has_no_decoder(stderr_lines)
+    # Not after the decoder said it can't decode the file (on this GPU, or at all), nor after the GPU turned out to have
+    # no decoder for it: full-frame decode asks the same one.
+    cant_decode = (
+        GPU_CANT_DECODE_LINE in stderr_lines
+        or video_has_no_decoder(stderr_lines)
+        or _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel_in(last_command), stderr_lines)
+    )
     # Nor after the stall watchdog: the mount is stuck and a rerun would wait out another full timeout.
     stalled = STALL_WATCHDOG_LINE in stderr_lines
     if rc != 0 and use_skip_initial and not cant_decode and not stalled:
@@ -2078,7 +2565,9 @@ def generate_images(
             image_count = _count_usable_frames(rc, stderr_lines)
 
             if rc != 0 and image_count == 0:
-                cut_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=False)
+                cut_off = _gpu_hand_off(
+                    rc, stderr_lines, stderr_lines_all, stopped_part_way=False, hwaccel=hwaccel_in(last_command)
+                )
                 disk = cut_off if cut_off and cut_off[0] in (FALLBACK_STALL, FALLBACK_IO_ERROR) else None
                 if gpu is not None:
                     # Still failing on GPU even with DV-safe filter -> the same worker retries on the CPU.
@@ -2100,7 +2589,7 @@ def generate_images(
                         diag_label,
                         video_file,
                         disk[1],
-                        _IO_ERROR_PLACES if disk[0] == FALLBACK_IO_ERROR else "the disk or network share it is on",
+                        _io_error_places() if disk[0] == FALLBACK_IO_ERROR else "the disk or network share it is on",
                     )
                 else:
                     # Already on CPU: no further fallback available without remuxing/bitstream filtering.
@@ -2122,7 +2611,9 @@ def generate_images(
     if rc != 0 and image_count == 0 and gpu is not None:
         if cancel_check and cancel_check():
             raise CancellationError(f"Processing cancelled for {video_file}")
-        hand_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded)
+        hand_off = _gpu_hand_off(
+            rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded, hwaccel=hwaccel_in(last_command)
+        )
         if hand_off is not None:
             fallback_kind, fallback_reason = hand_off
             # Log relevant stderr excerpt for debugging
@@ -2153,6 +2644,18 @@ def generate_images(
                 video_file,
                 rc,
             )
+
+    if image_count > 0 and gpu is not None and _thumbnails_lost_their_colour(output_folder):
+        logger.info(
+            "The GPU decoded {} without its colours (every thumbnail came out green), so its decoder can't handle this "
+            "video; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        _clean_output_images(output_folder)
+        raise CodecNotSupportedError(
+            f"GPU processing failed (the GPU decoded the video without its colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
 
     # Rename images only after all retries and error checks are complete
     if image_count > 0:
@@ -2208,15 +2711,16 @@ def generate_images(
                 "FFmpeg produced no preview frames for {}{}. "
                 "Common causes: video file is corrupted, codec is unsupported by your FFmpeg build, "
                 "or hardware acceleration failed silently. Try playing the file in a media player to "
-                "confirm it's intact, then enable Debug logging (Settings → Logging) to see FFmpeg's "
+                "confirm it's intact, then {} to see FFmpeg's "
                 "detailed output. The rest of the queue continues; only this file is skipped.",
                 video_file,
                 fallback_suffix,
+                debug_logging_hint(),
             )
             error_summary = _extract_ffmpeg_error_summary(stderr_lines_all)
         worker_ctx = "GPU" if gpu is not None else "CPU"
         reason = (
-            f"FFmpeg exit {rc} ({_diagnose_ffmpeg_exit_code(rc, stderr_lines)}){fallback_suffix}"
+            f"FFmpeg exit {rc} ({_diagnose_ffmpeg_exit_code(rc, stderr_lines, output_folder)}){fallback_suffix}"
             if rc != 0
             else f"0 images{fallback_suffix}"
         )
@@ -2327,6 +2831,7 @@ def generate_bif(
 
     Raises:
         PermissionError: If permission denied accessing files or directories
+        ValueError: ``images_path`` holds no thumbnails; nothing is written and the old BIF is kept.
 
     """
     magic = [0x89, 0x42, 0x49, 0x46, 0x0D, 0x0A, 0x1A, 0x0A]
@@ -2337,13 +2842,16 @@ def generate_bif(
     except PermissionError as e:
         logger.error(
             "Cannot read the temporary thumbnails folder at {}: permission denied ({}). "
-            "Verify the working folder (Settings → Advanced) is readable by the user running this "
+            "Verify the working folder is readable by the user running this "
             "tool. In Docker, check PUID/PGID. This file is skipped; the queue continues.",
             images_path,
             e,
         )
         raise
     images.sort()
+    if not images:
+        # A preview with no thumbnails is worse than the old one: Plex and Emby take it as done.
+        raise ValueError(f"no thumbnails in {images_path} to write a preview from")
 
     # Written beside the target and renamed over it once complete, so a crash or error part-way never leaves a
     # short BIF where Plex/Emby read it.

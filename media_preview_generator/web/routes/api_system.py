@@ -95,16 +95,19 @@ def list_notifications():
 
 
 _GPU_NOTIFICATION_ID_RE = _re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_NODE_NOTIFICATION_ID_RE = _re.compile(r"node:[0-9a-f]{1,64}:[a-z_]{1,32}")
 
 
 def _is_known_notification_id(notification_id: str) -> bool:
-    """Whether ``build_active_notifications`` can emit this id (fixed ids, or a per-GPU card id)."""
+    """Whether ``build_active_notifications`` can emit this id (fixed ids, a per-GPU or a per-node card id)."""
     from ...jobs.gpu_fallback import is_gpu_notification_id
     from ..notifications import (
         DEPRECATED_IMAGE_ID,
         LIBRARY_HEALTH_CHECK_FAILED_ID,
         LIBRARY_HEALTH_NOT_SHOWING_ID,
         MEDIA_MOUNT_UNHEALTHY_ID,
+        NODE_CARD_KINDS,
+        NODE_UNCONFIRMED,
         SCHEMA_MIGRATION_ID,
         TIMEZONE_MISCONFIGURED_ID,
         VULKAN_SOFTWARE_FALLBACK_ID,
@@ -121,6 +124,8 @@ def _is_known_notification_id(notification_id: str) -> bool:
     }
     if notification_id in fixed:
         return True
+    if _NODE_NOTIFICATION_ID_RE.fullmatch(notification_id):
+        return notification_id.rsplit(":", 1)[1] in {*NODE_CARD_KINDS, NODE_UNCONFIRMED}
     return is_gpu_notification_id(notification_id) and _GPU_NOTIFICATION_ID_RE.fullmatch(notification_id) is not None
 
 
@@ -231,8 +236,12 @@ def rescan_gpus():
     try:
         with _gpu_cache_lock:
             _gpu_cache["result"] = None
+        from ...gpu.vulkan_check import clear_vulkan_check_cache
+        from .api_vulkan import gpus_with_vulkan
+
+        clear_vulkan_check_cache()
         gpus = _ensure_gpu_cache()
-        return jsonify({"gpus": gpus})
+        return jsonify({"gpus": gpus_with_vulkan(gpus)})
     except Exception:
         logger.exception(
             "GPU re-scan failed. "
@@ -252,7 +261,9 @@ def get_system_status():
     of the process. Call clear_gpu_cache() to force a re-scan.
     """
     try:
-        gpus = _ensure_gpu_cache()
+        from .api_vulkan import gpus_with_vulkan
+
+        gpus = gpus_with_vulkan(_ensure_gpu_cache())
 
         job_manager = get_job_manager()
         running_job = job_manager.get_running_job()
@@ -478,6 +489,7 @@ def get_config():
     """Get current configuration."""
     try:
         from ...config import MAX_CPU_THREADS, get_cached_config
+        from ...config.validation import node_worker_total
         from ..settings_manager import get_settings_manager
 
         config = get_cached_config()
@@ -515,7 +527,7 @@ def get_config():
             "ffmpeg_threads": config.ffmpeg_threads,
             "log_level": config.log_level,
         }
-        if config.gpu_threads == 0 and config.cpu_threads == 0:
+        if config.gpu_threads == 0 and config.cpu_threads == 0 and not node_worker_total(settings.get_all()):
             resp["config_warning"] = (
                 "No workers configured — jobs will remain pending until GPU or CPU workers are added."
             )

@@ -21,7 +21,7 @@ from flask import jsonify, request
 from loguru import logger
 
 from ...config import resolve_frame_interval
-from ...markers.settings import mask_server
+from ...markers.settings import chosen_node_error, mask_server
 from ...servers import (
     ServerConfig,
     ServerRegistry,
@@ -482,8 +482,7 @@ def _validate_server_payload(
 
     stored_markers = base.get("markers")
     if "markers" in data:
-        # stored_markers is passed on as well: it holds the Plex marker agent's key, which a posted ``****`` means
-        # "keep" (markers.settings), exactly like TheIntroDB's.
+        # stored_markers is passed on as well: only a newly chosen Plex database node is checked (markers.settings).
         markers_block, err = _validate_markers(
             _merge_markers_update(stored_markers, data.get("markers")), type_value, stored_markers
         )
@@ -515,18 +514,15 @@ def _validate_server_payload(
                 if isinstance(stored_loudness, dict) and isinstance(posted, dict)
                 else posted,
                 type_value,
-                markers_block,
                 library_kinds=library_kinds,
             )
             if err:
                 return None, err
         elif isinstance(stored_loudness, dict):
             loudness_block = copy.deepcopy(stored_loudness)
-            if "markers" in data or "libraries" in data:
-                # The shared helper can change without posting loudness; do not save an unsupported combination.
-                loudness_block, err = validate_server_loudness(
-                    loudness_block, type_value, markers_block, library_kinds=library_kinds
-                )
+            if "libraries" in data:
+                # A library's type can change without posting loudness; do not save a choice it no longer supports.
+                loudness_block, err = validate_server_loudness(loudness_block, type_value, library_kinds=library_kinds)
                 if err:
                     return None, err
         else:
@@ -853,6 +849,9 @@ def create_server():
         servers = _get_media_servers()
         if any(isinstance(s, dict) and s.get("id") == entry["id"] for s in servers):
             return jsonify({"error": f"server id {entry['id']!r} already exists"}), 409
+        error = chosen_node_error(entry.get("markers"), None)
+        if error:
+            return jsonify({"error": error}), 400
         servers.append(entry)
         _save_media_servers(servers)
     logger.info("Added media server {!r} (id={})", entry["name"], entry["id"])
@@ -908,6 +907,9 @@ def update_server(server_id: str):
             if updated is None:
                 return jsonify({"error": error}), 400
             updated["id"] = server_id
+        error = chosen_node_error(updated.get("markers"), servers[index].get("markers"))
+        if error:
+            return jsonify({"error": error}), 400
         if fresh_identity:
             updated["server_identity"] = fresh_identity
         servers[index] = updated

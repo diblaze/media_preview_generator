@@ -13,21 +13,25 @@ read-back of what this app left on an item (``shows``) reads the database.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import urllib.parse
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
+from types import ModuleType
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from loguru import logger
 
+from ...nodes.protocol import relayed_text
 from ..decide import FileLimits, unusable_server_marker
 from ..fs import filesystem_type, is_local_filesystem, is_network_filesystem
 from ..models import Candidate, Marker, MarkerType, Source
@@ -45,6 +49,13 @@ from .base import (
     compare_shown,
     wait_cancelled,
 )
+
+# Windows has no fcntl: there the Plex database role asks ``nodes.server.winplatform`` instead (``_winplatform``).
+if sys.platform != "win32":
+    import fcntl
+
+# Plex on Windows keeps its preferences in the registry and never writes a Preferences.xml.
+_PLEX_PREFS_IN_REGISTRY = sys.platform == "win32"
 
 if TYPE_CHECKING:
     from ...servers.base import ServerConfig
@@ -250,6 +261,10 @@ _path_locks_guard = threading.Lock()
 _thread_state = threading.local()
 
 
+# How :func:`plex_busy_error` starts, so a caller that waited in several requests can tell it from "another task".
+PLEX_BUSY_PREFIX = "Plex's database was busy (held by another program)"
+
+
 def plex_busy_error(seconds: float) -> DatabaseBusyError:
     """The failure of a write that gave up because another program kept Plex's database locked.
 
@@ -260,9 +275,91 @@ def plex_busy_error(seconds: float) -> DatabaseBusyError:
         The error, UNREACHABLE like any lock wait that ran out.
     """
     return DatabaseBusyError(
-        f"Plex's database was busy (held by another program) for {max(1, round(seconds))} s; {NEXT_RUN}",
+        f"{PLEX_BUSY_PREFIX} for {max(1, round(seconds))} s; {NEXT_RUN}",
         state=Capability.UNREACHABLE,
     )
+
+
+def unwritable_message(details: dict, *, node: bool = False) -> str:
+    """Why Plex's database can't be written, from the file check's facts: the user to run as, or a read-only folder.
+
+    A writer that already is the database's owner gets "read-only": telling it to run as that user would send the
+    user after a fix that is already in place (a ``:ro`` mount, a read-only folder).
+
+    Args:
+        details: The file check's ``unwritable``, ``writer_uid`` and ``db_owner_uid``.
+        node: Whether the Plex database node ran the check (it, not this app, is the writer).
+
+    Returns:
+        The sentence the file check reports.
+    """
+    who = "The Plex database node" if node else "This app"
+    paths = ", ".join(str(p) for p in details.get("unwritable") or ())
+    writer = str(details.get("writer_uid") or "unknown")
+    owner = str(details.get("db_owner_uid") or "unknown")
+    if writer == owner and writer != "unknown":
+        return (
+            f"{who} (user {writer}) can't write {paths}, though it runs as the user that owns Plex's database: the "
+            "folder is read-only. Make it writable (in Docker, mount Plex's config folder without :ro)."
+        )
+    run = "Run the node as" if node else "Run it with"
+    return f"{who} (user {writer}) can't write {paths}. {run} the user that owns Plex's database (user {owner})."
+
+
+def node_wording(report: CapabilityReport) -> CapabilityReport:
+    """The database file check's refusal, said about the Plex database node that ran it rather than about this app.
+
+    ``LocalPlexDb.file_checks`` runs wherever the database is, but its wording is written from this app's side ("The
+    app must run on the same machine as Plex", "This app (user N) can't write ..."). Through a node that side is the
+    node, so the untouched wording tells the user to change or move the app: the one thing the node exists to avoid.
+
+    Args:
+        report: What the node's file check answered.
+
+    Returns:
+        The same state and details with the node's wording; ``report`` itself when its wording names nobody.
+    """
+    details = report.details
+    # The facts below are whatever the node sent: each sentence stays one line of relayed length however many paths
+    # or characters came.
+    if report.state is Capability.NEEDS_LOCAL_DB and "fs_type" in details:
+        fs_type = relayed_text(str(details.get("fs_type") or ""))
+        where = (
+            f"Plex's database is on a network share ({fs_type}) where the Plex database node runs."
+            if is_network_filesystem(fs_type)
+            else "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
+            f"({fs_type or 'unknown'})."
+        )
+        return CapabilityReport(
+            report.state,
+            f"{where} Give the node Plex's config folder from a local disk of the Plex machine (in Docker, mount "
+            "it from one); Plex stays read-only.",
+            details,
+        )
+    if report.state is Capability.MISCONFIGURED and details.get("unwritable"):
+        return CapabilityReport(report.state, relayed_text(unwritable_message(details, node=True)), details)
+    if report.state is Capability.MISCONFIGURED and details.get("missing_db_path"):
+        # The path is the node's, not this app's: said bare, it reads as a folder to fix on this app's side.
+        agent_info = details.get("agent")
+        agent: dict = agent_info if isinstance(agent_info, dict) else {}
+        who = str(agent.get("name") or "") or (f"at {agent['url']}" if agent.get("url") else "")
+        node = f"The Plex database node {who}" if who else "The Plex database node"
+        return CapabilityReport(
+            report.state,
+            relayed_text(
+                f"{node} doesn't find Plex's database at {details['missing_db_path']} on its machine. Give the node "
+                "Plex's own config folder."
+            ),
+            details,
+        )
+    if report.state is Capability.UNREACHABLE and details.get("lock_holder") is False:
+        return CapabilityReport(
+            report.state,
+            "Plex doesn't have its database open through the folder the Plex database node was given (Plex is "
+            "stopped, or the node sees a different path to the file). Nothing is written while Plex isn't running.",
+            details,
+        )
+    return report
 
 
 def report_of_failure(exc: PublishError, default: Capability, details: dict | None = None) -> CapabilityReport:
@@ -284,9 +381,53 @@ def report_of_failure(exc: PublishError, default: Capability, details: dict | No
     return CapabilityReport(exc.state or default, str(exc), {**(details or {}), **busy})
 
 
+def beside_another_plex(url: str, server_name: str, written: str, name: str = "") -> str:
+    """The refusal of a Plex database node beside a different Plex than the server (a mistyped address).
+
+    Args:
+        url: The node's address.
+        server_name: The server's name.
+        written: What would have gone into the wrong database ("markers").
+        name: The node's name ("" for one without).
+    """
+    where = f"at {url or 'this address'}"
+    return (
+        f"The Plex database node {f'{name} {where}' if name else where} is next to a different Plex server than "
+        f"{server_name or 'this one'}. Check the address: {written} would have gone into the wrong database."
+    )
+
+
 def plex_db_path(plex_config_folder: str) -> str:
     """Library DB path under the "Plex Media Server" folder the app already uses for previews."""
     return os.path.join(plex_config_folder, "Plug-in Support", "Databases", "com.plexapp.plugins.library.db")
+
+
+def plex_machine_identifier(plex_config_folder: str) -> str:
+    """Plex's own server id (``ProcessedMachineIdentifier``) for the Plex whose config folder this is, or "".
+
+    Plex writes it into ``Preferences.xml`` in that folder; Plex on Windows keeps it in the registry instead
+    (``winplatform.plex_machine_identifier``). No database is opened.
+
+    Args:
+        plex_config_folder: The "Plex Media Server" folder as this process sees it.
+
+    Returns:
+        The identifier, or "" when it can't be read.
+    """
+    if _PLEX_PREFS_IN_REGISTRY:
+        found = _winplatform().plex_machine_identifier(plex_config_folder)
+        if found:
+            return found
+    try:
+        root = ET.parse(
+            os.path.join(plex_config_folder, "Preferences.xml"),
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        ).getroot()
+    except (OSError, ET.ParseError, DefusedXmlException):
+        return ""
+    return str(root.get("ProcessedMachineIdentifier") or "")
 
 
 def _lock_key(db_path: str) -> object:
@@ -343,7 +484,7 @@ def _holding_db_lock(db_path: str, deadline: float, *, shared: bool = False) -> 
                 if busy_for is not None:
                     raise plex_busy_error(busy_for)
                 raise DatabaseBusyError(
-                    f"Another Intro & Credits task is still using this Plex database; {NEXT_RUN}",
+                    f"Another task is still using this Plex database; {NEXT_RUN}",
                     state=Capability.UNREACHABLE,
                 )
             if wait_cancelled():
@@ -384,7 +525,17 @@ def shm_lock_held_elsewhere(db_path: str, *, deadline: float | None = None) -> b
         return _shm_dms_locked_elsewhere(db_path)
 
 
+def _winplatform() -> ModuleType:
+    # Imported on Windows only: the node server package never loads in the app's (Linux) web process.
+    from ...nodes.server import winplatform
+
+    return winplatform
+
+
 def _shm_dms_locked_elsewhere(db_path: str) -> bool:
+    if sys.platform == "win32":
+        # None (neither Restart Manager nor the lock could tell) proves nothing, like a failed F_GETLK below.
+        return _winplatform().plex_holds_db(db_path) is True
     try:
         fd = os.open(f"{db_path}-shm", os.O_RDONLY | os.O_CLOEXEC)
     except OSError:
@@ -399,8 +550,25 @@ def _shm_dms_locked_elsewhere(db_path: str) -> bool:
     return lock_type != fcntl.F_UNLCK
 
 
+def _this_user() -> str:
+    """Who this process writes as: the uid, or the Windows user name (a Windows file has no owner uid)."""
+    return _winplatform().current_user() if sys.platform == "win32" else str(os.geteuid())
+
+
+def _file_owner(path: str) -> str:
+    """Who owns ``path``, in :func:`_this_user`'s terms; "unknown" when it can't be read."""
+    if sys.platform == "win32":
+        return _winplatform().file_owner(path) or "unknown"
+    with contextlib.suppress(OSError):
+        return str(os.stat(path).st_uid)
+    return "unknown"
+
+
 def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
     """Map a SQLite failure to a ``PublishError`` whose state the UI can explain.
+
+    Intro & Credits, loudness, chapters and Library Health all get these, in this app or on a Plex database node, so
+    none names a feature, nor this app as what opened the file.
 
     Args:
         exc: The SQLite exception.
@@ -430,13 +598,13 @@ def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
         )
     if damaged:
         return PublishError(
-            f"Database damaged: Plex's database needs repairing before markers can be written ({text})",
+            f"Database damaged: Plex's database needs repairing before this app can use it ({text})",
             state=Capability.MISCONFIGURED,
         )
     if access:
-        return PublishError(f"This app can't use Plex's database file ({text})", state=Capability.MISCONFIGURED)
+        return PublishError(f"Plex's database file can't be opened or written ({text})", state=Capability.MISCONFIGURED)
     return PublishError(
-        f"Plex's database returned an unexpected error; not writing markers ({text})",
+        f"Plex's database returned an unexpected error ({text})",
         state=Capability.UNSUPPORTED_SCHEMA,
     )
 
@@ -1190,7 +1358,8 @@ class LocalPlexDb(PlexDatabase):
     def _connect(self, *, read_only: bool, timeout: float) -> sqlite3.Connection:
         mode = "ro" if read_only else "rw"
         # Quoted: SQLite reads "?", "#" and "%" in a file: URI as query, fragment and escapes, which would open a
-        # different path for folders named like "Plex #2". mode=rw never creates a missing file.
+        # different path for folders named like "Plex #2". mode=rw never creates a missing file. The same on Windows:
+        # SQLite decodes the quoted drive colon and backslashes of a D:\ path back (windows-node.yml).
         uri = f"file:{urllib.parse.quote(os.path.abspath(self._path() or ''))}?mode={mode}"
         return sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level=None)
 
@@ -1312,6 +1481,11 @@ class LocalPlexDb(PlexDatabase):
 
     @staticmethod
     def _unwritable_paths(db: str) -> list[str]:
+        if sys.platform == "win32":
+            # os.access only reads the read-only attribute on Windows; the ACL decides who may write.
+            can_write = _winplatform().same_user_can_write
+            files = [p for p in (db, f"{db}-wal", f"{db}-shm") if os.path.exists(p) and not can_write(p)]
+            return files if can_write(os.path.dirname(db)) else [*files, os.path.dirname(db)]
         paths = [p for p in (db, f"{db}-wal", f"{db}-shm") if os.path.exists(p) and not os.access(p, os.W_OK)]
         folder = os.path.dirname(db)
         if not os.access(folder, os.W_OK | os.X_OK):
@@ -1331,10 +1505,17 @@ class LocalPlexDb(PlexDatabase):
         db = self._path()
         if not db or not os.path.isfile(db):
             return CapabilityReport(
-                Capability.MISCONFIGURED, f"Plex database not found at {db or '(Plex config folder not set)'}"
+                Capability.MISCONFIGURED,
+                f"Plex database not found at {db or '(Plex config folder not set)'}",
+                {"missing_db_path": db} if db else {},
             )
         # realpath: a symlinked config folder or DB file must be judged by where SQLite actually locks it.
-        fs_type = filesystem_type(os.path.realpath(db), mountinfo_path=self._mountinfo_path)
+        real = os.path.realpath(db)
+        if sys.platform == "win32":
+            fs_type, local = _winplatform().filesystem_label(real), _winplatform().is_local_drive(real)
+        else:
+            fs_type = filesystem_type(real, mountinfo_path=self._mountinfo_path)
+            local = is_local_filesystem(fs_type)
         details: dict = {"db_path": db, "fs_type": fs_type}
         if is_network_filesystem(fs_type):
             return CapabilityReport(
@@ -1343,7 +1524,7 @@ class LocalPlexDb(PlexDatabase):
                 "to write markers; Plex stays read-only.",
                 details,
             )
-        if not is_local_filesystem(fs_type):
+        if not local:
             return CapabilityReport(
                 Capability.NEEDS_LOCAL_DB,
                 f"Plex's database is on a filesystem this app doesn't recognise as a local disk ({fs_type or 'unknown'}); "
@@ -1352,18 +1533,11 @@ class LocalPlexDb(PlexDatabase):
             )
         unwritable = self._unwritable_paths(db)
         if unwritable:
-            owner = "unknown"
-            with contextlib.suppress(OSError):
-                owner = str(os.stat(db).st_uid)
+            owner, writer = _file_owner(db), _this_user()
             # The facts as well as the sentence: with an agent this ran on Plex's machine, and ``capability()``
             # rebuilds the sentence around the agent rather than around this app.
-            details.update({"unwritable": list(unwritable), "writer_uid": str(os.geteuid()), "db_owner_uid": owner})
-            return CapabilityReport(
-                Capability.MISCONFIGURED,
-                f"This app (user {os.geteuid()}) can't write {', '.join(unwritable)}. Run it with the user that owns "
-                f"Plex's database (user {owner}).",
-                details,
-            )
+            details.update({"unwritable": list(unwritable), "writer_uid": writer, "db_owner_uid": owner})
+            return CapabilityReport(Capability.MISCONFIGURED, unwritable_message(details), details)
         try:
             held = shm_lock_held_elsewhere(db, deadline=deadline)
         except PublishError as exc:
@@ -1916,54 +2090,27 @@ class PlexMarkerPublisher(MarkerPublisher):
             return None
         return CapabilityReport(
             Capability.AGENT_UNAVAILABLE,
-            f"The Plex marker agent at {agent.get('url') or 'this address'} is next to a different Plex server than "
-            f"{self._config.name or 'this one'}. Check the address: markers would have gone into the wrong database.",
+            beside_another_plex(
+                str(agent.get("url") or ""), self._config.name, "markers", str(agent.get("name") or "")
+            ),
             {**report.details, "agent": {**agent, "wrong_plex": True}},
         )
 
     def _through_the_agent(self, local: CapabilityReport) -> CapabilityReport | None:
-        """The database half's refusal, said about the agent's container instead of about this app.
-
-        ``LocalPlexDb.file_checks`` runs wherever the database is, but its wording is written from this app's
-        side ("The app must run on the same machine as Plex", "This app (user N) can't write ..."). Through an
-        agent that side is the agent's container, so the untouched wording tells the user to move the app —
-        the one thing the agent exists to avoid. With an agent the path, the filesystem check and
-        the lock proof are the agent's.
+        """The database half's refusal, said about the agent's container instead of about this app (``node_wording``).
 
         Args:
             local: What the database half answered.
 
         Returns:
-            The same state and details with the agent's wording, or None when no agent ran the check (or its
-            answer says nothing about where the app runs).
+            The same state and details with the agent's wording, or None when no agent ran the check, or its answer
+            says nothing about where the app runs. Plex not holding the file open is left to :meth:`capability`,
+            which tells "Plex stopped" from "a different file" by asking Plex.
         """
-        if not local.details.get("agent"):
+        if not local.details.get("agent") or local.details.get("lock_holder") is False:
             return None
-        details = local.details
-        if local.state is Capability.NEEDS_LOCAL_DB:
-            fs_type = str(details.get("fs_type") or "")
-            where = (
-                f"Plex's database is on a network share ({fs_type}) where the Plex marker agent runs."
-                if is_network_filesystem(fs_type)
-                else "Plex's database is on a filesystem the Plex marker agent doesn't recognise as a local disk "
-                f"({fs_type or 'unknown'})."
-            )
-            return CapabilityReport(
-                local.state,
-                f"{where} Mount Plex's config folder into the agent's container from a local disk of the Plex "
-                "machine; Plex stays read-only.",
-                details,
-            )
-        if local.state is Capability.MISCONFIGURED and details.get("unwritable"):
-            paths = ", ".join(str(p) for p in details["unwritable"])
-            return CapabilityReport(
-                local.state,
-                f"The Plex marker agent (user {details.get('writer_uid') or 'unknown'}) can't write {paths}. Run the "
-                f"agent's container with the user that owns Plex's database "
-                f"(user {details.get('db_owner_uid') or 'unknown'}).",
-                details,
-            )
-        return None
+        reworded = node_wording(local)
+        return None if reworded is local else reworded
 
     def capability(self) -> CapabilityReport:
         """Check settings, DB location and lock sharing, Plex Pass, schema and the marker tag row."""
@@ -1980,7 +2127,7 @@ class PlexMarkerPublisher(MarkerPublisher):
             if status is None:
                 return local
             # With an agent the path is the one IT sees; this app sees no database at all.
-            whose = "the agent sees" if local.details.get("agent") else "this app sees"
+            whose = "the Plex database node sees" if local.details.get("agent") else "this app sees"
             return CapabilityReport(
                 Capability.NEEDS_LOCAL_DB,
                 f"Plex is running, but not with the database file {whose} at {local.details['db_path']}. "

@@ -1,0 +1,63 @@
+# A worker node: another machine lending the app its GPU (or CPU) for previews, loudness and intro/credits steps.
+#
+# It is the app's own image started with MODE=node. It only reads your media and sends results back; the app does
+# every write. Mount the media read-only. At the same path as in the app's container, the mappings Add node fills in
+# work as they are; at any other path, set them on the node's Media tab (Settings -> Nodes).
+#
+# Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
+# http://THIS_MACHINE:9494 and the key the node prints once in `docker logs` on first start (or your own NODE_KEY).
+#
+# Update: whenever you update the app, set the same tag below and run docker compose pull && docker compose up -d.
+# Until then the node says "Update needed" and gets no work. /config stays, so its id and key do too. Watchtower can
+# update it like the app.
+
+services:
+  media-preview-node:
+    # Use the same tag as your app: a worker node must run the app's exact version.
+    image: stevezzau/media_preview_generator:latest
+    container_name: media-preview-node
+    restart: unless-stopped
+    ports:
+      - "9494:9494"
+
+    # --- Intel / AMD GPU (VAAPI) ---
+    # Uncomment only if this machine has an Intel or AMD GPU (check: ls -la /dev/dri). Without /dev/dri the container
+    # doesn't start ("error gathering device information").
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+    # --- NVIDIA GPU ---
+    # Uncomment the deploy block (and the two NVIDIA_* variables).
+    # Requires the NVIDIA Container Toolkit.
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    environment:
+      - MODE=node
+      # The key the app must send. Left empty, the node makes one (printed once in `docker logs`).
+      # To pick your own, put NODE_KEY=<key> in a .env file beside this one; make one with: openssl rand -hex 24
+      - NODE_KEY=${NODE_KEY:-}
+      # The name the app shows for this node.
+      - NODE_NAME=gpu-box
+      # The port the node listens on inside the container. Change the ports: mapping above to match (9500:9500).
+      # - NODE_PORT=9494
+      # --- NVIDIA only ---
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=all
+      # User/group that can read your media (match your host user; Unraid: 99/100)
+      - PUID=1000
+      - PGID=1000
+      # - TZ=America/New_York
+
+    volumes:
+      # Your media, read-only: a node never writes next to your files.
+      - /path/to/your/media:/media:ro
+      # The node's id (and generated key, when NODE_KEY isn't set) and logs.
+      - /path/to/node/config:/config:rw
+      - /etc/localtime:/etc/localtime:ro

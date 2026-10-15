@@ -288,6 +288,22 @@ class TestPlexTab:
         expect(authed_page.locator("#markersEmbyRedetectGroup")).to_be_hidden()
         expect(authed_page.locator("#markersEnabled")).not_to_be_checked()
 
+    def test_ready_status_through_a_node_names_the_plex_database_node(self, authed_page: Page, app_url: str) -> None:
+        server = _plex_server()
+        details = {**_plex_ready_details(), "agent": {"state": "connected", "url": "http://plexbox:9494"}}
+        status = _status(server, "ready", "Written into this Plex server's database", details)
+        _mock_server_page(authed_page, server, status)
+        _open_tab(authed_page, app_url, server)
+
+        block = authed_page.locator("#markersStatusBlock")
+        expect(block).to_contain_text("through the Plex database node", timeout=5000)
+        titles = " ".join(
+            block.locator("[title], [data-bs-original-title]").evaluate_all(
+                "els => els.map(e => e.getAttribute('title') || e.getAttribute('data-bs-original-title'))"
+            )
+        )
+        assert "agent" not in (block.inner_text() + titles).lower()
+
     def test_tab_points_to_the_libraries_tab_instead_of_listing_libraries(
         self, authed_page: Page, app_url: str
     ) -> None:
@@ -590,7 +606,7 @@ class TestPlexTab:
         expect(modal).to_contain_text("The app must run on the same machine as Plex.")
         expect(modal).to_contain_text(SAME_HOST_HINT)
         expect(authed_page.locator("#markersPlexConfirmSameMachineHint")).to_be_visible()
-        expect(modal).not_to_contain_text("The Plex marker agent writes the markers")
+        expect(modal).not_to_contain_text("The Plex database node writes the markers")
 
     def test_confirm_modal_drops_the_same_machine_advice_when_the_agent_is_on(
         self, authed_page: Page, app_url: str
@@ -601,17 +617,21 @@ class TestPlexTab:
             server,
             _status(server, "ready", "Written into this Plex server's database", _plex_ready_details()),
         )
+        nodes = {"nodes": [{"id": "node-pc", "name": "gaming-pc", "roles": ["plex_db"], "legacy": False}]}
+        authed_page.route("**/api/nodes", lambda route: _fulfill(route, nodes))
         _open_tab(authed_page, app_url, server)
 
-        # Switched on live in the form, unsaved — the dialog reads the switch the user just flipped.
+        # Picked live in the form, unsaved — the dialog reads the Plex database choice the user just made.
         _switch_tab(authed_page, "general")
-        authed_page.locator("label[for='markersAgentEnabled']").click()
+        select = authed_page.locator("#markersPlexDatabase")
+        expect(select.locator("option[value='node-pc']")).to_be_attached(timeout=5000)
+        select.select_option("node-pc")
         _switch_tab(authed_page, "processing")
         _flip_switch_on(authed_page)
         modal = authed_page.locator("#markersPlexConfirmModal")
         expect(modal).to_be_visible(timeout=5000)
         expect(modal).to_contain_text(
-            "The Plex marker agent writes the markers on the Plex machine, so this app can run anywhere."
+            "The Plex database node writes the markers on the Plex machine, so this app can run anywhere."
         )
         expect(modal).not_to_contain_text("The app must run on the same machine as Plex.")
         # The config-folder sub-line's text() is still in the DOM (untouched innerHTML), but the element itself
@@ -1479,9 +1499,9 @@ class TestSetupHealthMarkerRows:
         self._open_health(authed_page, app_url, _plex_server(), payload)
 
         must_fix = authed_page.locator("#editReadinessBody details[data-tier='critical']")
-        expect(must_fix).to_contain_text("The Plex marker agent isn't answering", timeout=5000)
+        expect(must_fix).to_contain_text("The Plex database node isn't answering", timeout=5000)
         expect(must_fix).to_contain_text("Skip buttons need Plex Pass")
-        expect(must_fix).to_contain_text("Fix on the agent")
+        expect(must_fix).to_contain_text("Fix on the node")
         expect(must_fix).to_contain_text("Change in Plex UI")
 
     def test_database_row_with_an_agent_says_fix_on_the_agent(self, authed_page: Page, app_url: str) -> None:
@@ -1498,9 +1518,9 @@ class TestSetupHealthMarkerRows:
 
         must_fix = authed_page.locator("#editReadinessBody details[data-tier='critical']")
         expect(must_fix).to_contain_text(
-            "The Plex marker agent isn't on the machine with Plex's database", timeout=5000
+            "The Plex database node isn't on the machine with Plex's database", timeout=5000
         )
-        expect(must_fix).to_contain_text("Fix on the agent")
+        expect(must_fix).to_contain_text("Fix on the node")
         expect(must_fix).not_to_contain_text("Change in Plex UI")
 
     @staticmethod

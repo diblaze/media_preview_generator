@@ -1,0 +1,163 @@
+{
+ "app_version": "0.0.0.dev0",
+ "nodes": [
+  {
+   "busy": 0,
+   "cpu": {
+    "cores": null,
+    "load1": null,
+    "ram_available": null,
+    "ram_total": null
+   },
+   "enabled": true,
+   "gpus": [],
+   "id": "c24c6cedf94c48ccbd653156e1e1fb1e",
+   "last_seen": 1792022930.8500128,
+   "legacy": true,
+   "name": "Plex helper (Lab Plex (through the agent))",
+   "path_mappings": [],
+   "platform": {},
+   "reason": "",
+   "roles": [
+    "plex_db"
+   ],
+   "state": "ready",
+   "url": "http://mlab-plex-agent:9494",
+   "used_by": {
+    "groups": [],
+    "servers": []
+   },
+   "version": "1.0.0"
+  },
+  {
+   "busy": 0,
+   "cpu": {
+    "cores": 20,
+    "load1": 25.09,
+    "ram_available": 81177165824,
+    "ram_total": 198130511872
+   },
+   "enabled": true,
+   "gpus": [
+    {
+     "device": "cuda:0",
+     "error": "",
+     "name": "Quadro P5000",
+     "status": "ok",
+     "type": "NVIDIA"
+    }
+   ],
+   "id": "efeca478ba124c4fbf4593d335d6c393",
+   "last_seen": 1792022793.038708,
+   "legacy": false,
+   "name": "lab-gpu",
+   "path_mappings": [
+    {
+     "app_prefix": "/media",
+     "node_prefix": "/mnt/nas"
+    }
+   ],
+   "platform": {
+    "arch": "x86_64",
+    "os": "Linux",
+    "python": "3.12.3"
+   },
+   "reason": "lab-gpu didn't answer. Check that it is running and reachable from this app.",
+   "roles": [
+    "worker"
+   ],
+   "state": "offline",
+   "url": "http://mlab-nodes-gpu:9494",
+   "used_by": {
+    "groups": [
+     {
+      "id": "lab-nodes",
+      "name": "Lab nodes"
+     }
+    ],
+    "servers": []
+   },
+   "version": "0.0.0.dev0"
+  },
+  {
+   "busy": 1,
+   "cpu": {
+    "cores": 20,
+    "load1": 29.31,
+    "ram_available": 83291303936,
+    "ram_total": 198130511872
+   },
+   "enabled": true,
+   "gpus": [],
+   "id": "60cac18ffdfa4fff9994eeaa925dc3c6",
+   "last_seen": 1792022917.8391807,
+   "legacy": false,
+   "name": "lab-cpu",
+   "path_mappings": [
+    {
+     "app_prefix": "/media",
+     "node_prefix": "/mnt/nas"
+    }
+   ],
+   "platform": {
+    "arch": "x86_64",
+    "os": "Linux",
+    "python": "3.12.3"
+   },
+   "reason": "",
+   "roles": [
+    "worker"
+   ],
+   "state": "ready",
+   "url": "http://mlab-nodes-cpu:9494",
+   "used_by": {
+    "groups": [
+     {
+      "id": "lab-nodes",
+      "name": "Lab nodes"
+     }
+    ],
+    "servers": []
+   },
+   "version": "0.0.0.dev0"
+  },
+  {
+   "busy": 0,
+   "cpu": {
+    "cores": null,
+    "load1": null,
+    "ram_available": null,
+    "ram_total": null
+   },
+   "enabled": true,
+   "gpus": [],
+   "id": "cd8e7b68ed984105848cdeaac688be89",
+   "last_seen": 1792022917.8382382,
+   "legacy": false,
+   "name": "lab-plexdb",
+   "path_mappings": [],
+   "platform": {
+    "arch": "x86_64",
+    "os": "Linux",
+    "python": "3.12.14"
+   },
+   "reason": "",
+   "roles": [
+    "plex_db"
+   ],
+   "state": "ready",
+   "url": "http://mlab-nodes-plexdb:9494",
+   "used_by": {
+    "groups": [],
+    "servers": [
+     {
+      "id": "mlab-plex",
+      "name": "Lab Plex (through the agent)"
+     }
+    ]
+   },
+   "version": "0.0.0.dev0"
+  }
+ ]
+}
+HTTP 200

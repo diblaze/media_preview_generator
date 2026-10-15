@@ -173,7 +173,7 @@ class TestValidateServer:
         assert block["plex"] == {
             "db_write_confirmed_at": "2026-09-13T10:00:00+00:00",
             "on_plex_redetect": "restore",
-            "agent": {"enabled": False, "url": "", "token": ""},
+            "agent": {"enabled": False, "node_id": None},
         }
 
     @pytest.mark.parametrize(
@@ -263,7 +263,27 @@ class TestValidateServer:
 
 
 class TestPlexMarkerAgentBlock:
-    """The per-server agent: its address, and a key that behaves exactly like TheIntroDB's."""
+    """The per-server Plex database node: which node it is; the node's record holds the address and key."""
+
+    NODE = {
+        "id": "n1",
+        "node_uid": None,
+        "name": "Plex box",
+        "url": "http://plex-host.lan:9494",
+        "key": "stored-key",
+        "enabled": True,
+        "path_mappings": [],
+        "added_at": "2026-10-15T00:00:00+00:00",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _nodes(self, tmp_path):
+        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+        reset_settings_manager()
+        get_settings_manager(str(tmp_path)).apply_changes(updates={"nodes": [dict(self.NODE)]})
+        yield
+        reset_settings_manager()
 
     def _stored(self, **agent):
         return {
@@ -272,93 +292,64 @@ class TestPlexMarkerAgentBlock:
             "plex": {
                 "db_write_confirmed_at": None,
                 "on_plex_redetect": "restore",
-                "agent": {"enabled": True, "url": "http://plex-host.lan:9494", "token": "stored-key", **agent},
+                "agent": {"enabled": True, "node_id": "n1", **agent},
             },
         }
 
     def test_a_new_plex_server_has_no_agent(self):
-        assert ms.default_server_markers("plex")["plex"]["agent"] == {"enabled": False, "url": "", "token": ""}
+        assert ms.default_server_markers("plex")["plex"]["agent"] == {"enabled": False, "node_id": None}
 
     @pytest.mark.parametrize("server_type", ["emby", "jellyfin"])
     def test_only_plex_has_one(self, server_type):
         assert "plex" not in ms.default_server_markers(server_type)
 
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "http://plex-host.lan:9494",
-            "https://agent.example.com",
-            "http://10.0.0.5:9494/agent",
-            "http://[2001:db8::1]:9494",
-        ],
-    )
-    def test_addresses_it_accepts(self, url):
-        block, err = ms.validate_server(self._stored(url=url), "plex")
-        assert err == "" and block["plex"]["agent"]["url"] == url.rstrip("/")
+    def test_choosing_a_node_that_exists_is_kept(self):
+        block, err = ms.validate_server(self._stored(), "plex", self._stored(enabled=False, node_id=None))
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
 
-    @pytest.mark.parametrize(
-        "url",
-        ["ftp://plex-host:9494", "plex-host:9494", "http://", "http://user:pw@plex-host:9494",
-         "http://plex-host:9494?x=1", "http://plex-host:9494#f", "http://" + "a" * 600],
-        ids=["wrong-scheme", "no-scheme", "no-host", "credentials", "query", "fragment", "too-long"],
-    )  # fmt: skip
-    def test_addresses_it_refuses(self, url):
-        block, err = ms.validate_server(self._stored(url=url), "plex")
-        assert block is None and "agent.url" in err
+    def test_choosing_a_node_that_isnt_configured_is_refused(self):
+        block, err = ms.validate_server(self._stored(node_id="gone"), "plex", self._stored())
+        assert block is None and "isn't on the Nodes page" in err
 
-    def test_a_trailing_slash_is_dropped_so_the_stored_address_is_one_shape(self):
-        block, _ = ms.validate_server(self._stored(url="http://plex-host.lan:9494/"), "plex")
-        assert block["plex"]["agent"]["url"] == "http://plex-host.lan:9494"
+    def test_a_stored_choice_is_not_looked_up_again_on_load(self):
+        # A node removed by hand must not make the whole block fall back to disabled defaults.
+        loaded = ms.load_server({**self._stored(node_id="gone"), "enabled": False}, "plex")
+        assert (loaded.agent_enabled, loaded.agent_node_id, loaded.agent_url) == (True, "gone", "")
 
-    def test_turning_it_on_without_an_address_or_key_is_refused(self):
-        for agent in ({"url": ""}, {"token": ""}):
-            block, err = ms.validate_server(self._stored(**agent), "plex")
-            assert block is None and "address and shared key" in err
+    def test_turning_it_on_without_a_node_is_refused(self):
+        block, err = ms.validate_server(self._stored(node_id=None), "plex")
+        assert block is None and "Choose the node" in err
 
-    def test_off_without_an_address_is_fine(self):
-        block, err = ms.validate_server(self._stored(enabled=False, url="", token=""), "plex")
-        assert err == "" and block["plex"]["agent"] == {"enabled": False, "url": "", "token": ""}
+    def test_off_without_a_node_is_fine(self):
+        block, err = ms.validate_server(self._stored(enabled=False, node_id=None), "plex")
+        assert err == "" and block["plex"]["agent"] == {"enabled": False, "node_id": None}
 
-    def test_the_mask_posted_back_keeps_the_stored_key(self):
-        stored = self._stored()
-        posted = self._stored(token=ms.SECRET_MASK)
+    def test_the_old_address_and_key_fields_are_dropped(self):
+        block, err = ms.validate_server(self._stored(url="http://x:1", token="k"), "plex")
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
+
+    def test_a_save_that_never_mentions_the_node_keeps_it_switched_off(self):
+        block, err = ms.validate_server({"enabled": False, "library_ids": None, "plex": {}}, "plex", self._stored())
+        assert err == "" and block["plex"]["agent"] == {"enabled": False, "node_id": "n1"}
+
+    def test_a_save_that_only_switches_it_keeps_the_node(self):
+        stored = self._stored(enabled=False)
+        posted = {**stored, "plex": {**stored["plex"], "agent": {"enabled": True}}}
         block, err = ms.validate_server(posted, "plex", stored)
-        assert err == "" and block["plex"]["agent"]["token"] == "stored-key"
-
-    def test_a_save_that_never_mentions_the_key_keeps_it(self):
-        stored = self._stored()
-        posted = {**stored, "plex": {**stored["plex"], "agent": {"enabled": True, "url": "http://new:9494"}}}
-        block, err = ms.validate_server(posted, "plex", stored)
-        assert err == "" and block["plex"]["agent"] == {
-            "enabled": True,
-            "url": "http://new:9494",
-            "token": "stored-key",
-        }
-
-    def test_a_save_that_never_mentions_the_agent_keeps_the_key(self):
-        stored = self._stored()
-        block, err = ms.validate_server({"enabled": False, "library_ids": None, "plex": {}}, "plex", stored)
-        assert err == "" and block["plex"]["agent"] == {"enabled": False, "url": "", "token": "stored-key"}
-
-    def test_a_new_key_replaces_the_stored_one(self):
-        block, err = ms.validate_server(self._stored(token="  fresh-key  "), "plex", self._stored())
-        assert err == "" and block["plex"]["agent"]["token"] == "fresh-key"
-
-    def test_a_key_longer_than_the_field_allows_is_refused(self):
-        block, err = ms.validate_server(self._stored(token="k" * 201), "plex")
-        assert block is None and "token" in err
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
 
     def test_the_agent_must_be_an_object(self):
         block, err = ms.validate_server(self._stored() | {"plex": {"agent": "http://x"}}, "plex")
         assert block is None and "agent must be an object" in err
 
-    def test_the_typed_view_carries_the_agent(self):
+    def test_the_typed_view_resolves_the_address_and_key_from_the_node(self):
         loaded = ms.load_server(self._stored(), "plex")
         assert (loaded.agent_enabled, loaded.agent_url, loaded.agent_token) == (
             True,
             "http://plex-host.lan:9494",
             "stored-key",
         )
+        assert (loaded.agent_node_id, loaded.agent_node_name) == ("n1", "Plex box")
 
     def test_a_server_without_an_agent_reads_as_having_none(self):
         loaded = ms.load_server({"enabled": False, "library_ids": None}, "plex")
@@ -367,16 +358,15 @@ class TestPlexMarkerAgentBlock:
     def test_the_key_is_not_in_the_typed_views_repr(self):
         assert "stored-key" not in repr(ms.load_server(self._stored(), "plex"))
 
-    def test_masking_replaces_a_stored_key_and_never_mutates_the_input(self):
+    def test_masking_a_node_block_changes_nothing_and_never_mutates_the_input(self):
         stored = self._stored()
         masked = ms.mask_server(stored, "plex")
-        assert masked["plex"]["agent"]["token"] == ms.SECRET_MASK
-        assert masked["plex"]["agent"]["url"] == "http://plex-host.lan:9494"
-        assert stored["plex"]["agent"]["token"] == "stored-key"
+        assert masked["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
+        assert masked is not stored
 
-    def test_masking_leaves_an_empty_key_empty(self):
-        masked = ms.mask_server(self._stored(token=""), "plex")
-        assert masked["plex"]["agent"]["token"] == ""
+    def test_masking_still_hides_a_key_in_a_block_from_before_nodes(self):
+        masked = ms.mask_server(self._stored(token="old-key"), "plex")
+        assert masked["plex"]["agent"]["token"] == ms.SECRET_MASK
 
     @pytest.mark.parametrize(
         ("block", "server_type"),

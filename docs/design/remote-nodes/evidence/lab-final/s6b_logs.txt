@@ -1,0 +1,118 @@
+[2026-10-15 11:06:36] INFO - Started job 56b58cd0-afda-4e94-a258-d3f704c4620c
+[2026-10-15 11:06:36] INFO - Job started
+[2026-10-15 11:06:36] INFO - Resolving 6 webhook path(s) across owning server(s): Lab Plex (through the agent) (6 path(s)) (pinned to server_id='mlab-plex')
+[2026-10-15 11:06:36] INFO - Multi-server Webhook Targets: reusing shared worker pool (2 worker(s): 0 GPU + 0 CPU here, 1 GPU + 1 CPU on nodes)
+[2026-10-15 11:06:36] INFO - Dispatcher: submitted 6 previews items for job 56b58cd0 (Webhook Targets)
+[2026-10-15 11:06:36] INFO - Lab nodes · 1 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:36] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:06:36] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:06:36] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:36] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:06:36] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:06:36] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:36] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=NVIDIA device=cuda:0 tmp=/tmp/frame_cache/frames-2138fd5da420a090
+[2026-10-15 11:06:36] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:36] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-9cedf7fb8354c100
+[2026-10-15 11:06:36] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:36] INFO - lab-gpu/GPU0 · Started preview frames: Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:40] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:06:40] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:40] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 0.8% (speed=20x)
+[2026-10-15 11:06:40] INFO - lab-gpu/GPU0 · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (GPU)
+[2026-10-15 11:06:40] INFO - lab-gpu/GPU0 · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:06:40] INFO - lab-gpu/GPU0 · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 19.0% (speed=500x)
+[2026-10-15 11:06:44] WARNING - Lab nodes · 1 hands /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv back to the queue: lab-gpu stopped answering: http://mlab-nodes-gpu:9494 didn't answer: ConnectionError
+[2026-10-15 11:06:44] INFO - Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv goes back in the queue for another try (lab-gpu stopped answering: http://mlab-nodes-gpu:9494 didn't answer: ConnectionError)
+[2026-10-15 11:06:45] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 24.3% (speed=58.2x)
+[2026-10-15 11:06:50] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 45.5% (speed=57.1x)
+[2026-10-15 11:06:55] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 68.3% (speed=58x)
+[2026-10-15 11:07:00] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 94.0% (speed=60.5x)
+[2026-10-15 11:07:01] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=21.5seconds SPEED=61.7x IMAGES=132
+[2026-10-15 11:07:02] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/9/14d308b622df9bd6b86a523c9143028753c823f.bundle/Contents/Indexes/index-sd.bif (132 thumbnails)
+[2026-10-15 11:07:02] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/9/14d308b622df9bd6b86a523c9143028753c823f.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:07:02] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E02 - Lawnmower Dog [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=132
+[2026-10-15 11:07:02] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:02] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:07:02] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:07:02] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:02] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-2138fd5da420a090
+[2026-10-15 11:07:02] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:03] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:07:03] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:03] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 0.0% (speed=0.0x)
+[2026-10-15 11:07:08] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 27.4% (speed=65.4x)
+[2026-10-15 11:07:13] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 49.4% (speed=61.9x)
+[2026-10-15 11:07:18] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 74.5% (speed=63.2x)
+[2026-10-15 11:07:23] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=19.8seconds SPEED=66.9x IMAGES=132
+[2026-10-15 11:07:23] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 100.0% (speed=66.9x)
+[2026-10-15 11:07:23] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/3/75e89d7bb8395532d82ca162b957dad56e7ba95.bundle/Contents/Indexes/index-sd.bif (132 thumbnails)
+[2026-10-15 11:07:23] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/3/75e89d7bb8395532d82ca162b957dad56e7ba95.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:07:23] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E03 - Anatomy Park [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=132
+[2026-10-15 11:07:23] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:23] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:07:23] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:07:23] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:23] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-7661eb6ea1988008
+[2026-10-15 11:07:23] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:26] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:07:26] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:26] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 0.0% (speed=0.0x)
+[2026-10-15 11:07:31] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 26.5% (speed=70x)
+[2026-10-15 11:07:36] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 48.4% (speed=64x)
+[2026-10-15 11:07:41] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 74.2% (speed=65.3x)
+[2026-10-15 11:07:45] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=18.8seconds SPEED=71.1x IMAGES=133
+[2026-10-15 11:07:45] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/9/327891a201c67ef0b2e10b9b14b1e5b0b3fe6ab.bundle/Contents/Indexes/index-sd.bif (133 thumbnails)
+[2026-10-15 11:07:45] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/9/327891a201c67ef0b2e10b9b14b1e5b0b3fe6ab.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:07:45] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E01 - Pilot [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=133
+[2026-10-15 11:07:45] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:45] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:07:45] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:07:45] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:45] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-50ad89a061716c07
+[2026-10-15 11:07:45] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:49] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:07:49] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:07:49] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 2.4% (speed=60x)
+[2026-10-15 11:07:54] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 37.0% (speed=85.4x)
+[2026-10-15 11:07:59] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 67.7% (speed=81.9x)
+[2026-10-15 11:08:04] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 91.4% (speed=74.8x)
+[2026-10-15 11:08:06] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=17.2seconds SPEED=74.5x IMAGES=127
+[2026-10-15 11:08:06] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/e/f86e98ecedc2125ee55d9660bfca1f78b5bdd34.bundle/Contents/Indexes/index-sd.bif (127 thumbnails)
+[2026-10-15 11:08:06] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/e/f86e98ecedc2125ee55d9660bfca1f78b5bdd34.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:08:06] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E05 - Meeseeks and Destroy [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=127
+[2026-10-15 11:08:06] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:06] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:08:06] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:08:06] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:06] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-69a5f8e4bc7c7661
+[2026-10-15 11:08:06] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:09] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:08:09] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:09] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 0.0% (speed=0.0x)
+[2026-10-15 11:08:14] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 29.5% (speed=76x)
+[2026-10-15 11:08:19] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 57.4% (speed=74x)
+[2026-10-15 11:08:24] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 88.4% (speed=76x)
+[2026-10-15 11:08:26] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=16.7seconds SPEED=78.1x IMAGES=129
+[2026-10-15 11:08:27] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/0/c239ebf178c37e1554cfe271089a0dc523972dc.bundle/Contents/Indexes/index-sd.bif (129 thumbnails)
+[2026-10-15 11:08:27] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/0/c239ebf178c37e1554cfe271089a0dc523972dc.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:08:27] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E06 - Rick Potion #9 [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=129
+[2026-10-15 11:08:27] INFO - Lab nodes · 2 picked up: /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:27] INFO - Dispatch: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv regenerate=True
+[2026-10-15 11:08:27] INFO - Owners resolved: 1 server(s) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv → [Lab Plex (through the agent)/plex_bundle]
+[2026-10-15 11:08:27] INFO - Frames: EXTRACTING (cache miss) for /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:27] INFO - FFmpeg start: server=Lab Plex (through the agent) path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv gpu=CPU device=- tmp=/tmp/frame_cache/frames-32797e162136dd38
+[2026-10-15 11:08:27] INFO - lab-cpu/CPU · Started preview frames: Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:32] INFO - lab-cpu/CPU · Encoding thumbnails for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv (CPU)
+[2026-10-15 11:08:32] INFO - lab-cpu/CPU · Started processing /media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv
+[2026-10-15 11:08:32] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 0.0% (speed=0.0x)
+[2026-10-15 11:08:37] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 26.1% (speed=66x)
+[2026-10-15 11:08:42] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 57.7% (speed=73x)
+[2026-10-15 11:08:47] INFO - lab-cpu/CPU · Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv - 76.7% (speed=64.6x)
+[2026-10-15 11:08:51] INFO - lab-cpu/CPU · [Lab Plex (through the agent)] Generated Video Preview for /mnt/nas/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv HW=False TIME=19.5seconds SPEED=65.4x IMAGES=127
+[2026-10-15 11:08:51] INFO - [Lab Plex (through the agent)] Generated BIF file: /plexcfg/Library/Application Support/Plex Media Server/Media/localhost/b/166bc4ce34df8aeafdd97cbcaebc271c6ed2753.bundle/Contents/Indexes/index-sd.bif (127 thumbnails)
+[2026-10-15 11:08:51] INFO - Publisher result: server=Lab Plex (through the agent) adapter=plex_bundle status=published item_id=- output=/plexcfg/Library/Application Support/Plex Media Server/Media/localhost/b/166bc4ce34df8aeafdd97cbcaebc271c6ed2753.bundle/Contents/Indexes/index-sd.bif message='Published'
+[2026-10-15 11:08:51] INFO - Dispatch complete: path=/media/tv/Rick and Morty (2013)/Season 01/Rick and Morty (2013) - S01E04 - M. Night Shaym-Aliens! [Bluray-1080p][AC3 5.1][x264]-NTb.mkv status=published published=1 skipped=0 failed=0 frames=127
+[2026-10-15 11:08:51] INFO - Multi-server Webhook Targets complete: 6 item(s) processed.
+[2026-10-15 11:08:51] INFO - Processing complete: 6 generated
+[2026-10-15 11:08:51] INFO - Job completed successfully
+[2026-10-15 11:08:51] INFO - Job 56b58cd0-afda-4e94-a258-d3f704c4620c completed successfully

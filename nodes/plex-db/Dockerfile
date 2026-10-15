@@ -1,0 +1,87 @@
+# The Plex database node (formerly the Plex marker agent): the app's database half, to run beside Plex.
+#
+# Build from the REPOSITORY ROOT (it needs the app's source, which is what it runs):
+#   docker build -f nodes/plex-db/Dockerfile -t plex-marker-agent:dev .
+#
+# It runs the node server (media_preview_generator/nodes/server/) with only the Plex database role on. It carries no
+# ffmpeg, no GPU drivers and none of the app's media libraries: the app's wheel is installed with --no-deps and only
+# the handful of libraries in requirements.lock.txt comes with it.
+#
+# Both stages pin the base by digest, not by tag: `python:3.12-slim-bookworm` is republished whenever Debian or
+# CPython gets a patch, so the tag alone makes two builds of one release tag different images. This digest is the
+# multi-arch index, so linux/amd64 and linux/arm64 both still resolve. To move it on:
+#   docker pull python:3.12-slim-bookworm && docker image inspect --format '{{index .RepoDigests 0}}' python:3.12-slim-bookworm
+
+FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS builder
+WORKDIR /build
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Dependency wheels first: this layer is keyed on the lock alone, so a source edit never rebuilds them.
+# requirements.lock.txt is the whole closure at one version each, with hashes; --require-hashes makes pip refuse
+# anything it wasn't told to expect, so two builds of one release tag get byte-identical dependencies.
+# requirements.txt stays the hand-written input (and the file tests/nodes/test_plex_db_role.py drift-checks against
+# the app's pyproject.toml); regenerate the lock from it with:
+#   docker run --rm -v "$PWD/nodes/plex-db:/w" -w /w python:3.12-slim-bookworm \
+#     sh -c 'pip install pip-tools && pip-compile --generate-hashes --strip-extras --no-header \
+#              --output-file=requirements.lock.txt requirements.txt'
+COPY nodes/plex-db/requirements.lock.txt ./
+RUN pip wheel --wheel-dir=/wheels --no-cache-dir --require-hashes -r requirements.lock.txt
+
+# The app wheel, without its dependencies: the node server's Plex database role imports markers/publishers,
+# loudness's database modules and library_health/plex_rows.py only (their imports of the server layer are
+# function-local, so none of it loads here).
+# setuptools-scm needs a version; CI passes the release's, a local build gets the fallback.
+COPY pyproject.toml ./
+COPY media_preview_generator/ ./media_preview_generator/
+ARG SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0.dev0"
+RUN SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MEDIA_PREVIEW_GENERATOR="$SETUPTOOLS_SCM_PRETEND_VERSION" \
+      pip wheel --wheel-dir=/wheels --no-cache-dir --no-deps .
+
+FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+LABEL org.opencontainers.image.title="Plex database node" \
+      org.opencontainers.image.description="Writes intro and credits markers, chapter thumbnails and loudness into Plex's database, and runs Library Health's counts, for Media Preview Generator running on another machine" \
+      org.opencontainers.image.source="https://github.com/stevezau/media_preview_generator"
+# NODE_PORT is deliberately not set here: the node listens on NODE_PORT, else AGENT_PORT, else 9494, so a setup from
+# the Plex marker agent days that moved AGENT_PORT keeps listening where its published mapping expects.
+# NODE_IMAGE_ROLES: the roles this image carries code for. The node refuses to start with NODE_ROLES=worker here (no
+# FFmpeg, no GPU code) instead of looking healthy and failing every file sent to it.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    NODE_ROLES=plex_db \
+    NODE_IMAGE_ROLES=plex_db \
+    CONFIG_DIR=/config \
+    PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server"
+
+COPY --from=builder /wheels /tmp/wheels
+# --no-deps: the wheel folder already holds the lock's full closure, and the app wheel's own dependency list
+# (ffmpeg-adjacent libraries it never imports here) must not pull anything in. ci.yml's `marker-agent-image` job
+# boots this image and calls it, so a new module-scope import on the role's path breaks a PR, not a release.
+# /config is the node's own folder (its id, and loudness's undo record): sticky and writable by anyone, because the
+# container runs as whichever PUID owns Plex's database, and a fresh named volume copies these permissions.
+RUN pip install --no-cache-dir --no-index --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels \
+    && install -d -m 1777 /config
+# A volume, so the node's id isn't written into the container's own layer when nothing is mounted. It has no name
+# then, and `docker rm` + `docker run` starts on a new, empty one, so the node's loudness check refuses it as it
+# refuses the container's layer: name one yourself (docker-compose.yml does) to keep the undo record across updates.
+VOLUME /config
+
+WORKDIR /app
+
+# Non-root by default. Plex's database is owned by the user Plex runs as, so run the container as that user
+# (compose: `user: "${PUID}:${PGID}"`); the image itself needs no privileges of its own.
+USER 1000:1000
+# The default port only. NODE_PORT (or AGENT_PORT) moves what the node binds, and EXPOSE can't follow an environment
+# variable — so a changed port also needs the published mapping changed (docker-compose.yml derives both from it).
+EXPOSE 9494
+
+# One process: the app's "one writer at a time" guarantee is a lock inside it (see nodes/server/plex_db.py). Threads
+# let a read-back and the Edit tab's checks overlap without a second process touching the database; waitress reads
+# each request whole before a thread takes it, so half-sent requests can't hold them (nodes/server/wsgi.py).
+# No --port: the node reads NODE_PORT (or AGENT_PORT) itself, after their FILE__ files (Docker secrets) have a say.
+CMD ["python", "-m", "media_preview_generator.nodes.server.wsgi", "--threads", "8"]
+
+# It asks where the node listens: with --network host, NODE_HOST may be one address only. Waitress takes :: as IPv6
+# only, so that one is asked on ::1. Each setting is read as the node reads it: its FILE__ file first.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD exec python3 -c "import os, urllib.request; e = os.environ; read = lambda n: (open(e['FILE__' + n], encoding='utf-8-sig').read().strip() if e.get('FILE__' + n) else '') or e.get(n, '').strip(); port = read('NODE_PORT') or read('AGENT_PORT') or '9494'; host = read('NODE_HOST'); host = {'': '127.0.0.1', '0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host); urllib.request.urlopen('http://' + ('[' + host + ']' if ':' in host else host) + ':' + port + '/v1/health', timeout=5)"

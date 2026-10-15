@@ -1,4 +1,4 @@
-name: Plex marker agent — build and publish image
+name: Plex marker agent — build and publish image and the Windows download
 
 on:
   push:
@@ -67,7 +67,7 @@ jobs:
 
       - name: The tag is the version the agent reports
         id: ver
-        # plex_marker_agent.AGENT_VERSION is the single source of truth for this number; the image tags in
+        # nodes/server/plex_db.AGENT_VERSION is the single source of truth for this number; the image tags in
         # docker-compose.yml and README.md are copies a test keeps in step with it. Checking the git tag here closes
         # the last gap: a release can't publish an image whose tag disagrees with what the running agent tells the app.
         env:
@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           version="${TAG#marker-agent-v}"
           # Parsed, not imported: the module imports flask and the app package, neither of which this runner has.
-          reported="$(python3 -c 'import ast, sys; body = ast.parse(open(sys.argv[1]).read()).body; print(next(n.value.value for n in body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "AGENT_VERSION" for t in n.targets)))' plex-marker-agent/plex_marker_agent.py)"
+          reported="$(python3 -c 'import ast, sys; body = ast.parse(open(sys.argv[1]).read()).body; print(next(n.value.value for n in body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "AGENT_VERSION" for t in n.targets)))' media_preview_generator/nodes/server/plex_db.py)"
           if [[ "$reported" != "$version" ]]; then
             echo "::error::${TAG} would publish :${version}, but AGENT_VERSION says ${reported}. Bump one to match the other."
             exit 1
@@ -157,7 +157,7 @@ jobs:
         with:
           # The repository root: the image installs the app's own source, which is what the agent runs.
           context: .
-          file: plex-marker-agent/Dockerfile
+          file: nodes/plex-db/Dockerfile
           platforms: ${{ matrix.platform }}
           build-args: |
             SETUPTOOLS_SCM_PRETEND_VERSION=${{ needs.resolve.outputs.app_version }}
@@ -175,6 +175,64 @@ jobs:
         with:
           name: marker-agent-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    # The same build, self-test, smoke test and package windows-node.yml runs on every pull request that touches the
+    # node, here from the tag, so the download is the code the image runs.
+    name: Build the Windows Plex database node
+    needs: resolve
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0  # setuptools-scm works the app version out from the tags
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        shell: pwsh
+        env:
+          # The app version the image's wheel carries, so the two downloads of one release say the same.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.resolve.outputs.app_version }}
+        run: ./nodes/windows/build.ps1
+
+      - name: Self-test the build (everything the role imports is in it)
+        shell: pwsh
+        run: |
+          ./dist/PlexDbNode/PlexDbNode-debug.exe --self-test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Smoke-test the windowed build
+        shell: pwsh
+        run: |
+          python nodes/windows/smoke_test.py dist/PlexDbNode/PlexDbNode.exe
+          exit $LASTEXITCODE
+
+      - name: Package the download (the PlexDbNode folder with install.ps1 beside it, as the README says)
+        shell: pwsh
+        run: |
+          $package = "dist/PlexDbNode-windows"
+          if (Test-Path $package) { Remove-Item -Recurse -Force $package }
+          New-Item -ItemType Directory $package | Out-Null
+          Copy-Item -Recurse dist/PlexDbNode (Join-Path $package "PlexDbNode")
+          Copy-Item nodes/windows/install.ps1, nodes/windows/uninstall.ps1, nodes/windows/README.md $package
+          # The folder's contents at the zip's top, like the pull request artifact: unzipping gives install.ps1 and
+          # PlexDbNode\ side by side.
+          Compress-Archive -Path "$package/*" -DestinationPath dist/PlexDbNode-windows.zip -Force
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlexDbNode-windows-zip
+          path: dist/PlexDbNode-windows.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -234,9 +292,6 @@ jobs:
           echo "$REF carries linux/amd64 and linux/arm64"
 
       - name: Summary
-        # No GitHub release is created on purpose. scripts/refresh_release_notes.py takes EVERY non-draft release
-        # with no tag filter, and version_check.py reads /releases/latest — so a release named marker-agent-v1.0.0
-        # would become the app's "latest version" for every user. The image in GHCR is the artifact.
         run: |
           {
             echo "## Plex marker agent ${{ needs.resolve.outputs.version }} published"
@@ -247,5 +302,49 @@ jobs:
             echo ""
             echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo "- App wheel inside the image: \`${{ needs.resolve.outputs.app_version }}\`"
-            echo "- No GitHub release: a \`marker-agent-v*\` release would be served to users as the app's own latest version."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    # The Windows node has no registry to live in: its download is a release asset. Never the "latest" release:
+    # version_check.py reads /releases/latest, and a marker-agent-v* release must not become the app's own latest
+    # version (refresh_release_notes.py already keeps only bare app tags).
+    name: Attach the Windows download to the release
+    needs: [resolve, publish, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the zip
+        uses: actions/download-artifact@v4
+        with:
+          name: PlexDbNode-windows-zip
+          path: dist
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          make_latest: false
+          name: "Plex database node ${{ needs.resolve.outputs.version }}"
+          body: |
+            The Plex database node (formerly the Plex marker agent) runs beside Plex so Media Preview Generator on
+            another machine can write markers, chapter thumbnails and loudness into Plex's database.
+
+            - Docker (Linux, unRAID, a NAS): `docker pull ${{ needs.resolve.outputs.image }}:${{ needs.resolve.outputs.version }}`
+              (setup: `nodes/plex-db/README.md`).
+            - Plex installed on Windows: download `PlexDbNode-windows.zip` below, unzip it and run `install.ps1` as
+              the Windows user Plex runs as (setup: `nodes/windows/README.md`).
+          files: dist/PlexDbNode-windows.zip
+          fail_on_unmatched_files: true
+
+      - name: Summary
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          {
+            echo "## Windows download attached"
+            echo ""
+            echo "- Release: https://github.com/$REPOSITORY/releases/tag/$TAG (not marked latest)"
+            echo "- Asset: \`PlexDbNode-windows.zip\`"
           } >> "$GITHUB_STEP_SUMMARY"

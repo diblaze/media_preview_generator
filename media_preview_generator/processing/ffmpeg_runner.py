@@ -28,7 +28,6 @@ import os
 import re
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -37,10 +36,20 @@ from typing import Any, cast
 
 from loguru import logger
 
+from ..utils import (
+    FFMPEG_LOG_PREFIX,
+    dies_with_node,
+    gpu_settings_hint,
+    is_node_mode,
+    node_temp_root,
+    scratch_dir,
+    working_folder_hint,
+)
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
     DV5_PATH_VAAPI_VULKAN,
+    rotation_filter,
 )
 from .hwaccel import hwaccel_decode_args
 
@@ -138,6 +147,8 @@ def create_ffmpeg_runner(
     chapter_start_ms: int | None = None,
     chapter_output: str | None = None,
     active_timeout_s: float | None = None,
+    last_command: list[str] | None = None,
+    rotation: int = 0,
 ) -> Callable[..., tuple[int, float, str, list[str]]]:
     """Factory: return a configured ffmpeg-runner closure for one media item.
 
@@ -147,20 +158,32 @@ def create_ffmpeg_runner(
     original closure did.  Callers in :func:`generator.generate_images`
     replace ``def _run_ffmpeg(...)`` with a single assignment and then
     invoke the returned callable through the full retry cascade.
+
+    ``last_command``, when given, holds each run's FFmpeg command from the moment it starts: a tier can decode with
+    another ``-hwaccel`` than the worker's GPU (the software Dolby Vision tier has none), and the CPU hand-off judges
+    a run by the decoder it asked for.
+
+    ``rotation`` is how far the stream is shown turned (:func:`generator.display_rotation`). FFmpeg turns frames in
+    memory upright by itself but not frames that stay on the GPU, so the GPU scale paths turn them after download.
     """
     # Import at factory-call time to avoid a circular dependency at module
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
     # once per media file, not once per FFmpeg invocation.
     from .generator import (
+        _FOLDER_WRITE_TEXT,
         FFMPEG_STALL_TIMEOUT_SEC,
         NO_DECODER_PHRASE,
         CancellationError,
         _crash_signal,
         _diagnose_ffmpeg_exit_code,
+        _folder_write_errno,
+        _gpu_lacks_the_decoder,
         _io_cut_off,
         _is_signal_killed,
         _save_ffmpeg_failure_log,
         _without_metadata_tags,
+        folder_write_fix,
+        hwaccel_in,
         parse_ffmpeg_progress_line,
     )
 
@@ -179,14 +202,23 @@ def create_ffmpeg_runner(
         """
         if not hw_decode_active:
             return None
+        # A rotated stream's frames are turned upright after download (``_assemble_vf``) and then sized by the CPU
+        # path's own scale (``base_scale``), so its thumbnails match the CPU's; the GPU first shrinks them to twice
+        # that box, as stored (portrait boxes for a quarter turn).
+        if rotation in (90, 270):
+            box = "w=480:h=640"
+        elif rotation == 180:
+            box = "w=640:h=480"
+        else:
+            box = "w=320:h=240"
         if effective_gpu == "NVIDIA":
             return (
-                f"scale_cuda=w=320:h=240:force_original_aspect_ratio=decrease:"
+                f"scale_cuda={box}:force_original_aspect_ratio=decrease:"
                 f"force_divisible_by=2:format={fmt},hwdownload,format={fmt}"
             )
         if effective_gpu in {"INTEL", "AMD"}:
             return (
-                f"scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease:"
+                f"scale_vaapi={box}:force_original_aspect_ratio=decrease:"
                 f"format={fmt},hwdownload,format={fmt},"
                 f"scale=trunc(iw/2)*2:trunc(ih/2)*2"
             )
@@ -223,16 +255,20 @@ def create_ffmpeg_runner(
         }:
             assert libplacebo_vf is not None
             return libplacebo_vf
+        fmt = "p010le" if effective_kind == "hdr10_zscale" else "nv12"
+        gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, fmt)
+        if gpu_seg is None:
+            if effective_kind == "hdr10_zscale":
+                return f"{fps_filter},{hdr10_zscale_chain},{base_scale}"
+            # SDR (also covers dv5_software_fallback — DV-safe fps+scale).
+            return f"{fps_filter},{base_scale}"
+        vf = f"{fps_filter},{gpu_seg}"
         if effective_kind == "hdr10_zscale":
-            gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, "p010le")
-            if gpu_seg is not None:
-                return f"{fps_filter},{gpu_seg},{hdr10_zscale_chain}"
-            return f"{fps_filter},{hdr10_zscale_chain},{base_scale}"
-        # SDR (also covers dv5_software_fallback — DV-safe fps+scale).
-        gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, "nv12")
-        if gpu_seg is not None:
-            return f"{fps_filter},{gpu_seg}"
-        return f"{fps_filter},{base_scale}"
+            vf += f",{hdr10_zscale_chain}"
+        turn = rotation_filter(rotation)
+        if turn is not None:
+            vf += f",{turn},{base_scale}"
+        return vf
 
     def _run_ffmpeg(
         use_skip: bool,
@@ -443,6 +479,8 @@ def create_ffmpeg_runner(
         if chapter_start_ms is not None:
             args += ["-map", "0:V:0", "-frames:v", "1", "-threads:v", str(max(1, effective_ffmpeg_threads))]
         args += [chapter_output or f"{output_folder}/img-%06d.jpg"]
+        if last_command is not None:
+            last_command[:] = args
 
         start_local = time.time()
         hw_label = "GPU" if gpu else "CPU"
@@ -472,19 +510,23 @@ def create_ffmpeg_runner(
 
         # Use file polling approach for non-blocking, high-frequency progress monitoring
         thread_id = threading.get_ident()
+        # A node's temp folder can be swept away under a running task; FFmpeg's log must not fail the file for it.
+        os.makedirs(scratch_dir(), exist_ok=True)
         output_file = os.path.join(
-            tempfile.gettempdir(),
-            f"ffmpeg_output_{os.getpid()}_{thread_id}_{time.time_ns()}.log",
+            scratch_dir(),
+            f"{FFMPEG_LOG_PREFIX}{os.getpid()}_{thread_id}_{time.time_ns()}.log",
         )
         stderr_fh = open(output_file, "w", encoding="utf-8")
         proc = None
         stderr_reader = None
         try:
+            run_args, preexec = dies_with_node(args)  # a node's FFmpeg dies with the node
             proc = subprocess.Popen(
-                args,
+                run_args,
                 stderr=stderr_fh,
                 stdout=subprocess.DEVNULL,
                 env=ffmpeg_env,
+                preexec_fn=preexec,
             )
 
             # Signal that FFmpeg process has started
@@ -703,9 +745,10 @@ def create_ffmpeg_runner(
                         "This usually means a slow disk, a stuck hardware decoder, or a damaged file. "
                         "Other files in the queue will keep processing; this one will be marked failed. "
                         "If it happens often on the same file, try toggling hardware acceleration off "
-                        "in Settings → Processing Options → GPU Configuration.",
+                        "in {}.",
                         FFMPEG_STALL_TIMEOUT_SEC,
                         video_file,
+                        gpu_settings_hint(),
                     )
                     stalled = True
                     proc.kill()
@@ -767,11 +810,50 @@ def create_ffmpeg_runner(
                 video_file,
                 proc.returncode,
             )
+        # A normal hand-off to the CPU, the same on every try: no error lines, stderr dump or failure log.
+        gpu_lacks_decoder = not stalled and _gpu_lacks_the_decoder(
+            proc.returncode, ffmpeg_output_lines, hwaccel_in(args), ffmpeg_output_lines
+        )
+        if gpu_lacks_decoder:
+            logger.info(
+                "The GPU can't decode the video of {} (FFmpeg exit code {}); the CPU makes its thumbnails instead.",
+                video_file,
+                proc.returncode,
+            )
         # Error logging (skip generic failure log when we stopped FFmpeg ourselves; already logged above)
-        if proc.returncode != 0 and not stalled and not gpu_cant_decode and not chapter_without_frame:
-            exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
+        if (
+            proc.returncode != 0
+            and not stalled
+            and not gpu_cant_decode
+            and not gpu_lacks_decoder
+            and not chapter_without_frame
+        ):
+            exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines, output_folder)
             no_decoder = exit_diagnosis == "no_decoder"
-            if no_decoder:
+            refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
+            # A node hands such a file back to the queue: its temp folder is the node's state, which its card and bell
+            # say, not a failed file, so one warning and no stderr lines. Its own rule, so the two can't disagree.
+            handed_back = False
+            if refused is not None and is_node_mode():
+                from ..nodes.server.tasks import blames_temp_folder
+
+                handed_back = blames_temp_folder(node_temp_root(), refused, output_folder)
+            if refused is not None:
+                # The folder's, not the file's or the GPU's: no hardware or codec advice.
+                folder, move = working_folder_hint(getattr(config, "tmp_folder", None))
+                fix = folder_write_fix(refused)
+                (logger.warning if handed_back else logger.error)(
+                    "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
+                    "{}, or {}. Other files in the queue will keep processing.",
+                    video_file,
+                    folder,
+                    output_folder,
+                    _FOLDER_WRITE_TEXT[refused][0],
+                    proc.returncode,
+                    fix,
+                    move,
+                )
+            elif no_decoder:
                 # The file's only failure line: the caller neither reruns it nor logs it again.
                 logger.error(
                     "This file's video can't be decoded by any device (an unknown or protected codec, such as an "
@@ -786,15 +868,17 @@ def create_ffmpeg_runner(
                     "(unsupported codec, broken hardware acceleration, corrupted file, full disk). "
                     "Other files in the queue will keep processing. "
                     "If this happens often on the same file, try toggling hardware acceleration off "
-                    "in Settings → Processing Options → GPU Configuration.",
+                    "in {}.",
                     video_file,
                     proc.returncode,
                     exit_diagnosis,
+                    gpu_settings_hint(),
                 )
 
             # Log last few stderr lines at WARNING level so users can diagnose
             # failures without needing DEBUG mode (especially for crashes/signals)
-            crash = _crash_signal(proc.returncode)
+            # A full quota's exit code (134) is also a wrapper shell's SIGABRT: the write failure was said above.
+            crash = _crash_signal(proc.returncode) if refused is None else None
             if crash is not None:
                 logger.warning(
                     "FFmpeg crashed on {} ({}, exit code {}). A crash like this comes from the file itself (damaged "
@@ -822,16 +906,20 @@ def create_ffmpeg_runner(
                     proc.returncode,
                     video_file,
                 )
-            elif _io_cut_off(proc.returncode, ffmpeg_output_lines):
+            elif refused is None and _io_cut_off(proc.returncode, ffmpeg_output_lines):
                 # Exit 251 with a GPU error in the stderr is the GPU's, not a disk's: the stderr lines below say so.
+                # One the folder refused (it couldn't create a frame file) was said above.
+                folder, _move = working_folder_hint()
                 logger.warning(
                     "FFmpeg hit an I/O error on {}: reading the video from its disk or network share, or writing "
-                    "thumbnails to the working folder ({}, exists: {}), failed. Check that disk or share, and that "
-                    "the working folder isn't full and is writable (Settings → Advanced). "
+                    "thumbnails to {} ({}, exists: {}), failed. Check that disk or share, and that "
+                    "{} isn't full and is writable. "
                     "Other files in the queue will keep processing.",
                     video_file,
+                    folder,
                     output_folder,
                     os.path.isdir(output_folder),
+                    folder,
                 )
             elif exit_diagnosis == "high_exit_non_signal":
                 logger.warning(
@@ -853,7 +941,7 @@ def create_ffmpeg_runner(
                 logger.warning("FFmpeg's last {} stderr lines about the video in {}:", len(tail), video_file)
                 for line in tail:
                     logger.warning("  {}", line)
-            elif ffmpeg_output_lines:
+            elif ffmpeg_output_lines and not handed_back:
                 tail = _without_metadata_tags(ffmpeg_output_lines)[-5:]
                 logger.warning(
                     "FFmpeg's last {} stderr lines for {} (these usually identify the cause):",

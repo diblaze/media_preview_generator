@@ -2282,7 +2282,10 @@ def cached_capability(ctx: PipelineContext, cfg: ServerConfig, publisher: Marker
 
     An off or unconfirmed answer isn't cached: Plex reads it from the saved settings, and switching Intro & Credits
     back on must reach the job's next file, not one 5 minutes later. Nor is one that gave up on a busy database
-    (``details["db_busy"]``). A ready Plex whose Plex Pass didn't answer is reused for ``PLEX_PASS_UNKNOWN_TTL_S`` only.
+    (``details["db_busy"]``), nor one that waits for a Plex database node that didn't answer or is still to be checked
+    (``details["node_waits"]``), nor one this app refused to send to the node (``details["node_refused"]``: turned off,
+    or its new id held until its key is typed again), which the Nodes page or the registry's next check lifts. A ready
+    Plex whose Plex Pass didn't answer is reused for ``PLEX_PASS_UNKNOWN_TTL_S`` only.
     """
     report = _cached_capability(ctx, cfg, publisher, wait_s=None)
     assert report is not None  # waiting without a bound always gets the check
@@ -2312,8 +2315,9 @@ def _cached_capability(
         if _still_fresh(ctx, cached):
             return cast(tuple[float, CapabilityReport], cached)[1]
         report = publisher.capability()
-        if report.details.get("db_busy"):
-            # A database busy just now says nothing about the job's next file, which asks again.
+        if report.details.get("db_busy") or report.details.get("node_waits") or report.details.get("node_refused"):
+            # A database busy just now, or a Plex database node a check or the Nodes page may clear seconds from now,
+            # says nothing about the job's next file, which asks again.
             ctx._capabilities.pop(cfg.id, None)
         elif report.state not in _SETTINGS_ANSWERS:
             ctx._capabilities[cfg.id] = (time.monotonic(), report)
@@ -2900,6 +2904,16 @@ def _built_line(build: Callable[[], str]) -> str | None:
         return None
 
 
+def _node_label(gpu: str | None, gpu_device_path: str | None) -> str:
+    """``<node>/<GPUn|CPU>`` when this thread's reads run on a node, else ""."""
+    from ..nodes.executor import placement_label
+
+    try:
+        return placement_label(None if gpu is None else (gpu, gpu_device_path or ""))
+    except Exception:  # a log line's wording must never stop the read
+        return ""
+
+
 def _log_live(build: Callable[..., str], level: str = "INFO") -> None:
     """Log one line as the file's work happens, live. Never raises: a bug building it (an unexpected shape in a
     step's own data) mustn't fail the file or hold up another owner's write -- the same guard ``_log_file`` gives
@@ -3214,7 +3228,12 @@ def _attempt(
                 phases: list[str] = []
                 on_gpu = gpu is not None
                 device = worker_device(notes.worker) if on_gpu else ""
-                _log_live(lambda s=source, g=on_gpu, d=device: titled(title, reading_line(s, on_gpu=g, device=d)))
+                node = _node_label(gpu, gpu_device_path)
+                _log_live(
+                    lambda s=source, g=on_gpu, d=device, n=node: titled(
+                        title, reading_line(s, on_gpu=g, device=d, node=n)
+                    )
+                )
                 read_started = ctx.monotonic()
                 try:
                     unanswered = _run_detector(

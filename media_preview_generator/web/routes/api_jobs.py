@@ -2056,6 +2056,9 @@ def _build_idle_workers_from_config():
         "ffmpeg_started": False,
         "current_phase": "",
         "chapter_progress": None,
+        "node": None,
+        "node_state": None,
+        "node_cause": None,
     }
 
     # Use the shared label helper so the panel reads identically whether
@@ -2067,6 +2070,7 @@ def _build_idle_workers_from_config():
         cpu_worker_label,
         friendly_device_label,
         gpu_worker_label,
+        node_worker_label,
     )
 
     statuses = []
@@ -2075,29 +2079,50 @@ def _build_idle_workers_from_config():
     cpu_seq = 0
 
     if isinstance(settings.get("worker_groups"), list):
-        from ...worker_groups import group_is_available, member_policies
+        from ...jobs.node_members import read_node_hardware
+        from ...worker_groups import group_is_available, group_resource_key, member_policies
 
         devices = {info.get("device") for info in gpu_infos if info.get("status") != "failed"}
-        for policy in member_policies(settings.worker_groups):
+        policies = member_policies(settings.worker_groups)
+        nodes = read_node_hardware(policies)
+        node_seq: dict[tuple[str, str], int] = {}
+        for policy in policies:
             if not policy["enabled"] or not group_is_available(policy):
                 continue
-            if policy["resource"] == "gpu" and policy["device"] not in devices:
+            node = policy.get("node")
+            hardware = nodes.member(policy) if node else None
+            if hardware is not None and not hardware.available:
+                continue
+            if not node and policy["resource"] == "gpu" and policy["device"] not in devices:
                 continue
             for index in range(policy["count"]):
                 worker_id += 1
-                statuses.append(
-                    {
-                        **idle_entry,
-                        "worker_id": worker_id,
-                        "worker_type": policy["resource"].upper(),
-                        "worker_name": f"{policy['name']} {index + 1}",
-                        "group_id": policy["group_id"],
-                        "member_id": policy["member_id"],
-                        "group_name": policy["name"],
-                        "group_resource": policy["resource"],
-                        "retiring": False,
-                    }
-                )
+                entry = {
+                    **idle_entry,
+                    "worker_id": worker_id,
+                    "worker_type": policy["resource"].upper(),
+                    "worker_name": f"{policy['name']} {index + 1}",
+                    "group_id": policy["group_id"],
+                    "member_id": policy["member_id"],
+                    "group_name": policy["name"],
+                    "group_resource": policy["resource"],
+                    "retiring": False,
+                }
+                if hardware is not None:
+                    seq_key = (node, policy["resource"])
+                    node_seq[seq_key] = node_seq.get(seq_key, 0) + 1
+                    if policy["resource"] == "gpu":
+                        gpu = hardware.gpu or {}
+                        device_label = friendly_device_label(gpu, policy["device"], gpu.get("type"))
+                        label = gpu_worker_label(node_seq[seq_key], device_label)
+                    else:
+                        label = cpu_worker_label(node_seq[seq_key])
+                    entry["worker_name"] = node_worker_label(hardware.node_name, label)
+                    entry["group_resource"] = group_resource_key(policy)
+                    entry["node"] = nodes.node_ref(node)
+                    entry["node_state"] = nodes.node_state(node)
+                    entry["node_cause"] = nodes.node_cause(node)
+                statuses.append(entry)
         return statuses
 
     config_by_device = {

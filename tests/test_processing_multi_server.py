@@ -13,6 +13,7 @@ Verifies that:
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1305,11 +1306,13 @@ class TestCrossServerBifReuse:
         truncate_plex_bif_to: int | None = None,
         header_interval_ms: int | None = None,
         timestamp_step: int = 1,
+        slot_leftovers: int = 0,
     ):
         """Plex already has an ``index-sd.bif`` made at ``plex_bif_interval_ms``; Emby at 5 s has no output yet.
 
         Plex's bundle path doesn't encode the interval, so the BIF still looks fresh after an interval change.
         ``truncate_plex_bif_to`` cuts the Plex BIF to that many bytes, as a partial write would.
+        ``slot_leftovers`` frames sit in the file's frame-cache slot with no cache entry, named as FFmpeg writes them.
 
         Returns:
             ``(result, emby_bif_path, generate_images_calls)``.
@@ -1335,6 +1338,11 @@ class TestCrossServerBifReuse:
         )
         if truncate_plex_bif_to is not None:
             plex_bif.write_bytes(plex_bif.read_bytes()[:truncate_plex_bif_to])
+        if slot_leftovers:
+            slot = get_frame_cache(base_dir=str(tmp_path / "tmp" / "frame_cache")).frame_dir_for(str(media_file))
+            slot.mkdir(parents=True)
+            for i in range(1, slot_leftovers + 1):
+                (slot / f"img-{i:06d}.jpg").write_bytes(buf.getvalue())
         from media_preview_generator.output.journal import write_meta
 
         write_meta([plex_bif], str(media_file), publisher="plex_bundle")
@@ -1400,6 +1408,19 @@ class TestCrossServerBifReuse:
         # The unpacked frames enter the cache stamped with the settings they were checked against.
         canonical_path = str(tmp_path / "data" / "movies" / "Test (2024)" / "Test (2024).mkv")
         assert get_frame_cache().get(canonical_path, extraction_key=(5, 4, "hable")) is not None
+
+    def test_frames_left_in_the_slot_are_not_published_with_the_sibling_bif(self, mock_config_for_processing, tmp_path):
+        """A cancelled extraction, or the previous run of the app, leaves frames in the slot with no cache entry. The
+        sibling BIF unpacked there must give Emby Plex's 20 frames, not those with the leftovers after them."""
+        result, emby_bif, calls = self._dispatch_plex_bif_to_emby_at_5s(
+            mock_config_for_processing, tmp_path, plex_bif_interval_ms=5000, slot_leftovers=7
+        )
+
+        assert calls == []
+        sources = {p.server_id: p.frame_source for p in result.publishers}
+        assert sources["emby-1"] == "cache_hit"
+        meta = read_bif_metadata(str(emby_bif))
+        assert (meta.frame_count, meta.frame_interval_ms) == (20, 5000)
 
     def test_sibling_bif_is_skipped_when_interval_differs(self, mock_config_for_processing, tmp_path):
         """A Plex BIF written at 10 s before the user switched to 5 s must not feed Emby's 5 s BIF."""
@@ -2263,6 +2284,48 @@ class TestSourceVanishesDuringGeneration:
         assert errors[0].startswith(f"Could not extract preview frames from {source} ({type(exc).__name__}: {exc}).")
 
 
+class TestAWorkingFolderThatRefusesTheThumbnails:
+    """FFmpeg couldn't write the thumbnails: the folder's condition, not a corrupt video, and nothing is published."""
+
+    @pytest.mark.parametrize(
+        ("code", "said"),
+        [
+            (errno.ENOSPC, "is full (No space left on device). Free up space there"),
+            (errno.EROFS, "is read-only"),
+            (
+                errno.EACCES,
+                "can't be written to (Permission denied). Let the app's user write to it (in Docker, check PUID and "
+                "PGID)",
+            ),
+        ],
+        ids=["full", "read-only", "no-permission"],
+    )
+    def test_the_file_fails_naming_the_folder_and_publishes_nothing(
+        self, mock_config_for_processing, tmp_path, code, said
+    ):
+        from media_preview_generator.processing.generator import WorkingFolderError
+
+        season = TestSourceVanishesDuringGeneration._season(tmp_path)
+        source = _video(season / TestSourceVanishesDuringGeneration.OLD)
+        folder = str(tmp_path / "cache" / "frame_cache" / "frames-x")
+
+        def generate(*_args, **_kwargs):
+            raise WorkingFolderError(code, os.strerror(code), folder)
+
+        result, records, _ = TestSourceVanishesDuringGeneration._run(
+            source, mock_config_for_processing, tmp_path, generate
+        )
+
+        assert result.status is MultiServerStatus.FAILED
+        assert result.message.startswith(f"Couldn't write the thumbnails: the working folder {folder} {said}")
+        # The working folder is the one TMP_FOLDER seeded, so a bigger disk goes there, not at the system's temp folder.
+        assert result.message.endswith(f", or mount a bigger, writable disk at {tmp_path / 'cache'}.")
+        assert result.publishers == []
+        assert not list((tmp_path / "tv").rglob("*.bif"))
+        errors = [message for level, message in records if level == "ERROR"]
+        assert errors == [f"{source}: {result.message}"], "no 'corrupt video' traceback"
+
+
 class TestAdapterFactory:
     def test_picks_default_per_server_type(self):
         plex_cfg = ServerConfig(
@@ -2770,3 +2833,77 @@ class TestPlexLocalPublishing:
             get_frame_cache().get(str(media_file), extraction_key=_frame_extraction_key(mock_config_for_processing))
             is None
         )
+
+
+class TestOnARemoteNode:
+    """A worker placed on a node gets its frames from the node; publishing still happens here."""
+
+    @staticmethod
+    def _registry(tmp_path: Path) -> ServerRegistry:
+        movies = str(tmp_path / "data" / "movies")
+        return ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="emby-1",
+                    server_type=ServerType.EMBY,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(movies,), enabled=True)],
+                    output={"adapter": "emby_sidecar", "width": 320, "frame_interval": 10},
+                )
+            ],
+        )
+
+    def test_frames_come_from_the_node_and_the_bif_is_published_here(self, mock_config_for_processing, tmp_path):
+        from media_preview_generator.nodes import protocol, remote_ops
+        from media_preview_generator.nodes.executor import Placement, placed_on
+
+        media_dir = tmp_path / "data" / "movies" / "Test (2024)"
+        media_file = _seed_canonical_file(media_dir)
+        calls = []
+
+        def run_on_node(op, app_path, params, *, gpu, artifact_to, **kwargs):
+            calls.append((op, app_path, gpu))
+            _populate_frames(artifact_to, count=5)
+            return {"generate_images": [True, 5, False, 1.0, "1.0x", None], "failures": []}
+
+        with (
+            patch.object(remote_ops, "run_on_node", side_effect=run_on_node),
+            patch("media_preview_generator.processing.multi_server.generate_images") as local,
+            placed_on(Placement("n1", "NAS")),
+        ):
+            result = process_canonical_path(
+                canonical_path=str(media_file), registry=self._registry(tmp_path), config=mock_config_for_processing
+            )
+
+        assert result.status is MultiServerStatus.PUBLISHED
+        assert result.frame_count == 5
+        local.assert_not_called()
+        assert calls == [(protocol.OP_PREVIEW_FRAMES, str(media_file), None)]
+        assert (media_dir / "Test (2024)-320-10.bif").exists()
+
+    @pytest.mark.parametrize("not_visible", [False, True], ids=["node-gone", "file-not-visible"])
+    def test_a_node_handing_the_file_back_reaches_the_worker_instead_of_failing_it(
+        self, mock_config_for_processing, tmp_path, not_visible
+    ):
+        from media_preview_generator.nodes import remote_ops
+        from media_preview_generator.nodes.executor import (
+            FileNotVisibleError,
+            NodeUnavailableError,
+            Placement,
+            placed_on,
+        )
+
+        media_file = _seed_canonical_file(tmp_path / "data" / "movies" / "Test (2024)")
+        exc = (
+            FileNotVisibleError("n1", "NAS", "missing", "not under any mapping")
+            if not_visible
+            else NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+        )
+
+        with (
+            patch.object(remote_ops, "run_on_node", side_effect=exc),
+            placed_on(Placement("n1", "NAS")),
+            pytest.raises(type(exc)),
+        ):
+            process_canonical_path(
+                canonical_path=str(media_file), registry=self._registry(tmp_path), config=mock_config_for_processing
+            )

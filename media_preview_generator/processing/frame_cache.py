@@ -78,6 +78,15 @@ class CacheEntry:
     size_bytes: int = 0
 
 
+def _jpg_count(frame_dir: Path) -> int | None:
+    """How many ``.jpg`` frames ``frame_dir`` holds; None when it is gone or can't be read."""
+    try:
+        with os.scandir(frame_dir) as children:
+            return sum(1 for child in children if child.name.endswith(".jpg"))
+    except OSError:
+        return None
+
+
 def _dir_size_bytes(frame_dir: Path) -> int:
     """Total size of the files directly under ``frame_dir``; 0 when it cannot be read."""
     total = 0
@@ -172,7 +181,8 @@ class FrameCache:
         An entry is valid iff:
         - it exists in the in-memory map,
         - it was stored with the same ``extraction_key``,
-        - its frame directory still exists on disk,
+        - its frame directory still holds every frame it was stored with (a regenerate empties the slot before
+          extracting into it),
         - the source file's identity and change markers match the extraction,
         - the entry is younger than ``ttl_seconds``.
 
@@ -214,8 +224,18 @@ class FrameCache:
                 self._evict(key)
                 return None
 
-            if not entry.frame_dir.is_dir():
+            frames_there = _jpg_count(entry.frame_dir)
+            if frames_there is None:
                 logger.info("Frame cache miss: cache dir gone for {}; will re-extract", canonical_path)
+                self._evict(key)
+                return None
+            if frames_there != entry.frame_count:
+                logger.info(
+                    "Frame cache miss: {} of the {} cached frames for {} are left; will re-extract",
+                    frames_there,
+                    entry.frame_count,
+                    canonical_path,
+                )
                 self._evict(key)
                 return None
 
@@ -297,9 +317,20 @@ class FrameCache:
         return entry
 
     def invalidate(self, canonical_path: str) -> None:
-        """Remove ``canonical_path`` from the cache + disk if present."""
+        """Remove ``canonical_path``'s entry and its slot folder, entry or not.
+
+        An extraction stopped part-way leaves frames in the slot before any entry is stored for them; left there, a
+        sibling BIF unpacked into the slot later would be published with them.
+        """
+        slot = self.frame_dir_for(canonical_path)
         with self._lock:
             self._evict(self._key(canonical_path))
+            try:
+                shutil.rmtree(slot)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("Frame cache: failed to rmtree {}: {}", slot, exc)
 
     def clear(self) -> None:
         """Remove all entries from memory and disk."""

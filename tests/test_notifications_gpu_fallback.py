@@ -45,7 +45,7 @@ class TestGpuKeepsFailingNotification:
             "title": "GPU keeps failing: files are running on the CPU",
             "body_html": (
                 "<p class='mb-0'>Intel UHD Graphics 770 couldn't process the last 5 files, so they ran on the CPU "
-                "(slower). Last reason: hevc not supported. Check the GPU driver in Settings → GPU.</p>"
+                "(slower). Last reason: hevc not supported. Check the GPU driver, and the GPU in Settings → Processing Options → GPU device tuning.</p>"
             ),
             "dismissable": True,
             "permanent_dismissable": False,
@@ -106,6 +106,46 @@ class TestGpuKeepsFailingNotification:
         get_gpu_fallback_tracker().record(KEY, "GPU A", fell_back=False, reason=None)
         _flag()
         assert [n["id"] for n in build_active_notifications()] == [notification_id(KEY)]
+
+    def test_a_node_gpu_card_names_the_node_and_links_to_it_not_this_apps_gpu_settings(self, monkeypatch):
+        from media_preview_generator.nodes import registry as reg
+
+        class _Registry:
+            def view(self, node_id):
+                assert node_id == "n1"
+                return reg.NodeView("n1", "Storage <box>", "http://n", True, reg.STATE_READY, "", "1", ("worker",),
+                                    (), 4, False, None)  # fmt: skip
+
+        monkeypatch.setattr(reg, "_registry", _Registry())
+        key = f"node:n1:{KEY}"
+        _flag(key, name="Storage <box> Intel Arc A380")
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert card["id"] == notification_id(key) and card["device"] == key
+        assert card["body_html"] == (
+            "<p class='mb-0'>Storage &lt;box&gt; Intel Arc A380 couldn't process the last 5 files, so they ran on the "
+            "CPU (slower). Last reason: hevc not supported. Check the GPU driver on Storage &lt;box&gt;, then Rescan "
+            "GPUs on its Nodes page.</p>"
+        )
+        assert "Settings → GPU" not in card["body_html"]
+        assert card["action"] == {"href": "/nodes#node-n1", "label": "Open node"}
+
+    def test_a_node_gpu_card_still_shows_when_the_node_is_gone(self, monkeypatch):
+        from media_preview_generator.nodes import registry as reg
+
+        class _Registry:
+            def view(self, node_id):
+                return None
+
+        monkeypatch.setattr(reg, "_registry", _Registry())
+        _flag(f"node:n1:{KEY}", name="NAS Intel Arc A380")
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert "Check the GPU driver on the node, then Rescan GPUs on its Nodes page." in card["body_html"]
+        assert card["action"] == {"href": "/nodes#node-n1", "label": "Open node"}
+
+    def test_a_local_gpu_card_has_no_node_link(self):
+        _flag()
+        (card,) = _build_gpu_keeps_failing_notifications()
+        assert "action" not in card
 
     def test_session_only_dismissal_covers_gpu_cards_and_the_media_mount_card(self):
         assert is_session_only_dismissal(notification_id(KEY)) is True
@@ -174,19 +214,32 @@ class TestCreditsOnCpuNotification:
         dismiss_session(card_id)
         assert card_id not in [n["id"] for n in build_active_notifications()]
 
-    def test_the_streak_card_for_the_same_gpu_is_suppressed_but_another_gpu_still_shows(self, credits_devices):
-        credits_devices.append(CREDITS_DEVICE)
-        credits = "Credits read on the CPU: this GPU failed its accuracy check. Previews still use the GPU."
-        _flag(KEY, "GPU A", reason=credits)
-        _flag("/dev/dri/renderD129", "GPU B", reason=credits)
+    def test_the_streak_card_for_a_kept_on_cpu_gpu_is_suppressed_but_another_gpu_still_shows(self):
+        _flag(KEY, "GPU A", reason="Credits read on the CPU until restart: this GPU failed its accuracy check.")
+        _flag("/dev/dri/renderD129", "GPU B", reason="Credits read on the CPU: the GPU crashed. It's tried again.")
         assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == ["/dev/dri/renderD129"]
 
     def test_a_preview_streak_on_the_same_gpu_still_shows_its_card(self, credits_devices):
         # The credits card says previews still use the GPU; a streak last fed by a preview decode failing says
         # otherwise, so its own card must not be hidden.
         credits_devices.append(CREDITS_DEVICE)
-        _flag(KEY, "GPU A", reason="Credits read on the CPU: this GPU failed its accuracy check.", n=4)
+        _flag(KEY, "GPU A", reason="Credits read on the CPU until restart: this GPU failed its accuracy check.", n=4)
         _flag(KEY, "GPU A", reason="hevc not supported", n=1)
+        assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == [KEY]
+
+    def test_software_vulkan_streak_gets_no_card_for_a_local_or_node_gpu(self):
+        # Issue #408: Vulkan offered only llvmpipe, so every credits file is read on the CPU by design.
+        reason = "Credits read on the CPU until restart: Vulkan reports no hardware GPU"
+        _flag(KEY, "Intel UHD Graphics 600", reason=reason)
+        _flag("node:n1:/dev/dri/renderD128", "Node GPU", reason=reason)
+        assert _build_gpu_keeps_failing_notifications() == []
+
+    def test_a_crashing_credits_helper_still_gets_the_streak_card(self):
+        # A crash is retried, so five in a row is the GPU failing.
+        reason = (
+            "Credits read on the CPU: the GPU crashed (exit code 9) while reading credits. It's tried again shortly."
+        )
+        _flag(KEY, "GPU A", reason=reason)
         assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == [KEY]
 
     def test_a_failing_read_gives_no_cards(self, monkeypatch):

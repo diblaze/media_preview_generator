@@ -39,6 +39,16 @@ run_as_user() {
     fi
 }
 
+# MODE=node: run as a remote node (lends this machine's GPU/CPU, or opens Plex's database here) instead of the app.
+# One process (its task table lives in its memory), served by waitress: it reads each request whole before a thread
+# takes it, so a few half-sent requests from anyone on the network can't freeze the node (nodes/server/wsgi.py).
+# Same rule as utils.is_node_mode() and the HEALTHCHECK: case and surrounding spaces don't matter (MODE=Node is a node).
+mode="${MODE:-}"
+if [[ "${mode,,}" =~ ^[[:space:]]*node[[:space:]]*$ ]]; then
+    echo "Starting node..."  # its own log names the port (it may come from FILE__NODE_PORT)
+    run_as_user python3 -m media_preview_generator.nodes.server.wsgi --threads 16
+fi
+
 # Start gunicorn web server
 RELOAD_FLAG=""
 if [ "${DEV_RELOAD:-false}" = "true" ]; then
@@ -47,13 +57,16 @@ if [ "${DEV_RELOAD:-false}" = "true" ]; then
 else
     echo "Starting gunicorn web server on port ${WEB_PORT:-8080}..."
 fi
+# A browser tab's websocket holds the worker for all of --graceful-timeout on a stop, so it ends inside the 3 s s6
+# gives the container's processes after a stop's SIGTERM (S6_KILL_GRACETIME). The app's own stop steps run from the
+# SIGTERM meanwhile (shutdown.on_shutdown).
 run_as_user gunicorn \
     --bind "0.0.0.0:${WEB_PORT:-8080}" \
     --worker-class gthread \
     --threads 8 \
     --workers 1 \
     --timeout 300 \
-    --graceful-timeout 30 \
+    --graceful-timeout 2 \
     --keep-alive 65 \
     --error-logfile - \
     --log-level info \

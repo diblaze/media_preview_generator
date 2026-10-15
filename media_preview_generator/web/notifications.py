@@ -43,6 +43,10 @@ LIBRARY_HEALTH_NOT_SHOWING_ID = "library_health_not_showing"
 LIBRARY_HEALTH_CHECK_FAILED_ID = "library_health_check_failed"
 
 CREDITS_ON_CPU_ID_PREFIX = "credits_on_cpu_"
+# ``node:<node id>:<kind>``, one per node in an alert state; the kind is a key of ``_NODE_CARD_TEXT``.
+NODE_ID_PREFIX = "node:"
+# The ``<state>`` of a Plex database node's card when it reports a new id its key must confirm.
+NODE_UNCONFIRMED = "unconfirmed"
 
 # Cards that can be hidden until the next restart but never for good: the problem they report comes and goes, and a
 # permanent dismissal would hide the next occurrence too. An id stored by an older version is ignored.
@@ -55,6 +59,7 @@ def is_session_only_dismissal(notification_id_value: str) -> bool:
         notification_id_value in SESSION_ONLY_DISMISSAL_IDS
         or is_gpu_notification_id(notification_id_value)
         or notification_id_value.startswith(CREDITS_ON_CPU_ID_PREFIX)
+        or notification_id_value.startswith(NODE_ID_PREFIX)
     )
 
 
@@ -99,13 +104,69 @@ def reset_session() -> None:
         _SESSION_DISMISSED.clear()
 
 
+def _vulkan_failures() -> list[tuple[dict[str, Any], Any]]:
+    """The detected GPUs that can't use Vulkan, each with its check; empty when none is known to fail."""
+    from ..gpu.vulkan_check import get_vulkan_checks
+    from .routes._helpers import _ensure_gpu_cache
+    from .routes.api_vulkan import _diagnose_vulkan_environment
+
+    try:
+        gpus = list(_ensure_gpu_cache())
+        checks = get_vulkan_checks(gpus, _diagnose_vulkan_environment)
+    except Exception as exc:  # noqa: BLE001 - the card still shows, with the general text
+        logger.debug("Couldn't check why Vulkan is unavailable for the notification: {}", exc)
+        return []
+    return [(gpu, check) for gpu, check in zip(gpus, checks, strict=True) if check is not None and not check.ok]
+
+
+def _vulkan_card_body(failures: list[tuple[dict[str, Any], Any]]) -> str:
+    """The bell card's body: what this means, why, what to do (plain text escaped; NVIDIA keeps its detailed HTML)."""
+    from markupsafe import escape
+
+    from ..markers.credits.textdet_helper import _WEBGPU_VENDORS
+    from .routes.api_vulkan import _diagnose_vulkan_environment, _nvidia_body_html
+
+    several = len(failures) > 1
+    effects = []
+    if any(gpu.get("type") in _WEBGPU_VENDORS for gpu, _ in failures):
+        effects.append("Credits text is read on the CPU: just as accurate, slower.")
+    effects.append("Dolby Vision Profile 5 thumbnails get a green and purple tint.")
+    effects.append("Previews and intros still use the GPU.")
+    html = "<strong>What this means</strong><ul>" + "".join(f"<li>{escape(e)}</li>" for e in effects) + "</ul>"
+
+    why_items, fix_items = [], []
+    for gpu, check in failures:
+        name = escape(gpu.get("name") or gpu.get("type") or "GPU")
+        if check.cause.startswith("nvidia_"):
+            detail = _nvidia_body_html(check.cause, _diagnose_vulkan_environment(), gpu.get("name") or "NVIDIA GPU")
+            why_items.append(detail)
+            continue
+        fix = (
+            "Nothing, if the CPU keeps up. A host OS update with a newer kernel fixes it."
+            if (check.cause == "kernel_too_old")
+            else check.fix
+        )
+        why_items.append(f"{f'<strong>{name}:</strong> ' if several else ''}{escape(check.why)}")
+        fix_items.append(f"{f'<strong>{name}:</strong> ' if several else ''}{escape(fix)}")
+    html += "<strong>Why</strong>" + _paragraph_or_list(why_items)
+    if fix_items:
+        html += "<strong>What to do</strong>" + _paragraph_or_list(fix_items)
+    return html
+
+
+def _paragraph_or_list(items: list[str]) -> str:
+    """One item as a paragraph, several as a list: a one-bullet list reads as if something is missing."""
+    if len(items) == 1:
+        return f"<p class='mb-2'>{items[0]}</p>"
+    return "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
+
+
 def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
     """Return a notification dict when the Vulkan probe fell back to software.
 
-    Returns ``None`` when Vulkan is healthy (no warning needed).  When
-    the warning fires, reuses the existing GPU-aware HTML body from
-    ``api_vulkan._get_vulkan_info`` so there is a single source of
-    truth for the remediation text.
+    Returns ``None`` when Vulkan is healthy (no warning needed).  When a GPU's check says why it can't use Vulkan, the
+    card names that GPU and the cause. Otherwise (no GPU known to fail) it keeps the general Dolby Vision text from
+    ``api_vulkan._get_vulkan_info``.
     """
     # Deferred import to avoid circular import (api_vulkan imports from
     # gpu_detection which imports loguru which... keep it lazy).
@@ -116,7 +177,7 @@ def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
     if not warning_html:
         return None
 
-    return {
+    card = {
         "id": VULKAN_SOFTWARE_FALLBACK_ID,
         "severity": "warning",
         "title": "Dolby Vision Profile 5 thumbnails will have the wrong colours",
@@ -125,6 +186,19 @@ def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
         "source": "vulkan_probe",
         "device": info.get("device"),
     }
+    failures = _vulkan_failures()
+    if not failures:
+        return card
+    if len(failures) == 1:
+        gpu, check = failures[0]
+        card["title"] = (
+            f"{gpu.get('name') or gpu.get('type')} can't use Vulkan: {check.title[:1].lower()}{check.title[1:]}"
+        )
+    else:
+        card["title"] = f"Vulkan isn't working on {len(failures)} GPUs"
+    card["body_html"] = _vulkan_card_body(failures)
+    card["action"] = {"href": "/settings#section-processing", "label": "Open GPU check"}
+    return card
 
 
 def _build_timezone_misconfigured_notification() -> dict[str, Any] | None:
@@ -378,33 +452,59 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     """
     from markupsafe import escape
 
-    from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
+    from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX
 
     cards = []
-    credits_keys = {device["key"] for device in _credits_on_cpu_devices()}
     for state in get_gpu_fallback_tracker().flagged():
-        # The credits card already explains a streak of credits fallbacks, and "check the GPU driver" is wrong for
-        # them; a streak whose last file fell back for another reason (a preview decode) still gets this card.
-        if state.key in credits_keys and (state.last_reason or "").startswith(CREDITS_ON_CPU_PREFIX):
+        # A GPU whose credits stay on the CPU for the process sends every credits file there by design, and its own
+        # card (self-test) or the Vulkan card says why; "check the GPU driver" is wrong for that. A streak whose last
+        # file fell back for another reason (a preview decode, a crashed helper that is retried) still gets this card.
+        if (state.last_reason or "").startswith(CREDITS_KEPT_ON_CPU_PREFIX):
             continue
+        node_id = _gpu_streak_node_id(state.key)
+        if node_id is None:
+            todo = "Check the GPU driver, and the GPU in Settings → Processing Options → GPU device tuning."
+        else:
+            todo = f"Check the GPU driver on {_node_name(node_id)}, then Rescan GPUs on its Nodes page."
         body = (
             f"<p class='mb-0'>{escape(state.name)} couldn't process the last {GPU_FALLBACK_STREAK} files, so they "
             f"ran on the CPU (slower). Last reason: {escape(state.last_reason or 'GPU processing failed')}. "
-            "Check the GPU driver in Settings → GPU.</p>"
+            f"{escape(todo)}</p>"
         )
-        cards.append(
-            {
-                "id": notification_id(state.key),
-                "severity": "warning",
-                "title": "GPU keeps failing: files are running on the CPU",
-                "body_html": body,
-                "dismissable": True,
-                "permanent_dismissable": False,
-                "source": "gpu_fallback_streak",
-                "device": state.key,
-            }
-        )
+        card = {
+            "id": notification_id(state.key),
+            "severity": "warning",
+            "title": "GPU keeps failing: files are running on the CPU",
+            "body_html": body,
+            "dismissable": True,
+            "permanent_dismissable": False,
+            "source": "gpu_fallback_streak",
+            "device": state.key,
+        }
+        if node_id is not None:
+            card["action"] = {"href": f"/nodes#node-{node_id}", "label": "Open node"}
+        cards.append(card)
     return cards
+
+
+def _gpu_streak_node_id(key: str) -> str | None:
+    """The node a GPU streak key (``node:<id>:<device>``, from a node worker) belongs to; None for this app's GPU."""
+    if not key.startswith("node:"):
+        return None
+    node_id = key.split(":", 2)[1]
+    return node_id or None
+
+
+def _node_name(node_id: str) -> str:
+    """The node's name for a card, or "the node" once it is gone."""
+    from ..nodes.registry import get_registry
+
+    try:
+        view = get_registry().view(node_id)
+    except Exception as exc:
+        logger.debug("node name for a GPU card unavailable: {}", exc)
+        view = None
+    return view.name if view is not None and view.name else "the node"
 
 
 def _not_showing_by_plex_server() -> dict[str, int]:
@@ -492,6 +592,189 @@ def _build_library_health_check_failed_notification() -> dict[str, Any] | None:
     }
 
 
+_NODE_CARD_TEXT = {
+    # kind (the node's state, or its cause when that has a card of its own, ``_node_card_kind``):
+    # (title, what to do when the node has no reason, action label, where on the node dialog the action lands)
+    "offline": (
+        "{name} is offline",
+        "Check that the node is running and that this app can reach it.",
+        "Open Nodes",
+        "",
+    ),
+    # It answered: offline only until its restart is done.
+    "restarting": (
+        "{name} is restarting",
+        "It gets no files until it is back.",
+        "Open Nodes",
+        "",
+    ),
+    # It answered too: it only holds this app back for a while (too many wrong keys from here).
+    "rate_limited": (
+        "{name} asks this app to wait",
+        "Something else at this app's address has an old key: give it the right one, or stop it.",
+        "Open Nodes",
+        "",
+    ),
+    "update_needed": (
+        "{name} needs an update",
+        "Update the node so its version matches this app.",
+        "Open Nodes",
+        "health",
+    ),
+    # A worker node ahead of this app: this app is the one to update. Setup Health's version row says so too.
+    "app_behind": (
+        "Update this app for {name}",
+        "The node runs a newer version. Update this app so its version matches the node.",
+        "Open Nodes",
+        "health",
+    ),
+    "key_refused": (
+        "{name} refused the key",
+        "Copy the node's key into its settings on the Nodes page.",
+        "Fix key",
+        "settings",
+    ),
+    "access_problem": (
+        "{name} can't see your media",
+        "Its workers are paused. Run Test access and fix its folder mappings.",
+        "Test access",
+        # The Media tab, with Test access started.
+        "media/test",
+    ),
+    "gpu_lost": (
+        "{name} lost its GPU",
+        "Its CPU workers keep running. Check the GPU driver on the node.",
+        "Open Nodes",
+        "health",
+    ),
+    "no_ffmpeg": (
+        "{name} can't find FFmpeg",
+        "Nothing is sent to it until FFmpeg is installed there.",
+        "Open Nodes",
+        "health",
+    ),
+    "duplicate": (
+        "{name} is added twice",
+        "Nothing is sent to it until one of the two is removed.",
+        "Open Nodes",
+        # Its Remove button.
+        "settings",
+    ),
+    "temp_problem": (
+        "{name} can't use its temp folder",
+        "Nothing is sent to it until it can write to its temp folder again.",
+        "Open Nodes",
+        "health",
+    ),
+}
+
+
+# Every ``<kind>`` a node card id can end in (``_is_known_notification_id`` accepts these).
+NODE_CARD_KINDS = tuple(_NODE_CARD_TEXT)
+
+
+def node_notification_id(node_id: str, kind: str) -> str:
+    """The bell card id for one node in one state (``_node_card_kind``)."""
+    return f"{NODE_ID_PREFIX}{node_id}:{kind}"
+
+
+def _node_card_kind(state: str, cause: str) -> str:
+    """Which card a node gets: its state, or its cause when that has a card of its own.
+
+    An offline node that answered (restarting, asks this app to wait) and a worker node ahead of this app get their own
+    card and id, so dismissing "is restarting" doesn't hide the "is offline" that follows when the node never comes
+    back.
+    """
+    from ..nodes.registry import (
+        OFFLINE_RATE_LIMITED,
+        OFFLINE_RESTARTING,
+        STATE_OFFLINE,
+        STATE_UPDATE_NEEDED,
+        UPDATE_APP_BEHIND,
+    )
+
+    carded = {
+        OFFLINE_RESTARTING: STATE_OFFLINE,
+        OFFLINE_RATE_LIMITED: STATE_OFFLINE,
+        UPDATE_APP_BEHIND: STATE_UPDATE_NEEDED,
+    }
+    return cause if cause and carded.get(cause) == state else state
+
+
+def _build_node_notifications() -> list[dict[str, Any]]:
+    """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU,
+    has no FFmpeg, is added twice or can't use its temp folder, plus one for a Plex database node whose new id waits
+    for its key to be typed again.
+
+    A node nothing uses (no switched-on worker group with a member on it, no switched-on Plex server with its Plex
+    database node switched on pointing at it) raises no card: whatever its state, no work waits on it.
+
+    The id carries the card's kind (``_node_card_kind``), so a dismissed "offline" card doesn't hide a later "refused
+    the key" one; the session dismissal of a kind the node has left is lifted, so the next time it happens the card
+    shows again.
+    """
+    from markupsafe import escape
+
+    from ..nodes.registry import get_registry
+    from ..nodes.settings import node_users
+    from .settings_manager import get_settings_manager
+
+    try:
+        views = get_registry().views()
+        settings = get_settings_manager()
+        groups, servers = settings.get("worker_groups"), settings.get("media_servers")
+    except Exception as exc:
+        logger.debug("node notifications skipped: {}", exc)
+        return []
+    cards = []
+    for view in views:
+        kind = _node_card_kind(view.state, view.cause)
+        for other in NODE_CARD_KINDS:
+            if other != kind:
+                undismiss_session(node_notification_id(view.id, other))
+        users = node_users(view.id, groups, servers, switched_on_only=True)
+        if not view.plex_db_unconfirmed:
+            undismiss_session(node_notification_id(view.id, NODE_UNCONFIRMED))
+        elif users["servers"]:
+            cards.append(_unconfirmed_node_card(view.id, view.name or "A node"))
+        text = _NODE_CARD_TEXT.get(kind)
+        if text is None or not any(users.values()):
+            continue
+        title, todo, label, target = text
+        name = view.name or "A node"
+        # The node's reason already ends with what to do, so the card's own line is only for a node without one.
+        body = view.reason or todo
+        href = f"/nodes#node-{view.id}/{target}" if target else f"/nodes#node-{view.id}"
+        cards.append(
+            {
+                "id": node_notification_id(view.id, kind),
+                "severity": "warning",
+                "title": title.format(name=name),
+                "body_html": f"<p class='mb-0'>{escape(body)}</p>",
+                "dismissable": True,
+                "permanent_dismissable": False,
+                "source": "nodes",
+                "action": {"href": href, "label": label},
+            }
+        )
+    return cards
+
+
+def _unconfirmed_node_card(node_id: str, name: str) -> dict[str, Any]:
+    """The card for a Plex database node that reports a new id (``NodeRegistry.plex_db_refusal``)."""
+    return {
+        "id": node_notification_id(node_id, NODE_UNCONFIRMED),
+        "severity": "warning",
+        "title": f"{name} reports a new id",
+        "body_html": "<p class='mb-0'>This app sends it no Plex database work until you confirm it is the same Plex. "
+        "Type the node's key again on its Settings tab.</p>",
+        "dismissable": True,
+        "permanent_dismissable": False,
+        "source": "nodes",
+        "action": {"href": f"/nodes#node-{node_id}/settings", "label": "Type the key again"},
+    }
+
+
 def _notification_sources() -> list[dict[str, Any] | None]:
     """All notification builders.  Add new sources here as they arrive."""
     return [
@@ -504,6 +787,7 @@ def _notification_sources() -> list[dict[str, Any] | None]:
         _build_library_health_check_failed_notification(),
         *_build_credits_on_cpu_notifications(),
         *_build_gpu_keeps_failing_notifications(),
+        *_build_node_notifications(),
     ]
 
 

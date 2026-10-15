@@ -229,15 +229,20 @@ ENV PUID=1000 \
 # Tell s6-overlay to preserve environment variables
 ENV S6_KEEP_ENV=1
 
-# Expose web UI port
+# Web UI port only. A node (MODE=node) is published with -p 9494:9494 instead: with a second exposed port, reverse
+# proxies that route to a container's only exposed port (nginx-proxy given just VIRTUAL_HOST) pick port 80 -> 502.
 EXPOSE 8080
 
-# Health check for web UI — respects WEB_PORT env var
+# Health check for the web UI (WEB_PORT), or for a node's /v1/health (NODE_PORT) when MODE=node
 # Uses python3 stdlib instead of curl (one fewer binary dependency).
 # exec replaces the shell so Docker kills the Python process on timeout (no orphans).
 # timeout=5 ensures the process exits if the server is unresponsive.
+# `or`, not get()'s default: an empty NODE_PORT/WEB_PORT is the default port. A node reads its port and host as the
+# node's server does (nodes/server/wsgi.py): FILE__NODE_PORT's file, else NODE_PORT, else FILE__AGENT_PORT's file,
+# else AGENT_PORT; FILE__NODE_HOST's file, else NODE_HOST. It is asked where it listens: with --network host,
+# NODE_HOST may be one address only. Waitress takes :: as IPv6 only, so that one is asked on ::1.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD exec python3 -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('WEB_PORT', '8080') + '/api/health', timeout=5)"
+    CMD exec python3 -c "import urllib.request, os; e = os.environ; node = (e.get('MODE') or '').strip().lower() == 'node'; read = lambda n: (open(e['FILE__' + n], encoding='utf-8-sig').read().strip() if node and e.get('FILE__' + n) else '') or e.get(n, '').strip(); port = read('NODE_PORT') or read('AGENT_PORT') or '9494'; host = read('NODE_HOST') if node else 'localhost'; host = {'': '127.0.0.1', '0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host); urllib.request.urlopen('http://' + ('[' + host + ']' if ':' in host else host) + ':' + (port + '/v1/health' if node else (e.get('WEB_PORT') or '8080') + '/api/health'), timeout=5)"
 
 # Use LinuxServer's /init for PUID/PGID handling
 ENTRYPOINT ["/init", "/app/wrapper.sh"]

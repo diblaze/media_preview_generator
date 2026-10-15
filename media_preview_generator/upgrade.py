@@ -10,12 +10,15 @@ application-level configuration.
 """
 
 import copy
+import filecmp
+import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +29,7 @@ from .config.validation import MAX_CPU_THREADS, validate_processing_thread_total
 # -------------------------------------------------------------------------
 # Schema version — bump when adding new migrations
 # -------------------------------------------------------------------------
-_CURRENT_SCHEMA_VERSION = 23
+_CURRENT_SCHEMA_VERSION = 24
 
 #: A flag earlier dev builds of v16, v17, v18 and v20 wrote and nothing reads; v23 deletes it.
 DECIDE_AGAIN_KEY = "_markers_decide_again"
@@ -103,6 +106,10 @@ def _v14_record_failure(sm) -> None:
 # backup; that's enough on its own.
 # -------------------------------------------------------------------------
 _USER_FACING_NOTES: dict[int, str] = {
+    24: (
+        "Your Plex helper is now a Plex database node, on the new Nodes page, which holds its address and key. "
+        "It works as before."
+    ),
     23: "The Max concurrent jobs setting is gone — jobs now run as soon as a worker that handles them is free.",
     22: "Groups can now include several devices — your existing groups are unchanged.",
     21: "Your worker counts are now worker groups. Existing availability and pauses are preserved.",
@@ -203,7 +210,7 @@ _DEPRECATED_ENV_VARS = [
 # =========================================================================
 
 
-def run_migrations(settings_manager) -> None:
+def run_migrations(settings_manager, *, plex_server_id: str | None = None) -> None:
     """Run all pending migrations.
 
     Call once on application startup, before the web server starts
@@ -211,10 +218,22 @@ def run_migrations(settings_manager) -> None:
 
     Args:
         settings_manager: A ``SettingsManager`` instance.
+        plex_server_id: The id v7 gives the Plex server it builds from the legacy ``plex_*`` settings, in place of a
+            new one: a restored legacy file's Plex server keeps the id it got at the first upgrade.
 
     """
-    _migrate_env_vars(settings_manager)
-    _migrate_schema(settings_manager)
+    if getattr(settings_manager, "load_failed", False) is True:
+        # Migrating empty defaults would overwrite the unreadable file the owner still needs to fix or restore.
+        logger.error("Skipping start-up migrations: settings.json could not be read and is left untouched.")
+        return
+    # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
+    # the user set, so no "Settings migrated" card is shown for them. An install set up with environment variables
+    # alone has no file either, but the steps rewrite the setup seeded from them, so that one still gets the card.
+    settings_file = getattr(settings_manager, "settings_file", None)
+    no_settings_file = bool(settings_file) and not os.path.exists(str(settings_file))
+    seeded_from_env = _migrate_env_vars(settings_manager)
+    fresh_install = no_settings_file and not seeded_from_env
+    _migrate_schema(settings_manager, announce=not fresh_install, plex_server_id=plex_server_id)
     _seed_last_seen_version_for_upgraders(settings_manager)
 
 
@@ -276,7 +295,7 @@ def _clamp_seeded_cpu_threads(value: int, source: str) -> int:
     return clamped
 
 
-def _migrate_env_vars(sm) -> None:
+def _migrate_env_vars(sm) -> bool:
     """Seed settings.json from environment variables.
 
     Only runs once.  After migration, settings.json is the sole source of
@@ -286,9 +305,12 @@ def _migrate_env_vars(sm) -> None:
     Also migrates legacy GPU env vars (GPU_THREADS, GPU_SELECTION,
     FFMPEG_THREADS) into the new ``gpu_config`` structure, and converts
     legacy path mapping env vars into the ``path_mappings`` list.
+
+    Returns:
+        True when at least one setting was seeded from the environment.
     """
     if sm.get("_env_migrated"):
-        return
+        return False
 
     updates: dict[str, Any] = {}
     migrated_keys: list[str] = []
@@ -350,6 +372,7 @@ def _migrate_env_vars(sm) -> None:
                 "Environment variable {} is deprecated and ignored. Use the Settings page in the web UI instead.",
                 env_name,
             )
+    return bool(migrated_keys)
 
 
 # =========================================================================
@@ -357,11 +380,45 @@ def _migrate_env_vars(sm) -> None:
 # =========================================================================
 
 
+_PRE_UPGRADE_SUFFIX_RE = re.compile(r"\.pre-v([0-9]+)(?:\.[0-9]{8}-[0-9]{6})?\.bak")
+
+
+def _pre_upgrade_copies(settings_file: str, from_schema: int | None = None) -> list[str]:
+    """Return the copies :func:`_backup_settings_before_migrating` took of ``settings_file``.
+
+    Args:
+        settings_file: The live settings.json path.
+        from_schema: Only the copies taken before migrating from this schema version; None for every version.
+
+    Returns:
+        Paths of ``{settings_file}.pre-v<N>.bak`` and ``{settings_file}.pre-v<N>.<YYYYMMDD-HHMMSS>.bak``.
+    """
+    copies = []
+    for path in glob.glob(glob.escape(settings_file) + ".pre-v*.bak"):
+        match = _PRE_UPGRADE_SUFFIX_RE.fullmatch(path[len(settings_file) :])
+        if match and (from_schema is None or int(match.group(1)) == from_schema):
+            copies.append(path)
+    return sorted(copies)
+
+
+def _newest_pre_upgrade_copy(settings_file: str) -> str:
+    """Return the most recently written pre-upgrade copy of ``settings_file``, or "" when there is none."""
+    copies = []
+    for path in _pre_upgrade_copies(settings_file):
+        try:
+            copies.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    return max(copies)[1] if copies else ""
+
+
 def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     """Copy settings.json to ``{settings_file}.pre-v{from_schema}.bak`` before any migration step saves over it.
 
     The name is not a timestamped one, so the save-time pruner never deletes it; ordinary saves would otherwise
-    rotate the pre-upgrade copy out within minutes.
+    rotate the pre-upgrade copy out within minutes. When that name is taken by a copy holding other settings (the
+    user rolled back, changed things on the older build and upgraded again), the copy is
+    ``{settings_file}.pre-v{from_schema}.<YYYYMMDD-HHMMSS>.bak`` instead, which the pruner doesn't touch either.
 
     Args:
         sm: The settings manager about to be migrated.
@@ -373,12 +430,20 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     settings_file = getattr(sm, "settings_file", None)
     if not settings_file or not os.path.isfile(str(settings_file)):
         return ""
+    settings_file = str(settings_file)
     bak_path = f"{settings_file}.pre-v{from_schema}.bak"
-    # The earliest copy is the one that matches the version the user came from; a retry boot must not replace it.
+    # A retry boot finds the copy it took last time still matching the file, so it keeps naming that one. Any
+    # existing copy is left alone: an earlier upgrade's copy is still the way back to before that upgrade.
+    for existing in _pre_upgrade_copies(settings_file, from_schema):
+        try:
+            if filecmp.cmp(settings_file, existing, shallow=False):
+                return existing
+        except OSError:
+            continue
     if os.path.isfile(bak_path):
-        return bak_path
+        bak_path = f"{settings_file}.pre-v{from_schema}.{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.bak"
     try:
-        shutil.copy2(str(settings_file), bak_path)
+        shutil.copy2(settings_file, bak_path)
         return bak_path
     except OSError as exc:
         logger.warning(
@@ -392,11 +457,12 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
         return ""
 
 
-def _migrate_schema(sm) -> None:
+def _migrate_schema(sm, *, announce: bool = True, plex_server_id: str | None = None) -> None:
     """Run incremental schema migrations on settings.
 
     Each migration is gated by ``_schema_version`` so it runs at most
-    once.
+    once. ``announce`` False (a brand-new install) leaves out the one-shot "Settings migrated" notice.
+    ``plex_server_id`` is the id v7 gives the Plex server it builds (None: a new one).
 
     Migrations:
         v2 -- Per-GPU config (gpu_config).  If a flat ``gpu_threads``
@@ -425,10 +491,12 @@ def _migrate_schema(sm) -> None:
         v7 -- Synthesizes a ``media_servers`` array from the legacy
               flat ``plex_*`` settings as part of the multi-media-server
               refactor.  Existing single-Plex deployments get one
-              entry with id ``"plex-default"`` so the new dispatcher
-              has a server to route to.  Legacy ``plex_*`` keys are
-              kept (read-path compatibility) and removed in a later
-              migration once all callers have been updated.
+              entry with a generated id so the new dispatcher has a
+              server to route to.  The Plex Direct webhook keys
+              (``plex_webhook_enabled`` / ``plex_webhook_public_url``)
+              move onto that server's ``output`` and are dropped; the
+              other legacy ``plex_*`` keys are kept (read-path
+              compatibility).
         v8 -- Moves global ``path_mappings`` / ``exclude_paths`` into ``media_servers[0]``.
         v9 -- Dedupes per-server ``path_mappings`` and ``exclude_paths`` that v7 + v8 doubled.
         v10 -- Rewrites the Plex Direct webhook URL ``/plex`` to ``/incoming`` and drops per-server
@@ -462,6 +530,8 @@ def _migrate_schema(sm) -> None:
         v22 -- Gives every worker group a member list: each v21 group keeps its id, name, hours and becomes one group
                with one member ``m1`` (device, count, job types). The groups revision moves on by one.
         v23 -- Drops ``max_concurrent_jobs``: workers decide how much runs at once, and only job start-up is bounded.
+        v24 -- Moves every Plex helper's address and key into a ``nodes`` record (Plex database role) and points the
+               server's ``markers.plex.agent.node_id`` at it; the server keeps no copy of the old ``url``/``token``.
     """
     current = sm.get("_schema_version", 1)
     if current > _CURRENT_SCHEMA_VERSION:
@@ -469,12 +539,19 @@ def _migrate_schema(sm) -> None:
         # Silent acceptance would drop unknown fields on the next save —
         # the exact failure mode that wiped jobs.json on tag-drift.
         settings_path = getattr(sm, "settings_file", None) or "settings.json"
+        newest_copy = _newest_pre_upgrade_copy(str(settings_path))
+        if newest_copy:
+            upgrade_copy = f"the copy taken just before the latest upgrade is {newest_copy}"
+        else:
+            upgrade_copy = (
+                f"the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
+                f"version you upgraded from"
+            )
         raise SchemaDowngradeError(
             f"settings.json was written by schema v{current} but this binary supports up to "
             f"v{_CURRENT_SCHEMA_VERSION}. Refusing to start (would silently drop fields on next save). "
             f"Either run a newer build of the app, or restore a settings.json from before the upgrade "
-            f"(the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
-            f"version you upgraded from; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
+            f"({upgrade_copy}; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
             f"and start the older app version that wrote it."
         )
     # A pending v14 retry has to get past the version gate: the failure that
@@ -509,7 +586,7 @@ def _migrate_schema(sm) -> None:
     if current < 6:
         _run(6, _migrate_to_v6)
     if current < 7:
-        _run(7, _migrate_to_v7)
+        _run(7, lambda settings: _migrate_to_v7(settings, id_override=plex_server_id))
     if current < 8:
         _run(8, _migrate_to_v8)
     if current < 9:
@@ -544,11 +621,16 @@ def _migrate_schema(sm) -> None:
         _run(22, _migrate_to_v22)
     if current < 23:
         _run(23, _migrate_to_v23)
+    if current < 24:
+        _run(24, _migrate_to_v24)
 
     sm.set("_schema_version", _CURRENT_SCHEMA_VERSION)
 
     if log_notes:
         logger.info("Settings schema migrated to v{}: {}", _CURRENT_SCHEMA_VERSION, ", ".join(log_notes))
+    # A version move with no notes still has to reach an unread card: left alone, it keeps naming the older
+    # upgrade's copy as the way back (a fresh install's first-boot copy holds nothing) and the older "to".
+    if announce and (log_notes or current < _CURRENT_SCHEMA_VERSION):
         # J5: drop a one-shot flag the dashboard's notification bell reads
         # so the user sees a single "we migrated your config" card on next
         # login. Dismissal removes the flag (see notifications.py).
@@ -560,14 +642,16 @@ def _migrate_schema(sm) -> None:
         # Older versions stored a permanent dismissal of this card, which would hide this new notice as well. They
         # also left the dismissed notice in place: the user has read it, so its notes don't go into the new card.
         dismissed = sm.get("dismissed_notifications")
-        if isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed:
-            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
+        stale_dismissal = isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed
+        if stale_dismissal:
             existing = {}
-        # An unread notice's backup, while still on disk, is the copy that matches the "from" version the card
-        # keeps reporting; this boot's snapshot is from a later version.
-        earlier_backup = existing.get("backup")
-        if isinstance(earlier_backup, str) and os.path.isfile(earlier_backup):
-            bak_path = earlier_backup
+        if not log_notes and not existing:
+            return
+        if stale_dismissal:
+            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
+        # The card always names this boot's snapshot, never an unread notice's older one: rolling back means
+        # restoring the settings as this build found them (an older notice's copy can be from a fresh install's
+        # first boot, holding nothing), and only the build that wrote them reads them as they are.
         # An existing notice's notes are unread, so merge into it rather than overwrite it —
         # regardless of whether this boot is a real version move or a retry-only boot.
         merged_notes = list(existing.get("notes") or [])
@@ -629,7 +713,7 @@ def _migrate_to_v2(sm) -> list:
             logger.warning(
                 "Old GPU settings (gpu_threads={!r}, ffmpeg_threads={!r}) aren't valid numbers — "
                 "they can't be migrated to the new per-GPU layout. Defaulting to 0 GPU workers + 2 ffmpeg threads. "
-                "Open Settings → Processing Options → GPU Configuration and configure your devices manually.",
+                "Open Settings → Processing Options → GPU device tuning and configure your devices manually.",
                 old_threads_val,
                 sm.get("ffmpeg_threads"),
             )
@@ -695,6 +779,43 @@ def _migrate_to_v3(sm) -> list:
     return []
 
 
+def _v4_scanner_name(entry: str | None) -> str:
+    """The name v4 gives the Recently Added schedule it makes for a ``recently_added_libraries`` entry (None: every
+    library)."""
+    return "Recently Added Scanner" if entry is None else f"Recently Added Scanner — {entry}"
+
+
+def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bool:
+    """Whether a Recently Added schedule already scans what v4 would make one for.
+
+    A settings file from before v4 restored over an install that already ran it (Settings -> Backups, or copied back
+    by hand) runs v4 again; the schedules it made the first time are still in schedules.json, maybe renamed or
+    retimed since. For every library, any Recently Added schedule counts: the one v4 made may have been pointed at
+    some libraries since, and Recently Added schedules only exist once v4 has run. For one library, a schedule for
+    every library counts, and so does the one v4 made for it (by its name) pointed at other libraries since.
+
+    Args:
+        schedules: Every stored schedule.
+        entry: A ``recently_added_libraries`` entry (a library id, or a name), or None for every library.
+    """
+    for schedule in schedules:
+        if (schedule.get("config") or {}).get("job_type") != "recently_added":
+            continue
+        if entry is None:
+            return True
+        ids = {str(x.get("library_id") if isinstance(x, dict) else x) for x in schedule.get("library_ids") or []}
+        if schedule.get("library_id"):
+            ids.add(str(schedule["library_id"]))
+        name = str(schedule.get("library_name") or "")
+        if not ids and not name:
+            return True
+        if schedule.get("name") == _v4_scanner_name(entry):
+            return True
+        if (entry in ids) if entry.isdigit() else (name == entry):
+            return True
+    return False
+
+
 def _migrate_to_v4(sm) -> list:
     """Convert legacy ``recently_added_*`` settings into schedule entries.
 
@@ -711,6 +832,8 @@ def _migrate_to_v4(sm) -> list:
       3. Deletes all four legacy keys from settings.
       4. Best-effort removes the obsolete ``system_recently_added_scan``
          APScheduler job if it exists in the persistent jobstore.
+
+    A schedule it would make that is already there (a restored settings file from before v4) is not made twice.
     """
     notes: list[str] = []
     legacy_keys = [
@@ -741,9 +864,12 @@ def _migrate_to_v4(sm) -> list:
             # (and any caller using a non-default CONFIG_DIR) end up with
             # a ScheduleManager writing to the right jobstore location.
             manager = get_schedule_manager(config_dir=str(sm.config_dir))
-            if not library_entries:
+            existing = manager.get_all_schedules()
+            if not library_entries and _has_recently_added_schedule(existing, None):
+                notes.append("v4: the recently-added schedule is already there")
+            elif not library_entries:
                 schedule = manager.create_schedule(
-                    name="Recently Added Scanner",
+                    name=_v4_scanner_name(None),
                     interval_minutes=interval,
                     library_id=None,
                     library_name="",
@@ -755,9 +881,10 @@ def _migrate_to_v4(sm) -> list:
                 )
                 notes.append(f"v4: created 1 recently-added schedule ({schedule['id']})")
             else:
-                for entry in library_entries:
+                missing = [entry for entry in library_entries if not _has_recently_added_schedule(existing, entry)]
+                for entry in missing:
                     schedule = manager.create_schedule(
-                        name=f"Recently Added Scanner — {entry}",
+                        name=_v4_scanner_name(entry),
                         interval_minutes=interval,
                         library_id=entry if entry.isdigit() else None,
                         library_name=entry if not entry.isdigit() else "",
@@ -767,9 +894,10 @@ def _migrate_to_v4(sm) -> list:
                         },
                         enabled=True,
                     )
-                notes.append(
-                    f"v4: created {len(library_entries)} recently-added schedule(s) from legacy library override"
-                )
+                if missing:
+                    notes.append(f"v4: created {len(missing)} recently-added schedule(s) from legacy library override")
+                if len(missing) < len(library_entries):
+                    notes.append(f"v4: {len(library_entries) - len(missing)} recently-added schedule(s) already there")
 
             # Best-effort: remove the stale system job if it's still in
             # the persistent APScheduler jobstore.
@@ -863,7 +991,7 @@ def _legacy_plex_to_media_server(sm, *, id_override: str | None = None) -> dict[
     persisted in ``settings.json`` (not a :class:`ServerConfig` instance);
     the runtime hydrates it into the dataclass at load time.
 
-    Used by the v7 migration (no ``id_override`` → a fresh UUID) and by
+    Used by the v7 migration (a fresh UUID, unless a restore passes the live server's id) and by
     runtime callers like :meth:`ServerRegistry.from_legacy_config` (which
     passes the stable slug ``"plex-default"`` because the synthesised
     stub is built repeatedly per request and the id must stay identical
@@ -920,28 +1048,39 @@ def _legacy_plex_to_media_server(sm, *, id_override: str | None = None) -> dict[
     }
 
 
-def _migrate_to_v7(sm) -> list:
+def _migrate_to_v7(sm, *, id_override: str | None = None) -> list:
     """Add a ``media_servers`` array synthesised from legacy ``plex_*`` keys.
 
     No-op when ``media_servers`` already exists. Legacy ``plex_*`` keys
-    are *not* removed yet — the read path continues to honour them so
-    Phase 1 ships the schema change without breaking existing single-Plex
-    deployments. A later migration removes them once all callers have
-    been routed through the server registry.
+    are *not* removed — the read path continues to honour them so
+    existing single-Plex deployments keep working. The Plex Direct webhook
+    keys (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto
+    the synthesised server's ``output`` and are dropped from the top level
+    (also on a fresh install, which gets an empty ``media_servers``).
+
+    Args:
+        sm: The settings manager.
+        id_override: The synthesised server's id (None: a new one).
     """
     notes: list[str] = []
     if sm.get("media_servers") is not None:
         return notes
 
-    entry = _legacy_plex_to_media_server(sm)
+    webhook_keys = [key for key in ("plex_webhook_public_url", "plex_webhook_enabled") if sm.get(key) is not None]
+    entry = _legacy_plex_to_media_server(sm, id_override=id_override)
     if entry is None:
         # Fresh install: write an empty list so callers can rely on the key
         # always being present.
-        sm.apply_changes(updates={"media_servers": []})
+        sm.apply_changes(updates={"media_servers": []}, deletes=webhook_keys)
         notes.append("v7: initialised empty media_servers array")
         return notes
 
-    sm.apply_changes(updates={"media_servers": [entry]})
+    webhook_url = (sm.get("plex_webhook_public_url") or "").strip()
+    if webhook_url:
+        entry["output"]["webhook_public_url"] = webhook_url
+    if sm.get("plex_webhook_enabled") is not None:
+        entry["output"]["webhook_enabled"] = bool(sm.get("plex_webhook_enabled"))
+    sm.apply_changes(updates={"media_servers": [entry]}, deletes=webhook_keys)
     notes.append("v7: synthesised media_servers[0] from legacy plex_* settings")
     return notes
 
@@ -1762,7 +1901,7 @@ def _migrate_to_v21(sm) -> list[str]:
     reasons = sorted(set(reasons) & {"manual", "quiet_hours"})
     updates: dict[str, Any] = {
         "worker_groups": groups,
-        "worker_groups_revision": int(stored.get("worker_groups_revision", 0)),
+        "worker_groups_revision": sm.worker_groups_revision,
         "processing_pause_reasons": reasons,
         "processing_paused": bool(reasons),
     }
@@ -1789,9 +1928,7 @@ def _migrate_to_v22(sm) -> list[str]:
     groups = validate_worker_groups(stored["worker_groups"])
     if groups == stored["worker_groups"]:
         return []
-    sm.apply_changes(
-        updates={"worker_groups": groups, "worker_groups_revision": int(stored.get("worker_groups_revision", 0)) + 1}
-    )
+    sm.apply_changes(updates={"worker_groups": groups, "worker_groups_revision": sm.worker_groups_revision + 1})
     return ["v22: worker groups now hold devices; every existing group kept its device, count, jobs and hours"]
 
 
@@ -1808,6 +1945,115 @@ def _migrate_to_v23(sm) -> list[str]:
     if "max_concurrent_jobs" not in stale:
         return []
     return ["v23: removed the Max concurrent jobs setting; workers now decide how much runs at once"]
+
+
+def _migrate_to_v24(sm) -> list[str]:
+    """Move every Plex helper's address and key into a ``nodes`` record and point the server at it.
+
+    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
+    (the address and key now live only on the node record). Servers that share one helper (same address and key)
+    share one node. The node is on when a switched-on server had the helper switched on, whatever Intro & Credits
+    says: chapter thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off
+    everywhere, or used only by switched-off servers (never contacted before the upgrade), becomes a node turned off,
+    so it is never checked or reported offline; the server keeps its helper switch for when it is switched on again.
+
+    A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
+    that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
+    before the upgrade nothing was written through it either, and it never falls back to this app's own copy of the
+    Plex database. A block with no address used this app's own copy before, so it gets ``"enabled": False``.
+
+    Rolling back to a build from before nodes means restoring the settings it wrote: that build refuses a v24 file
+    (``SchemaDowngradeError``), and the copy :func:`_backup_settings_before_migrating` takes before migrating
+    (``settings.json.pre-v<N>.bak`` beside settings.json) still has the helper's address and key.
+
+    Calling it twice changes nothing: a block that already has ``node_id`` keeps it (any ``url``/``token`` beside it
+    is dropped), and a helper already on the nodes list (same address and key) is reused. Settings already at v24
+    never run it again, so a lab install whose earlier build of this migration kept ``url``/``token`` beside
+    ``node_id`` keeps them until it restores the backup taken before that upgrade (``settings.json.pre-v<N>.bak``)
+    and upgrades again. No released build ever wrote v24.
+    """
+    from .nodes.settings import NAME_MAX_LEN, default_record, name_key, normalise_url, visible_name
+
+    stored = sm.get_all()
+    servers = stored.get("media_servers")
+    if not isinstance(servers, list):
+        return []
+    nodes = copy.deepcopy([n for n in stored.get("nodes") or [] if isinstance(n, dict)])
+    by_address = {(normalise_url(n.get("url"))[0], str(n.get("key") or "")): n for n in nodes}
+    names = {name_key(str(n.get("name") or "").strip()) for n in nodes}
+    servers_out = copy.deepcopy(servers)
+    changed = created = 0
+    nodes_changed = False
+    for entry in servers_out:
+        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+            continue
+        markers = entry.get("markers")
+        plex = markers.get("plex") if isinstance(markers, dict) else None
+        agent = plex.get("agent") if isinstance(plex, dict) else None
+        if not isinstance(agent, dict) or ("url" not in agent and "token" not in agent):
+            continue
+        changed += 1
+        raw_url = agent.pop("url", None)
+        token = str(agent.pop("token", None) or "").strip()
+        if "node_id" in agent:
+            continue
+        enabled = bool(agent.get("enabled"))
+        has_address = bool(str(raw_url or "").strip())
+        url = normalise_url(raw_url)[0] if has_address else None
+        if not (url and token):
+            if has_address and url is None:
+                logger.warning(
+                    "The Plex helper address of {} isn't a valid http(s) address, so it wasn't moved to the Nodes "
+                    "page. Add it there as a Plex database node and choose it in that server's Edit → Connection.",
+                    str(entry.get("name") or "a Plex server"),
+                )
+            agent.update({"enabled": enabled and has_address, "node_id": None})
+            continue
+        node_on = enabled and bool(entry.get("enabled", True))
+        node = by_address.get((url, token))
+        if node is None:
+            # A server's name takes any text; a node's name follows the Nodes page's rules, or every later save of
+            # the node (the registry's record of the id the node reports included) is refused.
+            name = _helper_node_name(visible_name(str(entry.get("name") or "")) or "Plex", names, NAME_MAX_LEN)
+            names.add(name_key(name))
+            node = default_record(name=name, url=url, key=token, enabled=node_on)
+            nodes.append(node)
+            by_address[(url, token)] = node
+            created += 1
+        elif node_on and not node.get("enabled"):
+            node["enabled"] = nodes_changed = True
+        agent.update({"enabled": enabled, "node_id": node["id"]})
+    if not changed:
+        return []
+    updates: dict[str, Any] = {"media_servers": servers_out}
+    if created or nodes_changed:
+        updates["nodes"] = nodes
+        updates["nodes_revision"] = int(stored.get("nodes_revision", 0)) + 1
+    sm.apply_changes(updates=updates)
+    if not created:
+        return []
+    return [f"v24: moved {created} Plex helper(s) to the nodes list"]
+
+
+def _helper_node_name(server_name: str, taken: set[str], limit: int) -> str:
+    """``Plex helper (<server name>)``, numbered when taken, with the server name cut so it fits ``limit``.
+
+    Args:
+        server_name: The Plex server's name, with what a node's name can't hold taken out.
+        taken: The names already used, as ``nodes.settings.name_key`` compares them.
+        limit: The longest name a node may have.
+    """
+    from .nodes.settings import name_key
+
+    suffix = 1
+    while True:
+        tail = f") {suffix}" if suffix > 1 else ")"
+        room = limit - len("Plex helper (") - len(tail)
+        short = server_name if len(server_name) <= room else server_name[: room - 1].rstrip() + "…"
+        name = f"Plex helper ({short}{tail}"
+        if name_key(name) not in taken:
+            return name
+        suffix += 1
 
 
 def _intro_credits_on_any_server(sm) -> bool:
@@ -1847,7 +2093,7 @@ def _build_gpu_config_from_env() -> list[dict[str, Any]] | None:
         logger.warning(
             "The legacy GPU_THREADS ({!r}) or FFMPEG_THREADS ({!r}) environment variable wasn't a valid number. "
             "Falling back to defaults (1 GPU worker, 2 ffmpeg threads). "
-            "Open Settings → Processing Options → GPU Configuration after startup and configure the values you actually want.",
+            "Open Settings → Processing Options → GPU device tuning after startup and configure the values you actually want.",
             gpu_threads_str,
             ffmpeg_threads_str,
         )

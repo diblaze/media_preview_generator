@@ -150,3 +150,61 @@ def test_non_file_source_rejected(tmp_path: Path) -> None:
 def test_missing_source_rejected(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         plex_hash.calculate_plex_hash(tmp_path / "missing.mkv")
+
+
+class _OtherCtime:
+    """``os.fstat`` as Windows' Python 3.12+ answers it: its st_ctime is the last change, not the creation time."""
+
+    def __init__(self, real_fstat, shift_ns: int) -> None:
+        self.real_fstat, self.shift_ns = real_fstat, shift_ns
+
+    def __call__(self, fd: int):
+        info = self.real_fstat(fd)
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        return type(
+            "Stat", (), {**{f: getattr(info, f) for f in fields}, "st_ctime_ns": info.st_ctime_ns + self.shift_ns}
+        )
+
+
+@pytest.mark.parametrize("size", [5, 70000], ids=["small", "large"])
+def test_on_windows_an_opened_files_other_ctime_isnt_a_change(tmp_path, monkeypatch, size):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * size)
+    expected = plex_hash.calculate_plex_hash(source)
+    plex_hash._hash_stable_source.cache_clear()
+    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", True, raising=False)
+    monkeypatch.setattr(plex_hash.os, "fstat", _OtherCtime(os.fstat, 1_000_000_000))
+
+    assert plex_hash.calculate_plex_hash(source) == expected
+    plex_hash._hash_stable_source.cache_clear()
+
+
+def test_elsewhere_an_opened_file_with_another_ctime_was_changed(tmp_path, monkeypatch):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * 70000)
+    plex_hash._hash_stable_source.cache_clear()
+    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", False)
+    monkeypatch.setattr(plex_hash.os, "fstat", _OtherCtime(os.fstat, 1_000_000_000))
+
+    with pytest.raises(plex_hash.SourceFileChangedError, match="changed before hashing"):
+        plex_hash.calculate_plex_hash(source)
+
+
+def test_on_windows_a_file_changed_while_hashing_is_still_rejected(tmp_path, monkeypatch):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * 70000)
+    plex_hash._hash_stable_source.cache_clear()
+    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", True)
+    real_fstat, calls = os.fstat, []
+
+    def grows_after_opening(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            with open(source, "ab") as writer:
+                writer.write(b"more")
+        return _OtherCtime(real_fstat, 1)(fd)
+
+    monkeypatch.setattr(plex_hash.os, "fstat", grows_after_opening)
+
+    with pytest.raises(plex_hash.SourceFileChangedError, match="changed while hashing"):
+        plex_hash.calculate_plex_hash(source)

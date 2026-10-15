@@ -1,14 +1,14 @@
 ---
 title: Skip Intro and Skip Credits detection for Plex, Emby and Jellyfin
 heading: Skip Intro and Skip Credits
-description: Set up Skip Intro and Skip Credits for Plex, Jellyfin and Emby. Check subscriptions, helper or plugin requirements, then inspect one file.
+description: Set up Skip Intro and Skip Credits for Plex, Jellyfin and Emby. Check subscriptions, node or plugin requirements, then inspect one file.
 ---
 
 Media Preview Generator detects where each file's intro and end credits are and sends those points to Plex, Emby and Jellyfin, so viewers get a skip button. It detects each file once and sends the same answer to every server that has the file. On Jellyfin and Emby it works through its own plugin. It runs in the same Docker container that makes your preview thumbnails, and it stays off until you turn it on for a server.
 
 ## What viewers get, and what each server needs
 
-- **Plex.** Skip Intro and Skip Credits buttons. The server needs Plex Pass, and so do viewers, or a Plex Home whose admin has it: without it, Plex hides skip buttons altogether. Plex has no way for another app to add markers, so the app writes them into Plex's own database and asks you to confirm once per server first. That only works on the Plex machine, so either run the app there or run the small [Plex marker agent](guides.md#plex-on-another-machine-the-plex-marker-agent) container next to Plex.
+- **Plex.** Skip Intro and Skip Credits buttons. The server needs Plex Pass, and so do viewers, or a Plex Home whose admin has it: without it, Plex hides skip buttons altogether. Plex has no way for another app to add markers, so the app writes them into Plex's own database and asks you to confirm once per server first. That only works on the Plex machine, so either run the app there or run a small [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node) container next to Plex.
 - **Jellyfin 10.11 or 12.0.** Jellyfin has no intro detection of its own: it shows skip segments that a plugin provides ([Jellyfin docs](https://jellyfin.org/docs/general/server/metadata/media-segments/)). This app's [Media Preview Bridge plugin](guides.md#jellyfin-the-media-preview-bridge-plugin), the same one trickplay uses, is that plugin. Viewers get Skip Intro and Skip Credits, plus Skip Recap and Skip Preview.
 - **Emby 4.9 or 4.10.** Skip Intro, and Skip Credits through Emby's Up Next prompt. It works through this app's [Media Preview Bridge for Emby plugin](guides.md#emby-the-media-preview-bridge-for-emby-plugin). Skip Intro also needs Emby Premiere, which is Emby's rule; the credits prompt works without it. Emby has no credits end, so skipping credits goes to the end of the file, past any scene after the credits.
 
@@ -21,9 +21,8 @@ Plex and Emby can have markers of their own. With **Use ours**, the default, the
 3. Review detection sources under **Settings → Intro & Credits**, then start an Intro & Credits job for the libraries you chose. [The full guide](guides.md#intro--credits) explains source choices and publishing rules.
 4. Open **Tools → Inspector** and inspect a known episode or movie. Compare the detected positions with the video and each server's published result. Adjust or lock a marker when needed; an uncertain result may intentionally have no skip button.
 
-To process away from Plex, the [Plex marker agent](guides.md#plex-on-another-machine-the-plex-marker-agent)
-must run beside Plex. This is different from [Plex loudness](plex-loudness-normalization.md), which
-requires a local database and does not support the helper or network-mounted databases.
+To process away from Plex, a [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node)
+must run beside Plex.
 
 ## How it detects intros and credits
 

@@ -210,7 +210,7 @@ class TestVideoNoDeviceCanDecode:
 
     @pytest.mark.parametrize("stderr", [NO_DECODER_STDERR, NO_DECODER_KEYFRAME_STDERR], ids=["full", "keyframe"])
     def test_is_not_handed_to_the_cpu(self, stderr):
-        assert _gpu_hand_off(NO_DECODER_EXIT, stderr, stderr, stopped_part_way=False) is None
+        assert _gpu_hand_off(NO_DECODER_EXIT, stderr, stderr, stopped_part_way=False, hwaccel="cuda") is None
 
     @pytest.mark.parametrize(
         ("rc", "stderr"),
@@ -218,7 +218,7 @@ class TestVideoNoDeviceCanDecode:
         ids=["plain-234", "69", "unknown-audio-codec"],
     )
     def test_other_codec_failures_still_go_to_the_cpu(self, rc, stderr):
-        assert _gpu_hand_off(rc, stderr, stderr, stopped_part_way=False) == ("codec", "codec error")
+        assert _gpu_hand_off(rc, stderr, stderr, stopped_part_way=False, hwaccel="cuda") == ("codec", "codec error")
 
     @pytest.mark.parametrize("keyframe_gap", [1.0, None], ids=["keyframe", "full-decode"])
     @pytest.mark.parametrize("gpu", ["NVIDIA", "INTEL", "AMD", None], ids=["nvidia", "intel", "amd", "cpu"])

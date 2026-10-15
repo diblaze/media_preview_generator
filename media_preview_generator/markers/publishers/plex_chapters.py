@@ -18,13 +18,12 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from defusedxml import ElementTree as ET
-from defusedxml.common import DefusedXmlException
 from PIL import Image
 
 from ..settings import load_server
@@ -33,11 +32,24 @@ from .plex_db import (
     TESTED_PMS_LABEL,
     TESTED_PMS_VERSIONS,
     LocalPlexDb,
+    beside_another_plex,
     is_tested_pms_version,
+    node_wording,
     plex_db_path,
+    plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from .plex_remote import AgentClient, agent_older_than, report_from_json
+from .plex_remote import (
+    CHAPTERS_WAIT_FOR_THE_NODE,
+    AgentClient,
+    agent_older_than,
+    node_refusal,
+    report_from_json,
+    report_wrong_node,
+    saved_node_address,
+    saved_node_uid,
+    saved_server_node_id,
+)
 
 CHAPTER_CAPABILITY = "chapters_v1"
 MAX_CHAPTERS = 1000
@@ -96,8 +108,10 @@ class ChapterTarget:
     chapters: tuple[Chapter, ...]
     machine_identifier: str
     # Plex has analysed this part (duration and audio/video streams recorded); chapters are written at that step, so
-    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False.
-    analysed: bool = False
+    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False. Derived, so
+    # not part of the snapshot's identity: an app older than this field sends none, and register's whole-snapshot
+    # comparison must not read that as Plex having changed the source.
+    analysed: bool = field(default=False, compare=False)
 
 
 def _target_changes(before: ChapterTarget, after: ChapterTarget) -> tuple[str, ...]:
@@ -216,21 +230,22 @@ def _chapters_match(own_starts: list[int] | None, shared_rows: list[tuple]) -> b
 
 
 class LocalChapters:
-    """Chapter operations sharing the marker writer's filesystem and SQLite locks."""
+    """Chapter operations sharing the marker writer's filesystem and SQLite locks.
 
-    def __init__(self, config_dir: str, *, mountinfo_path: str = "/proc/self/mountinfo") -> None:
+    Args:
+        config_dir: Plex's config folder.
+        mountinfo_path: For tests.
+        on_node: It runs on a Plex database node, so a database file check's refusal is said about the node
+            (``node_wording``), as markers and loudness say it, rather than about this app.
+    """
+
+    def __init__(self, config_dir: str, *, mountinfo_path: str = "/proc/self/mountinfo", on_node: bool = False) -> None:
         self.folder = Path(config_dir)
         self.database = LocalPlexDb(lambda: plex_db_path(config_dir), mountinfo_path=mountinfo_path)
+        self._on_node = on_node
 
     def _identity(self, expected: str, version: str) -> None:
-        try:
-            actual = (
-                ET.parse(self.folder / "Preferences.xml", forbid_dtd=True, forbid_entities=True, forbid_external=True)
-                .getroot()
-                .get("ProcessedMachineIdentifier")
-            )
-        except (OSError, ET.ParseError, DefusedXmlException):
-            actual = None
+        actual = plex_machine_identifier(str(self.folder))
         if not expected or not actual or expected != actual:
             raise ChapterError(
                 "Cannot prove this database belongs to the connected Plex server",
@@ -271,10 +286,21 @@ class LocalChapters:
             )
 
     def _guard(self, machine_identifier: str, version: str, deadline: float) -> None:
+        # Plex keeps Preferences.xml readable by its own user only: a writer running as another user can't read the
+        # identity either, and "can't write Plex's database" is the problem to name, not "can't prove which Plex".
+        identity_readable = bool(plex_machine_identifier(str(self.folder)))
+        if not identity_readable:
+            self._file_checks(deadline)
         self._identity(machine_identifier, version)
         self._media_root()
+        if identity_readable:
+            self._file_checks(deadline)
+
+    def _file_checks(self, deadline: float) -> None:
         report = self.database.file_checks(deadline=deadline)
         if not report.ready:
+            # The refusal travels as its message alone, so a node words it before it is sent.
+            report = node_wording(report) if self._on_node else report
             raise ChapterError(report.message, code="registration", state=report.state)
 
     def _media_root(self) -> Path:
@@ -462,9 +488,11 @@ class LocalChapters:
                     image.load()
                 stat = path.stat()
                 seen[index] = (stat.st_size, stat.st_mtime_ns)
+            except FileNotFoundError as exc:
+                raise ChapterError(_image_not_found(index, path), code="registration") from exc
             except (OSError, ValueError, Image.DecompressionBombError) as exc:
                 raise ChapterError(
-                    f"Chapter {index} image is missing, invalid, or changed", code="registration"
+                    f"Chapter {index} image is missing, invalid, or changed ({path})", code="registration"
                 ) from exc
         return seen
 
@@ -518,6 +546,35 @@ class LocalChapters:
             raise publish_error_from_sqlite(exc) from exc
 
 
+def _image_not_found(index: int, path: Path) -> str:
+    """The refusal of a chapter image that isn't where Plex reads it.
+
+    Through a Plex database node the app writes the images into its own Plex config folder and the node looks for them
+    in Plex's: a folder of another Plex (or a copy) on the app's side leaves every image missing here.
+    """
+    return (
+        f"Chapter {index} image isn't at {path}, where this Plex reads it. The Plex config folder chapter images are "
+        "written to must be this Plex's own folder."
+    )
+
+
+def _another_plexs_folder(config: Any, machine: str) -> str:
+    """Why this app's Plex config folder for the server is another Plex's, or "" when it isn't (or can't tell).
+
+    Through a Plex database node, this app still writes the chapter images (into that folder) and the node registers
+    them in Plex's database: images written into another Plex's folder are never where this Plex reads them, so each
+    file would fail its retries one by one.
+    """
+    folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "").strip()
+    theirs = plex_machine_identifier(folder) if folder else ""
+    if not theirs or not machine or theirs == machine:
+        return ""
+    return (
+        f"This server's Plex config folder ({folder}) belongs to a different Plex server, so chapter images written "
+        "there never reach this one. Set it to this Plex's own config folder in Edit → Connection."
+    )
+
+
 def _database_checked_recently(key: tuple[str, str, str]) -> bool:
     with _recent_lock:
         checked_at = _recent_database_checks.get(key)
@@ -562,14 +619,29 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
     settings = load_server(getattr(config, "markers", None), "plex")
     backend: AgentClient | LocalChapters
     if settings.agent_enabled:
-        if not settings.agent_url or not settings.agent_token:
-            raise ChapterError("Configure the Plex-side helper address and key", state=Capability.AGENT_UNAVAILABLE)
-        backend = AgentClient(settings.agent_url, settings.agent_token)
+        # The server's own config is the job's copy from when it started: compare its node with the saved one.
+        live = partial(saved_server_node_id, str(getattr(config, "id", "") or "")) if server_config is None else None
+        refusal = node_refusal(settings, live)
+        if refusal is not None:
+            raise ChapterError(refusal.message, state=refusal.state)
+        wrong_folder = _another_plexs_folder(config, machine)
+        if wrong_folder:
+            raise ChapterError(wrong_folder, code="unsupported", state=Capability.MISCONFIGURED)
+        backend = AgentClient(
+            settings.agent_url,
+            settings.agent_token,
+            name=getattr(settings, "agent_node_name", ""),
+            refusal=lambda: node_refusal(settings, live),
+            node_uid=lambda: saved_node_uid(settings),
+            wrong_node=lambda: report_wrong_node(settings),
+            address=lambda: saved_node_address(settings),
+        )
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
         if not folder:
             raise ChapterError(
-                "Set a local Plex config folder or configure the Plex-side helper", state=Capability.NEEDS_LOCAL_DB
+                "Set a local Plex config folder or choose a Plex database node in Edit → Connection",
+                state=Capability.NEEDS_LOCAL_DB,
             )
         backend = LocalChapters(folder)
     return backend, machine, version, plex
@@ -579,21 +651,54 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
 _AGENT_FOR_PMS_1_43_5 = "1.1.2"
 
 
-def _remote(client: AgentClient, operation: str, machine: str, version: str, **body: Any) -> dict:
+def _server_name(server: Any, server_config: Any = None) -> str:
+    config = server_config if server_config is not None else server._server_config
+    return str(getattr(config, "name", "") or "")
+
+
+def _running(client: AgentClient) -> str:
+    return f"The Plex database node {client.describe()} is version {client.version or 'unknown'}"
+
+
+def _remote(
+    client: AgentClient, operation: str, machine: str, version: str, *, server_name: str = "", **body: Any
+) -> dict:
+    """One chapter operation on the Plex database node, after the checks that it can run it for this Plex.
+
+    Args:
+        client: The server's Plex database node.
+        operation: ``check``, ``read`` or ``register``.
+        machine: The connected Plex's machine identifier.
+        version: The connected Plex's version.
+        server_name: The server's name, for the refusal of a node beside a different Plex.
+        **body: The operation's own fields.
+    """
     identity = client.ping(timeout=5)
     if CHAPTER_CAPABILITY not in client.capabilities:
         raise ChapterError(
-            "Update the Plex-side helper to version 1.1.0 or newer for chapter registration",
+            f"{_running(client)}; chapter thumbnails need version 1.1.0 or newer. Update the node.",
             state=Capability.PLUGIN_OUTDATED,
         )
     if version.startswith("1.43.5.") and agent_older_than(client.version, _AGENT_FOR_PMS_1_43_5):
         raise ChapterError(
-            f"Update the Plex-side helper to version {_AGENT_FOR_PMS_1_43_5} or newer for Plex 1.43.5",
+            f"{_running(client)}; chapter thumbnails for Plex 1.43.5 need version {_AGENT_FOR_PMS_1_43_5} or newer. "
+            "Update the node.",
             state=Capability.PLUGIN_OUTDATED,
         )
-    if not machine or identity.get("machine_identifier") != machine:
+    if not machine:
         raise ChapterError(
-            "The Plex-side helper belongs to a different or unverifiable Plex server", state=Capability.MISCONFIGURED
+            f"Plex didn't say which server it is, so this app can't tell whether the Plex database node "
+            f"{client.describe()} is beside it.",
+            state=Capability.MISCONFIGURED,
+        )
+    # A node that can't say (it can't read Plex's Preferences.xml: usually it runs as another user than Plex) is asked
+    # anyway: its own checks name what it can't read or write, and it refuses every operation until it can prove
+    # which Plex it is beside.
+    theirs = identity.get("machine_identifier")
+    if theirs and theirs != machine:
+        raise ChapterError(
+            beside_another_plex(client.url, server_name, "chapter thumbnails", client.name),
+            state=Capability.MISCONFIGURED,
         )
     result = client.post(
         f"/v1/chapters/{operation}",
@@ -604,23 +709,32 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
             **body,
         },
         timeout=13,
+        unreachable=CHAPTERS_WAIT_FOR_THE_NODE,
     )
     if result.get("capability") != CHAPTER_CAPABILITY:
-        raise ChapterError("Update the Plex-side helper for chapter registration", state=Capability.PLUGIN_OUTDATED)
+        raise ChapterError(
+            f"The Plex database node {client.describe()} sent no chapter answer. Update the node.",
+            state=Capability.PLUGIN_OUTDATED,
+        )
     return result
 
 
 def chapter_capability(server: Any, server_config: Any = None) -> CapabilityReport:
     """Readiness independently of marker settings, consent, or Plex Pass."""
+    backend: AgentClient | LocalChapters | None = None
     try:
         backend, machine, version, _ = _context(server, server_config)
         if isinstance(backend, AgentClient):
-            return report_from_json(_remote(backend, "check", machine, version)["report"])
+            checked = _remote(backend, "check", machine, version, server_name=_server_name(server, server_config))
+            return report_from_json(checked["report"])
         return backend.capability(machine, version, deadline=time.monotonic() + 10)
     except PublishError as exc:
         return CapabilityReport(exc.state or Capability.UNREACHABLE, str(exc))
     except (KeyError, TypeError, ValueError):
-        return CapabilityReport(Capability.AGENT_UNAVAILABLE, "Plex-side helper returned an invalid chapter response")
+        node = f" {backend.describe()}" if isinstance(backend, AgentClient) else ""
+        return CapabilityReport(
+            Capability.AGENT_UNAVAILABLE, f"The Plex database node{node} sent a chapter answer this app can't read"
+        )
 
 
 def resolve_chapter_target(
@@ -639,13 +753,23 @@ def resolve_chapter_target(
     backend, machine, version, _ = _context(server, reuse_recent=reuse_recent_checks)
     if isinstance(backend, AgentClient):
         try:
-            result = _remote(backend, "read", machine, version, source_path=canonical_path, item_id_hint=item_id_hint)
+            result = _remote(
+                backend,
+                "read",
+                machine,
+                version,
+                server_name=_server_name(server),
+                source_path=canonical_path,
+                item_id_hint=item_id_hint,
+            )
             target = target_from_json(result["target"])
             if target.machine_identifier != machine or target.source_path != canonical_path:
                 raise ValueError("Wrong source identity")
             return target
         except (KeyError, TypeError, ValueError) as exc:
-            raise ChapterError("Plex-side helper returned an invalid chapter snapshot") from exc
+            raise ChapterError(
+                f"The Plex database node {backend.describe()} sent a chapter snapshot this app can't read"
+            ) from exc
     return backend.read(
         canonical_path,
         machine,
@@ -680,6 +804,7 @@ def register_chapters(
                 "register",
                 machine,
                 version,
+                server_name=_server_name(server),
                 target=target_to_json(snapshot),
                 revisions=[{"index": index, "sha256": sha} for index, sha in revisions.items()],
             )

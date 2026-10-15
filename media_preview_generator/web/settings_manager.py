@@ -25,6 +25,10 @@ class WorkerGroupsConflict(ValueError):
     """A group editor attempted to overwrite a newer saved configuration."""
 
 
+class NodesConflict(ValueError):
+    """A node editor attempted to overwrite a newer saved node list."""
+
+
 def _distribute_gpu_threads_into_dict(settings: dict[str, Any], value: int) -> None:
     """Distribute a total GPU worker count across enabled GPUs in ``gpu_config``.
 
@@ -74,12 +78,14 @@ class SettingsManager:
         self._lock = threading.RLock()
         # Set when settings.json exists but could not be read; setup then counts as complete so auth stays closed.
         self._load_failed = False
+        self._refused_write_logged = False
         self._load()
         self._load_setup_state()
 
     def _load(self) -> None:
         """Load settings from file."""
         self._load_failed = False
+        self._refused_write_logged = False
         if self.settings_file.exists():
             try:
                 with open(self.settings_file) as f:
@@ -113,6 +119,95 @@ class SettingsManager:
         else:
             self._settings = {}
         self._migrate_global_plex_webhook_to_per_server()
+        self._repair_hand_written_nodes()
+
+    def _repair_hand_written_nodes(self) -> None:
+        """Repair node records written into settings.json by hand that would otherwise misbehave, and save them.
+
+        A record without an ``id``, or with one an earlier record has (a block copied by hand), gets an id of its own:
+        without one the record is never checked or listed on the Nodes page, and every save of the node list is
+        refused. The id is saved at once so it stays the same across restarts (worker group members and Plex servers
+        point at it). A copy's recorded node id is dropped too: it was learnt at the record it was copied from, and
+        is recorded again when the node answers.
+
+        An on/off switch that isn't ``true`` or ``false`` (``"false"`` typed in quotes) is turned off: read as it
+        was, any text counted as on, so a node meant to be off was checked and sent work.
+
+        An address that isn't text (a number, ``null``, or none at all) is cleared to ``""``, a node with no address:
+        read as it was, asking the node anything (its log, a Test access) failed with an error page. A key that isn't
+        text is cleared the same way, to be entered again.
+
+        Folder mappings that aren't a list are cleared to none, to be entered again: read as they were, the Nodes page
+        showed text as one mapping per character, and no save of the node was accepted.
+        """
+        raw = self._settings.get("nodes")
+        if not isinstance(raw, list):
+            return
+        from ..nodes.settings import new_node_id
+
+        named: list[str] = []
+        switched_off: list[str] = []
+        unaddressed: list[str] = []
+        unkeyed: list[str] = []
+        unmapped: list[str] = []
+        seen: set[str] = set()
+        for node in raw:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "")
+            if node_id in seen:
+                node["node_uid"] = None
+            if not node_id or node_id in seen:
+                node["id"] = new_node_id()
+                named.append(str(node.get("name") or node["id"]))
+            seen.add(str(node["id"]))
+            if "enabled" in node and type(node["enabled"]) is not bool:
+                node["enabled"] = False
+                switched_off.append(str(node.get("name") or node["id"]))
+            if not isinstance(node.get("url"), str):
+                node["url"] = ""
+                unaddressed.append(str(node.get("name") or node["id"]))
+            if not isinstance(node.get("key"), str):
+                node["key"] = ""
+                unkeyed.append(str(node.get("name") or node["id"]))
+            if node.get("path_mappings") is not None and not isinstance(node["path_mappings"], list):
+                node["path_mappings"] = []
+                unmapped.append(str(node.get("name") or node["id"]))
+        if not (named or switched_off or unaddressed or unkeyed or unmapped):
+            return
+        self._settings["nodes_revision"] = self.nodes_revision + 1
+        if named:
+            logger.info(
+                "Gave {} node(s) in settings.json with no id, or one another node has, an id: {}",
+                len(named),
+                ", ".join(named),
+            )
+        if switched_off:
+            logger.warning(
+                "The on/off switch of {} in settings.json isn't true or false, so it is turned off. To use it, turn it "
+                "back on from the Nodes page.",
+                ", ".join(switched_off),
+            )
+        if unaddressed:
+            logger.warning(
+                "The address of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
+                ", ".join(unaddressed),
+            )
+        if unkeyed:
+            logger.warning(
+                "The key of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
+                ", ".join(unkeyed),
+            )
+        if unmapped:
+            logger.warning(
+                "The folder mappings of {} in settings.json aren't a list, so they are cleared. Enter them again on the "
+                "Nodes page.",
+                ", ".join(unmapped),
+            )
+        try:
+            self._save()
+        except Exception:
+            logger.warning("These node fixes hold until the app restarts; the next settings save stores them.")
 
     def _migrate_global_plex_webhook_to_per_server(self) -> None:
         """One-shot migration: move legacy global Plex webhook keys onto the Plex server entry.
@@ -123,13 +218,19 @@ class SettingsManager:
         the right per-server token. Multi-server is brand-new on this branch
         so any settings.json hitting this code holds at most one Plex server;
         the migration is a straight copy.
+
+        A file from before the v7 upgrade has no server list yet: the keys stay for that step, which moves them onto
+        the Plex server it makes. The move is made in memory only, so the upgrade's pre-upgrade copy of settings.json
+        is the file as the old build wrote it; the next save stores it.
         """
         legacy_url = (self._settings.get("plex_webhook_public_url") or "").strip()
         legacy_enabled = self._settings.get("plex_webhook_enabled")
         if not legacy_url and legacy_enabled is None:
             return  # nothing to migrate
 
-        media_servers = self._settings.get("media_servers") or []
+        media_servers = self._settings.get("media_servers")
+        if media_servers is None:
+            return
         plex_entry = next(
             (s for s in media_servers if isinstance(s, dict) and s.get("type") == "plex"),
             None,
@@ -147,10 +248,19 @@ class SettingsManager:
 
         self._settings.pop("plex_webhook_public_url", None)
         self._settings.pop("plex_webhook_enabled", None)
-        self._save()
 
     def _save(self) -> None:
-        """Save settings to file atomically."""
+        """Save settings to file atomically, unless the file couldn't be read (see ``load_failed``)."""
+        if self._load_failed:
+            # The memory copy is empty defaults: writing it would replace the owner's real file and open setup.
+            if not self._refused_write_logged:
+                self._refused_write_logged = True
+                logger.error(
+                    "Not writing {}: it could not be read, so the app is keeping it untouched. Fix the file or "
+                    "restore a backup (Settings > Backup & Restore), then restart; changes made meanwhile are not saved.",
+                    self.settings_file,
+                )
+            return
         try:
             from ..utils import atomic_json_save_with_backup
 
@@ -193,6 +303,11 @@ class SettingsManager:
         """Re-read settings.json into memory (after the file was replaced on disk)."""
         with self._lock:
             self._load()
+
+    @property
+    def load_failed(self) -> bool:
+        """Whether settings.json exists but couldn't be read at the last load (the settings in memory are empty)."""
+        return self._load_failed
 
     def reload_setup_state(self) -> None:
         """Re-read setup_state.json into memory (after the file was replaced on disk)."""
@@ -306,8 +421,12 @@ class SettingsManager:
 
     @property
     def worker_groups_revision(self) -> int:
-        """Revision used to protect staged edits from concurrent quick scaling."""
-        return int(self.get("worker_groups_revision", 0))
+        """Revision used to protect staged edits from concurrent quick scaling.
+
+        A value edited by hand into something other than a whole number (``null``, ``"3"``) counts as 0.
+        """
+        revision = self.get("worker_groups_revision", 0)
+        return revision if type(revision) is int else 0
 
     def update_worker_groups(self, groups: list[dict], expected_revision: int | None = None) -> int:
         """Validate and persist one policy atomically before any runtime reconciliation.
@@ -325,12 +444,60 @@ class SettingsManager:
         """
         from ..worker_groups import validate_worker_groups
 
-        clean = validate_worker_groups(groups)
+        # Validated under the lock: a node removed between the check and the save would leave a member on it.
         with self._lock:
+            nodes = {
+                str(node["id"]): str(node.get("name") or node["id"])
+                for node in self.get("nodes") or []
+                if isinstance(node, dict) and node.get("id")
+            }
+            clean = validate_worker_groups(groups, nodes=nodes)
             revision = self.worker_groups_revision
             if expected_revision is not None and expected_revision != revision:
                 raise WorkerGroupsConflict("Worker groups changed elsewhere. Reload them before applying your edits.")
             self.apply_changes(updates={"worker_groups": clean, "worker_groups_revision": revision + 1})
+            return revision + 1
+
+    @property
+    def nodes(self) -> list[dict[str, Any]]:
+        """An independent copy of the configured nodes (keys included; mask before sending anywhere)."""
+        with self._lock:
+            raw = self._settings.get("nodes")
+            return copy.deepcopy([n for n in raw if isinstance(n, dict)]) if isinstance(raw, list) else []
+
+    @property
+    def nodes_revision(self) -> int:
+        """Revision of the ``nodes`` list; the node registry re-reads it when this moves.
+
+        A value edited by hand into something other than a whole number (``null``, ``"3"``) counts as 0.
+        """
+        revision = self.get("nodes_revision", 0)
+        return revision if type(revision) is int else 0
+
+    def update_nodes(self, nodes: list[dict], expected_revision: int | None = None) -> int:
+        """Validate and persist the whole node list atomically.
+
+        Args:
+            nodes: Complete desired node list (stored records, keys unmasked).
+            expected_revision: Revision the editor loaded, or None for a read-modify-write under :meth:`locked`.
+
+        Returns:
+            The newly persisted revision.
+
+        Raises:
+            NodesConflict: The list changed since the editor loaded it.
+            ValueError: A record is invalid.
+        """
+        from ..nodes.settings import validate_nodes
+
+        with self._lock:
+            clean, err = validate_nodes(nodes, saved=self.nodes)
+            if clean is None:
+                raise ValueError(err)
+            revision = self.nodes_revision
+            if expected_revision is not None and expected_revision != revision:
+                raise NodesConflict("Nodes changed elsewhere. Reload them before applying your edits.")
+            self.apply_changes(updates={"nodes": clean, "nodes_revision": revision + 1})
             return revision + 1
 
     # =========================================================================

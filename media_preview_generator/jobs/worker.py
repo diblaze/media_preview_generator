@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from typing import Any, Optional, cast
 
@@ -16,6 +16,8 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import ItemOutcome, normalize_outcome, outcome_value
+from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
+from ..nodes.executor import FileNotVisibleError, NodeRequeue, NodeUnavailableError, Placement, placed_on, requeue_for
 from ..processing.generator import (
     FALLBACK_CODEC,
     CancellationError,
@@ -25,8 +27,16 @@ from ..processing.generator import (
     failure_scope,
     gpu_fallback_advice,
 )
+from ..processing.types import ProcessableItem
 from ..utils import format_display_title, redact_secrets, redacted_traceback
 from .gpu_fallback import get_gpu_fallback_tracker
+from .node_members import (
+    EMPTY_NODE_HARDWARE,
+    NODE_GPU_FFMPEG_THREADS,
+    NodeHardware,
+    NodeMemberHardware,
+    checked_ready_since_drop,
+)
 from .worker_naming import friendly_device_label
 
 # Map thread_id -> job_id. Each job's log handler filters on its own id, so concurrent jobs
@@ -76,6 +86,29 @@ def job_thread(job_id: str | None) -> Iterator[None]:
         unregister_job_thread()
 
 
+@contextmanager
+def logging_for_job(job_id: str) -> Iterator[None]:
+    """Route the current thread's log lines to ``job_id``'s log for the block, then back to wherever they went.
+
+    For a line the dispatcher's own thread writes about one job's file (a file given back by its node).
+
+    Args:
+        job_id: The job.
+    """
+    ident = cast(int, threading.current_thread().ident)
+    with _job_thread_ids_lock:
+        previous = _job_thread_to_job_id.get(ident)
+        _job_thread_to_job_id[ident] = job_id
+    try:
+        yield
+    finally:
+        with _job_thread_ids_lock:
+            if previous is None:
+                _job_thread_to_job_id.pop(ident, None)
+            else:
+                _job_thread_to_job_id[ident] = previous
+
+
 def is_job_thread_for(thread_id: int, job_id: str) -> bool:
     """Check whether ``thread_id`` belongs to the specific ``job_id``.
 
@@ -115,6 +148,28 @@ def resolve_per_item_pin(config, item, registry) -> str | None:
     return None
 
 
+def resolve_per_item_regenerate(config: Config, item: ProcessableItem) -> bool:
+    """Decide whether a dispatch regenerates this item's previews.
+
+    Shared by the processing path and the dispatcher's checking stage, like
+    :func:`resolve_per_item_pin`. A Regenerate job regenerates every file,
+    except the ones its retry chain already regenerated
+    (``config.regenerated_paths``): those only wait on a server indexing them
+    or on Plex chapters, so each retry checks them like a normal run instead of
+    re-running FFmpeg on them.
+
+    Args:
+        config: The job's Config.
+        item: The :class:`ProcessableItem` being dispatched.
+
+    Returns:
+        True when the item's previews and chapters must be made again.
+    """
+    if not getattr(config, "regenerate_thumbnails", False):
+        return False
+    return item.canonical_path not in (getattr(config, "regenerated_paths", None) or ())
+
+
 def _extracted_frames(ms_result) -> bool:
     """Whether FFmpeg decoded this file for this run: a publisher row that took frames (``frame_source`` "extracted"
     on a status that describes a frame outcome), as opposed to frames from the cache or an output already there.
@@ -147,6 +202,8 @@ class Worker:
         gpu_index: int | None = None,
         gpu_name: str | None = None,
         ffmpeg_threads: int | None = None,
+        node_id: str | None = None,
+        node_name: str | None = None,
     ):
         """Initialize a worker.
 
@@ -159,6 +216,9 @@ class Worker:
             gpu_name: Human-readable GPU name for display.
             ffmpeg_threads: Per-GPU FFmpeg thread cap (overrides
                 config.ffmpeg_threads when set).
+            node_id: The node this worker's heavy steps run on (its ``gpu_device`` is the node's device); None runs
+                them in this app.
+            node_name: The node's name, for job log lines.
 
         """
         self.worker_id = worker_id
@@ -169,18 +229,27 @@ class Worker:
         self.gpu_name = gpu_name
         self.ffmpeg_threads = ffmpeg_threads
         self.display_name = f"{worker_type} {worker_id}"
+        self.node_id = node_id
+        self.node_name = node_name or node_id or ""
         # Ownership outlives edits: a busy slot never moves to a different group member.
         self.group_id: str | None = None
         self.member_id: str | None = None
         self.policy_id: str | None = None
         self.group_name: str | None = None
         self.group_resource: str = "cpu" if worker_type == "CPU" else f"gpu:{gpu_device}"
+        if node_id is not None:
+            self.group_resource = f"node:{node_id}:{self.group_resource}"
         self.allowed_job_types: frozenset[str] | None = None
 
         # Task state
         self.is_busy = False
         self.current_thread: threading.Thread | None = None
         self.current_task = None
+        # The item last assigned, kept after the task ends so the dispatcher can queue it again.
+        self.current_item = None
+        # Set when the last task gave its file back without an outcome (its node dropped, or can't see the file);
+        # the dispatcher queues it again or fails it, and the worker's counters say nothing about it.
+        self.last_task_requeue: NodeRequeue | None = None
         # When the last task's thread was seen finished (time.monotonic()); 0: never.
         self.task_ended_at = 0.0
 
@@ -257,6 +326,9 @@ class Worker:
         # happened.
         self.fallback_active = False
         self.fallback_reason: str | None = None
+        # True once the CPU decodes this file for a GPU worker (its CPU rerun, or a step that fell back to the CPU).
+        # Credit text read on the CPU sets fallback_active only: the GPU still decodes the frames it reads.
+        self.decoding_on_cpu = False
         # True once the last finished file needed the CPU fallback (cancelled files stay False); the dispatcher
         # folds it into the job's "N files ran on the CPU because the GPU failed" tally.
         self.last_task_cpu_fallback = False
@@ -271,6 +343,32 @@ class Worker:
         # dispatch loop to wake immediately instead of polling on a timer.
         # Set by WorkerPool when the pool has a _worker_done_event.
         self._done_event: threading.Event | None = None
+
+    @property
+    def node_device(self) -> str:
+        """``lab-gpu/GPU0`` for a worker on a node; empty for this app's own workers."""
+        if self.node_id is None:
+            return ""
+        device = "CPU" if self.worker_type != "GPU" else f"GPU{'' if self.gpu_index is None else self.gpu_index}"
+        return f"{self.node_name}/{device}"
+
+    @property
+    def log_tag(self) -> str:
+        """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
+        the prefix the node's own lines carry in the job log. A GPU worker reads as the CPU once the CPU decodes its
+        file (its CPU rerun, or a step that fell back to the CPU); credit text read on the CPU doesn't change it, as
+        the GPU still decodes those frames."""
+        on_gpu = self.worker_type == "GPU" and not self.decoding_on_cpu
+        if self.node_id is None:
+            return f"[GPU {self.gpu_index}]:" if on_gpu else "[CPU]:"
+        return f"{self.node_device} ·" if on_gpu else f"{self.node_name}/CPU ·"
+
+    @property
+    def placement(self) -> Placement | None:
+        """Where this worker's heavy steps run: its node, or None for this app."""
+        if self.node_id is None:
+            return None
+        return Placement(self.node_id, self.node_name)
 
     def is_available(self) -> bool:
         """Check if this worker is available for a new task."""
@@ -374,9 +472,11 @@ class Worker:
         self.last_ms_message = ""
         self.current_phase = ""
         self.chapter_progress = None
+        self.last_task_requeue = None
 
         self.is_busy = True
         self.current_task = item.canonical_path
+        self.current_item = item
         self.current_job_id = job_id
         self.media_title = item.title or item.canonical_path
         # Display-only heuristic: " - S" in the title means episode-style
@@ -402,6 +502,7 @@ class Worker:
         self.task_start_time = time.time()
         self.fallback_active = False
         self.fallback_reason = None
+        self.decoding_on_cpu = False
         self.last_task_cpu_fallback = False
         self.cancel_check = cancel_check
         self.pause_check = pause_check
@@ -459,7 +560,7 @@ class Worker:
         # Register THIS worker thread under THIS job's id so the per-job
         # log handler captures only its own messages — not a sibling job
         # running concurrently.
-        with job_thread(self.current_job_id), failure_scope(self.current_job_id):
+        with job_thread(self.current_job_id), failure_scope(self.current_job_id), placed_on(self.placement):
             display_name = self.media_file or self.media_title or item.canonical_path
 
             ctx_logger = logger.bind(
@@ -516,7 +617,7 @@ class Worker:
                     cancel_check=self.cancel_check,
                     pause_check=self.pause_check,
                     server_id_filter=per_item_pin,
-                    regenerate=bool(getattr(config, "regenerate_thumbnails", False)),
+                    regenerate=resolve_per_item_regenerate(config, item),
                     phase_callback=_phase_cb,
                     chapter_progress_callback=_chapter_progress_cb,
                     # Radarr/Sonarr deletedFiles[] from upgrade webhooks.
@@ -659,6 +760,7 @@ class Worker:
                         _persist(ProcessingResult.FAILED, "cancelled before CPU fallback")
                     else:
                         self.fallback_active = True
+                        self.decoding_on_cpu = True
                         self.fallback_reason = reason
                         ctx_logger.warning(
                             "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}. {}",
@@ -689,6 +791,8 @@ class Worker:
                             self.outcome_counts["failed"] += 1
                             self.failed += 1
                             _persist(ProcessingResult.FAILED, "cancelled during CPU fallback")
+                        except (NodeUnavailableError, FileNotVisibleError) as node_exc:
+                            self._give_back(node_exc, display_name)
                         except Exception as fallback_exc:
                             ctx_logger.exception(
                                 "{} also couldn't process {} on CPU after the GPU attempt failed. "
@@ -713,6 +817,8 @@ class Worker:
                     self.outcome_counts["failed"] += 1
                     self.failed += 1
                     _persist(ProcessingResult.FAILED, f"CPU codec error: {e}")
+            except (NodeUnavailableError, FileNotVisibleError) as exc:
+                self._give_back(exc, display_name)
             except Exception as exc:
                 ctx_logger.exception(
                     "{} failed to generate a preview for {}. "
@@ -728,7 +834,20 @@ class Worker:
                 # Counters are final by here; the dispatcher reads them once this thread has exited.
                 if self._done_event is not None:
                     self._done_event.set()
-                self._record_gpu_file(gpu_decoded=gpu_decoded, cancelled=cancelled)
+                # A file given back says nothing about the GPU, as a cancelled one doesn't.
+                self._record_gpu_file(
+                    gpu_decoded=gpu_decoded, cancelled=cancelled or self.last_task_requeue is not None
+                )
+
+    def _give_back(self, exc: NodeUnavailableError | FileNotVisibleError, display_name: str) -> None:
+        """Record that this task ends without an outcome: the dispatcher queues the file again or fails it.
+
+        Args:
+            exc: Why the node couldn't run it.
+            display_name: The file, for the job log.
+        """
+        self.last_task_requeue = requeue_for(exc)
+        logger.warning("{} hands {} back to the queue: {}", self.display_name, display_name, exc)
 
     def _record_gpu_file(self, *, gpu_decoded: bool, cancelled: bool) -> None:
         """Count a finished file for this GPU's fallback streak and the job's CPU-fallback tally.
@@ -747,10 +866,15 @@ class Worker:
         self.last_task_cpu_fallback = self.fallback_active
         if not (self.fallback_active or gpu_decoded):
             return
+        device = self.gpu_device or self.gpu or "GPU"
+        label = friendly_device_label({"name": self.gpu_name or ""}, self.gpu_device, self.gpu)
+        if self.node_id is not None:
+            # Two nodes can have the same device path; each node's GPU keeps its own streak.
+            device, label = f"node:{self.node_id}:{device}", f"{self.node_name} {label}"
         try:
             get_gpu_fallback_tracker().record(
-                self.gpu_device or self.gpu or "GPU",
-                friendly_device_label({"name": self.gpu_name or ""}, self.gpu_device, self.gpu),
+                device,
+                label,
                 fell_back=self.fallback_active,
                 reason=self.fallback_reason,
             )
@@ -781,8 +905,10 @@ class Worker:
         """
         register_job_thread(self.current_job_id or "")
         display_name = self.media_file or self.media_title or item.canonical_path
-        with failure_scope(self.current_job_id):
+        with failure_scope(self.current_job_id), placed_on(self.placement):
             self._log_pickup(item, display_name)
+
+            cpu_rerun = False
 
             def _phase_cb(text: str) -> None:
                 # A new phase is a new step with its own FFmpeg run (or none), so the row starts it over: the progress
@@ -795,11 +921,16 @@ class Worker:
                 self.progress_percent = 0
                 self.speed = "0.0x"
                 self.remaining_time = 0.0
+                # A step's own CPU decode ends with the step; a whole-item CPU rerun stays on the CPU throughout.
+                if not cpu_rerun:
+                    self.decoding_on_cpu = False
 
             def _fallback_cb(reason: str) -> None:
                 # A step that fell back to the CPU inside the kind's own run (the end-picture decode) shows on the row
-                # as a whole-item CPU rerun does.
+                # as a whole-item CPU rerun does. Credit text read on the CPU shows there too, but the GPU still
+                # decodes its frames, so the decode lines keep the GPU's prefix.
                 self.fallback_active = True
+                self.decoding_on_cpu = self.decoding_on_cpu or not reason.startswith(CREDITS_ON_CPU_PREFIX)
                 self.fallback_reason = redact_secrets(reason) or "GPU processing failed"
 
             def _run(gpu, gpu_device):
@@ -840,6 +971,8 @@ class Worker:
                 cancelled = bool(self.cancel_check and self.cancel_check())
                 if self.worker_type == "GPU" and not cancelled:
                     self.fallback_active = True
+                    self.decoding_on_cpu = True
+                    cpu_rerun = True
                     self.fallback_reason = redact_secrets(str(exc)) or "GPU processing failed"
                     logger.warning(
                         "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}",
@@ -852,10 +985,16 @@ class Worker:
                     except CancellationError:
                         cancelled = True
                         outcome = ItemOutcome("failed", "cancelled during CPU fallback")
+                    except (NodeUnavailableError, FileNotVisibleError) as node_exc:
+                        self._give_back(node_exc, display_name)
+                        return
                     except Exception as fallback_exc:
                         outcome = _failed(f"CPU fallback failed: {fallback_exc}", fallback_exc)
                 else:
                     outcome = ItemOutcome("failed", redact_secrets(f"codec error: {exc}"))
+            except (NodeUnavailableError, FileNotVisibleError) as exc:
+                self._give_back(exc, display_name)
+                return
             except Exception as exc:
                 outcome = _failed(str(exc) or type(exc).__name__, exc)
 
@@ -987,6 +1126,20 @@ class Worker:
                 )
 
 
+# A node that just dropped a file gets no new file until a registry check begun after the drop comes back ready. This
+# cap only ends a hold the registry never answers (a node that stays down loses its workers once it reads offline).
+SUSPECT_NODE_S = 300.0
+
+
+def _group_display_name(group_name: str, worker: Worker) -> str:
+    """A group worker's name in the job log: ``Off-hours · 2`` here, ``Lab nodes · lab-gpu/GPU0`` on a node.
+
+    A node worker is named by its node and device, the prefix its own lines carry; this app's running number would
+    match nothing the user sees for it.
+    """
+    return f"{group_name} · {worker.node_device or worker.worker_id + 1}"
+
+
 class WorkerPool:
     """Manages a pool of workers for processing media items."""
 
@@ -1024,16 +1177,15 @@ class WorkerPool:
         self._policy_targets: dict[str, int] = {}
         self._group_revision: int | None = None
         self._resource_targets: dict[str, int] = {}
+        # The node registry as read at the last reconcile; capacity and snapshots use it until the next one.
+        self._node_hardware: NodeHardware = EMPTY_NODE_HARDWARE
+        self._node_revision: int | None = None
+        # Node id -> the monotonic time its hold ends at the latest.
+        self._suspect_nodes: dict[str, float] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
-
-        logger.info(
-            "Created fresh worker pool — {} worker(s): {} GPU + {} CPU "
-            "(subsequent jobs reuse this pool, you'll see 'Reusing existing worker pool' instead)",
-            len(self.workers),
-            gpu_workers,
-            cpu_workers,
-        )
+        # The "Created fresh worker pool" line comes from whoever made it, once its worker groups are applied:
+        # members on nodes only get their workers then.
 
     def has_busy_workers(self) -> bool:
         """Check if any workers are currently busy."""
@@ -1045,6 +1197,30 @@ class WorkerPool:
         with self._workers_lock:
             return list(self.workers)
 
+    def size_summary(self) -> str:
+        """The pool's size for the job log: ``"3 worker(s): 1 GPU + 0 CPU here, 1 GPU + 1 CPU on nodes"``.
+
+        The part about nodes is there only when a worker runs on one.
+        """
+        workers = self._snapshot_workers()
+
+        def count(worker_type: str, on_node: bool) -> int:
+            return sum(1 for w in workers if w.worker_type == worker_type and (w.node_id is not None) == on_node)
+
+        text = f"{len(workers)} worker(s): {count('GPU', False)} GPU + {count('CPU', False)} CPU"
+        node_gpu, node_cpu = count("GPU", True), count("CPU", True)
+        if node_gpu or node_cpu:
+            text += f" here, {node_gpu} GPU + {node_cpu} CPU on nodes"
+        return text
+
+    def log_created(self) -> None:
+        """Log that this pool was just made, with its size once its worker groups are applied."""
+        logger.info(
+            "Created fresh worker pool — {} (subsequent jobs reuse this pool, you'll see 'reusing shared worker pool' "
+            "instead)",
+            self.size_summary(),
+        )
+
     def reconcile_groups(
         self, groups: list[dict], selected_gpus: list | None, *, now=None, revision: int | None = None
     ) -> dict:
@@ -1053,13 +1229,17 @@ class WorkerPool:
         Each group member is one policy owning its own slots. Closed and removed
         members contribute no target. Their in-flight tasks still consume the
         resource's assignment budget until reaped. Creating idle replacement
-        slots therefore cannot oversubscribe a handover.
+        slots therefore cannot oversubscribe a handover. A member on a node gets
+        its target from the node registry's capacity for that node.
         """
         from copy import deepcopy
 
         from ..worker_groups import group_is_available, group_resource_key, member_policies
+        from .node_members import member_detected, read_node_hardware
 
         by_id = {p["id"]: p for p in deepcopy(member_policies(groups))}
+        # Read before taking the pool lock: the registry has its own lock and the dispatch loop must not wait on it.
+        nodes = read_node_hardware(by_id.values())
         added = removed = 0
         with self._workers_lock:
             if revision is not None and self._group_revision is not None and revision < self._group_revision:
@@ -1071,9 +1251,7 @@ class WorkerPool:
             selected_gpus = list(self.selected_gpus if selected_gpus is None else selected_gpus)
             devices = {device: (gpu, device, info) for gpu, device, info in selected_gpus}
             targets = {
-                pid: p["count"]
-                if group_is_available(p, now=now) and (p["resource"] == "cpu" or p.get("device") in devices)
-                else 0
+                pid: p["count"] if group_is_available(p, now=now) and member_detected(p, devices, nodes) else 0
                 for pid, p in by_id.items()
             }
             resources: dict[str, int] = {}
@@ -1083,6 +1261,7 @@ class WorkerPool:
             self._policies = by_id
             self._policy_targets = targets
             self._resource_targets = resources
+            self._node_hardware = nodes
             self.selected_gpus = list(selected_gpus)
             self._pending_removals.clear()
             # Legacy/unowned slots and changed resources may finish, never
@@ -1102,32 +1281,46 @@ class WorkerPool:
                 # draining slots before allocating any replacements.
                 owned.sort(key=lambda w: (w._pending_removal, not w.is_busy))
                 desired = targets[pid]
+                hardware = nodes.member(policy) if policy.get("node") else None
                 for index, worker in enumerate(owned):
+                    if hardware is not None and hardware.available:
+                        # A rename or GPU reorder on the node shows in the job log prefix of workers already running.
+                        worker.node_name = hardware.node_name
+                        if worker.worker_type == "GPU" and hardware.gpu:
+                            worker.gpu_index = hardware.gpu_index
+                            worker.gpu_name = hardware.gpu.get("name") or policy["device"]
                     worker.group_name = policy["name"]
                     worker.allowed_job_types = frozenset(policy["job_types"])
-                    worker.display_name = f"{policy['name']} · {worker.worker_id + 1}"
+                    worker.display_name = _group_display_name(policy["name"], worker)
                     if index < desired:
                         worker._pending_removal = False
                         if worker.worker_type == "GPU":
-                            worker.ffmpeg_threads = devices[policy["device"]][2].get("ffmpeg_threads")
+                            worker.ffmpeg_threads = (
+                                NODE_GPU_FFMPEG_THREADS
+                                if policy.get("node")
+                                else devices[policy["device"]][2].get("ffmpeg_threads")
+                            )
                     elif worker.is_busy:
                         worker._pending_removal = True
                     else:
                         self.workers.remove(worker)
                         removed += 1
                 for _ in range(max(0, desired - len(owned))):
-                    if policy["resource"] == "gpu":
-                        self._next_gpu_assignment_index = next(
-                            i for i, (_, device, _) in enumerate(self.selected_gpus) if device == policy["device"]
-                        )
-                    worker = self._create_worker("CPU" if policy["resource"] == "cpu" else "GPU")
+                    if policy.get("node"):
+                        worker = self._create_node_worker(policy, hardware or nodes.member(policy))
+                    else:
+                        if policy["resource"] == "gpu":
+                            self._next_gpu_assignment_index = next(
+                                i for i, (_, device, _) in enumerate(self.selected_gpus) if device == policy["device"]
+                            )
+                        worker = self._create_worker("CPU" if policy["resource"] == "cpu" else "GPU")
                     worker.group_id = policy["group_id"]
                     worker.member_id = policy["member_id"]
                     worker.policy_id = pid
                     worker.group_name = policy["name"]
                     worker.group_resource = resource
                     worker.allowed_job_types = frozenset(policy["job_types"])
-                    worker.display_name = f"{policy['name']} · {worker.worker_id + 1}"
+                    worker.display_name = _group_display_name(policy["name"], worker)
                     self.workers.append(worker)
                     added += 1
             retiring = sum(w._pending_removal for w in self.workers)
@@ -1135,10 +1328,16 @@ class WorkerPool:
             self._worker_done_event.set()
         return {"added": added, "removed": removed, "retiring": retiring}
 
-    def _worker_supports_kind(self, worker: "Worker", kind: str) -> bool:
+    def _worker_supports_kind(self, worker: "Worker", kind: str, *, budget: bool = True) -> bool:
         """Check intrinsic capability, member policy and shared draining budget.
 
         Caller holds ``_workers_lock`` through assignment reservation.
+
+        Args:
+            worker: The worker.
+            kind: The job kind.
+            budget: Also require a free slot in its resource's shared budget; False asks only whether it runs
+                ``kind`` now, busy or not.
         """
         if kind == "loudness" and worker.worker_type != "CPU":
             return False
@@ -1152,6 +1351,8 @@ class WorkerPool:
 
         if not group_is_available(self._policies[worker.policy_id]):
             return False
+        if not budget:
+            return True
         busy = sum(w.is_busy and w.group_resource == worker.group_resource for w in self.workers)
         return busy < self._resource_targets.get(worker.group_resource, 0)
 
@@ -1171,7 +1372,9 @@ class WorkerPool:
                     "reason": "ready" if opened else "configuration",
                     "next_opening": None,
                 }
-            result = capacity_for_groups(list(self._policies.values()), self.selected_gpus, kind)
+            result = capacity_for_groups(
+                list(self._policies.values()), self.selected_gpus, kind, nodes=self._node_hardware
+            )
             result["available"] = 0
             for resource, target in self._resource_targets.items():
                 resource_workers = [w for w in self.workers if w.group_resource == resource]
@@ -1185,6 +1388,124 @@ class WorkerPool:
                 for w in self.workers
             )
             return result
+
+    def can_run_outside(self, kind: str, exclude_nodes: Collection[str]) -> bool:
+        """Whether the configured workers can still run ``kind`` somewhere other than ``exclude_nodes``.
+
+        True while nothing at all is configured for the kind (the item waits, as any item does); False when every
+        configured slot for it that can come back is on an excluded node. Busy slots, members outside their hours and
+        members on a node that is offline right now count: they come back, so the item waits for them instead of
+        failing. Members whose node needs someone to act (``NodeHardware.member_can_come_back``: turned off, removed,
+        needing an update, refusing the key, an access problem, no worker role, or not listing the member's GPU) and
+        this app's members on a GPU it hasn't detected don't count: an item waiting for them would never finish.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids that can't run the item.
+        """
+        from ..worker_groups import supports_job
+        from .node_members import member_detected
+
+        with self._workers_lock:
+            if self._policies is None:
+                nodes = [
+                    getattr(w, "node_id", None)
+                    for w in self.workers
+                    if not w._pending_removal
+                    and (kind != "loudness" or w.worker_type == "CPU")
+                    and (w.allowed_job_types is None or kind in w.allowed_job_types)
+                ]
+            else:
+                devices = {device for _gpu, device, _info in self.selected_gpus}
+                configured = [
+                    policy
+                    for policy in self._policies.values()
+                    if policy.get("enabled", True) and policy.get("count", 0) > 0 and supports_job(policy, kind)
+                ]
+                if not configured:
+                    return True
+                nodes = [
+                    policy.get("node")
+                    for policy in configured
+                    if (
+                        self._node_hardware.member_can_come_back(policy)
+                        if policy.get("node")
+                        else member_detected(policy, devices, self._node_hardware)
+                    )
+                ]
+                return any(node is None or node not in exclude_nodes for node in nodes)
+            return not nodes or any(node is None or node not in exclude_nodes for node in nodes)
+
+    def runs_kind_outside(self, kind: str, exclude_nodes: Collection[str]) -> bool:
+        """Whether a worker outside ``exclude_nodes`` runs ``kind`` now, busy or not.
+
+        Narrower than :meth:`can_run_outside`: a member outside its hours, or on a node that is offline, has no worker
+        that runs now, so a file waiting for one of those could wait hours.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids left out. This app's own workers are never left out.
+        """
+        with self._workers_lock:
+            return any(
+                not worker._pending_removal
+                and getattr(worker, "node_id", None) not in exclude_nodes
+                and self._worker_supports_kind(worker, kind, budget=False)
+                for worker in self.workers
+            )
+
+    def stuck_node_members(self, kind: str, exclude_nodes: Collection[str]) -> list[str]:
+        """``"<node> (<reason>)"`` for each node that has members for ``kind`` it won't give work until someone acts.
+
+        What :meth:`can_run_outside` leaves out on nodes outside ``exclude_nodes``, so a file failed for want of
+        anywhere else to run can say why those didn't count.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids that can't run the item.
+        """
+        from ..worker_groups import supports_job
+
+        with self._workers_lock:
+            hardware = self._node_hardware
+            stuck = [
+                f"{hardware.node_name(policy['node'])} ({hardware.member(policy).reason})"
+                for policy in (self._policies or {}).values()
+                if policy.get("node")
+                and policy["node"] not in exclude_nodes
+                and policy.get("enabled", True)
+                and policy.get("count", 0) > 0
+                and supports_job(policy, kind)
+                and not hardware.member_can_come_back(policy)
+            ]
+        return list(dict.fromkeys(stuck))
+
+    def capacity_outside(self, kind: str, exclude_nodes: Collection[str]) -> dict | None:
+        """The configured capacity for ``kind`` off ``exclude_nodes``, judged like a job's (``capacity_for_groups``).
+
+        Worked out from the last reconcile's policies and node snapshot after the pool lock is released.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids that can't run the item.
+
+        Returns:
+            ``capacity_for_groups``' dict (``open`` 0 with the ``reason`` when no member left is open now), or None for
+            a pool without worker groups.
+        """
+        from .group_runtime import capacity_for_groups
+
+        with self._workers_lock:
+            if self._policies is None:
+                return None
+            policies = [
+                policy
+                for policy in self._policies.values()
+                if policy.get("node") not in exclude_nodes and policy.get("count", 0) > 0
+            ]
+            selected_gpus = list(self.selected_gpus)
+            nodes = self._node_hardware
+        return capacity_for_groups(policies, selected_gpus, kind, nodes=nodes)
 
     def has_capacity_for(self, kind: str) -> bool:
         """Whether configured slots can run this kind now, even when all are busy."""
@@ -1203,10 +1524,13 @@ class WorkerPool:
 
         Each row is the member policy (``id`` = ``"<group_id>:<member_id>"``, ``group_id``, ``member_id``, ``name``,
         ``enabled``, ``availability``, ``resource``, ``device``, ``count``, ``job_types``) plus ``target``,
-        ``running``, ``available``, ``finishing``, ``state`` (active, disabled, hardware_unavailable, off_hours,
-        draining) and ``next_opening``. Draining rows have ``count`` 0 and ``enabled`` False.
+        ``running``, ``available``, ``finishing``, ``state`` (active, disabled, hardware_unavailable,
+        node_unavailable, off_hours, draining), ``reason`` (why a node member has zero workers, else ``""``),
+        ``node_name`` (``None`` for this app) and ``next_opening``. Draining rows have ``count`` 0 and ``enabled``
+        False.
         """
-        from ..worker_groups import next_group_opening
+        from ..worker_groups import group_resource_key, next_group_opening
+        from .node_members import MEMBER_STATE_NODE_UNAVAILABLE, worker_node_id
 
         with self._workers_lock:
             policies = dict(self._policies or {})
@@ -1223,24 +1547,30 @@ class WorkerPool:
                         "count": 0,
                         "job_types": list(worker.allowed_job_types or ()),
                         "availability": {"mode": "always", "windows": []},
+                        "node": worker_node_id(worker),
                     }
             rows = []
             devices = {device for _, device, _ in self.selected_gpus}
+            nodes = self._node_hardware
             for pid, policy in policies.items():
                 workers = [w for w in self.workers if w.policy_id == pid]
                 target = self._policy_targets.get(pid, 0)
                 finishing = sum(w.is_busy and w._pending_removal for w in workers)
+                node = policy.get("node")
+                hardware = nodes.member(policy) if node else None
                 state = "active"
                 if not policy["enabled"]:
                     state = "disabled"
-                elif policy["resource"] == "gpu" and policy.get("device") not in devices:
+                elif hardware is not None and not hardware.available:
+                    state = MEMBER_STATE_NODE_UNAVAILABLE
+                elif not node and policy["resource"] == "gpu" and policy.get("device") not in devices:
                     state = "hardware_unavailable"
                 elif not target:
                     state = "off_hours"
                 if finishing and not target:
                     state = "draining"
                 opening = next_group_opening(policy)
-                resource = "cpu" if policy["resource"] == "cpu" else f"gpu:{policy.get('device')}"
+                resource = group_resource_key(policy)
                 free_budget = max(
                     0,
                     self._resource_targets.get(resource, 0)
@@ -1260,10 +1590,37 @@ class WorkerPool:
                         ),
                         "finishing": finishing,
                         "state": state,
+                        "reason": hardware.reason if hardware is not None else "",
+                        "node_name": hardware.node_name if hardware is not None else None,
                         "next_opening": opening.isoformat() if opening is not None else None,
                     }
                 )
             return rows
+
+    def _create_node_worker(self, policy: dict, hardware: NodeMemberHardware) -> "Worker":
+        """Create a slot for a member on a node, typed and named from the node's own GPU entry.
+
+        Caller holds ``_workers_lock`` and has checked ``hardware.available``.
+        """
+        worker_id = self._next_worker_id
+        self._next_worker_id += 1
+        if policy["resource"] == "gpu":
+            gpu = hardware.gpu or {}
+            worker = Worker(
+                worker_id,
+                "GPU",
+                node_id=policy["node"],
+                node_name=hardware.node_name,
+                gpu=gpu.get("type"),
+                gpu_device=policy["device"],
+                gpu_index=hardware.gpu_index,
+                gpu_name=gpu.get("name") or policy["device"],
+                ffmpeg_threads=NODE_GPU_FFMPEG_THREADS,
+            )
+        else:
+            worker = Worker(worker_id, "CPU", node_id=policy["node"], node_name=hardware.node_name)
+        worker._done_event = self._worker_done_event
+        return worker
 
     def _create_worker(self, worker_type: str) -> "Worker":
         """Create a worker with a unique ID and display name, wired to wake the dispatch loop when it finishes."""
@@ -1587,8 +1944,53 @@ class WorkerPool:
             logger.info("Kept {} busy CPU worker(s) that were due to retire", cancelled)
         return {"added": added, "removed": removed, "deferred": deferred, "retiring": retiring}
 
+    def mark_node_suspect(self, node_id: str) -> None:
+        """Hold new files back from a node that just dropped one, until a check begun after the drop finds it ready
+        (spec §6).
+
+        Without this the file it gave back goes straight to another worker on the same dead node (GPU workers are
+        picked first), and so does every other queued file, each one failing there within milliseconds.
+
+        Args:
+            node_id: The node.
+        """
+        with self._workers_lock:
+            self._suspect_nodes[node_id] = time.monotonic() + SUSPECT_NODE_S
+
+    def refresh_suspect_nodes(self) -> None:
+        """Clear each suspect node a registry check begun since its drop found ready, or whose hold ran out.
+
+        Call without the pool lock held; the dispatch loop calls it once per assignment pass.
+        """
+        with self._workers_lock:
+            if not self._suspect_nodes:
+                return
+            suspects = dict(self._suspect_nodes)
+        now = time.monotonic()
+        cleared = []
+        for node_id, until in suspects.items():
+            if now >= until or checked_ready_since_drop(node_id):
+                cleared.append(node_id)
+        with self._workers_lock:
+            for node_id in cleared:
+                # A drop marked meanwhile starts a new hold.
+                if self._suspect_nodes.get(node_id) == suspects[node_id]:
+                    del self._suspect_nodes[node_id]
+
+    def _is_suspect(self, node_id: str | None, now: float) -> bool:
+        """Whether ``node_id``'s new files are held back. Caller holds ``_workers_lock``."""
+        if node_id is None:
+            return False
+        until = self._suspect_nodes.get(node_id)
+        return until is not None and now < until
+
     def _find_available_worker(
-        self, cpu_only: bool = False, *, claim: bool = False, kind: str = "previews"
+        self,
+        cpu_only: bool = False,
+        *,
+        claim: bool = False,
+        kind: str = "previews",
+        exclude_nodes: Collection[str] = (),
     ) -> Optional["Worker"]:
         """Find an available worker.
 
@@ -1600,14 +2002,22 @@ class WorkerPool:
                 find-and-assign the same worker. The caller is responsible
                 for either calling ``worker.assign_task(...)`` or unsetting
                 ``worker.is_busy = False`` if it backs out.
+            kind: The job kind the worker must run.
+            exclude_nodes: Node ids whose workers are skipped (nodes that couldn't see the item's file). This app's
+                own workers have no node and are never skipped. Workers on a node that just dropped a file
+                (:meth:`mark_node_suspect`) are skipped too.
 
         Returns:
             An available worker matching criteria, GPU workers before CPU workers, or None
         """
+        now = time.monotonic()
         with self._workers_lock:
             # Group order isn't a priority (an upgrade from v4 lists the CPU group first), so an idle GPU always wins.
             for worker in sorted(self.workers, key=lambda w: w.worker_type != "GPU"):
                 if cpu_only and worker.worker_type != "CPU":
+                    continue
+                node_id = getattr(worker, "node_id", None)
+                if node_id is not None and (node_id in exclude_nodes or self._is_suspect(node_id, now)):
                     continue
                 if worker.is_available() and self._worker_supports_kind(worker, kind):
                     if claim:
@@ -1658,10 +2068,7 @@ class WorkerPool:
             if not worker.start_logged:
                 worker.start_logged = True
                 display_path = worker.media_file if worker.media_file else worker.media_title
-                if worker.worker_type == "GPU":
-                    logger.info("[GPU {}]: Started processing {}", worker.gpu_index, display_path)
-                else:
-                    logger.info("[CPU]: Started processing {}", display_path)
+                logger.info("{} Started processing {}", worker.log_tag, display_path)
 
             # Mark that FFmpeg has started outputting progress
             worker.ffmpeg_started = True
@@ -1674,18 +2081,13 @@ class WorkerPool:
             current_time = time.time()
             if current_time - worker.last_verbose_log_time >= 5.0:
                 worker.last_verbose_log_time = current_time
-                if worker.worker_type == "GPU":
-                    logger.info(
-                        "[GPU {}]: {} - {}% (speed={})",
-                        worker.gpu_index,
-                        worker.media_title,
-                        round(progress_percent, 1),
-                        worker.speed,
-                    )
-                else:
-                    logger.info(
-                        "[CPU]: {} - {}% (speed={})", worker.media_title, round(progress_percent, 1), worker.speed
-                    )
+                logger.info(
+                    "{} {} - {}% (speed={})",
+                    worker.log_tag,
+                    worker.media_title,
+                    round(progress_percent, 1),
+                    worker.speed,
+                )
 
     def shutdown(self) -> None:
         """Shutdown all workers gracefully."""

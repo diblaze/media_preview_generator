@@ -4,14 +4,19 @@ Contains general-purpose utility functions that can be reused across
 different modules in the application.
 """
 
+import functools
 import json
 import os
 import re
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -168,6 +173,145 @@ def is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
+# A node runs the same GPU, FFmpeg and logging code as the app but has no screens of its own: its log is read on the
+# app's Nodes page, so a hint in a line it logs must name the app's screen for it, or the node's own setting.
+def is_node_mode() -> bool:
+    """Whether this process is a remote node (``MODE=node``), not the app."""
+    return os.environ.get("MODE", "").strip().lower() == "node"
+
+
+# What each FFmpeg run's log in scratch_dir() is named from; a node removes the ones a killed process left, at its start.
+FFMPEG_LOG_PREFIX = "ffmpeg_output_"
+
+
+def node_temp_root() -> str:
+    """A node's temp folder: ``NODE_TEMP_DIR``, or ``<system temp>/mpg-node``."""
+    return os.environ.get("NODE_TEMP_DIR", "").strip() or os.path.join(tempfile.gettempdir(), "mpg-node")
+
+
+def scratch_dir() -> str:
+    """The folder for this process's short-lived files (FFmpeg's log, a helper's stderr).
+
+    On a node, its temp folder (:func:`node_temp_root`), the one it makes and checks at start and sweeps for what a
+    killed node left: a node run read-only may have no writable system temp at all, and every file sent to it would
+    fail. Else the system's temp folder.
+    """
+    return node_temp_root() if is_node_mode() else tempfile.gettempdir()
+
+
+def gpu_settings_hint() -> str:
+    """Where a GPU is turned off: the app's GPU settings, or for a node's GPUs, the app's worker groups."""
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU device tuning"
+
+
+def cpu_workers_hint() -> str:
+    """Where the CPU worker count is set: the app's worker groups, for a node's CPU too."""
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Workers"
+
+
+def gpu_details_hint() -> str:
+    """Where each GPU's test result is shown."""
+    if is_node_mode():
+        return "this node's Overview tab on the app's Nodes page"
+    return "Settings → Processing Options → GPU device tuning"
+
+
+def log_viewer_hint() -> str:
+    """Where the live log is read."""
+    return "this node's Log tab on the app's Nodes page" if is_node_mode() else "the live web log viewer"
+
+
+def working_folder_hint(tmp_folder: str | None = None) -> tuple[str, str]:
+    """The folder FFmpeg writes thumbnails to, and how to give it another disk: ``(name, move)``.
+
+    ``move`` follows "or ". The app has no setting for its working folder (``tmp_folder``, seeded once from
+    ``TMP_FOLDER``), so a bigger or writable one is a disk mounted where it is: the container's temp folder, or the
+    folder ``TMP_FOLDER`` seeded.
+
+    Args:
+        tmp_folder: The app's working folder (``Config.tmp_folder``); None or the system's temp folder for the default.
+    """
+    if is_node_mode():
+        return "the node's temp folder", "choose another folder (NODE_TEMP_DIR)"
+    if tmp_folder and os.path.normpath(tmp_folder) != os.path.normpath(tempfile.gettempdir()):
+        return "the working folder", f"mount a bigger, writable disk at {tmp_folder}"
+    return "the working folder", "mount a bigger, writable disk at the container's temp folder"
+
+
+_PR_SET_PDEATHSIG = 1  # linux/prctl.h
+_PDEATHSIG_KILL = ("--pdeathsig", "KILL", "--")
+
+
+@functools.cache
+def _setpriv() -> str | None:
+    """The ``setpriv`` that sets a parent death signal (util-linux 2.33 and newer), or None.
+
+    Tried once: an older ``setpriv`` refuses ``--pdeathsig``, and putting it in front of every FFmpeg would fail them
+    all.
+    """
+    path = shutil.which("setpriv")
+    if path is None:
+        return None
+    try:
+        tried = subprocess.run([path, *_PDEATHSIG_KILL, "true"], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if tried.returncode == 0 else None
+
+
+def dies_with_node(args: list[str]) -> tuple[list[str], Callable[[], None] | None]:
+    """The command and ``preexec_fn`` that have a node's FFmpeg killed (SIGKILL) when the node dies, on Linux.
+
+    In Docker the container's end takes every process with it; a node run outside Docker that exits or is killed
+    left its FFmpeg decoding. Linux sends the signal when the *thread* that started the child ends, so use it only
+    for a child that thread waits for (each FFmpeg run, never a long-lived helper process).
+
+    ``setpriv --pdeathsig KILL`` sets the signal and then becomes FFmpeg (same process), so Python can start it the
+    cheap way. A ``preexec_fn`` is only the fallback where there is no such ``setpriv``: it makes every start a full
+    fork that runs Python in the child, which isn't safe beside threads holding locks (loguru's handlers). Unlike
+    the fallback, ``setpriv`` can't tell a node that died before the signal was set: that FFmpeg runs on.
+
+    Args:
+        args: The command (FFmpeg's).
+
+    Returns:
+        ``(args, preexec_fn)`` for ``subprocess.Popen``: on a Linux node, the command behind ``setpriv`` and None,
+        or without that ``setpriv`` the command and a function that sets the signal in the child; for the app and
+        off Linux, the command as it is and None.
+    """
+    if not sys.platform.startswith("linux") or not is_node_mode():
+        return args, None
+    setpriv = _setpriv()
+    if setpriv is not None:
+        return [setpriv, *_PDEATHSIG_KILL, *args], None
+    return args, _set_parent_death_signal()
+
+
+def _set_parent_death_signal() -> Callable[[], None] | None:
+    """A ``preexec_fn`` that sets SIGKILL as the child's parent death signal; None without ``prctl``."""
+    import ctypes
+
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl  # loaded here: the child only calls it
+    except (OSError, AttributeError):
+        return None
+    parent = os.getpid()
+
+    def set_parent_death_signal() -> None:
+        prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+        if os.getppid() != parent:  # the node died before the signal was set: nothing would send it
+            os._exit(1)
+
+    return set_parent_death_signal
+
+
+def debug_logging_hint() -> str:
+    """How to see FFmpeg's detailed output (a node keeps no DEBUG lines for the app to read; its console has them)."""
+    if is_node_mode():
+        return "set LOG_LEVEL=DEBUG on the node and read its docker logs"
+    return "enable Debug logging (Settings → Logging)"
+
+
 def sanitize_path(path: str) -> str:
     """Sanitize file path for cross-platform compatibility.
 
@@ -258,13 +402,12 @@ def _backup_retention() -> int:
 
     Uses :func:`peek_settings_manager` (a lock-free accessor) rather than
     :func:`get_settings_manager`. The standard accessor acquires
-    ``_settings_lock``, which is already held by the caller during
-    first-boot ``SettingsManager.__init__`` → ``_load`` →
-    ``_migrate_global_plex_webhook_to_per_server`` → ``_save``. A
-    re-entry deadlocks the worker for any user whose settings.json
-    carries the legacy ``plex_webhook_*`` keys (i.e., every 3.7.5
-    upgrader). When the singleton isn't built yet, fall through to env /
-    default — same value a brand-new install gets.
+    ``_settings_lock``, which ``get_settings_manager`` holds around
+    ``SettingsManager.__init__``, so a save made while the singleton is
+    being built would deadlock re-entering it (every 3.7.5 upgrader hit
+    this once, when ``_load`` saved the ``plex_webhook_*`` move). When the
+    singleton isn't built yet, fall through to env / default — same value
+    a brand-new install gets.
     """
     raw = None
     try:

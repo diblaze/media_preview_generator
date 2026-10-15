@@ -123,7 +123,7 @@ def test_plex_disabled_but_configured_is_checked_as_if_enabled(factory):
             "plex": {
                 "db_write_confirmed_at": None,
                 "on_plex_redetect": "keep_plex",
-                "agent": {"enabled": False, "url": "", "has_token": False},
+                "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
             },
         },
         "capability": {
@@ -159,7 +159,7 @@ def test_plex_enabled_keeps_its_stored_confirmation_and_library_choice(factory):
         "plex": {
             "db_write_confirmed_at": CONFIRMED,
             "on_plex_redetect": "restore",
-            "agent": {"enabled": False, "url": "", "has_token": False},
+            "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
         },
     }
 
@@ -175,7 +175,7 @@ def test_invalid_stored_block_shows_the_disabled_defaults_the_app_uses(factory):
         "plex": {
             "db_write_confirmed_at": None,
             "on_plex_redetect": "restore",
-            "agent": {"enabled": False, "url": "", "has_token": False},
+            "agent": {"enabled": False, "node_id": None, "node_name": "", "url": "", "has_token": False},
         },
     }
     assert factory.calls[0]["settings"].enabled is True
@@ -2594,6 +2594,22 @@ def test_forget_capability_drops_one_servers_answers():
     assert set(cache._entries) == {("plex", "status"), ("plex", "inspector")}
     assert cache.get(jf, "inspector", lambda: "needs_plugin") == "needs_plugin"
     assert cache.get(plex, "inspector", lambda: "unused") == "ready"
+
+
+@pytest.mark.parametrize("how", ["forget", "clear"])
+def test_a_check_running_when_its_server_is_forgotten_doesnt_store_its_answer(how):
+    # A check against a node's old address came back after its address changed (``forget_node_capability``): its
+    # answer was served for up to a minute.
+    cache = inspect.CapabilityCache(ttl_s=60.0, clock=lambda: 0.0)
+    cfg = server_config("plex", ServerType.PLEX)
+
+    def old_address_check():
+        cache.forget("plex") if how == "forget" else cache.clear()
+        return "ready"
+
+    assert cache.get(cfg, "status", old_address_check) == "ready"
+    assert cache.get(cfg, "status", lambda: "agent_unavailable") == "agent_unavailable"
+    assert cache.get(cfg, "status", lambda: "unused") == "agent_unavailable"
 
 
 def test_forget_capability_uses_the_shared_cache(factory):

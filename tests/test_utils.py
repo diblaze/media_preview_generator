@@ -5,7 +5,12 @@ Tests title formatting, path sanitization, Docker detection,
 and working directory setup.
 """
 
+import errno
 import os
+import re
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 from unittest.mock import patch
@@ -19,6 +24,7 @@ from media_preview_generator.utils import (
     redact_secrets,
     redacted_traceback,
     sanitize_path,
+    scratch_dir,
     setup_working_directory,
 )
 
@@ -362,6 +368,270 @@ class TestSafeResolveWithin:
             "the file lands locally; we still need to map+queue it"
         )
         assert str(not_yet) in result or str(not_yet.parent) in result
+
+
+class TestNodeHints:
+    """A node logs the app's GPU, FFmpeg and logging lines, but has none of the app's screens."""
+
+    APP = {
+        "gpu_settings_hint": "Settings → Processing Options → GPU device tuning",
+        "cpu_workers_hint": "Settings → Workers",
+        "gpu_details_hint": "Settings → Processing Options → GPU device tuning",
+        "log_viewer_hint": "the live web log viewer",
+        "working_folder_hint": ("the working folder", "mount a bigger, writable disk at the container's temp folder"),
+        "debug_logging_hint": "enable Debug logging (Settings → Logging)",
+    }
+    NODE = {
+        "gpu_settings_hint": "the app's Settings → Workers",
+        "cpu_workers_hint": "the app's Settings → Workers",
+        "gpu_details_hint": "this node's Overview tab on the app's Nodes page",
+        "log_viewer_hint": "this node's Log tab on the app's Nodes page",
+        "working_folder_hint": ("the node's temp folder", "choose another folder (NODE_TEMP_DIR)"),
+        "debug_logging_hint": "set LOG_LEVEL=DEBUG on the node and read its docker logs",
+    }
+
+    @pytest.mark.parametrize("hint", sorted(APP))
+    def test_the_app_keeps_its_wording_and_a_node_names_what_it_has(self, monkeypatch, hint):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        assert getattr(utils, hint)() == self.APP[hint]
+
+        monkeypatch.setenv("MODE", "node")
+        assert getattr(utils, hint)() == self.NODE[hint]
+
+    def test_a_node_says_its_temp_folder_is_where_an_io_error_may_come_from(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        monkeypatch.setenv("MODE", "node")
+
+        advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
+
+        assert "the node's temp folder isn't full" in advice and "Settings" not in advice
+
+    def test_a_folder_its_user_may_not_write_names_whose_user_to_let_in(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        refused = generator.WorkingFolderError(errno.EACCES, "Permission denied", "/scratch/task/frames")
+        monkeypatch.setenv("MODE", "node")
+
+        assert generator.working_folder_failure(refused) == (
+            "Couldn't write the thumbnails: the node's temp folder /scratch/task/frames can't be written to "
+            "(Permission denied). Let the node's user write to it (in Docker, check PUID and PGID), or choose another "
+            "folder (NODE_TEMP_DIR)."
+        )
+        monkeypatch.delenv("MODE")
+        assert "Let the app's user write to it" in generator.working_folder_failure(refused)
+
+    @pytest.mark.parametrize("kind", ["codec", "hwaccel", "signal", "stopped_part_way"])
+    def test_a_nodes_gpu_to_cpu_retry_advice_names_no_screen_of_the_apps_own_devices(self, monkeypatch, kind):
+        # A node's GPUs and CPU are worker-group members in the app; the app's GPU tuning doesn't list them.
+        from media_preview_generator.processing import generator
+
+        monkeypatch.setenv("MODE", "node")
+
+        advice = generator.gpu_fallback_advice(kind)
+
+        assert "Processing Options" not in advice and "Settings → CPU" not in advice, advice
+        assert "the app's" in advice or "this node's" in advice, advice
+
+    def test_the_apps_retry_advice_names_screens_it_has(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+
+        assert "under Settings → Workers." in generator.gpu_fallback_advice(generator.FALLBACK_CODEC)
+        assert "under Settings → Processing Options → GPU device tuning." in generator.gpu_fallback_advice(
+            generator.FALLBACK_HWACCEL
+        )
+
+    def test_the_apps_gpu_hints_name_a_heading_the_settings_page_shows(self, monkeypatch):
+        """The GPU section's heading is "GPU device tuning"; only its anchor is still gpu-configuration."""
+        from pathlib import Path
+
+        from media_preview_generator import utils
+        from media_preview_generator.processing import generator
+
+        templates = Path(utils.__file__).parent / "web" / "templates"
+        menu = (templates / "base.html").read_text()
+        headings = {
+            heading.strip()
+            for heading in re.findall(
+                r'class="settings-subheading"[^>]*>(?:<i [^>]*></i>)?([^<]+)', (templates / "settings.html").read_text()
+            )
+        }
+        monkeypatch.delenv("MODE", raising=False)
+
+        for text in (
+            utils.gpu_settings_hint(),
+            utils.gpu_details_hint(),
+            generator.gpu_fallback_advice(generator.FALLBACK_HWACCEL),
+        ):
+            found = re.search(r"Settings → ([^→]+) → ([^.,)]+)", text)
+            assert found is not None, text
+            assert f"'{found.group(1).strip()}'" in menu and found.group(2).strip() in headings, text
+
+    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])
+    def test_the_apps_working_folder_failure_names_no_settings_screen(self, monkeypatch, code):
+        """Nothing in the app's Settings sets its working folder, so the fix is a bigger or writable disk for it."""
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+
+        message = generator.working_folder_failure(generator.WorkingFolderError(code, "x", "/tmp/job/frames"))
+
+        assert "Settings" not in message, message
+        assert message.endswith(", or mount a bigger, writable disk at the container's temp folder."), message
+
+    def test_a_working_folder_elsewhere_gets_its_bigger_disk_where_it_is(self, monkeypatch):
+        """TMP_FOLDER=/transcode puts the frames on /transcode: a disk at the container's temp folder changes nothing."""
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+        full = generator.WorkingFolderError(errno.ENOSPC, "No space left on device", "/transcode/frame_cache/frames-0")
+
+        message = generator.working_folder_failure(full, "/transcode")
+
+        assert "container's temp folder" not in message, message
+        assert message.endswith("Free up space there, or mount a bigger, writable disk at /transcode."), message
+
+    @pytest.mark.parametrize("tmp_folder", [None, "/tmp", "/tmp/"])
+    def test_the_default_working_folder_keeps_the_containers_temp_folder(self, monkeypatch, tmp_folder):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+
+        assert utils.working_folder_hint(tmp_folder) == (
+            "the working folder",
+            "mount a bigger, writable disk at the container's temp folder",
+        )
+
+    def test_a_node_keeps_its_own_temp_folder_whatever_the_apps_working_folder(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+
+        assert utils.working_folder_hint("/transcode") == (
+            "the node's temp folder",
+            "choose another folder (NODE_TEMP_DIR)",
+        )
+
+
+def _running(pid: int) -> bool:
+    """A process that exists and isn't a zombie waiting to be reaped."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _cmdline(pid: int) -> bytes:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _is_the_child(pid: int) -> bool:
+    """The child has exec'd (past setpriv, or past the fork of the node's Python): its own command line."""
+    argv = _cmdline(pid).split(b"\0")
+    return argv[0] == sys.executable.encode() and argv[1:3] == [b"-c", b"import time; time.sleep(60)"]
+
+
+class TestDiesWithNode:
+    COMMAND = ["/usr/bin/ffmpeg", "-i", "/data/a.mkv"]
+
+    def test_the_apps_ffmpeg_and_a_node_off_linux_start_as_they_always_did(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        assert utils.dies_with_node(self.COMMAND) == (self.COMMAND, None)
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils.sys, "platform", "darwin")
+        assert utils.dies_with_node(self.COMMAND) == (self.COMMAND, None)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_a_linux_node_puts_setpriv_in_front_and_needs_no_preexec_fn(self, monkeypatch):
+        # A preexec_fn makes every FFmpeg start a full fork running Python in the child, beside the node's threads.
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils, "_setpriv", lambda: "/usr/bin/setpriv")
+
+        assert utils.dies_with_node(self.COMMAND) == (
+            ["/usr/bin/setpriv", "--pdeathsig", "KILL", "--", *self.COMMAND],
+            None,
+        )
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_without_a_setpriv_that_can_it_falls_back_to_a_preexec_fn(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils, "_setpriv", lambda: None)
+
+        args, preexec = utils.dies_with_node(self.COMMAND)
+
+        assert args == self.COMMAND and callable(preexec)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_a_setpriv_without_pdeathsig_is_not_used(self, monkeypatch, tmp_path):
+        from media_preview_generator import utils
+
+        old = tmp_path / "setpriv"
+        old.write_text("#!/bin/sh\necho 'setpriv: unrecognized option --pdeathsig' >&2\nexit 1\n")
+        old.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        utils._setpriv.cache_clear()
+        try:
+            assert utils._setpriv() is None
+        finally:
+            utils._setpriv.cache_clear()
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    @pytest.mark.parametrize("way", ["setpriv", "preexec_fn"])
+    def test_a_nodes_ffmpeg_dies_with_the_node_killed_outside_docker(self, way):
+        # Outside Docker (no PID namespace) a node that exited or was killed left its FFmpeg running.
+        if way == "setpriv" and not __import__("shutil").which("setpriv"):
+            pytest.skip("no setpriv on this machine")
+        node = (
+            "import subprocess, sys, time\n"
+            "from media_preview_generator import utils\n"
+            f"if {way == 'preexec_fn'!r}:\n"
+            "    utils._setpriv = lambda: None\n"
+            "args, preexec = utils.dies_with_node([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "ffmpeg = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=preexec)\n"
+            "print(ffmpeg.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        started = subprocess.Popen(
+            [sys.executable, "-c", node], cwd=repo, env={**os.environ, "MODE": "node"},
+            stdout=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        try:
+            pid = int(started.stdout.readline().strip())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not _is_the_child(pid):
+                time.sleep(0.02)  # setpriv becomes the child (same pid) once it has set the signal
+            assert _is_the_child(pid)
+            started.kill()  # SIGKILL: the node gets no chance to stop its FFmpeg itself
+            started.wait(10)
+        finally:
+            started.stdout.close()
+        deadline = time.monotonic() + 10
+        while _running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        still_running = _running(pid)
+        if still_running:
+            os.kill(pid, signal.SIGKILL)
+
+        assert not still_running
 
 
 class TestIsWindows:
@@ -764,3 +1034,27 @@ class TestAtomicJsonSaveWithBackup:
         # This should NOT raise — backup is best-effort.
         utils.atomic_json_save_with_backup(str(target), {"v": 2})
         assert _json.loads(target.read_text())["v"] == 2
+
+
+class TestScratchDir:
+    def test_a_node_uses_its_own_temp_folder(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", f"  {tmp_path}  ")
+        assert scratch_dir() == str(tmp_path)
+
+    def test_a_node_without_one_uses_the_temp_folder_its_tasks_use_and_the_app_the_system_one(
+        self, monkeypatch, tmp_path
+    ):
+        # The image sets no NODE_TEMP_DIR: FFmpeg's logs went to the system temp folder while the node swept
+        # <system temp>/mpg-node for the ones a killed node left behind.
+        import tempfile
+
+        from media_preview_generator.nodes.server.tasks import default_temp_root
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", "")
+        assert scratch_dir() == default_temp_root() == str(tmp_path / "mpg-node")
+        monkeypatch.delenv("MODE")
+        monkeypatch.setenv("NODE_TEMP_DIR", "/elsewhere")  # a node's setting: the app has no use for it
+        assert scratch_dir() == str(tmp_path)

@@ -5,11 +5,15 @@ Tests BIF generation, FFmpeg execution, progress parsing, path mapping,
 HDR detection, and the complete processing pipeline.
 """
 
+import json
 import os
+import shutil
 import struct
+import subprocess
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+from loguru import logger
 
 from media_preview_generator.gpu import VulkanProbeResult
 from media_preview_generator.processing import (
@@ -33,6 +37,7 @@ from media_preview_generator.processing import (
     parse_ffmpeg_progress_line,
     record_failure,
 )
+from media_preview_generator.processing.generator import _video_details_from_ffprobe, read_media_info
 from media_preview_generator.processing.hdr_detection import (
     detect_dolby_vision_rpu_error as _detect_dolby_vision_rpu_error,
 )
@@ -156,15 +161,12 @@ class TestBIFGeneration:
             assert test_data in content
 
     def test_generate_bif_empty_directory(self, temp_dir, mock_config):
-        """Test BIF generation with no thumbnails."""
+        """No thumbnails, no BIF: Plex and Emby would take an empty one as a finished preview."""
         bif_path = os.path.join(temp_dir, "empty.bif")
-        generate_bif(bif_path, temp_dir, mock_config)
+        with pytest.raises(ValueError, match="no thumbnails"):
+            generate_bif(bif_path, temp_dir, mock_config)
 
-        # Should create BIF with 0 images
-        with open(bif_path, "rb") as f:
-            f.seek(12)  # Skip magic + version
-            image_count = struct.unpack("<I", f.read(4))[0]
-            assert image_count == 0
+        assert not os.path.exists(bif_path)
 
     def test_generate_bif_frame_interval(self, temp_dir, mock_config):
         """Test that frame interval is correctly converted to milliseconds."""
@@ -468,6 +470,19 @@ class TestDetectHwaccelRuntimeError:
         """Test detection of hwaccel initialisation errors."""
         stderr_lines = ["hwaccel initialisation returned error"]
         assert _detect_hwaccel_runtime_error(stderr_lines) is True
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[vist#0:0/h264 @ 0x630c] [dec:h264 @ 0x630c] Hardware device setup failed for decoder: Generic error in an "
+            "external library",
+            "Device setup failed for decoder on input stream #0:0 : Generic error in an external library",
+        ],
+        ids=["ffmpeg-7-and-later", "older-ffmpeg"],
+    )
+    def test_detect_a_gpu_that_cant_start_the_decode(self, line):
+        """A container that lost its GPU: the decoder's GPU device can't be set up, and nothing decodes."""
+        assert _detect_hwaccel_runtime_error([line]) is True
 
     def test_no_match_on_normal_errors(self):
         """Test that non-hwaccel errors are not detected."""
@@ -1453,6 +1468,77 @@ class TestMediaInfoImport:
         assert result is True or result is False  # Just check it doesn't crash
 
 
+class TestDetailsMediaInfoCantRead:
+    """A tag MediaInfo writes into its XML as it is (U+FFFF in a title) makes pymediainfo raise ``ParseError``; FFmpeg
+    reads the file fine, so it gets its thumbnails without the details rather than failing."""
+
+    def test_the_file_gets_its_thumbnails_and_one_warning_naming_it(
+        self, video_mediainfo_cant_read, mock_config, tmp_path
+    ):
+        mock_config.ffmpeg_path = shutil.which("ffmpeg")
+        mock_config.plex_bif_frame_interval = 1
+        warnings: list[str] = []
+        sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+        try:
+            with failure_scope("mediainfo-cant-read"):
+                success, image_count, *_ = generate_images(
+                    video_mediainfo_cant_read, str(tmp_path / "frames"), None, None, mock_config
+                )
+        finally:
+            logger.remove(sink)
+        assert success and image_count >= 3
+        assert len(os.listdir(tmp_path / "frames")) == image_count
+        assert len(warnings) == 1 and video_mediainfo_cant_read in warnings[0], warnings
+
+
+class TestDetailsMediaInfoCantReadKeepsHdrAndRotation:
+    """When MediaInfo's answer can't be read, ffprobe still tells an HDR file from an SDR one, and its rotation."""
+
+    def test_hdr10_clip_is_still_seen_as_hdr(self, hdr10_video_mediainfo_cant_read):
+        track = read_media_info(hdr10_video_mediainfo_cant_read).video_tracks[0]
+        assert is_hdr_transfer(track.transfer_characteristics)
+
+    def test_hdr10_clip_gets_the_tone_mapping_path(self, hdr10_video_mediainfo_cant_read, mock_config, tmp_path):
+        mock_config.ffmpeg_path = shutil.which("ffmpeg")
+        mock_config.plex_bif_frame_interval = 1
+        infos: list[str] = []
+        sink = logger.add(lambda m: infos.append(m.record["message"]), level="INFO")
+        try:
+            with failure_scope("mediainfo-cant-read-hdr"):
+                success, *_ = generate_images(
+                    hdr10_video_mediainfo_cant_read, str(tmp_path / "frames"), None, None, mock_config
+                )
+        finally:
+            logger.remove(sink)
+        assert success
+        assert any("HDR transfer detected" in m for m in infos), infos
+
+    @pytest.mark.parametrize(
+        "side_data,expected",
+        [
+            pytest.param([{"rotation": -90}], {"Rotation": "90"}, id="turned-90-clockwise"),
+            pytest.param([{"rotation": 180}], {"Rotation": "180"}, id="upside-down"),
+            pytest.param(
+                [{"dv_profile": 5, "dv_bl_signal_compatibility_id": 0}], {"HDR_format": "Dolby Vision"}, id="dv-p5"
+            ),
+            pytest.param(
+                [{"dv_profile": 8, "dv_bl_signal_compatibility_id": 1}],
+                {"HDR_format": "Dolby Vision", "Transfer_characteristics": "PQ"},
+                id="dv-p8-hdr10-base",
+            ),
+        ],
+    )
+    def test_side_data_is_mapped_to_mediainfo_fields(self, side_data, expected):
+        stream = json.dumps({"streams": [{"color_transfer": "unknown", "side_data_list": side_data}]})
+        done = subprocess.CompletedProcess([], 0, stdout=stream)
+        with patch("media_preview_generator.processing.generator.subprocess.run", return_value=done):
+            assert _video_details_from_ffprobe("x.mkv") == expected
+
+    def test_a_file_ffprobe_cant_read_is_one_track_with_no_details(self):
+        with patch("media_preview_generator.processing.generator.subprocess.run", side_effect=OSError):
+            assert _video_details_from_ffprobe("x.mkv") == {}
+
+
 class TestDVNoBackwardCompat:
     """Test Dolby Vision Profile 5 / no-backward-compat detection.
 
@@ -2001,6 +2087,89 @@ class TestProactiveDVSkip:
         assert "scale_cuda=w=320:h=240:force_original_aspect_ratio=decrease" in vf
         assert "hwdownload" in vf
         assert vf.startswith("fps=fps=")
+
+    @pytest.mark.parametrize(
+        ("node", "caps", "says", "doesnt_say"),
+        [
+            pytest.param(True, None, "set NVIDIA_DRIVER_CAPABILITIES=all", "--runtime=nvidia", id="node-caps-unset"),
+            pytest.param(
+                True,
+                "all",
+                "start the container with --runtime=nvidia",
+                "set NVIDIA_DRIVER_CAPABILITIES",
+                id="node-caps-all",
+            ),
+            pytest.param(
+                False, "all", "See the dashboard notification centre", "NVIDIA_DRIVER_CAPABILITIES", id="app-caps-all"
+            ),
+        ],
+    )
+    @patch("media_preview_generator.processing.generator.MediaInfo")
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    @patch("media_preview_generator.processing.generator.os.rename")
+    @patch("media_preview_generator.processing.generator.os.remove")
+    @patch("os.path.exists")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("time.sleep")
+    @patch("media_preview_generator.processing.generator.glob.glob")
+    @patch("media_preview_generator.processing.generator._detect_codec_error")
+    def test_a_dv5_file_without_vulkan_names_the_fix_its_container_still_needs(
+        self,
+        mock_detect,
+        mock_glob,
+        mock_sleep,
+        mock_file,
+        mock_exists,
+        mock_remove,
+        mock_rename,
+        mock_run,
+        mock_popen,
+        mock_mediainfo,
+        temp_dir,
+        mock_config,
+        monkeypatch,
+        node,
+        caps,
+        says,
+        doesnt_say,
+    ):
+        """On a node the file's own line is the only place the fix is said; it mustn't ask for a setting already made."""
+        from loguru import logger
+
+        if caps is None:
+            monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        else:
+            monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", caps)
+        monkeypatch.setattr("media_preview_generator.processing.generator.is_node_mode", lambda: node)
+        messages: list[str] = []
+        sink_id = logger.add(lambda msg: messages.append(str(msg)), level="WARNING", format="{message}")
+        try:
+            self._run_generate(
+                "Dolby Vision",
+                "/test/dv_profile5_sw_vulkan.mkv",
+                mock_detect,
+                mock_glob,
+                mock_sleep,
+                mock_file,
+                mock_exists,
+                mock_remove,
+                mock_rename,
+                mock_run,
+                mock_popen,
+                mock_mediainfo,
+                temp_dir,
+                mock_config,
+                gpu="NVIDIA",
+                vulkan_device_info={"device": "llvmpipe (LLVM 18.1.3, 256 bits) (software)", "is_software": True},
+            )
+        finally:
+            logger.remove(sink_id)
+
+        hits = [m for m in messages if "needs a real GPU with Vulkan" in m]
+        assert len(hits) == 1, messages
+        assert says in hits[0]
+        assert doesnt_say not in hits[0]
 
     @patch("media_preview_generator.processing.generator.MediaInfo")
     @patch("subprocess.Popen")
@@ -3273,6 +3442,161 @@ class TestGpuScaleOptimisation:
         assert "-hwaccel" in args
         assert args[args.index("-hwaccel") + 1] == "cuda"
         assert "-hwaccel_output_format" not in args
+
+
+CPU_SCALE = "scale=w=320:h=240:force_original_aspect_ratio=decrease"
+# MediaInfo's Rotation (clockwise; a phone's portrait video is 90), the filters FFmpeg's autorotation would use, and
+# the GPU's box: twice the thumbnail, as the frame is stored.
+ROTATIONS = [
+    pytest.param("90.000", "transpose=clock", "w=480:h=640", id="90"),
+    pytest.param("270.000", "transpose=cclock", "w=480:h=640", id="270"),
+    pytest.param("180.000", "hflip,vflip", "w=640:h=480", id="180"),
+]
+SURFACE_GPUS = [
+    pytest.param("NVIDIA", "cuda", "scale_cuda", id="cuda"),
+    pytest.param("INTEL", "/dev/dri/renderD128", "scale_vaapi", id="intel-vaapi"),
+    pytest.param("AMD", "/dev/dri/renderD128", "scale_vaapi", id="amd-vaapi"),
+]
+
+
+class TestRotatedVideo:
+    """FFmpeg turns a rotated stream's frames upright by itself only when they are in memory: the CPU's, and those of
+    a GPU whose frames FFmpeg downloads (VideoToolbox, D3D11VA). Frames that stay on the GPU (CUDA, VAAPI) are turned
+    after their download and sized by the CPU's scale, so a portrait 16:9 video's thumbnails are 135x240 there too."""
+
+    @staticmethod
+    def _command(mock_config, gpu, device, rotation, *, hdr_fmt=None, transfer=None) -> list[str]:
+        info = MagicMock()
+        info.video_tracks = [MagicMock(hdr_format=hdr_fmt, transfer_characteristics=transfer, rotation=rotation)]
+        proc = MagicMock()
+        proc.poll.side_effect = [None, 0]
+        proc.returncode = 0
+        with (
+            patch("media_preview_generator.processing.generator.MediaInfo") as mediainfo,
+            patch("subprocess.Popen", return_value=proc) as popen,
+            patch(
+                "media_preview_generator.gpu.vulkan_probe.get_vulkan_device_info",
+                return_value=VulkanProbeResult(device="Real GPU", is_software=False),
+            ),
+            patch("os.path.exists", return_value=False),
+            patch("builtins.open", new_callable=mock_open),
+            patch("time.sleep"),
+            patch("media_preview_generator.processing.generator.glob.glob", return_value=[]),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            mediainfo.parse.return_value = info
+            generate_images("/test/v.mp4", "/tmp/o", gpu, device, mock_config)
+        return popen.call_args_list[0][0][0]
+
+    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    @pytest.mark.parametrize(("gpu", "device", "scaler"), SURFACE_GPUS)
+    @pytest.mark.parametrize(("hdr_fmt", "fmt"), [(None, "nv12"), ("SMPTE ST 2086", "p010le")], ids=["sdr", "hdr10"])
+    def test_frames_kept_on_the_gpu_are_turned_after_download_and_sized_as_on_the_cpu(
+        self, mock_config, gpu, device, scaler, rotation, turn, box, hdr_fmt, fmt
+    ):
+        args = self._command(mock_config, gpu, device, rotation, hdr_fmt=hdr_fmt)
+        vf = args[args.index("-vf") + 1]
+
+        assert args[args.index("-hwaccel_output_format") + 1] in {"cuda", "vaapi"}
+        assert f"{scaler}={box}:force_original_aspect_ratio=decrease" in vf
+        assert vf.index(f"hwdownload,format={fmt}") < vf.index(turn)
+        assert vf.endswith(f",{turn},{CPU_SCALE}"), vf
+        if hdr_fmt:
+            assert vf.index("tonemap=hable") < vf.index(turn), "tone mapped on the even-sized frame, then turned"
+
+    @pytest.mark.parametrize("rotation", ["0.000", None, "45.000", "bad"])
+    @pytest.mark.parametrize(("gpu", "device", "scaler"), SURFACE_GPUS)
+    def test_a_stream_shown_as_stored_keeps_its_gpu_scale(self, mock_config, gpu, device, scaler, rotation):
+        args = self._command(mock_config, gpu, device, rotation)
+        vf = args[args.index("-vf") + 1]
+
+        assert f"{scaler}=w=320:h=240:force_original_aspect_ratio=decrease" in vf
+        assert "transpose" not in vf and "flip" not in vf
+        assert CPU_SCALE not in vf
+
+    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    @pytest.mark.parametrize(
+        ("gpu", "device"),
+        [(None, None), ("APPLE", None), ("WINDOWS_GPU", None)],
+        ids=["cpu", "videotoolbox", "d3d11va"],
+    )
+    def test_frames_in_memory_are_left_to_ffmpegs_own_turn(self, mock_config, gpu, device, rotation, turn, box):
+        args = self._command(mock_config, gpu, device, rotation)
+        vf = args[args.index("-vf") + 1]
+
+        assert "-hwaccel_output_format" not in args
+        assert vf.endswith(f",{CPU_SCALE}") and turn not in vf, vf
+
+    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    @pytest.mark.parametrize(
+        ("gpu", "device", "download"),
+        [("INTEL", "/dev/dri/renderD128", "hwdownload,format=nv12,format=yuv420p"),
+         ("AMD", "/dev/dri/renderD128", "hwdownload,format=yuv420p")],
+        ids=["intel-opencl", "amd-vulkan"],
+    )  # fmt: skip
+    def test_dolby_vision_profile_5_on_vaapi_is_turned_after_its_download(
+        self, mock_config, gpu, device, download, rotation, turn, box
+    ):
+        args = self._command(mock_config, gpu, device, rotation, hdr_fmt="Dolby Vision")
+        vf = args[args.index("-vf") + 1]
+
+        assert vf.endswith(f"{download},{turn},{CPU_SCALE}"), vf
+
+    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    def test_dolby_vision_profile_5_on_nvidia_uploads_frames_ffmpeg_turned(self, mock_config, rotation, turn, box):
+        args = self._command(mock_config, "NVIDIA", "cuda", rotation, hdr_fmt="Dolby Vision")
+        vf = args[args.index("-vf") + 1]
+
+        assert "-hwaccel_output_format" not in args
+        assert "hwupload" in vf and turn not in vf, vf
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.parametrize("rotation", ["inf", "-inf", "nan", "abc", None, "45"])
+    def test_a_rotation_that_isnt_a_quarter_turn_is_read_as_none(self, rotation):
+        from types import SimpleNamespace
+
+        from media_preview_generator.processing.generator import display_rotation as read_rotation
+
+        assert read_rotation(SimpleNamespace(video_tracks=[SimpleNamespace(rotation=rotation)])) == 0
+
+    @pytest.mark.parametrize("display_rotation", ["-90", "90", "180"])
+    def test_the_turn_read_from_mediainfo_is_the_one_ffmpeg_makes_itself(self, display_rotation, tmp_path):
+        """Real files and FFmpeg: the filters for MediaInfo's angle, with FFmpeg's own turn off, give the CPU path's
+        thumbnail, pixel for pixel and at its size."""
+        import subprocess
+
+        from PIL import Image, ImageChops
+        from pymediainfo import MediaInfo
+
+        from media_preview_generator.processing.filter_chain import rotation_filter
+        from media_preview_generator.processing.generator import display_rotation as read_rotation
+
+        ffmpeg = shutil.which("ffmpeg")
+        stored = tmp_path / "stored.mp4"
+        shown = tmp_path / "shown.mp4"
+        quiet = [ffmpeg, "-nostdin", "-loglevel", "error"]
+        subprocess.run(
+            [*quiet, "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=5:duration=1", "-c:v", "mpeg4", str(stored)],
+            check=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [*quiet, "-display_rotation", display_rotation, "-i", str(stored), "-c", "copy", str(shown)],
+            check=True,
+            timeout=60,
+        )
+        turn = rotation_filter(read_rotation(MediaInfo.parse(str(shown))))
+        assert turn is not None
+        theirs, ours = tmp_path / "ffmpeg.png", tmp_path / "ours.png"
+        subprocess.run([*quiet, "-i", str(shown), "-frames:v", "1", "-vf", CPU_SCALE, str(theirs)], check=True)
+        subprocess.run(
+            [*quiet, "-noautorotate", "-i", str(shown), "-frames:v", "1", "-vf", f"{turn},{CPU_SCALE}", str(ours)],
+            check=True,
+        )
+
+        with Image.open(theirs) as expected, Image.open(ours) as actual:
+            assert actual.size == expected.size == ((320, 180) if display_rotation == "180" else (135, 240))
+            assert ImageChops.difference(actual.convert("RGB"), expected.convert("RGB")).getbbox() is None
 
 
 class TestFfmpegThreadFlags:

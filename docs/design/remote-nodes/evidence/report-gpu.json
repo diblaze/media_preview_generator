@@ -1,0 +1,134 @@
+{
+ "file": "/data/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv",
+ "mode": "gpu",
+ "node_gpus": [
+  [
+   "NVIDIA",
+   "cuda:0",
+   "Quadro P5000",
+   "ok"
+  ]
+ ],
+ "node_gpu_detect_s": 0.68,
+ "access_checks": [
+  [
+   true,
+   "/mnt/nas/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv"
+  ],
+  [
+   false,
+   "LookupError: no node mapping covers /elsewhere/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv"
+  ],
+  [
+   false,
+   "FileExistsError: different file at /mnt/nas/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv: size 775560700 vs 775560701, mtime_ns 1771246996454097483 vs 1771246996454097483"
+  ],
+  [
+   false,
+   "PermissionError: /mnt/etc/passwd is outside the mapped roots"
+  ],
+  [
+   false,
+   "FileNotFoundError: node can't see /mnt/nas/TV Shows/does-not-exist.mkv"
+  ]
+ ],
+ "task_with_wrong_mapping": {
+  "status": "file_not_visible",
+  "error": "FileNotFoundError: node can't see /mnt/wrong/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv",
+  "seconds": 0.0
+ },
+ "preview": {
+  "local": {
+   "generate_images": [
+    true,
+    274,
+    true,
+    51.6,
+    "26.7x",
+    ""
+   ],
+   "frames": 274
+  },
+  "local_s": 52.45,
+  "remote": {
+   "frames": 274,
+   "generate_images": [
+    true,
+    274,
+    true,
+    45.3,
+    "30.4x",
+    ""
+   ]
+  },
+  "remote_status": "done",
+  "remote_s": 45.78,
+  "polls": 92,
+  "progress_seen": 100.0,
+  "tar_mb": 4.5,
+  "fetch_s": 0.09,
+  "same_frame_names": true,
+  "frames_identical": true,
+  "bif_identical": true,
+  "error": null
+ },
+ "loudness": {
+  "identical": true,
+  "local": {
+   "ln:loudnessAnalysisVersion": "0.02",
+   "ln:loudness": "-23.00",
+   "ln:peak": "-5.69",
+   "ln:lra": "8.40",
+   "ln:threshold": "-33.42",
+   "ln:gainOffset": "-0.29"
+  },
+  "remote_status": "done",
+  "error": null
+ },
+ "fingerprint": {
+  "identical": true,
+  "n": 3845,
+  "kb": 15.0,
+  "remote_status": "done",
+  "error": null
+ },
+ "end_picture": {
+  "identical": true,
+  "frames": 60,
+  "remote_status": "done",
+  "error": null
+ },
+ "credits": {
+  "identical": true,
+  "local_s": 16.59,
+  "remote_s": 15.56,
+  "summary": {
+   "start_s": null,
+   "end_s": null,
+   "scale": 1,
+   "prose_start_s": null
+  },
+  "cpu_notes": [
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU",
+   "Credits read on the CPU: Vulkan reports no hardware GPU"
+  ],
+  "remote_status": "done",
+  "error": null
+ },
+ "cancel": {
+  "status": "failed",
+  "stop_s": 0.63,
+  "error": "CancellationError: Processing cancelled for /mnt/nas/TV Shows/Teen Titans (2003) {tvdb-71503}/Teen Titans (2003) - S04E10 - Mother Mae-Eye [Bluray-1080p][EAC3 2.0][x265]-edge2020.mkv"
+ },
+ "wrong_key_status": 401
+}

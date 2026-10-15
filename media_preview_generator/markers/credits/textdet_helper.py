@@ -53,7 +53,7 @@ from typing import Any, BinaryIO
 import numpy as np
 from loguru import logger
 
-from ...utils import redact_secrets
+from ...utils import redact_secrets, scratch_dir
 from ..locks import KeyedLocks
 from .cards import READ_SCALE
 from .devices import choose_ep_device, pin_env_to_gpu, worker_pci_bus_id
@@ -66,6 +66,9 @@ REC_MODEL_ENV = "MEDIA_PREVIEW_TEXTREC_MODEL"
 DEFAULT_REC_MODEL_PATH = "/app/models/latin_PP-OCRv5_rec_mobile.onnx"
 CPU_KEY = "cpu"
 CREDITS_ON_CPU_PREFIX = "Credits read on the CPU"
+# For a device whose credits stay on the CPU for the process (no WebGPU path, software Vulkan, failed self-test). The
+# GPU-streak card keys on it, since a remote node's verdict lives in the node's own pool, not this one.
+CREDITS_KEPT_ON_CPU_PREFIX = "Credits read on the CPU until restart"
 # ONNX Runtime threads per helper. Each CPU worker's request gets a helper of its own, so a small number keeps the
 # total in line with the worker count the user chose.
 THREADS = 2
@@ -470,13 +473,15 @@ def _exit_plain(code: int | None) -> str:
     return "exited"
 
 
-def _report_cpu_fallback(on_cpu: Callable[[str], None] | None, reason: str | None) -> None:
-    """Tell the worker a GPU worker's request is read on the CPU (its row's fallback flag). Never raises: the row is
-    only a display, and the request still has to be read."""
+def _report_cpu_fallback(on_cpu: Callable[[str], None] | None, reason: str | None, *, kept: bool = False) -> None:
+    """Tell the worker a GPU worker's request is read on the CPU (its row's fallback flag). ``kept``: the device's
+    credits stay on the CPU for the process. Never raises: the row is only a display, and the request still has to be
+    read."""
     if on_cpu is None or not reason:
         return
+    prefix = CREDITS_KEPT_ON_CPU_PREFIX if kept else CREDITS_ON_CPU_PREFIX
     try:
-        on_cpu(f"{CREDITS_ON_CPU_PREFIX}: {reason}")
+        on_cpu(f"{prefix}: {reason}")
     except Exception as exc:  # noqa: BLE001 - see docstring
         logger.debug("Couldn't show the text detection CPU fallback on the worker row: {}", exc)
 
@@ -717,7 +722,7 @@ def _start(spec: HelperSpec, *, command: Callable[[HelperSpec], list[str]], pope
     Raises:
         HelperError: It couldn't be started, or its first line wasn't a ready line.
     """
-    stderr_file = tempfile.TemporaryFile()
+    stderr_file = tempfile.TemporaryFile(dir=scratch_dir())
     try:
         proc = popen(command(spec), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, env=spec.env,
                      start_new_session=True)  # fmt: skip
@@ -934,7 +939,9 @@ class TextDetectorPool:
                             self._gpu_worked(key)
                             return answer
                         cpu_reason = self._cpu_reason(key)  # the helper just gave the device its CPU verdict
-            _report_cpu_fallback(on_cpu, cpu_reason)
+                # Read with the reason: after the lock another worker could change the verdict.
+                kept = self._has_cpu_verdict(key)
+            _report_cpu_fallback(on_cpu, cpu_reason, kept=kept)
         return self._on_cpu(
             planes,
             for_gpu_worker=key != CPU_KEY if gpu_worker is None else gpu_worker,
@@ -958,6 +965,21 @@ class TextDetectorPool:
             if state.verdict == "cpu" or _monotonic() < state.retry_at:
                 return "cpu"
             return state.verdict
+
+    def device_status(self) -> list[dict[str, str]]:
+        """Where each GPU device's credits text detection runs now, in key order, for the diagnostic bundle.
+
+        Returns:
+            One dict per device that has had a request: ``key``, ``backend`` (``webgpu``, ``cpu``, or ``untested``) and
+            ``reason`` (why it is on the CPU, empty otherwise).
+        """
+        with self._guard:
+            rows = []
+            for key, state in sorted(self._gpus.items()):
+                on_cpu = state.verdict == "cpu" or _monotonic() < state.retry_at
+                backend = "cpu" if on_cpu else state.verdict or "untested"
+                rows.append({"key": key, "backend": backend, "reason": state.cpu_reason if on_cpu else ""})
+            return rows
 
     def credits_on_cpu(self) -> list[dict[str, Any]]:
         """The GPU devices whose credits are read on the CPU because their self-test found other results than the
@@ -1023,6 +1045,11 @@ class TextDetectorPool:
                 self._use_cpu(key, "Vulkan reports no hardware GPU")
                 return self._cpu_reason(key)
         return None
+
+    def _has_cpu_verdict(self, key: str) -> bool:
+        with self._guard:
+            state = self._gpus.get(key)
+            return state is not None and state.verdict == "cpu"
 
     def _cpu_reason(self, key: str) -> str:
         with self._guard:
@@ -1446,14 +1473,32 @@ class TextDetectorPool:
 
 _pool: TextDetectorPool | None = None
 _pool_lock = threading.Lock()
+# Where the process pool's CPU helper count comes from when not the saved settings: a remote node has none.
+_cpu_limit_source: Callable[[], int] | None = None
+
+
+def set_cpu_limit_source(source: Callable[[], int] | None) -> None:
+    """Size the process pool's CPU helpers by ``source()`` instead of the saved CPU worker count (None: the settings).
+
+    Args:
+        source: Read on every CPU request, like the saved count.
+    """
+    global _cpu_limit_source
+    _cpu_limit_source = source
+
+
+def _cpu_limit() -> int:
+    source = _cpu_limit_source
+    return source() if source is not None else _configured_cpu_workers()
 
 
 def get_textdet_pool() -> TextDetectorPool:
-    """The process's helper pool: its CPU helpers follow the saved CPU worker count, and its helpers stop at exit."""
+    """The process's helper pool: its CPU helpers follow the saved CPU worker count (or what
+    :func:`set_cpu_limit_source` set), and its helpers stop at exit."""
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = TextDetectorPool(cpu_limit=_configured_cpu_workers)
+            _pool = TextDetectorPool(cpu_limit=_cpu_limit)
             atexit.register(_pool.close_all)
         return _pool
 
@@ -1477,6 +1522,16 @@ def credits_on_cpu_devices() -> list[dict[str, Any]]:
     with _pool_lock:
         pool = _pool
     return pool.credits_on_cpu() if pool is not None else []
+
+
+def credits_text_devices() -> list[dict[str, str]]:
+    """Where each GPU device's credits text detection runs (see :meth:`TextDetectorPool.device_status`).
+
+    Starts no pool: before any text detection there is nothing to report.
+    """
+    with _pool_lock:
+        pool = _pool
+    return pool.device_status() if pool is not None else []
 
 
 def _configured_cpu_workers() -> int:

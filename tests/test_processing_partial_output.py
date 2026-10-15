@@ -12,6 +12,9 @@ A run can stop part-way and leave frames on disk. The rule, per run and per tier
   interval) it is published with a warning on any tier, so decoders that only error at EOF keep their GPU offload
   instead of paying a second full decode on the CPU. With fewer, a GPU run hands the file to the CPU and a CPU run
   publishes the short preview with a warning (a truncated file fails the same way on every scan);
+* the folder refused a write: full, over its quota, read-only or not writable by this user (ENOSPC exit 228, EROFS
+  exit 226, the error's text on an output line, or the folder refusing a new file itself). On any tier and device the frames are deleted and ``WorkingFolderError`` ends the file at
+  once: whatever the run wrote stops where the folder filled up, and the next tier or the CPU writes to the same folder;
 * exit 0: published.
 
 The Dolby Vision ladder (hardware DV5 -> software libplacebo -> DV-safe chain -> CPU) follows the same table:
@@ -22,12 +25,17 @@ or fails (CPU).
 Only the FFmpeg boundary is mocked; counting, cleanup, renaming and the cascade run for real against ``tmp_path``.
 """
 
+import contextlib
+import errno
 import itertools
 import os
+import shutil
 import signal
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,6 +46,9 @@ from media_preview_generator.processing.ffmpeg_runner import STALL_WATCHDOG_LINE
 from media_preview_generator.processing.generator import (
     FFMPEG_STALL_TIMEOUT_SEC,
     PUBLISH_MIN_FRAME_RATIO,
+    WorkingFolderError,
+    _diagnose_ffmpeg_exit_code,
+    _folder_write_errno,
     _was_interrupted,
     clear_failures,
     failure_scope,
@@ -45,6 +56,7 @@ from media_preview_generator.processing.generator import (
     get_failures,
     gpu_fallback_announcement,
 )
+from media_preview_generator.processing.hwaccel import hwaccel_decode_args
 
 INTERVAL_S = 10
 DURATION_S = 1000
@@ -85,6 +97,62 @@ OPENCL_DEBUG_CHATTER = [
     "[in#0/matroska @ 0x5617a0] Error during demuxing: Input/output error",
 ]
 SHELL_SIGHUP = 128 + signal.SIGHUP
+# The folder the thumbnails go to refused a write. Real FFmpeg 8.1 lines (jellyfin-ffmpeg, a full tmpfs and a read-only
+# mount); FFmpeg exits with AVERROR(errno) & 0xff.
+FOLDER_FULL = 256 - errno.ENOSPC  # 228
+FOLDER_READ_ONLY = 256 - errno.EROFS  # 226
+SHELL_SIGABRT = 128 + signal.SIGABRT  # 134: what EDQUOT exits with too
+FOLDER_FULL_STDERR = [
+    "[vost#0:0/mjpeg @ 0x5edfed19cbc0] Error submitting a packet to the muxer: No space left on device",
+    "[out#0/image2 @ 0x5edfed1ba180] Error muxing a packet",
+    "[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -28 (No space left on device)",
+    "[out#0/image2 @ 0x5edfed1ba180] Terminating thread with return code -28 (No space left on device)",
+    "frame=   22 fps=2.2 q=2.0 Lsize=N/A time=00:03:40.00 bitrate=N/A speed=21.7x elapsed=0:00:10.14",
+    "Conversion failed!",
+]
+FOLDER_READ_ONLY_STDERR = [
+    "[image2 @ 0x619ec303d300] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x619ec3037bc0] Error submitting a packet to the muxer: Read-only file system",
+    "[out#0/image2 @ 0x619ec3055180] Task finished with error code: -30 (Read-only file system)",
+    "Conversion failed!",
+]
+# Stock FFmpeg 8.0.1 (Ubuntu) whose image2 muxer can't create a frame file: AVERROR(EIO) whatever the real error, so
+# exit 251 and no errno text. A full btrfs, ZFS or XFS folder refuses the file itself this way, as does a read-only one.
+CANT_OPEN_FRAME_STDERR = [
+    "[image2 @ 0x5bd024a95f80] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x5bd024a96380] Error submitting a packet to the muxer: Input/output error",
+    "[out#0/image2 @ 0x5bd024a95e80] Error muxing a packet",
+    "[out#0/image2 @ 0x5bd024a95e80] Task finished with error code: -5 (Input/output error)",
+    "[out#0/image2 @ 0x5bd024a95e80] Terminating thread with return code -5 (Input/output error)",
+    "Conversion failed!",
+]
+OVER_QUOTA_LINE = (
+    f"[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -{errno.EDQUOT} (Disk quota exceeded)"
+)
+OLD_FFMPEG_FULL_LINE = "av_interleaved_write_frame(): No space left on device"
+# The app image's FFmpeg 8.1.2, run as a user that may not write the folder (chmod 555): exit AVERROR(EACCES) & 0xff and
+# the errno's text on the output lines. A video that user may not read exits 243 too, saying so only about the input.
+PERMISSION_DENIED = 256 - errno.EACCES  # 243
+NOT_PERMITTED = 256 - errno.EPERM  # 255, also FFmpeg's own exit after a SIGTERM it handled
+FOLDER_PERMISSION_DENIED_STDERR = [
+    "[image2 @ 0x5c8427bd0480] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x5c8427bd0700] Error submitting a packet to the muxer: Permission denied",
+    "[out#0/image2 @ 0x5c8427b9ae40] Error muxing a packet",
+    "[out#0/image2 @ 0x5c8427b9ae40] Task finished with error code: -13 (Permission denied)",
+    "[out#0/image2 @ 0x5c8427b9ae40] Terminating thread with return code -13 (Permission denied)",
+    "Conversion failed!",
+]
+FOLDER_NOT_PERMITTED_STDERR = [
+    line.replace("Permission denied", "Operation not permitted").replace("-13", "-1")
+    for line in FOLDER_PERMISSION_DENIED_STDERR
+]
+VIDEO_PERMISSION_DENIED_STDERR = [
+    "[in#0 @ 0x5f186b621c40] Error opening input: Permission denied",
+    "Error opening input file /media/movie.mkv.",
+    "Error opening input files: Permission denied",
+]
+# Mesa on a read-only root: about its shader cache, not the thumbnails; the run goes on fine.
+MESA_SHADER_CACHE_LINE = "Failed to create //.cache for shader cache (Read-only file system)---disabling."
 
 DEVICE_FOR = {None: None, "NVIDIA": "cuda:0", "AMD": "/dev/dri/renderD128", "INTEL": "/dev/dri/renderD128"}
 
@@ -116,14 +184,30 @@ def _write_frames(output_folder: str, n_frames: int) -> None:
             fh.write(b"\xff\xd8\xff\xdb" + str(i).encode())
 
 
+def _make_movie(ffmpeg: str, path: Path) -> None:
+    """A real 20-second video for the tests that run real FFmpeg."""
+    made = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=20:s=64x36:r=5"]
+        + ["-c:v", "mpeg4", str(path)],
+        capture_output=True,
+        timeout=60,
+    )
+    assert made.returncode == 0, made.stderr
+
+
 def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
     """``create_ffmpeg_runner`` stand-in: attempt N writes ``attempts[N][1]`` distinct frames, exits ``[0]``
     and prints the optional ``[2]`` as stderr."""
 
-    def factory(**_kwargs):
+    def factory(*, gpu=None, gpu_device_path=None, last_command=None, **_kwargs):
         def _run(use_skip=False, init_vulkan=False, **kwargs):
             rc, n_frames, *stderr = attempts[len(calls)]
             calls.append({"use_skip": use_skip, "init_vulkan": init_vulkan, **kwargs})
+            if last_command is not None:
+                # The decoder the real runner asks for: the worker's GPU's, none on the software Dolby Vision tier.
+                software = kwargs.get("disable_vaapi_dv5", False)
+                decode = () if software else hwaccel_decode_args(gpu, gpu_device_path, keep_on_gpu=True).args
+                last_command[:] = ["ffmpeg", *decode]
             _write_frames(output_folder, n_frames)
             return rc, 1.0, "10x", list(stderr)
 
@@ -136,7 +220,16 @@ def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
 def run(mock_config, tmp_path):
     mock_config.plex_bif_frame_interval = INTERVAL_S
 
-    def _generate(attempts, *, gpu=None, keyframe_gap=None, dv5=False, duration_s=DURATION_S, runner_factory=None):
+    def _generate(
+        attempts,
+        *,
+        gpu=None,
+        keyframe_gap=None,
+        dv5=False,
+        duration_s=DURATION_S,
+        runner_factory=None,
+        track_fields=None,
+    ):
         calls: list = []
         out = str(tmp_path / "frames")
         os.makedirs(out, exist_ok=True)
@@ -145,6 +238,7 @@ def run(mock_config, tmp_path):
             hdr_format="Dolby Vision" if dv5 else None,
             transfer_characteristics=None,
             duration=duration_s * 1000 if duration_s else None,
+            **(track_fields or {}),
         )
         warnings: list[str] = []
         sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{level}|{message}")
@@ -168,7 +262,7 @@ def run(mock_config, tmp_path):
                 mock_mediainfo.parse.return_value = MagicMock(video_tracks=[track])
                 try:
                     result = generate_images(str(tmp_path / "movie.mkv"), out, gpu, DEVICE_FOR[gpu], mock_config)
-                except CodecNotSupportedError as exc:
+                except (CodecNotSupportedError, WorkingFolderError) as exc:
                     result = exc
                 failures = get_failures()
                 clear_failures()
@@ -202,6 +296,15 @@ def assert_handed_to_cpu(outcome: Outcome) -> None:
     assert isinstance(outcome.result, CodecNotSupportedError), f"expected a CPU hand-off, got {outcome.result!r}"
     assert outcome.frames_left == [], "frames left on disk would be counted by the publisher"
     # A hand-off isn't a failed item: the same worker retries it on the CPU.
+    assert outcome.failures == []
+
+
+def assert_refused(outcome: Outcome) -> None:
+    assert isinstance(outcome.result, WorkingFolderError), f"expected the folder's failure, got {outcome.result!r}"
+    assert os.path.basename(outcome.result.filename) == "frames"
+    assert outcome.frames_left == [], "frames left on disk would be counted by the publisher"
+    # Nothing to retry on another device or tier: they write to the same folder.
+    assert len(outcome.calls) == 1
     assert outcome.failures == []
 
 
@@ -317,6 +420,16 @@ OUTCOMES = [
     ("io-error-251-opencl-error-99pct", IO_ERROR, NEARLY_ALL, "publish-warn", "publish-warn", OPENCL_LINE),
     ("io-error-251-gpu-error-exactly-95pct", IO_ERROR, AT_RATIO, "publish-warn", "publish-warn", HWACCEL_LINE),
     ("io-error-251-gpu-error-94pct", IO_ERROR, BELOW_RATIO, "cpu", "publish-warn", HWACCEL_LINE),
+    # The folder refused a write: never published, on any device, however many frames it holds.
+    ("folder-full-228", FOLDER_FULL, 2, "refused", "refused", *FOLDER_FULL_STDERR),
+    ("folder-full-228-99pct", FOLDER_FULL, NEARLY_ALL, "refused", "refused", *FOLDER_FULL_STDERR),
+    ("folder-full-228-stderr-cut-off", FOLDER_FULL, 40, "refused", "refused"),
+    ("folder-full-windows-exit", 2**32 - errno.ENOSPC, 40, "refused", "refused"),
+    ("folder-full-old-ffmpeg-exit-1", SELF_EXIT, 40, "refused", "refused", OLD_FFMPEG_FULL_LINE),
+    ("folder-read-only-226", FOLDER_READ_ONLY, 0, "refused", "refused", *FOLDER_READ_ONLY_STDERR),
+    ("folder-over-quota-134", SHELL_SIGABRT, 40, "refused", "refused", OVER_QUOTA_LINE),
+    ("crash-shell-sigabrt-134-99pct", SHELL_SIGABRT, NEARLY_ALL, "publish-warn", "publish-warn"),
+    ("mesa-read-only-cache-99pct", SELF_EXIT, NEARLY_ALL, "publish-warn", "publish-warn", MESA_SHADER_CACHE_LINE),
 ]
 
 
@@ -333,6 +446,8 @@ def _check(outcome: Outcome, verdict: str, rc: int, n_frames: int) -> None:
         assert_published_with_warning(outcome, rc, n_frames)
     elif verdict == "cpu":
         assert_handed_to_cpu(outcome)
+    elif verdict == "refused":
+        assert_refused(outcome)
     else:
         assert_failed(outcome, rc)
 
@@ -413,6 +528,190 @@ class TestPublishOrDiscardMatrix:
         assert not _warned(outcome, "out of sync"), outcome.warnings
 
 
+class TestAFolderThatRefusesTheThumbnails:
+    """The working folder (a node's temp folder) fills up, runs out of quota or turns read-only mid-run."""
+
+    @pytest.mark.parametrize(
+        ("attempt", "code"),
+        [
+            ((FOLDER_FULL, 2, *FOLDER_FULL_STDERR), errno.ENOSPC),
+            ((FOLDER_FULL, 2), errno.ENOSPC),
+            ((FOLDER_READ_ONLY, 0, *FOLDER_READ_ONLY_STDERR), errno.EROFS),
+            ((SHELL_SIGABRT, 40, OVER_QUOTA_LINE), errno.EDQUOT),
+        ],
+        ids=["full", "full-stderr-cut-off", "read-only", "over-quota"],
+    )
+    def test_the_error_names_the_folder_and_why(self, run, tmp_path, attempt, code):
+        # A node reads errno + filename to tell its temp folder's problem from the file's (nodes/server/tasks.py).
+        outcome = run([attempt], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert (outcome.result.errno, outcome.result.filename) == (code, str(tmp_path / "frames"))
+        assert _diagnose_ffmpeg_exit_code(attempt[0], list(attempt[2:])) == "folder_write_error"
+
+    @pytest.mark.parametrize(
+        ("attempt", "code"),
+        [
+            ((PERMISSION_DENIED, 0, *FOLDER_PERMISSION_DENIED_STDERR), errno.EACCES),
+            ((NOT_PERMITTED, 0, *FOLDER_NOT_PERMITTED_STDERR), errno.EPERM),
+        ],
+        ids=["no-permission", "not-permitted"],
+    )
+    def test_a_permission_error_on_the_output_is_the_folders_when_the_folder_refuses_a_new_file(
+        self, run, tmp_path, attempt, code
+    ):
+        with self._refusing_new_files(tmp_path / "frames", code):
+            outcome = run([attempt], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert (outcome.result.errno, outcome.result.filename) == (code, str(tmp_path / "frames"))
+
+    def test_operation_not_permitted_on_the_output_of_a_folder_that_takes_files_is_not_the_folders(self, run):
+        # AVERROR(EPERM) is -1, FFmpeg's catch-all: an encoder's bare failure prints it on a [vost#] line.
+        failed = "[vost#0:0/mjpeg @ 0x5c8427bd0700] Task finished with error code: -1 (Operation not permitted)"
+        outcome = run([(NOT_PERMITTED, 0, failed, "Conversion failed!")] * 4, gpu="NVIDIA")
+
+        assert not isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert _diagnose_ffmpeg_exit_code(NOT_PERMITTED, [failed]) != "folder_write_error"
+
+    @pytest.mark.parametrize("gpu", ["NVIDIA", None], ids=["gpu", "cpu"])
+    def test_a_keyframe_pass_that_fills_the_folder_is_not_retried_with_full_decode(self, run, gpu):
+        outcome = run([(FOLDER_FULL, 12, *FOLDER_FULL_STDERR), (0, EXPECTED)], gpu=gpu, keyframe_gap=1.0)
+
+        assert_refused(outcome)
+        assert [c["use_skip"] for c in outcome.calls] == [True]
+
+    @staticmethod
+    def _refusing_new_files(folder: Path, code: int):
+        """The folder refuses any new file with ``code``, as a full btrfs, ZFS or XFS one does."""
+        real_open = os.open
+
+        def refusing_open(path, *args, **kwargs):
+            if Path(path).parent == folder:
+                raise OSError(code, os.strerror(code), path)
+            return real_open(path, *args, **kwargs)
+
+        return patch.object(os, "open", refusing_open)
+
+    @pytest.mark.parametrize(
+        "code",
+        [errno.ENOSPC, errno.EROFS, errno.EACCES, errno.EPERM],
+        ids=["full", "read-only", "no-permission", "not-permitted"],
+    )
+    def test_a_frame_file_ffmpeg_could_not_create_is_the_folders_when_it_takes_no_new_file(self, run, tmp_path, code):
+        with self._refusing_new_files(tmp_path / "frames", code):
+            outcome = run([(IO_ERROR, 0, *CANT_OPEN_FRAME_STDERR)], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert outcome.result.errno == code
+
+    def test_a_frame_file_ffmpeg_could_not_create_in_a_folder_that_takes_files_is_a_plain_io_error(self, run, tmp_path):
+        outcome = run([(IO_ERROR, 0, *CANT_OPEN_FRAME_STDERR)], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "io_error"
+        assert os.listdir(tmp_path / "frames") == [], "the check leaves no file behind"
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a folder without write permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_that_could_not_create_a_frame_file_in_a_full_folder_ends_on_the_folder(
+        self, run, tmp_path, mock_config
+    ):
+        """Real FFmpeg, runner and cascade. A folder without write permission makes FFmpeg's image2 muxer fail to
+        create its first frame file, exactly as a full btrfs folder does; the check then finds the folder full."""
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        _make_movie(ffmpeg, tmp_path / "movie.mkv")
+        mock_config.ffmpeg_path = ffmpeg
+        frames = tmp_path / "frames"
+        frames.mkdir()
+        frames.chmod(0o555)
+        try:
+            with self._refusing_new_files(frames, errno.ENOSPC):
+                outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            frames.chmod(0o755)
+
+        assert isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert (outcome.result.errno, outcome.result.filename) == (errno.ENOSPC, str(frames))
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and "No space left on device (exit code 251)" in refused[0], outcome.warnings
+        # Nor is it put down to the video's disk as well.
+        assert not any("hit an I/O error" in line for line in outcome.warnings), outcome.warnings
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a folder without write permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_into_a_folder_this_user_may_not_write_ends_on_the_folder(self, run, tmp_path, mock_config):
+        """Real FFmpeg, runner and cascade, a folder left by another user (PUID/PGID): stock 8.0.1 says only "Could not
+        open file" (the check asks the folder), the app image's 8.1.2 says "Permission denied" itself."""
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        _make_movie(ffmpeg, tmp_path / "movie.mkv")
+        mock_config.ffmpeg_path = ffmpeg
+        frames = tmp_path / "frames"
+        frames.mkdir()
+        frames.chmod(0o555)
+        try:
+            outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            frames.chmod(0o755)
+
+        assert isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert (outcome.result.errno, outcome.result.filename) == (errno.EACCES, str(frames))
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and "Permission denied (exit code" in refused[0], outcome.warnings
+        assert "check PUID and PGID" in refused[0] and "Free up space" not in refused[0], refused[0]
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a file without read permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_on_a_video_this_user_may_not_read_is_not_the_folders(self, run, tmp_path, mock_config):
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        movie = tmp_path / "movie.mkv"
+        _make_movie(ffmpeg, movie)
+        mock_config.ffmpeg_path = ffmpeg
+        movie.chmod(0)
+        try:
+            outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            movie.chmod(0o644)
+
+        assert_failed(outcome, PERMISSION_DENIED)
+        assert not any("couldn't write thumbnails" in line for line in outcome.warnings), outcome.warnings
+
+    def test_a_video_this_user_may_not_read_is_the_files_failure(self, run):
+        outcome = run([(PERMISSION_DENIED, 0, *VIDEO_PERMISSION_DENIED_STDERR)] * 4, gpu=None)
+
+        assert_failed(outcome, PERMISSION_DENIED)
+        assert _folder_write_errno(PERMISSION_DENIED, VIDEO_PERMISSION_DENIED_STDERR) is None
+        assert _diagnose_ffmpeg_exit_code(PERMISSION_DENIED, VIDEO_PERMISSION_DENIED_STDERR) != "folder_write_error"
+
+    def test_the_errors_text_is_read_as_ffmpeg_words_it_whatever_the_os_calls_the_errno(self, monkeypatch):
+        # Windows has no EDQUOT: Python's is WSAEDQUOT, which os.strerror calls "Unknown error".
+        real_strerror = os.strerror
+        monkeypatch.setattr(
+            os, "strerror", lambda code: "Unknown error" if code == errno.EDQUOT else real_strerror(code)
+        )
+        unknown = "[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -1313558101 (Unknown error)"
+
+        assert _folder_write_errno(SELF_EXIT, [unknown]) is None
+        assert _folder_write_errno(SELF_EXIT, [OVER_QUOTA_LINE]) == errno.EDQUOT
+        # macOS words it the BSD way.
+        assert _folder_write_errno(SELF_EXIT, [OVER_QUOTA_LINE.replace("Disk", "Disc")]) == errno.EDQUOT
+
+
 class TestStallWatchdogThroughTheRealRunner:
     """The stall cell end to end: the real runner's watchdog kills FFmpeg after it wrote nearly every frame."""
 
@@ -476,6 +775,94 @@ class TestTheRunnersFailureLines:
 
         assert _warned(outcome, "I/O error", "disk or network share", "working folder"), outcome.warnings
         assert outcome.result.kind == "io_error"
+
+    @pytest.mark.parametrize(
+        ("rc", "stderr", "said"),
+        [
+            (FOLDER_FULL, "\n".join(FOLDER_FULL_STDERR), "Free up space there"),
+            (FOLDER_READ_ONLY, "\n".join(FOLDER_READ_ONLY_STDERR), "Make it writable"),
+            (SHELL_SIGABRT, OVER_QUOTA_LINE, "Free up space there"),
+            (
+                PERMISSION_DENIED,
+                "\n".join(FOLDER_PERMISSION_DENIED_STDERR),
+                "Let the app's user write to it (in Docker, check PUID and PGID), or mount a bigger, writable disk",
+            ),
+        ],
+        ids=["full", "read-only", "over-quota", "no-permission"],
+    )
+    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(
+        self, run, tmp_path, mock_config, rc, stderr, said
+    ):
+        outcome = self._run_real(run, tmp_path, rc, stderr)
+
+        assert isinstance(outcome.result, WorkingFolderError)
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and str(tmp_path / "frames") in refused[0] and said in refused[0], outcome.warnings
+        assert f"mount a bigger, writable disk at {mock_config.tmp_folder}." in refused[0], refused
+        assert not any(
+            "crashed" in line or "hardware acceleration" in line or "GPU" in line for line in outcome.warnings
+        ), outcome.warnings
+
+    @pytest.mark.parametrize("node", [True, False], ids=["node", "app"])
+    @pytest.mark.parametrize(
+        ("rc", "stderr", "refuses_files", "temp_root_refuses", "handed_back"),
+        [
+            (FOLDER_FULL, FOLDER_FULL_STDERR, None, False, True),
+            (SHELL_SIGABRT, [OVER_QUOTA_LINE], None, False, True),
+            (FOLDER_READ_ONLY, FOLDER_READ_ONLY_STDERR, None, False, True),
+            (PERMISSION_DENIED, FOLDER_PERMISSION_DENIED_STDERR, errno.EACCES, True, True),
+            (PERMISSION_DENIED, FOLDER_PERMISSION_DENIED_STDERR, errno.EACCES, False, False),
+            (NOT_PERMITTED, FOLDER_NOT_PERMITTED_STDERR, errno.EPERM, True, True),
+            (NOT_PERMITTED, FOLDER_NOT_PERMITTED_STDERR, errno.EPERM, False, False),
+        ],
+        ids=[
+            "full",
+            "over-quota",
+            "read-only",
+            "no-permission-temp-folder-refuses",
+            "no-permission-temp-folder-takes-folders",
+            "not-permitted-temp-folder-refuses",
+            "not-permitted-temp-folder-takes-folders",
+        ],
+    )
+    def test_a_refused_write_on_a_node_is_one_warning_only_for_a_file_it_hands_back(
+        self, run, tmp_path, monkeypatch, rc, stderr, refuses_files, temp_root_refuses, handed_back, node
+    ):
+        """Lab: a node whose temp folder filled up logged an ERROR and five stderr WARNING lines for a file it only
+        handed back to the queue, so a job that completed with every preview made read as having a failed file. A
+        permission error the node fails the file for (its temp folder still takes new folders: nodes/server/tasks.py)
+        keeps the ERROR and stderr lines that say why."""
+        if node:
+            monkeypatch.setenv("MODE", "node")
+            # A node's thumbnails go to its task's folder inside its temp folder.
+            monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path))
+            # Its setpriv lookup would run through the stand-in Popen.
+            monkeypatch.setattr(
+                "media_preview_generator.processing.ffmpeg_runner.dies_with_node", lambda args: (args, None)
+            )
+        else:
+            monkeypatch.delenv("MODE", raising=False)
+        if temp_root_refuses:
+            monkeypatch.setattr(
+                "media_preview_generator.nodes.server.tasks.probe_temp_folder",
+                lambda temp_root: f"The node can't write to its temp folder {temp_root} (Permission denied)",
+            )
+
+        with (
+            TestAFolderThatRefusesTheThumbnails._refusing_new_files(tmp_path / "frames", refuses_files)
+            if refuses_files
+            else contextlib.nullcontext()
+        ):
+            outcome = self._run_real(run, tmp_path, rc, "\n".join(stderr))
+
+        assert isinstance(outcome.result, WorkingFolderError)
+        said = [line.split("|", 1)[0] for line in outcome.warnings if "couldn't write thumbnails" in line]
+        stderr_dumps = [line for line in outcome.warnings if "stderr lines" in line]
+        if node and handed_back:
+            assert (said, stderr_dumps) == (["WARNING"], []), outcome.warnings
+            assert not any(line.startswith("ERROR|") for line in outcome.warnings), outcome.warnings
+        else:
+            assert (said, len(stderr_dumps)) == (["ERROR"], 1), outcome.warnings
 
     def test_a_251_with_a_gpu_error_blames_neither(self, run, tmp_path):
         outcome = self._run_real(run, tmp_path, IO_ERROR, HWACCEL_LINE)

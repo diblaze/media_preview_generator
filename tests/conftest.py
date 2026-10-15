@@ -8,6 +8,7 @@ temporary directories, and helper functions for mocking FFmpeg and Plex.
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -242,6 +243,33 @@ def _reset_frame_cache_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _reset_textdet_cpu_limit_source():
+    """A node's credits op sizes the process text-detection pool by its own tasks; the app's tests size it by the
+    settings. Looked up, not imported: most tests never load text detection (and some put a stand-in there)."""
+    yield
+    reset = getattr(
+        sys.modules.get("media_preview_generator.markers.credits.textdet_helper"), "set_cpu_limit_source", None
+    )
+    if callable(reset):
+        reset(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_vulkan_check(monkeypatch):
+    """The per-GPU Vulkan check runs the Vulkan probe (FFmpeg) and reads /dev/dri; no test wants the host's answer.
+    Tests of the check itself call ``check_gpus`` or import ``get_vulkan_checks`` before this patch applies."""
+    from media_preview_generator.gpu import vulkan_check
+    from media_preview_generator.web.routes import api_vulkan
+
+    def no_checks(gpus, nvidia_diag=None):
+        return [None] * len(gpus)
+
+    monkeypatch.setattr(vulkan_check, "get_vulkan_checks", no_checks)
+    monkeypatch.setattr(api_vulkan, "get_vulkan_checks", no_checks)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_plex_partial_scan_throttle():
     """Forget which Plex folders were just scanned: the throttle is process-wide and tests reuse the same folders."""
     from media_preview_generator import plex_client
@@ -383,6 +411,61 @@ def mock_config():
     # None so get_library_sections filters by plex_libraries (titles), not by ID
     config.plex_library_ids = None
     return config
+
+
+@pytest.fixture(scope="session")
+def video_mediainfo_cant_read(tmp_path_factory) -> str:
+    """A real 4 s video whose title holds U+FFFF: MediaInfo copies the tag into its XML as it is, so pymediainfo can't
+    read that XML (``ParseError``), while FFmpeg reads the file fine."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    from pymediainfo import MediaInfo
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("needs ffmpeg")
+    path = tmp_path_factory.mktemp("mediainfo-cant-read") / "Tagged (2020).mkv"
+    subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=4:s=64x36:r=5", "-c:v", "mpeg4",
+         "-metadata", "title=q￿r", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )  # fmt: skip
+    try:
+        MediaInfo.parse(str(path))
+    except ET.ParseError:
+        return str(path)
+    pytest.skip("this MediaInfo writes the tag into XML pymediainfo can read")
+
+
+@pytest.fixture(scope="session")
+def hdr10_video_mediainfo_cant_read(tmp_path_factory) -> str:
+    """Like ``video_mediainfo_cant_read``, but an HDR10 (PQ) clip: only FFmpeg and ffprobe can say it is HDR."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    from pymediainfo import MediaInfo
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg and ffprobe")
+    path = tmp_path_factory.mktemp("mediainfo-cant-read-hdr") / "Tagged HDR (2020).mkv"
+    result = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=4:s=64x36:r=5",
+         "-vf", "setparams=color_trc=smpte2084:colorspace=bt2020nc:color_primaries=bt2020",
+         "-c:v", "libx264", "-metadata", "title=q￿r", str(path)],
+        capture_output=True,
+        timeout=60,
+    )  # fmt: skip
+    if result.returncode != 0:
+        pytest.skip("needs ffmpeg with libx264")
+    try:
+        MediaInfo.parse(str(path))
+    except ET.ParseError:
+        return str(path)
+    pytest.skip("this MediaInfo writes the tag into XML pymediainfo can read")
 
 
 @pytest.fixture
@@ -533,6 +616,25 @@ def _neutralize_prewarm_caches(request, monkeypatch):
     except ImportError:
         return
     monkeypatch.setattr(app_mod, "_prewarm_caches", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_node_registry(monkeypatch):
+    """Keep ``create_app()`` from starting the nodes' health loop, and drop the registry singleton after each test.
+
+    The loop is a daemon thread that would outlive the test and read whichever settings manager the next test
+    builds. Tests of the registry build their own ``NodeRegistry`` and start it themselves.
+    """
+    try:
+        import media_preview_generator.web.app as app_mod
+        from media_preview_generator.nodes import registry as registry_mod
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(app_mod, "_start_node_registry", lambda: None)
+    registry_mod.set_registry(None)
+    yield
+    registry_mod.set_registry(None)
 
 
 @pytest.fixture(autouse=True)

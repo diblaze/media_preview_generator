@@ -192,11 +192,14 @@ def main():
     assert len(probe["chapters"]) == 3 and abs(float(probe["format"]["duration"]) - 30) < 0.1
     assert len(plex.query("/library/sections")) == 1
     assert plex.query("/library/metadata/1")[0].get("title") == "Chapter Spike (2026)"
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "plex-marker-agent"))
-    import plex_marker_agent
+    from flask import Flask
+
+    from media_preview_generator.nodes.server.plex_db import register_plex_db
 
     key = secrets.token_hex(24)
-    http = make_server("127.0.0.1", 0, plex_marker_agent.create_app(config_dir=str(FOLDER), token=key), threaded=True)
+    role = Flask(__name__)
+    register_plex_db(role, plex_config_dir=str(FOLDER), key=key)
+    http = make_server("127.0.0.1", 0, role, threaded=True)
     thread = threading.Thread(target=http.serve_forever, daemon=True)
     thread.start()
     raw = {

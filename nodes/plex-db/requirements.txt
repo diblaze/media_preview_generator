@@ -1,0 +1,11 @@
+# The agent's runtime dependencies. Every line is copied character for character from the app's own
+# pyproject.toml — tests/nodes/test_plex_db_role.py fails if one drifts — because the agent runs the app's code
+# (markers/publishers/plex_db.py) and must run it against the same libraries.
+requests==2.33.0
+defusedxml>=0.7.1,<1
+urllib3>=2.8.0,<3.0.0
+loguru==0.7.3
+flask>=3.0.0,<4
+werkzeug>=3.1.9,<3.2
+waitress==3.0.2
+pillow>=12.2.0,<14

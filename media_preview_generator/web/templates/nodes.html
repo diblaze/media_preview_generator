@@ -1,0 +1,264 @@
+{% extends "base.html" %}
+
+{% block title %}Nodes · Media Preview Generator{% endblock %}
+
+{% block head %}
+{# server_modal.css carries the shared dialog parts (.sm-*) and the Setup Health buckets (.readiness-bucket, .rd-row). #}
+<link href="{{ url_for('static', filename='css/pages/server_modal.css') }}" rel="stylesheet">
+<link href="{{ url_for('static', filename='css/pages/nodes.css') }}" rel="stylesheet">
+{% endblock %}
+
+{% block content %}
+<div class="nodes-page">
+    <header class="page-header">
+        <div>
+            <h1 class="page-title"><i class="bi bi-pc-display-horizontal me-2"></i>Nodes</h1>
+            <p class="page-subtitle mb-0">Other machines that lend this app their GPU or CPU, or open Plex's database where Plex runs.
+                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="bottom"
+                        title="This app still decides everything and does every write. A node only runs the heavy step it is handed."
+                        data-explain-title="What a node does" data-explain-template="infoNodesWhatTpl" aria-label="About nodes"><i class="bi bi-info-circle"></i></button>
+                <a class="ms-1 text-nowrap" id="nodesGuide" href="https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
+                   target="_blank" rel="noopener noreferrer">Nodes guide <i class="bi bi-box-arrow-up-right" aria-label="Opens in a new tab"></i></a>
+            </p>
+        </div>
+        <div class="page-actions">
+            <button type="button" class="btn btn-outline-secondary d-none" id="nodesCheckNow" disabled data-bs-toggle="tooltip" data-bs-placement="bottom" title="Asks every node how it is now. Nodes are checked every 30 seconds on their own; one that stopped answering, less often, but every 15 seconds while a job waits for it.">
+                <i class="bi bi-arrow-repeat me-1"></i>Check now
+            </button>
+            <button type="button" class="btn btn-primary" id="nodesAddBtn">
+                <i class="bi bi-plus-lg me-1"></i>Add node
+            </button>
+        </div>
+    </header>
+
+    <div id="nodeList" class="nd-list" aria-live="polite">
+        <div class="nd-state text-muted">
+            <div class="spinner-border" role="status"></div>
+            <div class="mt-2">Loading nodes…</div>
+        </div>
+    </div>
+</div>
+
+<!-- Add node: step 1 connects and shows what the node found (nothing is saved until "Next"); step 2, for a node with
+     the worker role, sets where the node sees each library and tests it. -->
+<div class="modal fade sm-modal nd-modal" id="addNodeModal" tabindex="-1" aria-hidden="true" aria-labelledby="addNodeTitle">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header sm-header">
+                <span class="sm-logo"><i class="bi bi-pc-display-horizontal"></i></span>
+                <div class="sm-title">
+                    <h5 class="modal-title sm-name" id="addNodeTitle">Add node</h5>
+                    <div class="sm-sub" id="addNodeStepLabel">Step 1 of 2</div>
+                </div>
+                <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body nd-add-body">
+                <section class="sm-sec" id="addNodeStep1">
+                    <div class="nd-row3">
+                        <div class="sm-fld">
+                            <label class="sm-lab" for="addNodeName">Name
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="What this app calls the node. Pick anything; left empty, the node's own name is used."><i class="bi bi-info-circle"></i></button>
+                            </label>
+                            <input type="text" class="form-control" id="addNodeName" autocomplete="off" placeholder="gaming-pc">
+                        </div>
+                        <div class="sm-fld">
+                            <label class="sm-lab" for="addNodeUrl">Address
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="How this app reaches the node, with its port: 9494 unless you set NODE_PORT."><i class="bi bi-info-circle"></i></button>
+                            </label>
+                            <input type="url" class="form-control font-monospace" id="addNodeUrl" autocomplete="off" placeholder="http://host.lan:9494">
+                        </div>
+                        <div class="sm-fld">
+                            <label class="sm-lab" for="addNodeKey">Key
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="In the node's log on first start (Docker), printed by install.ps1 and kept in node.json (Windows), or the NODE_KEY you set."><i class="bi bi-info-circle"></i></button>
+                            </label>
+                            <input type="password" class="form-control" id="addNodeKey" autocomplete="new-password">
+                        </div>
+                    </div>
+                    <div class="sm-hint">The key is printed in the node's log on first start, or by the installer on Windows (it is also in node.json). It is never written to this app's logs.</div>
+                    <div class="sm-warnline bad d-none" id="addNodeError" role="alert"></div>
+                    <div class="sm-card d-none" id="addNodeProbe" role="status"></div>
+                </section>
+                <section class="sm-sec d-none" id="addNodeStep2">
+                    <div id="addNodeMappings"></div>
+                    <div class="sm-warnline bad d-none" id="addNodeSaveError" role="alert"></div>
+                </section>
+            </div>
+            <div class="modal-footer sm-footer">
+                <span class="sm-foot-msg" id="addNodeFootMsg"></span>
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="addNodeCancel">Cancel</button>
+                <button type="button" class="btn btn-outline-secondary" id="addNodeConnect">
+                    <i class="bi bi-plug me-1"></i>Connect
+                </button>
+                <button type="button" class="btn btn-primary d-none" id="addNodeNext">Next: where it sees your media →</button>
+                <button type="button" class="btn btn-primary d-none" id="addNodeFinish">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- One node: Overview, Media (path mappings), Setup Health, Log and Settings. Same frame as the server Edit dialog. -->
+<div class="modal fade sm-modal nd-modal" id="nodeModal" tabindex="-1" aria-hidden="true" aria-labelledby="nodeModalTitle">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header sm-header">
+                <span class="sm-logo" id="nodeModalIcon"><i class="bi bi-pc-display-horizontal"></i></span>
+                <div class="sm-title">
+                    <h5 class="modal-title sm-name" id="nodeModalTitle"><span class="text-truncate" id="nodeModalName"></span>
+                        <span class="pill" id="nodeModalState" role="status"></span>
+                    </h5>
+                    <div class="sm-host" id="nodeModalUrl"></div>
+                </div>
+                <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body nd-body">
+                <ul class="nav nav-tabs sm-rail" role="tablist" aria-label="Node section">
+                    <li class="nav-item">
+                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#node-tab-overview" data-tab="overview" type="button">
+                            <i class="bi bi-speedometer2"></i><span class="sm-rail-lbl">Overview</span>
+                        </button>
+                    </li>
+                    <li class="nav-item" id="nodeTabMediaLi">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#node-tab-media" data-tab="media" type="button">
+                            <i class="bi bi-signpost-split"></i><span class="sm-rail-lbl">Media</span>
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#node-tab-health" data-tab="health" type="button">
+                            <i class="bi bi-clipboard-check"></i><span class="sm-rail-lbl">Setup Health</span>
+                            <span class="sm-nb d-none" id="nodeHealthTabBadge" aria-hidden="true"></span>
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#node-tab-log" data-tab="log" type="button">
+                            <i class="bi bi-terminal"></i><span class="sm-rail-lbl">Log</span>
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#node-tab-settings" data-tab="settings" type="button">
+                            <i class="bi bi-gear"></i><span class="sm-rail-lbl">Settings</span>
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content sm-panes">
+                    <div class="tab-pane fade show active" id="node-tab-overview">
+                        <div id="nodeOverview"></div>
+                        <section class="sm-sec d-none" id="nodeGpuSection">
+                            <div class="sm-sec-h">GPUs
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="What the node found on its own machine. It checks again every 5 minutes and after a GPU error."><i class="bi bi-info-circle"></i></button>
+                            </div>
+                            <div id="nodeGpuList" class="nd-gpus"></div>
+                            <div class="sm-testrow">
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="nodeRescanGpus">
+                                    <i class="bi bi-arrow-repeat me-1"></i>Rescan GPUs
+                                </button>
+                                <span class="sm-tres" id="nodeRescanResult" role="status"></span>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="tab-pane fade" id="node-tab-media">
+                        <div id="nodeMediaEditor"></div>
+                        <div class="sm-testrow nd-savebar">
+                            <button type="button" class="btn btn-primary btn-sm" id="nodeSaveMappings">Save mappings</button>
+                            <span class="sm-tres" id="nodeMediaResult" role="status"></span>
+                        </div>
+                    </div>
+
+                    <div class="tab-pane fade" id="node-tab-health">
+                        <div class="nd-health-head">
+                            <h3 class="sm-hsum-title" id="nodeHealthTitle">Setup Health</h3>
+                            <span class="nd-health-sum" id="nodeHealthSummary"></span>
+                            <button type="button" class="btn btn-sm btn-outline-secondary ms-auto" id="nodeHealthRefresh">
+                                <i class="bi bi-arrow-clockwise me-1"></i>Check again
+                            </button>
+                        </div>
+                        <div class="sm-health-body" id="nodeHealthBody"></div>
+                    </div>
+
+                    <div class="tab-pane fade" id="node-tab-log">
+                        <div class="nd-health-head">
+                            <h3 class="sm-hsum-title">Node log
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="The node's own last 200 log lines. Lines from a running file also appear in that job's log here."><i class="bi bi-info-circle"></i></button>
+                            </h3>
+                            <button type="button" class="btn btn-sm btn-outline-secondary ms-auto" id="nodeLogRefresh">
+                                <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+                            </button>
+                        </div>
+                        <pre class="nd-log" id="nodeLog" tabindex="0" aria-label="Node log"></pre>
+                    </div>
+
+                    <div class="tab-pane fade" id="node-tab-settings">
+                        <section class="sm-sec">
+                            <div class="sm-sec-h">Node</div>
+                            <div class="sm-row2">
+                                <div class="sm-fld">
+                                    <label class="sm-lab" for="nodeSetName">Name
+                                        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="What this app calls the node in lists, workers and job logs."><i class="bi bi-info-circle"></i></button>
+                                    </label>
+                                    <input type="text" class="form-control" id="nodeSetName" autocomplete="off">
+                                </div>
+                                <div class="sm-fld">
+                                    <label class="sm-lab" for="nodeSetUrl">Address
+                                        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="How this app reaches the node, with its port."><i class="bi bi-info-circle"></i></button>
+                                    </label>
+                                    <input type="url" class="form-control font-monospace" id="nodeSetUrl" autocomplete="off" placeholder="http://host.lan:9494">
+                                </div>
+                            </div>
+                            <div class="sm-row2">
+                                <div class="sm-fld">
+                                    <label class="sm-lab" for="nodeSetKey">Key
+                                        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Stored and never shown. Leave the dots to keep it; type a new one to replace it."><i class="bi bi-info-circle"></i></button>
+                                    </label>
+                                    <input type="password" class="form-control" id="nodeSetKey" autocomplete="new-password">
+                                </div>
+                                <div class="sm-fld">
+                                    <span class="sm-lab">Enabled
+                                        <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Off = no work goes to this node and it isn't checked. Its settings stay."><i class="bi bi-info-circle"></i></button>
+                                    </span>
+                                    <div class="form-check form-switch mb-0">
+                                        <input type="checkbox" role="switch" class="form-check-input" id="nodeSetEnabled">
+                                        <label class="form-check-label" for="nodeSetEnabled">Send work to this node</label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="sm-testrow">
+                                <button type="button" class="btn btn-primary btn-sm" id="nodeSettingsSave">Save</button>
+                                <span class="sm-tres" id="nodeSettingsResult" role="status"></span>
+                            </div>
+                        </section>
+                        <section class="sm-sec">
+                            <div class="sm-sec-h">Remove</div>
+                            <div class="sm-dz">
+                                <div class="sm-dz-text"><b>Remove this node</b><span class="sm-hint">The node itself keeps running; this app stops using it.</span></div>
+                                <button type="button" class="btn btn-sm btn-outline-danger" id="nodeRemove"><i class="bi bi-trash me-1"></i>Remove</button>
+                            </div>
+                            <div class="sm-warnline bad d-none" id="nodeRemoveResult" role="alert"></div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+            <!-- Shown only when closing would drop edits that weren't saved. -->
+            <div class="modal-footer sm-footer d-none" id="nodeDiscardFoot">
+                <div class="sm-discard" role="alert">
+                    <span id="nodeDiscardText">Discard unsaved changes?</span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="nodeKeepEditing">Keep editing</button>
+                    <button type="button" class="btn btn-sm btn-danger" id="nodeDiscardConfirm">Discard</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<template id="infoNodesWhatTpl">
+    <p>A <strong>worker</strong> node lends its GPU or CPU: this app hands it one heavy step of a file (frames, loudness, intro or credits detection) and gets the result back. It never gets a server token or writes anything outside its own temp folder.</p>
+    <p>A <strong>Plex database</strong> node runs where Plex runs (also on Windows) and opens Plex's database for Intro &amp; Credits, chapter thumbnails, loudness and Library Health counts. It replaces the separate Plex helper.</p>
+    <p>One machine can do both.</p>
+</template>
+<template id="infoNodeTestAccessTpl">
+    <p>Test access takes 3 real files from each library and asks the node whether it sees each one at the mapped path with the same size and modified time.</p>
+    <p>A mapping that's wrong is found here, with the exact path tried, instead of showing up later as a failed file.</p>
+</template>
+
+<script src="{{ url_for('static', filename='js/nodes.js') }}"></script>
+{% endblock %}

@@ -78,12 +78,12 @@ manager.
 
 **Registration:** checks that this app can safely update the image references on Plex's existing chapters.
 It requires a supported Plex version and database schema, a positive server identity match, and a writer on
-Plex's machine. A safe local database connection works directly; when Plex is on another machine, configure
-the compatible Plex helper beside it. A network-mounted database alone is not enough.
+Plex's machine. A safe local database connection works directly; when Plex is on another machine, pick a
+compatible Plex database node beside it. A network-mounted database alone is not enough.
 
-The failure row gives the reason. **Configure Plex helper** opens the shared connection controls under
-**Intro & Credits**; you can enter the helper address and key while Intro & Credits stays off.
-See the [helper setup guide](../guides.md#plex-on-another-machine-the-plex-marker-agent).
+The failure row gives the reason. **Choose the Plex database** opens the **Plex database** selector under
+**Edit → Connection**; you can pick a node while Intro & Credits stays off.
+See [Plex on another machine](../guides.md#plex-on-another-machine-the-plex-database-node).
 This check reads capability only and does not change chapter rows.
 
 **Plex's own generation:** reads the server-wide **Generate chapter thumbnails** preference
@@ -105,7 +105,7 @@ See [Plex chapter thumbnails](../guides.md#plex-chapter-thumbnails) for job beha
 ## Plex loudness  <a id="plex-loudness"></a>
 *Plex only — shown when this app's loudness analysis is on*
 
-**Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
+**Writer readiness:** checks that this app can safely store loudness measurements in Plex's database.
 Select the movie and TV libraries this app should analyse in the server's loudness settings.
 
 **Plex's own analysis:** recommends setting the server-wide **Analyze audio tracks for loudness** schedule to
@@ -410,15 +410,15 @@ other row says what to change and where.
   leave the library's own setting on.
 - **Plex's library database isn't on this machine** (critical) / **…is on this machine**. Markers are written into
   Plex's database, which is only safe from the machine the file is on. Run this app on the Plex machine, or run the
-  [Plex marker agent](../guides.md#plex-on-another-machine-the-plex-marker-agent) next to Plex. With an agent
-  switched on the row reads **The Plex marker agent isn't on the machine with Plex's database**, means the agent's
-  container, and its badge reads **Fix on the agent**: mount Plex's config folder into it from one of that machine's
-  own disks.
-- **The Plex marker agent** (critical), shown only when an agent is switched on for this server. **…is connected**,
-  or one of: **isn't answering** (markers wait, nothing is lost), **refused this app's key** (set the same shared key
-  on both sides), **and this app are different versions** (the Processing → Intro & Credits section says which to update), **is
+  [Plex database node](../guides.md#plex-on-another-machine-the-plex-database-node) next to Plex. With a node
+  picked the row reads **The Plex database node isn't on the machine with Plex's database**, and its badge reads
+  **Fix on the node**: give the node Plex's config folder from one of that machine's own disks.
+- **The Plex database node** (critical), shown only when a node is picked for this server. **…is connected**,
+  or one of: **isn't answering** (markers wait, nothing is lost), **refused this app's key** (set the same key on
+  the node and on the Nodes page), **and this app are different versions** (the message says which to update), **is
   beside a different Plex** (check the address: markers would have gone into the wrong database). While it is red,
-  no marker reaches this server, and its badge reads **Fix on the agent** instead of **Change in Plex UI**.
+  no marker reaches this server, and its badge reads **Fix on the node** instead of **Change in Plex UI**. A node
+  that is turned off on the Nodes page, or that no longer exists, reads **Fix in this app**.
 - **TV Shows — skip buttons are hidden** (critical, one row per library, named after it) / **Plex shows skip buttons
   in your Intro & Credits libraries**. Each library Intro & Credits goes to has its own *Intro markers* and *Credits
   markers* setting in Plex (Edit library → Advanced; only TV libraries have the intro one). While one is off, Plex

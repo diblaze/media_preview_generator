@@ -1162,6 +1162,30 @@ class TestDetectAllGPUsEdgeCases:
         assert len(apple_gpus) > 0
         assert "M1 Max" in apple_gpus[0][2]["name"]
 
+    @pytest.mark.parametrize(
+        ("mode", "where"),
+        [
+            ("", "Settings → Processing Options → GPU device tuning"),
+            ("node", "this node's Overview tab on the app's Nodes page"),
+        ],
+    )
+    @patch("media_preview_generator.gpu.detect._test_acceleration_method", return_value=False)
+    def test_a_failed_gpu_test_points_at_the_screen_that_shows_it(self, _mock_test, monkeypatch, mode, where):
+        # A node's log pointed at the app's GPU settings, a screen the node doesn't have.
+        from loguru import logger
+
+        from media_preview_generator.gpu import detect
+
+        monkeypatch.setenv("MODE", mode)
+        warnings: list[str] = []
+        handler = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING", format="{message}")
+        try:
+            detect._detect_macos_gpus()
+        finally:
+            logger.remove(handler)
+
+        assert any(w.endswith(f"See {where} for details.") for w in warnings), warnings
+
     @patch("media_preview_generator.gpu.detect.is_macos")
     @patch("media_preview_generator.gpu.detect.is_windows")
     @patch("media_preview_generator.gpu.detect.platform.system")
@@ -2081,7 +2105,7 @@ class TestProbeVulkanDevice:
 
         # Point the tempfile root at pytest's tmp_path for cleanliness.
         with patch(
-            "media_preview_generator.gpu.vulkan_probe.tempfile.gettempdir",
+            "media_preview_generator.utils.tempfile.gettempdir",
             return_value=str(tmp_path),
         ):
             device = _probe_vulkan_device()
@@ -2115,6 +2139,51 @@ class TestProbeVulkanDevice:
         assert get_vulkan_env_overrides() == {
             "__EGL_VENDOR_LIBRARY_FILENAMES": str(synth_path),
         }
+
+    @patch(
+        "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
+        return_value=True,
+    )
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json")
+    @patch("media_preview_generator.gpu.vulkan_probe.subprocess.run")
+    def test_strategy_2c_writes_vendor_json_to_a_nodes_temp_folder(
+        self,
+        mock_run,
+        mock_find_icd,
+        mock_find_egl,
+        mock_find_libegl,
+        _mock_vk,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A node run read-only has no writable system temp: the vendor JSON goes to its NODE_TEMP_DIR instead."""
+        from media_preview_generator.gpu import _probe_vulkan_device, get_vulkan_env_overrides
+
+        node_temp = tmp_path / "node-temp"
+        node_temp.mkdir()
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(node_temp))
+        mock_find_egl.return_value = None
+        mock_find_icd.return_value = "/etc/vulkan/icd.d/nvidia_icd.json"
+        mock_find_libegl.return_value = "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.119.02"
+        llvmpipe = MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)"))
+        quadro = MagicMock(returncode=0, stderr=self._stderr_with_device("Quadro P4000 (discrete) (0x1bb1)"))
+        # Strategy 1 lands on llvmpipe; only a probe that got the vendor JSON finds the Quadro.
+        mock_run.side_effect = lambda *_a, **kw: (
+            quadro
+            if (kw.get("env") or {}).get("__EGL_VENDOR_LIBRARY_FILENAMES", "").startswith(str(node_temp))
+            else llvmpipe
+        )
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path / "no-such-system-temp")):
+            device = _probe_vulkan_device()
+
+        synth_path = node_temp / "plex_previews_nvidia_egl_vendor.json"
+        assert device == "Quadro P4000 (discrete) (0x1bb1)"
+        assert synth_path.exists()
+        assert get_vulkan_env_overrides() == {"__EGL_VENDOR_LIBRARY_FILENAMES": str(synth_path)}
 
     @patch(
         "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
@@ -2621,7 +2690,7 @@ class TestGetVulkanInfoAPI:
         }
 
     @patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment")
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_case_a1_missing_graphics_capability(self, mock_probe, mock_glob, mock_diag):
         """Case A1: NVIDIA-only + NVIDIA_DRIVER_CAPABILITIES missing 'graphics'
@@ -2654,7 +2723,7 @@ class TestGetVulkanInfoAPI:
         assert "already forwarded" not in warning
 
     @patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment")
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_case_a2_graphics_set_but_icd_json_missing(self, mock_probe, mock_glob, mock_diag):
         """Case A2: 'graphics' capability is set but the NVIDIA ICD JSON
@@ -2687,7 +2756,7 @@ class TestGetVulkanInfoAPI:
         assert "572.56" in warning  # echoes the detected driver version back
 
     @patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment")
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_case_a3_icd_present_but_libnvidia_glvkspirv_missing(self, mock_probe, mock_glob, mock_diag):
         """Case A3: ICD JSON is present but libnvidia-glvkspirv.so is not
@@ -2719,7 +2788,7 @@ class TestGetVulkanInfoAPI:
         assert "legacy" in warning  # points at mode = "legacy" workaround
 
     @patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment")
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_case_a4_all_checks_pass_but_loader_still_rejected(self, mock_probe, mock_glob, mock_diag):
         """Case A4: all the usual NVIDIA container requirements are
@@ -2751,7 +2820,7 @@ class TestGetVulkanInfoAPI:
         assert "/api/system/vulkan/debug" in warning
 
     @patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment")
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_pure_nvidia_with_dri_mapped_still_dispatches_into_case_a(self, mock_probe, mock_glob, mock_diag):
         """Regression guard: pure-NVIDIA host with /dev/dri already
@@ -2782,7 +2851,7 @@ class TestGetVulkanInfoAPI:
         assert "already forwarded" not in warning  # Case D text
         assert "vainfo" not in warning  # Case D text
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_nvidia_plus_intel_no_dri_recommends_mount(self, mock_probe, mock_glob):
         """Case B: NVIDIA + Intel with no /dev/dri → names both GPUs,
@@ -2816,7 +2885,7 @@ class TestGetVulkanInfoAPI:
         # Case B must not imply the NVIDIA-only workaround list.
         assert "Pure NVIDIA hosts" not in warning
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_intel_only_no_dri_recommends_mount(self, mock_probe, mock_glob):
         """Case C: Intel-only host with no /dev/dri → names the Intel
@@ -2843,7 +2912,7 @@ class TestGetVulkanInfoAPI:
         assert "NVIDIA" not in warning
         assert "VK_ERROR_INCOMPATIBLE_DRIVER" not in warning
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_intel_with_dri_mapped_points_at_drivers_or_perms(self, mock_probe, mock_glob):
         """Case D: Intel host with /dev/dri already forwarded but
@@ -2872,7 +2941,7 @@ class TestGetVulkanInfoAPI:
         # Already mounted — must not re-recommend mounting.
         assert "Docker Compose:" not in warning
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     @patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device")
     def test_no_gpu_detected_explains_missing_hardware(self, mock_probe, mock_glob):
         """Case E: Vulkan is llvmpipe and no GPU is detected at all →
@@ -2923,7 +2992,7 @@ class TestDiagnoseVulkanEnvironment:
         assert diag["nvidia_capabilities_has_graphics"] is False
         assert diag["nvidia_capabilities"] is None
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_icd_json_found_at_etc_path(self, mock_exists, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         # Return True only for the /etc/ path, False elsewhere.
@@ -2931,14 +3000,14 @@ class TestDiagnoseVulkanEnvironment:
         diag = self._diag()
         assert diag["nvidia_icd_json_path"] == "/etc/vulkan/icd.d/nvidia_icd.json"
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_icd_json_found_at_usr_share_path(self, mock_exists, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_exists.side_effect = lambda p: p == "/usr/share/vulkan/icd.d/nvidia_icd.json"
         diag = self._diag()
         assert diag["nvidia_icd_json_path"] == "/usr/share/vulkan/icd.d/nvidia_icd.json"
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_icd_json_absent_returns_none(self, mock_exists, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_exists.return_value = False
@@ -2946,7 +3015,7 @@ class TestDiagnoseVulkanEnvironment:
         assert diag["nvidia_icd_json_path"] is None
         assert diag["nvidia_drm_loaded"] is False
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     def test_libnvidia_glvkspirv_found_when_any_glob_matches(self, mock_glob, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         # Make the first glob path return a match, others empty.
@@ -2955,13 +3024,13 @@ class TestDiagnoseVulkanEnvironment:
         )
         assert self._diag()["libnvidia_glvkspirv_found"] is True
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     def test_libnvidia_glvkspirv_missing_when_all_globs_empty(self, mock_glob, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_glob.return_value = []
         assert self._diag()["libnvidia_glvkspirv_found"] is False
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     def test_libegl_nvidia_found_when_any_glob_matches(self, mock_glob, monkeypatch):
         """Strategy 2c gate: ``libEGL_nvidia.so.0`` present in the
         container must be reflected in the diagnostic dict so the
@@ -2974,13 +3043,13 @@ class TestDiagnoseVulkanEnvironment:
         diag = self._diag()
         assert diag["libegl_nvidia_found"] is True
 
-    @patch("media_preview_generator.web.routes.api_vulkan.glob.glob")
+    @patch("media_preview_generator.gpu.vulkan_check.glob.glob")
     def test_libegl_nvidia_missing_when_all_globs_empty(self, mock_glob, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_glob.return_value = []
         assert self._diag()["libegl_nvidia_found"] is False
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_egl_vendor_json_path_found_at_usr_share(self, mock_exists, monkeypatch):
         """Strategy 2c informational field: the GLVND vendor JSON path
         if present at either standard location, or None otherwise.
@@ -2990,14 +3059,14 @@ class TestDiagnoseVulkanEnvironment:
         diag = self._diag()
         assert diag["nvidia_egl_vendor_json_path"] == "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_egl_vendor_json_path_absent_returns_none(self, mock_exists, monkeypatch):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_exists.return_value = False
         diag = self._diag()
         assert diag["nvidia_egl_vendor_json_path"] is None
 
-    @patch("media_preview_generator.web.routes.api_vulkan.os.path.exists")
+    @patch("media_preview_generator.gpu.vulkan_check.os.path.exists")
     def test_nvidia_driver_version_parsed_from_proc(self, mock_exists, monkeypatch, tmp_path):
         monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
         mock_exists.side_effect = lambda p: (
@@ -3024,7 +3093,7 @@ class TestDiagnoseVulkanEnvironment:
             return original_open(path, *args, **kwargs)
 
         monkeypatch.setattr(
-            "media_preview_generator.web.routes.api_vulkan.open",
+            "media_preview_generator.gpu.vulkan_check.open",
             fake_open,
             raising=False,
         )

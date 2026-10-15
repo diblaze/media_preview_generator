@@ -33,7 +33,8 @@ def publisher_for(
         sibling_markers: Decided markers for another local file (Plex multi-version items).
         settings: Use these settings instead of the stored block (the Edit tab checks a server as if it were on).
         settings_provider: The saved settings right now; Plex checks them before every database write, so a job
-            started earlier can't write after Intro & Credits was turned off, and Emby reads "When Emby has its own
+            started earlier can't write after Intro & Credits was turned off, nor through a Plex database node the
+            server no longer uses (``plex_remote.node_refusal``), and Emby reads "When Emby has its own
             markers" from them before each write. Jellyfin needs no such guard: its writes go through the server's
             own API and the pipeline checks the saved settings first.
         ui_details: Include details only the Edit dialog shows in ``capability()`` (Plex's own detection settings, one
@@ -48,15 +49,16 @@ def publisher_for(
         settings = load_server(config.markers, config.type.value)
     if config.type is ServerType.PLEX:
         from .plex_db import PlexMarkerPublisher
-        from .plex_remote import plex_database
+        from .plex_remote import node_in_use, plex_database
 
         # Where the database work runs: in this process, or on the Plex marker agent beside a Plex on another
         # machine. Read from the settings this publisher is built with, so the Edit tab's "check it as if it were
-        # on" sees the agent too.
+        # on" sees the agent too; a job's saved settings then stop it once the server is re-pointed.
         database = plex_database(
             settings,
             path_provider=lambda: PlexMarkerPublisher.db_path_for(config),
             label=config.name or "",
+            live_node_id=(lambda: node_in_use(settings_provider())) if settings_provider is not None else None,
         )
         return PlexMarkerPublisher(
             server,

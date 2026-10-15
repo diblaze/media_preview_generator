@@ -47,7 +47,7 @@ def servers(app, media, tmp_path):
                 "plex": {
                     "db_write_confirmed_at": None,
                     "on_plex_redetect": "restore",
-                    "agent": {"enabled": True, "url": "http://plex-host.lan:9494", "token": AGENT_KEY},
+                    "agent": {"enabled": True, "node_id": "n1"},
                 },
             },
         },
@@ -80,6 +80,21 @@ def servers(app, media, tmp_path):
         },
     ]
     get_settings_manager().set("media_servers", entries)
+    get_settings_manager().set(
+        "nodes",
+        [
+            {
+                "id": "n1",
+                "node_uid": None,
+                "name": "Plex box",
+                "url": "http://plex-host.lan:9494",
+                "key": AGENT_KEY,
+                "enabled": True,
+                "path_mappings": [],
+                "added_at": "2026-10-15T00:00:00+00:00",
+            }
+        ],
+    )
     return entries
 
 
@@ -903,7 +918,13 @@ def test_the_status_payload_names_the_agent_but_never_its_key(client, servers, m
     monkeypatch.setattr(inspect, "_preview_capability", lambda server, config, settings: {"state": "ready"})
     resp = _secret_free(client.get("/api/markers/servers/plex-1/status", headers=_api_headers()))
     agent = resp.get_json()["settings"]["plex"]["agent"]
-    assert agent == {"enabled": True, "url": "http://plex-host.lan:9494", "has_token": True}
+    assert agent == {
+        "enabled": True,
+        "node_id": "n1",
+        "node_name": "Plex box",
+        "url": "http://plex-host.lan:9494",
+        "has_token": True,
+    }
 
 
 @pytest.mark.parametrize(

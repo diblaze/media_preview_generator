@@ -1,0 +1,10 @@
+GET /api/nodes -> 401  body: {"error":"Authentication required"}
+GET /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/probe -> 404  body: <!doctype html> <html lang=en> <title>404 Not Found</title> <h1>Not Found</h1> <p>The requested URL was not found on the
+GET /api/nodes/probe -> 405  body: <!doctype html> <html lang=en> <title>405 Method Not Allowed</title> <h1>Method Not Allowed</h1> <p>The method is not al
+GET /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/health -> 401  body: {"error":"Authentication required"}
+GET /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/log -> 401  body: {"error":"Authentication required"}
+POST /api/nodes -> 400  body: {"error":"This page's security token is missing or out of date. Reload the page and try again. Scripts: send the API tok
+POST /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/probe -> 400  body: {"error":"This page's security token is missing or out of date. Reload the page and try again. Scripts: send the API tok
+POST /api/nodes/probe -> 400  body: {"error":"This page's security token is missing or out of date. Reload the page and try again. Scripts: send the API tok
+POST /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/health -> 400  body: {"error":"This page's security token is missing or out of date. Reload the page and try again. Scripts: send the API tok
+POST /api/nodes/c24c6cedf94c48ccbd653156e1e1fb1e/log -> 400  body: {"error":"This page's security token is missing or out of date. Reload the page and try again. Scripts: send the API tok

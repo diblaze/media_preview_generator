@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -195,12 +196,23 @@ def test_capability_refuses_changed_schema(guarded, monkeypatch):
     assert loudness_capability(server, cfg).state is Capability.UNSUPPORTED_SCHEMA
 
 
-def test_helper_is_explicitly_unavailable(guarded):
+def test_a_helper_switched_on_without_an_address_never_falls_back_to_the_local_folder(guarded):
     _, cfg, server = guarded
     cfg.markers = {"plex": {"agent": {"enabled": True}}}
+    assert isinstance(create_loudness_db(cfg, server), guard.RemoteLoudnessDb)
     report = loudness_capability(server, cfg)
-    assert report.state is Capability.MISCONFIGURED and "helper does not support" in report.message
-    server._connect.assert_not_called()
+    # Refused as a node that is gone is: nothing reaches a database, and the local folder is never opened.
+    assert report.state is Capability.AGENT_UNAVAILABLE and "no Plex database node" in report.message
+
+
+def test_a_helper_with_an_address_is_used_instead_of_the_local_folder(guarded, monkeypatch):
+    _, cfg, server = guarded
+    monkeypatch.setattr(
+        "media_preview_generator.nodes.settings.node_address", lambda node_id: ("http://helper:9494", "k", "helper")
+    )
+    cfg.markers = {"plex": {"agent": {"enabled": True, "node_id": "n1"}}}
+    cfg.id = "plex-a"
+    assert isinstance(create_loudness_db(cfg, server), guard.RemoteLoudnessDb)
 
 
 def test_missing_folder_is_refused(guarded):
@@ -352,3 +364,112 @@ def test_a_failed_identity_proof_is_not_trusted_by_the_next_read(guarded):
     for _ in range(2):
         with pytest.raises(PublishError), db._database(read_only=True, deadline=1e12):
             pass
+
+
+class _NodeThatDoesNotAnswer:
+    """A ``requests.Session`` for a Plex database node that is down (restarting, updating, unplugged)."""
+
+    def post(self, *_args, **_kwargs):
+        import requests
+
+        raise requests.ConnectionError("connection refused")
+
+    get = post
+
+
+def _remote_loudness_db(*, capability_known: bool = False) -> guard.RemoteLoudnessDb:
+    from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
+
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+    remote = RemotePlexDb("http://plex-host:9494", "k" * 32, session=_NodeThatDoesNotAnswer())
+    if capability_known:
+        # Mid-job: the node answered earlier, so the next request goes straight to the loudness route.
+        remote._client.capabilities = ["loudness_v1"]
+    return guard.RemoteLoudnessDb(server, remote)
+
+
+@pytest.mark.parametrize("capability_known", [False, True], ids=["first-request", "mid-job"])
+def test_a_node_that_does_not_answer_is_a_database_this_app_cant_reach_now(capability_known):
+    """As a Plex this app can't reach in-process: UNREACHABLE, which the loudness job waits on instead of failing."""
+    db = _remote_loudness_db(capability_known=capability_known)
+    report = db.file_checks(deadline=time.monotonic() + 5)
+    assert report.state is Capability.UNREACHABLE, report
+    with pytest.raises(PublishError) as ei:
+        db.read_streams(["/media/movies/x.mkv"], deadline=time.monotonic() + 5)
+    assert ei.value.state is Capability.UNREACHABLE
+    assert "Can't reach the Plex database node at http://plex-host:9494" in str(ei.value)
+    assert "Markers" not in str(ei.value) and "Markers" not in report.message
+
+
+def test_the_node_not_answering_a_loudness_request_says_loudness_waits():
+    db = _remote_loudness_db(capability_known=True)
+    with pytest.raises(PublishError, match="Loudness waits until it answers again; nothing is lost"):
+        db.read_item_snapshot(1, deadline=time.monotonic() + 5)
+
+
+@pytest.mark.parametrize("owner", ["998", "1000"], ids=["another-user", "read-only-folder"])
+def test_loudness_through_a_node_that_cant_write_plexs_database_talks_about_the_node(owner):
+    from media_preview_generator.markers.publishers.plex_remote import report_to_json
+
+    details = {"db_path": "/plex/db", "fs_type": "ext4", "unwritable": ["/plex/db"], "writer_uid": "1000"}
+    refused = CapabilityReport(Capability.MISCONFIGURED, "This app (user 1000) can't write /plex/db.", details)
+    remote = MagicMock()
+    refused = CapabilityReport(refused.state, refused.message, {**details, "db_owner_uid": owner})
+    remote.loudness.return_value = {"report": report_to_json(refused)}
+    remote.agent_details.return_value = {"url": "http://plex-host:9494", "state": "connected"}
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+    report = guard.RemoteLoudnessDb(server, remote).capability(deadline=time.monotonic() + 5)
+    assert report.state is Capability.MISCONFIGURED
+    assert report.message.startswith("The Plex database node (user 1000) can't write /plex/db")
+    assert ("read-only" in report.message) is (owner == "1000")
+
+
+class _NodeSaying:
+    """A ``requests.Session`` for whatever answers at a node's address: every loudness request gets ``report``."""
+
+    def __init__(self, report: dict) -> None:
+        self.report = report
+
+    def post(self, *_args, **_kwargs):
+        import json
+
+        body = json.dumps(
+            {
+                "ok": True,
+                "agent": {"version": "1.2.0", "protocols": [1, 2], "capabilities": ["loudness_v1"]},
+                "result": {"report": self.report, "capability": "loudness_v1"},
+            }
+        ).encode()
+        return SimpleNamespace(
+            status_code=200, headers={}, iter_content=lambda chunk_size=1: iter([body]), close=lambda: None
+        )
+
+    get = post
+
+
+@pytest.mark.parametrize("check", ["file_checks", "capability"])
+def test_a_loudness_check_report_from_the_node_reaches_the_app_as_one_short_line(check):
+    # Loudness puts it in the job's rows and the log, as markers do.
+    from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
+    from media_preview_generator.nodes.protocol import RELAY_LINE_MAX
+
+    said = "Plex is fine\n2026-10-16 03:00:00 | ERROR | forged\x1b[31m " + "x" * 20_000
+    remote = RemotePlexDb(
+        "http://plex-host:9494", "k" * 32, session=_NodeSaying({"state": "misconfigured", "message": said})
+    )
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+
+    report = getattr(guard.RemoteLoudnessDb(server, remote), check)(deadline=time.monotonic() + 5)
+
+    assert report.state is Capability.MISCONFIGURED
+    assert report.message.startswith("Plex is fine\\n2026-10-16 03:00:00 | ERROR | forged\\x1b[31m xxx")
+    assert not any(c in report.message for c in "\n\x1b") and len(report.message) <= RELAY_LINE_MAX + 300

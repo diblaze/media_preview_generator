@@ -2510,7 +2510,9 @@ class TestPlexMarkersReadiness(_MarkerReadinessHarness):
         assert row["severity"] == "critical"
         assert row["ok"] is False
         assert (row["current"], row["recommended"]) == ("another machine", "this machine")
-        assert row["reason"] == ("Run the Plex marker agent next to Plex, or run this app on the same machine as Plex.")
+        assert row["reason"] == (
+            "Add a Plex database node on the Plex machine, or run this app on the same machine as Plex."
+        )
         # No agent configured for this server, so this app itself must move — not the agent's badge.
         assert "fix_where" not in row
         assert self._failing_critical(payload) == ["markers_plex_db_local"]
@@ -2595,14 +2597,68 @@ class TestPlexMarkersReadiness(_MarkerReadinessHarness):
 
         assert "markers_plex_detection" not in self._marker_checks(self._readiness(server, capability))
 
-    @pytest.mark.parametrize("state", ["unreachable", "misconfigured", "unsupported_schema", "unknown"])
-    def test_a_capability_that_knows_nothing_emits_no_section(self, state):
+    def test_a_capability_that_knows_nothing_emits_no_section(self):
         """No facts → no rows, rather than a guessed row: the card must not cry wolf."""
         server = self._server({"enabled": True, "library_ids": None, "plex": self.CONFIRMED})
 
-        payload = self._readiness(server, self._capability(state))
+        payload = self._readiness(server, self._capability("unknown"))
 
         assert [s["id"] for s in payload["sections"] if s["id"] == "markers"] == []
+
+    @pytest.mark.parametrize(
+        ("state", "message", "details"),
+        [
+            ("misconfigured", "Plex database not found at /plex/x.db", {}),
+            ("misconfigured", "Can't write /plex/x.db", {"db_path": "/plex/x.db", "unwritable": ["/plex/x.db"]}),
+            ("unsupported_schema", "Plex's database has a layout this app doesn't know", {}),
+            (
+                "unreachable",
+                "Plex doesn't have its database open through this folder right now",
+                {"lock_holder": False},
+            ),
+            ("misconfigured", "", {}),
+        ],
+        ids=["no-database", "read-only", "unknown-layout", "not-held-open", "no-message"],
+    )
+    def test_a_refused_database_fails_the_section_with_the_checks_own_reason(self, tmp_path, state, message, details):
+        """Every Intro & Credits file is skipped with this message, so Setup Health can't be all green."""
+        capability = {**self._capability(state, plex_pass=True, **details), "message": message}
+
+        payload = self._readiness(self._server_on(str(tmp_path)), capability)
+
+        checks = self._marker_checks(payload)
+        assert list(checks) == ["markers_plex_pass", "markers_plex_db"]
+        row = checks["markers_plex_db"]
+        assert (row["ok"], row["severity"]) == (False, "critical")
+        assert row["reason"] == (
+            message or "Markers aren't written until this is fixed. The Intro & Credits tab says why."
+        )
+        assert self._failing_critical(payload) == ["markers_plex_db"]
+        assert row["fix_where"] == "app"
+
+    def test_a_refused_database_behind_a_node_is_fixed_on_the_node(self, tmp_path):
+        agent = {"state": "connected", "url": "http://plex-host:9494", "version": "1.2.0"}
+        capability = {
+            **self._capability("misconfigured", agent=agent, plex_pass=True),
+            "message": "Plex database not found at /plex/x.db",
+        }
+
+        checks = self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
+
+        assert checks["markers_plex_agent"]["ok"] is True
+        assert (checks["markers_plex_db"]["ok"], checks["markers_plex_db"]["fix_where"]) == (False, "agent")
+
+    def test_a_refusal_another_row_explains_gets_no_second_row(self, tmp_path):
+        capability = self._capability("needs_local_db", fs_type="nfs4", db_path="/plex/x.db", plex_pass=True)
+
+        checks = self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
+
+        assert "markers_plex_db" not in checks and checks["markers_plex_db_local"]["ok"] is False
+
+    def test_a_busy_database_is_not_a_refusal(self, tmp_path):
+        capability = self._capability("unreachable", plex_pass=True, db_busy=True)
+
+        assert "markers_plex_db" not in self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
 
     def test_unreadable_settings_emit_no_section_rather_than_the_off_row(self, tmp_path):
         """Settings that can't be read are unknown, not "off" — the card says nothing either way."""
@@ -3011,34 +3067,34 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
         [
             (
                 {"state": "unreachable"},
-                "The Plex marker agent isn't answering",
+                "The Plex database node isn't answering",
                 "can't be reached",
                 "Markers wait here until it answers again. Nothing is lost.",
             ),
             (
                 {"state": "rejected"},
-                "The Plex marker agent refused this app's key",
+                "The Plex database node refused this app's key",
                 "key refused",
-                "Set the same shared key on the agent and in the Intro & Credits tab.",
+                "Set the same key on the node and on the Nodes page.",
             ),
             (
                 {"state": "incompatible"},
-                "The Plex marker agent and this app are different versions",
+                "The Plex database node and this app are different versions",
                 "version mismatch",
                 "The Intro & Credits tab says which of the two to update.",
             ),
             (
                 {"state": "connected", "wrong_plex": True},
-                "The Plex marker agent is beside a different Plex",
+                "The Plex database node is beside a different Plex",
                 "wrong Plex server",
-                "Check its address in the Intro & Credits tab: markers would have gone into the wrong database.",
+                "Check which node this server uses in Edit → Connection: markers would have gone into the wrong database.",
             ),
             # Connected and refused anyway, but NOT the wrong Plex: the agent answered something this app can't
             # decode. Inferring "wrong Plex" from connected-yet-refused would send the user to change a correct
             # address, so this cell has to read as "not answering" instead.
             (
                 {"state": "connected"},
-                "The Plex marker agent isn't answering",
+                "The Plex database node isn't answering",
                 "can't be reached",
                 "Markers wait here until it answers again. Nothing is lost.",
             ),
@@ -3065,12 +3121,26 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
         # the badge to "Fix on the agent".
         assert row["fix_where"] == "agent"
 
+    @pytest.mark.parametrize(
+        ("state", "label", "current"),
+        [
+            ("disabled", "The Plex database node is turned off", "turned off"),
+            ("no_node", "This server's Plex database node isn't on the Nodes page", "no node"),
+        ],
+    )
+    def test_a_node_this_app_refused_to_use_is_fixed_in_this_app(self, state, label, current):
+        row = self._agent_row(self._capability("agent_unavailable", agent=self._agent(state)))
+
+        assert (row["label"], row["current"], row["ok"], row["severity"]) == (label, current, False, "critical")
+        # The fix is on the Nodes page or in Edit → Connection: servers.js shows "Fix in this app".
+        assert row["fix_where"] == "app"
+
     def test_a_working_agent_is_a_passing_row(self):
         capability = self._capability("ready", agent=self._agent(), plex_pass=True, lock_holder=True, fs_type="ext4")
 
         row = self._agent_row(capability)
 
-        assert row["label"] == "The Plex marker agent is connected"
+        assert row["label"] == "The Plex database node is connected"
         assert row["ok"] is True
         assert (row["current"], row["recommended"]) == ("connected", "connected")
         assert row["reason"] is None
@@ -3142,6 +3212,15 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
             plex_remote.AGENT_UNREACHABLE,
             plex_remote.AGENT_REJECTED,
             plex_remote.AGENT_INCOMPATIBLE,
+            plex_remote.AGENT_NO_ROLE,
+            plex_remote.AGENT_DISABLED,
+            plex_remote.AGENT_NO_NODE,
+            plex_remote.AGENT_UNCONFIRMED_NODE,
+        }
+        assert readiness.AGENT_FIXED_IN_APP == {
+            plex_remote.AGENT_DISABLED,
+            plex_remote.AGENT_NO_NODE,
+            plex_remote.AGENT_UNCONFIRMED_NODE,
         }
         assert readiness.AGENT_RECOMMENDED == plex_remote.AGENT_CONNECTED
         assert readiness.AGENT_FALLBACK_STATE == plex_remote.AGENT_UNREACHABLE
@@ -3153,17 +3232,17 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
 
         row = self._marker_checks(self._readiness(self._server_on(), capability))["markers_plex_db_local"]
 
-        assert row["label"] == "The Plex marker agent isn't on the machine with Plex's database"
-        assert (row["current"], row["recommended"]) == ("another machine", "the agent's machine")
+        assert row["label"] == "The Plex database node isn't on the machine with Plex's database"
+        assert (row["current"], row["recommended"]) == ("another machine", "the node's machine")
         assert row["reason"] == (
-            "Run the Plex marker agent on the Plex machine, with Plex's config folder mounted from a local disk."
+            "Run the Plex database node on the Plex machine, with Plex's config folder on a local disk."
         )
         assert "run this app on the same machine as Plex" not in row["reason"]
-        assert "the Plex marker agent already does this write for you" in row["explanation"]
+        assert "the Plex database node already does this write for you" in row["explanation"]
         # Every piece of the row's copy switches together — a tooltip still saying "this app must run on the
         # Plex machine" would contradict the label right next to it.
         assert row["tooltip"] == (
-            "Markers go straight into Plex's database, so the Plex marker agent must run on the Plex machine "
+            "Markers go straight into Plex's database, so the Plex database node must run on the Plex machine "
             "with that machine's own copy of Plex's config folder."
         )
         # The fix happens on the agent's own machine, not in Plex's admin UI.
@@ -3178,7 +3257,7 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
         assert (row["current"], row["recommended"]) == ("another machine", "this machine")
         assert row["tooltip"] == (
             "Markers go straight into Plex's database, so this app must run on the Plex machine, or reach it "
-            "through the agent."
+            "through a Plex database node."
         )
         # No agent configured, so the fix is on this app's own machine — the shipped "Change in Plex UI" badge.
         assert "fix_where" not in row
@@ -3188,7 +3267,7 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
 
         row = self._marker_checks(self._readiness(self._server_on(), capability))["markers_plex_db_local"]
 
-        assert row["label"] == "The Plex marker agent is on the machine with Plex's database"
+        assert row["label"] == "The Plex database node is on the machine with Plex's database"
         assert row["ok"] is True
-        assert (row["current"], row["recommended"]) == ("the agent's machine", "the agent's machine")
+        assert (row["current"], row["recommended"]) == ("the node's machine", "the node's machine")
         assert row["fix_where"] == "agent"

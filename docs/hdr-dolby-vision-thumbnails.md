@@ -9,7 +9,7 @@ Washed-out, grey or green preview thumbnails come from frames taken from HDR vid
 
 - HDR10, HLG and HDR10+ are tone-mapped to SDR.
 - Dolby Vision Profiles 7 and 8 are read through their HDR10 layer.
-- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`.
+- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`, and on some Docker setups `--runtime=nvidia` as well.
 
 ## Why the built-ins get it wrong
 
@@ -44,6 +44,8 @@ docker run -d \
 ```
 
 In Docker Compose, set `NVIDIA_DRIVER_CAPABILITIES=all` under `environment:`. `compute,video,utility,graphics` also works if you prefer the minimum. Restart the container after changing it.
+
+If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out.
 
 Intel and AMD need no extra step beyond passing `/dev/dri`, which also brings the Mesa Vulkan driver.
 

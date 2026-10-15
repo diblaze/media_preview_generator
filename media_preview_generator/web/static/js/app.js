@@ -1362,19 +1362,17 @@ function renderNoWorkersWarning(message) {
         return;
     }
     if (!banner) {
+        // Above the Workers card; a page without it has nowhere to show the warning.
+        const workersBlock = document.getElementById('dashboard-workers');
+        if (!workersBlock) return;
         const row = document.createElement('div');
         row.id = 'noWorkersWarningRow';
-        row.className = 'row';
-        row.innerHTML = `<div class="col-12 mb-3">
-            <div class="alert alert-warning mb-0 d-flex align-items-center" id="noWorkersWarningBanner">
+        row.className = 'mb-3';
+        row.innerHTML = `<div class="alert alert-warning mb-0 d-flex align-items-center" id="noWorkersWarningBanner">
                 <i class="bi bi-exclamation-triangle-fill me-2"></i>
                 <span id="noWorkersWarningText"></span>
-            </div>
-        </div>`;
-        const workerSection = document.getElementById('workerStatusContainer');
-        if (workerSection) {
-            workerSection.closest('.row').before(row);
-        }
+            </div>`;
+        workersBlock.before(row);
         banner = document.getElementById('noWorkersWarningBanner');
     }
     const textEl = document.getElementById('noWorkersWarningText');
@@ -1750,6 +1748,7 @@ const STATUS_META = {
     loudness_no_owners:      { label: 'No server with Loudness on', cls: 'bg-secondary', tip: 'No Plex server with Loudness turned on has this file' },
     loudness_not_in_library: { label: 'Not in Plex yet', cls: 'bg-info text-dark', tip: 'Plex had not added this file when it was checked. The job status shows whether another attempt is scheduled.' },
     loudness_waiting:        { label: 'Waiting for Plex', cls: 'bg-info text-dark', tip: 'Plex or the source file was temporarily unavailable or changed. The job status shows whether another attempt is scheduled.' },
+    loudness_skipped:        { label: 'Skipped', cls: 'bg-secondary', tip: 'The file is a trailer or other extra: extras aren\'t analysed for loudness' },
 };
 
 const JOB_KIND_INTRO_CREDITS = 'intro_credits';
@@ -3154,7 +3153,7 @@ function updateWorkerStatuses(workers, options = {}) {
             col.innerHTML = `
                 <article class="card workers-panel-card wk" data-card data-status="idle">
                     <div class="card-body">
-                        <div class="worker-card-heading wk-top"><span data-name-wrap class="kind"><i class="bi" data-icon aria-hidden="true"></i><strong data-name></strong></span><span class="worker-id wk-n" data-worker-id></span><span class="pill warn" data-status-badge hidden></span></div>
+                        <div class="worker-card-heading wk-top"><span data-name-wrap class="kind"><span class="node-chip" data-node-chip hidden></span><i class="bi" data-icon aria-hidden="true"></i><strong data-name></strong></span><span class="worker-id wk-n" data-worker-id></span><span class="pill warn" data-status-badge hidden></span></div>
                         <span class="pill warn d-none" data-fallback-badge><i class="bi bi-arrow-down-circle" aria-hidden="true"></i>CPU fallback</span>
                         <div class="small text-warning d-none" data-fallback-note><i class="bi bi-exclamation-triangle me-1"></i><span data-fallback-reason></span></div>
                         <div class="wk-idle-note" data-idle-note>Waiting for work</div>
@@ -3192,6 +3191,25 @@ function updateWorkerStatuses(workers, options = {}) {
         }
     }
 }
+
+// One name and colour per node state for every page that shows one (Nodes, Workers, the dashboard): red gets no
+// work (its Setup Health has a Must fix), amber still works in part, grey isn't checked yet or is switched off.
+// ``short`` is the "0 now" chip's text, the same words the server gives a member with no workers; ``causes`` the
+// ones for an offline node that answered (restarting, asking to wait), which has nothing to fix, and for a worker
+// node ahead of this app, where this app is the one to update.
+window.NODE_STATES = Object.freeze({
+    ready: { tone: 'ok', label: 'Ready', short: '' },
+    update_needed: { tone: 'bad', label: 'Update needed', short: 'node needs an update', causes: { app_behind: 'app needs an update' } },
+    access_problem: { tone: 'bad', label: 'Access problem', short: 'fix media access first' },
+    gpu_lost: { tone: 'warn', label: 'GPU lost', short: 'GPU lost' },
+    no_ffmpeg: { tone: 'bad', label: 'FFmpeg missing', short: 'FFmpeg missing on node' },
+    duplicate: { tone: 'bad', label: 'Added twice', short: 'node added twice' },
+    temp_problem: { tone: 'bad', label: 'Temp folder problem', short: "node's temp folder can't be used" },
+    offline: { tone: 'bad', label: 'Offline', short: 'node offline', causes: { restarting: 'node restarting', rate_limited: 'node asks to wait' } },
+    key_refused: { tone: 'bad', label: 'Key refused', short: 'key refused' },
+    connecting: { tone: 'off', label: 'Connecting…', short: 'connecting to node' },
+    disabled: { tone: 'off', label: 'Turned off', short: 'node turned off' },
+});
 
 function _patchWorkerCard(col, worker) {
     const fallbackActive = !!worker.fallback_active;
@@ -3278,6 +3296,12 @@ function _patchWorkerCard(col, worker) {
         nameEl.textContent = kindName;
     }
     nameEl.title = worker.worker_name || '';
+    // A worker on a node shows the node's name in front, as every other place that names its device does.
+    const nodeChip = col.querySelector('[data-node-chip]');
+    const nodeName = worker.node ? worker.node.name || worker.node.id || '' : '';
+    if (nodeChip.textContent !== nodeName) nodeChip.textContent = nodeName;
+    nodeChip.hidden = !nodeName;
+    nodeChip.title = nodeName ? `Runs on node ${nodeName}` : '';
 
     // Fallback badge + note
     fallbackBadge.classList.toggle('d-none', !fallbackActive);
@@ -3292,11 +3316,24 @@ function _patchWorkerCard(col, worker) {
     }
 
     // Status badge: only the exceptional states get a pill; busy and idle show through the card style.
-    const workerStatus = paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
+    // A node that stopped answering outranks pause and retirement: it is why the card's file is not progressing.
+    const nodeDown = !!worker.node && !!worker.node_state && !['ready', 'gpu_lost'].includes(worker.node_state);
+    const nodeState = window.NODE_STATES[worker.node_state];
+    const nodeStateText = String(nodeState ? nodeState.label : worker.node_state);
+    // "Node offline", "Node FFmpeg missing": only a capitalised word is lowered, never a name like FFmpeg or GPU.
+    const nodeStatus = /^[A-Z][a-z]/.test(nodeStateText) ? nodeStateText[0].toLowerCase() + nodeStateText.slice(1) : nodeStateText;
+    // An offline node that answered ("node restarting", "node asks to wait") isn't called offline, nor is a node
+    // ahead of this app said to need the update ("app needs an update").
+    const nodeCause = nodeState?.causes?.[worker.node_cause];
+    const nodeText = nodeCause ? nodeCause[0].toUpperCase() + nodeCause.slice(1) : `Node ${nodeStatus}`;
+    const workerStatus = nodeDown ? nodeText : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
     if (statusEl.textContent !== workerStatus) {
         statusEl.textContent = workerStatus;
     }
-    statusEl.hidden = !(paused || worker.retiring);
+    const nodeBad = nodeDown && nodeState?.tone === 'bad';
+    statusEl.classList.toggle('bad', nodeBad);
+    statusEl.classList.toggle('warn', !nodeBad);
+    statusEl.hidden = !(nodeDown || paused || worker.retiring);
     card.classList.toggle('worker-long-status', !!worker.retiring);
 
     const title = isProcessing ? worker.current_title || worker.current_file || 'Processing…' : '';
@@ -4444,12 +4481,19 @@ function _archiveVisibleToast(toast) {
 }
 
 function showToast(title, message, type = 'info') {
-    const toast = document.getElementById('toastNotification');
+    let toast = document.getElementById('toastNotification');
+    if (toast.classList.contains('show') || toast.classList.contains('showing')) _archiveVisibleToast(toast);
+    if (bootstrap.Toast.getInstance(toast)) {
+        // Disposing a toast still fading in or out makes Bootstrap's queued transition callback throw on its cleared
+        // element; the old toast finishes that harmlessly off the page and a fresh copy takes its place.
+        const fresh = toast.cloneNode(true);
+        fresh.classList.remove('show', 'showing', 'hide');
+        toast.replaceWith(fresh);
+        toast = fresh;
+    }
     const toastTitle = document.getElementById('toastTitle');
     const toastBody = document.getElementById('toastBody');
     const toastIcon = document.getElementById('toastIcon');
-
-    if (toast.classList.contains('show')) _archiveVisibleToast(toast);
     toastTitle.textContent = title;
     toastBody.textContent = message;
 
@@ -4458,8 +4502,6 @@ function showToast(title, message, type = 'info') {
     toast.setAttribute('aria-live', type === 'danger' ? 'assertive' : 'polite');
     toastIcon.className = `bi ${_TOAST_ICONS[type] || _TOAST_ICONS.info} me-2`;
 
-    const previous = bootstrap.Toast.getInstance(toast);
-    if (previous) previous.dispose();
     new bootstrap.Toast(toast, { autohide: type !== 'danger', delay: 5000 }).show();
 }
 
@@ -4589,14 +4631,16 @@ async function refreshBackupsPanel() {
                         <select id="${selectId}" class="form-select form-select-sm"
                                 aria-label="Backup snapshot for ${escapeHtml(f.name)}">
                             ${backups.map((b) => {
+                                const unreadable = b.readable === false;
                                 const label = escapeHtml(_formatBackupLabel(b))
-                                    + (b.legacy ? ' (legacy)' : '');
-                                return `<option value="${escapeHtml(b.filename)}">${label}</option>`;
+                                    + (b.legacy ? ' (legacy)' : '')
+                                    + (unreadable ? " (can't be read)" : '');
+                                return `<option value="${escapeHtml(b.filename)}"${unreadable ? ' disabled' : ''}>${label}</option>`;
                             }).join('')}
                         </select>
                         <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0"
                                 data-restore-file="${escapeHtml(f.name)}"
-                                data-restore-select="${selectId}">
+                                data-restore-select="${selectId}"${backups.some((b) => b.readable !== false) ? '' : ' disabled'}>
                             <i class="bi bi-arrow-counterclockwise me-1"></i>Restore selected
                         </button>
                     </div>
@@ -4626,8 +4670,12 @@ async function refreshBackupsPanel() {
                 const origHtml = target.innerHTML;
                 target.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Restoring…';
                 try {
-                    await apiPost('/api/settings/backups/restore', { file, backup });
-                    showToast('Backup restored', `${file} restored from ${backup}. The server is already using it; reload the page to see the restored values.`, 'success');
+                    const result = await apiPost('/api/settings/backups/restore', { file, backup });
+                    if (result && result.warning) {
+                        showToast('Backup restored', `${file} restored from ${backup}. ${result.warning}`, 'warning');
+                    } else {
+                        showToast('Backup restored', `${file} restored from ${backup}. The server is already using it; reload the page to see the restored values.`, 'success');
+                    }
                     refreshBackupsPanel();
                 } catch (e) {
                     showToast('Restore failed', (e && e.message) || 'Unknown error', 'danger');

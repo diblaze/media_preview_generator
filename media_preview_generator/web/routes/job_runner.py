@@ -98,6 +98,18 @@ def _not_found_message(not_found: int, total: int, *, nothing_succeeded: bool, r
     return f"{not_found} of {total} items skipped (file not found locally) — check path mapping configuration"
 
 
+def _node_failure_clauses(node_failed: dict[str, str]) -> list[str]:
+    """``"N failed: node X unavailable (...)"`` per distinct reason, most files first.
+
+    Args:
+        node_failed: Path -> why its node couldn't run it.
+    """
+    counts: dict[str, int] = {}
+    for why in node_failed.values():
+        counts[why] = counts.get(why, 0) + 1
+    return [f"{n} failed: {why}" for why, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 def _file_problem_clauses(failure_count: int, outcome: dict | None, *, retry_scheduled: bool) -> list[str]:
     """What a finished job says about files that failed or weren't on disk, each count once.
 
@@ -478,7 +490,8 @@ def _build_selected_gpus(settings, detected: list[dict] | None = None) -> list:
     if isinstance(groups, list):
         from ...worker_groups import configured_group_totals, member_policies
 
-        policies = member_policies(groups)
+        # A node's GPU is not this app's hardware, even when its device string matches a local one.
+        policies = [p for p in member_policies(groups) if not p.get("node")]
         grouped_devices = {p["device"] for p in policies if p["resource"] == "gpu" and p["enabled"]}
         for g in cached_gpus:
             device = g.get("device", "")
@@ -877,6 +890,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         config.regenerate_thumbnails = bool(value)
                     elif key == "webhook_paths":
                         config.webhook_paths = [str(path).strip() for path in value if str(path).strip()]
+                    elif key == "regenerated_paths":
+                        if isinstance(value, list | tuple):
+                            config.regenerated_paths = frozenset(str(path) for path in value if path) or None
                     elif key == "webhook_deleted_paths":
                         # Radarr/Sonarr deletedFiles[] from upgrade events.
                         # Forwarded to process_canonical_path so cleanup +
@@ -1008,6 +1024,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         group_name=worker_data.get("group_name"),
                         group_resource=worker_data.get("group_resource"),
                         retiring=bool(worker_data.get("retiring", False)),
+                        node=worker_data.get("node"),
+                        node_state=worker_data.get("node_state"),
                     )
                     job_manager.update_worker_status(worker_key, status)
                 job_manager.prune_worker_statuses(active_worker_keys)
@@ -1386,6 +1404,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
                     resolution = result.get("webhook_resolution", {})
                     unresolved_paths = resolution.get("unresolved_paths") or []
+                    # Found and owned, but their processing failed or their node couldn't run them: their failed rows
+                    # are already written with why, so they get no "not found" row or path-mapping hint, only a retry.
+                    failed_paths: list[str] = resolution.get("failed_paths") or []
+                    node_failed: dict[str, str] = resolution.get("node_failed") or {}
                     total_paths = resolution.get("total_paths", 0)
                     resolved_count = resolution.get("resolved_count", 0)
                     path_hints = resolution.get("path_hints") or []
@@ -1402,9 +1424,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # Unified-dispatch payload: the orchestrator already
                     # walked every configured server's ownership and
                     # fanned out per-server publishers. Anything left in
-                    # ``unresolved_paths`` is either (a) owned by no
-                    # enabled server, or (b) owned but every publisher
-                    # failed. Per-server outcome counters in ``outcome``
+                    # ``unresolved_paths`` is owned by no enabled
+                    # server. Per-server outcome counters in ``outcome``
                     # carry the precise breakdown \u2014 this row is the
                     # job-level summary line.
                     generic_detail = "file may not be scanned yet, or path mappings in Settings may need adjusting"
@@ -1579,6 +1600,18 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     for pp in pending_registration_paths:
                         if pp not in retry_paths:
                             retry_paths.append(pp)
+                    for np_ in (*failed_paths, *node_failed):
+                        if np_ not in retry_paths:
+                            retry_paths.append(np_)
+                    # A Regenerate job's retry regenerates only the files that never got output this run. A file that
+                    # only waits on a server or on chapters was already regenerated, so its retry checks it normally.
+                    # Pending paths are the canonical paths a retry's items carry; the others are webhook inputs.
+                    no_output = {*unresolved_paths, *stale_inputs, *failed_paths, *node_failed}
+                    regenerated_paths = [
+                        pp
+                        for pp in pending_registration_paths
+                        if pp not in no_output and input_by_canonical.get(pp, pp) not in no_output
+                    ]
 
                     def _spawn_retry_job(paths, attempt, retry_reason=None):
                         """Create and start a retry job for unresolved webhook paths.
@@ -1690,6 +1723,15 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         }
                         if current_job and (current_job.config or {}).get("source"):
                             retry_async_config["source"] = current_job.config["source"]
+                        # What the job asked for: a Regenerate job's retry regenerates too (bar the files it already
+                        # regenerated), and an upgrade's retry still removes the replaced release's previews.
+                        for key in ("force_generate", "regenerate_thumbnails", "webhook_deleted_paths"):
+                            if job_config.get(key):
+                                retry_async_config[key] = job_config[key]
+                        if regenerated_paths and (
+                            retry_async_config.get("force_generate") or retry_async_config.get("regenerate_thumbnails")
+                        ):
+                            retry_async_config["regenerated_paths"] = regenerated_paths
                         # K1: thread server_id through so the retry's worker
                         # builds Config from the right per-server view.
                         # CRITICAL: only inherit the publish-pin when the
@@ -1792,6 +1834,10 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             "pending_by_server": dict(pending_by_server),
                             "chapter_waits_by_server": dict(chapter_waits_by_server),
                         }
+                        if failed_paths:
+                            retry_reason["failed"] = len(failed_paths)
+                        if node_failed:
+                            retry_reason["node_failed"] = len(node_failed)
 
                         if is_retry and retry_attempt < effective_max:
                             next_attempt = retry_attempt + 1
@@ -1800,6 +1846,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} unresolved")
+                            if failed_paths:
+                                reason_parts.append(f"{len(failed_paths)} failed")
+                            reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:
@@ -1825,6 +1874,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} not found on any server")
+                            if failed_paths:
+                                reason_parts.append(f"{len(failed_paths)} failed")
+                            reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
                             if pending_by_server:

@@ -4,7 +4,7 @@
 - name: Plex
   note: >-
     Needs Plex Pass on the server, and for viewers (or their Plex Home); the app runs on the Plex
-    machine or next to it via the Plex marker agent.
+    machine or next to it through a Plex database node.
 - name: Jellyfin
   note: >-
     Jellyfin 10.11 or 12.0 with the Media Preview Bridge plugin (the one trickplay uses).

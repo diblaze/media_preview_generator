@@ -175,6 +175,22 @@ class TestLoggingConfig:
         mock_logger.remove.assert_called_once()
         assert mock_logger.add.call_count == 1
 
+    @pytest.mark.parametrize(
+        ("mode", "where"), [("", "the live web log viewer"), ("node", "this node's Log tab on the app's Nodes page")]
+    )
+    @patch("media_preview_generator.logging_config.os.makedirs", side_effect=PermissionError)
+    @patch("media_preview_generator.logging_config.logger")
+    def test_a_log_folder_it_cant_make_names_the_log_still_shown(
+        self, mock_logger, mock_makedirs, monkeypatch, mode, where
+    ):
+        # A node has no web log viewer: its lines are read on the app's Nodes page.
+        monkeypatch.setenv("MODE", mode)
+
+        setup_logging()
+
+        message, *args = mock_logger.warning.call_args.args
+        assert f"Logging continues to the console and {where}, but" in message.format(*args)
+
     def test_a_logged_exception_shows_no_local_values(self, tmp_path):
         """loguru's ``diagnose`` prints each frame's variable values under a traceback; a token among them would land
         in ``docker logs`` and app.log. The traceback itself stays."""
@@ -303,6 +319,38 @@ class TestStdlibLogging:
         for text in read():
             assert "Checking chapters" not in text
             assert "Failed: unreadable" in text
+
+    def test_a_console_only_line_reaches_the_console_and_nothing_else(self, start):
+        from loguru import logger
+
+        read = start("DEBUG")
+        logger.bind(**{_logging_mod.CONSOLE_ONLY: True}).warning("This node made its key: k3y-0nly-f0r-the-c0ns0le")
+        logger.warning("an ordinary line")
+
+        console, app_log, live = read()
+        assert "k3y-0nly-f0r-the-c0ns0le" in console
+        assert "k3y-0nly-f0r-the-c0ns0le" not in app_log and "k3y-0nly-f0r-the-c0ns0le" not in live
+        assert "an ordinary line" in app_log and "an ordinary line" in live
+
+    def test_the_console_only_name_is_the_node_logs_secret_name(self):
+        from media_preview_generator.nodes.server import nodelog
+
+        assert _logging_mod.CONSOLE_ONLY == nodelog.SECRET_EXTRA
+
+    def test_a_held_back_line_reaches_no_app_sink(self, start):
+        # A node's GPU re-check holds its lines and logs them again itself (at DEBUG when nothing changed).
+        from loguru import logger
+
+        from media_preview_generator.nodes.server import nodelog
+
+        read = start("DEBUG")
+        with logger.contextualize(**{nodelog.HELD_EXTRA: True}):
+            logger.warning("Checking NVIDIA GPU 0, held back")
+        logger.warning("an ordinary line")
+
+        for text in read():
+            assert "held back" not in text and "an ordinary line" in text
+        assert _logging_mod.HELD == nodelog.HELD_EXTRA
 
     def test_a_per_file_job_log_line_is_written_when_the_app_logs_at_debug(self, start):
         from media_preview_generator.markers.job_log import write_line

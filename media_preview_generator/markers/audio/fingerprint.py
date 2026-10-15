@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from loguru import logger
 
+from ...utils import dies_with_node
 from ..freeze import Freeze
 from ..fs import gone_from_disk
 from ..locks import KeyedLocks
@@ -409,13 +410,15 @@ def _run_fingerprint(
             command = fingerprint_command(
                 ffmpeg, path, length_s, retime, progress_fd=progress_pipe[1], audio_stream=audio_stream
             )
+        run_args, preexec = dies_with_node(command)  # a node's FFmpeg dies with the node
         # Its own session, so a pause stops ffmpeg's whole group and never the app's.
         proc = subprocess.Popen(
-            command,
+            run_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
             pass_fds=() if progress_pipe is None else (progress_pipe[1],),
+            preexec_fn=preexec,
         )
     except BaseException:
         _close_fds(progress_pipe)
@@ -605,8 +608,13 @@ def ensure_fingerprint(
         if skip is not None and skip():
             raise FingerprintSkippedError(f"Not fingerprinting {name} again yet")
         _raise_if_stalled(name)
+        from ...nodes import remote_ops
+        from ...nodes.executor import current_placement
+
+        # A remote worker fingerprints on its node; the lock, the cache and the store stay here.
+        compute = remote_ops.compute_fingerprint if current_placement() else compute_fingerprint
         try:
-            points = compute_fingerprint(
+            points = compute(
                 rec.canonical_path,
                 rec.duration_ms,
                 ffmpeg=ffmpeg,

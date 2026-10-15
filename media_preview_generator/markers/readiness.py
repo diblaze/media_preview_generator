@@ -54,72 +54,109 @@ TAG_ROW_TOOLTIP = "Plex builds this list the first time it finds a marker itself
 
 LOCAL_DB_LABEL = "Plex's library database isn't on this machine"
 LOCAL_DB_LABEL_OK = "Plex's library database is on this machine"
-LOCAL_DB_REASON = "Run the Plex marker agent next to Plex, or run this app on the same machine as Plex."
+LOCAL_DB_REASON = "Add a Plex database node on the Plex machine, or run this app on the same machine as Plex."
 LOCAL_DB_TOOLTIP = (
-    "Markers go straight into Plex's database, so this app must run on the Plex machine, or reach it through the agent."
+    "Markers go straight into Plex's database, so this app must run on the Plex machine, or reach it through a Plex "
+    "database node."
 )
 # With an agent the check ran on ITS machine, so the row can't say "this machine" — the app is already where it
 # belongs, and the advice above would tell the user to move the one thing the agent exists to avoid moving.
-LOCAL_DB_LABEL_AGENT = "The Plex marker agent isn't on the machine with Plex's database"
-LOCAL_DB_LABEL_AGENT_OK = "The Plex marker agent is on the machine with Plex's database"
-LOCAL_DB_REASON_AGENT = (
-    "Run the Plex marker agent on the Plex machine, with Plex's config folder mounted from a local disk."
-)
-LOCAL_DB_CURRENT_AGENT = "the agent's machine"
+LOCAL_DB_LABEL_AGENT = "The Plex database node isn't on the machine with Plex's database"
+LOCAL_DB_LABEL_AGENT_OK = "The Plex database node is on the machine with Plex's database"
+LOCAL_DB_REASON_AGENT = "Run the Plex database node on the Plex machine, with Plex's config folder on a local disk."
+LOCAL_DB_CURRENT_AGENT = "the node's machine"
 LOCAL_DB_TOOLTIP_AGENT = (
-    "Markers go straight into Plex's database, so the Plex marker agent must run on the Plex machine with that "
+    "Markers go straight into Plex's database, so the Plex database node must run on the Plex machine with that "
     "machine's own copy of Plex's config folder."
 )
 LOCAL_DB_TODO = (
-    "<p><strong>What to do:</strong> run this app on the Plex machine, or run the Plex marker agent next to "
+    "<p><strong>What to do:</strong> run this app on the Plex machine, or add a Plex database node beside "
     "Plex. Everything else about this server keeps working either way.</p>"
 )
 LOCAL_DB_TODO_AGENT = (
-    "<p><strong>What to do:</strong> the Plex marker agent already does this write for you, so this app can "
-    "stay where it is. Run the agent's container on the Plex machine and mount Plex's config folder into it "
-    "from one of that machine's own disks. Everything else about this server keeps working either way.</p>"
+    "<p><strong>What to do:</strong> the Plex database node already does this write for you, so this app can "
+    "stay where it is. Run the node on the Plex machine with Plex's config folder on one of that machine's own "
+    "disks (in Docker, mount it from one). Everything else about this server keeps working either way.</p>"
 )
 
-AGENT_LABEL_OK = "The Plex marker agent is connected"
+# Any other refusal by the capability check (the database not found or not writable, a layout this app doesn't know,
+# Plex not answering): the check's own message is the reason, since no other row explains it.
+DB_REFUSED_LABEL = "Plex's database can't take markers"
+DB_REFUSED_REASON = "Markers aren't written until this is fixed. The Intro & Credits tab says why."
+DB_REFUSED_TOOLTIP = "Markers go straight into Plex's database. This is what the check found when it tried it."
+DB_REFUSED_EXPLANATION = (
+    "<p><strong>What it checks:</strong> that Plex's library database can be found and written, and that this app "
+    "knows its layout.</p>"
+    "<p><strong>Why it matters:</strong> while the check refuses it, every Intro &amp; Credits file is skipped with "
+    "this message and nothing reaches Plex.</p>"
+)
+
+AGENT_LABEL_OK = "The Plex database node is connected"
 AGENT_RECOMMENDED = "connected"
 AGENT_TOOLTIP = (
-    "A Plex on another machine is written by the Plex marker agent running beside it; without it, no marker reaches "
-    "this server."
+    "A Plex on another machine is written by the Plex database node running beside it; without it, no marker "
+    "reaches this server."
 )
 # Connection state (``publishers.plex_remote.AGENT_*``) → this row's label, ``current`` and reason. An unknown state
 # reads as "can't be reached", the same fallback the Edit tab's badge uses (``markers_server_tab.js AGENT_BADGES``).
 AGENT_STATES: dict[str, tuple[str, str, str]] = {
     "unreachable": (
-        "The Plex marker agent isn't answering",
+        "The Plex database node isn't answering",
         "can't be reached",
         "Markers wait here until it answers again. Nothing is lost.",
     ),
     "rejected": (
-        "The Plex marker agent refused this app's key",
+        "The Plex database node refused this app's key",
         "key refused",
-        "Set the same shared key on the agent and in the Intro & Credits tab.",
+        "Set the same key on the node and on the Nodes page.",
     ),
     "incompatible": (
-        "The Plex marker agent and this app are different versions",
+        "The Plex database node and this app are different versions",
         "version mismatch",
         "The Intro & Credits tab says which of the two to update.",
     ),
+    "no_role": (
+        "The chosen node doesn't have its Plex database role turned on",
+        "role off",
+        "Start that node with the Plex database role (NODE_ROLES=worker,plex_db), or choose another node in "
+        "Edit → Connection.",
+    ),
+    # This app refused to send anything (``plex_remote.node_refusal``).
+    "disabled": (
+        "The Plex database node is turned off",
+        "turned off",
+        "Turn it back on in the Nodes page, then run Intro & Credits again: nothing is written to Plex while it is off.",
+    ),
+    "no_node": (
+        "This server's Plex database node isn't on the Nodes page",
+        "no node",
+        "Choose a Plex database node in Edit → Connection.",
+    ),
+    "unconfirmed_node": (
+        "The Plex database node reports a new id",
+        "not confirmed",
+        "Type the node's key again on its Settings tab on the Nodes page to confirm it is the same Plex.",
+    ),
 }
 AGENT_FALLBACK_STATE = "unreachable"
+# States where this app refused to send anything: the fix is in this app (the Nodes page, Edit → Connection), not on
+# the node's machine.
+AGENT_FIXED_IN_APP = frozenset({"disabled", "no_node", "unconfirmed_node"})
 # Connected, and refused anyway: the agent is beside a different Plex than this server (a mistyped address).
 AGENT_WRONG_PLEX = (
-    "The Plex marker agent is beside a different Plex",
+    "The Plex database node is beside a different Plex",
     "wrong Plex server",
-    "Check its address in the Intro & Credits tab: markers would have gone into the wrong database.",
+    "Check which node this server uses in Edit → Connection: markers would have gone into the wrong database.",
 )
 AGENT_EXPLANATION = (
-    "<p><strong>What it checks:</strong> whether the Plex marker agent running beside Plex answers this app.</p>"
+    "<p><strong>What it checks:</strong> whether the Plex database node running beside Plex answers this app.</p>"
     "<p><strong>Why it matters:</strong> Plex has no API for intro and credits markers, so they are written "
     "into its database — which only works from the machine that database is on. When Plex is on another "
-    "machine, the agent is the only way in, and while it isn't answering no marker reaches this server at "
+    "machine, the Plex database node is the only way in, and while it isn't answering no marker reaches this "
+    "server at "
     "all.</p>"
     "<p><strong>Nothing is lost:</strong> markers stay in this app. The next Intro &amp; Credits run sends "
-    "them as soon as the agent answers again.</p>"
+    "them as soon as the node answers again.</p>"
 )
 
 # Plex's names for its settings: each library's own (Edit library → Advanced) and the server-wide ones (Settings →
@@ -229,6 +266,7 @@ class MarkerFacts:
         state: The :class:`~media_preview_generator.markers.publishers.base.Capability` value the check
             returned, or ``"unknown"``.
         details: That report's ``details`` — the facts the rows below are read from.
+        message: That report's message, for a refusal no other row explains.
         keep_plex: Whether this Plex server is set to "Keep Plex's" (``on_plex_redetect``).
         libraries: ``(id, name)`` of each library in this server's Intro & Credits selection, in order.
         library_detection: Each library's own "Intro markers" / "Credits markers" settings, as
@@ -239,6 +277,7 @@ class MarkerFacts:
     enabled: bool | None
     state: str = _UNKNOWN_STATE
     details: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
     keep_plex: bool = False
     libraries: tuple[tuple[str, str], ...] = ()
     library_detection: dict[str, dict[str, Any]] | None = None
@@ -418,6 +457,7 @@ def marker_facts(server: Any, config: ServerConfig | None) -> MarkerFacts:
         enabled=bool(payload.get("enabled")),
         state=str(capability.get("state") or _UNKNOWN_STATE),
         details=dict(details) if isinstance(details, dict) else {},
+        message=str(capability.get("message") or ""),
     )
     if config.type is not ServerType.PLEX:
         return facts
@@ -576,7 +616,7 @@ def agent_check(facts: MarkerFacts) -> dict[str, Any] | None:
         current=current,
         recommended=AGENT_RECOMMENDED,
         reason=reason,
-        fix_where="agent",
+        fix_where="app" if state in AGENT_FIXED_IN_APP and not ok else "agent",
     )
 
 
@@ -677,6 +717,23 @@ def plex_section(facts: MarkerFacts) -> dict[str, Any] | None:
                 recommended=here,
                 reason=None if local_db else reason,
                 fix_where="agent" if facts.agent is not None else None,
+            )
+        )
+
+    # A busy database is "can't tell" (asked again on the next run), not a refusal.
+    refused = facts.state not in (Capability.READY.value, _UNKNOWN_STATE) and not facts.details.get("db_busy")
+    if refused and not any(c["ok"] is False and c["severity"] == CRITICAL for c in checks):
+        checks.append(
+            _row(
+                "markers_plex_db",
+                DB_REFUSED_LABEL,
+                severity=CRITICAL,
+                ok=False,
+                tooltip=DB_REFUSED_TOOLTIP,
+                explanation=DB_REFUSED_EXPLANATION,
+                reason=facts.message or DB_REFUSED_REASON,
+                # The database, its folder and the user writing it are set where the check ran.
+                fix_where="agent" if facts.agent is not None else "app",
             )
         )
 

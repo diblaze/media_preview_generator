@@ -6,20 +6,29 @@ scheduling: workers focus on the highest-priority active job and only spill
 over to the next job when the current job's queue is empty.
 """
 
+import itertools
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from functools import partial
-from typing import Any, cast, overload
+from typing import Any, NamedTuple, cast, overload
 
 from loguru import logger
 
 from ..config import Config
 from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_outcome, outcome_value
+from ..nodes.executor import REQUEUE_NODE_NOT_STARTED, REQUEUE_NODE_UNAVAILABLE, NodeRequeue
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
-from .worker import JOB_LOG_SKIP, Worker, WorkerPool
+from .node_members import (
+    EMPTY_NODE_HARDWARE,
+    NodeHardware,
+    checked_ready_since_drop,
+    note_waiting_for_nodes,
+    worker_node_id,
+)
+from .worker import JOB_LOG_SKIP, Worker, WorkerPool, logging_for_job
 
 _submission_counter_lock = threading.Lock()
 _submission_counter = 0
@@ -33,6 +42,32 @@ WAITING_FOR_WORKER = "Waiting for a free worker"
 # Kinds with a check_share < 1 together hold at most this share of the checking threads, so with Intro & Credits and
 # loudness both scanning, a quarter is still free for preview checks.
 CAPPED_KINDS_SHARE = 0.75
+# A file whose node drops it this many times fails instead of going back in the queue (spec §6).
+MAX_NODE_DROPS = 2
+# A start the node never took doesn't count as a drop, but a node that answers its health check while refusing every
+# task must not keep a file in the queue forever. Such a start counts toward this only once no worker off the nodes
+# that failed the file's start runs its kind: while one does, the file waits for it rather than failing for a node's
+# outage.
+MAX_NODE_START_FAILURES = 5
+# After a node fails to start it, a file waits this long (doubling with each of its starts that node failed, at most
+# NODE_START_RETRY_MAX_S) before it goes back to that node, though any other worker may take it meanwhile: the node's
+# health check reads only /v1/info, which may answer while its starts fail, so it can't lift this wait.
+NODE_START_RETRY_S = 1.0
+NODE_START_RETRY_MAX_S = 30.0
+# How far down a job's queue the dispatcher looks for a file a free worker may run, when files at the front can't run
+# on that worker's node.
+EXCLUDED_SCAN_LIMIT = 64
+# How often the dispatch loop works out why a job's queued files all wait for workers that are away.
+NODE_WAIT_CHECK_S = 1.0
+
+
+class StartWait(NamedTuple):
+    """A node that failed a file's start: its name, how many of the file's starts it failed, and when the file may go
+    back to it (monotonic seconds)."""
+
+    node_name: str
+    failures: int
+    retry_at: float
 
 
 def _next_submission_order() -> int:
@@ -112,12 +147,39 @@ class JobTracker:
         self.active_checks = 0
         self.active_processing = 0
         self.check_queue: deque = deque(items)
+        # Checking threads append to its right end without a lock, so the dispatch loop never iterates it directly.
+        # The dispatch loop takes files out of it under ``_counts_lock``, because ``cancel`` clears it from a web
+        # thread under that lock (see ``JobDispatcher._claim_worker``), and puts files back at its left end.
         self.item_queue: deque = deque()
+        # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
+        # the name of the node behind each drop, how many of its never-taken starts counted toward
+        # ``MAX_NODE_START_FAILURES``, the node that last did either (its retry goes elsewhere when it can), and the
+        # nodes (id -> name) that can't see it.
+        self.node_drops: dict[str, list[str]] = {}
+        self.node_start_failures: dict[str, int] = {}
+        # Each node that failed a file's start (path -> node id -> its wait), so the file's retry avoids every node
+        # whose wait hasn't run out, not only the last one. Not checkpointed: a resumed file starts with no waits.
+        self.start_waits: dict[str, dict[str, StartWait]] = {}
+        self.dropped_on: dict[str, str] = {}
+        self.excluded_nodes: dict[str, dict[str, str]] = {}
+        # A dropped file handed back to the node that dropped it (path -> node id), and one that node dropped again
+        # while a worker elsewhere runs its kind: that drop isn't counted, and the file waits for a worker elsewhere
+        # from then on (a node that passes its idle checks but drops files under load would fail every file).
+        self.sent_back: dict[str, str] = {}
+        self.stays_off: dict[str, str] = {}
+        # Why every queued file waits for workers that are away (outside their hours, offline, still connecting) while
+        # nothing of the job runs, else "": the kind still has open capacity on the nodes that can't see the files, so
+        # the job never parks. Set by the dispatch loop (``JobDispatcher._node_wait``), read by the banner.
+        self.node_wait = ""
+        self.node_wait_checked_at = 0.0
         self.total_items = len(items)
         self.successful = 0
         self.failed = 0
         # Which files failed, so a multi-path webhook retries those and not the first N (guarded by _counts_lock).
         self.failed_paths: list[str] = []
+        # The failed files whose node couldn't run them (dropped them, never started them, or can't see them), with
+        # why: a webhook job words them as the node's failure, never as "not found on any server" (_counts_lock).
+        self.node_failures: dict[str, str] = {}
         self.cancelled = False
         if handlers is not None:
             self.outcome_counts: dict[str, int] = {key: 0 for key in handlers.outcome_keys}
@@ -189,6 +251,12 @@ class JobTracker:
             self.successful = int(carried_state.get("successful", 0))
             self.failed = int(carried_state.get("failed", 0))
             self.failed_paths = list(carried_state.get("failed_paths", []))
+            self.node_failures = dict(carried_state.get("node_failures", {}))
+            # Older snapshots have none of these: their files start with no node tries counted.
+            self.node_drops = {path: list(names) for path, names in carried_state.get("node_drops", {}).items()}
+            self.node_start_failures = dict(carried_state.get("node_start_failures", {}))
+            self.dropped_on = dict(carried_state.get("dropped_on", {}))
+            self.excluded_nodes = {path: dict(nodes) for path, nodes in carried_state.get("excluded_nodes", {}).items()}
             self.outcome_counts.update(carried_state.get("outcome_counts", {}))
             self.publishers_aggregate = dict(carried_state.get("publishers_aggregate", {}))
             self.cpu_fallback_files = int(carried_state.get("cpu_fallback_files", 0))
@@ -223,6 +291,7 @@ class JobTracker:
         worker_display_name: str = "",
         title: str = "",
         canonical_path: str = "",
+        node_failure: str = "",
     ) -> None:
         """Record a completed item and fire per-job callbacks.
 
@@ -231,6 +300,7 @@ class JobTracker:
             worker_display_name: Display name of the worker for logging.
             title: Media title for logging.
             canonical_path: The item's file, recorded in ``failed_paths`` when it failed.
+            node_failure: Why its node couldn't run it, when that is why it failed (kept in ``node_failures``).
 
         """
         # Increment under the lock and capture the post-increment completion
@@ -242,6 +312,8 @@ class JobTracker:
                 self.failed += 1
                 if canonical_path:
                     self.failed_paths.append(canonical_path)
+                    if node_failure:
+                        self.node_failures[canonical_path] = node_failure
             is_done = (self.successful + self.failed) >= self.total_items
 
         # A raising callback must never prevent done_event.set() below — that
@@ -315,14 +387,17 @@ class JobTracker:
             completed: The count to show, so the text matches the count sent beside it; the live count when omitted.
 
         Returns:
-            E.g. "Waiting for a free worker", "Checking existing previews… 3/10", "Looking up markers… 3/10" or
-            "3/10 completed".
+            E.g. "Waiting for a free worker", "Checking existing previews… 3/10", "Looking up markers… 3/10",
+            "3/10 completed" or, while every file left waits for a node that is away, "Waiting for a node — nuc:
+            node offline".
         """
         if completed is None:
             completed = self.completed
         if not self.work_started:
             return f"{self.library_prefix}{WAITING_FOR_WORKER}"
         if self.generation_started:
+            if self.node_wait:
+                return f"{self.library_prefix}{self.node_wait}"
             return f"{self.library_prefix}{completed}/{self.total_items} completed"
         check_label = self.handlers.check_label if self.handlers else "Checking existing previews…"
         return f"{self.library_prefix}{check_label} {completed}/{self.total_items}"
@@ -528,14 +603,82 @@ class JobTracker:
         """Return the per-job result dict: counts, failed paths, cancelled flag and outcome counts."""
         with self._counts_lock:
             failed_paths = list(self.failed_paths)
+            node_failures = dict(self.node_failures)
         return {
             "completed": self.successful,
             "failed": self.failed,
             "failed_paths": failed_paths,
+            "node_failures": node_failures,
             "total": self.total_items,
             "cancelled": self.cancelled,
             "outcome": dict(self.outcome_counts),
         }
+
+
+def _starts_failure(names: list[str], last_try: str) -> str:
+    """Why a file fails whose start its nodes kept failing, naming each of them, and the last try's reason.
+
+    Args:
+        names: The nodes that failed its start, in the order they first did.
+        last_try: The last failed start's message: the node's own words (its temp folder filling up, say) say what to
+            fix.
+    """
+    if len(names) == 1:
+        why = f"node {names[0]} unavailable (it couldn't start the file {MAX_NODE_START_FAILURES} times)"
+    else:
+        why = f"nodes {', '.join(names[:-1])} and {names[-1]} unavailable (none of them could start the file)"
+    return f"{why}. Last try: {last_try}"
+
+
+def _drops_failure(names: list[str]) -> str:
+    """Why a file the nodes kept dropping fails, naming each node behind a drop.
+
+    Args:
+        names: The node behind each drop, in order (``MAX_NODE_DROPS`` of them); "" for a drop a checkpoint from an
+            earlier build counted without its node.
+    """
+    nodes = list(dict.fromkeys(name for name in names if name))
+    if not nodes:
+        return "nodes unavailable (they dropped the file twice)"
+    if "" in names:
+        nodes.append("an earlier one")
+    if len(nodes) == 1:
+        return f"node {nodes[0]} unavailable (it dropped the file twice)"
+    return f"nodes {', '.join(nodes[:-1])} and {nodes[-1]} unavailable (each dropped the file once)"
+
+
+def _queue_head(queue: deque) -> list:
+    """Copy the first EXCLUDED_SCAN_LIMIT queued files.
+
+    Checking threads append to the queue's right end without a lock, and even a copy made in C can be interrupted
+    (a garbage collection running finalizers lets another thread in), raising "deque mutated during iteration". An
+    append never moves the head, so copying again is always right. A cancel can clear the queue after the copy, so
+    a delete by the copy's index checks the file is still there first (``_take_queued``).
+    """
+    while True:
+        try:
+            return list(itertools.islice(queue, EXCLUDED_SCAN_LIMIT))
+        except RuntimeError:
+            continue
+
+
+def _take_queued(tracker: JobTracker, index: int | None, item: Any = None) -> Any:
+    """Take a file off ``tracker.item_queue``: the first one (``index`` None), or ``item`` when it is still at ``index``.
+
+    Under the tracker's ``_counts_lock``, which ``JobTracker.cancel`` clears the queue under: a cancel landing after
+    the caller looked at the queue leaves nothing to take, and appends never move a file's index.
+
+    Returns:
+        The file taken, or None when it is no longer there.
+    """
+    queue = tracker.item_queue
+    with tracker._counts_lock:
+        if index is None:
+            return queue.popleft() if queue else None
+        if index < len(queue) and queue[index] is item:
+            del queue[index]
+            return item
+        return None
 
 
 class JobDispatcher:
@@ -760,6 +903,11 @@ class JobDispatcher:
                             "successful": tracker.successful,
                             "failed": tracker.failed,
                             "failed_paths": tracker.failed_paths,
+                            "node_failures": tracker.node_failures,
+                            "node_drops": tracker.node_drops,
+                            "node_start_failures": tracker.node_start_failures,
+                            "dropped_on": tracker.dropped_on,
+                            "excluded_nodes": tracker.excluded_nodes,
                             "outcome_counts": tracker.outcome_counts,
                             "publishers_aggregate": tracker.publishers_aggregate,
                             "cpu_fallback_files": tracker.cpu_fallback_files,
@@ -921,7 +1069,10 @@ class JobDispatcher:
             with self._trackers_lock:
                 tracker = self._trackers.get(job_id) if job_id else None
 
-            if tracker and not tracker.done_event.is_set():
+            requeue = getattr(worker, "last_task_requeue", None)
+            if tracker and not tracker.done_event.is_set() and isinstance(requeue, NodeRequeue):
+                self._requeue_or_fail(worker, tracker, worker.current_item, requeue)
+            elif tracker and not tracker.done_event.is_set():
                 success = worker.last_task_succeeded()
                 # The worker is already idle, so a merge error that skipped record_completion would leave
                 # tracker.wait() blocked forever.
@@ -952,6 +1103,97 @@ class JobDispatcher:
             # Retire deferred-removal workers
             self.worker_pool._retire_idle_worker_if_scheduled(worker)
         return reaped
+
+    def _requeue_or_fail(self, worker: Worker, tracker: JobTracker, item, requeue: NodeRequeue) -> None:
+        """Put a file a remote worker gave back at the front of its job's queue, or fail it (spec §6).
+
+        A node that dropped the file sends it back once; a second drop fails it, except a drop on the node the file
+        was handed back to only because no worker elsewhere was free, while one runs its kind: that one isn't counted
+        and the file then waits for a worker elsewhere. A start the node never took doesn't count as a drop; it counts
+        toward ``MAX_NODE_START_FAILURES`` only once no worker off the nodes that failed the file's start runs its
+        kind, and the file goes back to each of those nodes only after ``NODE_START_RETRY_S``, doubled for each start
+        that node failed. Either way the node gets no new file until it checks ready
+        again, and this file's retry prefers another node or this app. A node that can't see it is left out for that
+        file and it goes back for another worker; once no configured worker outside the nodes that can't see it
+        remains, it fails. The file goes back on the queue and ``active_processing`` drops together under
+        ``_trackers_lock``, so a parking snapshot never misses the file.
+
+        Args:
+            worker: The worker that gave it back.
+            tracker: Its job.
+            item: The :class:`ProcessableItem`.
+            requeue: Why.
+        """
+        path = item.canonical_path
+        failure: str | None = None
+        dropped = requeue.reason in (REQUEUE_NODE_UNAVAILABLE, REQUEUE_NODE_NOT_STARTED)
+        if dropped:
+            self.worker_pool.mark_node_suspect(requeue.node_id)
+        with self._trackers_lock:
+            if dropped:
+                tracker.dropped_on[path] = requeue.node_id
+            sent_back = tracker.sent_back.pop(path, None) == requeue.node_id
+            if (
+                requeue.reason == REQUEUE_NODE_UNAVAILABLE
+                and sent_back
+                and self.worker_pool.runs_kind_outside(
+                    tracker.kind, {*tracker.excluded_nodes.get(path, {}), requeue.node_id}
+                )
+            ):
+                tracker.stays_off[path] = requeue.node_id
+            elif requeue.reason == REQUEUE_NODE_UNAVAILABLE:
+                drops = tracker.node_drops.setdefault(path, [])
+                drops.append(requeue.node_name)
+                if len(drops) >= MAX_NODE_DROPS:
+                    failure = _drops_failure(drops)
+            elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
+                waits = tracker.start_waits.setdefault(path, {})
+                earlier = waits.get(requeue.node_id)
+                tries = earlier.failures + 1 if earlier else 1
+                wait_s = min(NODE_START_RETRY_S * 2 ** (tries - 1), NODE_START_RETRY_MAX_S)
+                waits[requeue.node_id] = StartWait(requeue.node_name, tries, time.monotonic() + wait_s)
+                # A worker off those nodes that runs its kind takes the file once it's free, so this try cost nothing.
+                if not self.worker_pool.runs_kind_outside(
+                    tracker.kind, {*tracker.excluded_nodes.get(path, {}), *waits}
+                ):
+                    starts = tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
+                    if starts >= MAX_NODE_START_FAILURES:
+                        failure = _starts_failure([wait.node_name for wait in waits.values()], requeue.message)
+            else:
+                excluded = tracker.excluded_nodes.setdefault(path, {})
+                excluded[requeue.node_id] = requeue.node_name
+                if not self.worker_pool.can_run_outside(tracker.kind, excluded):
+                    failure = self._not_visible_failure(tracker.kind, excluded)
+            if failure is None:
+                tracker.item_queue.appendleft(item)
+                tracker.active_processing = max(0, tracker.active_processing - 1)
+        title = worker.media_title or path
+        try:
+            with logging_for_job(tracker.job_id):
+                if failure is None:
+                    logger.info("{} goes back in the queue for another try ({})", title, requeue.message)
+                else:
+                    logger.warning("{} failed: {}", title, failure)
+        except Exception as exc:  # a log line must never strand the file
+            logger.debug("Dispatcher: couldn't log the requeue of {}: {}", path, exc)
+        if failure is None:
+            return
+        try:
+            self._record_failed_item(tracker, item, worker.display_name, failure, node_failure=True)
+        finally:
+            with self._trackers_lock:
+                tracker.active_processing = max(0, tracker.active_processing - 1)
+
+    def _not_visible_failure(self, kind: str, excluded: dict[str, str]) -> str:
+        """Why a file fails that no node left can see: the nodes that can't, and any that need someone to act first.
+
+        Args:
+            kind: The job kind.
+            excluded: Node id -> name of the nodes that can't see the file.
+        """
+        failure = f"not visible on {', '.join(excluded.values())}"
+        stuck = self.worker_pool.stuck_node_members(kind, excluded)
+        return f"{failure}; no other worker can take it: {', '.join(stuck)}" if stuck else failure
 
     def _merge_worker_outcome(self, worker: Worker, tracker: JobTracker) -> None:
         """Merge the latest outcome delta from a worker into the tracker.
@@ -1001,6 +1243,117 @@ class JobDispatcher:
 
     def _assign_tasks(self) -> None:
         """Reserve a compatible job and slot together under a fixed lock order."""
+        stranded: list[tuple[JobTracker, Any, str]] = []
+        self.worker_pool.refresh_suspect_nodes()
+        back_nodes = self._nodes_back_since_drop()
+        try:
+            self._assign_tasks_locked(stranded, back_nodes)
+        finally:
+            # Failed outside the locks: completion runs the job's callbacks.
+            for tracker, item, reason in stranded:
+                try:
+                    self._record_failed_item(tracker, item, "", reason, node_failure=True)
+                finally:
+                    with self._trackers_lock:
+                        tracker.active_processing = max(0, tracker.active_processing - 1)
+
+    def _nodes_back_since_drop(self) -> frozenset[str]:
+        """The nodes behind a queued file's drop that a registry check begun since found ready.
+
+        The others are checked soon: queued files they dropped can wait for them, and an offline node's back-off (up to
+        five minutes) would hold those files up after it is back. Asked of the registry before the dispatcher's and
+        pool's locks are taken, like the pool's suspect hold.
+        """
+        with self._trackers_lock:
+            dropped = {node for t in self._trackers.values() if t.item_queue for node in t.dropped_on.values()}
+            waiting = {
+                node
+                for t in self._trackers.values()
+                if t.dropped_on
+                for item in _queue_head(t.item_queue)
+                if (node := t.dropped_on.get(item.canonical_path)) is not None
+            }
+        back = frozenset(node for node in dropped if checked_ready_since_drop(node))
+        if waiting - back:
+            note_waiting_for_nodes(waiting - back)
+        return back
+
+    def _claim_worker(
+        self, tracker: JobTracker, stranded: list, back_nodes: Collection[str] = ()
+    ) -> tuple[Worker, Any] | None:
+        """Claim a free worker and the first queued file of the job it may run; the caller holds both locks.
+
+        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped goes to
+        a free worker elsewhere first. Until that node checks ready again, it waits for a worker elsewhere while one
+        runs its kind now (busy or not), and goes back to that node only when none does
+        (``WorkerPool.runs_kind_outside``). Once the node has checked ready, it goes back there when no worker
+        elsewhere is free. A file goes to no node that failed its start until that node's wait (``start_waits``) has
+        run out. One that no configured worker can run any more is taken off the queue into ``stranded``
+        (counted in ``active_processing`` until it is failed). A worker claimed for a file a cancel has since cleared
+        off the queue is given back.
+
+        Args:
+            tracker: The job.
+            stranded: Collects ``(tracker, item, reason)`` to fail once the locks are released.
+            back_nodes: The nodes that checked ready since they last dropped a file (:meth:`_nodes_back_since_drop`).
+
+        Returns:
+            The claimed worker and the file, or None.
+        """
+        pool = self.worker_pool
+        if not tracker.excluded_nodes and not tracker.dropped_on:
+            worker = pool._find_available_worker(claim=True, kind=tracker.kind)
+            if worker is None:
+                return None
+            item = _take_queued(tracker, None)
+            if item is None:
+                worker.is_busy = False
+                return None
+            return worker, item
+        head = _queue_head(tracker.item_queue)
+        now = time.monotonic()
+        for index, item in enumerate(head):
+            excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
+            dropped_on = tracker.dropped_on.get(item.canonical_path)
+            waits = tracker.start_waits.get(item.canonical_path) or {}
+            waiting = {node for node, wait in waits.items() if wait.retry_at > now}
+            worker = None
+            if dropped_on is not None:
+                avoid = {*excluded, dropped_on}
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid | waiting)
+                back = dropped_on in back_nodes and tracker.stays_off.get(item.canonical_path) != dropped_on
+                if worker is None and (
+                    dropped_on in waiting or (not back and pool.runs_kind_outside(tracker.kind, avoid))
+                ):
+                    # Back on a node that hasn't answered since it dropped the file, a second drop fails it. The free
+                    # worker there takes a later file instead. Once the node has checked ready, a busy worker elsewhere
+                    # isn't waited for: it can stay busy for hours (a long film, a file its job's schedule froze),
+                    # unless the node dropped the file again when it was handed back (``stays_off``). A file whose
+                    # start a node just failed waits out that node's wait whatever its check says.
+                    continue
+            if worker is None:
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes={*excluded, *waiting})
+            if worker is not None:
+                if _take_queued(tracker, index, item) is None:
+                    worker.is_busy = False
+                    return None
+                if dropped_on is not None and worker.node_id == dropped_on:
+                    tracker.sent_back[item.canonical_path] = dropped_on
+                else:
+                    tracker.sent_back.pop(item.canonical_path, None)
+                return worker, item
+            if not excluded and not waiting:
+                return None  # no free worker for this kind at all
+            if excluded and not pool.can_run_outside(tracker.kind, excluded):
+                if _take_queued(tracker, index, item) is None:
+                    return None
+                tracker.active_processing += 1
+                stranded.append((tracker, item, self._not_visible_failure(tracker.kind, excluded)))
+                return None
+        return None
+
+    def _assign_tasks_locked(self, stranded: list, back_nodes: Collection[str] = ()) -> None:
+        """:meth:`_assign_tasks`'s loop; files no worker can run any more go to ``stranded``."""
         self.worker_pool._apply_deferred_removals()
         while True:
             # Pause/cancel callbacks may read settings or job-manager state.
@@ -1028,16 +1381,17 @@ class JobDispatcher:
                     )
                     chosen = None
                     for tracker in eligible:
-                        worker = self.worker_pool._find_available_worker(claim=True, kind=tracker.kind)
-                        if worker is not None:
-                            chosen = (tracker, worker)
+                        claimed = self._claim_worker(tracker, stranded, back_nodes)
+                        if claimed is not None:
+                            chosen = (tracker, *claimed)
                             break
                     if chosen is None:
                         return
-                    tracker, worker = chosen
-                    item = tracker.item_queue.popleft()
+                    tracker, worker, item = chosen
                     tracker.active_processing += 1
                     tracker.generation_started = True
+                    # Its last wait message is stale now; the next check, up to NODE_WAIT_CHECK_S away, would be late.
+                    tracker.node_wait = ""
                     self._stamp_pick(tracker)
                     progress_callback = partial(self.worker_pool._update_worker_progress, worker)
                     try:
@@ -1078,8 +1432,6 @@ class JobDispatcher:
             item: The :class:`ProcessableItem`.
             exc: What ``assign_task`` raised (a thread that couldn't start).
         """
-        from ..processing.generator import _notify_file_result, failure_scope
-
         reason = f"{worker.display_name} couldn't start on this file ({type(exc).__name__}: {exc})"
         logger.error(
             "Dispatch: {} couldn't start {!r} (job {}): {}: {}; counting it as failed",
@@ -1093,22 +1445,39 @@ class JobDispatcher:
         if not (worker.current_thread and worker.current_thread.is_alive()):
             worker.current_task = None
             worker.is_busy = False
+        self._record_failed_item(tracker, item, worker.display_name, reason)
+
+    def _record_failed_item(
+        self, tracker: JobTracker, item, worker_display_name: str, reason: str, *, node_failure: bool = False
+    ) -> None:
+        """Count an item the dispatcher itself failed: its outcome, its Files-panel row, its completion.
+
+        Args:
+            tracker: The item's job.
+            item: The :class:`ProcessableItem`.
+            worker_display_name: The worker it was with ("" when none).
+            reason: The row's reason.
+            node_failure: It failed because its node couldn't run it (``reason`` says how).
+        """
+        from ..processing.generator import _notify_file_result, failure_scope
+
         failed = ProcessingResult.FAILED.value
         with tracker._counts_lock:
             tracker.outcome_counts[failed] = tracker.outcome_counts.get(failed, 0) + 1
         try:
             with failure_scope(tracker.job_id):
                 _notify_file_result(
-                    item.canonical_path, cast(ProcessingResult, outcome_value(failed)), reason, worker.display_name
+                    item.canonical_path, cast(ProcessingResult, outcome_value(failed)), reason, worker_display_name
                 )
         except Exception as notify_exc:
-            logger.warning("Could not record the failed start of {}: {}", item.canonical_path, notify_exc)
+            logger.warning("Could not record the failure of {}: {}", item.canonical_path, notify_exc)
         finally:
             tracker.record_completion(
                 False,
-                worker.display_name,
+                worker_display_name,
                 getattr(item, "title", "") or item.canonical_path,
                 canonical_path=item.canonical_path,
+                node_failure=reason if node_failure else "",
             )
 
     def _get_next_check_item(self):
@@ -1265,7 +1634,7 @@ class JobDispatcher:
 
         from ..processing.generator import failure_scope
         from ..processing.multi_server import MultiServerStatus, process_canonical_path
-        from .worker import register_job_thread, resolve_per_item_pin
+        from .worker import register_job_thread, resolve_per_item_pin, resolve_per_item_regenerate
 
         # Register under the job so the per-job log captures the check's
         # Dispatch / Owners-resolved lines (mirrors the processing worker).
@@ -1288,7 +1657,7 @@ class JobDispatcher:
                     progress_callback=None,
                     cancel_check=tracker.is_cancelled,
                     server_id_filter=per_item_pin,
-                    regenerate=bool(getattr(tracker.config, "regenerate_thumbnails", False)),
+                    regenerate=resolve_per_item_regenerate(tracker.config, item),
                     check_only=True,
                 )
 
@@ -1402,8 +1771,57 @@ class JobDispatcher:
         """
         with self._trackers_lock:
             active = [t for t in self._trackers.values() if not t.done_event.is_set()]
+        now = time.monotonic()
         for tracker in active:
+            # Only nodes fill excluded_nodes and dropped_on, so without nodes nothing more runs here.
+            if not tracker.excluded_nodes and not tracker.dropped_on:
+                tracker.node_wait = ""
+            elif now - tracker.node_wait_checked_at >= NODE_WAIT_CHECK_S:
+                tracker.node_wait_checked_at = now
+                tracker.node_wait = self._node_wait(tracker)
             tracker.emit_progress(min_interval=3.0)
+
+    def _node_wait(self, tracker: JobTracker) -> str:
+        """Why the job's queued files all wait for workers that are away, or ``""`` when any of them can run now.
+
+        Each file some nodes can't see waits for a worker off those nodes. When nothing of the job runs and every
+        member left for each file is outside its hours, offline or still connecting, the job only waits for them. A
+        file a node dropped waits for that node until it checks ready again (``_claim_worker``).
+
+        Args:
+            tracker: The job.
+
+        Returns:
+            ``capacity_wait_message``'s wording for each distinct wait, joined by "; ", or "".
+        """
+        from .group_runtime import capacity_wait_message
+
+        with self._trackers_lock:
+            if tracker.active_processing or tracker.active_checks or tracker.check_queue:
+                return ""
+            waits: list[tuple[frozenset[str], str | None]] = []
+            for item in _queue_head(tracker.item_queue):
+                excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
+                dropped_on = tracker.dropped_on.get(item.canonical_path)
+                if not excluded and dropped_on is None:
+                    return ""
+                waits.append((frozenset(excluded), dropped_on))
+        # The pool lock only copies its snapshot, taken after the dispatcher's lock is released.
+        messages = []
+        for excluded_ids, dropped_on in dict.fromkeys(waits):
+            if dropped_on is not None and not checked_ready_since_drop(dropped_on):
+                note_waiting_for_nodes({dropped_on})
+                nodes = getattr(self.worker_pool, "_node_hardware", None)
+                name = nodes.node_name(dropped_on) if isinstance(nodes, NodeHardware) else dropped_on
+                messages.append(f"Waiting for a node — {name}: checking it again")
+                continue
+            if not excluded_ids:
+                return ""
+            capacity = self.worker_pool.capacity_outside(tracker.kind, excluded_ids)
+            if capacity is None or capacity["open"]:
+                return ""
+            messages.append(capacity_wait_message(capacity))
+        return "; ".join(dict.fromkeys(messages))
 
     def _get_in_progress_fraction(self, job_id: str) -> float:
         """Sum fractional progress of workers busy on a specific job.
@@ -1428,14 +1846,23 @@ class JobDispatcher:
         return fraction
 
     def _build_worker_statuses(self) -> list[dict]:
-        """Build the worker status list for the worker_callback."""
-        all_workers = self.worker_pool._snapshot_workers()
+        """Build the worker status list for the worker_callback.
 
-        type_counters: dict[str, int] = {}
+        A worker on a node is named ``"<node> · <label>"`` and numbered among that node's own workers, so this app's
+        labels stay the same whether or not nodes are in use. Each row carries ``node`` (``{"id", "name"}``, ``None``
+        for this app) and ``node_state`` (the node's registry state).
+        """
+        all_workers = self.worker_pool._snapshot_workers()
+        nodes = getattr(self.worker_pool, "_node_hardware", None)
+        if not isinstance(nodes, NodeHardware):
+            nodes = EMPTY_NODE_HARDWARE
+
+        type_counters: dict[tuple[str | None, str], int] = {}
         worker_type_index: dict[int, int] = {}
         for w in all_workers:
-            type_counters[w.worker_type] = type_counters.get(w.worker_type, 0) + 1
-            worker_type_index[w.worker_id] = type_counters[w.worker_type]
+            counter_key = (worker_node_id(w), w.worker_type)
+            type_counters[counter_key] = type_counters.get(counter_key, 0) + 1
+            worker_type_index[w.worker_id] = type_counters[counter_key]
 
         statuses = []
         for worker in all_workers:
@@ -1457,13 +1884,14 @@ class JobDispatcher:
                 fallback_reason = getattr(worker, "fallback_reason", None)
                 member_id = worker.member_id
                 retiring = worker._pending_removal
+                node_id = worker_node_id(worker)
 
             idx = worker_type_index[worker.worker_id]
             # Shared label helper — keeps this dispatcher's rows visually
             # identical to the multi-server dispatcher's rows and to the
             # synthesised idle entries returned by /api/jobs/workers when
             # no job is active.
-            from .worker_naming import cpu_worker_label, friendly_device_label, gpu_worker_label
+            from .worker_naming import cpu_worker_label, friendly_device_label, gpu_worker_label, node_worker_label
 
             if worker.worker_type == "GPU":
                 device_label = friendly_device_label(
@@ -1474,6 +1902,12 @@ class JobDispatcher:
                 display_name = gpu_worker_label(idx, device_label)
             else:
                 display_name = cpu_worker_label(idx)
+            node = None
+            if node_id:
+                # The pool's latest registry read, not the name the worker was created with, so a rename shows.
+                node_name = nodes.node_name(node_id) if node_id in nodes.views else getattr(worker, "node_name", None)
+                node = {"id": node_id, "name": node_name or node_id}
+                display_name = node_worker_label(node["name"], display_name)
 
             # Shown after the file ends only long enough for the next polls to see it (a quick CPU rerun ends
             # inside one): an idle worker would otherwise say "CPU fallback" until its next file, however long.
@@ -1507,6 +1941,9 @@ class JobDispatcher:
                     "ffmpeg_started": ffmpeg_started,
                     "current_phase": current_phase,
                     "chapter_progress": progress_data.get("chapter_progress") if has_task else None,
+                    "node": node,
+                    "node_state": nodes.node_state(node_id) if node_id else None,
+                    "node_cause": nodes.node_cause(node_id) if node_id else None,
                 }
             )
         return statuses
@@ -1613,6 +2050,7 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
     from .group_runtime import refresh_worker_groups
 
     selected = list(selected_gpus or [])
+    created = False
     with _dispatcher_lock:
         if _dispatcher is None:
             pool = WorkerPool(
@@ -1621,12 +2059,15 @@ def get_or_create_dispatcher(config: Config, selected_gpus: list) -> JobDispatch
                 selected_gpus=selected,
             )
             _dispatcher = JobDispatcher(pool)
+            created = True
         existing = _dispatcher
     if not refresh_worker_groups(existing.worker_pool, config, selected, force=True) and selected:
         try:
             existing.worker_pool.reconcile_gpu_workers(selected)
         except Exception as exc:
             logger.debug("Could not reconcile GPU workers: {}", exc)
+    if created:
+        existing.worker_pool.log_created()
     return existing
 
 

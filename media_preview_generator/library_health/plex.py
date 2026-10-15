@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
@@ -25,71 +25,29 @@ from ..loudness.undecodable import ffmpeg_identity, skipped_count_by_part_hash
 from ..markers.fs import filesystem_type, is_network_filesystem
 from ..markers.publishers.base import PublishError
 from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
-from ..markers.publishers.plex_remote import plex_database
+from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
 from ..output.plex_bundle import PlexBundleAdapter
 from ..output.plex_hash import get_source_fingerprint
 from ..servers.base import MediaServer, ServerConfig
 from .models import Cell, CellState, CheckCancelled, Feature, LibraryResult, ServerResult, TodoFile
+from .plex_rows import query_rows
 from .scope import LibraryScope, excluded, library_scopes
 
 ACCESS_DIRECT = "Reads Plex's database directly"
+ACCESS_NODE = "Reads Plex's database through the Plex database node"
 ACCESS_API_ONLY = "No access to Plex's database"
 NEEDS_DATABASE = "Needs access to Plex's database"
 
 _DB_WAIT_S = 30.0
+# The Plex helper build that first runs these counts on Plex's machine; named in the "update the helper" message.
+LIBRARY_HEALTH_AGENT_VERSION = "1.2.0"
 _BIF_THREADS = 8
 _BIF_CHUNK = 2000
 _MOVIE = 1
 _EPISODE = 4
 _SD_FLAG = '"mi:indexes":"sd"'
 _SD_FLAG_URL_FORM = "mi%3Aindexes=sd"
-
-_PARTS_SQL = """
-SELECT mi.library_section_id, mi.id, mi.metadata_type, mp.id, mp.file, mp.hash, mp.extra_data,
-       mi.title, parent.title AS season, grand.title AS show, mi."index", parent."index", mdi.id
-FROM metadata_items mi
-JOIN media_items mdi ON mdi.metadata_item_id = mi.id AND mdi.deleted_at IS NULL
-JOIN media_parts mp ON mp.media_item_id = mdi.id AND mp.deleted_at IS NULL
-LEFT JOIN metadata_items parent ON parent.id = mi.parent_id
-LEFT JOIN metadata_items grand ON grand.id = parent.parent_id
-WHERE mi.library_section_id IN ({ids}) AND mi.metadata_type IN (1, 4) AND mi.deleted_at IS NULL
-  AND COALESCE(mdi.proxy_type, 0) = 0
-"""
-_AUDIO_COUNT_SQL = """
-SELECT ms.media_part_id, COUNT(*) FROM media_streams ms JOIN media_parts mp ON mp.id = ms.media_part_id
-JOIN media_items mdi ON mdi.id = mp.media_item_id JOIN metadata_items mi ON mi.id = mdi.metadata_item_id
-WHERE ms.stream_type_id = 2 AND ms."index" IS NOT NULL AND mi.library_section_id IN ({ids}) GROUP BY ms.media_part_id
-"""
-# Same stream filter as the loudness job (indexed audio only), so the counts agree with what it will analyse.
-# Only streams that may carry loudness (plain or URL-encoded 'ln:'): keeps memory small
-# (thousands of rows, not hundreds of thousands).
-_LOUDNESS_STREAMS_SQL = """
-SELECT ms.media_part_id, ms.extra_data FROM media_streams ms JOIN media_parts mp ON mp.id = ms.media_part_id
-JOIN media_items mdi ON mdi.id = mp.media_item_id JOIN metadata_items mi ON mi.id = mdi.metadata_item_id
-WHERE ms.stream_type_id = 2 AND ms."index" IS NOT NULL
-  AND (ms.extra_data LIKE '%ln:%' OR ms.extra_data LIKE '%ln\\%3A%' ESCAPE '\\')
-  AND mi.library_section_id IN ({ids})
-"""
-# Plex keeps chapters as taggings of tag type 9; a chapter has a thumbnail when its thumb_url is set (by Plex or
-# this app). One row per item keeps memory small: the chapter count plus "index:start" of each chapter without one.
-_CHAPTERS_SQL = """
-SELECT t.metadata_item_id, COUNT(*),
-       GROUP_CONCAT(CASE WHEN COALESCE(t.thumb_url, '') = '' THEN t."index" || ':' || t.time_offset END)
-FROM taggings t JOIN tags ON tags.id = t.tag_id AND tags.tag_type = 9
-JOIN metadata_items mi ON mi.id = t.metadata_item_id
-WHERE mi.library_section_id IN ({ids}) AND mi.metadata_type IN (1, 4) AND mi.deleted_at IS NULL
-GROUP BY t.metadata_item_id
-"""
-_DURATIONS_SQL = """
-SELECT mdi.metadata_item_id, MAX(mdi.duration) FROM media_items mdi
-JOIN metadata_items mi ON mi.id = mdi.metadata_item_id
-WHERE mi.library_section_id IN ({ids}) AND mdi.deleted_at IS NULL GROUP BY mdi.metadata_item_id
-"""
-_MARKERS_SQL = """
-SELECT tg.metadata_item_id, tg.text FROM taggings tg JOIN tags t ON t.id = tg.tag_id
-WHERE t.tag_type = 12 AND tg.text IN ('intro', 'credits')
-"""
 
 
 @dataclass
@@ -128,16 +86,29 @@ class _PlexRows:
     durations: dict[int, int] = field(default_factory=dict)
 
 
-def _open_db(cfg: ServerConfig) -> LocalPlexDb | None:
-    """The local Plex database for this server, or None when this app can't open it directly."""
+def _open_db(cfg: ServerConfig) -> LocalPlexDb | RemotePlexDb | None:
+    """This server's Plex database: the local file, or its Plex database node (the Plex helper) when one is set up.
+
+    None without a Plex config folder: the previews and chapter counts read Plex's bundles there, whichever side runs
+    the database queries.
+    """
     db = plex_database(
         load_server(cfg.markers, "plex"),
         path_provider=lambda: PlexMarkerPublisher.db_path_for(cfg),
         label=cfg.name or "",
     )
-    if isinstance(db, LocalPlexDb) and (cfg.output or {}).get("plex_config_folder"):
+    if (cfg.output or {}).get("plex_config_folder"):
         return db
     return None
+
+
+def _node_refusal(db: RemotePlexDb) -> str:
+    """Why the node can't run the counts ("update the helper", "can't reach it"), or "" when it can."""
+    try:
+        db.require_library_health(needs=LIBRARY_HEALTH_AGENT_VERSION)
+    except PublishError as exc:
+        return str(exc)
+    return ""
 
 
 def _network_share(cfg: ServerConfig) -> str | None:
@@ -178,15 +149,20 @@ def count_plex(
     """
     scopes = library_scopes(cfg)
     db = _open_db(cfg)
-    share = _network_share(cfg) if db is not None else None
-    if db is not None and share is None:
+    # A node checks its own disk; this app's view of the database path only matters when it opens the file itself.
+    share = _network_share(cfg) if isinstance(db, LocalPlexDb) else None
+    refused = _node_refusal(db) if isinstance(db, RemotePlexDb) else ""
+    if db is not None and share is None and not refused:
         libraries, todo = _count_from_db(
             cfg, db, scopes, nothing_found=nothing_found, cancel_check=cancel_check, progress=progress
         )
-        access = ACCESS_DIRECT
+        access = ACCESS_NODE if isinstance(db, RemotePlexDb) else ACCESS_DIRECT
     else:
         unavailable, access = NEEDS_DATABASE, ACCESS_API_ONLY
-        if share:
+        if refused:
+            logger.warning("Library health: the Plex database node for {} can't count: {}", cfg.name, refused)
+            unavailable = refused[:200]
+        elif share:
             logger.warning(
                 "Library health: Plex's database on {} is on a network share ({}); counting previews through Plex's API",
                 cfg.name,
@@ -254,30 +230,57 @@ def _parse_missing(text: str | None) -> list[tuple[int, int]]:
     return missing
 
 
-def _read_rows(db: LocalPlexDb, section_ids: list[int], *, want_markers: bool, want_chapters: bool) -> _PlexRows:
-    marks = ",".join("?" * len(section_ids))
+def _rows_from(raw: Mapping[str, Iterable[Sequence[Any]]], undecodable: dict[str, int]) -> _PlexRows:
+    """The queries' rows (``plex_rows.query_rows``' cursors here, or a Plex database node's lists) as lookups.
+
+    Raises:
+        ValueError: A node sent rows in another shape.
+    """
+    try:
+        loudness_streams: dict[int, list[str | None]] = defaultdict(list)
+        for part_id, extra in raw["loudness_streams"]:
+            loudness_streams[part_id].append(extra)
+        rows = _PlexRows(
+            [tuple(row) for row in raw["parts"]],
+            {part_id: count for part_id, count in raw["audio_counts"]},
+            loudness_streams,
+            undecodable,
+        )
+        for item_id, text in raw["markers"]:
+            rows.markers.setdefault(item_id, set()).add(text)
+        for item_id, count, missing in raw["chapters"]:
+            rows.chapters[item_id] = _Chapters(count, _parse_missing(missing))
+        rows.durations = {item_id: duration for item_id, duration in raw["durations"] if duration}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Library Health rows in an unexpected shape: {exc}") from exc
+    return rows
+
+
+def _read_rows(
+    db: LocalPlexDb | RemotePlexDb,
+    section_ids: list[int],
+    *,
+    want_markers: bool,
+    want_chapters: bool,
+    machine_identifier: str = "",
+) -> _PlexRows:
     # In the image this is always the bundled analyser the loudness job uses; outside it a custom ffmpeg_path makes
     # Health conservative (skips recorded by another ffmpeg don't count), never optimistic.
     ffmpeg = ffmpeg_identity(analyze.resolve_ffmpeg("ffmpeg"))
-    with db._database(read_only=True, deadline=time.monotonic() + _DB_WAIT_S) as conn:
-        parts = conn.execute(_PARTS_SQL.format(ids=marks), section_ids).fetchall()
-        audio_counts = dict(conn.execute(_AUDIO_COUNT_SQL.format(ids=marks), section_ids).fetchall())
-        loudness_streams: dict[int, list[str | None]] = defaultdict(list)
-        for part_id, extra in conn.execute(_LOUDNESS_STREAMS_SQL.format(ids=marks), section_ids):
-            loudness_streams[part_id].append(extra)
-        rows = _PlexRows(parts, audio_counts, loudness_streams, skipped_count_by_part_hash(ffmpeg))
-        if want_markers:
-            for item_id, text in conn.execute(_MARKERS_SQL):
-                rows.markers.setdefault(item_id, set()).add(text)
-        if want_chapters:
-            for item_id, count, missing in conn.execute(_CHAPTERS_SQL.format(ids=marks), section_ids):
-                rows.chapters[item_id] = _Chapters(count, _parse_missing(missing))
-            rows.durations = {
-                item_id: duration
-                for item_id, duration in conn.execute(_DURATIONS_SQL.format(ids=marks), section_ids)
-                if duration
-            }
-    return rows
+    deadline = time.monotonic() + _DB_WAIT_S
+    if isinstance(db, RemotePlexDb):
+        raw = db.library_health_rows(
+            section_ids,
+            want_markers=want_markers,
+            want_chapters=want_chapters,
+            deadline=deadline,
+            needs=LIBRARY_HEALTH_AGENT_VERSION,
+            machine_identifier=machine_identifier,
+        )
+        return _rows_from(raw, skipped_count_by_part_hash(ffmpeg))
+    with db._database(read_only=True, deadline=deadline) as conn:
+        queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+        return _rows_from(queries, skipped_count_by_part_hash(ffmpeg))
 
 
 def _loudness_done(part_id: int, part_hash: str, rows: _PlexRows) -> bool:
@@ -452,7 +455,7 @@ def _tally_library(
 
 def _count_from_db(
     cfg: ServerConfig,
-    db: LocalPlexDb,
+    db: LocalPlexDb | RemotePlexDb,
     scopes: list[LibraryScope],
     *,
     nothing_found: dict[str, set[Feature]],
@@ -473,8 +476,14 @@ def _count_from_db(
     want_chapters = any(scope.features.get(Feature.CHAPTERS) is None for scope in scopes)
     progress("Reading Plex's database", 0, 0)
     try:
-        rows = _read_rows(db, section_ids, want_markers=want_markers, want_chapters=want_chapters)
-    except (PublishError, sqlite3.Error) as exc:
+        rows = _read_rows(
+            db,
+            section_ids,
+            want_markers=want_markers,
+            want_chapters=want_chapters,
+            machine_identifier=str(getattr(cfg, "server_identity", None) or ""),
+        )
+    except (PublishError, sqlite3.Error, ValueError) as exc:
         logger.warning("Library health: could not read Plex's database on {}: {}", cfg.name, exc)
         return [_error_library(scope, str(exc)) for scope in scopes], []
 

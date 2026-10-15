@@ -171,6 +171,20 @@ def test_group_revision_and_persistence_failure_preserve_saved_policy(tmp_path, 
     assert settings.worker_groups[0]["members"][0]["count"] == 2
 
 
+@pytest.mark.parametrize("hand_edited", [None, "3", 2.5, True, []])
+def test_a_hand_edited_group_revision_that_isnt_a_whole_number_counts_as_zero(tmp_path, hand_edited):
+    import json
+
+    from media_preview_generator.web.settings_manager import SettingsManager
+
+    (tmp_path / "settings.json").write_text(json.dumps({"worker_groups_revision": hand_edited}))
+    settings = SettingsManager(str(tmp_path))
+
+    assert settings.worker_groups_revision == 0
+    assert settings.update_worker_groups([cpu_group()]) == 1
+    assert settings.update_worker_groups([cpu_group()], expected_revision=1) == 2
+
+
 def test_global_pause_owners_do_not_clear_each_other(tmp_path):
     from media_preview_generator.web.settings_manager import SettingsManager
 
@@ -437,6 +451,7 @@ def test_member_policies_copy_group_and_member_fields_under_a_composite_id():
             "device": "cuda:0",
             "count": 3,
             "job_types": ["previews"],
+            "node": None,
         },
         {
             "id": "g1:b",
@@ -449,6 +464,7 @@ def test_member_policies_copy_group_and_member_fields_under_a_composite_id():
             "device": None,
             "count": 10,
             "job_types": ["loudness"],
+            "node": None,
         },
     ]
     assert member_policies(policies) == policies

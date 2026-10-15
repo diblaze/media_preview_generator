@@ -32,7 +32,7 @@ from .ffmpeg_runner import (
     is_matroska_corruption_line,
 )
 from .filter_chain import build_hdr10_zscale_chain
-from .generator import CancellationError, MediaInfo
+from .generator import CancellationError, read_media_info
 from .hdr_detection import is_dv_no_backward_compat, is_hdr_transfer
 
 if TYPE_CHECKING:
@@ -548,7 +548,7 @@ def extract_chapter_frame(
     """
     if cancel_check and cancel_check():
         raise CancellationError("Chapter extraction cancelled")
-    media_info = media_info or MediaInfo.parse(video_path)
+    media_info = media_info or read_media_info(video_path)
     if not media_info.video_tracks:
         raise UnsupportedChapterFormatError("No video stream for chapter thumbnails")
     track = media_info.video_tracks[0]
@@ -750,8 +750,8 @@ def publish_chapters(
             try:
                 if media_info is None:
                     try:
-                        media_info = MediaInfo.parse(plan.canonical_path)
-                    except (OSError, RuntimeError, ValueError):
+                        media_info = read_media_info(plan.canonical_path)
+                    except (OSError, RuntimeError):
                         if seek_failure is None:
                             raise
                 if seek_failure is not None and media_info is not None:

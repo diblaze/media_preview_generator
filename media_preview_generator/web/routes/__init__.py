@@ -23,6 +23,7 @@ from . import (  # noqa: E402
     api_library_health,  # noqa: F401
     api_loudness,  # noqa: F401
     api_markers,  # noqa: F401
+    api_nodes,  # noqa: F401
     api_plex,  # noqa: F401
     api_plex_webhook,  # noqa: F401
     api_schedules,  # noqa: F401

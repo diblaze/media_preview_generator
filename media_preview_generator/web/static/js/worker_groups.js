@@ -70,16 +70,84 @@
         }
     }
 
-    const hardwareFor = member => (snapshot.hardware || []).find(item => item.device === member.device);
-    const deviceMissing = member => member.resource === 'gpu' && !hardwareFor(member);
+    // The names and colours every page uses for a node's state (app.js NODE_STATES).
+    const nodeState = state => window.NODE_STATES?.[state] || null;
+    // Red when the node (or a removed one) gets no work at all, as on the Nodes page; amber when it still works in part
+    // or isn't checked yet.
+    const nodeTone = state => (!state || nodeState(state)?.tone === 'bad' ? 'bad' : 'warn');
+    const nodesList = () => snapshot.nodes || [];
+    // A node's roles are known once it has answered; until then it may still turn out to run workers.
+    const runsWorkers = node => !(node.roles || []).length || node.roles.includes('worker');
+    const nodeFor = member => (member.node ? nodesList().find(node => node.id === member.node) || null : null);
+    const nodeStateLabel = node => (node ? nodeState(node.state)?.label || node.state || '' : 'Removed');
+    const hardwareFor = member => (member.node
+        ? (nodeFor(member)?.devices || []).find(item => item.device === member.device)
+        : (snapshot.hardware || []).find(item => item.device === member.device));
+    const deviceMissing = member => !member.node && member.resource === 'gpu' && !hardwareFor(member);
     const deviceIcon = member => (member.resource === 'cpu' ? 'cpu' : 'gpu-card');
-    // The dashboard page does not load week_graph.js, so it keeps the same palette (CPU green, GPUs in detected order).
-    const FALLBACK_GPU_COLORS = ['var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)'];
+
+    function nodeName(member) {
+        if (!member.node) return '';
+        return nodeFor(member)?.name || member.node_name || member.node;
+    }
+
+    // Why a node member has no workers now, in the few words its chip has room for, judged from the node list; the
+    // server's member row says the same once saved.
+    function nodeIssue(member) {
+        if (!member.node) return '';
+        const node = nodeFor(member);
+        if (!node) return 'node removed';
+        if (!runsWorkers(node)) return "node doesn't run workers";
+        const state = nodeState(node.state);
+        const reason = state?.causes?.[node.cause] || state?.short || node.reason
+            || `node ${nodeStateLabel(node).toLowerCase()}`;
+        if (member.resource === 'cpu') return ['ready', 'gpu_lost'].includes(node.state) ? '' : reason;
+        if (node.state !== 'ready') return reason;
+        const gpu = (node.devices || []).find(item => item.device === member.device);
+        if (!gpu) return 'GPU not found on this node';
+        return gpu.status === 'failed' ? 'GPU failed its test on this node' : '';
+    }
+
+    // The node's own sentence for it (a chip's tooltip), or the short reason when the node gave none.
+    function nodeIssueDetail(member) {
+        const issue = nodeIssue(member);
+        const node = nodeFor(member);
+        return issue && node && runsWorkers(node) && node.state !== 'ready' && node.reason ? node.reason : issue;
+    }
+
+    // The dashboard page does not load week_graph.js, so it keeps a copy of the same palette (see week_graph.js).
+    const FALLBACK_GPU_COLORS = [
+        'var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)', 'var(--t-chapters)',
+        'color-mix(in srgb, var(--run) 50%, var(--t-chapters))', 'color-mix(in srgb, var(--t-loud) 50%, var(--accent))',
+        'color-mix(in srgb, var(--t-intro) 50%, var(--t-loud))',
+    ];
+    const FALLBACK_CPU_COLORS = [
+        'var(--ok)', 'color-mix(in srgb, var(--ok) 55%, var(--accent))', 'color-mix(in srgb, var(--ok) 55%, var(--bs-body-color))',
+        'color-mix(in srgb, var(--ok) 45%, var(--bs-body-bg))',
+    ];
+    // Local devices keep their colours; each node's follow them, so a node's CPU or a node GPU named like a local
+    // one still differs.
+    const paletteKey = member => {
+        const device = member.resource === 'cpu' ? 'cpu' : member.device;
+        return member.node ? `node:${member.node}:${device}` : device;
+    };
+    const paletteDevices = () => [
+        { resource: 'cpu', device: 'cpu' },
+        ...(snapshot.hardware || []).map(item => ({ device: item.device })),
+        ...nodesList().flatMap(node => [
+            { resource: 'cpu', device: `node:${node.id}:cpu` },
+            ...(node.devices || []).map(item => ({ device: `node:${node.id}:${item.device}` })),
+        ]),
+    ];
     function deviceColor(member) {
-        if (window.WeekGraph) return window.WeekGraph.deviceColor(member, snapshot.hardware);
-        if (member.resource === 'cpu') return 'var(--ok)';
-        const index = (snapshot.hardware || []).findIndex(item => item.device === member.device);
-        return FALLBACK_GPU_COLORS[(index < 0 ? (snapshot.hardware || []).length : index) % FALLBACK_GPU_COLORS.length];
+        const keyed = { resource: member.resource, device: paletteKey(member) };
+        const palette = paletteDevices();
+        if (window.WeekGraph) return window.WeekGraph.deviceColor(keyed, palette);
+        const cpu = member.resource === 'cpu';
+        const pool = palette.filter(item => (item.resource === 'cpu') === cpu);
+        const index = pool.findIndex(item => item.device === keyed.device);
+        const colors = cpu ? FALLBACK_CPU_COLORS : FALLBACK_GPU_COLORS;
+        return colors[(index < 0 ? (cpu ? 0 : pool.length) : index) % colors.length];
     }
     const totalWorkers = group => group.members.reduce((sum, member) => sum + member.count, 0);
     const groupJobTypes = group => [...new Set(group.members.flatMap(member => member.job_types))];
@@ -88,6 +156,11 @@
         if (member.resource === 'cpu') return 'CPU';
         return hardwareFor(member)?.name || member.device || 'Unavailable GPU';
     }
+
+    // "storage · Quadro P5000" for a node's device; just the device for this app's own.
+    const deviceTitle = member => (member.node ? `${nodeName(member)} · ${deviceName(member)}` : deviceName(member));
+    const nodeChip = member => (member.node
+        ? `<span class="node-chip" title="${escapeHtml(`Runs on node ${nodeName(member)}`)}"><i class="bi bi-hdd-network" aria-hidden="true"></i>${escapeHtml(nodeName(member))}</span>` : '');
 
     // "NVIDIA GeForce RTX 4090" -> "RTX 4090"; chips are narrow and the vendor adds nothing next to a model number.
     function shortDeviceName(member) {
@@ -102,8 +175,16 @@
         return { ...row, busy: row.busy ?? 0, finishing: row.finishing ?? 0, available: row.available ?? 0 };
     }
 
+    // "; the other devices keep working" only while some other device has workers: with every other group off (or
+    // out of hours) nothing else runs.
+    function othersKeepWorking(group, member, the = 'the ') {
+        const working = (snapshot.capacity?.groups || []).some(groupRow => (groupRow.members || [])
+            .some(row => !(groupRow.id === group.id && row.id === member.id) && Number(row.target) > 0));
+        return working ? `; ${the}other devices keep working` : '';
+    }
+
     // "3 GPU + 10 CPU": the System card's one-line summary of a group.
-    const memberSummary = group => group.members.map(member => `${member.count} ${member.resource === 'cpu' ? 'CPU' : 'GPU'}`).join(' + ');
+    const memberSummary = group => group.members.map(member => `${member.count} ${member.node ? nodeName(member) + ' ' : ''}${member.resource === 'cpu' ? 'CPU' : 'GPU'}`).join(' + ');
 
     function hours(group) {
         if (group.availability.mode === 'always') return 'Always available';
@@ -138,7 +219,7 @@
         const row = (snapshot.capacity?.groups || []).find(item => item.id === group.id) || {};
         const labels = {
             disabled: 'Disabled', outside_hours: 'Outside hours', scheduled: 'Outside hours',
-            hardware_unavailable: 'Hardware unavailable', unavailable: 'Hardware unavailable',
+            hardware_unavailable: 'Hardware unavailable', unavailable: 'Hardware unavailable', node_unavailable: 'Node unavailable',
             active: 'Within group hours', off_hours: 'Outside hours', draining: 'Finishing current files',
             available: 'Available', open: 'Available', busy: 'Workers busy', paused: 'Globally paused',
             quiet_hours: 'Global pause schedule active',
@@ -164,18 +245,21 @@
 
     const STATE_TONES = {
         'Available': 'ok', 'Within group hours': 'ok', 'Workers busy': 'run', 'Finishing current files': 'run',
-        'Globally paused': 'warn', 'Global pause schedule active': 'warn', 'Hardware unavailable': 'bad',
+        'Globally paused': 'warn', 'Global pause schedule active': 'warn', 'Hardware unavailable': 'bad', 'Node unavailable': 'bad',
     };
     const PRESETS = { all: [0, 1, 2, 3, 4, 5, 6], weekdays: [0, 1, 2, 3, 4], weekends: [5, 6] };
     // Same device, same colour in every group, strip and legend (week_graph.js owns the palette).
-    const memberLabel = (group, member) => `${group.name} · ${shortDeviceName(member)} ×${member.count}`;
+    const memberLabel = (group, member) => `${group.name} · ${member.node ? nodeName(member) + ' · ' : ''}${shortDeviceName(member)} ×${member.count}`;
     const memberLanes = group => group.members.map(member => ({
         color: deviceColor(member), label: memberLabel(group, member), segments: window.WeekGraph.groupSegments(group),
     }));
 
     function memberChip(member) {
-        const missing = deviceMissing(member);
-        return `<span class="mchip${missing ? ' is-missing' : ''}" style="--c:${deviceColor(member)}" title="${escapeHtml(deviceName(member) + (missing ? ' (not detected)' : ''))}"><i class="dot" aria-hidden="true"></i><i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="mchip-name">${escapeHtml(shortDeviceName(member))}</span><span class="mchip-x">×${member.count}</span>${capabilityIcons(member.job_types)}</span>`;
+        const issue = nodeIssueDetail(member);
+        const missing = deviceMissing(member) || !!issue;
+        const note = deviceMissing(member) ? ' (not detected)' : issue ? ` (${issue} · 0 now)` : '';
+        const name = (member.node ? nodeName(member) + ' · ' : '') + shortDeviceName(member);
+        return `<span class="mchip${missing ? ' is-missing' : ''}" style="--c:${deviceColor(member)}" title="${escapeHtml(deviceTitle(member) + note)}"><i class="dot" aria-hidden="true"></i><i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="mchip-name">${escapeHtml(name)}</span><span class="mchip-x">×${member.count}</span>${capabilityIcons(member.job_types)}</span>`;
     }
 
     function settingsGroupMeta(group) {
@@ -233,8 +317,10 @@
         graph.innerHTML = lanes.length ? window.WeekGraph.render(lanes, window.WeekGraph.pauseSegments(), { timeZone: snapshot.timezone })
             : '<div class="wkg-empty">No enabled groups. Jobs wait until a compatible group is available.</div>';
         const devices = new Map();
-        for (const member of enabled.flatMap(group => group.members)) devices.set(member.resource === 'cpu' ? 'cpu' : member.device, member);
-        legend.innerHTML = [...devices.values()].map(member => `<span><i class="swatch" style="--c:${deviceColor(member)}"></i>${escapeHtml(deviceName(member))}</span>`).join('')
+        for (const member of enabled.flatMap(group => group.members)) {
+            devices.set(`${member.node || ''}|${member.resource === 'cpu' ? 'cpu' : member.device}`, member);
+        }
+        legend.innerHTML = [...devices.values()].map(member => `<span><i class="swatch" style="--c:${deviceColor(member)}"></i>${escapeHtml(deviceTitle(member))}</span>`).join('')
             + '<span><i class="swatch swatch-pause"></i>Global pause</span><span><i class="swatch swatch-now"></i>Now</span>';
         document.querySelectorAll('#workerWeekTz, [data-week-tz]').forEach(node => { node.innerHTML = `<i class="bi bi-globe2" aria-hidden="true"></i> ${escapeHtml(timezoneLabel())}`; });
     }
@@ -436,8 +522,12 @@
         return entry?.host || null;
     }
 
-    function warnings() {
-        return (snapshot.warnings || []).map(warning => typeof warning === 'string' ? warning : warning.message || '').filter(Boolean);
+    // The dashboard's member rows already say why a device has no workers, so its footer leaves those out.
+    const ROW_WARNINGS = ['node_unavailable', 'hardware_unavailable'];
+    function warnings({ skipRowWarnings = false } = {}) {
+        return (snapshot.warnings || [])
+            .filter(warning => !(skipRowWarnings && warning && ROW_WARNINGS.includes(warning.code)))
+            .map(warning => typeof warning === 'string' ? warning : warning.message || '').filter(Boolean);
     }
 
     function replaceDashboardHeader(entry, markup) {
@@ -564,14 +654,27 @@
 
     function memberHead(group, member) {
         const state = memberStatus(group, member);
-        const missing = deviceMissing(member) || ['hardware_unavailable', 'unavailable'].includes(state.state);
+        const nodeDown = !!member.node && (state.state === 'node_unavailable' || (!state.state && !!nodeIssue(member)));
+        const missing = !member.node && (deviceMissing(member) || ['hardware_unavailable', 'unavailable'].includes(state.state));
         const name = deviceName(member);
-        const occupancy = `${state.busy} of ${member.count} configured ${member.count === 1 ? 'worker' : 'workers'} busy on ${name}.`;
-        const chip = missing
-            ? `<span class="chip warn" tabindex="0" role="img" aria-label="${escapeHtml(name)} not detected" data-bs-toggle="tooltip" data-bs-title="Its jobs wait; the other devices keep working."><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>Not detected</span>`
-            : `<span class="occ-chip" data-member-indicator role="img" aria-label="${escapeHtml(occupancy)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(occupancy)}">${state.busy}<small>/ ${member.count}</small></span>`;
+        const title = deviceTitle(member);
+        const reason = nodeDown ? state.reason || nodeIssue(member) || 'node unavailable' : '';
+        const tone = nodeTone(nodeFor(member)?.state);
+        const occupancy = `${state.busy} of ${member.count} configured ${member.count === 1 ? 'worker' : 'workers'} busy on ${title}.`;
+        let chip = `<span class="occ-chip" data-member-indicator role="img" aria-label="${escapeHtml(occupancy)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(occupancy)}">${state.busy}<small>/ ${member.count}</small></span>`;
+        if (missing) chip = `<span class="chip warn" tabindex="0" role="img" aria-label="${escapeHtml(name)} not detected" data-bs-toggle="tooltip" data-bs-title="Its jobs wait${othersKeepWorking(group, member)}."><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>Not detected</span>`;
+        // The chip has room for a few words; the node's own sentence, when it says more, leads its tooltip.
+        const detail = nodeDown ? nodeIssueDetail(member) : '';
+        const why = detail && detail !== reason ? `${detail.replace(/\.$/, '')}. ` : '';
+        if (nodeDown) chip = `<span class="chip ${tone}" data-node-zero tabindex="0" role="img" aria-label="${escapeHtml(`${title}: ${reason}, no workers now`)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(`${why}Its jobs wait for ${nodeName(member)}${othersKeepWorking(group, member)}.`)}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>${escapeHtml(reason)} · 0 now</span>`;
+        const problem = missing || nodeDown;
         const stepper = group.enabled ? memberStepper(group, member, member.count) : '';
-        return `<div class="mem-h${missing ? ' miss' : ''}"><span class="devname"><i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="nm" title="${escapeHtml(name)}">${escapeHtml(name)}</span></span>${missing ? '' : capabilityIcons(member.job_types)}${chip}${stepper}</div>${missing ? `<p class="msg warn"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><span>${escapeHtml(name)}: GPU not detected. Its jobs wait; other devices keep working.</span></p>` : ''}`;
+        const others = othersKeepWorking(group, member, '');
+        const note = missing ? `${name}: GPU not detected. Its jobs wait${others}.`
+            : nodeDown ? `${title}: ${reason}. Its jobs wait${others}.` : '';
+        const nodeLink = nodeDown && nodeFor(member)
+            ? ` <a class="msg-link" href="/nodes#node-${encodeURIComponent(member.node)}">Open ${escapeHtml(nodeName(member))}</a>` : '';
+        return `<div class="mem-h${problem ? ' miss' : ''}"><span class="devname">${nodeChip(member)}<i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="nm" title="${escapeHtml(title)}">${escapeHtml(name)}</span></span>${problem ? '' : capabilityIcons(member.job_types)}${chip}${stepper}</div>${note ? `<p class="msg ${nodeDown && tone === 'bad' ? 'err' : 'warn'}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><span>${escapeHtml(note)}${nodeLink}</span></p>` : ''}`;
     }
 
     // A member that is no longer configured keeps its row while its last files finish.
@@ -616,7 +719,7 @@
             const counts = activity(state);
             const total = totalWorkers(group);
             entry.occupied = state.busy > 0 || state.finishing > 0;
-            entry.searchText = [group.name, ...group.members.flatMap(member => [member.resource, deviceName(member)]), ...groupJobTypes(group).map(kind => JOBS[kind] || kind), hours(group)].join(' ');
+            entry.searchText = [group.name, ...group.members.flatMap(member => [member.resource, deviceName(member), nodeName(member)]), ...groupJobTypes(group).map(kind => JOBS[kind] || kind), hours(group)].join(' ');
             const exceptions = [];
             for (const count of counts) {
                 if (!/^\d+ (running|available)$/.test(count)) exceptions.push(`<span>${escapeHtml(count)}</span>`);
@@ -699,7 +802,7 @@
         renderIdleRows();
         applyDenseRows();
         document.getElementById('workerGroupEmpty').hidden = dashboardGroups.size > 0;
-        document.getElementById('workerGroupLiveWarnings').textContent = warnings().join(' ');
+        document.getElementById('workerGroupLiveWarnings').textContent = warnings({ skipRowWarnings: true }).join(' ');
         renderSystemGroups();
         renderGroupVisibility();
         window.dispatchEvent(new CustomEvent('worker-groups-updated', { detail: snapshot }));
@@ -721,7 +824,12 @@
             window._initBootstrapTooltips?.(mount);
         }
         const capacity = snapshot.capacity || {};
-        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}. ${timezoneLabel()}.` : '';
+        // Members on nodes are counted apart from this app's own hardware, and only named when there are any.
+        const nodesNow = capacity.nodes_current || {};
+        const nodesPeak = capacity.nodes_peak || {};
+        const onNodes = (nodesPeak.cpu || 0) + (nodesPeak.gpu || 0) > 0;
+        const nodePart = (counts) => onNodes ? ` here, ${counts.gpu || 0} GPU + ${counts.cpu || 0} CPU on nodes` : '';
+        document.getElementById('workerGroupCapacity').textContent = capacity.current && capacity.peak ? `${dirty ? 'Saved schedule' : 'Scheduled'} now: CPU ${capacity.current.cpu} · GPU ${capacity.current.gpu}${nodePart(nodesNow)}. Weekly peak: CPU ${capacity.peak.cpu} · GPU ${capacity.peak.gpu}${nodePart(nodesPeak)}. ${timezoneLabel()}.` : '';
         renderRows(document.getElementById('workerGroupRows'));
         renderWeekOverview(draft || snapshot.groups);
         paintEditorPreview();
@@ -781,25 +889,76 @@
     }
 
     const infoIcon = (label, tip) => `<button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="${escapeHtml(tip)}" aria-label="About ${escapeHtml(label)}"><i class="bi bi-info-circle"></i></button>`;
-    const deviceKeyOf = member => (member.resource === 'cpu' ? 'cpu' : member.device);
+    const localKeyOf = member => (member.resource === 'cpu' ? 'cpu' : member.device);
+    // Picker values: this app's keep their old shape ("cpu" / device); a node's are "node:<id>:cpu" / "node:<id>:gpu:<device>".
+    const deviceKeyOf = member => (member.node ? `node:${member.node}:${member.resource === 'cpu' ? 'cpu' : 'gpu:' + member.device}` : localKeyOf(member));
     const memberLimit = member => snapshot.limits?.[member.resource] || 64;
     const maxMembers = () => snapshot.limits?.members || 8;
 
-    // The first unused GPU, else CPU; null when every detected device is already in the group.
+    const CPU_JOBS = ['previews', 'intro_credits', 'loudness'];
+    // Members whose loudness a switch to a GPU took away, so a switch back to a CPU restores it.
+    const loudnessRemoved = new Set();
+    const GPU_JOBS = ['previews', 'intro_credits'];
+
+    // The first unused device: this app's GPUs, its CPU, then each ready node's GPUs and CPU; null when all are used.
     function nextDevice(group) {
         const used = new Set(group.members.map(deviceKeyOf));
         const gpu = (snapshot.hardware || []).find(item => item.device && item.status !== 'failed' && !used.has(item.device));
-        if (gpu) return { resource: 'gpu', device: gpu.device, job_types: ['previews', 'intro_credits'] };
-        return used.has('cpu') ? null : { resource: 'cpu', device: null, job_types: ['previews', 'intro_credits', 'loudness'] };
+        if (gpu) return { resource: 'gpu', device: gpu.device, job_types: GPU_JOBS.slice() };
+        if (!used.has('cpu')) return { resource: 'cpu', device: null, job_types: CPU_JOBS.slice() };
+        for (const node of nodesList().filter(item => item.state === 'ready' && runsWorkers(item))) {
+            const nodeGpu = (node.devices || []).find(item => item.status !== 'failed' && !used.has(`node:${node.id}:gpu:${item.device}`));
+            if (nodeGpu) return { resource: 'gpu', device: nodeGpu.device, node: node.id, job_types: GPU_JOBS.slice() };
+            if (!used.has(`node:${node.id}:cpu`)) return { resource: 'cpu', device: null, node: node.id, job_types: CPU_JOBS.slice() };
+        }
+        return null;
+    }
+
+    // Every device the picker offers, in sections: "This app" first, then each node by name with its state.
+    function pickerChoices(member) {
+        const gpus = (snapshot.hardware || []).filter(item => item.device);
+        const sections = [{
+            label: 'This app',
+            options: [
+                { value: 'cpu', label: 'CPU', resource: 'cpu', device: null, node: null },
+                ...gpus.map(gpu => ({ value: gpu.device, label: (gpu.name || gpu.device) + (gpu.status === 'failed' ? ' (unavailable)' : ''), resource: 'gpu', device: gpu.device, node: null })),
+            ],
+        }];
+        if (!member.node && member.resource === 'gpu' && !gpus.some(gpu => gpu.device === member.device)) {
+            sections[0].options.push({ value: member.device, label: `${member.device} — not detected`, resource: 'gpu', device: member.device, node: null });
+        }
+        // A Plex database node has no CPU or GPU to lend, so it isn't offered.
+        for (const node of nodesList().filter(runsWorkers)) {
+            const state = nodeStateLabel(node);
+            const devices = (node.devices || []).map(gpu => ({
+                value: `node:${node.id}:gpu:${gpu.device}`, label: `${node.name} · ${gpu.name || gpu.device}${gpu.status === 'failed' ? ' (unavailable)' : ''}`,
+                resource: 'gpu', device: gpu.device, node: node.id,
+            }));
+            const cores = node.cpu_cores ? ` (${node.cpu_cores} cores)` : '';
+            sections.push({
+                label: `${node.name} · ${state}`, node: node.id,
+                options: [...devices, { value: `node:${node.id}:cpu`, label: `${node.name} · CPU${cores}`, resource: 'cpu', device: null, node: node.id }],
+            });
+        }
+        const selected = deviceKeyOf(member);
+        if (member.node && !sections.some(section => section.options.some(option => option.value === selected))) {
+            // The member's device is no longer reported (node removed, GPU gone): keep it selectable so nothing silently changes.
+            const known = sections.find(section => section.node === member.node);
+            const option = { value: selected, label: `${nodeName(member)} · ${deviceName(member)} — ${nodeIssue(member) || 'not found'}`, resource: member.resource, device: member.device, node: member.node };
+            if (known) known.options.push(option);
+            else sections.push({ label: `${nodeName(member)} · ${nodeFor(member) ? "Doesn't run workers" : 'Removed'}`, node: member.node, options: [option] });
+        }
+        return sections;
     }
 
     function deviceOptions(group, member) {
         const used = new Set(group.members.filter(other => other !== member).map(deviceKeyOf));
-        const gpus = (snapshot.hardware || []).filter(item => item.device);
-        const options = [{ value: 'cpu', label: 'CPU' }, ...gpus.map(gpu => ({ value: gpu.device, label: (gpu.name || gpu.device) + (gpu.status === 'failed' ? ' (unavailable)' : '') }))];
-        if (member.resource === 'gpu' && !gpus.some(gpu => gpu.device === member.device)) options.push({ value: member.device, label: `${member.device} — not detected` });
         const selected = deviceKeyOf(member);
-        return options.map(option => `<option value="${escapeHtml(option.value)}" ${option.value === selected ? 'selected' : ''} ${used.has(option.value) ? 'disabled' : ''}>${escapeHtml(option.label)}${used.has(option.value) ? ' (already in this group)' : ''}</option>`).join('');
+        const sections = pickerChoices(member);
+        const optionMarkup = option => `<option value="${escapeHtml(option.value)}" ${option.value === selected ? 'selected' : ''} ${used.has(option.value) ? 'disabled' : ''}>${escapeHtml(option.label)}${used.has(option.value) ? ' (already in this group)' : ''}</option>`;
+        // Without nodes the picker stays the flat list it always was.
+        if (sections.length === 1) return sections[0].options.map(optionMarkup).join('');
+        return sections.map(section => `<optgroup label="${escapeHtml(section.label)}">${section.options.map(optionMarkup).join('')}</optgroup>`).join('');
     }
 
     function jobChips(member) {
@@ -812,26 +971,40 @@
 
     // Row-level problems, shown live under the row; the same wording is used when Apply is refused.
     function memberIssues(group, member) {
-        const name = shortDeviceName(member);
+        const name = (member.node ? nodeName(member) + ' · ' : '') + shortDeviceName(member);
         const issues = [];
         if (!Number.isInteger(member.count) || member.count < 1 || member.count > memberLimit(member)) issues.push(['err', `${name}: enter 1–${memberLimit(member)} workers. Remove the device to use zero.`]);
         if (!member.job_types.length) issues.push(['err', `${name}: choose at least one job type.`]);
         if (group.members.findIndex(other => deviceKeyOf(other) === deviceKeyOf(member)) !== group.members.indexOf(member)) issues.push(['err', `${name} is already in this group.`]);
         if (member.resource === 'gpu' && member.job_types.includes('loudness')) issues.push(['err', `${name}: loudness runs on CPU only.`]);
-        if (deviceMissing(member)) issues.push(['warn', 'Not detected — its jobs wait; the other devices keep working.']);
+        if (deviceMissing(member)) issues.push(['warn', `Not detected — its jobs wait${othersKeepWorking(group, member)}.`]);
+        const issue = nodeIssue(member);
+        if (issue) issues.push(['warn', `${nodeName(member)}: ${issue} · 0 workers now. Its jobs wait for the node${othersKeepWorking(group, member)}.`]);
         if (memberNotes.has(member.id)) issues.push(['note', memberNotes.get(member.id)]);
         return issues;
     }
 
     const messageMarkup = issues => issues.map(([tone, text]) => `<p class="msg ${tone}"><i class="bi bi-${tone === 'err' ? 'exclamation-circle' : tone === 'warn' ? 'exclamation-triangle' : 'info-circle'}" aria-hidden="true"></i><span>${escapeHtml(text)}</span></p>`).join('');
 
+    // The node chip, and a red/amber "0 now" chip with the reason while that node can't take work.
+    function memberNodeChips(member) {
+        if (!member.node) return '';
+        const issue = nodeIssue(member);
+        const detail = nodeIssueDetail(member);
+        const zero = issue ? `<span class="node-zero ${nodeTone(nodeFor(member)?.state)}" data-node-zero tabindex="0" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(detail)}">${escapeHtml(issue)} · 0 now</span>` : '';
+        return `<span class="node-chips" data-node-chips>${nodeChip(member)}${zero}</span>`;
+    }
+
     function memberRow(group, member) {
         const limit = memberLimit(member);
         const issues = memberIssues(group, member);
-        const label = shortDeviceName(member);
+        const label = (member.node ? nodeName(member) + ' · ' : '') + shortDeviceName(member);
+        const deviceTip = nodesList().length
+            ? infoIcon('device', 'This app’s devices come first, then each node’s, labelled with the node name and its state. A device on a node that is not ready can still be picked; it gets workers once the node is ready.')
+            : '';
         return `<div class="mrow${issues.some(i => i[0] === 'err') ? ' has-err' : issues.some(i => i[0] === 'warn') ? ' has-warn' : ''}" data-member="${escapeHtml(member.id)}" style="--c:${deviceColor(member)}">
             <div class="mrow-top">
-                <div class="fld-dev"><label class="lbl" for="wgDevice-${escapeHtml(member.id)}">Device</label><select class="form-select" id="wgDevice-${escapeHtml(member.id)}" data-pick>${deviceOptions(group, member)}</select></div>
+                <div class="fld-dev"><span class="lbl"><label for="wgDevice-${escapeHtml(member.id)}">Device</label>${deviceTip}${memberNodeChips(member)}</span><select class="form-select" id="wgDevice-${escapeHtml(member.id)}" data-pick>${deviceOptions(group, member)}</select></div>
                 <div><span class="lbl">Workers${infoIcon('workers', 'Simultaneous tasks on this device, not CPU cores.')}</span><div class="wg-stepper" role="group" aria-label="Workers on ${escapeHtml(label)}">
                     <button type="button" data-step="-1" aria-label="One fewer worker" ${member.count <= 1 ? 'disabled title="Remove the device to use zero"' : ''}><i class="bi bi-dash" aria-hidden="true"></i></button>
                     <input class="val" type="number" min="1" max="${limit}" value="${Number.isFinite(member.count) ? member.count : ''}" inputmode="numeric" data-count aria-label="Worker count for ${escapeHtml(label)}">
@@ -937,12 +1110,26 @@
         });
         container.querySelectorAll('[data-pick]').forEach(select => select.onchange = () => {
             const member = memberOf(select);
-            member.resource = select.value === 'cpu' ? 'cpu' : 'gpu';
-            member.device = member.resource === 'cpu' ? null : select.value;
+            const choice = pickerChoices(member).flatMap(section => section.options).find(option => option.value === select.value);
+            if (!choice) return;
+            const wasGpu = member.resource === 'gpu';
+            member.resource = choice.resource;
+            member.device = choice.device;
+            if (choice.node) member.node = choice.node; else delete member.node;
             memberNotes.delete(member.id);
             if (member.resource === 'gpu' && member.job_types.includes('loudness')) {
                 member.job_types = member.job_types.filter(kind => kind !== 'loudness');
                 memberNotes.set(member.id, 'Loudness removed — it runs on CPU only.');
+                loudnessRemoved.add(member.id);
+            }
+            // A CPU that was a GPU a moment ago (the next free device, or a switch that took loudness away) takes the
+            // loudness the group runs back.
+            const groupRunsLoudness = loudnessRemoved.has(member.id)
+                || group.members.some(other => other !== member && other.job_types.includes('loudness'));
+            if (wasGpu && member.resource === 'cpu' && groupRunsLoudness && !member.job_types.includes('loudness')) {
+                loudnessRemoved.delete(member.id);
+                member.job_types = [...member.job_types, 'loudness'];
+                memberNotes.set(member.id, 'Loudness added, as the group runs it.');
             }
             changed(); refocus(select.id);
         });
@@ -988,7 +1175,7 @@
             row.querySelector('[data-remove-window]').onclick = () => { group.availability.windows.splice(Number(row.dataset.window), 1); changed(); renderEditor(); };
         });
         document.getElementById('workerGroupClose').onclick = () => { editing = null; if (!dirty) draft = null; renderSettings(); renderEditor(); document.getElementById(dirty ? 'workerGroupApply' : 'workerGroupAdd').focus(); };
-        document.getElementById('workerGroupDuplicate').onclick = () => { const duplicate = clone(group); duplicate.id = 'group-' + Date.now().toString(36) + Math.random().toString(36).slice(2); duplicate.name += ' copy'; dirty = true; draft.push(duplicate); edit(duplicate.id); };
+        document.getElementById('workerGroupDuplicate').onclick = () => { const duplicate = clone(group); duplicate.id = 'group-' + Date.now().toString(36) + Math.random().toString(36).slice(2); duplicate.name += ' copy'; duplicate.members.forEach(member => { member.id = newId('m'); }); dirty = true; draft.push(duplicate); edit(duplicate.id); };
         document.getElementById('workerGroupRemove').onclick = () => { draft = draft.filter(item => item.id !== group.id); editing = null; changed(); renderEditor(); };
     }
 
@@ -1045,7 +1232,7 @@
                 const data = await request('GET');
                 if (snapshot && data.revision < snapshot.revision) return;
                 // An open draft retains its original revision; a newer read must not authorize overwriting concurrent edits.
-                if (draft && snapshot && !force) { snapshot.capacity = data.capacity; snapshot.warnings = data.warnings; snapshot.hardware = data.hardware; }
+                if (draft && snapshot && !force) { snapshot.capacity = data.capacity; snapshot.warnings = data.warnings; snapshot.hardware = data.hardware; snapshot.nodes = data.nodes; }
                 else if (draft && snapshot) { snapshot.capacity = data.capacity; }
                 else snapshot = data;
                 if (messageIsError) message('');

@@ -1587,7 +1587,8 @@ class _EndPictures:
 
     A file ffprobe or ffmpeg couldn't read (``end_picture.ReadFailedError``) is remembered with its identity for a day
     (``END_PICTURE_RETRY``) and not read for the check meanwhile, by this episode's run or any sibling's; one only the
-    worker's GPU attempt failed on (a timeout) is not remembered, since the CPU hasn't tried it. It is never a
+    worker's GPU attempt failed on (a timeout) is not remembered, since the CPU hasn't tried it, nor a partner only the
+    worker's node can't see (``ReadFailedError.not_visible``). It is never a
     pass: this episode's own file makes the check unavailable (no season audio answer this time), and a partner has no
     share, so the other partner decides; with no share at all the check is unavailable too. Only a share, or "certainly
     no frames" (None), is cached. A cancel or stalled ffprobes raise ``end_picture.CheckUnavailableError`` with nothing
@@ -1657,8 +1658,9 @@ class _EndPictures:
                         self._shares[key] = self._measure(key, segment, partner, offset_s)
                     except end_picture.ReadFailedError as exc:
                         failed = self._target if exc.path == self._target.canonical_path else partner
-                        # A GPU attempt's failure isn't the file's: remembered, it refused the worker's CPU rerun.
-                        if not exc.gpu_attempt:
+                        # A GPU attempt's failure isn't the file's: remembered, it refused the worker's CPU rerun. Nor
+                        # is a partner only this worker's node can't see: other workers would skip it for a day.
+                        if not exc.gpu_attempt and not exc.not_visible:
                             self._record_failure(failed)
                         if failed is self._target:
                             raise end_picture.CheckUnavailableError(str(exc)) from exc
@@ -1856,6 +1858,7 @@ def detect_season_audio(
             schedule's stop time holds this episode's fingerprint, an end-picture read stalled or timed out, or
             cancelled.
     """
+    from ...nodes.executor import FileNotVisibleError, reading_other_file
     from ..pipeline import DetectorAnswer, DetectorUnavailableError
 
     phase = phase_callback or (lambda _text: None)
@@ -1872,17 +1875,24 @@ def detect_season_audio(
         own_file = member.id == rec.id
         try:
             # A failure is recorded while the file's lock is held, so siblings' steps waiting on it skip it (for a day).
-            found = ensure_fingerprint(
-                ctx.store,
-                member,
-                ffmpeg=ffmpeg,
-                cancel_check=cancel_check,
-                skip=None if own_file else functools.partial(_fingerprint_failed_lately, ctx, member),
-                on_failure=functools.partial(_record_fingerprint_failure, ctx, member),
-                retime=retime,
-                pause_check=pause_check,
-                progress=lambda total_s, clock: StepProgress.maybe(progress_callback, total_s, clock=clock),
-            )
+            with reading_other_file(not own_file):
+                found = ensure_fingerprint(
+                    ctx.store,
+                    member,
+                    ffmpeg=ffmpeg,
+                    cancel_check=cancel_check,
+                    skip=None if own_file else functools.partial(_fingerprint_failed_lately, ctx, member),
+                    on_failure=functools.partial(_record_fingerprint_failure, ctx, member),
+                    retime=retime,
+                    pause_check=pause_check,
+                    progress=lambda total_s, clock: StepProgress.maybe(progress_callback, total_s, clock=clock),
+                )
+        except FileNotVisibleError as exc:
+            if own_file:
+                raise  # the worker hands the episode back for a worker that can see it
+            # Only the worker's node can't see the sibling (another worker may), so nothing is recorded against it.
+            logger.info("Season audio leaves out {} this time: {}", os.path.basename(member.canonical_path), exc)
+            return None
         except FingerprintSkippedError:
             logger.debug(
                 "Season audio leaves out {}: it couldn't be fingerprinted lately",

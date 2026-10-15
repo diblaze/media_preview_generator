@@ -428,6 +428,9 @@ class WorkerStatus:
     fallback_active: bool = False
     fallback_reason: str | None = None
     fallback_title: str = ""
+    # The node a remote worker runs on ({"id", "name"}; None = this app) and that node's registry state.
+    node: dict | None = None
+    node_state: str | None = None
     # When an idle worker stops showing its last file's fallback (time.time()); None: while it runs. The saved
     # statuses can go unrefreshed while no job feeds the workers, so the read ages it out too.
     fallback_until: float | None = None

@@ -447,6 +447,24 @@ class TestMigrateSchema:
         assert f"{settings_manager.settings_file}.<timestamp>.bak" in msg
         assert f"{settings_manager.settings_file}.bak" not in msg
 
+    def test_refusal_names_the_newest_pre_upgrade_copy_on_disk(self, settings_manager):
+        import os
+
+        from media_preview_generator.upgrade import SchemaDowngradeError, _migrate_schema
+
+        live = str(settings_manager.settings_file)
+        for age, name in enumerate(["pre-v24.20261015-120000.bak", "pre-v24.bak", "pre-v23.bak"]):
+            Path(f"{live}.{name}").write_text("{}")
+            os.utime(f"{live}.{name}", (1_700_000_000 - age * 60, 1_700_000_000 - age * 60))
+        settings_manager.set("_schema_version", _CURRENT_SCHEMA_VERSION + 1)
+
+        with pytest.raises(SchemaDowngradeError) as exc_info:
+            _migrate_schema(settings_manager)
+
+        assert f"the copy taken just before the latest upgrade is {live}.pre-v24.20261015-120000.bak;" in str(
+            exc_info.value
+        )
+
     def test_builds_gpu_config_from_flat_gpu_threads(self, settings_manager):
         """Flat gpu_threads is converted to per-GPU gpu_config."""
         from media_preview_generator.upgrade import _migrate_schema
@@ -967,6 +985,112 @@ class TestMigrateToV4:
         library_ids = {s["library_id"] for s in schedules}
         assert library_ids == {"1", "2"}
 
+    @pytest.mark.parametrize("libraries", [[], ["1", "TV Shows"]], ids=["all-libraries", "per-library"])
+    def test_restoring_a_settings_file_from_before_v4_adds_no_second_scanner(
+        self, settings_manager, _fresh_schedule_manager, libraries
+    ):
+        """A 2.x backup restored over an install that already made its scanner schedules (the upgrade from 2.x)
+        runs v4 again: the schedules it would make are already there, renamed or retimed or not."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {
+            "recently_added_enabled": True,
+            "recently_added_interval_minutes": 15,
+            "recently_added_lookback_hours": 24,
+            "recently_added_libraries": libraries,
+        }
+        settings_manager.apply_changes(updates=legacy)
+        _migrate_to_v4(settings_manager)
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        first = manager.get_all_schedules()
+        manager.update_schedule(first[0]["id"], name="My scanner", interval_minutes=60)
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert sorted(s["id"] for s in manager.get_all_schedules()) == sorted(s["id"] for s in first)
+        assert settings_manager.get("recently_added_enabled") is None
+        assert not any("created" in n for n in notes)
+
+    def test_restoring_over_a_scanner_moved_to_one_library_adds_no_all_libraries_one(
+        self, settings_manager, _fresh_schedule_manager
+    ):
+        """The all-libraries scanner v4 made, since pointed at one library, is still the scanner it would make."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {"recently_added_enabled": True, "recently_added_libraries": []}
+        settings_manager.apply_changes(updates=legacy)
+        _migrate_to_v4(settings_manager)
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        first = manager.get_all_schedules()
+        manager.update_schedule(first[0]["id"], library_id="3", library_name="Movies")
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert [s["id"] for s in manager.get_all_schedules()] == [first[0]["id"]]
+        assert not any("created" in n for n in notes)
+
+    def test_a_scanner_for_another_library_is_still_made(self, settings_manager, _fresh_schedule_manager):
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        manager.create_schedule(
+            name="Movies scanner",
+            interval_minutes=15,
+            library_id="1",
+            library_name="",
+            config={"job_type": "recently_added", "lookback_hours": 24},
+            enabled=True,
+        )
+        settings_manager.apply_changes(updates={"recently_added_enabled": True, "recently_added_libraries": ["2"]})
+
+        _migrate_to_v4(settings_manager)
+
+        assert sorted(s["library_id"] for s in manager.get_all_schedules()) == ["1", "2"]
+
+    @pytest.mark.parametrize("existing", ["all-libraries", "retargeted"])
+    def test_restoring_a_library_list_counts_a_scanner_that_still_covers_it(
+        self, settings_manager, _fresh_schedule_manager, existing
+    ):
+        """A restored 2.x file with a library list runs v4 again. A Recently Added schedule for every library covers
+        each library on the list, and so do the ones v4 made for them after they were pointed at other libraries."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {
+            "recently_added_enabled": True,
+            "recently_added_interval_minutes": 15,
+            "recently_added_lookback_hours": 24,
+            "recently_added_libraries": ["1", "TV Shows"],
+        }
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        if existing == "all-libraries":
+            manager.create_schedule(
+                name="Every library",
+                interval_minutes=30,
+                library_id=None,
+                library_name="",
+                config={"job_type": "recently_added", "lookback_hours": 24},
+                enabled=True,
+            )
+        else:
+            settings_manager.apply_changes(updates=legacy)
+            _migrate_to_v4(settings_manager)
+            for schedule in manager.get_all_schedules():
+                manager.update_schedule(schedule["id"], library_id="7", library_name="Kids")
+        first = manager.get_all_schedules()
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert sorted(s["id"] for s in manager.get_all_schedules()) == sorted(s["id"] for s in first)
+        assert settings_manager.get("recently_added_enabled") is None
+        assert not any("created" in n for n in notes), notes
+
 
 class TestMigrateToV6:
     """Tests for the v6 migration that strips stale generic 'cuda' gpu_config entries."""
@@ -1034,6 +1158,70 @@ class TestMigrateToV6:
 
 class TestMigrateToV7:
     """Tests for the v7 multi-media-server schema migration."""
+
+    # What 3.7.5's own POST /api/settings left (generated by running 3.7.5's code; token replaced).
+    FROM_3_7_5 = {
+        "_env_migrated": True,
+        "plex_webhook_enabled": True,
+        "plex_webhook_public_url": "https://previews.example.com",
+        "_schema_version": 6,
+        "plex_config_folder": "/plex/Library/Application Support/Plex Media Server",
+        "plex_local_videos_path_mapping": "/media",
+        "plex_name": "Home Plex",
+        "plex_token": "p" * 20,
+        "plex_url": "http://plex:32400",
+        "plex_videos_path_mapping": "/media",
+        "cpu_threads": 3,
+        "thumbnail_interval": 5,
+        "thumbnail_quality": 3,
+        "webhook_delay": 30,
+        "webhook_enabled": True,
+        "webhook_secret": "hook-secret-123456",
+        "setup_complete": True,
+    }
+
+    def _upgrade_from_3_7_5(self, tmp_path):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        (tmp_path / "settings.json").write_text(json.dumps(self.FROM_3_7_5))
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+        return sm
+
+    def test_the_plex_direct_webhook_of_a_3_7_install_moves_onto_its_plex_server(self, tmp_path):
+        sm = self._upgrade_from_3_7_5(tmp_path)
+
+        (plex,) = [s for s in sm.get("media_servers") if s["type"] == "plex"]
+        assert plex["output"]["webhook_enabled"] is True
+        assert plex["output"]["webhook_public_url"] == "https://previews.example.com"
+        assert sm.get("plex_webhook_enabled") is None and sm.get("plex_webhook_public_url") is None
+
+    def test_a_plex_server_id_given_to_the_migrations_is_the_one_v7_gives_the_plex_server(self, tmp_path):
+        """A restore passes the live Plex server's id, so a restored 3.x file's server keeps the id it has."""
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        (tmp_path / "settings.json").write_text(json.dumps(self.FROM_3_7_5))
+        sm = SettingsManager(config_dir=str(tmp_path))
+
+        run_migrations(sm, plex_server_id="live-plex-id")
+
+        assert [s["id"] for s in sm.get("media_servers")] == ["live-plex-id"]
+
+    def test_the_pre_upgrade_copy_of_a_3_7_install_is_the_file_3_7_wrote(self, tmp_path):
+        self._upgrade_from_3_7_5(tmp_path)
+
+        assert json.loads((tmp_path / "settings.json.pre-v6.bak").read_text()) == self.FROM_3_7_5
+
+    def test_a_fresh_install_drops_the_plex_direct_webhook_keys(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v7
+
+        settings_manager.apply_changes(updates={"plex_webhook_public_url": "https://x.example"})
+
+        _migrate_to_v7(settings_manager)
+
+        assert settings_manager.get("plex_webhook_public_url") is None
 
     def test_fresh_install_writes_empty_array(self, settings_manager):
         """No plex_url/token → media_servers initialised to []."""
@@ -2727,28 +2915,68 @@ class TestMigrationNoticeBackupAndDismissal:
 
     @pytest.mark.parametrize("kind", ["version_move", "retry_boot"])
     @pytest.mark.parametrize("earlier_backup_on_disk", [True, False])
-    def test_merging_into_an_unread_notice_keeps_its_backup_only_while_that_file_exists(
+    def test_merging_into_an_unread_notice_names_this_boots_backup_not_the_notices_older_one(
         self, tmp_path, kind, earlier_backup_on_disk
     ):
-        """The card keeps the unread notice's "from", so it keeps the backup from that version when there is one."""
+        """The card keeps the unread notice's "from", but rolling back means restoring the settings as this build
+        found them: an unread notice's copy can be a fresh install's first-boot file, and restoring it wipes
+        every setting."""
         from media_preview_generator.upgrade import _migrate_schema
 
-        earlier = tmp_path / "settings.json.20260101-000000.bak"
+        earlier = tmp_path / "settings.json.pre-v1.bak"
         if earlier_backup_on_disk:
-            earlier.write_text('{"_schema_version": 11}')
-        unread = {"from": 11, "to": 13, "backup": str(earlier), "notes": ["An unread note."]}
+            earlier.write_text('{"_env_migrated": true}')
+        unread = {"from": 1, "to": 13, "backup": str(earlier), "notes": ["An unread note."]}
         seeded = self._seed(kind, _pending_migration_notice=unread)
         sm = self._boot(tmp_path, seeded)
 
         _migrate_schema(sm)
 
         notice = sm.get("_pending_migration_notice")
-        assert notice["from"] == 11
-        if earlier_backup_on_disk:
-            assert notice["backup"] == str(earlier)
-        else:
-            assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
-            assert json.loads(Path(notice["backup"]).read_text()) == seeded
+        assert notice["from"] == 1
+        assert notice["backup"] != str(earlier)
+        assert json.loads(Path(notice["backup"]).read_text()) == seeded
+
+    def test_an_upgrade_with_no_notes_still_points_an_unread_notice_at_this_boots_backup(self, tmp_path):
+        """A 5.1.0 install's unread card names its fresh-install copy (pre-v1.bak, holding nothing); v24 on a server
+        with no helper writes no notes, and the card must still move on to the copy this upgrade took."""
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.web import notifications as notif
+
+        earlier = tmp_path / "settings.json.pre-v1.bak"
+        earlier.write_text('{"_env_migrated": true}')
+        unread = {"from": 1, "to": 23, "backup": str(earlier), "notes": ["An unread note."]}
+        seeded = {"_schema_version": 23, "thumbnail_interval": 5, "_pending_migration_notice": unread}
+        sm = self._boot(tmp_path, seeded)
+
+        _migrate_schema(sm)
+
+        notice = sm.get("_pending_migration_notice")
+        assert (notice["from"], notice["to"], notice["notes"]) == (1, _CURRENT_SCHEMA_VERSION, ["An unread note."])
+        assert json.loads(Path(notice["backup"]).read_text()) == seeded
+        with patch("media_preview_generator.web.settings_manager.get_settings_manager", return_value=sm):
+            body = notif._build_schema_migration_notification()["body_html"]
+        assert "pre-v1.bak" not in body
+        assert f"<code>{notice['backup']}</code>" in body
+
+    @pytest.mark.parametrize("earlier", ["none", "dismissed"])
+    def test_an_upgrade_with_no_notes_and_no_unread_notice_writes_no_card(self, tmp_path, earlier):
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.web.notifications import SCHEMA_MIGRATION_ID
+
+        extra = {}
+        if earlier == "dismissed":
+            extra = {
+                "_pending_migration_notice": {"from": 1, "to": 23, "backup": "", "notes": []},
+                "dismissed_notifications": [SCHEMA_MIGRATION_ID],
+            }
+        sm = self._boot(tmp_path, {"_schema_version": 23, **extra})
+
+        _migrate_schema(sm)
+
+        assert sm.get("_schema_version") == _CURRENT_SCHEMA_VERSION
+        assert sm.get("_pending_migration_notice") == extra.get("_pending_migration_notice")
+        assert sm.get("dismissed_notifications") == extra.get("dismissed_notifications")
 
     def test_the_notice_backup_survives_fifteen_ordinary_saves(self, tmp_path, monkeypatch):
         """Saves rotate timestamped backups (keep 10); the pre-upgrade copy must not be one of them."""
@@ -2778,15 +3006,51 @@ class TestMigrationNoticeBackupAndDismissal:
         assert backup.exists()
         assert json.loads(backup.read_text()) == seeded
 
-    def test_an_existing_pre_upgrade_copy_is_kept(self, tmp_path):
+    def test_a_retry_boot_names_the_copy_it_took_last_time(self, tmp_path):
         from media_preview_generator.upgrade import _backup_settings_before_migrating
 
         sm = self._boot(tmp_path, self._seed("version_move"))
         existing = Path(f"{sm.settings_file}.pre-v13.bak")
-        existing.write_text("earliest")
+        existing.write_bytes(Path(sm.settings_file).read_bytes())
 
         assert _backup_settings_before_migrating(sm, 13) == str(existing)
-        assert existing.read_text() == "earliest"
+        assert sorted(p.name for p in tmp_path.glob("settings.json.pre-v*")) == ["settings.json.pre-v13.bak"]
+
+    def test_an_earlier_upgrades_copy_is_kept_and_a_new_one_taken_of_settings_changed_since(self, tmp_path):
+        """Rolled back by restoring pre-v13.bak, changed on the older build, upgraded again: the way back now is the
+        settings as they are, and the first upgrade's copy stays as it was."""
+        from media_preview_generator.upgrade import _backup_settings_before_migrating
+
+        sm = self._boot(tmp_path, self._seed("version_move"))
+        earlier = Path(f"{sm.settings_file}.pre-v13.bak")
+        earlier.write_text("earliest")
+
+        taken = _backup_settings_before_migrating(sm, 13)
+
+        assert taken != str(earlier)
+        assert Path(taken).name.startswith("settings.json.pre-v13.")
+        assert Path(taken).read_bytes() == Path(sm.settings_file).read_bytes()
+        assert earlier.read_text() == "earliest"
+        assert _backup_settings_before_migrating(sm, 13) == taken  # a retry boot of this upgrade reuses it
+
+    def test_a_second_upgrade_after_a_rollback_names_a_copy_of_the_settings_it_migrated(self, tmp_path):
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.utils import timestamped_backups
+
+        first = self._seed("version_move")
+        _migrate_schema(self._boot(tmp_path, first))
+        first_copy = tmp_path / "settings.json.pre-v13.bak"
+        assert json.loads(first_copy.read_text()) == first
+
+        changed_on_the_older_build = {**first, "thumbnail_interval": 10}
+        sm = self._boot(tmp_path, changed_on_the_older_build)
+        _migrate_schema(sm)
+
+        named = Path(sm.get("_pending_migration_notice")["backup"])
+        assert named != first_copy
+        assert json.loads(named.read_text()) == changed_on_the_older_build
+        assert json.loads(first_copy.read_text()) == first
+        assert str(named) not in timestamped_backups(str(sm.settings_file))  # saves never prune it
 
     def test_notice_names_no_backup_when_none_could_be_written(self, tmp_path, monkeypatch):
         from media_preview_generator import upgrade
@@ -2850,12 +3114,11 @@ class TestMigrationNoticeBackupAndDismissal:
         if earlier_notice == "unread":
             assert notice["notes"] == ["An earlier note.", *this_upgrades_notes]
             assert notice["from"] == 11
-            assert notice["backup"] == str(earlier_backup)
         else:
             assert notice["notes"] == this_upgrades_notes
             assert notice.get("from") == (13 if kind == "version_move" else None)
-            assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
-            assert notice["backup"] != str(earlier_backup)
+        assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
+        assert notice["backup"] != str(earlier_backup)
         assert sm.dismissed_notifications == []
 
     def test_a_migration_that_writes_no_notice_leaves_stored_dismissals_alone(self, tmp_path):
@@ -3254,6 +3517,349 @@ class TestMigrateToV23:
         assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[23]]
 
 
+def _plex_entry(server_id: str, name: str, agent: dict | None, server_type: str = "plex") -> dict:
+    entry: dict = {"id": server_id, "type": server_type, "name": name, "enabled": True, "url": "http://p:32400"}
+    if agent is not None:
+        entry["markers"] = {
+            "enabled": True,
+            "library_ids": None,
+            "plex": {"db_write_confirmed_at": "2026-01-01", "on_plex_redetect": "restore", "agent": agent},
+        }
+    return entry
+
+
+def _agent_of(settings_manager, index: int) -> dict:
+    return settings_manager.get("media_servers")[index]["markers"]["plex"]["agent"]
+
+
+class TestMigrateToV24:
+    """v24 moves every Plex helper's address and key into a ``nodes`` record the server points at."""
+
+    HELPER = {"enabled": True, "url": "http://helper.lan:9494/", "token": "helper-key"}
+
+    def test_an_enabled_helper_becomes_a_node_and_the_server_points_at_it(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+
+        notes = _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert (node["name"], node["url"], node["key"], node["enabled"]) == (
+            "Plex helper (Home)",
+            "http://helper.lan:9494",
+            "helper-key",
+            True,
+        )
+        assert node["node_uid"] is None and node["path_mappings"] == [] and node["added_at"]
+        # The address and key live only on the node now: the server keeps no copy of the old key.
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+        assert settings_manager.nodes_revision == 1
+        assert notes and notes[0].startswith("v24:")
+        assert "Nodes page" in _USER_FACING_NOTES[24]
+
+    def test_a_disabled_helper_with_an_address_keeps_its_node_switched_off(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {**self.HELPER, "enabled": False}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        node = settings_manager.get("nodes")[0]
+        assert node["enabled"] is False
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": node["id"]}
+
+    @pytest.mark.parametrize(
+        "agent",
+        [{"enabled": False, "url": "", "token": ""}, {"enabled": False, "url": "http://x:1", "token": ""}],
+        ids=["no-address", "no-key"],
+    )
+    def test_a_block_without_a_helper_points_at_no_node(self, settings_manager, agent):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get("nodes") is None
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+
+    @pytest.mark.parametrize(
+        "agent",
+        [
+            {"enabled": True, "url": "http://helper.lan:9494", "token": ""},
+            {"enabled": True, "url": 9494, "token": "k"},
+            {"enabled": True, "url": "plex-host:9494", "token": "k"},
+        ],
+        ids=["no-key", "int-address", "no-scheme"],
+    )
+    def test_a_switched_on_helper_that_cant_be_moved_stays_on_with_no_node(self, settings_manager, agent, tmp_path):
+        """Before the upgrade nothing was written through it; after it the server is refused "no node", never sent
+        to this app's own copy of the Plex database, and a bad address can't lock the nodes list."""
+        from media_preview_generator.markers.publishers.plex_remote import AGENT_NO_NODE, RemotePlexDb, plex_database
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.nodes.settings import default_record
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        assert settings_manager.get("nodes") is None
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": None}
+        settings = load_server(settings_manager.get("media_servers")[0]["markers"], "plex")
+        db = plex_database(settings, path_provider=lambda: str(tmp_path / "plex.db"), label="Home")
+        assert isinstance(db, RemotePlexDb) and db._client.refusal().agent_state == AGENT_NO_NODE
+        settings_manager.update_nodes([default_record(name="NUC", url="http://nuc:9494", key="node-key")])
+        assert [n["name"] for n in settings_manager.nodes] == ["NUC"]
+
+    def test_a_switched_on_helper_with_no_address_keeps_using_this_apps_copy(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {"enabled": True, "url": "", "token": "k"}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+
+    def test_a_switched_on_helper_stays_on_whatever_intro_and_credits_says(self, settings_manager):
+        """Chapter thumbnails went through a switched-on helper with Intro & Credits off (5.1.0's own docs), so
+        its node stays on: off, chapters would be refused "turned off on the Nodes page" after the upgrade."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        entry = _plex_entry("p1", "Home", self.HELPER)
+        entry["markers"]["enabled"] = False
+        settings_manager.apply_changes(updates={"media_servers": [entry]})
+
+        _migrate_to_v24(settings_manager)
+
+        node = settings_manager.get("nodes")[0]
+        assert node["enabled"] is True
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+
+    def test_a_helper_only_a_switched_off_server_used_becomes_a_node_turned_off(self, settings_manager):
+        """5.1.0 never contacted a switched-off server's helper; turned on, the node was checked forever and shown
+        red "Offline", used by that server."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        entry = _plex_entry("p1", "Old Plex", self.HELPER)
+        entry["enabled"] = False
+        settings_manager.apply_changes(updates={"media_servers": [entry]})
+
+        _migrate_to_v24(settings_manager)
+
+        node = settings_manager.get("nodes")[0]
+        assert node["enabled"] is False
+        # The server keeps its helper switch for when it is switched on again.
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+
+    @pytest.mark.parametrize("off_first", [True, False])
+    def test_a_helper_a_switched_on_server_also_used_stays_on(self, settings_manager, off_first):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        old = _plex_entry("p1", "Old Plex", self.HELPER)
+        old["enabled"] = False
+        home = _plex_entry("p2", "Home", dict(self.HELPER))
+        settings_manager.apply_changes(updates={"media_servers": [old, home] if off_first else [home, old]})
+
+        _migrate_to_v24(settings_manager)
+
+        (node,) = settings_manager.get("nodes")
+        assert node["enabled"] is True
+
+    def test_chapter_thumbnails_keep_going_through_a_helper_whose_intro_and_credits_is_off(self, settings_manager):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from media_preview_generator.markers.publishers import plex_chapters
+        from media_preview_generator.markers.publishers.plex_remote import AgentClient
+        from media_preview_generator.upgrade import _migrate_to_v24
+        from media_preview_generator.web import settings_manager as sm_mod
+
+        entry = _plex_entry("p1", "Home", self.HELPER)
+        entry["markers"]["enabled"] = False
+        entry["output"] = {"adapter": "plex_bundle", "plex_config_folder": "", "chapter_thumbnails": True}
+        settings_manager.apply_changes(updates={"media_servers": [entry]})
+        _migrate_to_v24(settings_manager)
+
+        migrated = settings_manager.get("media_servers")[0]
+        config = SimpleNamespace(markers=migrated["markers"], output=migrated["output"])
+        sm_mod._settings_manager = settings_manager
+        try:
+            with patch.object(plex_chapters, "_server_identity", return_value=("machine", "1.43.4.1")):
+                backend, *_ = plex_chapters._context(MagicMock(), config)
+        finally:
+            sm_mod.reset_settings_manager()
+        assert isinstance(backend, AgentClient)
+
+    def test_a_block_that_already_has_a_node_keeps_it_and_loses_its_old_address_and_key(self, settings_manager):
+        """Called on a block that already has node_id, it drops url/token beside it and keeps the node; twice is a
+        no-op. (Settings already at v24 never run it: _migrate_schema stops at the current schema.)"""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {**self.HELPER, "node_id": "n-earlier"}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": "n-earlier"}
+        assert settings_manager.get("nodes") is None
+        before = settings_manager.get_all()
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get_all() == before
+
+    def test_servers_without_a_markers_block_and_other_vendors_are_untouched(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [_plex_entry("p1", "Home", None), _plex_entry("j1", "JF", self.HELPER, server_type="jellyfin")]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get("media_servers") == servers
+        assert settings_manager.get("nodes") is None
+
+    def test_two_servers_sharing_one_helper_share_one_node(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [
+            _plex_entry("p1", "Home", {**self.HELPER, "enabled": False}),
+            _plex_entry("p2", "Cabin", {**self.HELPER, "url": "http://helper.lan:9494"}),
+            _plex_entry("p3", "Home", {"enabled": True, "url": "http://other:9494", "token": "other-key"}),
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert [n["name"] for n in nodes] == ["Plex helper (Home)", "Plex helper (Home) 2"]
+        # The shared node is on because one of its servers had it on.
+        assert nodes[0]["enabled"] is True
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 1) == {"enabled": True, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 2) == {"enabled": True, "node_id": nodes[1]["id"]}
+
+    def test_a_second_run_changes_nothing(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+        before = settings_manager.get_all()
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get_all() == before
+
+    def test_a_re_run_on_a_rolled_back_block_reuses_the_node_at_that_address(self, settings_manager):
+        """A build from before nodes saved the server again (dropping node_id); the next upgrade reuses the node."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+        node_id = settings_manager.get("nodes")[0]["id"]
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert [n["id"] for n in settings_manager.get("nodes")] == [node_id]
+        assert _agent_of(settings_manager, 0)["node_id"] == node_id
+
+    def test_a_long_server_name_is_cut_so_the_node_name_fits(self, settings_manager):
+        from media_preview_generator.nodes.settings import NAME_MAX_LEN, validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        long_name = "A" * 75 + " Plex"
+        servers = [
+            _plex_entry("p1", long_name, self.HELPER),
+            _plex_entry("p2", long_name, {"enabled": True, "url": "http://other:9494", "token": "other-key"}),
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        names = [n["name"] for n in settings_manager.get("nodes")]
+        assert all(len(name) <= NAME_MAX_LEN for name in names)
+        assert names[0].startswith("Plex helper (AAAA") and names[0].endswith("…)")
+        assert names[1].endswith("…) 2") and len({n.casefold() for n in names}) == 2
+        assert validate_nodes(settings_manager.get("nodes"))[1] == ""
+
+    @pytest.mark.parametrize(
+        ("server_names", "node_names"),
+        [
+            (["Casa \U0001f468‍\U0001f469‍\U0001f467"], ["Plex helper (Casa \U0001f468\U0001f469\U0001f467)"]),
+            (["בית ‏Plex"], ["Plex helper (בית Plex)"]),
+            (["Home\nPlex\tTV"], ["Plex helper (Home Plex TV)"]),
+            (["​‎"], ["Plex helper (Plex)"]),
+            (["Café", "Café"], ["Plex helper (Café)", "Plex helper (Café) 2"]),
+            (["NUC", "ＮＵＣ"], ["Plex helper (NUC)", "Plex helper (ＮＵＣ) 2"]),
+        ],
+        ids=["zwj-emoji", "rtl-mark", "line-break-and-tab", "only-hidden", "cafe-two-ways", "full-width"],
+    )
+    def test_a_server_name_the_node_name_rules_refuse_still_makes_a_valid_node_name(
+        self, settings_manager, server_names, node_names
+    ):
+        """A server's name takes any text; a node name the rules refuse made every later save of the node fail,
+        the registry's record of the id the node reports included."""
+        from media_preview_generator.nodes.settings import validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [
+            _plex_entry(f"p{i}", name, {"enabled": True, "url": f"http://helper{i}.lan:9494", "token": "k"})
+            for i, name in enumerate(server_names)
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert [n["name"] for n in nodes] == node_names
+        assert validate_nodes(nodes)[1] == ""
+
+    def test_a_migrated_long_name_leaves_the_nodes_list_editable(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "B" * 120, self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.nodes
+        nodes[0]["enabled"] = False
+        settings_manager.update_nodes(nodes)
+        assert settings_manager.nodes[0]["enabled"] is False
+
+    def test_the_migrated_settings_pass_node_validation_and_resolve_the_address(self, settings_manager):
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.nodes.settings import validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+        from media_preview_generator.web import settings_manager as sm_mod
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", self.HELPER)]})
+        _migrate_to_v24(settings_manager)
+
+        assert validate_nodes(settings_manager.get("nodes"))[1] == ""
+        sm_mod._settings_manager = settings_manager
+        try:
+            loaded = load_server(settings_manager.get("media_servers")[0]["markers"], "plex")
+        finally:
+            sm_mod.reset_settings_manager()
+        assert (loaded.agent_enabled, loaded.agent_url, loaded.agent_token) == (
+            True,
+            "http://helper.lan:9494",
+            "helper-key",
+        )
+
+    def test_the_schema_step_runs_once_stamps_the_version_and_tells_the_user(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_schema
+
+        settings_manager.apply_changes(
+            updates={"_schema_version": 23, "media_servers": [_plex_entry("p1", "Home", self.HELPER)]}
+        )
+
+        _migrate_schema(settings_manager)
+
+        assert settings_manager.get("_schema_version") == _CURRENT_SCHEMA_VERSION == 24
+        assert len(settings_manager.get("nodes")) == 1
+        assert settings_manager.get("_pending_migration_notice")["notes"] == [_USER_FACING_NOTES[24]]
+
+
 class TestUpgradedAutoPauseResumes:
     """A proven no-workers pause becomes capacity waiting after upgrading."""
 
@@ -3311,3 +3917,41 @@ class TestUpgradedAutoPauseResumes:
             for g in get_settings_manager().worker_groups
             for m in g["members"]
         )
+
+
+class TestFreshInstallNotice:
+    def test_a_brand_new_install_gets_no_settings_migrated_card(self, tmp_path):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("_schema_version") == _CURRENT_SCHEMA_VERSION
+        assert sm.get("_pending_migration_notice") is None
+
+    def test_an_install_upgraded_from_an_older_version_still_gets_the_card(self, tmp_path):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        (tmp_path / "settings.json").write_text(json.dumps({"_schema_version": 20, "cpu_threads": 2}))
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("_pending_migration_notice")["from"] == 20
+
+    def test_an_install_set_up_with_environment_variables_only_still_gets_the_card(self, tmp_path, monkeypatch):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        # Before settings.json existed the app was set up with env vars alone: no file, but a real Plex setup.
+        monkeypatch.setenv("PLEX_URL", "http://plex.lan:32400")
+        monkeypatch.setenv("PLEX_TOKEN", "abc123token")
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("media_servers")[0]["url"] == "http://plex.lan:32400"
+        notice = sm.get("_pending_migration_notice")
+        assert notice and any("multi-server" in note for note in notice["notes"])
+        # What's New already treats it as an upgrade; the card now agrees.
+        assert sm.get("last_seen_version") == "0.0.0"

@@ -854,9 +854,7 @@ def test_a_busy_database_during_the_capability_check_fails_the_file_for_a_retry_
     row = out.publisher_rows[0]
     assert _outcomes(out) == ["failed"]
     assert (row["status"], row["reason_code"]) == ("failed", PLEX_DB_BUSY)
-    assert row["message"] == (
-        "Another Intro & Credits task is still using this Plex database; this job tries again in a few minutes"
-    )
+    assert row["message"] == "Another task is still using this Plex database; this job tries again in a few minutes"
     assert job_runner.retry_reason(row) == PLEX_DB_BUSY
     assert ctx.busy_promised() == {item.paths["1080p"]}
     # The same job's next file asks again, and publishes once the database is free.

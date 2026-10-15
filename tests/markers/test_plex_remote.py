@@ -1,11 +1,15 @@
 """The Plex marker agent's wire protocol and the app's side of it.
 
-The agent's own side lives in ``tests/test_plex_marker_agent.py``, including the two containers' round trip.
+The agent's own side (the node's Plex database role) lives in ``tests/nodes/test_plex_db_role.py``, including the two
+containers' round trip.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import tracemalloc
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,7 +39,9 @@ from media_preview_generator.markers.publishers.plex_db import (
 )
 from media_preview_generator.markers.publishers.plex_remote import AgentError, RemotePlexDb, plex_database
 from media_preview_generator.markers.settings import ServerMarkersSettings
+from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, RELAY_LINE_MAX
 from media_preview_generator.servers.base import ServerConfig, ServerType
+from tests.nodes.slow_answers import answering_late, dripping_server
 
 T = MarkerType
 TOKEN = "s3cret-key-nobody-should-see"
@@ -50,14 +56,22 @@ def _deadline(seconds: float = 8.0) -> float:
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: object) -> None:
-        self.status_code = status_code
-        self._payload = payload
+    """A streamed ``requests`` response: a payload that is an exception stands for a body that isn't JSON."""
 
-    def json(self):
-        if isinstance(self._payload, Exception):
-            raise self._payload
-        return self._payload
+    def __init__(self, status_code: int, payload: object, *, headers: dict | None = None, body: bytes | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
+        if body is None:
+            body = b"not json" if isinstance(payload, Exception) else json.dumps(payload).encode()
+        self._body = body
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self._body), chunk_size):
+            yield self._body[start : start + chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeSession:
@@ -67,12 +81,15 @@ class FakeSession:
         self.answers = list(answers)
         self.calls: list[dict] = []
 
-    def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+    def post(self, url, json=None, headers=None, timeout=None, **kwargs):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout, **kwargs})
         answer = self.answers.pop(0) if self.answers else FakeResponse(200, {})
         if isinstance(answer, Exception):
             raise answer
         return answer
+
+    def get(self, url, headers=None, timeout=None, **kwargs):
+        return self.post(url, headers=headers, timeout=timeout, **kwargs)
 
 
 def _envelope(result: dict, *, version: str = "1.0.0", protocols=(1,)) -> FakeResponse:
@@ -248,10 +265,46 @@ class TestVersionSkew:
 
     @pytest.mark.parametrize(
         ("version", "too_old"),
-        [("0.9.0", True), ("1.0.0", False), ("1.0.1", False), ("2.0.0", False), ("", False), ("dev", False)],
+        [
+            ("0.9.0", True),
+            ("1.0.0", False),
+            ("1.0.1", False),
+            ("2.0.0", False),
+            ("", False),
+            ("dev", False),
+            # A digit to str.isdigit() that int() refuses, and a number past int()'s digit limit: unreadable.
+            ("0.²", False),
+            ("0." + "9" * 5000, False),
+        ],
+        ids=lambda v: repr(v)[:12],
     )
     def test_only_a_lower_readable_version_counts_as_too_old(self, version, too_old):
         assert plex_remote.agent_too_old(version) is too_old
+
+    @pytest.mark.parametrize(
+        ("version", "needed", "older"),
+        [
+            # A :dev image (setuptools-scm: 3 commits after 5.1.0, heading for 5.1.1) and a local build.
+            ("4.4.3.dev5", "9.9.0", True),
+            ("9.9.0", "4.4.3.dev5", False),
+            ("5.1.0", "5.1.1.dev3", True),
+            ("5.1.1.dev3", "5.1.0", False),
+            ("5.1.1.dev3+g1234abc", "5.1.0", False),
+            # A dev build of a release comes before that release, and two of them order by their dev number.
+            ("5.1.1.dev3", "5.1.1", True),
+            ("5.1.1", "5.1.1.dev3", False),
+            ("5.1.1.dev3", "5.1.1.dev5", True),
+            ("5.1.1.dev5", "5.1.1.dev3", False),
+            ("5.1.1.dev3", "5.1.1.dev3", False),
+            ("5.1.1rc1", "5.1.1", True),
+            ("5.1.1rc1", "5.1.0", False),
+            ("5.1.0+local", "5.1.0", False),
+            ("dev", "5.1.0", False),
+            ("5.1.0", "dev", False),
+        ],
+    )
+    def test_a_dev_or_local_build_is_ordered_by_its_release(self, version, needed, older):
+        assert plex_remote.agent_older_than(version, needed) is older
 
     def test_an_agent_ahead_of_this_app_says_to_update_the_app(self):
         remote, _ = _remote(FakeResponse(409, {"agent": {"version": "2.0.0", "protocols": [2]}, "error": {}}))
@@ -282,7 +335,7 @@ class TestVersionSkew:
         with pytest.raises(AgentError) as ei:
             remote.read_item(7, deadline=_deadline())
         assert "0.3.0" in str(ei.value) and plex_remote.MIN_AGENT_VERSION in str(ei.value)
-        assert "Update the agent container" in str(ei.value)
+        assert "Update the node." in str(ei.value)
 
     def test_an_agent_older_than_this_app_is_refused_even_when_it_answers(self):
         remote, _ = _remote(_envelope({"item": {"exists": True, "parts": []}}, version="0.3.0"))
@@ -302,6 +355,58 @@ class TestVersionSkew:
         assert report.details["agent"]["state"] == "incompatible"
 
 
+_CAPABILITIES = ["loudness_v1", "library_health_v1"]
+
+
+def _answer_of(size: int, result: dict) -> FakeResponse:
+    """An agent's answer with ``result``, exactly ``size`` bytes long (padded with whitespace, which JSON allows)."""
+    agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+    body = json.dumps({"ok": True, "agent": agent, "result": result}).encode()
+    return FakeResponse(200, {}, body=body + b" " * (size - len(body)))
+
+
+def _answering(answer: FakeResponse) -> RemotePlexDb:
+    """A node that answered before (its capabilities are known, so a request goes straight to its route)."""
+    remote, _ = _remote(answer)
+    remote._client.capabilities = list(_CAPABILITIES)
+    return remote
+
+
+def _outcome(call, remote: RemotePlexDb) -> str:
+    """What the call said: the refusal it raised, or the message of the report it returned."""
+    try:
+        answer = call(remote)
+    except PublishError as exc:
+        return str(exc)
+    return str(getattr(answer, "message", ""))
+
+
+def _library_health_rows(remote: RemotePlexDb) -> dict:
+    return remote.library_health_rows([1], want_markers=False, want_chapters=False, deadline=_deadline(), needs="1")
+
+
+_REPORT = {"report": {"state": "ok", "message": "", "details": {}}}
+_SMALL_ANSWER_CALLS = [
+    pytest.param(lambda r: r.read_item(7, deadline=_deadline()), {"item": {"exists": True, "parts": []}}, id="read"),
+    pytest.param(
+        lambda r: r.write_item(
+            WriteRequest(7, [PART], [INTRO], [], 1, [], (1,), frozenset(), False), deadline=_deadline()
+        ),
+        {"write": {"changed": True, "shown": "ours", "replaced_own": [], "replaced_stale": []}},
+        id="write",
+    ),
+    pytest.param(lambda r: r.item_exists(7, deadline=_deadline()), {"exists": True}, id="exists"),
+    pytest.param(
+        lambda r: r.loudness("streams", {}, deadline=_deadline(), needs="1"),
+        {"capability": "loudness_v1"},
+        id="loudness",
+    ),
+    pytest.param(lambda r: r.node_machine_identifier(), {"machine_identifier": "m1"}, id="ping"),
+    pytest.param(lambda r: r.file_checks(deadline=_deadline()), _REPORT, id="file-checks"),
+    pytest.param(lambda r: r.db_checks(deadline=_deadline()), _REPORT, id="db-checks"),
+]
+
+
 class TestFailuresLookLikeTodays:
     """Whatever goes wrong, the app sees the same exception shape it sees from a local database."""
 
@@ -316,6 +421,32 @@ class TestFailuresLookLikeTodays:
         assert str(ei.value) == "Plex is busy writing its database"
         assert ei.value.state is Capability.UNREACHABLE and type(ei.value) is PublishError
 
+    @pytest.mark.parametrize(
+        ("call", "says"),
+        [
+            (lambda r: r.read_item(7, deadline=_deadline()), "Markers wait here until it answers again"),
+            (
+                lambda r: r.loudness("streams", {}, deadline=_deadline(), needs="1.2.0"),
+                "Loudness waits until it answers again",
+            ),
+            (
+                lambda r: r.library_health_rows(
+                    [1], want_markers=True, want_chapters=False, deadline=_deadline(), needs="1.2.0"
+                ),
+                "Library Health counts these once it answers again",
+            ),
+        ],
+        ids=["markers", "loudness", "library-health"],
+    )
+    def test_a_node_that_does_not_answer_is_worded_for_the_feature_that_asked(self, call, says):
+        remote, _ = _remote(requests.ConnectionError("connection refused"))
+        # The node answered earlier, so each request goes straight to its route.
+        remote._client.capabilities = ["loudness_v1", "library_health_v1"]
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            call(remote)
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert str(ei.value).startswith(f"Can't reach the Plex database node at {URL} (ConnectionError). {says}")
+
     def test_an_item_the_agent_cant_find_stays_an_item_not_found(self):
         remote, _ = _remote(_refusal({"kind": "item_not_found", "message": "Plex item 7 not found", "state": None}))
         with pytest.raises(ItemNotFoundError):
@@ -325,9 +456,10 @@ class TestFailuresLookLikeTodays:
         remote, _ = _remote(requests.ConnectionError("connection refused"))
         report = remote.file_checks(deadline=_deadline())
         assert report.state is Capability.AGENT_UNAVAILABLE
-        assert "Can't reach the Plex marker agent" in report.message and "nothing is lost" in report.message
+        assert "Can't reach the Plex database node" in report.message and "nothing is lost" in report.message
         assert report.details["agent"] == {
             "url": URL,
+            "name": "",
             "version": "",
             "state": "unreachable",
             "machine_identifier": "",
@@ -341,6 +473,13 @@ class TestFailuresLookLikeTodays:
             )
         assert ei.value.state is Capability.AGENT_UNAVAILABLE and URL in str(ei.value)
 
+    def test_a_node_asking_this_apps_address_to_wait_is_a_wait_not_a_refused_key(self):
+        remote, _ = _remote(FakeResponse(429, {"ok": False, "error": {"kind": "rate_limited"}}))
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            remote.read_item(7, deadline=_deadline())
+        assert "too many wrong keys" in str(ei.value) and "Markers wait here until it answers again" in str(ei.value)
+        assert remote._client.state == "unreachable"
+
     def test_a_wrong_key_is_refused_and_named(self):
         remote, _ = _remote(FakeResponse(401, {"agent": {"version": "1.0.0", "protocols": [1]}, "error": {}}))
         report = remote.file_checks(deadline=_deadline())
@@ -350,8 +489,10 @@ class TestFailuresLookLikeTodays:
     @pytest.mark.parametrize(
         "answer",
         [FakeResponse(500, {}), FakeResponse(200, {"ok": True}), FakeResponse(200, ValueError("not json")),
-         FakeResponse(200, [1, 2])],
-        ids=["server-error", "no-result", "not-json", "not-an-object"],
+         FakeResponse(200, [1, 2]),
+         # Deeper than Python's JSON parser goes: RecursionError, not ValueError.
+         FakeResponse(200, {}, body=b"[" * 200_000 + b"]" * 200_000)],
+        ids=["server-error", "no-result", "not-json", "not-an-object", "nested-too-deep"],
     )  # fmt: skip
     def test_an_answer_this_app_cant_read_never_looks_like_success(self, answer):
         remote, _ = _remote(answer)
@@ -381,6 +522,206 @@ class TestFailuresLookLikeTodays:
         remote = RemotePlexDb("", TOKEN, session=FakeSession())
         report = remote.file_checks(deadline=_deadline())
         assert report.state is Capability.AGENT_UNAVAILABLE
+
+    def test_a_redirect_is_never_followed_and_says_so(self):
+        moved = FakeResponse(307, {}, headers={"Location": "http://elsewhere.example/v1/item/write"})
+        remote, session = _remote(moved)
+        with pytest.raises(AgentError, match="redirect") as ei:
+            remote.read_item(7, deadline=_deadline())
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert session.calls[0]["allow_redirects"] is False and moved.closed
+
+    def test_a_compressed_answer_is_refused_unread(self):
+        # requests would inflate it: a megabyte on the wire can become gigabytes here.
+        bomb = FakeResponse(200, {}, headers={"Content-Encoding": "gzip"}, body=b"\x1f\x8b" + b"\0" * 64)
+        remote, session = _remote(bomb)
+        with pytest.raises(AgentError, match="compressed"):
+            remote.read_item(7, deadline=_deadline())
+        assert session.calls[0]["headers"]["Accept-Encoding"] == "identity" and session.calls[0]["stream"] is True
+
+    @pytest.mark.parametrize(("call", "result"), _SMALL_ANSWER_CALLS)
+    def test_every_answer_but_library_health_rows_is_refused_past_1_mb(self, call, result):
+        # JSON parses into ~25x its size: one 512 MB cap for every answer let any of them cost the app gigabytes.
+        assert "too large" not in _outcome(call, _answering(_answer_of(1024 * 1024, result)))
+        big = _answer_of(1024 * 1024 + 1, result)
+        assert "too large" in _outcome(call, _answering(big))
+        assert big.closed
+
+    def test_library_health_rows_read_past_1_mb_up_to_their_own_cap(self, monkeypatch):
+        monkeypatch.setattr(plex_remote, "MAX_ANSWER_BYTES", 2 * 1024 * 1024)
+        rows = {"capability": "library_health_v1", "rows": {"parts": []}}
+        assert _library_health_rows(_answering(_answer_of(2 * 1024 * 1024, rows))) == {"parts": []}
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(_answer_of(2 * 1024 * 1024 + 1, rows)))
+
+    ROWS_HEAD = b'{"ok":true,"agent":{"version":"1.2.0","protocols":[1]},"result":{"rows":{"parts":['
+    ROWS_TAIL = b']},"capability":"library_health_v1"}}'
+
+    @pytest.mark.parametrize(
+        "row",
+        [b"[]", b"[0,0]", b'["ab",1000000]', b"[" + b",".join([b"null"] * 13) + b"]"],
+        ids=["empty", "small-numbers", "short-text", "nulls"],
+    )
+    def test_library_health_rows_are_refused_once_past_the_memory_they_may_take(self, monkeypatch, row):
+        # Read whole and then parsed, a 24 MB answer of tiny rows took ~550 MB (JSON of "[]," parses into ~25x its
+        # size), so one under the 512 MB cap could take ~12 GB. Rows are now parsed as they arrive and counted.
+        budget = 8 * 1024 * 1024
+        monkeypatch.setattr(plex_remote, "MAX_ROWS_MEMORY_BYTES", budget)
+        count = 24 * 1024 * 1024 // (len(row) + 1)
+        remote = _answering(FakeResponse(200, {}, body=self.ROWS_HEAD + b",".join([row] * count) + self.ROWS_TAIL))
+        tracemalloc.start()
+        try:
+            with pytest.raises(AgentError, match="too large"):
+                _library_health_rows(remote)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < budget * 1.5, f"took {peak >> 20} MB"
+
+    def test_library_health_rows_under_their_memory_budget_are_read_whole(self, monkeypatch):
+        rows = [[1, i, 4, i, f"/tv/{i}.mkv", f"{i:040x}", None, "T", "S", "Show", 1, 1, i] for i in range(5000)]
+        body = self.ROWS_HEAD + json.dumps(rows, separators=(",", ":")).encode()[1:-1] + self.ROWS_TAIL
+        assert _library_health_rows(_answering(FakeResponse(200, {}, body=body))) == {"parts": rows}
+        monkeypatch.setattr(plex_remote, "MAX_ROWS_MEMORY_BYTES", 1024 * 1024)
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(FakeResponse(200, {}, body=body)))
+
+    def test_everything_but_library_health_rows_is_held_to_1_mb(self):
+        filler = b'"filler":[' + b",".join([b"[]"] * (400 * 1024)) + b"],"
+        body = self.ROWS_HEAD.replace(b'"result"', filler + b'"result"') + b"[1,2]" + self.ROWS_TAIL
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(FakeResponse(200, {}, body=body)))
+
+    @pytest.mark.parametrize("row", [b"[[1]]", b'[{"a":1}]', b"5"], ids=["list-in-a-row", "object-in-a-row", "number"])
+    def test_a_library_health_row_that_isnt_a_list_of_values_is_an_answer_the_app_cant_read(self, row):
+        remote = _answering(FakeResponse(200, {}, body=self.ROWS_HEAD + row + self.ROWS_TAIL))
+        with pytest.raises(AgentError, match="instead of a result"):
+            _library_health_rows(remote)
+
+    @pytest.mark.parametrize(
+        ("call", "deadline_s"),
+        [
+            # A read asked to answer within 0.5 s: the connect timeout, then that plus ANSWER_GRACE_S.
+            (lambda r: r.read_item(7, deadline=_deadline(0.5)), 0.5 + 0.5 + 0.5),
+            (lambda r: r.node_machine_identifier(timeout=1.0), 0.5 + 1.0),
+            # Library Health's own: its wait for the database, then ROWS_ANSWER_S for the read and the sending.
+            (
+                lambda r: r.library_health_rows(
+                    [1], want_markers=False, want_chapters=False, deadline=_deadline(0.5), needs="1"
+                ),
+                0.5 + 1.5,
+            ),
+        ],
+        ids=["item-read", "ping", "library-health-rows"],
+    )
+    def test_an_answer_dripped_a_byte_at_a_time_is_given_up_on_at_its_deadline(self, monkeypatch, call, deadline_s):
+        # requests' read timeout is the longest wait for the next byte: an answer sent a byte a second held a marker
+        # write, a loudness job or Library Health for as long as the sender liked.
+        monkeypatch.setattr(plex_remote, "CONNECT_TIMEOUT_S", 0.5)
+        monkeypatch.setattr(plex_remote, "ANSWER_GRACE_S", 0.5)
+        monkeypatch.setattr(plex_remote, "ROWS_ANSWER_S", 1.5)
+        agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+        body = json.dumps({"ok": True, "agent": agent, "result": {}}).encode()
+        with dripping_server(body, drip_s=60, gap_s=0.05) as url:
+            session = requests.Session()
+            session.trust_env = False
+            remote = RemotePlexDb(url, TOKEN, session=session)
+            remote._client.capabilities = list(_CAPABILITIES)
+            started = time.monotonic()
+            with pytest.raises(plex_remote.AgentUnreachableError, match="Can't reach the Plex database node"):
+                call(remote)
+            took = time.monotonic() - started
+        assert remote._client.state == plex_remote.AGENT_UNREACHABLE
+        assert deadline_s - 0.1 <= took < deadline_s + 1.0
+
+    def test_a_slow_start_leaves_the_body_its_whole_time(self, monkeypatch):
+        # The default deadline counted from the request, so an answer whose headers took 0.9 s had 0.6 s for its body.
+        monkeypatch.setattr(plex_remote, "CONNECT_TIMEOUT_S", 0.5)
+        agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+        body = json.dumps({"ok": True, "agent": agent, "result": {"machine_identifier": "m1"}}).encode()
+        pieces = [b" ", b" ", b" ", body]
+        session = requests.Session()
+        session.trust_env = False
+        url = answering_late(wait_s=0.9, pieces=pieces, gap_s=0.3)
+        remote = RemotePlexDb(url, TOKEN, session=session)
+        remote._client.capabilities = list(_CAPABILITIES)
+        assert remote.node_machine_identifier(timeout=1.0) == "m1"
+
+    def test_a_connection_cut_mid_answer_is_unreachable(self):
+        class _Cut(FakeResponse):
+            def iter_content(self, chunk_size=1):
+                yield b'{"ok": '
+                raise requests.exceptions.ChunkedEncodingError("cut")
+
+        remote, _ = _remote(_Cut(200, {}))
+        report = remote.file_checks(deadline=_deadline())
+        assert report.state is Capability.AGENT_UNAVAILABLE and "Can't reach" in report.message
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            lambda text: _refusal({"kind": "refused", "message": text}),
+            lambda text: _refusal({"kind": "protocol", "message": text}, protocols=(1, 2)),
+            lambda text: _envelope({}, version=text, protocols=(text,)),
+        ],
+        ids=["refusal-message", "protocol-refusal-message", "version-and-protocols"],
+    )
+    def test_what_the_node_says_reaches_the_app_as_one_short_line(self, answer):
+        # Its words go to the app's log and the job's file rows: line breaks or escapes there forge lines of the
+        # app's own, as worker nodes' words already can't (protocol.relayed_text).
+        said = "refused\n2026-10-16 | ERROR | forged\x1b[31m " + "x" * 20_000
+        remote, _ = _remote(answer(said))
+        with pytest.raises(PublishError) as raised:
+            remote.read_item(7, deadline=_deadline())
+        message = str(raised.value)
+        assert not any(c in message for c in "\n\x1b "), repr(message[:120])
+        assert len(message) <= RELAY_LINE_MAX + 200
+
+    SAID = "Plex is fine\n2026-10-16 03:00:00 | ERROR | forged\x1b[31m " + "x" * 20_000
+
+    @staticmethod
+    def _one_short_line(text: str) -> None:
+        assert not any(c in text for c in "\n\x1b"), repr(text[:120])
+        assert len(text) <= RELAY_LINE_MAX + 300, len(text)
+
+    @pytest.mark.parametrize("check", ["file_checks", "db_checks"])
+    def test_a_check_report_the_node_sends_reaches_the_app_as_one_short_line(self, check):
+        # Markers put its message in the job's file rows and the log; Setup Health shows its paths.
+        details = {"db_path": self.SAID, "unwritable": [self.SAID, 7], "writer_uid": 1000, "lock_holder": True}
+        report = {"state": "misconfigured", "message": self.SAID, "details": details}
+        remote, _ = _remote(_envelope({"report": report}))
+
+        answer = getattr(remote, check)(deadline=_deadline())
+
+        assert answer.state is Capability.MISCONFIGURED
+        assert answer.message.startswith("Plex is fine\\n2026-10-16 03:00:00 | ERROR | forged\\x1b[31m xxx")
+        for text in (answer.message, answer.details["db_path"], answer.details["unwritable"][0]):
+            self._one_short_line(text)
+        assert (answer.details["unwritable"][1], answer.details["writer_uid"]) == (7, 1000)
+        assert answer.details["lock_holder"] is True
+
+    @pytest.mark.parametrize(
+        ("state", "details", "sentence"),
+        [
+            ("needs_local_db", {"fs_type": "nfs4\n" + SAID}, "Plex's database is on a filesystem the Plex database"),
+            ("needs_local_db", {"fs_type": {"type": SAID}}, "Plex's database is on a filesystem the Plex database"),
+            (
+                "misconfigured",
+                {"unwritable": [SAID] * 50, "writer_uid": SAID, "db_owner_uid": 0},
+                "The Plex database node (user Plex is fine\\n",
+            ),
+        ],
+        ids=["fs-type", "fs-type-not-text", "unwritable-paths"],
+    )
+    def test_the_sentence_the_app_words_from_the_node_s_facts_is_one_short_line(self, state, details, sentence):
+        from media_preview_generator.markers.publishers.plex_db import node_wording
+
+        remote, _ = _remote(_envelope({"report": {"state": state, "message": "x", "details": details}}))
+
+        answer = node_wording(remote.file_checks(deadline=_deadline()))
+
+        assert answer.message.startswith(sentence)
+        self._one_short_line(answer.message)
 
 
 class TestWhatIsSent:
@@ -445,6 +786,157 @@ class TestWhatIsSent:
         )
         batch = remote.shown_many([ShownAsk(i, [INTRO], frozenset(), None) for i in range(10)], timeout_s=30.0)
         assert len(batch.answers) == 3 and batch.unreadable is False
+
+
+class TestTheNodesSavedId:
+    """Each request names the node this app saved at the address, so another machine answering there runs nothing."""
+
+    @staticmethod
+    def _remote(*answers, uid: str = "uid-a") -> tuple[RemotePlexDb, FakeSession, list]:
+        session = FakeSession(*answers)
+        told: list = []
+        remote = RemotePlexDb(URL, TOKEN, session=session, node_uid=lambda: uid, wrong_node=lambda: told.append(1))
+        return remote, session, told
+
+    @staticmethod
+    def _write() -> WriteRequest:
+        return WriteRequest(7, [PART], [INTRO], [], 1_320_000, [], (1,), frozenset(), False)
+
+    def test_a_request_names_the_saved_id_in_the_protocol_that_checks_it(self):
+        remote, session, _ = self._remote(_envelope({"exists": True}, protocols=(1, 2)))
+        assert remote.item_exists(7, deadline=_deadline()) is True
+        headers = session.calls[0]["headers"]
+        assert headers[NODE_UID_HEADER] == "uid-a"
+        assert headers[plex_remote.PROTOCOL_HEADER] == str(plex_remote.AGENT_PROTOCOL_NODE_UID)
+
+    def test_before_an_id_is_saved_none_is_named_and_an_old_helper_keeps_protocol_1(self):
+        remote, session, _ = self._remote(_envelope({"exists": True}), uid="")
+        assert remote.item_exists(7, deadline=_deadline()) is True
+        headers = session.calls[0]["headers"]
+        assert NODE_UID_HEADER not in headers
+        assert headers[plex_remote.PROTOCOL_HEADER] == str(plex_remote.AGENT_PROTOCOL)
+
+    def test_another_machine_at_the_address_is_a_wait_and_a_recheck_never_a_failed_write(self):
+        wrong = _refusal({"kind": KIND_WRONG_NODE, "message": "another id"}, version="1.2.0", protocols=(1, 2))
+        remote, _, told = self._remote(wrong)
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        assert "isn't the Plex database node saved there" in str(ei.value)
+        assert plex_remote.MARKERS_WAIT_FOR_THE_NODE in str(ei.value)
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert remote.agent_details()["state"] == plex_remote.AGENT_UNREACHABLE
+        assert told == [1]
+
+    def test_a_node_from_before_the_check_refuses_the_request_and_is_to_be_updated(self):
+        # Its guard refuses protocol 2 before anything runs; the app says which side to update.
+        older = FakeResponse(409, {"agent": {"version": "1.2.0", "protocols": [1]}, "error": {"kind": "protocol"}})
+        remote, _, told = self._remote(older)
+        with pytest.raises(AgentError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        message = str(ei.value)
+        assert not isinstance(ei.value, plex_remote.AgentUnreachableError)
+        assert "protocol 1" in message and "needs 2" in message and "Update the node." in message
+        assert "Update this app" not in message
+        assert remote.agent_details()["state"] == plex_remote.AGENT_INCOMPATIBLE
+        assert told == []
+
+    def test_an_id_dropped_on_the_way_is_the_nodes_refusal_and_the_badge_says_so(self):
+        """A proxy that strips the id header: the node speaks protocol 2 and refuses the request without it. Every
+        request fails the same way, so the badge can't say connected, and the node's message names the fix."""
+        said = "The node's id (X-MPG-Node-Uid) didn't arrive with this request, so this node ran nothing."
+        stripped = _refusal(
+            {"kind": "protocol", "message": said, "state": Capability.AGENT_UNAVAILABLE.value},
+            version="1.2.0",
+            protocols=(1, 2),
+        )
+        remote, _, told = self._remote(stripped)
+        with pytest.raises(AgentError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        assert not isinstance(ei.value, plex_remote.AgentUnreachableError)
+        assert str(ei.value) == said
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert remote.agent_details()["state"] == plex_remote.AGENT_INCOMPATIBLE
+        assert told == []
+
+    def test_the_id_is_read_for_each_request(self):
+        uids = iter(["uid-a", ""])
+        session = FakeSession(_envelope({"exists": True}, protocols=(1, 2)), _envelope({"exists": True}))
+        remote = RemotePlexDb(URL, TOKEN, session=session, node_uid=lambda: next(uids))
+        remote.item_exists(7, deadline=_deadline())
+        remote.item_exists(7, deadline=_deadline())  # the key typed again cleared the saved id
+        assert [c["headers"].get(NODE_UID_HEADER) for c in session.calls] == ["uid-a", None]
+
+
+class TestARefusalCallsTheNodeByItsName:
+    """Lab: every relayed refusal, in the job log and Setup Health, said "The Plex database node at http://...", where
+    the Nodes page knows the node by its name. The address stays only where checking it is the fix."""
+
+    WRONG_NODE = _refusal({"kind": KIND_WRONG_NODE, "message": "another id"}, version="1.2.0", protocols=(1, 2))
+    OLDER = FakeResponse(409, {"agent": {"version": "1.2.0", "protocols": [1]}, "error": {"kind": "protocol"}})
+
+    @pytest.mark.parametrize(
+        ("answer", "named", "unnamed"),
+        [
+            (
+                requests.ConnectionError("refused"),
+                f"Can't reach the Plex database node plex-box at {URL} (ConnectionError).",
+                f"Can't reach the Plex database node at {URL} (ConnectionError).",
+            ),
+            (
+                FakeResponse(302, {}),
+                f"The Plex database node plex-box at {URL} answered with a redirect; this app doesn't follow one. "
+                "Check the node's address.",
+                f"The Plex database node at {URL} answered with a redirect; this app doesn't follow one. "
+                "Check the node's address.",
+            ),
+            (
+                FakeResponse(401, {}),
+                "The Plex database node plex-box refused this app's key. Set the same key on both sides.",
+                f"The Plex database node at {URL} refused this app's key. Set the same key on both sides.",
+            ),
+            (
+                OLDER,
+                "The Plex database node plex-box is version 1.2.0; it speaks protocol 1 and this app needs 2. "
+                "Update the node.",
+                f"The Plex database node at {URL} is version 1.2.0; it speaks protocol 1 and this app needs 2. "
+                "Update the node.",
+            ),
+            (
+                WRONG_NODE,
+                f"The machine answering at {URL} isn't plex-box, the Plex database node saved there (it has another "
+                "id), so it ran nothing.",
+                f"The machine answering at {URL} isn't the Plex database node saved there (it has another id), so it "
+                "ran nothing.",
+            ),
+            (
+                FakeResponse(500, {}),
+                "The Plex database node plex-box answered 500 instead of a result.",
+                f"The Plex database node at {URL} answered 500 instead of a result.",
+            ),
+        ],
+        ids=["unreachable", "redirect", "key-refused", "older-protocol", "another-machine", "no-result"],
+    )
+    @pytest.mark.parametrize("name", ["plex-box", ""], ids=["named", "no-name"])
+    def test_a_refusal_says_the_nodes_name(self, answer, named, unnamed, name):
+        remote = RemotePlexDb(URL, TOKEN, name=name, session=FakeSession(answer), node_uid=lambda: "uid-a")
+
+        with pytest.raises(PublishError) as ei:
+            remote.item_exists(7, deadline=_deadline())
+
+        assert str(ei.value).startswith(named if name else unnamed), str(ei.value)
+
+    @pytest.mark.parametrize(
+        ("name", "said"),
+        [
+            ("plex-box", f"The Plex database node plex-box at {URL} is next"),
+            ("", f"The Plex database node at {URL} is next"),
+        ],
+        ids=["named", "no-name"],
+    )
+    def test_one_beside_another_plex_is_named_with_the_address_to_check(self, name, said):
+        from media_preview_generator.markers.publishers.plex_db import beside_another_plex
+
+        assert beside_another_plex(URL, "Home", "markers", name).startswith(said)
 
 
 class FakeDatabase:
@@ -588,20 +1080,27 @@ class TestWhichDatabaseHalfAServerGets:
         [
             (False, "", LocalPlexDb),
             (False, URL, LocalPlexDb),
-            (True, "", LocalPlexDb),
+            # On with no address (its node record is gone): still the agent half, which refuses every call,
+            # never this app's own copy of the folder, which Plex isn't reading.
+            (True, "", RemotePlexDb),
             (True, URL, RemotePlexDb),
         ],
         ids=["off-no-address", "off-with-address", "on-no-address", "on-with-address"],
     )
-    def test_the_agent_is_used_only_when_it_is_on_and_has_an_address(self, enabled, url, expected):
+    def test_the_agent_is_used_whenever_it_is_on(self, enabled, url, expected):
         settings = ServerMarkersSettings(
             True, None, "x", "restore", agent_enabled=enabled, agent_url=url, agent_token=TOKEN
         )
         database = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
         assert isinstance(database, expected)
 
-    def test_the_factory_gives_a_plex_server_with_an_agent_the_remote_half(self):
+    def test_the_factory_gives_a_plex_server_with_an_agent_the_remote_half(self, tmp_path):
         from media_preview_generator.markers.publishers.factory import publisher_for
+        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+        reset_settings_manager()
+        node = {"id": "n1", "name": "Plex box", "url": URL, "key": TOKEN, "enabled": True, "path_mappings": []}
+        get_settings_manager(str(tmp_path)).set("nodes", [node])
 
         config = ServerConfig(
             id="plex-1",
@@ -617,12 +1116,15 @@ class TestWhichDatabaseHalfAServerGets:
                 "plex": {
                     "db_write_confirmed_at": "2026-09-13T00:00:00+00:00",
                     "on_plex_redetect": "restore",
-                    "agent": {"enabled": True, "url": URL, "token": TOKEN},
+                    "agent": {"enabled": True, "node_id": "n1"},
                 },
             },
         )
         publisher = publisher_for(MagicMock(), config)
+        reset_settings_manager()
         assert isinstance(publisher._db, RemotePlexDb)
+        # Its messages call it by its name on the Nodes page.
+        assert (publisher._db.agent_details()["url"], publisher._db.agent_details()["name"]) == (URL, "Plex box")
 
     def test_the_factory_gives_a_plex_server_without_one_the_local_half(self):
         from media_preview_generator.markers.publishers.factory import publisher_for
@@ -639,7 +1141,9 @@ class TestWhichDatabaseHalfAServerGets:
         )
         publisher = publisher_for(MagicMock(), config)
         assert isinstance(publisher._db, LocalPlexDb)
-        assert publisher.db_path() == "/local/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+        assert publisher.db_path() == os.path.join(
+            "/local/plex", "Plug-in Support", "Databases", "com.plexapp.plugins.library.db"
+        )
 
 
 class TestTheAgentMustBeNextToThisPlex:
@@ -758,8 +1262,8 @@ class TestARefusalNamesTheContainerItIsAbout:
         ).capability()
         assert report.state is Capability.NEEDS_LOCAL_DB
         assert report.message == (
-            "Plex's database is on a network share (nfs4) where the Plex marker agent runs. Mount Plex's config "
-            "folder into the agent's container from a local disk of the Plex machine; Plex stays read-only."
+            "Plex's database is on a network share (nfs4) where the Plex database node runs. Give the node Plex's "
+            "config folder from a local disk of the Plex machine (in Docker, mount it from one); Plex stays read-only."
         )
         # The refusal the agent exists to make unnecessary must not be the advice it gives.
         assert "The app must run on the same machine as Plex" not in report.message
@@ -774,9 +1278,9 @@ class TestARefusalNamesTheContainerItIsAbout:
             )
         ).capability()
         assert report.message == (
-            "Plex's database is on a filesystem the Plex marker agent doesn't recognise as a local disk "
-            "(fuse.weird). Mount Plex's config folder into the agent's container from a local disk of the Plex "
-            "machine; Plex stays read-only."
+            "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
+            "(fuse.weird). Give the node Plex's config folder from a local disk of the Plex machine (in Docker, "
+            "mount it from one); Plex stays read-only."
         )
         assert "this app doesn't recognise" not in report.message
 
@@ -791,8 +1295,8 @@ class TestARefusalNamesTheContainerItIsAbout:
         ).capability()
         assert report.state is Capability.MISCONFIGURED
         assert report.message == (
-            "The Plex marker agent (user 1000) can't write /agent/db, /agent/db-wal. Run the agent's container "
-            "with the user that owns Plex's database (user 998)."
+            "The Plex database node (user 1000) can't write /agent/db, /agent/db-wal. Run the node as the user "
+            "that owns Plex's database (user 998)."
         )
         assert "This app (user" not in report.message
 
@@ -822,7 +1326,7 @@ class TestARefusalNamesTheContainerItIsAbout:
             )
         ).capability()
         assert report.state is Capability.NEEDS_LOCAL_DB
-        assert "the database file the agent sees at /agent/db" in report.message
+        assert "the database file the Plex database node sees at /agent/db" in report.message
 
 
 class TestWhatAFailedWriteLeavesBehind:

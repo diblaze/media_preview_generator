@@ -14,7 +14,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import is_macos, is_windows
+from ..utils import gpu_details_hint, gpu_settings_hint, is_macos, is_windows
 from .enumeration import (
     _detect_gpu_type_from_lspci,
     _detect_nvidia_via_nvidia_smi,
@@ -535,7 +535,8 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
                     "WSL2 detected — NVIDIA GPUs are accelerated here via CUDA passthrough. "
                     "Detection is less reliable than on a native Linux host; if GPU jobs misbehave, "
                     "run the container on Linux. Intel/AMD GPUs are NOT usable under WSL2 — "
-                    "disable them in Settings → Processing Options → GPU Configuration."
+                    "disable them in {}.",
+                    gpu_settings_hint(),
                 )
             for g in smi_gpus:
                 idx = g["index"]
@@ -660,7 +661,8 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
                             "treating as NVIDIA because nvidia-smi succeeded. "
                             "If GPU jobs misbehave, run the container on a Linux host. "
                             "Intel/AMD GPUs are NOT usable under WSL2 — "
-                            "disable them in Settings → Processing Options → GPU Configuration."
+                            "disable them in {}.",
+                            gpu_settings_hint(),
                         )
                 else:
                     # Even if nvidia-smi didn't confirm, try CUDA anyway if available
@@ -680,7 +682,8 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
                                 "CUDA hardware-decode works on this GPU but the vendor couldn't be confirmed — "
                                 "treating it as NVIDIA. Things may still work, but if GPU jobs misbehave, "
                                 "run the container on a Linux host. Intel/AMD GPUs are NOT usable under WSL2 — "
-                                "disable them in Settings → Processing Options → GPU Configuration."
+                                "disable them in {}.",
+                                gpu_settings_hint(),
                             )
                             # Fall through to normal NVIDIA processing
                         else:
@@ -786,10 +789,11 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
                 logger.warning(
                     "{}: every hardware-acceleration method tested ({} primary, {} fallback) failed. "
                     "This GPU will be skipped; CPU fallback still works for jobs that targeted it. "
-                    "See Settings → Processing Options → GPU Configuration for the per-device error detail.",
+                    "See {} for the per-device error detail.",
                     card_name,
                     primary_method,
                     fallback_method,
+                    gpu_details_hint(),
                 )
                 error, error_detail = _build_gpu_error_detail(primary_method, device_path, render_device, accel_config)
                 gpu_name = get_gpu_name(vendor, device_path or render_device)
@@ -809,10 +813,11 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
             logger.warning(
                 "{}: {} {} test failed and there's no fallback acceleration method for this vendor. "
                 "This GPU will be skipped; CPU fallback still works for jobs that targeted it. "
-                "See Settings → Processing Options → GPU Configuration for the per-device error detail.",
+                "See {} for the per-device error detail.",
                 card_name,
                 vendor,
                 primary_method,
+                gpu_details_hint(),
             )
             error, error_detail = _build_gpu_error_detail(primary_method, device_path, render_device, accel_config)
             gpu_name = get_gpu_name(vendor, device_path or render_device)
@@ -907,7 +912,8 @@ def _detect_macos_gpus() -> list[tuple[str, str, dict]]:
             "Apple VideoToolbox hardware-decode test failed on this Mac. "
             "All preview generation will fall back to CPU, which is slow on large libraries. "
             "Fix: confirm `ffmpeg -hwaccels` lists 'videotoolbox' on this machine, "
-            "and that you're not running ffmpeg under Rosetta. See Settings → Processing Options → GPU Configuration for details."
+            "and that you're not running ffmpeg under Rosetta. See {} for details.",
+            gpu_details_hint(),
         )
 
     return detected_gpus

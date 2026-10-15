@@ -115,6 +115,10 @@ class CapabilityCache:
         self._guard = threading.Lock()
         self._entries: dict[tuple[str, str], tuple[float, str, Any]] = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
+        # How often each server's answers were forgotten, and every answer cleared: a check that began before one of
+        # those (against a node's old address, say) answers for what was forgotten, so it isn't stored.
+        self._forgets: dict[str, int] = {}
+        self._clears = 0
 
     def get(self, config: ServerConfig, variant: str, compute: Callable[[], Any]) -> Any:
         """The cached answer for ``config``'s server, computing it at most once at a time per server.
@@ -146,9 +150,12 @@ class CapabilityCache:
             if entry is not None and not saved_since and self._clock() - entry[0] < self._ttl_for(entry[2]):
                 return copy.deepcopy(entry[2])
             try:
+                with self._guard:
+                    began = (self._clears, self._forgets.get(config.id, 0))
                 value = compute()
                 with self._guard:
-                    self._entries[key] = (self._clock(), fingerprint, value)
+                    if began == (self._clears, self._forgets.get(config.id, 0)):
+                        self._entries[key] = (self._clock(), fingerprint, value)
             finally:
                 if saved_since:
                     # The lock goes with the evicted answer; a thread already waiting on it still finds the new one.
@@ -180,7 +187,8 @@ class CapabilityCache:
         return self.ttl_s if ready else self.not_ready_ttl_s
 
     def forget(self, server_id: str) -> None:
-        """Forget one server's answers (both variants), so its next load checks it again.
+        """Forget one server's answers (both variants), and what a check of it still running finds, so its next load
+        checks it again.
 
         Args:
             server_id: The server's id.
@@ -188,12 +196,15 @@ class CapabilityCache:
         with self._guard:
             for key in [k for k in self._entries if k[0] == server_id]:
                 del self._entries[key]
+            self._forgets[server_id] = self._forgets.get(server_id, 0) + 1
 
     def clear(self) -> None:
         """Forget every answer and its lock."""
         with self._guard:
             self._entries.clear()
             self._locks.clear()
+            self._forgets.clear()
+            self._clears += 1
 
 
 def _config_fingerprint(config: ServerConfig) -> str:
@@ -218,6 +229,24 @@ def forget_capability(server_id: str) -> None:
     _CAPABILITY_CACHE.forget(server_id)
 
 
+def forget_node_capability(node_id: str) -> None:
+    """Forget the cached answers of every Plex server whose Plex database node is ``node_id``.
+
+    A server's config names only the node; the node's address, key and switch live in the nodes list, so a change
+    there doesn't change the server's fingerprint and its old node's answer would be served for up to a minute.
+
+    Args:
+        node_id: The node whose address, key or switch changed.
+    """
+    from ..nodes.settings import server_agent
+    from ..web.settings_manager import get_settings_manager
+
+    for entry in get_settings_manager().get("media_servers") or []:
+        agent = server_agent(entry)
+        if agent is not None and agent.get("node_id") == node_id and entry.get("id"):
+            _CAPABILITY_CACHE.forget(str(entry["id"]))
+
+
 def _marker_dict(marker: Any) -> dict:
     return {"type": marker.type.value, "start_ms": marker.start_ms, "end_ms": marker.end_ms}
 
@@ -231,9 +260,11 @@ def _settings_block(config: ServerConfig, settings: ServerMarkersSettings) -> di
         block["plex"] = {
             "db_write_confirmed_at": settings.db_write_confirmed_at,
             "on_plex_redetect": settings.on_plex_redetect,
-            # The agent's key is never in a response: only whether one is stored (``has_token``).
+            # The agent's key is never in a response: only whether its node has one (``has_token``).
             "agent": {
                 "enabled": settings.agent_enabled,
+                "node_id": settings.agent_node_id,
+                "node_name": settings.agent_node_name,
                 "url": settings.agent_url,
                 "has_token": bool(settings.agent_token),
             },
@@ -298,6 +329,12 @@ def _checked_as_if_on(server: Any, config: ServerConfig, settings: ServerMarkers
             details["hint"] = PLEX_SAME_HOST_PATH_HINT
         if report.ready and details.get("plex_pass") is None:
             warning = PLEX_PASS_UNCHECKED_WARNING
+        if isinstance(details.get("agent"), dict) and settings.agent_node_id:
+            details["agent"] = {
+                **details["agent"],
+                "node_id": settings.agent_node_id,
+                "node_name": settings.agent_node_name,
+            }
     # Not asked of an Emby that can't be reached or rejects the credentials: the read would only fail, and slowly.
     emby_answers = report.state is not Capability.UNREACHABLE and report.message != CREDENTIALS_REJECTED
     if config.type is ServerType.EMBY and emby_answers:

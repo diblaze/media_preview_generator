@@ -6,9 +6,17 @@
     const DAY_MINUTES = 1440;
     const WEEK_MINUTES = DAY_MINUTES * 7;
     const LANE_COLORS = ['var(--run)', 'var(--accent)', 'var(--t-intro)', 'var(--t-loud)', 'var(--ok)'];
-    // GPUs take these in detected-hardware order so a device keeps its colour in every group, strip and legend.
-    const GPU_COLORS = ['var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)'];
-    const CPU_COLOR = 'var(--ok)';
+    // GPUs take these in detected-hardware order so a device keeps its colour in every group, strip and legend; this
+    // app's CPU is green and each node's CPU another shade of it.
+    const GPU_COLORS = [
+        'var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)', 'var(--t-chapters)',
+        'color-mix(in srgb, var(--run) 50%, var(--t-chapters))', 'color-mix(in srgb, var(--t-loud) 50%, var(--accent))',
+        'color-mix(in srgb, var(--t-intro) 50%, var(--t-loud))',
+    ];
+    const CPU_COLORS = [
+        'var(--ok)', 'color-mix(in srgb, var(--ok) 55%, var(--accent))', 'color-mix(in srgb, var(--ok) 55%, var(--bs-body-color))',
+        'color-mix(in srgb, var(--ok) 45%, var(--bs-body-bg))',
+    ];
     const LANE_HEIGHT = 6;
     const escape = value => String(value).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     const clock = minutes => String(Math.floor(minutes / 60)).padStart(2, '0') + ':' + String(minutes % 60).padStart(2, '0');
@@ -42,10 +50,13 @@
         return group.availability.mode === 'always' ? allWeek() : segments(group.availability.windows);
     }
 
+    /** hardware: every device in palette order; CPU entries carry resource 'cpu' (one per machine), the rest are GPUs. */
     function deviceColor(member, hardware) {
-        if (member.resource === 'cpu') return CPU_COLOR;
-        const index = (hardware || []).findIndex(gpu => gpu.device === member.device);
-        return GPU_COLORS[(index < 0 ? (hardware || []).length : index) % GPU_COLORS.length];
+        const cpu = member.resource === 'cpu';
+        const pool = (hardware || []).filter(item => (item.resource === 'cpu') === cpu);
+        const index = pool.findIndex(item => item.device === member.device);
+        const colors = cpu ? CPU_COLORS : GPU_COLORS;
+        return colors[(index < 0 ? (cpu ? 0 : pool.length) : index) % colors.length];
     }
 
     function pauseWindows() {

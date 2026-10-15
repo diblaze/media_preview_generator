@@ -73,6 +73,13 @@ def _add_plex(markers=None, loudness=None):
     return entry["id"]
 
 
+def _add_helper_node():
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    node = {"id": "n1", "name": "helper", "url": "http://helper:8765", "key": "test-helper-key-0123456789"}
+    get_settings_manager().set("nodes", [{**node, "enabled": True, "path_mappings": []}])
+
+
 def _saved():
     from media_preview_generator.web.settings_manager import get_settings_manager
 
@@ -105,22 +112,23 @@ def test_save_enables_loudness_without_marker_write_confirmation(client):
     assert not resp.get_json()["markers"]["plex"].get("db_write_confirmed_at")
 
 
-def test_save_refuses_loudness_with_unsupported_helper(client):
-    sid = _add_plex(markers={"enabled": False, "plex": {"agent": {"enabled": True}}})
+_HELPER = {"plex": {"agent": {"enabled": True, "node_id": "n1"}}}
+
+
+def test_save_allows_loudness_through_the_helper(client):
+    _add_helper_node()
+    sid = _add_plex(markers={"enabled": False, **_HELPER})
     resp = client.put(f"/api/servers/{sid}", json={"loudness": {"enabled": True}})
-    assert resp.status_code == 400
-    assert "helper does not support" in resp.get_json()["error"]
-
-
-def test_enabling_helper_requires_turning_loudness_off(client):
-    sid = _add_plex(loudness={"enabled": True})
-    helper = {"plex": {"agent": {"enabled": True, "url": "http://helper:8765", "token": "test-helper-key-0123456789"}}}
-    resp = client.put(f"/api/servers/{sid}", json={"markers": helper})
-    assert resp.status_code == 400
-    assert "helper does not support" in resp.get_json()["error"]
-    resp = client.put(f"/api/servers/{sid}", json={"markers": helper, "loudness": {"enabled": False}})
     assert resp.status_code == 200, resp.get_json()
-    assert _saved()["enabled"] is False
+    assert _saved()["enabled"] is True
+
+
+def test_enabling_the_helper_keeps_loudness_on(client):
+    _add_helper_node()
+    sid = _add_plex(loudness={"enabled": True})
+    resp = client.put(f"/api/servers/{sid}", json={"markers": _HELPER})
+    assert resp.status_code == 200, resp.get_json()
+    assert _saved()["enabled"] is True
 
 
 def test_save_without_loudness_key_carries_the_block_forward(client):

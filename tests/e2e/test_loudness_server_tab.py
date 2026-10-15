@@ -97,13 +97,15 @@ class TestLoudnessTab:
         assert body["markers"]["enabled"] is False
         assert not body["markers"]["plex"].get("db_write_confirmed_at")
 
-    def test_switch_explains_unsupported_helper(self, authed_page: Page, app_url: str) -> None:
+    def test_switch_works_through_the_helper_and_names_the_version_it_needs(
+        self, authed_page: Page, app_url: str
+    ) -> None:
         server = _plex_server()
         server["markers"]["plex"]["agent"] = {"enabled": True, "url": "http://helper:8765", "token": "****"}
         _open(authed_page, app_url, server)
-        expect(authed_page.locator("#loudnessEnabled")).to_be_disabled()
+        expect(authed_page.locator("#loudnessEnabled")).to_be_enabled()
         expect(authed_page.locator("#loudnessHelperHint")).to_be_visible()
-        expect(authed_page.locator("#loudnessHelperHint")).to_contain_text("does not support loudness")
+        expect(authed_page.locator("#loudnessHelperHint")).to_contain_text("1.2.0 or newer")
 
     @pytest.mark.parametrize("enabled", ["false", "true", 1, None])
     def test_invalid_stored_enable_is_displayed_and_saved_as_off(

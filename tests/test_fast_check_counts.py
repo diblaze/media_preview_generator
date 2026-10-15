@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image, ImageFile
+from pymediainfo import MediaInfo
 
 from media_preview_generator.markers.publishers import plex_chapters as plex_chapters_module
 from media_preview_generator.markers.publishers import plex_db
@@ -148,7 +149,7 @@ def steady_state(tmp_path, mock_config, monkeypatch):
         target,
         chapters.ChapterOutcome("queued", total=2),
     )
-    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: object())
+    monkeypatch.setattr(MediaInfo, "parse", lambda _path: object())
     monkeypatch.setattr(
         chapters,
         "extract_chapter_frame",

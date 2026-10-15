@@ -3,12 +3,12 @@
 Creates and configures the Flask application with SocketIO support.
 """
 
-import atexit
 import hashlib
 import hmac
 import json
 import logging  # stdlib logging only — required to mute werkzeug's own logger; app code must use loguru
 import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +20,8 @@ from loguru import logger
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
+from ..nodes.protocol import APP_INSTANCE_HEADER
+from ..shutdown import on_shutdown
 from .auth import log_token_on_startup
 from .jobs import JobStatus, get_job_manager
 from .scheduler import get_schedule_manager
@@ -246,8 +248,12 @@ def _prewarm_caches() -> None:
         try:
             from .routes._helpers import _ensure_gpu_cache
 
-            _ensure_gpu_cache()
+            gpus = _ensure_gpu_cache()
             logger.debug("GPU cache pre-warmed")
+            from ..gpu.vulkan_check import log_vulkan_warnings
+            from .routes.api_vulkan import _diagnose_vulkan_environment
+
+            log_vulkan_warnings(gpus, _diagnose_vulkan_environment)
         except Exception as exc:
             logger.debug("GPU cache pre-warm failed (non-fatal): {}", exc)
 
@@ -271,6 +277,17 @@ def _prewarm_caches() -> None:
 
     threading.Thread(target=_warm_gpu, name="prewarm-gpu", daemon=True).start()
     threading.Thread(target=_warm_version, name="prewarm-version", daemon=True).start()
+
+
+def _start_node_registry() -> None:
+    """Start the remote nodes' health loop; when the process stops, free the tasks running on nodes, then stop it."""
+    from ..nodes.executor import cancel_running_tasks
+    from ..nodes.registry import get_registry
+
+    registry = get_registry()
+    registry.start()
+    on_shutdown(cancel_running_tasks, name="node tasks")
+    on_shutdown(registry.stop, name="node registry")
 
 
 # Chains whose `retry_started_at` is older than this at boot time are
@@ -718,6 +735,8 @@ def create_app(config_dir: str | None = None) -> Flask:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["CONFIG_DIR"] = config_dir
+    # Identifies this running app to Add node, which refuses its own address (protocol.APP_INSTANCE_HEADER).
+    app.config["APP_INSTANCE_ID"] = secrets.token_hex(8)
     # Flask-WTF's own check can't tell a script's API token from a browser session, so
     # _require_csrf_for_browser_requests (below) runs the check instead.
     app.config["WTF_CSRF_CHECK_DEFAULT"] = False
@@ -961,6 +980,7 @@ def create_app(config_dir: str | None = None) -> Flask:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(APP_INSTANCE_HEADER, app.config["APP_INSTANCE_ID"])
         return response
 
     # Auto-requeue jobs that were interrupted by the server restart. Kept ahead of schedule ticks; leftover Intro &
@@ -970,10 +990,9 @@ def create_app(config_dir: str | None = None) -> Flask:
     # Start scheduler
     schedule_manager.start()
 
-    # Ensure the scheduler is shut down when the process exits to prevent
-    # orphaned threads from lingering after gunicorn/Flask stops.
-    # Call scheduler.shutdown() directly instead of schedule_manager.stop()
-    # to avoid logger.info() writing to a closed stream during atexit.
+    # Shut the scheduler down as the process stops, so no schedule starts or pauses a job in its last seconds and no
+    # orphaned threads linger after gunicorn/Flask stops. Call scheduler.shutdown() directly instead of
+    # schedule_manager.stop() to avoid logger.info() writing to a closed stream when this runs at exit.
     def _shutdown_scheduler() -> None:
         try:
             if schedule_manager.scheduler.running:
@@ -981,7 +1000,9 @@ def create_app(config_dir: str | None = None) -> Flask:
         except Exception:
             logger.debug("Scheduler shutdown error during exit", exc_info=True)
 
-    atexit.register(_shutdown_scheduler)
+    on_shutdown(_shutdown_scheduler, name="scheduler")
+
+    _start_node_registry()
 
     # Log token on startup
     log_token_on_startup()

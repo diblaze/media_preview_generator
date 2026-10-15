@@ -1,0 +1,525 @@
+"""A worker placed on a remote node: its heavy steps run there, and a file the node can't run goes back to the queue."""
+
+from __future__ import annotations
+
+import itertools
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from media_preview_generator.job_kinds import ItemOutcome
+from media_preview_generator.jobs import worker as worker_mod
+from media_preview_generator.jobs.node_members import NodeMemberHardware
+from media_preview_generator.jobs.worker import Worker, WorkerPool
+from media_preview_generator.nodes.executor import (
+    REQUEUE_NODE_UNAVAILABLE,
+    REQUEUE_NOT_VISIBLE,
+    FileNotVisibleError,
+    NodeUnavailableError,
+    Placement,
+    current_placement,
+)
+from media_preview_generator.nodes.registry import (
+    STATE_ACCESS_PROBLEM,
+    STATE_CONNECTING,
+    STATE_DISABLED,
+    STATE_GPU_LOST,
+    STATE_KEY_REFUSED,
+    STATE_OFFLINE,
+    STATE_READY,
+    STATE_UPDATE_NEEDED,
+    NodeCapacity,
+    NodeRegistry,
+    NodeView,
+    set_registry,
+)
+from media_preview_generator.processing import CodecNotSupportedError
+from media_preview_generator.processing.types import ProcessableItem
+from tests.conftest import _ms, _pi
+
+DEVICE = "/dev/dri/renderD128"
+
+
+def _node_gpu_worker() -> Worker:
+    return Worker(0, "GPU", "INTEL", DEVICE, 0, "Arc A380", node_id="n1", node_name="NAS")
+
+
+def _run_preview(worker: Worker, side_effect) -> None:
+    with patch("media_preview_generator.processing.multi_server.process_canonical_path", side_effect=side_effect):
+        worker.assign_task(_pi("k", title="Film", media_type="movie"), MagicMock(cpu_threads=1), MagicMock())
+        worker.current_thread.join(timeout=5)
+
+
+def _gone() -> NodeUnavailableError:
+    return NodeUnavailableError("n1", "NAS", "NAS stopped answering")
+
+
+def _not_visible() -> FileNotVisibleError:
+    return FileNotVisibleError("n1", "NAS", "missing", "no mapping covers /m/t.mkv")
+
+
+class TestPlacement:
+    def test_a_node_worker_has_its_own_slot_resource_and_placement(self):
+        worker = _node_gpu_worker()
+        assert worker.placement == Placement("n1", "NAS")
+        assert worker.group_resource == f"node:n1:gpu:{DEVICE}"
+        assert Worker(1, "CPU", node_id="n1").group_resource == "node:n1:cpu"
+
+    def test_a_local_worker_is_unchanged(self):
+        worker = Worker(0, "GPU", "NVIDIA", "cuda", 0, "RTX")
+        assert worker.placement is None
+        assert worker.group_resource == "gpu:cuda"
+        assert worker.node_name == ""
+
+
+class TestPreviewOnANode:
+    def test_the_whole_item_runs_placed_on_the_node(self):
+        seen = []
+
+        def process(*args, **kwargs):
+            seen.append((current_placement(), kwargs.get("gpu_device_path")))
+            return _ms("generated")
+
+        worker = _node_gpu_worker()
+        item = _pi("k", title="Film")
+        with patch("media_preview_generator.processing.multi_server.process_canonical_path", side_effect=process):
+            worker.assign_task(item, MagicMock(cpu_threads=1), MagicMock())
+            worker.current_thread.join(timeout=5)
+        assert seen == [(Placement("n1", "NAS"), DEVICE)]
+        assert worker.completed == 1
+        assert worker.current_item is item, "the dispatcher reads the finished item back to queue it again"
+        assert worker.last_task_requeue is None
+        assert current_placement() is None, "the placement leaked out of the worker thread"
+
+    def test_a_gpu_failure_reruns_on_the_same_nodes_cpu_and_keeps_the_nodes_own_streak(self):
+        seen = []
+
+        def process(*args, **kwargs):
+            seen.append((current_placement(), kwargs.get("gpu")))
+            if len(seen) == 1:
+                raise CodecNotSupportedError("GPU processing failed", kind="hwaccel")
+            return _ms("generated")
+
+        worker = _node_gpu_worker()
+        tracker = MagicMock()
+        with patch("media_preview_generator.jobs.worker.get_gpu_fallback_tracker", return_value=tracker):
+            _run_preview(worker, process)
+        assert seen == [(Placement("n1", "NAS"), "INTEL"), (Placement("n1", "NAS"), None)]
+        assert worker.completed == 1 and worker.fallback_active is True
+        device, label = tracker.record.call_args.args
+        assert device == f"node:n1:{DEVICE}"
+        assert label.startswith("NAS ")
+
+    @pytest.mark.parametrize(
+        ("exc", "reason"),
+        [(_gone, REQUEUE_NODE_UNAVAILABLE), (_not_visible, REQUEUE_NOT_VISIBLE)],
+        ids=["node-gone", "not-visible"],
+    )
+    @pytest.mark.parametrize("on_cpu_rerun", [False, True], ids=["first-run", "cpu-rerun"])
+    def test_a_file_the_node_cant_run_is_handed_back_without_an_outcome(self, exc, reason, on_cpu_rerun):
+        calls = []
+
+        def process(*args, **kwargs):
+            calls.append(kwargs.get("gpu"))
+            if on_cpu_rerun and len(calls) == 1:
+                raise CodecNotSupportedError("GPU processing failed", kind="hwaccel")
+            raise exc()
+
+        worker = _node_gpu_worker()
+        tracker = MagicMock()
+        with (
+            patch("media_preview_generator.jobs.worker._notify_file_result") as persisted,
+            patch("media_preview_generator.jobs.worker.get_gpu_fallback_tracker", return_value=tracker),
+        ):
+            _run_preview(worker, process)
+        assert len(calls) == (2 if on_cpu_rerun else 1)
+        requeue = worker.last_task_requeue
+        assert (requeue.reason, requeue.node_id, requeue.node_name) == (reason, "n1", "NAS")
+        assert (worker.completed, worker.failed) == (0, 0)
+        assert sum(worker.outcome_counts.values()) == 0
+        persisted.assert_not_called()
+        tracker.record.assert_not_called()
+
+    def test_the_next_task_clears_the_hand_back(self):
+        worker = _node_gpu_worker()
+        _run_preview(worker, lambda *a, **k: (_ for _ in ()).throw(_gone()))
+        assert worker.last_task_requeue is not None
+        assert worker.check_completion() is True
+        _run_preview(worker, lambda *a, **k: _ms("generated"))
+        assert worker.last_task_requeue is None
+        assert worker.completed == 1
+
+
+class TestCustomKindOnANode:
+    @staticmethod
+    def _run(worker: Worker, process_fn) -> None:
+        with patch("media_preview_generator.jobs.worker._notify_file_result") as persisted:
+            worker.assign_task(
+                ProcessableItem(canonical_path="/m/t.mkv", server_id="s1", title="t"),
+                MagicMock(cpu_threads=0),
+                MagicMock(),
+                job_id="j",
+                process_fn=process_fn,
+                outcome_keys=("markers_published", "failed"),
+            )
+            worker.current_thread.join(timeout=5)
+        return persisted
+
+    def test_the_kind_runs_placed_on_the_node_and_its_cpu_rerun_too(self):
+        seen = []
+
+        def process_fn(item, *, gpu, **_kwargs):
+            seen.append((current_placement(), gpu))
+            if gpu is not None:
+                raise CodecNotSupportedError("GPU processing failed", kind="hwaccel")
+            return ItemOutcome("markers_published")
+
+        worker = _node_gpu_worker()
+        with patch("media_preview_generator.jobs.worker.get_gpu_fallback_tracker"):
+            self._run(worker, process_fn)
+        assert seen == [(Placement("n1", "NAS"), "INTEL"), (Placement("n1", "NAS"), None)]
+        assert worker.outcome_counts.get("markers_published") == 1
+
+    @pytest.mark.parametrize("on_cpu_rerun", [False, True], ids=["first-run", "cpu-rerun"])
+    def test_a_file_the_node_cant_see_is_handed_back_without_an_outcome(self, on_cpu_rerun):
+        def process_fn(item, *, gpu, **_kwargs):
+            if on_cpu_rerun and gpu is not None:
+                raise CodecNotSupportedError("GPU processing failed", kind="hwaccel")
+            raise _not_visible()
+
+        worker = _node_gpu_worker()
+        persisted = self._run(worker, process_fn)
+        assert worker.last_task_requeue.reason == REQUEUE_NOT_VISIBLE
+        assert worker.current_item.canonical_path == "/m/t.mkv"
+        assert (worker.completed, worker.failed) == (0, 0)
+        assert sum(worker.outcome_counts.values()) == 0
+        persisted.assert_not_called()
+
+
+class TestPoolExcludesNodes:
+    @staticmethod
+    def _pool(*workers: Worker) -> WorkerPool:
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.workers.extend(workers)
+        return pool
+
+    def test_a_node_that_cant_see_the_file_is_skipped_and_this_apps_workers_never_are(self):
+        local = Worker(0, "CPU")
+        on_a = Worker(1, "CPU", node_id="a", node_name="A")
+        on_b = Worker(2, "CPU", node_id="b", node_name="B")
+        assert self._pool(on_a, on_b)._find_available_worker(exclude_nodes={"a"}) is on_b
+        assert self._pool(on_a)._find_available_worker(exclude_nodes={"a"}) is None
+        assert self._pool(local, on_a)._find_available_worker(exclude_nodes={"a", "b"}) is local
+
+    def test_can_run_outside_is_false_only_when_every_slot_is_on_an_excluded_node(self):
+        on_a = Worker(1, "CPU", node_id="a")
+        on_b = Worker(2, "CPU", node_id="b")
+        assert self._pool(on_a, on_b).can_run_outside("previews", {"a"}) is True
+        assert self._pool(on_a, on_b).can_run_outside("previews", {"a", "b"}) is False
+        assert self._pool(on_a, Worker(0, "CPU")).can_run_outside("previews", {"a"}) is True
+        assert self._pool().can_run_outside("previews", {"a"}) is True
+
+
+class _Registry(NodeRegistry):
+    """One view per node: its state and when the registry last heard from it. Ready nodes give full capacity and
+    others none, unless :attr:`capacities` says otherwise; :attr:`gpus` lists a node's GPUs."""
+
+    revision = 0  # shadows the real registry's property
+
+    def __init__(self) -> None:
+        self.states: dict[str, tuple[str, float | None]] = {}
+        self.capacities: dict[str, NodeCapacity] = {}
+        self.gpus: dict[str, tuple[dict, ...]] = {}
+        # Nodes a check begun after their last drop found ready.
+        self.checked_since_drop: set[str] = set()
+        self._clock = itertools.count(1)
+
+    def set(self, node_id: str, state: str, *, seen_now: bool) -> None:
+        last = self.states.get(node_id, (STATE_READY, None))[1]
+        self.states[node_id] = (state, float(next(self._clock)) if seen_now else last)
+
+    def view(self, node_id: str) -> NodeView | None:
+        if node_id not in self.states:
+            return None
+        state, seen = self.states[node_id]
+        gpus = self.gpus.get(node_id, ())
+        return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), gpus, 4, False, seen)
+
+    def checked_ready_since_unavailable(self, node_id: str) -> bool:
+        state = self.states.get(node_id, (STATE_OFFLINE,))[0]
+        return node_id in self.checked_since_drop and state in (STATE_READY, STATE_GPU_LOST)
+
+    def capacity(self, node_id: str) -> NodeCapacity:
+        if node_id in self.capacities:
+            return self.capacities[node_id]
+        ready = self.states.get(node_id, (STATE_OFFLINE, None))[0] == STATE_READY
+        return NodeCapacity(ready, ready, "" if ready else "node offline")
+
+
+# Noon on a Monday; a scheduled group open only 00:00-00:01 is outside its hours then.
+NOON = datetime(2026, 10, 12, 12, 0)
+OFF_HOURS = {"mode": "scheduled", "windows": [{"days": list(range(7)), "start": "00:00", "end": "00:01"}]}
+ALWAYS = {"mode": "always", "windows": []}
+
+
+def _group(
+    gid: str,
+    *,
+    node: str | None = None,
+    kinds=("previews",),
+    availability=ALWAYS,
+    enabled=True,
+    device: str | None = None,
+) -> dict:
+    resource = "gpu" if device else "cpu"
+    member = {"id": "m1", "resource": resource, "device": device, "count": 1, "job_types": list(kinds)}
+    if node is not None:
+        member["node"] = node
+    return {"id": gid, "name": gid, "enabled": enabled, "availability": availability, "members": [member]}
+
+
+class TestCanRunOutsideWithGroups:
+    """Every enabled member that supports the kind and can come back counts, whatever its hours or whether its node
+    answers right now: the file waits for it instead of failing. A member on a node turned off or removed, or on a
+    GPU this app doesn't have, never comes back on its own, so a file waiting for it would wait forever."""
+
+    @pytest.fixture(autouse=True)
+    def registry(self):
+        fake = _Registry()
+        fake.set("a", STATE_READY, seen_now=True)
+        fake.set("b", STATE_OFFLINE, seen_now=False)
+        fake.set("off", STATE_DISABLED, seen_now=False)
+        for node_id, state in (
+            ("connecting", STATE_CONNECTING),
+            ("update", STATE_UPDATE_NEEDED),
+            ("key", STATE_KEY_REFUSED),
+            ("access", STATE_ACCESS_PROBLEM),
+        ):
+            fake.set(node_id, state, seen_now=False)
+        fake.capacities["update"] = NodeCapacity(False, False, "node needs an update")
+        # Ready, but it lists no GPU, or answers as a Plex database node only.
+        fake.set("no-gpu", STATE_READY, seen_now=True)
+        fake.set("db-only", STATE_READY, seen_now=True)
+        fake.capacities["db-only"] = NodeCapacity(False, False, "node doesn't run workers")
+        # Lost its GPU: the registry rechecks it on its own, and its CPU keeps working.
+        fake.set("gpu-lost", STATE_GPU_LOST, seen_now=True)
+        fake.capacities["gpu-lost"] = NodeCapacity(True, False, "lost its GPU")
+        set_registry(fake)
+        yield fake
+        set_registry(None)
+
+    @staticmethod
+    def _can_run_outside_a(*groups: dict) -> bool:
+        gpus = [("INTEL", DEVICE, {"name": "Arc"})]
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=gpus)
+        pool.reconcile_groups([_group("nas", node="a"), *groups], gpus, now=NOON)
+        return pool.can_run_outside("previews", {"a"})
+
+    @pytest.mark.parametrize(
+        ("other", "expected"),
+        [
+            (_group("local", availability=OFF_HOURS), True),
+            (_group("other-node", node="b"), True),
+            (_group("other-node-off-hours", node="b", availability=OFF_HOURS), True),
+            (_group("local"), True),
+            (_group("local", enabled=False), False),
+            (_group("local", kinds=("loudness",)), False),
+            (_group("nas-night", node="a", availability=OFF_HOURS), False),
+            (None, False),
+            (_group("turned-off-node", node="off"), False),
+            (_group("removed-node", node="gone"), False),
+            (_group("local-gpu", device="/dev/dri/renderD129"), False),
+            (_group("local-gpu", device=DEVICE), True),
+            (_group("node-connecting", node="connecting"), True),
+            (_group("node-gpu-lost", node="gpu-lost", device=DEVICE), True),
+            (_group("node-update-needed", node="update"), False),
+            (_group("node-key-refused", node="key"), False),
+            (_group("node-access-problem", node="access"), False),
+            (_group("ready-node-without-the-gpu", node="no-gpu", device=DEVICE), False),
+            (_group("ready-node-without-the-worker-role", node="db-only"), False),
+        ],
+        ids=[
+            "this-app-off-hours",
+            "offline-node",
+            "offline-node-off-hours",
+            "this-app-open",
+            "this-app-disabled",
+            "this-app-other-kind",
+            "excluded-node-off-hours",
+            "nothing-else",
+            "turned-off-node",
+            "removed-node",
+            "this-app-gpu-missing",
+            "this-app-gpu-detected",
+            "connecting-node",
+            "node-rechecking-a-lost-gpu",
+            "node-needs-an-update",
+            "node-key-refused",
+            "node-access-problem",
+            "ready-node-without-the-gpu",
+            "ready-node-without-the-worker-role",
+        ],
+    )
+    def test_members_that_count(self, other, expected):
+        assert self._can_run_outside_a(*([other] if other else [])) is expected
+
+    def test_a_node_the_registry_cant_answer_for_still_counts(self, registry, monkeypatch):
+        real_view = registry.view
+
+        def view(node_id: str) -> NodeView | None:
+            if node_id == "b":
+                raise RuntimeError("registry busy")
+            return real_view(node_id)
+
+        monkeypatch.setattr(registry, "view", view)
+        assert self._can_run_outside_a(_group("other-node", node="b")) is True
+
+    def test_only_members_that_cant_come_back_left_is_false(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.reconcile_groups([_group("off", node="off")], [], now=NOON)
+        assert pool.can_run_outside("previews", {"a"}) is False
+
+    def test_the_members_left_out_are_named_with_why(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        groups = [
+            _group("nas", node="a"),
+            _group("upd", node="update"),
+            _group("gpu", node="no-gpu", device=DEVICE),
+            _group("offline", node="b"),
+            _group("loud", node="key", kinds=("loudness",)),
+        ]
+        pool.reconcile_groups(groups, [], now=NOON)
+        assert pool.stuck_node_members("previews", {"a"}) == [
+            "update (node needs an update)",
+            "no-gpu (GPU not found on this node)",
+        ]
+
+
+class TestSuspectNodes:
+    @pytest.fixture
+    def registry(self):
+        fake = _Registry()
+        fake.set("a", STATE_READY, seen_now=True)
+        set_registry(fake)
+        yield fake
+        set_registry(None)
+
+    @staticmethod
+    def _pool() -> tuple[WorkerPool, Worker, Worker]:
+        on_a = Worker(0, "GPU", "NVIDIA", "cuda:0", 0, "RTX", node_id="a", node_name="A")
+        local = Worker(1, "CPU")
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        pool.workers.extend([on_a, local])
+        return pool, on_a, local
+
+    def test_a_node_that_dropped_a_file_gets_none_until_a_check_begun_since_comes_back_ready(self, registry):
+        pool, on_a, local = self._pool()
+        assert pool._find_available_worker() is on_a  # an idle GPU wins
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is local
+        registry.set("a", STATE_OFFLINE, seen_now=True)  # the re-check: still down
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is local
+        registry.set("a", STATE_READY, seen_now=True)  # ready, from a check that began before the drop
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is local
+        registry.checked_since_drop.add("a")
+        pool.refresh_suspect_nodes()
+        assert pool._find_available_worker() is on_a
+
+    def test_the_hold_outlasts_the_time_a_hung_node_takes_to_read_offline(self):
+        # Seen live: a paused node took up to 197 s to read offline but its hold ended after 60 s, so it got a new
+        # file whose start timed out.
+        from media_preview_generator.nodes import client, registry
+
+        worst_check_s = (
+            registry.CHECK_ATTEMPTS * (client.CONNECT_TIMEOUT_S + client.INFO_TIMEOUT_S)
+            + (registry.CHECK_ATTEMPTS - 1) * registry.ATTEMPT_GAP_S
+        )
+        assert worst_check_s <= 60.0 < worker_mod.SUSPECT_NODE_S
+
+    def test_the_hold_ends_on_its_own_after_a_while(self, registry, monkeypatch):
+        pool, on_a, local = self._pool()
+        monkeypatch.setattr(worker_mod, "SUSPECT_NODE_S", 0.0)
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is on_a
+        pool.refresh_suspect_nodes()
+        assert pool._suspect_nodes == {}
+
+    def test_only_the_dropping_nodes_workers_are_held(self, registry):
+        pool, on_a, local = self._pool()
+        on_b = Worker(2, "GPU", "NVIDIA", "cuda:0", 0, "RTX", node_id="b", node_name="B")
+        pool.workers.append(on_b)
+        pool.mark_node_suspect("a")
+        assert pool._find_available_worker() is on_b
+
+
+class TestNodeWorkerConstruction:
+    @pytest.mark.parametrize("resource", ["cpu", "gpu"])
+    def test_a_node_worker_without_a_node_name_is_named_by_its_node_id(self, resource):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        policy = {"node": "n1", "resource": resource, "device": "cuda:0" if resource == "gpu" else None}
+        gpu = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX"}
+        worker = pool._create_node_worker(policy, NodeMemberHardware(True, "", "", gpu=gpu, gpu_index=0))
+        assert (worker.node_id, worker.node_name) == ("n1", "n1")
+        assert worker.placement == Placement("n1", "n1")
+        assert worker.group_resource == ("node:n1:cpu" if resource == "cpu" else "node:n1:gpu:cuda:0")
+        assert worker.worker_type == resource.upper()
+
+
+class TestPoolSizeSummary:
+    def test_workers_on_nodes_are_counted_apart_from_this_apps(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=1, selected_gpus=[])
+        pool.workers.append(_node_gpu_worker())
+        pool.workers.append(Worker(7, "CPU", node_id="n2", node_name="lab-cpu"))
+        assert pool.size_summary() == "3 worker(s): 0 GPU + 1 CPU here, 1 GPU + 1 CPU on nodes"
+
+    def test_a_pool_with_no_node_workers_says_nothing_about_nodes(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=2, selected_gpus=[])
+        assert pool.size_summary() == "2 worker(s): 0 GPU + 2 CPU"
+
+
+class TestNodeWorkerLogLines:
+    """A node worker's own progress lines carry the prefix its node's lines do (``NAS/GPU0 ·``), not ``[GPU 0]:``."""
+
+    @staticmethod
+    def _lines(worker: Worker, *calls: tuple) -> list[str]:
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        worker.media_title = "Film"
+        lines: list[str] = []
+        sink = worker_mod.logger.add(lambda m: lines.append(m.record["message"]), level="INFO", format="{message}")
+        try:
+            for args in calls:
+                pool._update_worker_progress(worker, *args, media_file="/m/film.mkv")
+        finally:
+            worker_mod.logger.remove(sink)
+        return lines
+
+    @pytest.mark.parametrize(
+        ("worker", "tag"),
+        [
+            (Worker(0, "GPU", "INTEL", DEVICE, 0, "Arc A380", node_id="n1", node_name="NAS"), "NAS/GPU0 ·"),
+            (Worker(1, "CPU", node_id="n2", node_name="lab-cpu"), "lab-cpu/CPU ·"),
+            (Worker(2, "GPU", "INTEL", DEVICE, 1, "Arc A380"), "[GPU 1]:"),
+            (Worker(3, "CPU"), "[CPU]:"),
+        ],
+        ids=["node-gpu", "node-cpu", "local-gpu", "local-cpu"],
+    )
+    def test_started_and_progress_lines_name_where_the_file_runs(self, worker, tag):
+        lines = self._lines(worker, (40.0, 4.0, 10.0, "3.0x", 2.0))
+        assert lines == [f"{tag} Started processing /m/film.mkv", f"{tag} Film - 40.0% (speed=3.0x)"]
+
+    @pytest.mark.parametrize(
+        ("worker", "tag"),
+        [
+            (Worker(0, "GPU", "INTEL", DEVICE, 0, "Arc A380", node_id="n1", node_name="NAS"), "NAS/CPU ·"),
+            (Worker(2, "GPU", "INTEL", DEVICE, 1, "Arc A380"), "[CPU]:"),
+        ],
+        ids=["node-gpu", "local-gpu"],
+    )
+    def test_a_gpu_workers_cpu_fallback_lines_name_the_cpu(self, worker, tag):
+        # The GPU couldn't take the file and this worker retries it on the CPU: "GPU" lines read as the GPU working.
+        worker.decoding_on_cpu = True
+        lines = self._lines(worker, (40.0, 4.0, 10.0, "3.0x", 2.0))
+        assert lines == [f"{tag} Started processing /m/film.mkv", f"{tag} Film - 40.0% (speed=3.0x)"]
