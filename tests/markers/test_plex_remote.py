@@ -405,8 +405,10 @@ class TestFailuresLookLikeTodays:
     @pytest.mark.parametrize(
         "answer",
         [FakeResponse(500, {}), FakeResponse(200, {"ok": True}), FakeResponse(200, ValueError("not json")),
-         FakeResponse(200, [1, 2])],
-        ids=["server-error", "no-result", "not-json", "not-an-object"],
+         FakeResponse(200, [1, 2]),
+         # Deeper than Python's JSON parser goes: RecursionError, not ValueError.
+         FakeResponse(200, {}, body=b"[" * 200_000 + b"]" * 200_000)],
+        ids=["server-error", "no-result", "not-json", "not-an-object", "nested-too-deep"],
     )  # fmt: skip
     def test_an_answer_this_app_cant_read_never_looks_like_success(self, answer):
         remote, _ = _remote(answer)

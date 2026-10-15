@@ -980,7 +980,18 @@ class NodeRegistry:
                 with self._lock:
                     live.checks_begun += 1
                     number = live.checks_begun
-                outcome = self._probe(record, client)
+                try:
+                    outcome = self._probe(record, client)
+                except Exception:
+                    # Still a finished check: one that ended here would leave the node as it was (a ready node
+                    # keeps getting work) whatever it answers now.
+                    name = record.get("name") or "The node"
+                    logger.opt(exception=True).warning("Health check of node {} couldn't read its answer", name)
+                    outcome = _Outcome(
+                        STATE_OFFLINE,
+                        f"{name} answered in a way this app couldn't read. Check that the address is the node's and "
+                        "that the node runs this app's version.",
+                    )
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.

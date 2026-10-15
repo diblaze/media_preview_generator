@@ -179,6 +179,29 @@ class TestStates:
         assert view.state == reg.STATE_OFFLINE
         assert view.reason.startswith("nuc accepts connections but doesn't answer.")
 
+    @pytest.mark.parametrize("where", ["info", "older-helper-ping"])
+    def test_a_check_that_cant_read_the_answer_takes_a_ready_node_offline(self, h, where):
+        # The check used to end at the exception and leave the node's state alone: a ready node stayed ready, and
+        # kept getting work, whatever it answered now.
+        client = h.client()
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+        if where == "info":
+            client.default_info = RecursionError("maximum recursion depth exceeded")
+        else:
+            client.default_info = NodeProtocolError("404")
+
+            def ping(url, key):
+                raise RecursionError("maximum recursion depth exceeded")
+
+            h.registry._legacy_ping = ping
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_OFFLINE and view.reason.startswith(
+            "nuc answered in a way this app couldn't read"
+        )
+        assert h.registry.capacity("n1").cpu is False
+
     def test_one_failed_attempt_is_not_offline(self, h):
         client = h.client()
         client.infos = [NodeUnreachableError("x")]
