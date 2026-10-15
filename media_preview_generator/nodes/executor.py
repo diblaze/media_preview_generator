@@ -472,6 +472,7 @@ class _TaskRun:
         failed_polls = 0
         failing_since = 0.0
         reached_at = time.monotonic()
+        held_back = False
         while True:
             self._forward_controls()
             asked_at = time.monotonic()
@@ -479,7 +480,7 @@ class _TaskRun:
                 state = self._client.poll_task(self._task_id, log_from=self._next_log)
             except NodeUnknownTaskError as exc:
                 self._forgotten = True
-                if asked_at - reached_at > protocol.TASK_UNPOLLED_EXPIRY_S:
+                if held_back and asked_at - reached_at > protocol.TASK_UNPOLLED_EXPIRY_S:
                     # No poll reached the task for the node's unpolled-task expiry (they were held back with 429s),
                     # so the node dropped it for that, not for going away: no drop counts against the file.
                     raise self._unavailable(
@@ -496,6 +497,7 @@ class _TaskRun:
                 # the task, which keeps running until no poll has reached it for the node's unpolled-task expiry.
                 logger.debug("{}poll held back: {}", self._prefix, exc)
                 failed_polls = 0
+                held_back = True
                 if time.monotonic() - reached_at > RATE_LIMITED_GIVE_UP_S:
                     # Neither the node's doing nor the file's, so no drop counts against the file.
                     raise self._unavailable(
@@ -513,6 +515,7 @@ class _TaskRun:
                 continue
             else:
                 failed_polls = 0
+                held_back = False
                 reached_at = asked_at
                 self._relay(state)
                 if state.get("status") in protocol.FINISHED_STATUSES:

@@ -428,6 +428,25 @@ class TestNodeDrops:
         assert registry.reports == [("unavailable", NODE_ID)]
         assert client.named("delete") == []
 
+    def test_a_task_forgotten_after_a_long_gap_with_no_held_back_poll_is_read_as_a_restart(self, media, monkeypatch):
+        # No 429 came back (the app was paused past the node's unpolled-task expiry): the wrong-keys message would
+        # blame something that never happened, and the node going away counts a drop as usual.
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+
+        def answered_then_paused(client):
+            clock.now += protocol.TASK_UNPOLLED_EXPIRY_S + 5.0
+            return running()
+
+        client = ScriptedClient([running(), answered_then_paused, NodeUnknownTaskError("unknown_task")])
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError, match="no longer knows the task") as raised:
+            _run(media)
+
+        assert raised.value.started is not False
+
     def test_polls_held_back_now_and_then_keep_waiting_for_a_task_the_node_still_runs(self, media, monkeypatch):
         clock = _FakeTime()
         monkeypatch.setattr(executor, "time", clock)
