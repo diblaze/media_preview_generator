@@ -31,10 +31,19 @@ class _FlaskResponse:
 
     def __init__(self, response) -> None:
         self.status_code = response.status_code
+        self.headers = response.headers
         self._response = response
 
     def json(self):
         return self._response.get_json()
+
+    def iter_content(self, chunk_size=1):
+        data = self._response.get_data()
+        for start in range(0, len(data), chunk_size):
+            yield data[start : start + chunk_size]
+
+    def close(self) -> None:
+        self._response.close()
 
 
 class FlaskSession:
@@ -57,10 +66,10 @@ class FlaskSession:
         self.paths.append(path)
         return path
 
-    def post(self, url, json=None, headers=None, timeout=None):
+    def post(self, url, json=None, headers=None, timeout=None, **_kwargs):
         path = self._check(url)
         self.bodies[path] = json
         return _FlaskResponse(self._client.post(path, json=json, headers=headers))
 
-    def get(self, url, headers=None, timeout=None):
+    def get(self, url, headers=None, timeout=None, **_kwargs):
         return _FlaskResponse(self._client.get(self._check(url), headers=headers))

@@ -42,10 +42,14 @@ written.
 
 The one file it writes outside Plex's folder is `/config/loudness-writes.jsonl` in its own volume: the undo record of
 each loudness write, kept beside the database because undo has to run there (see
-[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the command in this container). Keep `/config`
-on a volume (the compose file names one, `plex-db-node-config`): the node's loudness check reports not ready while
-`/config` is only the container's own layer, which an update throws away together with the undo record and the
-node's id.
+[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the command in this container). **`/config`
+must be a volume** (the compose file names one, `plex-db-node-config`): without one it is only the container's own
+layer, which an update throws away together with the undo record and the node's id, so the node writes no loudness
+until it has one.
+
+**Updating a helper from before nodes?** Its old compose file or `docker run` had no `/config` volume. Add
+`-v plex-db-node-config:/config` (or the compose file's `volumes:` line) when you update, or loudness reports
+"Mount a volume at /config".
 
 It will not:
 

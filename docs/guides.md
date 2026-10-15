@@ -1302,7 +1302,9 @@ machine: without it that Plex stays read-only for markers. If the app and Plex a
    A version the app doesn't accept is refused on the first call, in either direction, with a message saying which
    side to update.
 
-A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working.
+A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working. For loudness it
+now needs a volume at `/config` (its old setup had none): add one when you update it, or the node writes no loudness,
+because its undo record would be lost on the next update.
 
 For Intro & Credits, the node writes the marker rows of one item into Plex's library database. A compatible agent
 also supports [chapter thumbnails](#plex-chapter-thumbnails), updating only existing chapter image references.

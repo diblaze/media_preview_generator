@@ -48,6 +48,26 @@ class TestApplyInversePathMappings:
         local = apply_path_mappings(remote, mappings)[0]
         assert apply_inverse_path_mappings(local, mappings) == [remote]
 
+    @pytest.mark.parametrize(
+        ("prefix", "native"),
+        [
+            ("D:\\Media", r"D:\Media\TV\Show\S01E01.mkv"),
+            ("D:/Media", r"D:\Media\TV\Show\S01E01.mkv"),
+            ("D:\\", r"D:\TV\Show\S01E01.mkv"),
+            ("\\\\nas\\media", r"\\nas\media\TV\Show\S01E01.mkv"),
+        ],
+        ids=["backslashes", "typed-with-slashes", "drive-root", "unc-share"],
+    )
+    def test_a_server_on_windows_gets_its_own_backslashed_path_first(self, prefix, native):
+        # Plex on Windows stores D:\Media\TV\..., and loudness looks it up exactly; the old form stays second.
+        mappings = [{"plex_prefix": prefix, "local_prefix": "/data"}]
+        candidates = apply_inverse_path_mappings("/data/TV/Show/S01E01.mkv", mappings)
+        assert candidates == [native, prefix.rstrip("/") + "/TV/Show/S01E01.mkv"]
+
+    def test_a_linux_server_path_never_gets_backslashes(self):
+        mappings = [{"remote_prefix": "/media", "local_prefix": "/data"}]
+        assert apply_inverse_path_mappings("/data/TV/a b/x.mkv", mappings) == ["/media/TV/a b/x.mkv"]
+
 
 class TestPathMappingCandidates:
     """``apply_path_mappings`` with each candidate's disk root (the Plex publisher's gone-from-disk check)."""

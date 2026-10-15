@@ -8,6 +8,9 @@
     node runs as the same user as Plex, which is what lets it open Plex's database), starts it, and prints the address
     and key to paste into the app (Settings -> Nodes -> Add node).
 
+    With NODE_KEY set in this session, the node uses that key, and the installer keeps it in the node's node.json: the
+    logon entry starts the node without this session's environment.
+
     Run it as the Windows user Plex runs as, not from an elevated prompt for another account. -AddFirewallRule asks
     for elevation once, to let other machines on private and domain networks reach the node's port.
 
@@ -39,6 +42,12 @@ $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $RunValue = "MediaPreviewGeneratorPlexDbNode"
 $RuleName = "Media Preview Generator Plex database node"
 
+function ConvertTo-Argument([string]$Value) {
+    # One argument, quoted the way the program's C runtime splits its command line: backslashes are literal except
+    # before a quote, so a run of them before the closing quote is doubled ("D:\Plex\" would end in an escaped quote).
+    '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
 if (-not $Source) {
     $candidates = @(
         $PSScriptRoot,
@@ -64,13 +73,16 @@ $Exe = Join-Path $InstallDir "PlexDbNode.exe"
 
 $NodeArgs = @("--port", "$Port")
 if ($PlexConfigDir) { $NodeArgs += @("--plex-config-dir", $PlexConfigDir) }
-$Quoted = ($NodeArgs | ForEach-Object { '"{0}"' -f $_ }) -join " "
-New-Item -Path $RunKey -Force | Out-Null
-Set-ItemProperty -Path $RunKey -Name $RunValue -Value ('"{0}" {1}' -f $Exe, $Quoted)
+$Quoted = ($NodeArgs | ForEach-Object { ConvertTo-Argument $_ }) -join " "
+# Never New-Item -Force on a key that exists: it deletes the key, and every other program's logon entry with it.
+if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey | Out-Null }
+Set-ItemProperty -Path $RunKey -Name $RunValue -Value ('{0} {1}' -f (ConvertTo-Argument $Exe), $Quoted)
 
 if ($AddFirewallRule) {
+    # Single-quoted PowerShell strings: a quote inside one (a user folder like O'Brien) is written twice.
+    $program = $Exe.Replace("'", "''")
     $command = "Remove-NetFirewallRule -DisplayName '$RuleName' -ErrorAction SilentlyContinue; " +
-        "New-NetFirewallRule -DisplayName '$RuleName' -Direction Inbound -Action Allow -Program '$Exe' " +
+        "New-NetFirewallRule -DisplayName '$RuleName' -Direction Inbound -Action Allow -Program '$program' " +
         "-Protocol TCP -LocalPort $Port -Profile Private,Domain | Out-Null"
     # Encoded: the elevated PowerShell gets the command intact, whatever spaces and quotes the paths hold.
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
@@ -98,9 +110,19 @@ $address = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Select-Object -First 1).IPAddress
 if (-not $address) { $address = $env:COMPUTERNAME }
 
-$key = $env:NODE_KEY
-if (-not $key -and (Test-Path (Join-Path $NodeDir "node.json"))) {
-    $key = (Get-Content -Raw (Join-Path $NodeDir "node.json") | ConvertFrom-Json).key
+$identityFile = Join-Path $NodeDir "node.json"
+$key = $null
+if ($env:NODE_KEY -and $env:NODE_KEY.Trim()) {
+    # The logon entry starts the node without this session's NODE_KEY: keep the key it was installed with in
+    # node.json, which the node falls back to, or the next logon would expect a key nobody was shown.
+    $key = $env:NODE_KEY.Trim()
+    $identity = Get-Content -Raw $identityFile | ConvertFrom-Json
+    $identity.key = $key
+    # No byte order mark: Windows PowerShell's -Encoding UTF8 writes one, and the node reads plain UTF-8.
+    $noBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($identityFile, ($identity | ConvertTo-Json -Compress), $noBom)
+} elseif (Test-Path $identityFile) {
+    $key = (Get-Content -Raw $identityFile | ConvertFrom-Json).key
 }
 
 ""

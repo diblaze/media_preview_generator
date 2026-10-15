@@ -13,8 +13,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from defusedxml import ElementTree as ET
-from defusedxml.common import DefusedXmlException
 from loguru import logger
 
 from ..markers.publishers.base import Capability, CapabilityReport, DatabaseBusyError, PublishError
@@ -28,6 +26,7 @@ from ..markers.publishers.plex_db import (
     is_tested_pms_version,
     plex_busy_error,
     plex_db_path,
+    plex_machine_identifier,
     publish_error_from_sqlite,
 )
 from .analyze import ANALYSIS_VERSION
@@ -69,8 +68,8 @@ class LoudnessPlexDb(LocalPlexDb):
     """The shared SQLite writer, proven before each use to belong to the Plex ``identity()`` names.
 
     It runs in the app for a Plex on this machine, and on Plex's machine for a Plex database node, which is handed
-    the identity the app just read from Plex's API: either way the database's own ``Preferences.xml`` must name the
-    same server, and the server must be a tested Plex version.
+    the identity the app just read from Plex's API: either way Plex's own preferences beside the database
+    (``plex_machine_identifier``) must name the same server, and the server must be a tested Plex version.
     """
 
     def __init__(
@@ -110,14 +109,7 @@ class LoudnessPlexDb(LocalPlexDb):
             return
         self._identity_proven_at = None
         machine, version = self._read_identity()
-        try:
-            actual = (
-                ET.parse(self.folder / "Preferences.xml", forbid_dtd=True, forbid_entities=True, forbid_external=True)
-                .getroot()
-                .get("ProcessedMachineIdentifier")
-            )
-        except (OSError, ET.ParseError, DefusedXmlException):
-            actual = None
+        actual = plex_machine_identifier(str(self.folder))
         if not isinstance(machine, str) or not machine or not actual or actual != machine:
             raise PublishError(
                 "Cannot prove this database belongs to the connected Plex server", state=Capability.MISCONFIGURED
@@ -144,7 +136,10 @@ class LoudnessPlexDb(LocalPlexDb):
         if not read_only:
             report = self.file_checks(deadline=deadline)
             if not report.ready:
-                raise PublishError(report.message, state=report.state)
+                # A lock probe that gave up on a busy database stays busy, so a node's caller waits it out in slices
+                # (RemoteLoudnessDb._write_in_slices) instead of giving up after the first one.
+                failure = DatabaseBusyError if report.details.get("db_busy") else PublishError
+                raise failure(report.message, state=report.state)
         with super()._database(read_only=read_only, deadline=deadline) as conn:
             if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
                 raise PublishError("Loudness writes require Plex's live WAL database", state=Capability.NEEDS_LOCAL_DB)

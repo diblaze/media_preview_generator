@@ -1587,8 +1587,8 @@ to the journal. Undo only replays confirmed writes: a crash or rollback cannot m
 If saving the confirmation fails, the database write remains and the app warns; keep the journal for recovery, because
 that unconfirmed record will not be replayed automatically.
 
-Through a Plex database node, the node keeps this record instead, in its own `/config`, because undo has to
-run beside the database file.
+Through a Plex database node, the node keeps this record instead, in its own `/config` (the Windows node: in
+`%LOCALAPPDATA%\MediaPreviewGenerator\node`), because undo has to run beside the database file.
 
 To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
@@ -1598,6 +1598,10 @@ docker exec -it media-preview-generator python -m media_preview_generator.loudne
 ```
 
 `--db` is Plex's database as the container sees it. Add `--dry-run` to count what would be restored first.
+
+On the Windows Plex database node there is no container: stop Plex and run
+`PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
+`--dry-run` first). It finds its own record and Plex's database by itself.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are
@@ -2910,7 +2914,9 @@ machine: without it that Plex stays read-only for markers. If the app and Plex a
    A version the app doesn't accept is refused on the first call, in either direction, with a message saying which
    side to update.
 
-A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working.
+A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working. For loudness it
+now needs a volume at `/config` (its old setup had none): add one when you update it, or the node writes no loudness,
+because its undo record would be lost on the next update.
 
 For Intro & Credits, the node writes the marker rows of one item into Plex's library database. A compatible agent
 also supports [chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails), updating only existing chapter image references.

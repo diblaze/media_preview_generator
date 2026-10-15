@@ -41,8 +41,10 @@ EXCLUDES = [
     "PIL.ImageTk",
 ]
 
-# Loaded by name inside functions (create_node_app mounts the role; plex_db asks winplatform on Windows only).
+# Loaded by name inside functions (create_node_app mounts the role; plex_db asks winplatform on Windows only;
+# --undo-loudness runs loudness.undo).
 HIDDEN = [
+    "media_preview_generator.loudness.undo",
     "media_preview_generator.nodes.server.app",
     "media_preview_generator.nodes.server.plex_db",
     "media_preview_generator.nodes.server.winplatform",

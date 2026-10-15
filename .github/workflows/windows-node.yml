@@ -6,9 +6,12 @@ on:
     paths:
       - "nodes/**"
       - "media_preview_generator/nodes/**"
-      - "media_preview_generator/markers/publishers/plex_db*.py"
+      - "media_preview_generator/markers/publishers/plex_*.py"
       - "media_preview_generator/markers/fs.py"
+      - "media_preview_generator/loudness/**"
+      - "media_preview_generator/library_health/plex_rows.py"
       - "tests/test_winplatform.py"
+      - "tests/nodes/**"
       - ".github/workflows/windows-node.yml"
   workflow_dispatch:
 
@@ -46,7 +49,9 @@ jobs:
             "tests/nodes/test_plex_db_role.py",
             "tests/test_plex_chapters.py",
             "tests/nodes/test_plex_db_loudness.py",
-            "tests/nodes/test_plex_db_library_health.py"
+            "tests/nodes/test_plex_db_library_health.py",
+            "tests/nodes/test_plex_db_windows.py",
+            "tests/markers/test_plex_remote.py"
           ) | Where-Object { Test-Path $_ }
           # Two workers: the runner's disk is slow to commit, and the lock-timing tests share it.
           python -m pytest --no-cov -n 2 -q -rfEs -p no:cacheprovider @files
@@ -85,14 +90,28 @@ jobs:
         shell: pwsh
         run: |
           ./dist/PlexDbNode/PlexDbNode-debug.exe --self-test
-          exit $LASTEXITCODE
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The loudness undo is in the build too: with no undo record it says so and changes nothing.
+          $empty = Join-Path $env:RUNNER_TEMP "undo-check"
+          $said = ./dist/PlexDbNode/PlexDbNode-debug.exe --undo-loudness --config-dir $empty --plex-config-dir $empty 2>&1
+          if ($LASTEXITCODE -ne 1 -or "$said" -notmatch "No loudness undo record") { throw "--undo-loudness: $said" }
+          "ok   --undo-loudness runs in the build"
       - name: Smoke-test the windowed build
         if: steps.ready.outputs.run == 'true'
         shell: pwsh
         run: |
           python nodes/windows/smoke_test.py dist/PlexDbNode/PlexDbNode.exe
           exit $LASTEXITCODE
-      - name: Install for this user, call it, uninstall
+      - name: Package the download (the PlexDbNode folder with install.ps1 beside it, as the README says)
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $package = "dist/PlexDbNode-windows"
+          if (Test-Path $package) { Remove-Item -Recurse -Force $package }
+          New-Item -ItemType Directory $package | Out-Null
+          Copy-Item -Recurse dist/PlexDbNode (Join-Path $package "PlexDbNode")
+          Copy-Item nodes/windows/install.ps1, nodes/windows/uninstall.ps1, nodes/windows/README.md $package
+      - name: Install for this user, call it, log on again, uninstall
         if: steps.ready.outputs.run == 'true'
         shell: pwsh
         run: |
@@ -102,13 +121,46 @@ jobs:
           $plex = Join-Path $env:RUNNER_TEMP "Plex Media Server"
           New-Item -ItemType Directory -Force $plex | Out-Null
           $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-          ./nodes/windows/install.ps1 -Source dist/PlexDbNode -Port 9495 -PlexConfigDir $plex
+          $sibling = "MediaPreviewGeneratorCiSibling"
+          # Another program's logon entry, which installing must leave alone.
+          if (-not (Test-Path $runKey)) { New-Item -Path $runKey | Out-Null }
+          Set-ItemProperty -Path $runKey -Name $sibling -Value '"C:\Windows\System32\notepad.exe"'
+          # From the unzipped download, as the README says, with the trailing backslash tab completion adds.
+          ./dist/PlexDbNode-windows/install.ps1 -Port 9495 -PlexConfigDir "$plex\"
           if (-not (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue)) {
             throw "install.ps1 left no logon entry"
           }
+          if (-not (Get-ItemProperty $runKey -Name $sibling -ErrorAction SilentlyContinue)) {
+            throw "install.ps1 deleted another program's logon entry"
+          }
+          Remove-ItemProperty -Path $runKey -Name $sibling
+          "ok   another program's logon entry survived the install"
           $ping = Invoke-RestMethod http://127.0.0.1:9495/v1/ping -Headers @{ Authorization = "Bearer $key" }
           if (-not $ping.ok) { throw "the installed node didn't answer /v1/ping" }
           "ok   the installed node answers /v1/ping"
+          $info = Invoke-RestMethod http://127.0.0.1:9495/v1/info -Headers @{
+            Authorization = "Bearer $key"; "X-MPG-Node-Protocol" = "1"
+          }
+          if ($info.plex_db.config_dir.TrimEnd("\") -ne $plex) {
+            throw "the node serves '$($info.plex_db.config_dir)', not '$plex'"
+          }
+          "ok   a Plex folder with a trailing backslash reaches the node intact"
+          # The next logon: the logon entry's own command line, without this session's NODE_KEY.
+          Get-Process -Name PlexDbNode -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Milliseconds 500
+          $env:NODE_KEY = $null
+          $entry = (Get-ItemProperty $runKey).MediaPreviewGeneratorPlexDbNode
+          if ($entry -notmatch '^"([^"]+)"\s*(.*)$') { throw "unexpected logon entry: $entry" }
+          Start-Process -FilePath $Matches[1] -ArgumentList $Matches[2]
+          $ping = $null
+          for ($i = 0; $i -lt 60 -and -not $ping; $i++) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $ping = Invoke-RestMethod http://127.0.0.1:9495/v1/ping -Headers @{ Authorization = "Bearer $key" }
+            } catch { }
+          }
+          if (-not $ping.ok) { throw "after a logon the node doesn't take the key install.ps1 printed" }
+          "ok   the key install.ps1 printed still works after the next logon"
           ./nodes/windows/uninstall.ps1 -RemoveData
           if (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue) {
             throw "uninstall.ps1 left the logon entry"
@@ -123,9 +175,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PlexDbNode-windows
-          path: |
-            dist/PlexDbNode
-            nodes/windows/install.ps1
-            nodes/windows/uninstall.ps1
-            nodes/windows/README.md
+          # One folder: the zip holds install.ps1, uninstall.ps1, README.md and PlexDbNode\ side by side.
+          path: dist/PlexDbNode-windows
           retention-days: 7

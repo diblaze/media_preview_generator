@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from ..config.paths import windows_native_path
 from .base import Library, ServerConfig
 
 
@@ -186,7 +187,10 @@ def apply_inverse_path_mappings(local_path: str, mappings: list[dict[str, Any]])
             continue
         swapped = _swap_prefix(local_fwd, local, remote)
         if swapped is not None:
-            candidates.append(swapped)
+            # A server on Windows stores ``D:\Media\TV\x.mkv``, never the mixed ``D:\Media/TV/x.mkv`` built here.
+            for form in (windows_native_path(remote, swapped), swapped):
+                if form and form not in candidates:
+                    candidates.append(form)
     if not candidates:
         candidates.append(local_path)
     return candidates

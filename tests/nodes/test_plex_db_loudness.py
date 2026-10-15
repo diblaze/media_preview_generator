@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,8 @@ from tests.nodes.plex_db_harness import NODE_URL, TOKEN, FlaskSession, node_app
 
 MACHINE = "plex-a"
 VERSION = "1.43.4.12345-abc123"
+# Taken before the autouse fixture below stands in for it.
+_REAL_LOCK_PROBE = plex_db.shm_lock_held_elsewhere
 AUTH = {"Authorization": f"Bearer {TOKEN}", plex_remote.PROTOCOL_HEADER: str(plex_remote.AGENT_PROTOCOL)}
 
 
@@ -414,6 +417,35 @@ class TestTheCodec:
 class TestTheUndoRecordSurvivesAnUpdate:
     """The node keeps the undo record in ``CONFIG_DIR``; inside a container that folder has to be a mount of its own."""
 
+    @pytest.fixture(autouse=True)
+    def no_container_marker(self, tmp_path, monkeypatch):
+        """Whatever box the tests run on, no Docker or Podman marker file: the mount table alone decides here."""
+        monkeypatch.setattr(plex_db_role, "_CONTAINER_MARKERS", (str(tmp_path / "no-such-marker"),))
+
+    @pytest.mark.parametrize(
+        ("root_fs", "marker", "refused"),
+        [
+            ("fuse.fuse-overlayfs", False, True),
+            ("btrfs", True, True),
+            ("zfs", True, True),
+            ("xfs", True, True),
+            ("btrfs", False, False),
+            ("zfs", False, False),
+        ],
+        ids=["rootless-podman", "unraid-docker-img", "docker-on-zfs", "docker-on-xfs", "host-btrfs", "host-zfs"],
+    )
+    @linux_mount_table
+    def test_a_containers_own_layer_is_refused_whatever_its_storage_driver(
+        self, folder, tmp_path, monkeypatch, root_fs, marker, refused
+    ):
+        if marker:
+            (tmp_path / "dockerenv").write_text("")
+            monkeypatch.setattr(plex_db_role, "_CONTAINER_MARKERS", (str(tmp_path / "dockerenv"),))
+        problem = plex_db_role.undo_record_problem(mountinfo_path=_mountinfo(tmp_path, fs=root_fs))
+        assert bool(problem) is refused, problem
+        if refused:
+            assert "Mount a volume at" in problem
+
     @staticmethod
     def _check(folder: Path, tmp_path: Path, *, root_fs: str, config_mounted: bool) -> object:
         config_dir = Path(loudness_db.write_log_path()).parent
@@ -610,3 +642,28 @@ class TestAWriteWaitsForPlexInSlices:
         # The message counts the whole wait, not the last slice.
         assert "for 2 s" in str(caught.value) or "for 3 s" in str(caught.value)
         assert _extra(folder, "metadata_items", 1) is None
+
+    def test_a_write_waits_out_another_writer_holding_the_nodes_lock(self, node, folder, monkeypatch):
+        # The real lock probe, which takes this process's per-database lock first; only "Plex has it open" is
+        # stood in for. Another worker's write holds that lock for longer than one slice.
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", _REAL_LOCK_PROBE)
+        monkeypatch.setattr(plex_db, "_shm_dms_locked_elsewhere", lambda _db: True)
+        db, session = _remote(node)
+        holding, release = threading.Event(), threading.Event()
+
+        def other_writer() -> None:
+            with plex_db._holding_db_lock(plex_db.plex_db_path(str(folder)), time.monotonic() + 10):
+                holding.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=other_writer, daemon=True)
+        thread.start()
+        assert holding.wait(5)
+        threading.Timer(2.5 * plex_db.WAIT_SLICE_S, release.set).start()
+        try:
+            assert loudness_db.write_stream(db, 11, FIELDS, deadline=time.monotonic() + 20) is True
+        finally:
+            release.set()
+            thread.join(5)
+        assert session.paths.count("/v1/loudness/write") >= 2
+        assert _extra(folder, "media_streams", 11) == PLEX_ANALYSED

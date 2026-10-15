@@ -13,6 +13,7 @@ schema it doesn't know, a missing or duplicated marker tag row).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -49,6 +50,11 @@ ANSWER_GRACE_S = 3.0
 # it has (the items left are simply unread, exactly as a cancelled local read-back leaves them).
 READ_BACK_CHUNK = 50
 READ_BACK_BUDGET_S = 60.0
+# The most of one answer this app reads. Library Health's rows for a whole large library are the largest answer (each
+# media part's extra_data, a few KB): hundreds of MB at most. Answers are never compressed, so a small reply can't
+# expand into gigabytes here.
+MAX_ANSWER_BYTES = 512 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 # Agent states the Edit tab badges (``capability().details["agent"]["state"]``).
 AGENT_CONNECTED = "connected"
 AGENT_UNREACHABLE = "unreachable"
@@ -566,40 +572,81 @@ class AgentClient:
             AgentError: The agent couldn't be reached, refused the key, or speaks another protocol.
             PublishError: The agent ran the request and it was refused (the original exception, rebuilt).
         """
+        return self._send(
+            self._session.post,
+            path,
+            {"json": body},
+            timeout=timeout,
+            unreachable="Markers wait here until it answers again; nothing is lost.",
+        )
+
+    def ping(self, *, timeout: float) -> dict:
+        """Read advertised optional capabilities before sending their typed operations."""
+        return self._send(self._session.get, "/v1/ping", {}, timeout=timeout)
+
+    def _send(
+        self, method: Callable[..., Any], path: str, extra: dict, *, timeout: float, unreachable: str = ""
+    ) -> dict:
+        """Send one request and read its answer: never a redirect followed, never more than ``MAX_ANSWER_BYTES``."""
         self._refuse_early()
         try:
-            response = self._session.post(
+            response = method(
                 f"{self.url}{path}",
-                json=body,
-                headers={"Authorization": f"Bearer {self._token}", PROTOCOL_HEADER: str(AGENT_PROTOCOL)},
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    PROTOCOL_HEADER: str(AGENT_PROTOCOL),
+                    "Accept-Encoding": "identity",
+                },
                 timeout=(CONNECT_TIMEOUT_S, max(1.0, timeout)),
+                # A redirect would carry the key and the request to wherever the node pointed.
+                allow_redirects=False,
+                stream=True,
+                **extra,
             )
+            try:
+                payload = self._payload(response)
+            finally:
+                response.close()
         except requests.RequestException as exc:
             self.state = AGENT_UNREACHABLE
             # The exception text can hold the URL but never the key (it is a header).
             raise AgentError(
-                f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}). "
-                "Markers wait here until it answers again; nothing is lost.",
+                f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}). {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             ) from exc
-        return self._read(response)
+        return self._read(response.status_code, payload)
 
-    def ping(self, *, timeout: float) -> dict:
-        """Read advertised optional capabilities before sending their typed operations."""
-        self._refuse_early()
-        try:
-            response = self._session.get(
-                f"{self.url}/v1/ping",
-                headers={"Authorization": f"Bearer {self._token}", PROTOCOL_HEADER: str(AGENT_PROTOCOL)},
-                timeout=(CONNECT_TIMEOUT_S, max(1.0, timeout)),
-            )
-        except requests.RequestException as exc:
+    def _payload(self, response: Any) -> Any:
+        """The answer's JSON body, read up to ``MAX_ANSWER_BYTES``; None when it isn't JSON.
+
+        Raises:
+            AgentError: A redirect, a compressed body, or a body larger than any answer.
+        """
+        if 300 <= response.status_code < 400:
             self.state = AGENT_UNREACHABLE
             raise AgentError(
-                f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}).",
+                f"The Plex database node at {self.describe()} answered with a redirect; this app doesn't follow one. "
+                "Check the node's address.",
                 state=Capability.AGENT_UNAVAILABLE,
-            ) from exc
-        return self._read(response)
+            )
+        encoding = str(response.headers.get("Content-Encoding") or "identity").strip().lower()
+        body = bytearray()
+        if encoding == "identity":
+            for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
+                body += chunk
+                if len(body) > MAX_ANSWER_BYTES:
+                    break
+        if encoding != "identity" or len(body) > MAX_ANSWER_BYTES:
+            self.state = AGENT_UNREACHABLE
+            raise AgentError(
+                f"The Plex database node at {self.describe()} sent an answer this app doesn't read "
+                f"({'compressed' if encoding != 'identity' else 'too large'}).",
+                state=Capability.AGENT_UNAVAILABLE,
+            )
+        try:
+            return json.loads(body)
+        except ValueError:
+            return None
 
     def refusal(self) -> NodeRefusal | None:
         """Why nothing may be sent to this node now, or None when requests may go out."""
@@ -640,11 +687,7 @@ class AgentClient:
                 state=Capability.PLUGIN_OUTDATED,
             )
 
-    def _read(self, response: Any) -> dict:
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
+    def _read(self, status_code: int, payload: Any) -> dict:
         if not isinstance(payload, dict):
             payload = {}
         advertised_agent = payload.get("agent")
@@ -654,7 +697,7 @@ class AgentClient:
         self.version = str(agent.get("version") or "")
         advertised_protocols = agent.get("protocols")
         protocols = advertised_protocols if isinstance(advertised_protocols, list) else []
-        if response.status_code == 401:
+        if status_code == 401:
             self.state = AGENT_REJECTED
             raise AgentError(
                 f"The Plex database node at {self.describe()} refused this app's key. Set the same key on both sides.",
@@ -679,13 +722,13 @@ class AgentClient:
                 f"The Plex database node at {self.describe()} is version {named}; {advice}",
                 state=Capability.AGENT_UNAVAILABLE,
             )
-        if response.status_code == 409 and isinstance(payload.get("error"), dict):
+        if status_code == 409 and isinstance(payload.get("error"), dict):
             self.state = AGENT_CONNECTED
             raise error_from_json(payload["error"])
-        if response.status_code != 200 or not isinstance(payload.get("result"), dict):
+        if status_code != 200 or not isinstance(payload.get("result"), dict):
             self.state = AGENT_UNREACHABLE
             raise AgentError(
-                f"The Plex database node at {self.describe()} answered {response.status_code} instead of a result.",
+                f"The Plex database node at {self.describe()} answered {status_code} instead of a result.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         self.state = AGENT_CONNECTED

@@ -123,8 +123,8 @@ to the journal. Undo only replays confirmed writes: a crash or rollback cannot m
 If saving the confirmation fails, the database write remains and the app warns; keep the journal for recovery, because
 that unconfirmed record will not be replayed automatically.
 
-Through a Plex database node, the node keeps this record instead, in its own `/config`, because undo has to
-run beside the database file.
+Through a Plex database node, the node keeps this record instead, in its own `/config` (the Windows node: in
+`%LOCALAPPDATA%\MediaPreviewGenerator\node`), because undo has to run beside the database file.
 
 To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
@@ -134,6 +134,10 @@ docker exec -it media-preview-generator python -m media_preview_generator.loudne
 ```
 
 `--db` is Plex's database as the container sees it. Add `--dry-run` to count what would be restored first.
+
+On the Windows Plex database node there is no container: stop Plex and run
+`PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
+`--dry-run` first). It finds its own record and Plex's database by itself.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are
