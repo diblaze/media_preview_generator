@@ -378,7 +378,11 @@ class TestCredits:
     @pytest.mark.parametrize(
         ("error", "kind", "extra"),
         [
-            (frames.GpuDecodeError("cuda died", stderr_tail=("line 1",)), protocol.KIND_GPU_FAILED, ["line 1"]),
+            (
+                frames.GpuDecodeError("cuda died", stderr_tail=("line 1",), fallback_kind=FALLBACK_HWACCEL),
+                protocol.KIND_GPU_FAILED,
+                ["line 1"],
+            ),
             (frames.GpuReadNothingError(), protocol.KIND_FAILED, None),
             (textdet_helper.TextDetUnavailableError("helper gone"), protocol.KIND_FAILED, None),
         ],
@@ -394,6 +398,31 @@ class TestCredits:
         assert raised.value.kind == kind
         assert raised.value.extra["error_type"] == type(error).__name__
         assert raised.value.extra.get("stderr_tail") == extra
+
+    @pytest.mark.parametrize(
+        ("fallback_kind", "kind"),
+        [
+            (FALLBACK_HWACCEL, protocol.KIND_GPU_FAILED),
+            (generator.FALLBACK_SIGNAL, protocol.KIND_GPU_FAILED),
+            # A codec the GPU can't decode (AV1 on a Pascal card), an I/O error or an unnamed failure is no reason to
+            # test the GPU again: the file only needs the CPU, as preview.frames says for the same file.
+            (FALLBACK_CODEC, protocol.KIND_FAILED),
+            (generator.FALLBACK_IO_ERROR, protocol.KIND_FAILED),
+            (None, protocol.KIND_FAILED),
+        ],
+    )
+    def test_only_a_gpu_fault_is_reported_as_the_gpu_failing(self, ctx, monkeypatch, fallback_kind, kind):
+        def fake(path, **kwargs):
+            raise frames.GpuDecodeError("the GPU said no", stderr_tail=("why",), fallback_kind=fallback_kind)
+
+        monkeypatch.setattr(textdet_helper, "get_textdet_pool", _Pool)
+        monkeypatch.setattr(detector, "find_credits", fake)
+        with pytest.raises(OpError) as raised:
+            ops.credits_find(ctx, NODE_PATH, self.PARAMS)
+
+        assert raised.value.kind == kind
+        assert raised.value.extra["error_type"] == "GpuDecodeError"
+        assert raised.value.extra.get("fallback_kind") == fallback_kind
 
     def test_two_cpu_tasks_on_a_node_detect_text_side_by_side(self, tmp_path, monkeypatch):
         # A node process: no saved settings, a fresh process pool whose helpers are faked to take a second each.
