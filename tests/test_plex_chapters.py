@@ -505,7 +505,7 @@ def test_remote_names_the_helper_update_plex_1_43_5_needs(agent_version, pms_ver
         def ping(self, *, timeout):
             return {"machine_identifier": MACHINE}
 
-        def post(self, path, body, timeout):
+        def post(self, path, body, timeout, **_kwargs):
             sent.append(body["pms_version"])
             return {"capability": "chapters_v1"}
 

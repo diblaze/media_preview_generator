@@ -36,7 +36,13 @@ from .plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from .plex_remote import AgentClient, agent_older_than, node_refusal, report_from_json
+from .plex_remote import (
+    CHAPTERS_WAIT_FOR_THE_NODE,
+    AgentClient,
+    agent_older_than,
+    node_refusal,
+    report_from_json,
+)
 
 CHAPTER_CAPABILITY = "chapters_v1"
 MAX_CHAPTERS = 1000
@@ -599,6 +605,7 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
             **body,
         },
         timeout=13,
+        unreachable=CHAPTERS_WAIT_FOR_THE_NODE,
     )
     if result.get("capability") != CHAPTER_CAPABILITY:
         raise ChapterError("Update the Plex database node for chapter registration", state=Capability.PLUGIN_OUTDATED)

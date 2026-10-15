@@ -327,6 +327,32 @@ class TestFailuresLookLikeTodays:
         assert str(ei.value) == "Plex is busy writing its database"
         assert ei.value.state is Capability.UNREACHABLE and type(ei.value) is PublishError
 
+    @pytest.mark.parametrize(
+        ("call", "says"),
+        [
+            (lambda r: r.read_item(7, deadline=_deadline()), "Markers wait here until it answers again"),
+            (
+                lambda r: r.loudness("streams", {}, deadline=_deadline(), needs="1.2.0"),
+                "Loudness waits until it answers again",
+            ),
+            (
+                lambda r: r.library_health_rows(
+                    [1], want_markers=True, want_chapters=False, deadline=_deadline(), needs="1.2.0"
+                ),
+                "Library Health counts these once it answers again",
+            ),
+        ],
+        ids=["markers", "loudness", "library-health"],
+    )
+    def test_a_node_that_does_not_answer_is_worded_for_the_feature_that_asked(self, call, says):
+        remote, _ = _remote(requests.ConnectionError("connection refused"))
+        # The node answered earlier, so each request goes straight to its route.
+        remote._client.capabilities = ["loudness_v1", "library_health_v1"]
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            call(remote)
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert str(ei.value).startswith(f"Can't reach the Plex database node at {URL} (ConnectionError). {says}")
+
     def test_an_item_the_agent_cant_find_stays_an_item_not_found(self):
         remote, _ = _remote(_refusal({"kind": "item_not_found", "message": "Plex item 7 not found", "state": None}))
         with pytest.raises(ItemNotFoundError):

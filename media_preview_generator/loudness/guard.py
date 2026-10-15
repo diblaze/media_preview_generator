@@ -284,13 +284,23 @@ class RemoteLoudnessDb:
         self._identity_read_at = time.monotonic()
         return self._read
 
+    def _loudness(self, operation: str, body: dict, *, deadline: float) -> dict:
+        """One loudness operation on the node; a node that doesn't answer is a database this app can't reach now.
+
+        That is what a Plex this app can't reach in-process is (UNREACHABLE): the file waits and is tried again,
+        instead of failing as a refusal does.
+        """
+        from ..markers.publishers.plex_remote import AgentUnreachableError
+
+        try:
+            return self._remote.loudness(operation, body, deadline=deadline, needs=LOUDNESS_AGENT_VERSION)
+        except AgentUnreachableError as exc:
+            raise PublishError(str(exc), state=Capability.UNREACHABLE) from exc
+
     def _call(self, operation: str, body: dict, *, deadline: float, trust_recent: bool = True) -> dict:
         machine, version = self._identity(trust_recent=trust_recent)
-        result = self._remote.loudness(
-            operation,
-            {"machine_identifier": machine, "pms_version": version, **body},
-            deadline=deadline,
-            needs=LOUDNESS_AGENT_VERSION,
+        result = self._loudness(
+            operation, {"machine_identifier": machine, "pms_version": version, **body}, deadline=deadline
         )
         if isinstance(machine, str):
             self.machine_identifier = machine
@@ -303,7 +313,7 @@ class RemoteLoudnessDb:
             if identity:
                 result = self._call(operation, body, deadline=deadline)
             else:
-                result = self._remote.loudness(operation, body, deadline=deadline, needs=LOUDNESS_AGENT_VERSION)
+                result = self._loudness(operation, body, deadline=deadline)
             report = report_from_json(result.get("report"))
         except PublishError as exc:
             report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc))

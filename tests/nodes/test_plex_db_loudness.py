@@ -354,11 +354,12 @@ class TestAnOlderHelper:
         report = db.file_checks(deadline=_deadline())
         assert report.state is Capability.PLUGIN_OUTDATED and "Update the node" in report.message
 
-    def test_an_unreachable_helper_is_a_retryable_unavailable_not_a_crash(self, node):
+    def test_an_unreachable_helper_is_a_database_this_app_cant_reach_now_not_a_crash(self, node):
         db, session = _remote(node)
         session.stopped = True
         report = db.file_checks(deadline=_deadline())
-        assert report.state is Capability.AGENT_UNAVAILABLE
+        # UNREACHABLE, as a Plex this app can't reach in-process: the loudness job waits on it instead of failing.
+        assert report.state is Capability.UNREACHABLE
 
 
 class TestTheRouteRefusesWhatIsntAnOperation:

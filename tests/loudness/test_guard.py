@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -363,3 +364,47 @@ def test_a_failed_identity_proof_is_not_trusted_by_the_next_read(guarded):
     for _ in range(2):
         with pytest.raises(PublishError), db._database(read_only=True, deadline=1e12):
             pass
+
+
+class _NodeThatDoesNotAnswer:
+    """A ``requests.Session`` for a Plex database node that is down (restarting, updating, unplugged)."""
+
+    def post(self, *_args, **_kwargs):
+        import requests
+
+        raise requests.ConnectionError("connection refused")
+
+    get = post
+
+
+def _remote_loudness_db(*, capability_known: bool = False) -> guard.RemoteLoudnessDb:
+    from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
+
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+    remote = RemotePlexDb("http://plex-host:9494", "k" * 32, session=_NodeThatDoesNotAnswer())
+    if capability_known:
+        # Mid-job: the node answered earlier, so the next request goes straight to the loudness route.
+        remote._client.capabilities = ["loudness_v1"]
+    return guard.RemoteLoudnessDb(server, remote)
+
+
+@pytest.mark.parametrize("capability_known", [False, True], ids=["first-request", "mid-job"])
+def test_a_node_that_does_not_answer_is_a_database_this_app_cant_reach_now(capability_known):
+    """As a Plex this app can't reach in-process: UNREACHABLE, which the loudness job waits on instead of failing."""
+    db = _remote_loudness_db(capability_known=capability_known)
+    report = db.file_checks(deadline=time.monotonic() + 5)
+    assert report.state is Capability.UNREACHABLE, report
+    with pytest.raises(PublishError) as ei:
+        db.read_streams(["/media/movies/x.mkv"], deadline=time.monotonic() + 5)
+    assert ei.value.state is Capability.UNREACHABLE
+    assert "Can't reach the Plex database node at http://plex-host:9494" in str(ei.value)
+    assert "Markers" not in str(ei.value) and "Markers" not in report.message
+
+
+def test_the_node_not_answering_a_loudness_request_says_loudness_waits():
+    db = _remote_loudness_db(capability_known=True)
+    with pytest.raises(PublishError, match="Loudness waits until it answers again; nothing is lost"):
+        db.read_item_snapshot(1, deadline=time.monotonic() + 5)

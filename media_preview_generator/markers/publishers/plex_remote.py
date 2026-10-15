@@ -67,10 +67,23 @@ AGENT_DISABLED = "disabled"
 AGENT_NO_NODE = "no_node"
 # The node reports a new id this app can't tie to the server's Plex (``NodeRegistry.plex_db_refusal``).
 AGENT_UNCONFIRMED_NODE = "unconfirmed_node"
+# What "Can't reach the Plex database node" goes on to say, per feature (``AgentClient.post``).
+MARKERS_WAIT_FOR_THE_NODE = "Markers wait here until it answers again; nothing is lost."
+LOUDNESS_WAITS_FOR_THE_NODE = "Loudness waits until it answers again; nothing is lost."
+CHAPTERS_WAIT_FOR_THE_NODE = "Chapter thumbnails are tried again once it answers."
+LIBRARY_HEALTH_WAITS_FOR_THE_NODE = "Library Health counts these once it answers again."
 
 
 class AgentError(PublishError):
     """The agent couldn't be used (unreachable, wrong key, wrong version) — not a failure of the database itself."""
+
+
+class AgentUnreachableError(AgentError):
+    """The node didn't answer at all (down, restarting, unplugged): a later attempt may well succeed.
+
+    Its state stays ``AGENT_UNAVAILABLE``, which the Edit tab and Setup Health explain; a feature that waits for a
+    database it can't reach (loudness) tells this one apart from a refusal by its type.
+    """
 
 
 def _version_tuple(version: str) -> tuple[int, ...] | None:
@@ -555,28 +568,24 @@ class AgentClient:
         """The address, for messages the user reads."""
         return self.url or "(no address)"
 
-    def post(self, path: str, body: dict, *, timeout: float) -> dict:
+    def post(self, path: str, body: dict, *, timeout: float, unreachable: str = MARKERS_WAIT_FOR_THE_NODE) -> dict:
         """Send one request and return its ``result``.
 
         Args:
             path: The endpoint under the agent's base address, e.g. ``/v1/item/read``.
             body: The request body.
             timeout: Seconds allowed for the answer, on top of the connect timeout.
+            unreachable: What happens to the feature's work while the node doesn't answer, for that message.
 
         Returns:
             The answer's ``result`` object.
 
         Raises:
-            AgentError: The agent couldn't be reached, refused the key, or speaks another protocol.
+            AgentUnreachableError: The agent didn't answer.
+            AgentError: The agent refused the key, or speaks another protocol.
             PublishError: The agent ran the request and it was refused (the original exception, rebuilt).
         """
-        return self._send(
-            self._session.post,
-            path,
-            {"json": body},
-            timeout=timeout,
-            unreachable="Markers wait here until it answers again; nothing is lost.",
-        )
+        return self._send(self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable)
 
     def ping(self, *, timeout: float) -> dict:
         """Read advertised optional capabilities before sending their typed operations."""
@@ -608,7 +617,7 @@ class AgentClient:
         except requests.RequestException as exc:
             self.state = AGENT_UNREACHABLE
             # The exception text can hold the URL but never the key (it is a header).
-            raise AgentError(
+            raise AgentUnreachableError(
                 f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}). {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             ) from exc
@@ -984,7 +993,10 @@ class RemotePlexDb(PlexDatabase):
         self._client.require(LOUDNESS_CAPABILITY, feature="loudness analysis", needs=needs)
         remaining = self._remaining(deadline)
         result = self._client.post(
-            f"/v1/loudness/{operation}", {**body, "deadline_s": remaining}, timeout=remaining + ANSWER_GRACE_S
+            f"/v1/loudness/{operation}",
+            {**body, "deadline_s": remaining},
+            timeout=remaining + ANSWER_GRACE_S,
+            unreachable=LOUDNESS_WAITS_FOR_THE_NODE,
         )
         if result.get("capability") != LOUDNESS_CAPABILITY:
             raise self._unreadable(ValueError("no loudness capability in the answer"))
@@ -1034,7 +1046,12 @@ class RemotePlexDb(PlexDatabase):
             "machine_identifier": machine_identifier,
             "deadline_s": remaining,
         }
-        result = self._client.post("/v1/library-health/rows", body, timeout=remaining + ANSWER_GRACE_S)
+        result = self._client.post(
+            "/v1/library-health/rows",
+            body,
+            timeout=remaining + ANSWER_GRACE_S,
+            unreachable=LIBRARY_HEALTH_WAITS_FOR_THE_NODE,
+        )
         if result.get("capability") != LIBRARY_HEALTH_CAPABILITY or not isinstance(result.get("rows"), dict):
             raise self._unreadable(ValueError("no Library Health rows in the answer"))
         return result["rows"]
