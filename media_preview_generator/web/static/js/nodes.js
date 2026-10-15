@@ -1645,6 +1645,13 @@
         $('#addNodeModal').addEventListener('shown.bs.modal', () => {
             if (!$('#addNodeStep1').classList.contains('d-none')) $('#addNodeUrl').focus();
         });
+        // Finish later, Esc and the backdrop save the rows shown (keepStep2Rows). A row with one side filled in is
+        // refused as Save refuses it ("Fill in both paths, or remove the row."): closing on it saved no row at all.
+        $('#addNodeModal').addEventListener('hide.bs.modal', (event) => {
+            if (event.target !== $('#addNodeModal') || add.finished || !add.node) return;
+            if ($('#addNodeStep2').classList.contains('d-none')) return;
+            if (add.editor.read() === null) event.preventDefault();
+        });
         $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
             // Opened from code, the dialog gives focus back to nothing: the page's Add node button takes it.

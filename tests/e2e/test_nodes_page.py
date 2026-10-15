@@ -781,6 +781,44 @@ class TestAddNode:
             {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}], "edit_tag": "n-new-1"}
         ]
 
+    @pytest.mark.parametrize("close", ["finish_later", "escape"])
+    def test_finish_later_with_a_half_filled_row_says_so_instead_of_dropping_every_row(
+        self, authed_page: Page, app_url: str, close: str
+    ) -> None:
+        """A row with one side filled in made Finish later and Esc save nothing, the suggested rows included, without a
+        word; Save refuses the same row with "Fill in both paths, or remove the row."."""
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        _open_add(page)
+        self._to_step_2(page)
+        editor = page.locator("#addNodeMappings")
+        editor.locator(".nd-add-row").click()
+        editor.locator(".nd-app").nth(1).fill("/data/Movies")
+
+        if close == "escape":
+            page.keyboard.press("Escape")
+        else:
+            page.locator("#addNodeCancel").click()
+
+        expect(editor.locator(".nd-map-error")).to_have_text("Fill in both paths, or remove the row.")
+        expect(editor.locator(".nd-node").nth(1)).to_be_focused()
+        expect(page.locator("#addNodeModal")).to_be_visible()
+        assert not api.bodies("PUT", "/nodes/n-new")
+
+        editor.locator(".nd-node").nth(1).fill("/mnt/nas/Movies")
+        with page.expect_response(lambda r: r.request.method == "PUT" and r.url.endswith("/api/nodes/n-new")):
+            page.locator("#addNodeCancel").click()
+        expect(page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        assert api.bodies("PUT", "/nodes/n-new") == [
+            {
+                "path_mappings": [
+                    {"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"},
+                    {"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"},
+                ],
+                "edit_tag": "n-new-1",
+            }
+        ]
+
     def test_step_2_with_servers_but_no_libraries_says_to_refresh_them(self, authed_page: Page, app_url: str) -> None:
         page = authed_page
         api = _open_nodes(page, app_url, [])
