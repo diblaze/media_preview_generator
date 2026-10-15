@@ -447,6 +447,24 @@ class TestMigrateSchema:
         assert f"{settings_manager.settings_file}.<timestamp>.bak" in msg
         assert f"{settings_manager.settings_file}.bak" not in msg
 
+    def test_refusal_names_the_newest_pre_upgrade_copy_on_disk(self, settings_manager):
+        import os
+
+        from media_preview_generator.upgrade import SchemaDowngradeError, _migrate_schema
+
+        live = str(settings_manager.settings_file)
+        for age, name in enumerate(["pre-v24.20261015-120000.bak", "pre-v24.bak", "pre-v23.bak"]):
+            Path(f"{live}.{name}").write_text("{}")
+            os.utime(f"{live}.{name}", (1_700_000_000 - age * 60, 1_700_000_000 - age * 60))
+        settings_manager.set("_schema_version", _CURRENT_SCHEMA_VERSION + 1)
+
+        with pytest.raises(SchemaDowngradeError) as exc_info:
+            _migrate_schema(settings_manager)
+
+        assert f"the copy taken just before the latest upgrade is {live}.pre-v24.20261015-120000.bak;" in str(
+            exc_info.value
+        )
+
     def test_builds_gpu_config_from_flat_gpu_threads(self, settings_manager):
         """Flat gpu_threads is converted to per-GPU gpu_config."""
         from media_preview_generator.upgrade import _migrate_schema
@@ -2870,15 +2888,51 @@ class TestMigrationNoticeBackupAndDismissal:
         assert backup.exists()
         assert json.loads(backup.read_text()) == seeded
 
-    def test_an_existing_pre_upgrade_copy_is_kept(self, tmp_path):
+    def test_a_retry_boot_names_the_copy_it_took_last_time(self, tmp_path):
         from media_preview_generator.upgrade import _backup_settings_before_migrating
 
         sm = self._boot(tmp_path, self._seed("version_move"))
         existing = Path(f"{sm.settings_file}.pre-v13.bak")
-        existing.write_text("earliest")
+        existing.write_bytes(Path(sm.settings_file).read_bytes())
 
         assert _backup_settings_before_migrating(sm, 13) == str(existing)
-        assert existing.read_text() == "earliest"
+        assert sorted(p.name for p in tmp_path.glob("settings.json.pre-v*")) == ["settings.json.pre-v13.bak"]
+
+    def test_an_earlier_upgrades_copy_is_kept_and_a_new_one_taken_of_settings_changed_since(self, tmp_path):
+        """Rolled back by restoring pre-v13.bak, changed on the older build, upgraded again: the way back now is the
+        settings as they are, and the first upgrade's copy stays as it was."""
+        from media_preview_generator.upgrade import _backup_settings_before_migrating
+
+        sm = self._boot(tmp_path, self._seed("version_move"))
+        earlier = Path(f"{sm.settings_file}.pre-v13.bak")
+        earlier.write_text("earliest")
+
+        taken = _backup_settings_before_migrating(sm, 13)
+
+        assert taken != str(earlier)
+        assert Path(taken).name.startswith("settings.json.pre-v13.")
+        assert Path(taken).read_bytes() == Path(sm.settings_file).read_bytes()
+        assert earlier.read_text() == "earliest"
+        assert _backup_settings_before_migrating(sm, 13) == taken  # a retry boot of this upgrade reuses it
+
+    def test_a_second_upgrade_after_a_rollback_names_a_copy_of_the_settings_it_migrated(self, tmp_path):
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.utils import timestamped_backups
+
+        first = self._seed("version_move")
+        _migrate_schema(self._boot(tmp_path, first))
+        first_copy = tmp_path / "settings.json.pre-v13.bak"
+        assert json.loads(first_copy.read_text()) == first
+
+        changed_on_the_older_build = {**first, "thumbnail_interval": 10}
+        sm = self._boot(tmp_path, changed_on_the_older_build)
+        _migrate_schema(sm)
+
+        named = Path(sm.get("_pending_migration_notice")["backup"])
+        assert named != first_copy
+        assert json.loads(named.read_text()) == changed_on_the_older_build
+        assert json.loads(first_copy.read_text()) == first
+        assert str(named) not in timestamped_backups(str(sm.settings_file))  # saves never prune it
 
     def test_notice_names_no_backup_when_none_could_be_written(self, tmp_path, monkeypatch):
         from media_preview_generator import upgrade

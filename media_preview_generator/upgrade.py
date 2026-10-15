@@ -10,12 +10,15 @@ application-level configuration.
 """
 
 import copy
+import filecmp
+import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -362,11 +365,45 @@ def _migrate_env_vars(sm) -> None:
 # =========================================================================
 
 
+_PRE_UPGRADE_SUFFIX_RE = re.compile(r"\.pre-v([0-9]+)(?:\.[0-9]{8}-[0-9]{6})?\.bak")
+
+
+def _pre_upgrade_copies(settings_file: str, from_schema: int | None = None) -> list[str]:
+    """Return the copies :func:`_backup_settings_before_migrating` took of ``settings_file``.
+
+    Args:
+        settings_file: The live settings.json path.
+        from_schema: Only the copies taken before migrating from this schema version; None for every version.
+
+    Returns:
+        Paths of ``{settings_file}.pre-v<N>.bak`` and ``{settings_file}.pre-v<N>.<YYYYMMDD-HHMMSS>.bak``.
+    """
+    copies = []
+    for path in glob.glob(glob.escape(settings_file) + ".pre-v*.bak"):
+        match = _PRE_UPGRADE_SUFFIX_RE.fullmatch(path[len(settings_file) :])
+        if match and (from_schema is None or int(match.group(1)) == from_schema):
+            copies.append(path)
+    return sorted(copies)
+
+
+def _newest_pre_upgrade_copy(settings_file: str) -> str:
+    """Return the most recently written pre-upgrade copy of ``settings_file``, or "" when there is none."""
+    copies = []
+    for path in _pre_upgrade_copies(settings_file):
+        try:
+            copies.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    return max(copies)[1] if copies else ""
+
+
 def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     """Copy settings.json to ``{settings_file}.pre-v{from_schema}.bak`` before any migration step saves over it.
 
     The name is not a timestamped one, so the save-time pruner never deletes it; ordinary saves would otherwise
-    rotate the pre-upgrade copy out within minutes.
+    rotate the pre-upgrade copy out within minutes. When that name is taken by a copy holding other settings (the
+    user rolled back, changed things on the older build and upgraded again), the copy is
+    ``{settings_file}.pre-v{from_schema}.<YYYYMMDD-HHMMSS>.bak`` instead, which the pruner doesn't touch either.
 
     Args:
         sm: The settings manager about to be migrated.
@@ -378,12 +415,20 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     settings_file = getattr(sm, "settings_file", None)
     if not settings_file or not os.path.isfile(str(settings_file)):
         return ""
+    settings_file = str(settings_file)
     bak_path = f"{settings_file}.pre-v{from_schema}.bak"
-    # The earliest copy is the one that matches the version the user came from; a retry boot must not replace it.
+    # A retry boot finds the copy it took last time still matching the file, so it keeps naming that one. Any
+    # existing copy is left alone: an earlier upgrade's copy is still the way back to before that upgrade.
+    for existing in _pre_upgrade_copies(settings_file, from_schema):
+        try:
+            if filecmp.cmp(settings_file, existing, shallow=False):
+                return existing
+        except OSError:
+            continue
     if os.path.isfile(bak_path):
-        return bak_path
+        bak_path = f"{settings_file}.pre-v{from_schema}.{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.bak"
     try:
-        shutil.copy2(str(settings_file), bak_path)
+        shutil.copy2(settings_file, bak_path)
         return bak_path
     except OSError as exc:
         logger.warning(
@@ -476,12 +521,19 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         # Silent acceptance would drop unknown fields on the next save —
         # the exact failure mode that wiped jobs.json on tag-drift.
         settings_path = getattr(sm, "settings_file", None) or "settings.json"
+        newest_copy = _newest_pre_upgrade_copy(str(settings_path))
+        if newest_copy:
+            upgrade_copy = f"the copy taken just before the latest upgrade is {newest_copy}"
+        else:
+            upgrade_copy = (
+                f"the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
+                f"version you upgraded from"
+            )
         raise SchemaDowngradeError(
             f"settings.json was written by schema v{current} but this binary supports up to "
             f"v{_CURRENT_SCHEMA_VERSION}. Refusing to start (would silently drop fields on next save). "
             f"Either run a newer build of the app, or restore a settings.json from before the upgrade "
-            f"(the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
-            f"version you upgraded from; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
+            f"({upgrade_copy}; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
             f"and start the older app version that wrote it."
         )
     # A pending v14 retry has to get past the version gate: the failure that

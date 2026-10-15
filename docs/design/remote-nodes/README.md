@@ -40,8 +40,9 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
   - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
-    restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating): an older build
-    refuses a v24 file.
+    restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating; named in the Settings
+    migrated card): an older build refuses a v24 file. Upgrading again after a rollback keeps that copy and takes
+    `settings.json.pre-v<N>.<timestamp>.bak` when the settings changed in between.
   - A worker node that answers with the saved key at the saved address is that node even when it reports a new
     id (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
     node's new id is taken silently only when its `plex_db.machine_identifier` matches every server that uses it;
