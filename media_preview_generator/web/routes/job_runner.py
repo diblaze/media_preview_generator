@@ -1711,6 +1711,11 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         }
                         if current_job and (current_job.config or {}).get("source"):
                             retry_async_config["source"] = current_job.config["source"]
+                        # What the job asked for, not which files: a Regenerate job's retry regenerates too, and an
+                        # upgrade's retry still removes the replaced release's previews.
+                        for key in ("force_generate", "regenerate_thumbnails", "webhook_deleted_paths"):
+                            if job_config.get(key):
+                                retry_async_config[key] = job_config[key]
                         # K1: thread server_id through so the retry's worker
                         # builds Config from the right per-server view.
                         # CRITICAL: only inherit the publish-pin when the

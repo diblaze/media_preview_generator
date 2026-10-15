@@ -3093,3 +3093,73 @@ class TestAFileThatFailedIsAFailureNotAFileNoServerFound:
         assert "Add the webhook's path root (e.g. '/downloads')" in rows[-1]["reason"]
         assert retries[0].config["retry_reason"]["unresolved"] == 1
         assert "failed" not in retries[0].config["retry_reason"]
+
+
+class TestARetryKeepsWhatTheJobAskedFor:
+    """Lab: a Regenerate job (the Files panel's Regenerate) whose file a node couldn't see was retried without the
+    force flag, found the old BIF and ended "skipped_bif_exists": the preview asked for was never made again. The
+    orchestrator and _start_job_async run for real; only the dispatcher is stood in for."""
+
+    LIBRARY = "/media/movies"
+    PATH = f"{LIBRARY}/Film (2024)/Film (2024).mkv"
+
+    @pytest.fixture()
+    def owned_movies(self, app):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        manager = get_settings_manager()
+        servers = manager.get("media_servers")
+        for server in servers:
+            for library in server["libraries"]:
+                library["remote_paths"] = [self.LIBRARY]
+        manager.set("media_servers", servers)
+
+    def _dispatches(self, app, asked: dict) -> list[tuple[bool, list[str] | None]]:
+        """``(regenerate_thumbnails, webhook_deleted_paths)`` of each dispatch of a job (two retries allowed) whose
+        every dispatch fails its one file."""
+        from media_preview_generator.processing.generator import ProcessingResult, _notify_file_result
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes.job_runner import _start_job_async
+
+        seen: list[tuple[bool, list[str] | None]] = []
+
+        def failing_dispatch(pairs, **kwargs):
+            seen.append((kwargs["config"].regenerate_thumbnails, kwargs["config"].webhook_deleted_paths))
+            paths = [item.canonical_path for _, item in pairs]
+            for failed in paths:
+                _notify_file_result(failed, ProcessingResult.FAILED, "not visible on NAS", "NAS CPU 1")
+            return {"completed": 0, "failed": len(paths), "cancelled": False, "outcome": {"failed": len(paths)},
+                    "failed_paths": [], "node_failures": {p: "not visible on NAS" for p in paths}}  # fmt: skip
+
+        overrides = {"webhook_paths": [self.PATH], **asked}
+        with (
+            app.app_context(),
+            patch(
+                "media_preview_generator.jobs.orchestrator._dispatch_processable_items", side_effect=failing_dispatch
+            ),
+        ):
+            jm = get_job_manager()
+            job = jm.create_job(library_name="Manual: Film (2024).mkv", config=dict(overrides))
+            _start_job_async(job.id, config_overrides={**overrides, "webhook_retry_count": 2})
+            assert len(_retries_of(jm, job.id)) == 2
+        return seen
+
+    @pytest.mark.parametrize(
+        ("asked", "regenerate"),
+        [
+            ({"force_generate": True}, True),
+            ({"regenerate_thumbnails": True}, True),
+            ({"force_generate": False}, False),
+            ({}, False),
+        ],
+        ids=["regenerate", "regenerate-thumbnails-key", "not-forced", "nothing-asked"],
+    )
+    def test_each_retry_regenerates_only_when_the_job_did(self, app, owned_movies, no_retry_wait, asked, regenerate):
+        assert self._dispatches(app, asked) == [(regenerate, None)] * 3  # the job, its retry, the retry's retry
+
+    def test_each_retry_of_an_upgrade_still_removes_the_replaced_releases_previews(
+        self, app, owned_movies, no_retry_wait
+    ):
+        replaced = [f"{self.LIBRARY}/Film (2024)/Film (2024) 720p.mkv"]
+
+        assert self._dispatches(app, {"webhook_deleted_paths": replaced}) == [(False, replaced)] * 3
