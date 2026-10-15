@@ -12,6 +12,7 @@ import pytest
 from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
 from media_preview_generator.jobs.dispatcher import JobDispatcher
 from media_preview_generator.jobs.worker import WorkerPool
+from media_preview_generator.markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
 from media_preview_generator.processing.generator import (
     CancellationError,
     CodecNotSupportedError,
@@ -583,6 +584,46 @@ def test_a_cpu_fallback_inside_a_kinds_step_shows_on_the_worker_row(caplog):
     assert w.completed == 1
     _run_custom(w, lambda item, **kwargs: ItemOutcome("markers_published"))
     assert w.fallback_active is False and w.fallback_reason is None
+
+
+@pytest.mark.parametrize(
+    ("note", "codec_error", "tag"),
+    [
+        (f"{CREDITS_ON_CPU_PREFIX}: Vulkan reports no hardware GPU", False, "[GPU 0]:"),
+        ("The end-picture check couldn't decode a.mkv on the GPU and decoded it on the CPU: exit 1", False, "[CPU]:"),
+        (None, True, "[CPU]:"),
+        (f"{CREDITS_ON_CPU_PREFIX}: Vulkan reports no hardware GPU", True, "[CPU]:"),
+    ],
+    ids=["credit-text-on-cpu", "end-picture-decode-on-cpu", "cpu-rerun", "credit-text-during-cpu-rerun"],
+)
+def test_a_kinds_progress_lines_name_the_device_that_decodes_the_file(note, codec_error, tag):
+    # Credit text read on the CPU (no hardware Vulkan) while NVDEC decoded the frames logged "[CPU]: ep - 16.9%".
+    from loguru import logger
+
+    from media_preview_generator.jobs.worker import Worker
+
+    w = Worker(1, "GPU", gpu="NVIDIA", gpu_device="cuda:0", gpu_index=0, ffmpeg_threads=2)
+    pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+
+    def process(item, **kwargs):
+        if codec_error and kwargs["gpu"] is not None:
+            raise CodecNotSupportedError("hevc")
+        if note is not None:
+            kwargs["fallback_callback"](note)
+        w.last_verbose_log_time = 0.0
+        pool._update_worker_progress(w, 16.9, 10.0, 60.0, speed="1.4x")
+        return ItemOutcome("markers_published")
+
+    lines: list[str] = []
+    handler = logger.add(lambda m: lines.append(m.record["message"]), level="INFO", format="{message}")
+    try:
+        _run_custom(w, process)
+    finally:
+        logger.remove(handler)
+
+    progress = [line for line in lines if "16.9%" in line]
+    assert progress and all(line.startswith(f"{tag} ") for line in progress), lines
+    assert w.fallback_active is True  # the row still says the worker used its CPU
 
 
 @pytest.mark.parametrize(

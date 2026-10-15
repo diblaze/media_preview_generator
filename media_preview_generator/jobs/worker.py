@@ -16,6 +16,7 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import ItemOutcome, normalize_outcome, outcome_value
+from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
 from ..nodes.executor import FileNotVisibleError, NodeRequeue, NodeUnavailableError, Placement, placed_on, requeue_for
 from ..processing.generator import (
     FALLBACK_CODEC,
@@ -325,6 +326,9 @@ class Worker:
         # happened.
         self.fallback_active = False
         self.fallback_reason: str | None = None
+        # True once the CPU decodes this file for a GPU worker (its CPU rerun, or a step that fell back to the CPU).
+        # Credit text read on the CPU sets fallback_active only: the GPU still decodes the frames it reads.
+        self.decoding_on_cpu = False
         # True once the last finished file needed the CPU fallback (cancelled files stay False); the dispatcher
         # folds it into the job's "N files ran on the CPU because the GPU failed" tally.
         self.last_task_cpu_fallback = False
@@ -351,9 +355,10 @@ class Worker:
     @property
     def log_tag(self) -> str:
         """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
-        the prefix the node's own lines carry in the job log. A GPU worker on its CPU fallback reads as the CPU, which
-        is what runs the file then."""
-        on_gpu = self.worker_type == "GPU" and not self.fallback_active
+        the prefix the node's own lines carry in the job log. A GPU worker reads as the CPU once the CPU decodes its
+        file (its CPU rerun, or a step that fell back to the CPU); credit text read on the CPU doesn't change it, as
+        the GPU still decodes those frames."""
+        on_gpu = self.worker_type == "GPU" and not self.decoding_on_cpu
         if self.node_id is None:
             return f"[GPU {self.gpu_index}]:" if on_gpu else "[CPU]:"
         return f"{self.node_device} ·" if on_gpu else f"{self.node_name}/CPU ·"
@@ -497,6 +502,7 @@ class Worker:
         self.task_start_time = time.time()
         self.fallback_active = False
         self.fallback_reason = None
+        self.decoding_on_cpu = False
         self.last_task_cpu_fallback = False
         self.cancel_check = cancel_check
         self.pause_check = pause_check
@@ -754,6 +760,7 @@ class Worker:
                         _persist(ProcessingResult.FAILED, "cancelled before CPU fallback")
                     else:
                         self.fallback_active = True
+                        self.decoding_on_cpu = True
                         self.fallback_reason = reason
                         ctx_logger.warning(
                             "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}. {}",
@@ -915,8 +922,10 @@ class Worker:
 
             def _fallback_cb(reason: str) -> None:
                 # A step that fell back to the CPU inside the kind's own run (the end-picture decode) shows on the row
-                # as a whole-item CPU rerun does.
+                # as a whole-item CPU rerun does. Credit text read on the CPU shows there too, but the GPU still
+                # decodes its frames, so the decode lines keep the GPU's prefix.
                 self.fallback_active = True
+                self.decoding_on_cpu = self.decoding_on_cpu or not reason.startswith(CREDITS_ON_CPU_PREFIX)
                 self.fallback_reason = redact_secrets(reason) or "GPU processing failed"
 
             def _run(gpu, gpu_device):
@@ -957,6 +966,7 @@ class Worker:
                 cancelled = bool(self.cancel_check and self.cancel_check())
                 if self.worker_type == "GPU" and not cancelled:
                     self.fallback_active = True
+                    self.decoding_on_cpu = True
                     self.fallback_reason = redact_secrets(str(exc)) or "GPU processing failed"
                     logger.warning(
                         "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}",
