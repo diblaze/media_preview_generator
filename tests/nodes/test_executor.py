@@ -292,7 +292,7 @@ class TestArtifact:
 
     def test_artifact_download_failure_is_node_unavailable(self, media, tmp_path):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
-        client.fetch_artifact = lambda task_id: (_ for _ in ()).throw(unreachable())
+        client.fetch_artifact = lambda task_id, cancel_check=None: (_ for _ in ()).throw(unreachable())
         registry = _install(client)
         with pytest.raises(NodeUnavailableError) as raised:
             _run(media, artifact_to=str(tmp_path))
@@ -304,7 +304,7 @@ class TestArtifact:
         # Each fetch waits up to ARTIFACT_TIMEOUT_S (minutes) for the next byte: three of them held the worker ~15 min.
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
 
-        def fetch(task_id):
+        def fetch(task_id, cancel_check=None):
             client.calls.append(("artifact",))
             raise NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT)
 
@@ -319,7 +319,7 @@ class TestArtifact:
         cancelled = []
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
 
-        def fetch(task_id):
+        def fetch(task_id, cancel_check=None):
             client.calls.append(("artifact",))
             cancelled.append(True)  # the job is cancelled while this fetch fails
             raise NodeUnreachableError("http://n answered HTTP 502")
@@ -348,7 +348,7 @@ class TestArtifact:
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={"frames": 1})], artifact=tar)
         answers = [error, error]
 
-        def fetch(task_id):
+        def fetch(task_id, cancel_check=None):
             client.calls.append(("artifact",))
             if answers:
                 raise answers.pop(0)
@@ -381,7 +381,7 @@ class TestArtifact:
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
         fetched_at: list[float] = []
 
-        def fetch(task_id):
+        def fetch(task_id, cancel_check=None):
             fetched_at.append(clock.now)
             if len(fetched_at) > 1000:  # a build that never gives up fails here instead of hanging
                 return _tar([])
@@ -407,7 +407,9 @@ class TestArtifact:
     def test_a_node_that_no_longer_has_the_frames_isnt_asked_again(self, media, tmp_path, error, started):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
         fetched: list[str] = []
-        client.fetch_artifact = lambda task_id: fetched.append(task_id) or (_ for _ in ()).throw(error)
+        client.fetch_artifact = lambda task_id, cancel_check=None: (
+            fetched.append(task_id) or (_ for _ in ()).throw(error)
+        )
         _install(client)
 
         with pytest.raises(NodeUnavailableError) as raised:
@@ -684,7 +686,7 @@ class TestNodeDrops:
 
     def test_a_node_that_restarts_before_sending_the_frames_gives_the_file_back_without_a_drop(self, media, tmp_path):
         class Restarting(ScriptedClient):
-            def fetch_artifact(self, task_id):
+            def fetch_artifact(self, task_id, cancel_check=None):
                 raise NodeStoppingError("http://n is restarting")
 
         _install(Restarting([finished(protocol.STATUS_DONE, result={})]))
@@ -987,7 +989,7 @@ class _KeyChanged(ScriptedClient):
         self._gate("pause")
         super().pause_task(task_id)
 
-    def fetch_artifact(self, task_id: str) -> bytes:
+    def fetch_artifact(self, task_id: str, cancel_check=None) -> bytes:
         self._gate("artifact")
         return super().fetch_artifact(task_id)
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import ssl
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
 from json import loads as parse_json
@@ -35,10 +35,10 @@ INFO_TIMEOUT_S = 10.0
 GPU_RESCAN_TIMEOUT_S = 60.0
 # The longest wait for the next byte of a task's frames. The node sends the tar it already wrote, so bytes start at
 # once and keep coming however slow the link: this long with none is a stalled link. A job's cancel, or the app's
-# stop, waits for a stalled download no longer than this (a stalled poll is given up on within ~30 s too).
+# stop, is seen at the next piece of a flowing download, and waits for a stalled one no longer than this.
 ARTIFACT_TIMEOUT_S = 30.0
 # The longest wait for the artifact's headers: a busy node answers a queued request once the earlier ones finish, and
-# the finished work isn't redone if this gives up first.
+# the finished work isn't redone if this gives up first. A cancel or stop isn't seen until the headers come.
 ARTIFACT_HEADERS_TIMEOUT_S = 120.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
@@ -241,11 +241,17 @@ def _set_body_timeout(response: Any, seconds: float) -> None:
         sock.settimeout(seconds)
 
 
+class DownloadCancelledError(NodeError):
+    """The caller's ``cancel_check`` turned true while an answer was arriving."""
+
+
 class AnswerTooSlowError(requests.Timeout):
     """An answer that didn't arrive whole by its deadline (``answer_pieces``)."""
 
 
-def answer_pieces(response: Any, chunk_bytes: int, deadline: float) -> Iterator[bytes]:
+def answer_pieces(
+    response: Any, chunk_bytes: int, deadline: float, cancel_check: Callable[[], bool] | None = None
+) -> Iterator[bytes]:
     """A streamed answer's body as it arrives, given up on once ``deadline`` (``time.monotonic()``) has passed.
 
     ``iter_content`` waits for a whole chunk, which an answer sent a byte at a time never fills; urllib3's ``read1``
@@ -256,8 +262,10 @@ def answer_pieces(response: Any, chunk_bytes: int, deadline: float) -> Iterator[
         response: A ``requests`` answer, opened with ``stream=True``.
         chunk_bytes: The most bytes one piece holds.
         deadline: When to give up.
+        cancel_check: Asked after each piece; true gives the answer up.
 
     Raises:
+        DownloadCancelledError: ``cancel_check`` turned true before the answer ended.
         AnswerTooSlowError: The deadline passed before the answer ended.
         requests.RequestException: The connection timed out, dropped or broke mid-answer.
     """
@@ -278,6 +286,8 @@ def answer_pieces(response: Any, chunk_bytes: int, deadline: float) -> Iterator[
             return
         if time.monotonic() >= deadline:
             raise AnswerTooSlowError("the answer didn't arrive whole in time")
+        if cancel_check is not None and cancel_check():
+            raise DownloadCancelledError("the download was cancelled")
         yield piece
 
 
@@ -328,6 +338,7 @@ class NodeClient:
     def _call(
         self, method: str, path: str, *, json: dict | None = None, read_timeout: float | None = None,
         auth: bool = True, raw: bool = False, limit: int = MAX_ANSWER_BYTES, deadline_s: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> Any:  # fmt: skip
         if read_timeout is None:
             read_timeout = READ_TIMEOUT_S
@@ -363,14 +374,22 @@ class NodeClient:
         with response:
             if headers_timeout != read_timeout:
                 _set_body_timeout(response, read_timeout)
-            return self._answer(response, path, raw=raw, limit=limit, deadline=time.monotonic() + deadline_s)
+            return self._answer(
+                response, path, raw=raw, limit=limit, deadline=time.monotonic() + deadline_s, cancel_check=cancel_check
+            )
 
-    def _read(self, response: requests.Response, limit: int, deadline: float) -> bytearray:
+    def _read(
+        self,
+        response: requests.Response,
+        limit: int,
+        deadline: float,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> bytearray:
         """The body, refused once it passes ``limit`` bytes (returned as read: a copy of an artifact is ~1 GB), or
         once ``deadline`` has passed."""
         body = bytearray()
         try:
-            for chunk in answer_pieces(response, 1024 * 1024, deadline):
+            for chunk in answer_pieces(response, 1024 * 1024, deadline, cancel_check):
                 body += chunk
                 if len(body) > limit:
                     raise NodeProtocolError(f"{self._address.base} sent more than {limit // (1024 * 1024)} MB")
@@ -395,7 +414,16 @@ class NodeClient:
         error = body.get("error") if isinstance(body, dict) else None
         return str(error.get("kind") or "") if isinstance(error, dict) else ""
 
-    def _answer(self, response: requests.Response, path: str, *, raw: bool, limit: int, deadline: float) -> Any:
+    def _answer(
+        self,
+        response: requests.Response,
+        path: str,
+        *,
+        raw: bool,
+        limit: int,
+        deadline: float,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Any:
         """The node's answer to ``path``: the JSON body (refused unparsed past ``limit`` bytes), or the bytes when
         ``raw``; anything else, or an answer still arriving at ``deadline``, raises."""
         app_instance = str(response.headers.get(protocol.APP_INSTANCE_HEADER) or "")
@@ -419,7 +447,7 @@ class NodeClient:
         if encoding != "identity":
             raise NodeProtocolError(f"{self._address.base} sent a {encoding}-compressed answer")
         if raw and response.status_code == 200:
-            return self._read(response, MAX_ARTIFACT_BYTES, deadline)
+            return self._read(response, MAX_ARTIFACT_BYTES, deadline, cancel_check)
         try:
             body = parse_json(self._read(response, limit, deadline))
         except (ValueError, RecursionError) as exc:  # RecursionError: JSON nested deeper than Python's parser goes
@@ -499,10 +527,19 @@ class NodeClient:
         """``POST /v1/tasks/<id>/resume``."""
         self._call("POST", f"{protocol.ROUTE_TASKS}/{task_id}/resume", json={})
 
-    def fetch_artifact(self, task_id: str) -> bytes | bytearray:
-        """``GET /v1/tasks/<id>/artifact``: the task's artifact bytes (a preview's frames as a tar)."""
+    def fetch_artifact(self, task_id: str, cancel_check: Callable[[], bool] | None = None) -> bytes | bytearray:
+        """``GET /v1/tasks/<id>/artifact``: the task's artifact bytes (a preview's frames as a tar).
+
+        Args:
+            task_id: The node's task id.
+            cancel_check: Asked after each piece of the body; true raises ``DownloadCancelledError``.
+        """
         return self._call(
-            "GET", f"{protocol.ROUTE_TASKS}/{task_id}/artifact", read_timeout=ARTIFACT_TIMEOUT_S, raw=True
+            "GET",
+            f"{protocol.ROUTE_TASKS}/{task_id}/artifact",
+            read_timeout=ARTIFACT_TIMEOUT_S,
+            raw=True,
+            cancel_check=cancel_check,
         )
 
     def delete_task(self, task_id: str, *, read_timeout: float = READ_TIMEOUT_S) -> None:

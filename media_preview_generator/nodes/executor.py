@@ -611,6 +611,9 @@ class _TaskRun:
             raise self._unavailable(f"{name} couldn't finish the task: {message}", started=False)
         raise NodeTaskError(kind or protocol.KIND_FAILED, message, error_type=error_type, extra=extra)
 
+    def _download_cancelled(self) -> bool:
+        return self._cancel_requested() or is_shutting_down()
+
     def _download(self, dest: str) -> None:
         """Fetch the finished task's frames into ``dest``.
 
@@ -625,7 +628,7 @@ class _TaskRun:
         failing_since = 0.0
         while True:
             try:
-                data = self._client.fetch_artifact(self._task_id)
+                data = self._client.fetch_artifact(self._task_id, cancel_check=self._download_cancelled)
                 break
             except NodeAuthError as exc:
                 raise self._refused_key() from exc
@@ -633,7 +636,7 @@ class _TaskRun:
                 if failed == 0:
                     failing_since = time.monotonic()
                 failed += 1
-                if self._cancel_requested() or is_shutting_down():
+                if self._download_cancelled():
                     raise NodeTaskCancelledError(
                         protocol.KIND_CANCELLED, f"{self._placement.node_name} didn't send the frames: {exc}"
                     ) from exc

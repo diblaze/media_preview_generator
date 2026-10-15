@@ -94,7 +94,7 @@ class ScriptedClient:
     def resume_task(self, task_id: str) -> None:
         self.calls.append(("resume",))
 
-    def fetch_artifact(self, task_id: str) -> bytes:
+    def fetch_artifact(self, task_id: str, cancel_check=None) -> bytes:
         self.calls.append(("artifact",))
         return self.artifact
 
@@ -182,7 +182,7 @@ class LoopbackClient:
     def resume_task(self, task_id: str) -> None:
         pass
 
-    def fetch_artifact(self, task_id: str) -> bytes:
+    def fetch_artifact(self, task_id: str, cancel_check=None) -> bytes:
         assert self.ctx is not None and self.ctx.artifact is not None
         with open(self.ctx.artifact, "rb") as fh:
             return fh.read()
