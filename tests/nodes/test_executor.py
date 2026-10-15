@@ -86,6 +86,23 @@ def _wait_until(check, timeout: float = 5.0) -> bool:
     return False
 
 
+def test_frames_are_unpacked_from_the_downloaded_buffer_without_copying_it(tmp_path):
+    import tracemalloc
+
+    frames = [(f"{n}.jpg", os.urandom(1024 * 1024)) for n in range(1, 25)]
+    data = bytearray(_tar(frames))
+    tracemalloc.start()
+    try:
+        names = extract_artifact(data, str(tmp_path))
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert names == sorted(name for name, _ in frames)
+    assert (tmp_path / "7.jpg").read_bytes() == frames[6][1]
+    assert peak < len(data) / 2
+    assert extract_artifact(memoryview(_tar(frames[:1])), str(tmp_path / "again")) == ["1.jpg"]
+
+
 def _tar(entries: list[tuple[str, bytes]], *, symlink: str | None = None) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:

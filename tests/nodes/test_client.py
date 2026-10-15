@@ -191,6 +191,21 @@ class TestAnswersAreBounded:
         with pytest.raises(NodeProtocolError, match="more than 1 MB"):
             _local(url).poll_task("t1")
 
+    def test_an_artifact_is_held_once_not_copied(self, serve):
+        import tracemalloc
+
+        size = 32 * 1024 * 1024
+        url, _ = serve(200, b"x" * size)
+        client = _local(url)
+        tracemalloc.start()
+        try:
+            data = client.fetch_artifact("t1")
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert len(data) == size
+        assert peak < 1.5 * size
+
     def test_answers_under_the_caps_come_through(self, serve):
         url, _ = serve(200, b"tar bytes")
         assert _local(url).fetch_artifact("t1") == b"tar bytes"

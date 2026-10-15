@@ -173,7 +173,36 @@ def requeue_for(exc: BaseException) -> NodeRequeue | None:
     return None
 
 
-def extract_artifact(data: bytes, dest: str) -> list[str]:
+class _BufferFile(io.RawIOBase):
+    """A read-only file over a buffer that doesn't copy it (``io.BytesIO`` copies anything but ``bytes``)."""
+
+    def __init__(self, data: bytes | bytearray | memoryview) -> None:
+        super().__init__()
+        self._view = memoryview(data).cast("B")
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        count = max(0, min(len(buffer), len(self._view) - self._pos))
+        buffer[:count] = self._view[self._pos : self._pos + count]
+        self._pos += count
+        return count
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: len(self._view)}[whence]
+        self._pos = max(0, base + offset)
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+
+def extract_artifact(data: bytes | bytearray | memoryview, dest: str) -> list[str]:
     """Unpack a preview's frames tar into ``dest``: plain files with bare names only, every entry checked first.
 
     Args:
@@ -188,7 +217,7 @@ def extract_artifact(data: bytes, dest: str) -> list[str]:
             than any preview's frames.
     """
     try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        with tarfile.open(fileobj=_BufferFile(data), mode="r:") as tar:
             members = []
             total = 0
             # A sparse member passes isfile() yet unpacks to any size it declares from a few bytes of tar.
