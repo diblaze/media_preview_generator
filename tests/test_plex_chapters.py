@@ -473,8 +473,13 @@ def test_error_retry_classification_roundtrips():
 @pytest.mark.parametrize("capabilities,machine", [([], MACHINE), (["chapters_v1"], "other")])
 def test_remote_refuses_old_or_wrong_helper_before_sending_operation(capabilities, machine):
     class Client:
+        name, url, version = "Plex box", "http://plex-host.lan:9494", "1.0.4"
+
         def __init__(self):
             self.capabilities = capabilities
+
+        def describe(self):
+            return "Plex box"
 
         def ping(self, *, timeout):
             assert timeout == 5
@@ -558,6 +563,9 @@ def test_remote_names_the_helper_update_plex_1_43_5_needs(agent_version, pms_ver
         capabilities = ["chapters_v1"]
         version = agent_version
 
+        def describe(self):
+            return "Plex box"
+
         def ping(self, *, timeout):
             return {"machine_identifier": MACHINE}
 
@@ -566,7 +574,7 @@ def test_remote_names_the_helper_update_plex_1_43_5_needs(agent_version, pms_ver
             return {"capability": "chapters_v1"}
 
     if refused:
-        with pytest.raises(ChapterError, match="1.1.2 or newer for Plex 1.43.5") as caught:
+        with pytest.raises(ChapterError, match="for Plex 1.43.5 need version 1.1.2 or newer") as caught:
             _remote(Client(), "check", MACHINE, pms_version)
         assert caught.value.state is Capability.PLUGIN_OUTDATED
         assert sent == []

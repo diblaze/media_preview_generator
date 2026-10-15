@@ -13,6 +13,7 @@ import threading
 import time
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,7 +36,7 @@ from media_preview_generator.nodes.server import plex_db as plex_db_role
 from media_preview_generator.nodes.server import winplatform
 from media_preview_generator.servers.base import ServerConfig, ServerType
 from tests.markers.test_plex_db_publisher import _make_db, _mountinfo, linux_mount_table, windows_only
-from tests.nodes.plex_db_harness import TOKEN, FlaskSession, node_app
+from tests.nodes.plex_db_harness import NODE_URL, TOKEN, FlaskSession, node_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_DIR = REPO_ROOT / "nodes" / "plex-db"
@@ -847,6 +848,147 @@ class TestWhichPlexTheAgentServes:
         assert "different Plex server" in str(ei.value)
         assert _served(plex_config) == []
         assert publisher.capability().state is Capability.AGENT_UNAVAILABLE
+
+
+class TestChapterRefusalsNameTheNode:
+    """Chapter thumbnails refuse a Plex database node by its name, as markers and loudness do, in the server's Setup
+    Health row and the job's chapter row alike."""
+
+    @pytest.fixture
+    def check(self, agent, plex_config, monkeypatch):
+        """``chapter_capability`` for a server named Home, connected to a Plex with ``machine`` and ``version``."""
+        from media_preview_generator.markers.publishers import plex_chapters
+
+        (plex_config / "Preferences.xml").write_text('<Preferences ProcessedMachineIdentifier="plex-b"/>')
+        client = plex_remote.AgentClient(NODE_URL, TOKEN, name="Plex box", session=FlaskSession(agent))
+
+        def connect(machine: str = "plex-b", version: str = "1.43.4.10127") -> None:
+            monkeypatch.setattr(plex_chapters, "_context", lambda *_a, **_kw: (client, machine, version, None))
+
+        def run(**plex: str):
+            connect(**plex)
+            return plex_chapters.chapter_capability(MagicMock(), SimpleNamespace(name="Home"))
+
+        connect()
+
+        return client, run
+
+    def test_beside_another_plex(self, check):
+        _client, run = check
+        report = run(machine="plex-a")
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            f"The Plex database node Plex box at {NODE_URL} is next to a different Plex server than Home. Check the "
+            "address: chapter thumbnails would have gone into the wrong database.",
+        )
+
+    def test_plex_gave_no_id(self, check):
+        _client, run = check
+        report = run(machine="")
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            "Plex didn't say which server it is, so this app can't tell whether the Plex database node Plex box is "
+            "beside it.",
+        )
+
+    def test_too_old_for_chapters(self, check, monkeypatch):
+        _client, run = check
+        monkeypatch.setattr(plex_db_role, "AGENT_VERSION", "1.0.4")
+        monkeypatch.setattr(plex_db_role, "CAPABILITIES", [])
+        report = run()
+        assert (report.state, report.message) == (
+            Capability.PLUGIN_OUTDATED,
+            "The Plex database node Plex box is version 1.0.4; chapter thumbnails need version 1.1.0 or newer. "
+            "Update the node.",
+        )
+
+    def test_too_old_for_plex_1_43_5(self, check, monkeypatch):
+        _client, run = check
+        monkeypatch.setattr(plex_db_role, "AGENT_VERSION", "1.1.1")
+        report = run(version="1.43.5.10000")
+        assert (report.state, report.message) == (
+            Capability.PLUGIN_OUTDATED,
+            "The Plex database node Plex box is version 1.1.1; chapter thumbnails for Plex 1.43.5 need version 1.1.2 "
+            "or newer. Update the node.",
+        )
+
+    def test_no_chapter_answer(self, check, monkeypatch):
+        client, run = check
+        monkeypatch.setattr(client, "post", lambda *_a, **_kw: {})
+        report = run()
+        assert (report.state, report.message) == (
+            Capability.PLUGIN_OUTDATED,
+            "The Plex database node Plex box sent no chapter answer. Update the node.",
+        )
+
+    def test_an_answer_this_app_can_t_read(self, check, monkeypatch):
+        from media_preview_generator.markers.publishers.plex_chapters import CHAPTER_CAPABILITY
+
+        client, run = check
+        monkeypatch.setattr(client, "post", lambda *_a, **_kw: {"capability": CHAPTER_CAPABILITY, "report": "x"})
+        report = run()
+        assert (report.state, report.message) == (
+            Capability.AGENT_UNAVAILABLE,
+            "The Plex database node Plex box sent a chapter answer this app can't read",
+        )
+
+    def test_a_snapshot_this_app_can_t_read(self, check, monkeypatch):
+        from media_preview_generator.markers.publishers import plex_chapters
+
+        client, _run = check
+        answer = {"capability": plex_chapters.CHAPTER_CAPABILITY, "target": "x"}
+        monkeypatch.setattr(client, "post", lambda *_a, **_kw: answer)
+        with pytest.raises(plex_chapters.ChapterError) as refused:
+            plex_chapters.resolve_chapter_target(MagicMock(), "/data/tv/S01E01.mkv")
+        assert str(refused.value) == "The Plex database node Plex box sent a chapter snapshot this app can't read"
+
+
+class TestADatabaseTheNodeDoesntFindIsSaidToBeOnTheNode:
+    """The path a node looks in is its own: said bare ("Plex database not found at <path>"), it reads as a folder to
+    fix on this app's side."""
+
+    @pytest.fixture
+    def through(self, tmp_path):
+        """A node started with a Plex folder that holds no database, reached under ``name``."""
+        folder = tmp_path / "node" / "Plex Media Server"
+        folder.mkdir(parents=True)
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        missing = plex_db.plex_db_path(str(folder))
+        return lambda name: RemotePlexDb(NODE_URL, TOKEN, name=name, session=FlaskSession(node)), missing
+
+    @staticmethod
+    def _markers(db: RemotePlexDb):
+        config = ServerConfig(
+            id="plex-1", type=ServerType.PLEX, name="Plex", enabled=True, url="http://plex:32400", auth={}, output={}
+        )
+        settings = ServerMarkersSettings(
+            True, None, "2026-09-13T00:00:00+00:00", "restore", agent_enabled=True, agent_url=NODE_URL
+        )
+        return PlexMarkerPublisher(MagicMock(), config, settings, db=db).capability()
+
+    @staticmethod
+    def _loudness_job(db: RemotePlexDb):
+        from media_preview_generator.loudness.guard import RemoteLoudnessDb
+
+        return RemoteLoudnessDb(MagicMock(), db, server_name="Plex").file_checks(deadline=time.monotonic() + 5)
+
+    @staticmethod
+    def _loudness_setup_health(db: RemotePlexDb):
+        from media_preview_generator.loudness.guard import RemoteLoudnessDb
+        from tests.nodes.test_plex_db_loudness import _plex
+
+        return RemoteLoudnessDb(_plex(), db, server_name="Plex").capability(deadline=time.monotonic() + 5)
+
+    @pytest.mark.parametrize("feature", ["_markers", "_loudness_job", "_loudness_setup_health"])
+    @pytest.mark.parametrize(("name", "called"), [("Plex box", "Plex box"), ("", f"at {NODE_URL}")])
+    def test_the_refusal_names_the_node(self, through, feature, name, called):
+        make, missing = through
+        report = getattr(self, feature)(make(name))
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            f"The Plex database node {called} doesn't find Plex's database at {missing} on its machine. Give the "
+            "node Plex's own config folder.",
+        )
 
 
 class TestTheAgentBlock:

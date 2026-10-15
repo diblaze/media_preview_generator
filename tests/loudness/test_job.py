@@ -6,7 +6,6 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +13,7 @@ import pytest
 from media_preview_generator.jobs.dispatcher import JobDispatcher
 from media_preview_generator.jobs.worker import WorkerPool
 from media_preview_generator.loudness import job
+from media_preview_generator.markers.publishers.base import CapabilityReport
 from media_preview_generator.output.plex_hash import calculate_plex_hash
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
@@ -314,7 +314,7 @@ def test_an_unwritable_database_is_asked_again_later_a_writable_one_is_kept(medi
     answers = iter([job.Capability.UNREACHABLE, job.Capability.READY])
 
     def checks(self, *, deadline):
-        return SimpleNamespace(state=next(answers), message="Plex is restarting")
+        return CapabilityReport(next(answers), "Plex is restarting")
 
     with (
         patch.object(job, "create_loudness_db", return_value=job.LocalPlexDb(lambda: "unused")),

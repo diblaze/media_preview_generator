@@ -336,7 +336,7 @@ class RemoteLoudnessDb:
         return result
 
     def _report(self, operation: str, body: dict, *, deadline: float, identity: bool) -> CapabilityReport:
-        from ..markers.publishers.plex_remote import report_from_json
+        from ..markers.publishers.plex_remote import NodeRefusedError, report_from_json
 
         try:
             if identity:
@@ -348,15 +348,17 @@ class RemoteLoudnessDb:
             if another:
                 report = CapabilityReport(Capability.MISCONFIGURED, another, report.details)
         except PublishError as exc:
-            report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc))
+            refused = {"node_refused": True} if isinstance(exc, NodeRefusedError) else {}
+            report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc), refused)
         except ValueError as exc:
             logger.debug("Plex helper: unreadable loudness report: {}", exc)
             report = CapabilityReport(
                 Capability.AGENT_UNAVAILABLE, "The Plex database node sent a loudness answer this app can't read"
             )
-        # The file checks ran on the node: a refusal of theirs is about the node, not this app.
-        report = node_wording(report)
-        return CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
+        # The file checks ran on the node: a refusal of theirs is about the node, not this app (and names it).
+        return node_wording(
+            CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
+        )
 
     def file_checks(self, *, deadline: float) -> CapabilityReport:
         """The database file's checks, run on the node (found, local disk there, writable, held open by Plex)."""

@@ -2678,10 +2678,7 @@ class TestLockTimeouts:
                 _write_one(pub, [INTRO])
             assert ei.value.state is Capability.UNREACHABLE
             # The task holding the lock isn't waiting for Plex: it is ours that is still busy.
-            assert (
-                str(ei.value)
-                == "Another Intro & Credits task is still using this Plex database; trying again on the next run"
-            )
+            assert str(ei.value) == "Another task is still using this Plex database; trying again on the next run"
             assert time.monotonic() - start < 0.5 + 1.0
             start = time.monotonic()
             assert pub.capability().state is Capability.UNREACHABLE
@@ -3906,7 +3903,7 @@ class TestReadBackMany:
         def busy_after_the_first(self, **kwargs):
             opened.append(1)
             if len(opened) == 2:
-                raise PublishError("Another Intro & Credits task is still using this Plex database",
+                raise PublishError("Another task is still using this Plex database",
                                    state=Capability.UNREACHABLE)  # fmt: skip
             return real_database(self, **kwargs)
 
@@ -3945,7 +3942,7 @@ class TestReadBackMany:
         elif case == "database-busy":
 
             def busy(self, **kwargs):
-                raise PublishError("Another Intro & Credits task is still using this Plex database",
+                raise PublishError("Another task is still using this Plex database",
                                    state=Capability.UNREACHABLE)  # fmt: skip
 
             monkeypatch.setattr(LocalPlexDb, "_database", busy)

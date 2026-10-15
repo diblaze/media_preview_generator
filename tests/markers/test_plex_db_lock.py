@@ -91,7 +91,7 @@ class TestReadersShare:
         with _holding_db_lock(db, _deadline(5)):
             (error,) = _contend(db, 0.2, shared=True)
         assert isinstance(error, DatabaseBusyError)
-        assert "Another Intro & Credits task is still using this Plex database" in str(error)
+        assert "Another task is still using this Plex database" in str(error)
         assert error.state is Capability.UNREACHABLE
 
     def test_a_reader_excludes_an_exclusive_holder(self, tmp_path):
