@@ -7,7 +7,9 @@ import threading
 import time
 import types
 
-from media_preview_generator.nodes.server import info
+from loguru import logger
+
+from media_preview_generator.nodes.server import info, nodelog
 
 
 def _until(check, timeout: float = 10.0) -> None:
@@ -136,6 +138,49 @@ class TestDetection:
         finally:
             release.set()
             recheck.join(5)
+
+    def test_a_background_recheck_logs_at_debug_unless_the_gpus_changed(self, tmp_path):
+        # Every 5 minutes an idle node logged the same 3 lines per GPU (2 warnings per failed one) into its Log tab.
+        found = [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+
+        def detect():
+            logger.info("Checking NVIDIA GPU 0 (GPU 0)...")
+            logger.warning("card1: VAAPI test failed")
+            return list(found)
+
+        node_log = nodelog.install()
+        levels: list[str] = []
+        sink = logger.add(
+            lambda message: levels.append(message.record["level"].name),
+            level=0,
+            filter=lambda r: r["message"] == "card1: VAAPI test failed" and not r["extra"].get(nodelog.HELD_EXTRA),
+        )
+        try:
+            worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+            worker.rescan()  # the first pass, at start
+            worker.rescan(quiet=True)  # a re-check: the same GPUs
+            found.append(("INTEL", "/dev/dri/renderD128", {"name": "UHD 770"}))
+            worker.rescan(quiet=True)  # a re-check that found a GPU more
+        finally:
+            logger.remove(sink)
+
+        assert levels == ["WARNING", "DEBUG", "WARNING"]
+        shown = [line["message"] for line in node_log.lines(100)]
+        assert shown.count("Checking NVIDIA GPU 0 (GPU 0)...") == 2 and shown.count("card1: VAAPI test failed") == 2
+
+    def test_the_loop_rechecks_quietly_after_its_first_pass(self, tmp_path, monkeypatch):
+        passes = []
+        worker = info.WorkerInfo(temp_root=str(tmp_path), recheck_s=3600, detect=list)
+        monkeypatch.setattr(worker, "rescan", lambda quiet=False: passes.append(quiet) or [])
+        worker.start()
+        try:
+            _until(lambda: len(passes) == 1)
+            worker.note_gpu_error()
+            _until(lambda: len(passes) == 2)
+        finally:
+            worker.stop()
+
+        assert passes == [False, True]
 
     def test_info_during_the_first_detection_waits_for_it_instead_of_detecting_again(self, tmp_path):
         # A second detection right after the first doubled the first /v1/info's time and logged every GPU twice.

@@ -52,6 +52,9 @@ PER_FILE_LOG = "per_file_log"
 # Extra key on a line meant for the console (docker logs) only: a node's one-time key notice. The same name as
 # nodes.server.nodelog.SECRET_EXTRA, which isn't imported here: the app's web process never loads the node server.
 CONSOLE_ONLY = "node_secret"
+# Extra key on a line a node holds back to log again at the level it chooses (nodes.server.nodelog.HELD_EXTRA): no
+# app-wide sink keeps it.
+HELD = "node_held"
 _WARNING_NO = 30  # loguru's WARNING severity
 
 _managed_handler_ids: list[int] = []
@@ -244,8 +247,9 @@ def _route_stdlib_logging() -> None:
 
 
 def _app_sink_filter(log_level: str, *, console: bool):
-    """Filter for the app-wide sinks: drop per-file job-log lines below WARNING unless the sinks log DEBUG, and a
-    console-only line (``CONSOLE_ONLY``: a node's one-time key notice) everywhere but the console.
+    """Filter for the app-wide sinks: drop per-file job-log lines below WARNING unless the sinks log DEBUG, a
+    console-only line (``CONSOLE_ONLY``: a node's one-time key notice) everywhere but the console, and a held-back
+    line (``HELD``) everywhere.
 
     Args:
         log_level: The sinks' minimum level name.
@@ -257,6 +261,8 @@ def _app_sink_filter(log_level: str, *, console: bool):
     debug_enabled = log_level.upper() in ("TRACE", "DEBUG")
 
     def keep(record) -> bool:
+        if record["extra"].get(HELD):
+            return False
         if not console and record["extra"].get(CONSOLE_ONLY):
             return False
         if not record["extra"].get(PER_FILE_LOG):

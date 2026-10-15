@@ -26,12 +26,16 @@ SECRET_EXTRA = "node_secret"
 # ``logger.bind(**{TASK_LOGGED_EXTRA: True})``: the line is already in its task's log (``TaskContext.log``), so the
 # thread capture must not add it a second time.
 TASK_LOGGED_EXTRA = "node_task_logged"
+# Set (``logger.contextualize``) on lines :func:`held_lines` holds back: no log keeps them, and the code that held them
+# logs them again at the level it chooses. logging_config.HELD is the same name.
+HELD_EXTRA = "node_held"
 
 LineCallback = Callable[[str, str], None]
 
 
 def _keep(record: dict[str, Any]) -> bool:
-    return record["level"].no >= CAPTURE_MIN_LEVEL and not record["extra"].get(SECRET_EXTRA)
+    extra = record["extra"]
+    return record["level"].no >= CAPTURE_MIN_LEVEL and not extra.get(SECRET_EXTRA) and not extra.get(HELD_EXTRA)
 
 
 class NodeLogBuffer:
@@ -125,6 +129,40 @@ def capture_thread(callback: LineCallback) -> Iterator[None]:
     )
     try:
         yield
+    finally:
+        try:
+            logger.remove(handler_id)
+        except ValueError:
+            pass
+
+
+@contextmanager
+def held_lines(into: list[tuple[str, str]]) -> Iterator[None]:
+    """Hold back every line the calling thread logs while inside: no log gets it, ``into`` does.
+
+    The caller logs them again afterwards, at their own level or a lower one (a periodic GPU re-check that found the
+    same GPUs logs its lines at DEBUG).
+
+    Args:
+        into: Gets ``(level name, message)`` for each line, in order.
+    """
+    thread_id = threading.get_ident()
+
+    def held(record: dict[str, Any]) -> bool:
+        return record["thread"].id == thread_id and bool(record["extra"].get(HELD_EXTRA))
+
+    handler_id = logger.add(
+        lambda message: into.append((message.record["level"].name, message.record["message"])),
+        level=0,
+        format="{message}",
+        filter=held,
+        enqueue=False,
+        diagnose=False,
+        catch=True,
+    )
+    try:
+        with logger.contextualize(**{HELD_EXTRA: True}):
+            yield
     finally:
         try:
             logger.remove(handler_id)

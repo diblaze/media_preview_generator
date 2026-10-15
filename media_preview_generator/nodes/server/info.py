@@ -8,6 +8,7 @@ re-checked in the background every :data:`GPU_RECHECK_S`, at once after a task r
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from typing import Any
 
 from loguru import logger
 
+from . import nodelog
 from .tasks import probe_temp_folder
 
 GPU_RECHECK_S = 300.0
@@ -156,8 +158,10 @@ class WorkerInfo:
         self._wake.set()
 
     def _loop(self) -> None:
+        first = True
         while not self._stop.is_set():
-            self.rescan()
+            self.rescan(quiet=not first)
+            first = False
             self._wake.wait(self._recheck_s)
             self._wake.clear()
 
@@ -165,12 +169,16 @@ class WorkerInfo:
         """A task's GPU failed: re-check the GPUs now rather than at the next interval."""
         self._wake.set()
 
-    def rescan(self) -> list[dict[str, Any]]:
+    def rescan(self, *, quiet: bool = False) -> list[dict[str, Any]]:
         """Run GPU detection now.
 
         A detection that raises keeps the last list it found, its error kept: one failed pass on a busy GPU must not
         read as a lost GPU. With no earlier list the node reports no GPUs and the error, which the app reads as a
         check still to come, not as a missing GPU.
+
+        Args:
+            quiet: A background re-check: detection's lines are logged at DEBUG unless the GPUs (or the error) changed,
+                so an idle node's log isn't the same few lines every few minutes.
 
         Returns:
             The JSON-safe GPU list now reported.
@@ -178,20 +186,26 @@ class WorkerInfo:
         with self._detect_lock:
             detect = self._detect
             error: str | None = None
+            held: list[tuple[str, str]] = []
             try:
                 if detect is None:
                     from ...gpu import detect as gpu_detect
 
                     detect = gpu_detect.detect_all_gpus
-                found = [_gpu_entry(raw) for raw in detect() or []]
+                with nodelog.held_lines(held) if quiet else contextlib.nullcontext():
+                    raw = detect()
+                found = [_gpu_entry(entry) for entry in raw or []]
             except Exception as exc:  # noqa: BLE001 - a broken probe must not take /v1/info down with it
                 logger.opt(exception=True).warning("GPU detection failed on this node; it keeps its last GPU list")
                 with self._cache_lock:
                     found = list(self._gpus) if self._gpus is not None else []
                 error = f"{type(exc).__name__}: {exc}"
             with self._cache_lock:
+                changed = (found, error) != (self._gpus, self._gpu_error)
                 self._gpus, self._checked_at, self._gpu_error = found, time.time(), error
             self._detected.set()
+            for level, message in held:
+                logger.log(level if changed else "DEBUG", "{}", message)
             return [dict(entry) for entry in found]
 
     def gpus(self) -> list[dict[str, Any]]:

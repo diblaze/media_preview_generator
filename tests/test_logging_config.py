@@ -321,6 +321,21 @@ class TestStdlibLogging:
 
         assert _logging_mod.CONSOLE_ONLY == nodelog.SECRET_EXTRA
 
+    def test_a_held_back_line_reaches_no_app_sink(self, start):
+        # A node's GPU re-check holds its lines and logs them again itself (at DEBUG when nothing changed).
+        from loguru import logger
+
+        from media_preview_generator.nodes.server import nodelog
+
+        read = start("DEBUG")
+        with logger.contextualize(**{nodelog.HELD_EXTRA: True}):
+            logger.warning("Checking NVIDIA GPU 0, held back")
+        logger.warning("an ordinary line")
+
+        for text in read():
+            assert "held back" not in text and "an ordinary line" in text
+        assert _logging_mod.HELD == nodelog.HELD_EXTRA
+
     def test_a_per_file_job_log_line_is_written_when_the_app_logs_at_debug(self, start):
         from media_preview_generator.markers.job_log import write_line
 
