@@ -1231,6 +1231,12 @@ class NodeRegistry:
                     self._new_uid(node_id, live, record, outcome)
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
+                if outcome.info is not None:
+                    # It answered (ready or not: a full temp folder needs them most): the DELETEs lost while it was
+                    # away reach it now, rather than its finished tasks keeping their temp dirs for 10 minutes.
+                    from .executor import send_pending_deletes
+
+                    send_pending_deletes(node_id, client)
         except Exception:
             logger.exception("Health check of node {} failed unexpectedly", record.get("name") or node_id)
         finally:

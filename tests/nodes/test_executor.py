@@ -61,6 +61,7 @@ def _fast_polls(monkeypatch):
     monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.0)
     # Polls take no time here, so the node counts as gone on the failed-poll count alone.
     monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.0)
+    monkeypatch.setattr(executor, "_pending_deletes", {})
     yield
     set_registry(None)
 
@@ -797,6 +798,40 @@ class TestFreeingTheTask:
         assert _wait_until(lambda: len(client.named("delete")) == 3)
         time.sleep(0.1)
         assert len(client.named("delete")) == 3 and client.deleted == []
+
+    @pytest.mark.parametrize("node_gone", [False, True], ids=["after-a-finished-task", "after-the-node-went-away"])
+    def test_a_delete_nothing_answers_is_sent_again_once_the_node_answers_a_check(self, media, monkeypatch, node_gone):
+        """An outage longer than the retries (~5 s) left the node a finished task's temp dir (a preview's frames and
+        their tar) for 10 minutes."""
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.0, 0.0))
+        script = [running(), unreachable()] if node_gone else self.DONE
+        lost = NodeTimeoutError("http://n didn't answer in time")
+        client = _DeleteAnswers(script, [lost, lost, lost, lost])
+        _install(client)
+
+        if node_gone:
+            with pytest.raises(NodeUnavailableError):
+                _run(media)
+        else:
+            _run(media)
+
+        assert _wait_until(lambda: executor._pending_deletes == {NODE_ID: {"t1": None}})
+        assert client.deleted == []
+        executor.send_pending_deletes("another-node", client)
+        executor.send_pending_deletes(NODE_ID, client)  # it answers a check, but the DELETE is lost again
+        assert _wait_until(lambda: len(client.named("delete")) == 4 and executor._pending_deletes)
+        assert executor._pending_deletes == {NODE_ID: {"t1": None}}
+        executor.send_pending_deletes(NODE_ID, client)
+        assert _wait_until(lambda: client.deleted == ["t1"])
+        assert executor._pending_deletes == {} and client.timeouts == [executor.GONE_DELETE_TIMEOUT_S] * 5
+
+    def test_a_node_away_for_long_keeps_only_its_latest_lost_deletes(self, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_PENDING_DELETES", 2)
+        for task_id in ("t1", "t2", "t3"):
+            executor._keep_pending(NODE_ID, task_id)
+        executor._keep_pending("node-b", "t9")
+
+        assert executor._pending_deletes == {NODE_ID: {"t2": None, "t3": None}, "node-b": {"t9": None}}
 
     @pytest.mark.parametrize(
         "answer",

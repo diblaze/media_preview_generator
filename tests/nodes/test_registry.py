@@ -519,6 +519,27 @@ class TestStates:
         assert (view.state, view.cause) == (reg.STATE_OFFLINE, cause_after)
         assert "restarting" not in view.reason
 
+    @pytest.mark.parametrize(
+        ("answer", "sent"),
+        [
+            (_info, True),
+            (lambda: dict(_info(), worker={**_info()["worker"], "temp": {"path": "/t", "problem": "is full"}}), True),
+            (lambda: NodeUnreachableError("http://nuc:9494 refused", reason=UNREACHABLE_REFUSED), False),
+            (lambda: NodeAuthError("http://nuc:9494 refused the key"), False),
+        ],
+        ids=["ready", "temp-folder-full", "unreachable", "key-refused"],
+    )
+    def test_a_check_the_node_answers_sends_the_deletes_lost_while_it_was_away(self, h, monkeypatch, answer, sent):
+        from media_preview_generator.nodes import executor
+
+        calls = []
+        monkeypatch.setattr(executor, "send_pending_deletes", lambda node_id, client: calls.append((node_id, client)))
+        h.client().default_info = answer()
+
+        h.registry.check_now("n1")
+
+        assert calls == ([("n1", h.client())] if sent else [])
+
     def test_a_node_that_never_comes_back_from_a_restart_goes_back_to_the_offline_back_off(self, h):
         client = h.client()
         stopping = _info()
