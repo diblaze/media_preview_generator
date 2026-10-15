@@ -329,6 +329,32 @@ class TestSettingsManagerNodes:
         other, _ = ns.validate_node(_post(name="other", url="http://other.lan:9494"), existing=None, others=sm.nodes)
         assert sm.update_nodes([*sm.nodes, other]) == 5
 
+    @pytest.mark.parametrize("hand_written", ["false", "true", "off", 0, None])
+    def test_a_hand_written_switch_that_isnt_true_or_false_turns_the_node_off(self, tmp_path, hand_written):
+        """Read as it was, "false" in quotes counted as on: a node meant to be off was checked and sent work."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"nodes": [{**first, "enabled": hand_written}], "nodes_revision": 3})
+        )
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes[0]["enabled"] is False and sm.nodes_revision == 4
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["enabled"] is False
+        sm.update_nodes([{**sm.nodes[0], "enabled": True}])  # the record is valid again: it can be switched on
+
+    def test_a_switch_that_is_true_or_false_is_left_alone(self, tmp_path):
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [first], "nodes_revision": 3}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes == [first] and sm.nodes_revision == 3
+
     def test_a_bad_record_written_by_hand_holds_up_only_a_change_to_itself(self, tmp_path):
         import json
 
