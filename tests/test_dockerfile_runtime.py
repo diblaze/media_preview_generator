@@ -155,3 +155,15 @@ def test_the_plex_database_image_names_the_only_role_it_carries():
     env = " ".join(line for line in _instructions(PLEX_DB) if line.startswith("ENV "))
     assert re.search(r"\bNODE_IMAGE_ROLES=plex_db\b", env), env
     assert "NODE_IMAGE_ROLES" not in " ".join(_instructions(MAIN))
+
+
+def test_gunicorn_lets_its_worker_go_before_s6_kills_the_container():
+    """s6 kills what is left S6_KILL_GRACETIME after a stop's SIGTERM (3 s unless set), and gunicorn's worker waits all
+    of its --graceful-timeout for a browser tab's websocket: past the grace, gunicorn's own stop never finishes."""
+    env = " ".join(line for line in _instructions(MAIN) if line.startswith("ENV "))
+    found = re.search(r"\bS6_KILL_GRACETIME=(\d+)\b", env)
+    grace_s = int(found.group(1)) / 1000 if found else 3.0
+    graceful = re.search(r"--graceful-timeout (\d+)", (ROOT / "wrapper.sh").read_text())
+    assert graceful is not None
+
+    assert int(graceful.group(1)) + 1 <= grace_s

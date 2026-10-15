@@ -55,8 +55,9 @@ REAP_INTERVAL_S = 5.0
 DELETED_ID_KEEP_S = 300.0
 DELETED_IDS_MAX = 1024
 # How long a stopping node keeps answering, at most, until the app has asked after each task it cancelled: told it
-# was a restart, the app sends the file back without counting a drop. The app polls every second, and Docker's stop
-# timeout is 10 s (the server's SHUTDOWN_WAIT_S for the ops comes first).
+# was a restart, the app sends the file back without counting a drop. The app polls every second. In the image s6
+# kills the node 3 s after a stop's SIGTERM (S6_KILL_GRACETIME), cutting this and the server's SHUTDOWN_WAIT_S short
+# when a task is slow to stop; a longer grace would slow every stop by as much, as s6 waits all of it.
 STOP_TELL_WAIT_S = 3.0
 _STOP_TELL_POLL_S = 0.05
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})

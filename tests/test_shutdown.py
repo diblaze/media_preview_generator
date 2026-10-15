@@ -1,10 +1,13 @@
 """A stop kills FFmpeg along with the app: previews interrupted by it stay RUNNING for startup revival."""
 
 import json
+import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -183,6 +186,22 @@ class TestPreviewJobRunnerWhileShuttingDown:
 
 
 class TestShutdownHooks:
+    @pytest.fixture(autouse=True)
+    def _own_stop_steps(self, monkeypatch):
+        """Each test gets its own stop steps and waker: a SIGTERM raised here never runs the steps other tests' apps
+        registered in this process."""
+        monkeypatch.setattr(shutdown, "_callbacks", [])
+        monkeypatch.setattr(shutdown, "_callbacks_ran", False)
+        monkeypatch.setattr(shutdown, "_wake_fd", None)
+        monkeypatch.setattr(shutdown, "_exit_hook_registered", True)
+        before = set(threading.enumerate())
+        yield
+        if shutdown._wake_fd is not None:
+            os.close(shutdown._wake_fd)  # its thread reads the end of the pipe and stops
+        for thread in set(threading.enumerate()) - before:
+            if thread.name == "shutdown-hooks":
+                thread.join(5)
+
     def test_sigterm_sets_the_flag_then_runs_the_previous_handler(self):
         calls = []
         saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -224,3 +243,58 @@ class TestShutdownHooks:
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=30)
 
         assert result.returncode == -signal.SIGTERM
+
+    def test_sigterm_runs_the_stop_steps_at_once_in_order_on_their_own_thread_and_only_once(self):
+        ran: list[tuple[str, bool]] = []
+        done = threading.Event()
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)  # gunicorn's: its worker only stops taking requests
+        try:
+            with patch("media_preview_generator.shutdown.atexit.register"):
+                shutdown.install_shutdown_hooks()
+            shutdown.on_shutdown(
+                lambda: ran.append(("scheduler", threading.current_thread() is threading.main_thread()))
+            )
+            shutdown.on_shutdown(lambda: 1 / 0)  # a step that fails stops none of the next
+            shutdown.on_shutdown(
+                lambda: ran.append(("node tasks", threading.current_thread() is threading.main_thread()))
+            )
+            shutdown.on_shutdown(done.set)
+
+            signal.raise_signal(signal.SIGTERM)
+
+            assert done.wait(5)
+            shutdown.run_shutdown_callbacks()  # the exit hook, once the process exits
+            assert ran == [("scheduler", False), ("node tasks", False)]
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
+    def test_the_stop_steps_run_while_the_process_waits_to_exit(self, tmp_path):
+        """gunicorn's worker waits for a browser tab's websocket before it exits, and s6 kills it a few seconds after
+        its SIGTERM: exit hooks never run, so the steps run from the signal."""
+        marker = tmp_path / "stopped"
+        code = (
+            "import signal, time\n"
+            "from media_preview_generator import shutdown\n"
+            "signal.signal(signal.SIGTERM, lambda signum, frame: None)\n"
+            "shutdown.install_shutdown_hooks()\n"
+            f"shutdown.on_shutdown(lambda: open({str(marker)!r}, 'w').close())\n"
+            "print('ready', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(0.05)\n"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, cwd=Path(__file__).resolve().parents[1]
+        )
+        try:
+            assert child.stdout.readline() == "ready\n"
+            child.send_signal(signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert marker.exists()
+            assert child.poll() is None  # still waiting to exit, as gunicorn's worker does
+        finally:
+            child.kill()
+            child.wait(10)

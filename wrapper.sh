@@ -57,13 +57,16 @@ if [ "${DEV_RELOAD:-false}" = "true" ]; then
 else
     echo "Starting gunicorn web server on port ${WEB_PORT:-8080}..."
 fi
+# A browser tab's websocket holds the worker for all of --graceful-timeout on a stop, so it ends inside the 3 s s6
+# gives the container's processes after a stop's SIGTERM (S6_KILL_GRACETIME). The app's own stop steps run from the
+# SIGTERM meanwhile (shutdown.on_shutdown).
 run_as_user gunicorn \
     --bind "0.0.0.0:${WEB_PORT:-8080}" \
     --worker-class gthread \
     --threads 8 \
     --workers 1 \
     --timeout 300 \
-    --graceful-timeout 30 \
+    --graceful-timeout 2 \
     --keep-alive 65 \
     --error-logfile - \
     --log-level info \

@@ -59,7 +59,8 @@ MAX_REQUEST_BODY_BYTES = 512 * 1024
 # 512 KB: 4 MB bodies from a thousand connections held 4 GB of the node's temp disk for REQUEST_READ_S). Twice the
 # body limit, as a chunked body is cut off up to one read past it: no body is ever written out.
 INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
-# How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop: inside Docker's 10 s stop timeout.
+# How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop, inside Docker's 10 s stop timeout;
+# in the image s6 kills the node sooner, 3 s after the SIGTERM (see tasks.STOP_TELL_WAIT_S).
 SHUTDOWN_WAIT_S = 5.0
 STOP_POLL_S = 0.2
 
