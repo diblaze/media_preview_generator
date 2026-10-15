@@ -195,6 +195,11 @@ def gpu_settings_hint() -> str:
     return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU Configuration"
 
 
+def cpu_workers_hint() -> str:
+    """Where the CPU worker count is set: the app's worker groups, for a node's CPU too."""
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Workers"
+
+
 def gpu_details_hint() -> str:
     """Where each GPU's test result is shown."""
     if is_node_mode():

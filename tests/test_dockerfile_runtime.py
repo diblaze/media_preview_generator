@@ -55,6 +55,9 @@ def _url(dockerfile: Path, **env: str) -> str:
         # wrapper.sh reads an empty NODE_PORT as the default (${NODE_PORT:-9494}); the check must look there too.
         ({"MODE": "node", "NODE_PORT": ""}, "http://localhost:9494/v1/health"),
         ({"MODE": "node", "NODE_PORT": "9500"}, "http://localhost:9500/v1/health"),
+        # The node strips its port: an env file saved with CRLF, or spaces, still serve there (nodes/server/wsgi.py).
+        ({"MODE": "node", "NODE_PORT": "9500\r"}, "http://localhost:9500/v1/health"),
+        ({"MODE": "node", "NODE_PORT": " 9500 "}, "http://localhost:9500/v1/health"),
         ({}, "http://localhost:8080/api/health"),
         ({"WEB_PORT": ""}, "http://localhost:8080/api/health"),
         ({"WEB_PORT": "8181"}, "http://localhost:8181/api/health"),
@@ -70,6 +73,8 @@ def test_the_main_images_healthcheck_asks_the_port_the_server_listens_on(env, ur
         ({}, "http://127.0.0.1:9494/v1/health"),
         ({"NODE_PORT": ""}, "http://127.0.0.1:9494/v1/health"),
         ({"AGENT_PORT": "9600"}, "http://127.0.0.1:9600/v1/health"),
+        ({"NODE_PORT": "9500\r"}, "http://127.0.0.1:9500/v1/health"),
+        ({"AGENT_PORT": "9600\r"}, "http://127.0.0.1:9600/v1/health"),
     ],
 )
 def test_the_plex_database_images_healthcheck_asks_the_port_the_node_listens_on(env, url):

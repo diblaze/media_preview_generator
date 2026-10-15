@@ -230,8 +230,9 @@ retry runs (on the **node's** CPU, see §6).
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
 * `temp_problem`: a worker node whose `/v1/info` reports `worker.temp.problem` (it can't make a task folder in its
-  temp folder: full, read-only, no permission); it gets no work. A start the node refuses for that reason (400
-  `failed`) gives the file back as never started, and the node is checked at once.
+  temp folder: full, read-only, no permission; or a task filled it up, reported until the folder has more than 1 MB
+  more free than that task started with, or a task started after it finishes); it gets no work. A start the node
+  refuses for that reason (400 `failed`) gives the file back as never started, and the node is checked at once.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.

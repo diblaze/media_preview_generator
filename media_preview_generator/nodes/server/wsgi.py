@@ -206,11 +206,29 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Media Preview Generator node")
     parser.add_argument("--host", default=os.environ.get("NODE_HOST", "").strip() or DEFAULT_HOST)
-    # AGENT_PORT: the Plex marker agent's name for it, still read when NODE_PORT isn't set.
+    # AGENT_PORT: the Plex marker agent's name for it, still read when NODE_PORT isn't set. Checked in _serve, once
+    # logging is up: a bad NODE_PORT is one logged line, not argparse's usage or a traceback.
     port = os.environ.get("NODE_PORT", "").strip() or os.environ.get("AGENT_PORT", "").strip() or str(DEFAULT_PORT)
-    parser.add_argument("--port", type=int, default=port)
+    parser.add_argument("--port", default=port)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="requests served at once")
     return parser.parse_args(argv)
+
+
+def _port(value: str) -> int | None:
+    """``value`` as a port to listen on, or None when it isn't one.
+
+    Args:
+        value: NODE_PORT or ``--port``; spaces and a Windows line ending (an env file saved with CRLF) around it are
+            ignored.
+
+    Returns:
+        The port (1-65535), or None.
+    """
+    text = value.strip()
+    if not (text.isascii() and text.isdigit()):
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,6 +275,11 @@ def _serve(argv: list[str] | None) -> int:
                 name,
             )
     args = _parse(argv)
+    port = _port(args.port)
+    if port is None:
+        logger.error("The node didn't start: NODE_PORT is {!r}, which isn't a port number from 1 to 65535", args.port)
+        return 1
+    args.port = port
     try:
         app = create_node_app()
     except SystemExit as exc:

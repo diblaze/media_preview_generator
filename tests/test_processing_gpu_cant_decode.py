@@ -276,3 +276,64 @@ class TestTheHandOff:
         assert procs, "the CPU run happened"
         for proc in procs:
             proc.terminate.assert_not_called()
+
+
+# A real NVIDIA GPU (Quadro P5000) on an H.264 High 10 file: NVDEC has no decoder for that profile, the driver is fine.
+# FFmpeg ends the run itself (exit 218); a High 4:4:4 file prints the same lines.
+H264_HI10P_ON_NVDEC = [
+    "Stream #0:0: Video: h264 (High 10), yuv420p10le(progressive), 1920x1080, 23.98 fps",
+    "[h264 @ 0x5dbb72cb3c40] Hardware is lacking required capabilities",
+    "[h264 @ 0x5dbb72cb3c40] Failed setup for format cuda: hwaccel initialisation returned error.",
+    "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' and the "
+    "filter 'auto_scale_0'",
+    "[vf#0:0 @ 0x5dbb72ce1040] Error reinitializing filters!",
+    "[vost#0:0/mjpeg @ 0x5dbb72ce8880] Task finished with error code: -22 (Invalid argument)",
+    "[out#0/image2 @ 0x5dbb72cb1380] Nothing was written into output file, because at least one of its streams "
+    "received no packets.",
+    "Conversion failed!",
+]
+NVDEC_PROFILE_EXIT = 218
+
+
+class TestAProfileTheGpuLacks:
+    """NVDEC's "Hardware is lacking required capabilities" is a codec the GPU can't decode, not a driver error.
+
+    Read as a driver error, a node answered every such file as its GPU failing (a GPU re-check per file) and the log
+    said to check the GPU driver.
+    """
+
+    def test_is_handed_to_the_cpu_as_a_codec_the_gpu_cant_decode(self, run):  # noqa: F811
+        outcome = run([(NVDEC_PROFILE_EXIT, 0, *H264_HI10P_ON_NVDEC)], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert not _warned(outcome, "GPU driver"), outcome.warnings
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            pytest.param(HEVC_HWACCEL_INIT_ONLY, id="init-failed-without-the-verdict"),
+            pytest.param(
+                [
+                    "[h264 @ 0x1] cuvidCreateDecoder(&ctx->decoder, params) failed -> CUDA_ERROR_OUT_OF_MEMORY: "
+                    "out of memory",
+                    "[h264 @ 0x1] Failed setup for format cuda: hwaccel initialisation returned error.",
+                    "[vf#0:0 @ 0x2] Error reinitializing filters!",
+                    "Conversion failed!",
+                ],
+                id="cuda-out-of-memory",
+            ),
+        ],
+    )
+    def test_a_driver_failure_stays_a_hardware_accelerator_error(self, run, stderr):  # noqa: F811
+        outcome = run([(NVDEC_PROFILE_EXIT, 0, *stderr)], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+
+    def test_av1_the_gpu_cant_decode_stays_a_codec(self, run):  # noqa: F811
+        # The AV1 block carries the same capabilities line ahead of its own verdict; a full walk ends in exit 69.
+        outcome = run([(LEFT_ALONE_EXIT, 0, *INPUT_DUMP, *_av1_block("cuda"))], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"

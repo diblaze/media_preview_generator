@@ -89,6 +89,9 @@ class NodeStoppingError(Exception):
 # is opened read-only), so one of these from an op is the temp folder's.
 _TEMP_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
 _TEMP_WRITE_ERRNOS = _TEMP_FULL_ERRNOS | {errno.EROFS}
+# After a task filled the temp folder, free space that comes back by less than this isn't room made: a new folder's
+# block, or other files on a shared disk, come and go by that much.
+TEMP_ROOM_MADE_BYTES = 1 << 20
 
 
 def default_temp_root() -> str:
@@ -110,6 +113,13 @@ def temp_folder_problem(temp_root: str, exc: OSError) -> str:
     if exc.errno in _TEMP_FULL_ERRNOS:
         return f"The node's temp folder {temp_root} is full ({why})"
     return f"The node can't write to its temp folder {temp_root} ({why})"
+
+
+def _free_bytes(path: str) -> int | None:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
 
 
 def probe_temp_folder(temp_root: str) -> str | None:
@@ -221,6 +231,8 @@ class NodeTask:
         self.mappings = mappings
         self.gpu = gpu
         self.temp_dir = temp_dir
+        # The temp folder's free space before this task's folder was made: what turned out too little if it fills up.
+        self.temp_free_at_start: int | None = None
         self.status = STATUS_RUNNING
         self.result: dict | None = None
         self.error: dict | None = None
@@ -353,6 +365,9 @@ class TaskTable:
         self._finished_keep_s = finished_keep_s
         self._on_gpu_failed = on_gpu_failed
         self._tasks: dict[str, NodeTask] = {}
+        # When a task last filled the temp folder, and the free space that task started with. The folder reads full until
+        # it has more room than that, or a task started after it finishes; the app sends no files meanwhile.
+        self._filled: tuple[float, int | None] | None = None
         # Task id -> when a DELETE found no such task (oldest first), so a start arriving after it never runs.
         self._deleted_unknown: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
@@ -418,8 +433,9 @@ class TaskTable:
             self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
-        temp_dir = self._make_temp_dir(task_id)
+        temp_dir, free_at_start = self._make_temp_dir(task_id)
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
+        task.temp_free_at_start = free_at_start
         with self._lock:
             try:
                 # Checked again under the lock close() takes to collect the tasks: a task registered here is either
@@ -439,8 +455,11 @@ class TaskTable:
             task.thread.start()
         return task_id
 
-    def _make_temp_dir(self, task_id: str) -> str:
+    def _make_temp_dir(self, task_id: str) -> tuple[str, int | None]:
         """The task's own temp dir, the temp root made again first (a host's tmp cleaner may have removed it).
+
+        Returns:
+            The dir, and the temp folder's free space just before it was made (None when that can't be read).
 
         Raises:
             TaskStartError: The folder can't be made (a full disk, no permission), or the node has no temp folder.
@@ -449,26 +468,51 @@ class TaskTable:
             raise TaskStartError("This node has no temp folder: it runs no tasks")
         try:
             os.makedirs(self.temp_root, exist_ok=True)
-            return tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
+            free = _free_bytes(self.temp_root)
+            return tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root), free
         except OSError as exc:
             message = temp_folder_problem(self.temp_root, exc)
             logger.warning("Task {} not started: {}", task_id[:8], message)
             raise TaskStartError(message) from exc
 
-    def _temp_folder_failure(self, exc: BaseException) -> str | None:
-        """The message for an op that stopped because the temp folder filled up or went read-only, else None."""
+    def _temp_folder_failure(self, exc: BaseException) -> tuple[str, bool] | None:
+        """Why an op stopped, when the temp folder filled up or went read-only, and whether it filled up; else None."""
         seen: BaseException | None = exc
         while seen is not None and self.temp_root is not None:
             if isinstance(seen, OSError) and seen.errno in _TEMP_WRITE_ERRNOS:
                 written = seen.filename if isinstance(seen.filename, str) else None
                 if written is None or _inside(written, self.temp_root):
                     message = temp_folder_problem(self.temp_root, seen)
-                    if seen.errno in _TEMP_FULL_ERRNOS:
+                    filled = seen.errno in _TEMP_FULL_ERRNOS
+                    if filled:
                         # The preview op holds its JPEGs and their tar there at once.
                         message += "; a preview needs about twice its frames' size there"
-                    return message
+                    return message, filled
             seen = seen.__cause__
         return None
+
+    def filled_problem(self) -> str | None:
+        """The temp folder's problem after a task filled it up, while it lasts; None when no task did.
+
+        Once the task's folder is removed the folder has room again, and a fresh check of it finds nothing wrong, so
+        without this the app would send the next big file straight back to fill it.
+
+        Returns:
+            A sentence naming the folder and the free space that turned out too little, or None.
+        """
+        with self._lock:
+            filled = self._filled
+        if filled is None or self.temp_root is None:
+            return None
+        _started, free_then = filled
+        free_now = _free_bytes(self.temp_root)
+        if free_then is not None and free_now is not None and free_now > free_then + TEMP_ROOM_MADE_BYTES:
+            with self._lock:
+                if self._filled == filled:
+                    self._filled = None
+            return None
+        room = f" ({free_then / (1 << 20):,.0f} MB free)" if free_then is not None else ""
+        return f"The node's temp folder {self.temp_root} filled up while working on a file{room}"
 
     def _run(self, task: NodeTask) -> None:
         try:
@@ -515,8 +559,12 @@ class TaskTable:
             if task.cancel_check() or _is_cancellation(exc):
                 task.finish(STATUS_CANCELLED, error={"kind": KIND_CANCELLED, "message": "Cancelled"})
                 return
-            temp_problem = self._temp_folder_failure(exc)
-            if temp_problem is not None:
+            temp_failure = self._temp_folder_failure(exc)
+            if temp_failure is not None:
+                temp_problem, filled = temp_failure
+                if filled:
+                    with self._lock:
+                        self._filled = (time.monotonic(), task.temp_free_at_start)
                 # The node's condition, not a bug: no traceback.
                 quiet.warning("Task {} ({}) failed: {}", task.id[:8], task.op, temp_problem)
                 task.finish(STATUS_FAILED, error={"kind": KIND_TEMP_FOLDER, "message": temp_problem})
@@ -536,6 +584,10 @@ class TaskTable:
             task.finish(STATUS_FAILED, error={"kind": KIND_FAILED, "message": f"{type(exc).__name__}: {exc}"})
             return
         quiet.info("Task {} ({}) done", task.id[:8], task.op)
+        with self._lock:
+            # A task started after the folder filled up fitted there: it has room for files again.
+            if self._filled is not None and task.started > self._filled[0]:
+                self._filled = None
         task.finish(STATUS_DONE, result=result)
 
     def _touch(self, task_id: str) -> NodeTask | None:

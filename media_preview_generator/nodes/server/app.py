@@ -327,7 +327,7 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
             "stopping": table.stopping,
         }
         if state.worker_info is not None:
-            body["worker"] = state.worker_info.block(busy=table.busy())
+            body["worker"] = state.worker_info.block(busy=table.busy(), filled=table.filled_problem())
         info_block = getattr(state.plex_db_module, "info_block", None)
         if callable(info_block):
             body["plex_db"] = info_block()

@@ -597,6 +597,17 @@ class TestRunDecode:
         "frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:08.64    \n"
         "Conversion failed!\n"
     )
+    # A real NVIDIA GPU (Quadro P5000) on an H.264 High 10 file: NVDEC has no decoder for the profile, the driver is
+    # fine. A High 4:4:4 file prints the same lines.
+    H264_HI10P_ON_NVDEC = (
+        "  Stream #0:0: Video: h264 (High 10), yuv420p10le(progressive), 1920x1080, 23.98 fps\n"
+        "[h264 @ 0x5dbb72cb3c40] Hardware is lacking required capabilities\n"
+        "[h264 @ 0x5dbb72cb3c40] Failed setup for format cuda: hwaccel initialisation returned error.\n"
+        "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' and the "
+        "filter 'auto_scale_0'\n"
+        "[vf#0:0 @ 0x5dbb72ce1040] Error reinitializing filters!\n"
+        "Conversion failed!\n"
+    )
 
     @pytest.mark.parametrize(
         ("exit_code", "stderr", "message", "kind"),
@@ -616,6 +627,15 @@ class TestRunDecode:
                 "the GPU's decoder hit a hardware or driver error (ffmpeg exited 251)",
                 "hwaccel",
             ),
+            (218, H264_HI10P_ON_NVDEC, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
+            (
+                218,
+                "[h264 @ 0x1] Failed to create decode context: 2 (resource allocation failed).\n"
+                "[h264 @ 0x1] Failed setup for format cuda: hwaccel initialisation returned error.\n"
+                "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n",
+                "the GPU's decoder hit a hardware or driver error (ffmpeg exited 218)",
+                "hwaccel",
+            ),
             (
                 251,
                 "[matroska,webm @ 0x1] Read error at pos. 5234901 (0x4fe0d5)\n"
@@ -631,7 +651,15 @@ class TestRunDecode:
                 None,
             ),
         ],
-        ids=["codec-av1", "codec-unnamed", "hwaccel", "io-error", "anything-else"],
+        ids=[
+            "codec-av1",
+            "codec-unnamed",
+            "hwaccel",
+            "codec-h264-profile-the-gpu-lacks",
+            "hwaccel-init-failed-without-that-verdict",
+            "io-error",
+            "anything-else",
+        ],
     )
     def test_a_gpu_failure_names_the_cause_previews_gives_it(self, exit_code, stderr, message, kind):
         # The worker's CPU rerun shows this as its reason: the last 300 characters of stderr said "inating thread with

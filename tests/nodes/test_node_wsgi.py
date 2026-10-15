@@ -93,6 +93,73 @@ def test_a_worker_node_whose_temp_folder_cant_be_made_exits_once_without_a_trace
     assert output.count("The node didn't start: NODE_TEMP_DIR") == 1, output
 
 
+@pytest.fixture
+def node_env(tmp_path, monkeypatch):
+    from loguru import logger
+
+    from media_preview_generator.nodes.server import wsgi
+
+    for name in ("NODE_PORT", "NODE_HOST", "LOG_LEVEL", "AGENT_TOKEN", "NODE_ROLES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MODE", "node")  # main() setdefaults it; set here, it is undone after the test
+    monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "tmp"))
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("NODE_KEY", KEY)
+    monkeypatch.setattr(wsgi, "_setup_logging", lambda: None)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(f"{m.record['level'].name} {m.record['message']}"), level="INFO")
+    yield wsgi, lines
+    logger.remove(sink)
+
+
+@pytest.mark.parametrize("port", ["abc", "9494x", "-1", "0", "65536", "9494 9495", "\u0663"])
+def test_a_node_port_that_isnt_a_port_is_one_line_and_exit_1(node_env, monkeypatch, port):
+    wsgi, lines = node_env
+    monkeypatch.setenv("NODE_PORT", port)
+
+    assert wsgi.main([]) == 1
+
+    assert lines == [f"ERROR The node didn't start: NODE_PORT is {port!r}, which isn't a port number from 1 to 65535"]
+
+
+def test_a_bad_port_on_the_command_line_is_one_line_and_exit_1(node_env):
+    wsgi, lines = node_env
+
+    assert wsgi.main(["--port", "abc"]) == 1
+
+    assert [line for line in lines if "NODE_PORT is 'abc'" in line] == lines and len(lines) == 1, lines
+
+
+@pytest.mark.parametrize("value", ["9500", " 9500 ", "9500\r", "9500\r\n", "1", "65535"])
+def test_a_port_with_spaces_or_a_windows_line_ending_around_it_is_that_port(value):
+    from media_preview_generator.nodes.server import wsgi
+
+    assert wsgi._port(value) == int(value)
+
+
+def test_a_crlf_node_port_serves_on_that_port(tmp_path):
+    # An env file saved on Windows: wrapper.sh hands the value on as it is (--port "${NODE_PORT:-9494}").
+    port = _free_port()
+    command = [*_command(port)[:-4], "--port", f"{port}\r", "--threads", "4"]
+    proc = subprocess.Popen(command, cwd=REPO, env=_env(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)  # fmt: skip
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                assert _health(port, 1) == 200
+                break
+            except OSError:
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    proc.kill()
+                    pytest.fail(f"the node never answered: {proc.communicate()[0]}")
+                time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
 def test_half_sent_requests_dont_stop_health_answering(node):
     proc, port = node
     held = []
@@ -190,9 +257,9 @@ def test_a_node_listens_on_agent_port_when_node_port_isnt_set(monkeypatch):
 
     monkeypatch.setenv("NODE_PORT", "")
     monkeypatch.setenv("AGENT_PORT", "9601")
-    assert wsgi._parse([]).port == 9601
+    assert wsgi._port(wsgi._parse([]).port) == 9601
     monkeypatch.setenv("NODE_PORT", "9602")
-    assert wsgi._parse([]).port == 9602
+    assert wsgi._port(wsgi._parse([]).port) == 9602
 
 
 def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it():
