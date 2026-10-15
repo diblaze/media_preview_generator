@@ -46,7 +46,8 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     `settings.json.pre-v<N>.<timestamp>.bak` when the settings changed in between.
   - A worker node that answers with the saved key at the saved address is that node even when it reports a new
     id (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
-    node's new id is taken silently only when its `plex_db.machine_identifier` matches every server that uses it;
+    node's new id is taken silently only when its `plex_db.machine_identifier` matches every server that uses it
+    (and again at the node's first Plex database request after, since no switched-on server may have used it then);
     otherwise its Plex database work is refused ("Type the node's key again on its Settings tab to confirm") until
     the key is typed again, which clears the saved id. A Plex database node beside the wrong Plex is caught by the
     Plex machine identifier check.

@@ -1334,6 +1334,99 @@ class TestNewPlexDatabaseNodeId:
         assert h.registry.plex_db_refusal("n1") == ""
         h.registry.stop()
 
+    UNCONFIRMED = reg.PlexDbHold(
+        "nuc reports a new id and this app can't confirm it is the same Plex. Type the node's key again on its "
+        "Settings tab to confirm."
+    )
+
+    def _new_id_with_every_server_off(self, machine_identifier):
+        """The node reports a new id while no switched-on server uses it: nothing to compare with, so it is taken."""
+        h = self._harness([])
+        self._answer(h, "uid-2", machine_identifier)
+        assert h.uids == [("n1", "uid-2")]
+        h.change(node_uid="uid-2")  # as ``_default_record_uid`` saves it
+        assert h.registry.plex_db_hold("n1") is None  # still nothing to protect while every server is off
+        return h
+
+    @pytest.mark.parametrize(
+        ("served", "machine_identifier", "held"),
+        [
+            (["plex-a"], "plex-a", False),
+            (["plex-a"], "", True),
+            ([""], "plex-a", True),
+            (["plex-a", "plex-b"], "plex-a", True),
+        ],
+        ids=["same-plex", "node-doesnt-say", "server-doesnt-say", "two-plexes"],
+    )
+    def test_a_new_id_taken_with_every_server_off_is_tied_to_their_plex_once_one_is_on(
+        self, served, machine_identifier, held
+    ):
+        # Taken with every server using the node switched off, the id was never compared with their Plex, and
+        # nothing compared it once one was switched back on: a different machine given the node's key and address,
+        # beside a Plex with an empty identifier, got that server's Plex database work.
+        h = self._new_id_with_every_server_off(machine_identifier)
+        h.registry._served_plex_ids = lambda node_id: list(served)  # a server using the node is switched on
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold == (self.UNCONFIRMED if held else None)
+        assert h.registry.view("n1").plex_db_unconfirmed is held
+        self._answer(h, "uid-2", machine_identifier)  # the next check hears the saved id: it says nothing new
+        assert h.registry.view("n1").plex_db_unconfirmed is held
+        assert h.registry.plex_db_hold("n1") == (self.UNCONFIRMED if held else None)
+        assert h.uids == [("n1", "uid-2")]
+        h.registry.stop()
+
+    def test_a_held_id_taken_with_every_server_off_is_released_by_typing_the_key_again(self):
+        h = self._new_id_with_every_server_off("")
+        h.registry._served_plex_ids = lambda node_id: ["plex-a"]
+        assert h.registry.plex_db_hold("n1") == self.UNCONFIRMED
+
+        h.change(node_uid=None)
+
+        assert h.registry.plex_db_hold("n1") is None
+        self._answer(h, "uid-2", "")  # recorded again as the node's first id: confirmed by the typed key
+        assert h.uids == [("n1", "uid-2"), ("n1", "uid-2")]
+        h.change(node_uid="uid-2")
+        assert h.registry.plex_db_hold("n1") is None
+        h.registry.stop()
+
+    def test_a_held_id_taken_with_every_server_off_goes_ahead_once_the_server_names_the_nodes_plex(self):
+        h = self._new_id_with_every_server_off("plex-a")
+        h.registry._served_plex_ids = lambda node_id: [""]
+        assert h.registry.plex_db_hold("n1") == self.UNCONFIRMED
+
+        h.registry._served_plex_ids = lambda node_id: ["plex-a"]  # the server's identity is read
+
+        assert h.registry.plex_db_hold("n1") is None
+        assert not h.registry.view("n1").plex_db_unconfirmed
+        h.registry.stop()
+
+    def test_a_new_id_taken_with_every_server_off_waits_while_the_servers_cant_be_read(self):
+        h = self._new_id_with_every_server_off("")
+
+        def unreadable(node_id):
+            raise OSError("settings.json unreadable")
+
+        h.registry._served_plex_ids = unreadable
+        hold = h.registry.plex_db_hold("n1")
+        assert hold is not None and hold.waits and hold.message.startswith("Checking nuc before")
+
+        h.registry._served_plex_ids = lambda node_id: ["plex-a"]
+        assert h.registry.plex_db_hold("n1") == self.UNCONFIRMED
+        h.registry.stop()
+
+    def test_a_new_id_tied_to_their_plex_when_taken_goes_ahead_once_saved(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "plex-a")
+        h.change(node_uid="uid-2")
+
+        assert h.registry.plex_db_hold("n1") is None
+        self._answer(h, "uid-2", "plex-a")
+        assert h.registry.plex_db_hold("n1") is None
+        assert h.uids == [("n1", "uid-2")] and not h.registry.view("n1").plex_db_unconfirmed
+        h.registry.stop()
+
 
 class TestPlexDatabaseNodeNotHeardSinceStart:
     """Which machine answers at a Plex database node's address is known only from a check that reached it.
