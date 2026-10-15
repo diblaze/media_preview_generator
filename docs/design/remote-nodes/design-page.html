@@ -179,13 +179,26 @@ svg .bx-vm { fill: none; stroke: var(--fg-2); stroke-width: 1.2; stroke-dasharra
 .proof b.p { color: var(--good); font: 600 .78rem var(--mono); } .proof b.f { color: var(--n); font: 600 .78rem var(--mono); }
 .summary { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--m); border-radius: 8px; padding: 14px 18px; margin: 22px 0 0; }
 .summary ol { margin: 6px 0 0; padding-left: 20px; } .summary li { margin: 4px 0; }
+.built { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--good); border-radius: 8px; padding: 14px 18px; margin: 22px 0 0; }
+.built ul { margin: 6px 0 0; padding-left: 20px; } .built li { margin: 4px 0; font-size: .95rem; }
+.shots { display: grid; gap: 14px; margin: 14px 0; }
+.shots figure { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.shots img { display: block; width: 100%; height: auto; }
+.shots figcaption { padding: 8px 12px; font-size: .88rem; color: var(--fg-2); }
 @media (max-width: 560px) { .case { grid-template-columns: 1fr; } .proof div { grid-template-columns: 1fr; } }
 </style>
 
 <div class="wrap">
-  <div class="eyebrow">Media Preview Generator · design proposal v3 · 15 Oct 2026</div>
+  <div class="eyebrow">Media Preview Generator · design v4 · built · 15 Oct 2026</div>
   <h1>Remote Worker Nodes</h1>
   <p class="lede">Add other machines to the app. A <b>worker node</b> lends its GPU or CPU to the same queue. A <b>Plex database node</b> does Plex-database work on the machine where Plex runs, which is the fix for Plex on Windows (#407). The main app stays in charge of everything. Nodes only do the work they're handed.</p>
+  <div class="built"><b>Status: built and proven, waiting for your review</b>
+    <ul>
+      <li>Everything below is built on the <code>stevezau/extra_node</code> branch. Nothing is pushed to dev, deployed or released. I built it before you reviewed this design, so ask for any change.</li>
+      <li>Every architecture review finding is fixed. The full test suite passes: 20,398 tests, 92% coverage. The Windows Plex database tests pass on a Windows machine (1,052 tests), and the Windows build starts and answers.</li>
+      <li>In a real lab run, a GPU node, a CPU node and a Plex database node ran previews, intros/credits and loudness on real files. A node restarted or stopped mid-job and no file failed. See <a href="#built">"The real build in the lab"</a> and <a href="#shots">"Screenshots"</a>.</li>
+    </ul>
+  </div>
   <div class="summary"><b>How it works, in five steps</b>
     <ol>
       <li>Run the node (Docker on Linux, or a small native install on Windows for the Plex database), then paste its address and key into the app's new <b>Nodes</b> page.</li>
@@ -757,18 +770,47 @@ svg .bx-vm { fill: none; stroke: var(--fg-2); stroke-width: 1.2; stroke-dasharra
     <div><b class="f">FIX</b><span><b>Prototype rough edges the real build must get right:</b> cancel was reported as "failed" (must say cancelled), and an unknown task returned an error 500 (must be 404).</span></div>
 </div>
 
+  <h3 id="built">The real build in the lab</h3>
+  <p>The real build ran in the lab: the app saw the media at <code>/media</code> and two worker nodes saw the same files at <code>/mnt/nas</code>. One worker had an NVIDIA GPU, the other was CPU-only. A Plex database node ran next to the lab Plex. The app's settings were a copy of an older lab setup, so the upgrade ran on real settings.</p>
+  <div class="proof">    <div><b class="p">PASS</b><span><b>Upgrade.</b> The old Plex helper became a Plex database node on the Nodes page and kept working. Its old address and key are kept, so rolling back to an older version still works.</span></div>
+    <div><b class="p">PASS</b><span><b>Security.</b> The nodes API refuses anyone not signed in. A saved key is never sent to a different address: a listener at that address got nothing.</span></div>
+    <div><b class="p">PASS</b><span><b>Previews on nodes only.</b> Every file's log line names its node ("lab-gpu/GPU0 ·"). The dashboard shows live progress and speed. The app wrote the BIF files. GPU node: 9–14 s per 4K episode. CPU node: about 170 s.</span></div>
+    <div><b class="p">PASS</b><span><b>Intros, credits and loudness</b> ran on node workers and were written into Plex through the Plex database node.</span></div>
+    <div><b class="p">PASS</b><span><b>Node restarted mid-job:</b> 0 of 6 files failed. <b>Node stopped for good:</b> 0 of 6 failed, and the rest finished on the CPU node. The node showed Offline with a bell notice, then Ready again once it came back.</span></div>
+    <div><b class="p">PASS</b><span><b>Plex database node turned off:</b> the app sent it nothing and said why. Setup Health said to fix it in the app.</span></div>
+    <div><b class="p">PASS</b><span><b>Test access</b> found a wrong mapping and showed the exact path it tried. Its result survives an app restart.</span></div>
+    <div><b class="f">FIXED</b><span><b>Found and fixed during the build:</b>
+      <ul style="margin:4px 0 0;padding-left:18px">
+        <li>A file was retried on the node that had just dropped it, so many files failed when a node restarted.</li>
+        <li>Node workers showed 0% progress.</li>
+        <li>Node failures were described as "not found".</li>
+        <li>The worker totals ignored nodes.</li>
+        <li>Plex database writes could still reach a node that was turned off.</li>
+        <li>A Plex database node without its own <code>/config</code> folder could lose the loudness undo record on an update.</li>
+      </ul></span>
+    </div>
+  </div>
+
+  <h3 id="shots">Screenshots from that run</h3>
+  <div class="shots">
+    <figure><img src="evidence/lab-final/shot_nodes_page.png" alt="Nodes page listing the migrated Plex helper, lab-gpu, lab-cpu and lab-plexdb, all Ready" loading="lazy"><figcaption>The Nodes page: the migrated Plex helper, two worker nodes and a Plex database node.</figcaption></figure>
+    <figure><img src="evidence/lab-final/shot_worker_groups_section.png" alt="Worker group Lab nodes with lab-gpu Quadro P5000 and lab-cpu CPU devices" loading="lazy"><figcaption>A worker group made of node devices. The capacity line counts workers here and on nodes separately.</figcaption></figure>
+    <figure><img src="evidence/lab-final/shot_dashboard_node_job.png" alt="Dashboard workers panel with a node worker extracting frames" loading="lazy"><figcaption>The dashboard during a job that runs on nodes.</figcaption></figure>
+    <figure><img src="evidence/lab-final/shot_node_health.png" alt="A node's Setup Health tab" loading="lazy"><figcaption>A node's own Setup Health.</figcaption></figure>
+  </div>
+
   <h2 id="confidence">15 · How confident I am</h2>
   <div class="conf">    <div class="row"><span class="chip hi">High</span><div><p><b>Heavy steps on a node give the same result.</b> Every step was run both ways on a real file and compared byte for byte. The app's existing functions run unchanged on the node.</p></div></div>
     <div class="row"><span class="chip hi">High</span><div><p><b>Path mappings, file checks and the key.</b> Every bad case I could think of was refused before work started, and size + time are stable across every mount type here.</p></div></div>
     <div class="row"><span class="chip hi">High</span><div><p><b>Dropped node → back in the queue.</b> Measured on a killed node, and the queue change was proved inside the real job code with the existing tests green.</p></div></div>
     <div class="row"><span class="chip hi">High</span><div><p><b>Plex database node on Linux.</b> It's today's Plex helper with two more calls, and the helper is already live.</p></div></div>
-    <div class="row"><span class="chip md">Medium</span><div><p><b>Windows Plex database node.</b> Locking, drive type and packaging are proven on a Windows runner. 16 real porting failures remain (Windows paths), and it hasn't touched a real Plex on Windows yet. That needs the beta with the #407 reporter.</p></div></div>
-    <div class="row"><span class="chip md">Medium</span><div><p><b>Fitting nodes into worker groups and the dashboard.</b> I know every place the code assumes a local device (about 12). It's careful work, not unknown work.</p></div></div>
+    <div class="row"><span class="chip md">Medium</span><div><p><b>Windows Plex database node.</b> Built: all 1,052 Plex database tests pass on a Windows machine, and the Windows build starts and answers. It hasn't touched a real Plex on Windows yet. That needs the beta with the #407 reporter.</p></div></div>
+    <div class="row"><span class="chip hi">High</span><div><p><b>Nodes in worker groups and the dashboard.</b> Built and run in the lab: node devices sit in groups like local ones, with live progress, and their counts are shown separately.</p></div></div>
     <div class="row"><span class="chip md">Medium</span><div><p><b>Docker Desktop on Windows reaching a native node</b> (<code>host.docker.internal</code>). Not tested; checked during the beta.</p></div></div>
     <div class="row"><span class="chip lo">Not v1</span><div><p><b>Native Windows worker</b> for Intel/AMD GPUs. Possible later, but it's a separate FFmpeg and GPU build.</p></div></div>
 </div>
 
-  <h2 id="build">16 · Build order</h2>
+  <h2 id="build">16 · Build order (all steps built)</h2>
   <ol class="steps">
     <li><b>Node basics:</b> node mode, key, API, health checks, the Nodes page, Add node and node Setup Health. No job runs on a node yet.</li>
     <li><b>Plex database node on Linux:</b> today's Plex helper becomes this role, plus loudness writes and Library Health counts.</li>

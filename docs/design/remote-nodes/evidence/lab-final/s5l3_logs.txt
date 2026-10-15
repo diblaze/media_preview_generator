@@ -1,0 +1,34 @@
+[2026-10-15 11:00:39] INFO - Plex loudness: 2 file(s) to check
+[2026-10-15 11:00:39] INFO - Plex loudness: using /opt/ffmpeg-loudness/bin/ffmpeg
+[2026-10-15 11:00:39] INFO - [Lab Plex (through the agent)] Connecting to Plex...
+[2026-10-15 11:00:39] INFO - [Lab Plex (through the agent)] Successfully connected to Plex
+[2026-10-15 11:00:39] INFO - Lab nodes · 2 picked up: /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv
+[2026-10-15 11:00:39] INFO - lab-cpu/CPU · Started loudness analysis: South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv
+[2026-10-15 11:00:40] INFO - lab-cpu/CPU · Started processing /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv
+[2026-10-15 11:00:40] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 0.4% (speed=12.0x)
+[2026-10-15 11:00:45] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 9.5% (speed=22.4x)
+[2026-10-15 11:00:50] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 17.9% (speed=23.1x)
+[2026-10-15 11:00:55] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 26.4% (speed=23.4x)
+[2026-10-15 11:01:00] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 35.3% (speed=23.9x)
+[2026-10-15 11:01:05] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 44.1% (speed=24.1x)
+[2026-10-15 11:01:10] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 53.0% (speed=24.3x)
+[2026-10-15 11:01:15] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 62.0% (speed=24.5x)
+[2026-10-15 11:01:20] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 70.9% (speed=24.5x)
+[2026-10-15 11:01:25] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 79.8% (speed=24.7x)
+[2026-10-15 11:01:30] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 88.4% (speed=24.6x)
+[2026-10-15 11:01:35] INFO - lab-cpu/CPU · South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv - 96.8% (speed=24.6x)
+[2026-10-15 11:01:37] INFO - Lab nodes · 2 picked up: /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 11:01:37] INFO - lab-cpu/CPU · Started loudness analysis: South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 11:01:38] INFO - lab-cpu/CPU · Started processing /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 11:01:38] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 0.5% (speed=13.0x)
+[2026-10-15 11:01:43] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 9.9% (speed=21.7x)
+[2026-10-15 11:01:48] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 18.6% (speed=22.4x)
+[2026-10-15 11:01:53] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 28.4% (speed=23.4x)
+[2026-10-15 11:01:58] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 37.9% (speed=23.9x)
+[2026-10-15 11:02:03] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 47.8% (speed=24.3x)
+[2026-10-15 11:02:08] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 57.2% (speed=24.4x)
+[2026-10-15 11:02:13] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 66.1% (speed=24.3x)
+[2026-10-15 11:02:18] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 75.9% (speed=24.5x)
+[2026-10-15 11:02:23] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 85.4% (speed=24.5x)
+[2026-10-15 11:02:28] INFO - lab-cpu/CPU · South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 95.3% (speed=24.7x)
+[2026-10-15 11:02:31] INFO - Job 036b0913-b104-4ec1-9df3-b60874ccd06e completed successfully

@@ -17,6 +17,38 @@ https://claude.ai/artifact/G5nBhYJVFBekqJMQ93NCHa
 * Build order and lane ownership: §8. Each phase gets an Architecture Review (`.claude/agents/architecture-review.md`)
   because it touches workers/concurrency, settings schema, auth and paths.
 
+## 0.1 Build status (2026-10-15)
+
+Built on `stevezau/extra_node` **before the owner reviewed this design** (owner: "build everything, test it, prove it,
+I'll review the design later and may ask for changes"). Not pushed to `dev`, not deployed, not released.
+
+* **Built:** every lane in §8: node server + `MODE=node`, Nodes page and API, node devices in worker groups, remote
+  execution for previews / Intro & Credits / loudness, the Plex database role (old helper folded in, plus loudness
+  writes and Library Health rows), the Windows Plex database node (`nodes/windows/`), migration v24, docs
+  (`docs/guides.md#remote-nodes`).
+* **Reviewed:** an Architecture Review per area (jobs, settings/auth, Plex database role), then one over all the fixes;
+  every HIGH/MED/LOW from those is fixed.
+* **Proven:** the full unit suite (20,398 passed, 92% coverage), node + worker-group e2e, Windows CI (1,052 Plex
+  database tests on `windows-latest`, PyInstaller build started and called), and a real lab run with GPU, CPU and
+  Plex database nodes (all scenarios passed: [`evidence/lab-final/`](evidence/lab-final/README.md)).
+* **Changes from the design as written:**
+  - A node that drops a file is held back until it checks ready again (or 60 s); starts the node never took don't
+    count toward the two-drop limit (max 5 per file). Retries prefer another worker.
+  - Each task carries a client id; a start whose answer was lost is cancelled by that id.
+  - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
+  - Test access results persist in `node_access_results.json` until that node's mappings change.
+  - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
+  - v24 keeps the old helper's `url`/`token` (unused) so a rollback to an older build still works.
+  - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
+    refuses loudness writes.
+* **Still open:**
+  - The image name `plex-marker-agent` and tag prefix `marker-agent-v*` are unchanged; renaming is a release-time
+    decision.
+  - The Windows node has never touched a real Plex on Windows (needs the #407 reporter's beta), and Docker Desktop
+    reaching a native node via `host.docker.internal` is untested.
+  - Nodes in a different time zone from the app weren't tried in the lab (all ran one zone).
+  - A worker node must run the app's exact version, so every app update means updating each worker node.
+
 ## 1. Repository layout
 
 Everything about nodes lives in one package (`media_preview_generator/nodes/`) and one packaging folder

@@ -1,0 +1,14 @@
+keys with version: {'_schema_version': 24, 'last_seen_version': '0.0.0'}
+nodes: [
+ {
+  "id": "c24c6cedf94c48ccbd653156e1e1fb1e",
+  "node_uid": null,
+  "name": "Plex helper (Lab Plex (through the agent))",
+  "url": "http://mlab-plex-agent:9494",
+  "key": "<redacted len=48>",
+  "enabled": true,
+  "path_mappings": [],
+  "added_at": "2026-10-14T23:49:26+00:00"
+ }
+]
+server mlab-plex plex agent: {"enabled": true, "url": "http://mlab-plex-agent:9494", "token": "<redacted len=48>", "node_id": "c24c6cedf94c48ccbd653156e1e1fb1e"}

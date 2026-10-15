@@ -1,0 +1,26 @@
+{
+ "notifications": [
+  {
+   "body_html": "<p class='mb-0'>Your settings were migrated from schema <strong>v1</strong> to <strong>v24</strong>.</p><div class='small mt-2'>A backup of your previous settings is at <code>/config/settings.json.pre-v19.bak</code> &mdash; safe to ignore unless you need to roll back.</div><details class='mt-2'><summary class='small text-muted'>What changed</summary><ul class='small mb-0'><li>Your Plex configuration was upgraded to the new multi-server format. You can now add Jellyfin or Emby alongside Plex from Settings \u2192 Servers \u2014 your existing Plex setup is unchanged.</li><li>Frame-reuse caching is now on by default. When the same frame shows up across multiple files, it's reused instead of re-encoded \u2014 saves time on large libraries. Tunable under Settings \u2192 Performance.</li><li>Intro & Credits no longer waits for two sources to agree when one source that checks your own file found a marker (on-screen credit text or chapters), so far fewer files wait in Needs review. The files already waiting there are checked again by one Intro & Credits job, which reuses what was already found.</li><li>Intro & Credits no longer has a Needs review list. When it can't confirm an intro or credits from your own file, it writes nothing, and you can still add or adjust one in the Inspector. The files that were waiting there are checked again by your next manual or scheduled Find markers job, reusing saved answers.</li><li>Your worker counts are now worker groups. Existing availability and pauses are preserved.</li><li>Your Plex helper now appears on the new Nodes page, which holds its address and key. It works as before.</li></ul></details>",
+   "dismissable": true,
+   "id": "schema_migration_completed",
+   "severity": "info",
+   "source": "schema_migration",
+   "title": "Settings migrated"
+  },
+  {
+   "action": {
+    "href": "/nodes#node-efeca478ba124c4fbf4593d335d6c393",
+    "label": "Open Nodes"
+   },
+   "body_html": "<p class='mb-0'>lab-gpu didn&#39;t answer. Check that it is running and reachable from this app. Check that the node is running and that this app can reach it.</p>",
+   "dismissable": true,
+   "id": "node:efeca478ba124c4fbf4593d335d6c393:offline",
+   "permanent_dismissable": false,
+   "severity": "warning",
+   "source": "nodes",
+   "title": "lab-gpu is offline"
+  }
+ ]
+}
+HTTP 200

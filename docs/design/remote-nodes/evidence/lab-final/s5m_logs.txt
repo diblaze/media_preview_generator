@@ -1,0 +1,81 @@
+[2026-10-15 10:57:00] INFO - Intro & Credits job 86001b12 started: 2 files, manual run
+[2026-10-15 10:57:00] INFO - South Park (1997) S01E02: checking intro and credits
+[2026-10-15 10:57:00] INFO - South Park (1997) S01E02 · Checking chapters… none (asked now)
+[2026-10-15 10:57:00] INFO - South Park (1997) S01E01: checking intro and credits
+[2026-10-15 10:57:00] INFO - South Park (1997) S01E01 · Checking chapters… "Title Sequence" chapter at 0:08–0:34, "End Credits" chapter at 21:35–21:59 (asked now)
+[2026-10-15 10:57:01] INFO - [Lab Plex (through the agent)] Connecting to Plex...
+[2026-10-15 10:57:01] INFO - [Lab Plex (through the agent)] Successfully connected to Plex
+[2026-10-15 10:57:02] INFO - South Park (1997) S01E01 · Checking IntroDB… intro 0:00–0:30 (asked now)
+[2026-10-15 10:57:02] INFO - South Park (1997) S01E01 · Checking SkipDB… no entry (asked now)
+[2026-10-15 10:57:03] INFO - Lab nodes · 1 picked up: South Park (1997) S01E01, checking intro and credits
+[2026-10-15 10:57:03] INFO - South Park (1997) S01E01 · Reading season audio on lab-gpu/GPU0…
+[2026-10-15 10:57:03] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:03] INFO - South Park (1997) S01E02 · Checking IntroDB… intro 0:00–0:30 (asked now)
+[2026-10-15 10:57:03] INFO - South Park (1997) S01E02 · Checking SkipDB… no entry (asked now)
+[2026-10-15 10:57:03] INFO - Lab nodes · 2 picked up: South Park (1997) S01E02, checking intro and credits
+[2026-10-15 10:57:03] INFO - South Park (1997) S01E02 · Reading season audio on lab-cpu/CPU…
+[2026-10-15 10:57:03] INFO - lab-cpu/CPU · Started season audio fingerprint: South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:04] INFO - lab-gpu/GPU0 · Started processing /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:04] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 14.2% (speed=0.0x)
+[2026-10-15 10:57:04] INFO - lab-cpu/CPU · Started processing /media/tv/South Park (1997)/Season 01/South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:04] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 7.4% (speed=0.0x)
+[2026-10-15 10:57:06] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E03 - Weight Gain 4000 [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:09] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 100.0% (speed=230.6x)
+[2026-10-15 10:57:09] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E04 - Big Gay Als Big Gay Boat Ride [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:12] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:14] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 70.6% (speed=325.3x)
+[2026-10-15 10:57:15] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E06 - Death [Bluray-1080p][AC3 5.1][x264].mkv
+[2026-10-15 10:57:17] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E07 - Pinkeye [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:19] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 67.4% (speed=310.3x)
+[2026-10-15 10:57:20] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E08 - Starvin Marvin [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:24] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 100.0% (speed=155.2x)
+[2026-10-15 10:57:24] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E09 - Mr. Hankey the Christmas Poo [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:27] INFO - lab-cpu/CPU · Started season audio fingerprint: South Park (1997) - S01E10 - Damien [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:28] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 12.2% (speed=0.0x)
+[2026-10-15 10:57:30] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E11 - Toms Rhinoplasty [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:31] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 10.4% (speed=0.0x)
+[2026-10-15 10:57:33] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E12 - Mecha-Streisand [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:36] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 100.0% (speed=230.7x)
+[2026-10-15 10:57:36] INFO - lab-gpu/CPU · Started season audio fingerprint: South Park (1997) - S01E13 - Cartmans Mom Is a Dirty Slut [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:40] INFO - lab-cpu/CPU · Started end-picture frames: South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:40] INFO - South Park (1997) S01E01 · Season audio: no match (38 s)
+[2026-10-15 10:57:40] INFO - South Park (1997) S01E01 · Checking last season's audio… no match (asked now)
+[2026-10-15 10:57:40] INFO - South Park (1997) S01E01 · Reading credit text on lab-gpu/GPU0…
+[2026-10-15 10:57:40] INFO - lab-gpu/GPU0 · Started credit text: South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:42] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 80.6% (speed=1.8x)
+[2026-10-15 10:57:42] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 23.8% (speed=104.7x)
+[2026-10-15 10:57:43] INFO - lab-cpu/CPU · Started end-picture frames: South Park (1997) - S01E04 - Big Gay Als Big Gay Boat Ride [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:43] INFO - lab-gpu/GPU0 · Vulkan ready for Dolby Vision Profile 5 tone-mapping: Quadro P5000 (discrete) (0x1bb0) (via __EGL_VENDOR_LIBRARY_FILENAMES override)
+[2026-10-15 10:57:45] INFO - lab-cpu/CPU · Started end-picture frames: South Park (1997) - S01E05 - An Elephant Makes Love to a Pig [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:47] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 80.6% (speed=1.8x)
+[2026-10-15 10:57:48] INFO - South Park (1997) S01E02 · Season audio: intro 0:00–0:34 (same theme found in 10 of 13 episodes; 45 s)
+[2026-10-15 10:57:48] INFO - South Park (1997) S01E02 · Checking last season's audio… no match (asked now)
+[2026-10-15 10:57:48] INFO - South Park (1997) S01E02 · Reading credit text on lab-cpu/CPU…
+[2026-10-15 10:57:48] INFO - lab-cpu/CPU · Started credit text: South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv
+[2026-10-15 10:57:52] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 4.0% (speed=4.9x)
+[2026-10-15 10:57:53] INFO - lab-gpu/GPU0 · Credit text detection on cuda:0: GPU (median 13.67 ms per frame, CPU 18.12 ms; GPU/CPU 0.7026 per round), pinned to 0000:02:00.0
+[2026-10-15 10:57:54] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 91.9% (speed=30.4x)
+[2026-10-15 10:57:57] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 11.1% (speed=5.7x)
+[2026-10-15 10:57:59] INFO - lab-gpu/GPU0 · South Park (1997) - S01E01 - Cartman Gets an Anal Probe [AMZN WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 93.8% (speed=6.3x)
+[2026-10-15 10:58:00] INFO - South Park (1997) S01E01 · Credit text: credits start at 21:35 (keeps the "End Credits" chapter at 21:35; 20 s)
+[2026-10-15 10:58:00] INFO - South Park (1997) S01E01 · Checking Lab Plex (through the agent)'s own markers… intro 0:08–0:34, credits start at 21:35 (asked now)
+[2026-10-15 10:58:00] INFO - South Park (1997) S01E01 · Decided: intro 0:08–0:34, from the "Title Sequence" chapter · credits 21:35–21:59, from the "End Credits" chapter
+[2026-10-15 10:58:00] INFO - South Park (1997) S01E01 · [Lab Plex (through the agent)] Already up to date (intro 0:08–0:34 · credits 21:35–21:59)
+[2026-10-15 10:58:00] INFO - Lab nodes · 1 completed: South Park (1997) S01E01 (success, 58 s)
+[2026-10-15 10:58:02] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 19.2% (speed=6.3x)
+[2026-10-15 10:58:07] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 35.6% (speed=8.6x)
+[2026-10-15 10:58:12] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 44.1% (speed=8.4x)
+[2026-10-15 10:58:17] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 52.1% (speed=8.2x)
+[2026-10-15 10:58:22] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 61.0% (speed=8.2x)
+[2026-10-15 10:58:27] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 70.8% (speed=8.2x)
+[2026-10-15 10:58:32] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 78.8% (speed=8.1x)
+[2026-10-15 10:58:37] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 87.7% (speed=8.1x)
+[2026-10-15 10:58:42] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 95.2% (speed=7.9x)
+[2026-10-15 10:58:47] INFO - lab-cpu/CPU · South Park (1997) - S01E02 - Volcano [AMZN][WEBDL-2160p][EAC3 5.1][HEVC]-MZABI.mkv - 31.9% (speed=2.1x)
+[2026-10-15 10:58:51] INFO - South Park (1997) S01E02 · Credit text: credits start at 21:38 (1 min 3 s)
+[2026-10-15 10:58:51] INFO - South Park (1997) S01E02 · Checking Lab Plex (through the agent)'s own markers… intro 0:00–0:34, credits start at 21:38 (asked now)
+[2026-10-15 10:58:51] INFO - South Park (1997) S01E02 · Decided: intro 0:00–0:34 (IntroDB, season audio and server markers agree) · credits 21:38–22:02 (credit text and server markers agree)
+[2026-10-15 10:58:51] INFO - South Park (1997) S01E02 · [Lab Plex (through the agent)] Already up to date (intro 0:00–0:34 · credits 21:38–22:02)
+[2026-10-15 10:58:51] INFO - Lab nodes · 2 completed: South Park (1997) S01E02 (success, 1 min 48 s)
+[2026-10-15 10:58:51] INFO - Done: 2 files · 0 sent to Lab Plex (through the agent) · 0 nothing found · 2 already up to date
+[2026-10-15 10:58:51] INFO - Job 86001b12-20f2-4495-9687-4d98398a0b42 completed successfully
