@@ -130,6 +130,9 @@ class SettingsManager:
 
         An on/off switch that isn't ``true`` or ``false`` (``"false"`` typed in quotes) is turned off: read as it
         was, any text counted as on, so a node meant to be off was checked and sent work.
+
+        An address that isn't text (a number, ``null``, or none at all) is cleared to ``""``, a node with no address:
+        read as it was, asking the node anything (its log, a Test access) failed with an error page.
         """
         raw = self._settings.get("nodes")
         if not isinstance(raw, list):
@@ -138,6 +141,7 @@ class SettingsManager:
 
         named: list[str] = []
         switched_off: list[str] = []
+        unaddressed: list[str] = []
         seen: set[str] = set()
         for node in raw:
             if not isinstance(node, dict):
@@ -152,7 +156,10 @@ class SettingsManager:
             if "enabled" in node and type(node["enabled"]) is not bool:
                 node["enabled"] = False
                 switched_off.append(str(node.get("name") or node["id"]))
-        if not (named or switched_off):
+            if not isinstance(node.get("url"), str):
+                node["url"] = ""
+                unaddressed.append(str(node.get("name") or node["id"]))
+        if not (named or switched_off or unaddressed):
             return
         self._settings["nodes_revision"] = self.nodes_revision + 1
         if named:
@@ -166,6 +173,11 @@ class SettingsManager:
                 "The on/off switch of {} in settings.json isn't true or false, so it is turned off. To use it, turn it "
                 "back on from the Nodes page.",
                 ", ".join(switched_off),
+            )
+        if unaddressed:
+            logger.warning(
+                "The address of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
+                ", ".join(unaddressed),
             )
         try:
             self._save()

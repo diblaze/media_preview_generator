@@ -1271,6 +1271,28 @@ class TestBadAddresses:
         assert client.put(f"/api/nodes/{node_id}", json={"url": url, "key": "new-key"}).status_code == 400
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
 
+    @pytest.mark.parametrize("hand_written", [9494, None, "missing"])
+    def test_a_node_whose_address_written_by_hand_isnt_text_is_asked_nothing(self, client, nodes, hand_written):
+        """Read as it was, the node's Log tab and Test access failed with an error page (the client strips the
+        address's trailing slash, and a number or null has none to strip)."""
+        import json
+
+        node_id = _add(client).get_json()["id"]
+        settings_file = Path(_sm().settings_file)
+        saved = json.loads(settings_file.read_text())
+        if hand_written == "missing":
+            del saved["nodes"][0]["url"]
+        else:
+            saved["nodes"][0]["url"] = hand_written
+        settings_file.write_text(json.dumps(saved))
+        _sm().reload()
+
+        no_address = {"error": "nuc has no address. Enter it on the Nodes page."}
+        log = client.get(f"/api/nodes/{node_id}/log")
+        assert (log.status_code, log.get_json()) == (400, no_address)
+        access = client.post(f"/api/nodes/{node_id}/test-access", json={})
+        assert (access.status_code, access.get_json()) == (400, no_address)
+
 
 class TestTheSameMachineAddedTwice:
     def test_an_address_differing_only_in_letter_case_is_already_added(self, client, nodes):

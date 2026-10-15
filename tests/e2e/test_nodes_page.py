@@ -1740,12 +1740,27 @@ class TestPlexDatabaseSelector:
         assert body["markers"]["plex"]["agent"] == {"enabled": True, "node_id": "n-gone"}
 
     def test_a_saved_node_that_hasnt_answered_yet_keeps_its_name(self, authed_page: Page, app_url: str) -> None:
-        # After a restart a node reports no roles until its first check answers, so the role filter misses it.
+        # After a restart a node reports no roles until its first check answers.
         waking = _node("n-wake", "plex-box", "connecting", roles=[], gpus=[], cpu={})
         self._open(authed_page, app_url, {"enabled": True, "node_id": "n-wake"}, nodes=[*_four_nodes(), waking])
         select = authed_page.locator("#markersPlexDatabase")
         expect(select).to_have_value("n-wake")
         expect(select.locator("option[value='n-wake']")).to_have_text("Through a Plex database node: plex-box")
+
+    def test_a_node_turned_off_is_offered_and_a_server_left_on_this_app_remembers_it(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        # The upgrade turns a switched-off Plex helper into a node turned off, which never answers with its roles; its
+        # server opens the database itself and remembers the node for when it is switched back.
+        off = _node("n-off", "plex-helper", "disabled", enabled=False, roles=[], gpus=[], cpu={})
+        self._open(authed_page, app_url, {"enabled": False, "node_id": "n-off"}, nodes=[*_four_nodes(), off])
+        select = authed_page.locator("#markersPlexDatabase")
+        expect(select.locator("option[value='n-off']")).to_have_text(
+            "Through a Plex database node: plex-helper · turned off"
+        )
+        expect(select).to_have_value("")
+        body = _save_and_read_put(authed_page, "plex-1")
+        assert body["markers"]["plex"]["agent"] == {"enabled": False, "node_id": "n-off"}
 
     def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(self, authed_page: Page, app_url: str) -> None:
         self._open(authed_page, app_url, None)
