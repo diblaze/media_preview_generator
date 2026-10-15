@@ -257,6 +257,7 @@ class _TaskRun:
         cancel_check: Callable[[], bool] | None,
         pause_check: Callable[[], bool] | None,
         progress_callback: Callable[[dict], None] | None,
+        path_swap: tuple[str, str] | None = None,
     ) -> None:
         self._registry = registry
         self._client = client
@@ -274,6 +275,8 @@ class _TaskRun:
         self._cancel_delivered = False
         self._paused_at: float | None = None
         self._forgotten = False
+        # (node's path, app's path) of the file: the job log names it by this app's path throughout.
+        self._path_swap = path_swap
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
@@ -378,7 +381,10 @@ class _TaskRun:
             if not isinstance(line, dict):
                 continue
             level = str(line.get("level") or "INFO").upper()
-            logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, line.get("message", ""))
+            message = str(line.get("message", ""))
+            if self._path_swap:
+                message = message.replace(*self._path_swap)
+            logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, message)
         next_log = state.get("next_log")
         if isinstance(next_log, int):
             self._next_log = next_log
@@ -534,6 +540,7 @@ def run_on_node(
         "gpu": None if gpu is None else {"type": gpu[0], "device": gpu[1]},
         "params": params,
     }
+    node_path = protocol.map_app_path(app_path, mappings)
     run = _TaskRun(
         registry,
         client,
@@ -542,6 +549,7 @@ def run_on_node(
         cancel_check=cancel_check,
         pause_check=pause_check,
         progress_callback=progress_callback,
+        path_swap=(node_path, app_path) if node_path and node_path != app_path else None,
     )
     run.start(spec)
     try:

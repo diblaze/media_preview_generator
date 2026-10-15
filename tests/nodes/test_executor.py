@@ -568,6 +568,22 @@ class TestLogsAndProgress:
             logger.remove(sink)
         assert ("WARNING", "NAS/GPU0 · decode {braces} slow") in lines
 
+    def test_node_lines_name_the_file_by_this_apps_path(self, media, monkeypatch):
+        app_root = os.path.dirname(os.path.dirname(media))
+        node_path = "/mnt/nas" + media[len(app_root) :]
+        lines = []
+        state = running(log=[{"seq": 0, "level": "INFO", "message": f"decoding {node_path} at 3x"}], next_log=1)
+        registry = _install(ScriptedClient([state, finished(protocol.STATUS_DONE, result={})]))
+        monkeypatch.setattr(
+            registry, "mappings", lambda node_id: [protocol.PathMapping(app_prefix=app_root, node_prefix="/mnt/nas")]
+        )
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+        try:
+            _run(media)
+        finally:
+            logger.remove(sink)
+        assert f"NAS/CPU · decoding {media} at 3x" in lines
+
     @pytest.mark.parametrize(
         ("op", "gpu", "expected"),
         [
