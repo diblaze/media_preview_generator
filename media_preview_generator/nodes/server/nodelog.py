@@ -20,7 +20,8 @@ NODE_LOG_LINES = 2000
 CAPTURE_MIN_LEVEL = 20
 
 # ``logger.bind(**{SECRET_EXTRA: True})``: the line goes to the console only, never into a buffer someone can read
-# back over the API (the one-time key notice).
+# back over the API (the one-time key notice). logging_config.CONSOLE_ONLY is the same name, so app.log and the live
+# log viewer drop it too.
 SECRET_EXTRA = "node_secret"
 # ``logger.bind(**{TASK_LOGGED_EXTRA: True})``: the line is already in its task's log (``TaskContext.log``), so the
 # thread capture must not add it a second time.

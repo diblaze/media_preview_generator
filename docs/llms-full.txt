@@ -2275,7 +2275,7 @@ Use the app's own image, the **same tag** as the app, started with `MODE=node`:
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e NODE_KEY=change-me -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest
@@ -2283,7 +2283,8 @@ docker run -d --name media-preview-node -p 9494:9494 \
 
 - Mount your media read-only, at any path.
 - Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA).
-- Leave out `NODE_KEY` and the node makes one, printed once in `docker logs`.
+- The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
+  made by `openssl rand -hex 24`.
 - A compose file is in [`nodes/worker/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/worker/docker-compose.yml).
 
 ### Adding it

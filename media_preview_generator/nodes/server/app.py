@@ -43,9 +43,14 @@ class NodeServerState:
     worker_info: Any = None
     plex_db_module: Any = None
 
-    def close(self) -> None:
-        """Stop the background threads (tests; a node process just exits)."""
-        self.tasks.close()
+    def close(self, wait_s: float = 0.0) -> None:
+        """Stop the background threads and cancel every task.
+
+        Args:
+            wait_s: How long to wait for the cancelled tasks' ops (and their FFmpeg) to stop; a node shutting down
+                waits, tests don't.
+        """
+        self.tasks.close(wait_s)
         if self.worker_info is not None:
             self.worker_info.stop()
 
@@ -99,6 +104,7 @@ def create_node_app(
         "id": me.id,
         "name": me.name,
         "version": __version__,
+        "build": protocol.build_sha(),
         "protocols": [protocol.NODE_PROTOCOL],
         "roles": list(chosen_roles),
     }
@@ -240,6 +246,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
 
     @bp.post(protocol.ROUTE_ACCESS_CHECK)
     def access_check() -> Any:
+        # The roots come from the request, so on a node without the worker role (one beside Plex, maybe Windows with
+        # its user's own rights) the route would only list folders for whoever holds the Plex database key.
+        if state.worker_info is None:
+            return refuse(protocol.KIND_REQUEST, 400, "This node has no worker role")
         body = json_body()
         if body is None:
             return refuse(protocol.KIND_REQUEST, 400, "The request body must be a JSON object")
@@ -291,6 +301,8 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             return refuse(protocol.KIND_REQUEST, 400, str(exc))
         except tasks.TaskDeletedError as exc:
             return refuse(protocol.KIND_TASK_DELETED, 409, str(exc))
+        except tasks.TaskStartError as exc:
+            return refuse(protocol.KIND_FAILED, 400, str(exc))
         return answer({"id": task_id}, 202)
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")

@@ -67,7 +67,7 @@ media_preview_generator/nodes/
     ops.py           op registry: the app's own heavy functions, called with node paths
     plex_db.py       the Plex database role (today's agent routes, moved; same protocol, same tests)
     winplatform.py   Windows replacements for the Linux-only bits the Plex database role needs
-    wsgi.py          gunicorn entry point
+    wsgi.py          entry point (waitress)
   client.py          NodeClient: the app's HTTP client for one node
   registry.py        NodeRegistry: configured nodes, their live state, the health loop, alerts
   mappings.py        app path <-> node path rules, Test access sampling and suggestions
@@ -108,13 +108,15 @@ on bytes. Node routes also require `X-MPG-Node-Protocol: 1`; a mismatch answers 
 The Plex database routes keep the agent's header and protocol exactly.
 
 Every JSON answer: `{"ok": bool, "node": NODE_BLOCK, ...}` where
-`NODE_BLOCK = {"id", "name", "version", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the app
-package version; the Plex database role also keeps the agent's `"agent"` block for old apps).
+`NODE_BLOCK = {"id", "name", "version", "build", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the
+app package version, `build` = the image's `GIT_SHA` or "": a worker node on the same version but another build needs
+an update, since pull request and local images all report one version; the Plex database role also keeps the agent's
+`"agent"` block for old apps).
 
 | Route | Body | Answer |
 |---|---|---|
 | `GET /v1/health` | – | `{"ok": true, "node": …}` (no auth; container HEALTHCHECK) |
-| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at}`, `plex_db {config_dir, db_present, machine_identifier}` (per role) |
+| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
 | `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |

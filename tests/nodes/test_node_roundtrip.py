@@ -103,7 +103,7 @@ class TestRoundTrip:
 
         node_id = app.extensions[node_app.EXTENSION].identity.id
         assert health["node"] == {"id": node_id, "name": "test-node", "version": health["node"]["version"],
-                                  "protocols": [1], "roles": ["worker"]}  # fmt: skip
+                                  "build": health["node"]["build"], "protocols": [1], "roles": ["worker"]}  # fmt: skip
         assert details["node"]["id"] == node_id
         assert details["worker"]["gpus"] == [] and details["worker"]["busy"] == 0
         assert client.rescan_gpus()["worker"]["gpus"] == []

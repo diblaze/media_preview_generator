@@ -77,6 +77,7 @@ class Harness:
         self.legacy = ("connected", "1.2.0")
         self.quick = True
         self.clock = Clock()
+        self.app_build = ""
         self.registry = reg.NodeRegistry(
             revision_provider=lambda: self.revision,
             nodes_provider=lambda: [dict(n) for n in self.nodes],
@@ -85,6 +86,7 @@ class Harness:
             record_uid=lambda node_id, uid: self.uids.append((node_id, uid)),
             quick_access=lambda client, mappings: self.quick,
             app_version=lambda: APP_VERSION,
+            app_build=lambda: self.app_build,
             attempt_gap_s=0.0,
             clock=self.clock,
             wall_clock=lambda: 1_700_000_000.0,
@@ -194,6 +196,28 @@ class TestStates:
         assert view.state == reg.STATE_UPDATE_NEEDED
         assert "9.9.8" in view.reason and APP_VERSION in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node needs an update")
+
+    def test_a_worker_on_another_build_of_the_same_version_needs_an_update(self, h):
+        # Pull request images and local builds all report one version: their commit tells them apart.
+        h.app_build = "a" * 40
+        info = _info()
+        info["node"]["build"] = "b" * 40
+        h.client().default_info = info
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_UPDATE_NEEDED
+        assert "bbbbbbb" in view.reason and "aaaaaaa" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node needs an update")
+
+    @pytest.mark.parametrize(("app_build", "node_build"), [("a" * 40, "a" * 40), ("", "b" * 40), ("a" * 40, "")])
+    def test_the_same_build_or_an_unknown_one_is_ready(self, h, app_build, node_build):
+        h.app_build = app_build
+        info = _info()
+        info["node"]["build"] = node_build
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
 
     def test_a_plex_database_only_node_needs_no_version_match(self, h):
         h.client().default_info = _info(version="1.0.0", roles=(ROLE_PLEX_DB,))

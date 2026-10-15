@@ -1,6 +1,6 @@
 """The node's task table: each task is one op run on one file, in its own thread, polled by the app.
 
-A task lives only in this process's memory (gunicorn runs one worker for that reason). The app polls it about once a
+A task lives only in this process's memory (the node is served by one process for that reason). The app polls it about once a
 second; one nobody has polled for ``unpolled_expiry_s`` is cancelled and its temp dir removed, so an app that
 restarted mid-task never leaves FFmpeg running here. A finished task is kept ``finished_keep_s`` after its last poll
 so the app can still fetch the artifact, unless the app deletes it first.
@@ -8,6 +8,7 @@ so the app can still fetch the artifact, unless the app deletes it first.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -71,6 +72,11 @@ class TaskSpecError(ValueError):
 
 class TaskDeletedError(Exception):
     """The app deleted this task id before its start arrived (answered 409, kind ``task_deleted``): nothing runs."""
+
+
+class TaskStartError(Exception):
+    """The node can't take the task (its temp folder is full or can't be written): answered 400, kind ``failed``,
+    so the app fails the file with this message instead of reading a 500 as a node that didn't answer."""
 
 
 def default_temp_root() -> str:
@@ -175,6 +181,7 @@ class NodeTask:
         self._cancel = threading.Event()
         self._paused = threading.Event()
         self._lock = threading.Lock()
+        self.thread: threading.Thread | None = None
 
     # TaskContext ------------------------------------------------------------------------------------------------
 
@@ -334,6 +341,7 @@ class TaskTable:
         Raises:
             TaskSpecError: The spec is malformed or names an op this node doesn't have.
             TaskDeletedError: The app deleted this id in the last ``DELETED_ID_KEEP_S``.
+            TaskStartError: The task's temp folder can't be made.
         """
         if not isinstance(spec, dict):
             raise TaskSpecError("the task spec must be an object")
@@ -353,7 +361,7 @@ class TaskTable:
             self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
-        temp_dir = tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
+        temp_dir = self._make_temp_dir(task_id)
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
             try:
@@ -365,8 +373,29 @@ class TaskTable:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 return task_id
             self._tasks[task_id] = task
-        threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True).start()
+            # Daemon: a hung op must not keep the process alive; close() waits for the rest so their FFmpeg is killed.
+            # Started under the lock, so close() never finds a thread it can't join yet.
+            task.thread = threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True)
+            task.thread.start()
         return task_id
+
+    def _make_temp_dir(self, task_id: str) -> str:
+        """The task's own temp dir, the temp root made again first (a host's tmp cleaner may have removed it).
+
+        Raises:
+            TaskStartError: The folder can't be made (a full disk, no permission).
+        """
+        try:
+            os.makedirs(self.temp_root, exist_ok=True)
+            return tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
+        except OSError as exc:
+            why = exc.strerror or str(exc) or type(exc).__name__
+            if exc.errno == errno.ENOSPC:
+                message = f"The node's temp folder {self.temp_root} is full ({why})"
+            else:
+                message = f"The node couldn't make a folder for the task in its temp folder {self.temp_root} ({why})"
+            logger.warning("Task {} not started: {}", task_id[:8], message)
+            raise TaskStartError(message) from exc
 
     def _run(self, task: NodeTask) -> None:
         try:
@@ -529,10 +558,30 @@ class TaskTable:
             except Exception:  # noqa: BLE001 - the reaper must outlive one bad pass
                 logger.opt(exception=True).warning("The node's task reaper failed one pass")
 
-    def close(self) -> None:
-        """Stop the reaper and drop every task (tests; a node process just exits)."""
+    def close(self, wait_s: float = 0.0) -> None:
+        """Stop the reaper and drop every task: running ones are cancelled, which stops their FFmpeg.
+
+        Args:
+            wait_s: How long to wait, in all, for the cancelled ops to return (a node shutting down waits, so no FFmpeg
+                outlives it and no task dir is left behind; tests don't).
+        """
         self._stop.set()
         with self._lock:
             tasks, self._tasks = list(self._tasks.values()), {}
         for task in tasks:
             self._discard(task)
+        deadline = time.monotonic() + wait_s
+        for task in tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if task.thread is not None and task.thread is not threading.current_thread():
+                task.thread.join(remaining)
+        running = [task for task in tasks if task.thread is not None and task.thread.is_alive()]
+        if wait_s > 0 and running:
+            logger.warning(
+                "{} task(s) still running after {:.0f} s of stopping: {}",
+                len(running),
+                wait_s,
+                ", ".join(f"{task.id[:8]} ({task.op})" for task in running),
+            )

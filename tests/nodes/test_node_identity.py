@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from loguru import logger
@@ -33,7 +36,7 @@ class TestNodeJson:
         path = tmp_path / "node.json"
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
         stored = json.loads(path.read_text())
-        assert stored == {"id": me.id, "key": me.key}
+        assert stored == {"id": me.id, "key": me.key, "announced": True}
         assert len(me.id) == 32 and me.key_generated and me.key_source == "node.json"
 
     def test_same_id_and_key_on_the_next_start(self, tmp_path):
@@ -71,7 +74,7 @@ class TestNodeJson:
 
 class TestKeyPrecedence:
     def test_argument_beats_env_and_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NODE_KEY", "from-node-key")
+        monkeypatch.setenv("NODE_KEY", "from-node-key-0123456789")
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
 
         me = identity.load_identity(str(tmp_path), key="from-arg")
@@ -79,10 +82,10 @@ class TestKeyPrecedence:
         assert (me.key, me.key_source) == ("from-arg", "argument")
 
     def test_node_key_beats_agent_token(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NODE_KEY", "from-node-key")
+        monkeypatch.setenv("NODE_KEY", "from-node-key-0123456789")
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
 
-        assert identity.load_identity(str(tmp_path)).key == "from-node-key"
+        assert identity.load_identity(str(tmp_path)).key == "from-node-key-0123456789"
 
     def test_agent_token_beats_the_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
@@ -126,6 +129,42 @@ class TestKeyPrecedence:
             identity.load_identity(str(tmp_path), key="ключ")
 
 
+class TestPublicOrWeakKeys:
+    @pytest.mark.parametrize("sample", ["change-me-to-a-long-random-key", "change-me", "CHANGE-ME-please-0123456789"])
+    @pytest.mark.parametrize("variable", ["NODE_KEY", "AGENT_TOKEN"])
+    def test_a_docs_example_key_refuses_to_start(self, tmp_path, monkeypatch, variable, sample):
+        monkeypatch.setenv(variable, sample)
+
+        with pytest.raises(SystemExit, match="example key from the docs") as refused:
+            identity.load_identity(str(tmp_path))
+        assert "openssl rand -hex 24" in str(refused.value)
+
+    def test_a_docs_example_key_as_the_argument_refuses_to_start(self, tmp_path):
+        with pytest.raises(SystemExit, match="example key"):
+            identity.load_identity(str(tmp_path), key="change-me")
+
+    @pytest.mark.parametrize("short", ["x", "abc123", "fifteen-chars-x"])
+    def test_a_short_node_key_refuses_to_start(self, tmp_path, monkeypatch, short):
+        monkeypatch.setenv("NODE_KEY", short)
+
+        with pytest.raises(SystemExit, match=f"too short to be safe \\({len(short)} characters; use at least 16\\)"):
+            identity.load_identity(str(tmp_path))
+
+    def test_a_node_key_of_16_characters_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NODE_KEY", "sixteen-chars-ok")
+
+        assert identity.load_identity(str(tmp_path)).key == "sixteen-chars-ok"
+
+    def test_a_plex_helpers_short_agent_token_keeps_working_with_a_warning(self, tmp_path, monkeypatch, warnings_seen):
+        monkeypatch.setenv("AGENT_TOKEN", "old-token")
+
+        me = identity.load_identity(str(tmp_path))
+
+        assert (me.key, me.key_source) == ("old-token", "AGENT_TOKEN")
+        assert [m for m in warnings_seen if "AGENT_TOKEN is only 9 characters" in m and "NODE_KEY" in m]
+        assert not [m for m in warnings_seen if "old-token" in m]
+
+
 class TestKeyNotice:
     def test_generated_key_announced_once(self, tmp_path, warnings_seen):
         me = identity.load_identity(str(tmp_path))
@@ -136,12 +175,74 @@ class TestKeyNotice:
         assert "Add node" in notices[0] and "NODE_KEY" in notices[0]
 
     def test_no_notice_when_the_key_comes_from_env(self, tmp_path, monkeypatch, warnings_seen):
-        monkeypatch.setenv("NODE_KEY", "mine")
+        monkeypatch.setenv("NODE_KEY", "mine-0123456789abcdef")
 
         identity.load_identity(str(tmp_path))
 
         stored_key = json.loads((tmp_path / "node.json").read_text())["key"]
-        assert not [m for m in warnings_seen if stored_key in m or "mine" in m]
+        assert not [m for m in warnings_seen if stored_key in m or "mine-0123456789abcdef" in m]
+
+    def test_a_stored_key_is_announced_the_first_time_it_is_used(self, tmp_path, monkeypatch, warnings_seen):
+        monkeypatch.setenv("NODE_KEY", "a-key-the-user-chose-0123456789")
+        identity.load_identity(str(tmp_path))  # first start (or install.ps1) with NODE_KEY: node.json made, unused
+        monkeypatch.delenv("NODE_KEY")
+
+        later = identity.load_identity(str(tmp_path))  # the next start without it runs on node.json's key
+        identity.load_identity(str(tmp_path))
+
+        assert later.key_source == "node.json"
+        assert len([m for m in warnings_seen if later.key in m]) == 1
+        assert json.loads((tmp_path / "node.json").read_text())["announced"] is True
+
+    def test_a_node_json_from_before_the_flag_is_announced_once(self, tmp_path, warnings_seen):
+        (tmp_path / "node.json").write_text(json.dumps({"id": "a" * 32, "key": "k" * 43}))
+
+        identity.load_identity(str(tmp_path))
+        identity.load_identity(str(tmp_path))
+
+        assert len([m for m in warnings_seen if "k" * 43 in m]) == 1
+
+    def test_a_read_only_node_json_still_starts_and_shows_the_key_again(self, tmp_path, monkeypatch, warnings_seen):
+        identity.load_identity(str(tmp_path), key="from-arg")  # made, unused
+
+        def read_only(*_args):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(identity, "_write_private", read_only)
+
+        first = identity.load_identity(str(tmp_path))
+        second = identity.load_identity(str(tmp_path))
+
+        assert first.key == second.key
+        assert len([m for m in warnings_seen if first.key in m]) == 2
+        assert [m for m in warnings_seen if "shown again next start" in m]
+
+    def test_notice_reaches_docker_logs_but_never_app_log(self, tmp_path):
+        """A worker node runs the app's setup_logging (the full image): its app.log is mode 0644 and goes into bug
+        reports, beside the 0600 node.json meant to be the key's only home. A process of its own, so this one's
+        handlers stay as they are."""
+        script = textwrap.dedent(
+            """
+            import os
+            from loguru import logger
+            from media_preview_generator.logging_config import setup_logging
+            from media_preview_generator.nodes.server import identity
+
+            setup_logging(log_level="INFO")
+            identity.load_identity(os.environ["CONFIG_DIR"])
+            logger.complete()
+            """
+        )
+        env = {k: v for k, v in os.environ.items() if k not in ("NODE_KEY", "AGENT_TOKEN")}
+        env.update(CONFIG_DIR=str(tmp_path), LOG_FORMAT="pretty")
+
+        done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=60)
+
+        assert done.returncode == 0, done.stderr
+        key = json.loads((tmp_path / "node.json").read_text())["key"]
+        assert key in done.stderr
+        app_log = (tmp_path / "logs" / "app.log").read_text()
+        assert key not in app_log and "node.json" not in app_log
 
     def test_notice_never_reaches_the_readable_node_log(self, tmp_path):
         buffer = nodelog.install()

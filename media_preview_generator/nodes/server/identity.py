@@ -1,8 +1,9 @@
 """Who this node is: a stable id, a display name, and the key the app must send.
 
-``<CONFIG_DIR>/node.json`` holds ``{"id", "key"}``, written once with mode 0600. The id never changes, so the app
-can tell this node from another one answering at the same address. The key the node expects is, in order: the one
-passed in, ``NODE_KEY``, ``AGENT_TOKEN`` (what a Plex helper was set up with), else the generated one in node.json.
+``<CONFIG_DIR>/node.json`` holds ``{"id", "key", "announced"}``, written with mode 0600. The id never changes, so the
+app can tell this node from another one answering at the same address. The key the node expects is, in order: the one
+passed in, ``NODE_KEY``, ``AGENT_TOKEN`` (what a Plex helper was set up with), else the generated one in node.json,
+shown once in the console the first time it is the one in use (``announced`` records that it was).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import secrets
 import socket
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from loguru import logger
 
@@ -20,6 +22,12 @@ from ..protocol import sendable_key
 from .nodelog import SECRET_EXTRA
 
 IDENTITY_FILE = "node.json"
+# The examples in the docs and compose files once carried keys with this in them; a key copied from there is public.
+PLACEHOLDER_MARK = "change-me"
+# A key set with NODE_KEY is new, so it must be long enough not to be guessed. A Plex helper's AGENT_TOKEN predates the
+# rule: it keeps working whatever its length (with a warning), so an upgrade never locks the app out.
+MIN_KEY_LENGTH = 16
+MAKE_A_KEY = "openssl rand -hex 24"
 
 
 @dataclass(frozen=True)
@@ -41,17 +49,27 @@ def default_config_dir() -> str:
     return os.environ.get("CONFIG_DIR", "").strip() or "/config"
 
 
-def _check_key(key: str, source: str) -> str:
+def _check_key(key: str, source: str, *, min_length: int = 0) -> str:
     # The app refuses to store a key outside printable ASCII without spaces, so such a key could never match one the
     # app sends: every request would 401 and look like a typo on the app's side. Said once, at start.
     if not sendable_key(key):
         raise SystemExit(
             f"{source} must be printable ASCII with no spaces: the app can't send a key with any other character."
         )
+    if PLACEHOLDER_MARK in key.lower():
+        raise SystemExit(
+            f"{source} is the example key from the docs, so anyone can read it. Remove {source} and the node makes "
+            f"a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
+        )
+    if len(key) < min_length:
+        raise SystemExit(
+            f"{source} is too short to be safe ({len(key)} characters; use at least {min_length}). Remove it and the "
+            f"node makes a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
+        )
     return key
 
 
-def _write_private(path: str, data: dict[str, str]) -> None:
+def _write_private(path: str, data: dict[str, Any]) -> None:
     tmp = f"{path}.tmp-{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -69,7 +87,7 @@ def _write_private(path: str, data: dict[str, str]) -> None:
         raise
 
 
-def _load_or_create(config_dir: str) -> tuple[dict[str, str], bool]:
+def _load_or_create(config_dir: str) -> tuple[dict[str, Any], bool]:
     path = os.path.join(config_dir, IDENTITY_FILE)
     try:
         with open(path, encoding="utf-8") as handle:
@@ -86,8 +104,8 @@ def _load_or_create(config_dir: str) -> tuple[dict[str, str], bool]:
             or not isinstance(stored.get("key"), str)
         ):
             raise SystemExit(f"{path} isn't a node identity file; fix or remove it and restart.")
-        return {"id": stored["id"], "key": stored["key"]}, False
-    data = {"id": uuid.uuid4().hex, "key": secrets.token_urlsafe(32)}
+        return {"id": stored["id"], "key": stored["key"], "announced": stored.get("announced") is True}, False
+    data = {"id": uuid.uuid4().hex, "key": secrets.token_urlsafe(32), "announced": False}
     try:
         os.makedirs(config_dir, exist_ok=True)
         _write_private(path, data)
@@ -112,6 +130,15 @@ def _announce_key(key: str, config_dir: str) -> None:
     logger.bind(**{SECRET_EXTRA: True}).warning("\n" + "\n".join(box))
 
 
+def _mark_announced(config_dir: str, stored: dict[str, Any]) -> None:
+    path = os.path.join(config_dir, IDENTITY_FILE)
+    try:
+        _write_private(path, {**stored, "announced": True})
+    except OSError as exc:
+        # The key still works; it is only shown again at the next start.
+        logger.warning("Couldn't note in {} that its key was shown ({}); it is shown again next start", path, exc)
+
+
 def load_identity(config_dir: str | None = None, *, key: str | None = None) -> NodeIdentity:
     """Read (or create on first start) this node's identity.
 
@@ -123,7 +150,8 @@ def load_identity(config_dir: str | None = None, *, key: str | None = None) -> N
         The identity.
 
     Raises:
-        SystemExit: node.json can't be read or written, or the key isn't printable ASCII.
+        SystemExit: node.json can't be read or written, or the key isn't printable ASCII, is a docs example, or
+            (from ``NODE_KEY``) is shorter than :data:`MIN_KEY_LENGTH`.
     """
     folder = config_dir or default_config_dir()
     stored, created = _load_or_create(folder)
@@ -131,13 +159,23 @@ def load_identity(config_dir: str | None = None, *, key: str | None = None) -> N
     if key is not None:
         chosen, source = _check_key(key.strip(), "The node key"), "argument"
     elif os.environ.get("NODE_KEY", "").strip():
-        chosen, source = _check_key(os.environ["NODE_KEY"].strip(), "NODE_KEY"), "NODE_KEY"
+        chosen = _check_key(os.environ["NODE_KEY"].strip(), "NODE_KEY", min_length=MIN_KEY_LENGTH)
+        source = "NODE_KEY"
     elif os.environ.get("AGENT_TOKEN", "").strip():
         chosen, source = _check_key(os.environ["AGENT_TOKEN"].strip(), "AGENT_TOKEN"), "AGENT_TOKEN"
+        if len(chosen) < MIN_KEY_LENGTH:
+            logger.warning(
+                "AGENT_TOKEN is only {} characters, short enough to be guessed. Set NODE_KEY to a longer one "
+                "(made with: {}) and paste it into the app's node too.",
+                len(chosen),
+                MAKE_A_KEY,
+            )
     else:
         chosen, source = _check_key(stored["key"], os.path.join(folder, IDENTITY_FILE) + "'s key"), IDENTITY_FILE
-        if created:
+        # Not "when created": a node first started with NODE_KEY and later without it runs on this key from then on.
+        if not stored["announced"]:
             _announce_key(chosen, folder)
+            _mark_announced(folder, stored)
     return NodeIdentity(
         id=stored["id"], name=name, key=chosen, key_source=source, key_generated=created and source == IDENTITY_FILE
     )

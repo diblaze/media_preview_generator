@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tarfile
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -32,6 +34,10 @@ def ctx(tmp_path):
 @pytest.fixture(autouse=True)
 def _node_ffmpeg(monkeypatch):
     monkeypatch.setattr(ops, "_node_ffmpeg", lambda: "/node/ffmpeg")
+    # credits_find points the process pool's CPU helper count at the node's own tasks; undone after each test.
+    monkeypatch.setattr(textdet_helper, "_cpu_limit_source", None)
+    monkeypatch.setattr(ops, "_cpu_credits_running", 0)
+    monkeypatch.setattr(ops, "_cpu_credits_most", 0)
 
 
 def test_every_protocol_op_is_registered():
@@ -104,6 +110,17 @@ class TestPreviewFrames:
             ops.preview_frames(ctx, NODE_PATH, self.PARAMS)
         assert raised.value.kind == protocol.KIND_CANCELLED
         assert raised.value.extra["error_type"] == "CancellationError"
+
+    @pytest.mark.parametrize("value", ["hable,drawtext=text=x", "HABLE", "", None, 3])
+    def test_a_tonemap_the_app_cant_send_runs_no_ffmpeg(self, ctx, monkeypatch, value):
+        ran = []
+        monkeypatch.setattr(generator, "generate_images", lambda *a, **k: ran.append(1))
+
+        with pytest.raises(OpError) as raised:
+            ops.preview_frames(ctx, NODE_PATH, {**self.PARAMS, "tonemap_algorithm": value})
+
+        assert raised.value.kind == protocol.KIND_FAILED and "tonemap_algorithm must be one of" in raised.value.message
+        assert ran == []
 
 
 class TestLoudness:
@@ -266,6 +283,24 @@ class TestEndPicture:
             ops.intro_end_picture(ctx, NODE_PATH, self.PARAMS)
         assert raised.value.kind == protocol.KIND_FAILED
 
+    @pytest.mark.parametrize("value", ["nv12,drawtext=text=x", "yuv420p", 1])
+    def test_a_download_format_the_app_cant_send_runs_no_ffmpeg(self, ctx, monkeypatch, value):
+        ran = []
+        monkeypatch.setattr(end_picture, "decode_frames", lambda *a, **k: ran.append(1))
+
+        with pytest.raises(OpError) as raised:
+            ops.intro_end_picture(ctx, NODE_PATH, {**self.PARAMS, "download_format": value})
+
+        assert raised.value.kind == protocol.KIND_FAILED and ran == []
+
+    def test_no_download_format_is_allowed(self, ctx, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(end_picture, "decode_frames", lambda *a, **k: seen.update(k) or [])
+
+        ops.intro_end_picture(ctx, NODE_PATH, {**self.PARAMS, "download_format": None})
+
+        assert seen["download_format"] is None
+
 
 class _Pool:
     def __init__(self):
@@ -359,3 +394,76 @@ class TestCredits:
         assert raised.value.kind == kind
         assert raised.value.extra["error_type"] == type(error).__name__
         assert raised.value.extra.get("stderr_tail") == extra
+
+    def test_two_cpu_tasks_on_a_node_detect_text_side_by_side(self, tmp_path, monkeypatch):
+        # A node process: no saved settings, a fresh process pool whose helpers are faked to take a second each.
+        from media_preview_generator.web import settings_manager
+
+        monkeypatch.setattr(settings_manager, "peek_settings_manager", lambda: None)
+        monkeypatch.setattr(textdet_helper, "_pool", None)
+        lock = threading.Lock()
+        inside = {"now": 0, "most": 0}
+
+        def on_helper(self, key, planes, spec, accept=None, read=False):
+            with lock:
+                inside["now"] += 1
+                inside["most"] = max(inside["most"], inside["now"])
+            time.sleep(1.0)
+            with lock:
+                inside["now"] -= 1
+            return [() for _ in range(len(planes))]
+
+        def find_credits(path, *, detect_boxes, **_kwargs):
+            detect_boxes(np.zeros((1, 8, 8), dtype=np.uint8))
+            return detector.CreditsTextResult(None, None, (), (), ())
+
+        monkeypatch.setattr(textdet_helper.TextDetectorPool, "_on_helper", on_helper)
+        monkeypatch.setattr(detector, "find_credits", find_credits)
+        params = {**self.PARAMS, "gpu_worker": False}
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                ops.credits_find(FakeTaskContext(str(tmp_path), None), NODE_PATH, params)
+            except BaseException as exc:  # noqa: BLE001 - reported by the assert below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        finally:
+            if textdet_helper._pool is not None:
+                textdet_helper._pool.close_all()
+
+        assert errors == []
+        assert inside["most"] == 2, f"text detection ran {inside['most']} at a time for two CPU tasks"
+        assert ops._cpu_credits_running == 0 and ops._cpu_credits_cap() == 2
+
+    def test_a_gpu_workers_task_isnt_counted_against_the_cpu_cap(self, ctx, monkeypatch):
+        seen = []
+        monkeypatch.setattr(textdet_helper, "get_textdet_pool", _Pool)
+        monkeypatch.setattr(
+            detector,
+            "find_credits",
+            lambda path, **kw: (
+                seen.append(ops._cpu_credits_cap()) or detector.CreditsTextResult(None, None, (), (), ())
+            ),
+        )
+
+        ops.credits_find(ctx, NODE_PATH, {**self.PARAMS, "gpu_worker": True})
+        ops.credits_find(ctx, NODE_PATH, {**self.PARAMS, "gpu_worker": False})
+
+        assert seen == [0, 1] and textdet_helper._cpu_limit() == 1
+
+    def test_a_tail_that_isnt_a_number_runs_no_decode(self, ctx, monkeypatch):
+        ran = []
+        monkeypatch.setattr(textdet_helper, "get_textdet_pool", _Pool)
+        monkeypatch.setattr(detector, "find_credits", lambda *a, **k: ran.append(1))
+
+        with pytest.raises(ValueError):
+            ops.credits_find(ctx, NODE_PATH, {**self.PARAMS, "tail_s": "30,drawtext=text=x"})
+
+        assert ran == []

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import threading
 import time
 
@@ -211,6 +213,28 @@ class TestSpecValidation:
     def test_non_object_spec_is_refused(self, make_table):
         with pytest.raises(tasks.TaskSpecError):
             make_table({}).start([])
+
+
+class TestTempFolder:
+    def test_a_temp_root_removed_after_start_is_made_again(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {}})
+        shutil.rmtree(table.temp_root)  # a host's tmp cleaner, or a share remounted under NODE_TEMP_DIR
+
+        task_id = table.start(_spec(media))
+
+        assert _finished(table, task_id)["status"] == protocol.STATUS_DONE
+
+    def test_a_full_temp_disk_refuses_the_start_with_the_cause(self, make_table, media, monkeypatch):
+        table = make_table({"test.op": lambda *a: {}})
+
+        def full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tasks.tempfile, "mkdtemp", full)
+
+        with pytest.raises(tasks.TaskStartError, match="temp folder .* is full \\(No space left on device\\)"):
+            table.start(_spec(media))
+        assert table.busy() == 0
 
 
 class TestClientTaskId:
@@ -522,6 +546,46 @@ class TestExpiry:
         table.delete(task_id)
 
         _until(lambda: not os.path.exists(seen["temp"]))
+
+    def test_closing_cancels_running_ops_and_waits_for_them(self, make_table, media):
+        """A node that stops (SIGTERM) waits for its cancelled ops, so their FFmpeg is stopped, not orphaned."""
+        seen, stopped = {}, threading.Event()
+
+        def op(ctx, node_path, params):
+            seen["temp"] = ctx.temp_dir
+            _until(ctx.cancel_check)
+            time.sleep(0.3)  # stopping FFmpeg takes a moment
+            stopped.set()
+            return {}
+
+        table = make_table({"test.op": op})
+        table.start(_spec(media))
+        _until(lambda: "temp" in seen)
+
+        table.close(wait_s=5)
+
+        assert stopped.is_set() and not os.path.exists(seen["temp"])
+
+    def test_closing_waits_no_longer_than_asked_for_an_op_that_never_stops(self, make_table, media, monkeypatch):
+        release = threading.Event()
+        warned: list[str] = []
+        monkeypatch.setattr(tasks.logger, "warning", lambda message, *args: warned.append(message.format(*args)))
+
+        def op(ctx, node_path, params):
+            release.wait(10)
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        start = time.monotonic()
+        try:
+            table.close(wait_s=0.3)
+            waited = time.monotonic() - start
+        finally:
+            release.set()
+
+        assert 0.25 <= waited < 2
+        assert [line for line in warned if task_id[:8] in line and "still running" in line]
 
     def test_leftover_task_dirs_from_a_dead_process_are_removed_at_start(self, tmp_path):
         root = tmp_path / "node-tmp"

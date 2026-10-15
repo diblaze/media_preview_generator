@@ -8,6 +8,7 @@ temporary directories, and helper functions for mocking FFmpeg and Plex.
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -239,6 +240,18 @@ def _reset_frame_cache_between_tests():
     reset_frame_cache()
     yield
     reset_frame_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_textdet_cpu_limit_source():
+    """A node's credits op sizes the process text-detection pool by its own tasks; the app's tests size it by the
+    settings. Looked up, not imported: most tests never load text detection (and some put a stand-in there)."""
+    yield
+    reset = getattr(
+        sys.modules.get("media_preview_generator.markers.credits.textdet_helper"), "set_cpu_limit_source", None
+    )
+    if callable(reset):
+        reset(None)
 
 
 @pytest.fixture(autouse=True)

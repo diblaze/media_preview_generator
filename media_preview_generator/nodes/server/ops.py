@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import os
 import tarfile
+import threading
 import uuid
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
@@ -83,6 +86,26 @@ class _Reporter:
         self._send()
 
 
+def _choice(params: dict, name: str, allowed: Collection[str], *, optional: bool = False) -> str | None:
+    """``params[name]`` when it is one of ``allowed`` (or None when ``optional``).
+
+    These values are written into FFmpeg filter strings, where a comma or a colon starts another filter or option: only
+    the names the app itself can send are let through.
+
+    Raises:
+        OpError: Kind ``failed``: any other value.
+    """
+    value = params.get(name)
+    if (value is None and optional) or (isinstance(value, str) and value in allowed):
+        return value
+    raise OpError(protocol.KIND_FAILED, f"{name} must be one of {', '.join(sorted(allowed))}, not {value!r}")
+
+
+def _optional_float(params: dict, name: str) -> float | None:
+    value = params.get(name)
+    return None if value is None else float(value)
+
+
 def _op_error(ctx: TaskContext, exc: BaseException, *, gpu_failed: bool = False, **extra: object) -> OpError:
     """The OpError for an exception the app raises again by name: cancelled once the job is, else a GPU or plain failure."""
     if ctx.cancel_check():
@@ -109,6 +132,7 @@ class PreviewConfig:
 
 def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
     """``generate_images`` into the task's temp dir; the JPEGs (sorted) become the task's artifact tar."""
+    from ...config.validation import VALID_TONEMAP_ALGORITHMS
     from ...processing.generator import (
         FALLBACK_HWACCEL,
         FALLBACK_SIGNAL,
@@ -122,7 +146,7 @@ def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
 
     config = PreviewConfig(
         plex_bif_frame_interval=int(params["frame_interval"]),
-        tonemap_algorithm=str(params["tonemap_algorithm"]),
+        tonemap_algorithm=_choice(params, "tonemap_algorithm", VALID_TONEMAP_ALGORITHMS),
         thumbnail_quality=int(params["thumbnail_quality"]),
         ffmpeg_threads=int(params["ffmpeg_threads"]),
         log_level=str(params.get("log_level") or "INFO"),
@@ -268,7 +292,7 @@ def intro_end_picture(ctx: TaskContext, node_path: str, params: dict) -> dict:
             gpu_device_path=device,
             container_start_s=float(params["container_start_s"]),
             cancel_check=ctx.cancel_check,
-            download_format=params.get("download_format"),
+            download_format=_choice(params, "download_format", set(frames.DOWNLOAD_FORMATS.values()), optional=True),
             pause_check=ctx.pause_check,
             ffmpeg_threads=None if threads is None else int(threads),
             fallback_callback=reporter.fallback,
@@ -283,13 +307,49 @@ def intro_end_picture(ctx: TaskContext, node_path: str, params: dict) -> dict:
     return {"frames": [{"t": float(t), "frame": protocol.encode_array(a, "float32")} for t, a in decoded]}
 
 
+# The app caps its CPU text-detection helpers at its saved CPU worker count; a node has no settings, and runs exactly
+# the CPU credits tasks the app's members send it. So its cap is the most of them it has run at once: never lower, so
+# a helper isn't stopped between one file and the next only to be started again (idle helpers leave on their own).
+_credits_lock = threading.Lock()
+_cpu_credits_running = 0
+_cpu_credits_most = 0
+
+
+def _cpu_credits_cap() -> int:
+    with _credits_lock:
+        return _cpu_credits_most
+
+
+@contextmanager
+def _counted_credits_task(*, on_cpu_worker: bool) -> Iterator[None]:
+    """Count a CPU worker's credits task as running while inside (a GPU worker's text detection is never capped)."""
+    global _cpu_credits_running, _cpu_credits_most
+    if not on_cpu_worker:
+        yield
+        return
+    with _credits_lock:
+        _cpu_credits_running += 1
+        _cpu_credits_most = max(_cpu_credits_most, _cpu_credits_running)
+    try:
+        yield
+    finally:
+        with _credits_lock:
+            _cpu_credits_running -= 1
+
+
 def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
     """``find_credits`` with this node's own text-detection pool; its CPU notes go out as progress ``fallbacks``."""
     from ...markers.credits import frames
     from ...markers.credits.detector import find_credits
-    from ...markers.credits.textdet_helper import TextDetCancelledError, TextDetUnavailableError, get_textdet_pool
+    from ...markers.credits.textdet_helper import (
+        TextDetCancelledError,
+        TextDetUnavailableError,
+        get_textdet_pool,
+        set_cpu_limit_source,
+    )
 
     gpu, device = ctx.gpu or (None, None)
+    set_cpu_limit_source(_cpu_credits_cap)
     pool = get_textdet_pool()
     reporter = _Reporter(ctx)
     detect: dict[str, Any] = {
@@ -300,36 +360,37 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
         "cancel_check": ctx.cancel_check,
     }
     threads = params.get("ffmpeg_threads")
-    try:
-        result = find_credits(
-            node_path,
-            duration_ms=int(params["duration_ms"]),
-            is_episode=bool(params["is_episode"]),
-            tail_s=params.get("tail_s"),
-            ffmpeg=_node_ffmpeg(),
-            detect_boxes=lambda planes: pool.detect_boxes(planes, **detect),
-            read_text=(lambda planes: pool.read_text(planes, **detect)) if params.get("read_text", True) else None,
-            gpu=gpu,
-            gpu_device_path=device,
-            cancel_check=ctx.cancel_check,
-            phase=reporter.phase,
-            earliest_start_s=params.get("earliest_start_s"),
-            pause_check=ctx.pause_check,
-            ffmpeg_threads=None if threads is None else int(threads),
-            progress_callback=reporter.worker_progress if params.get("progress") else None,
-        )
-    except frames.GpuReadNothingError as exc:
-        # Not the GPU's failure: the app reads the file again on the CPU to tell (detect_credits_text).
-        raise _op_error(ctx, exc) from exc
-    except frames.GpuDecodeError as exc:
-        raise _op_error(ctx, exc, gpu_failed=True, stderr_tail=list(exc.stderr_tail)) from exc
-    except (
-        frames.FrameDecodeError,
-        frames.DecodeCancelledError,
-        TextDetCancelledError,
-        TextDetUnavailableError,
-    ) as exc:
-        raise _op_error(ctx, exc) from exc
+    with _counted_credits_task(on_cpu_worker=not detect["gpu_worker"]):
+        try:
+            result = find_credits(
+                node_path,
+                duration_ms=int(params["duration_ms"]),
+                is_episode=bool(params["is_episode"]),
+                tail_s=_optional_float(params, "tail_s"),
+                ffmpeg=_node_ffmpeg(),
+                detect_boxes=lambda planes: pool.detect_boxes(planes, **detect),
+                read_text=(lambda planes: pool.read_text(planes, **detect)) if params.get("read_text", True) else None,
+                gpu=gpu,
+                gpu_device_path=device,
+                cancel_check=ctx.cancel_check,
+                phase=reporter.phase,
+                earliest_start_s=_optional_float(params, "earliest_start_s"),
+                pause_check=ctx.pause_check,
+                ffmpeg_threads=None if threads is None else int(threads),
+                progress_callback=reporter.worker_progress if params.get("progress") else None,
+            )
+        except frames.GpuReadNothingError as exc:
+            # Not the GPU's failure: the app reads the file again on the CPU to tell (detect_credits_text).
+            raise _op_error(ctx, exc) from exc
+        except frames.GpuDecodeError as exc:
+            raise _op_error(ctx, exc, gpu_failed=True, stderr_tail=list(exc.stderr_tail)) from exc
+        except (
+            frames.FrameDecodeError,
+            frames.DecodeCancelledError,
+            TextDetCancelledError,
+            TextDetUnavailableError,
+        ) as exc:
+            raise _op_error(ctx, exc) from exc
     return {"result": _jsonable(result)}
 
 

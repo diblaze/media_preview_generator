@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -75,6 +76,12 @@ class TestAuth:
         assert body["node"]["version"] == __version__
         assert body["node"]["protocols"] == [1] and body["node"]["roles"] == ["worker"]
         assert "agent" not in body
+
+    @pytest.mark.parametrize(("sha", "build"), [("ABCDEF0123456789", "abcdef0123456789"), ("unknown", ""), ("", "")])
+    def test_the_node_block_carries_the_images_commit(self, make_app, monkeypatch, sha, build):
+        monkeypatch.setenv("GIT_SHA", sha)
+
+        assert make_app().test_client().get("/v1/health").get_json()["node"]["build"] == build
 
     @pytest.mark.parametrize(
         "headers",
@@ -158,8 +165,23 @@ class TestInfo:
         assert worker["temp"]["path"] == os.environ["NODE_TEMP_DIR"] and worker["temp"]["free_bytes"] > 0
         assert worker["busy"] == 0
         assert worker["ffmpeg"] == {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"}
-        assert worker["gpu_checked_at"] is not None
+        assert worker["gpu_checked_at"] is not None and worker["gpu_error"] is None
         assert "plex_db" not in body
+
+    def test_info_still_answers_when_gpu_detection_raises(self, make_app, monkeypatch):
+        import media_preview_generator.gpu.detect as gpu_detect
+
+        def detect():
+            raise OSError("vulkaninfo: device lost")
+
+        monkeypatch.setattr(gpu_detect, "detect_all_gpus", detect)
+
+        response = make_app().test_client().get("/v1/info", headers=HEADERS)
+
+        assert response.status_code == 200
+        worker = response.get_json()["worker"]
+        assert worker["gpus"] == [] and worker["gpu_error"] == "OSError: vulkaninfo: device lost"
+        assert worker["cpu"]["cores"] >= 1
 
     def test_rescan_runs_detection_again(self, make_app, monkeypatch):
         import media_preview_generator.gpu.detect as gpu_detect
@@ -287,6 +309,22 @@ class TestTaskRoutes:
 
         assert response.status_code == 404 and response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
 
+    def test_a_full_temp_disk_is_400_with_the_cause_not_500(self, make_app, media, monkeypatch):
+        import tempfile
+
+        def full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkdtemp", full)
+        spec = {"op": "test.op", "path": "/data/a.mkv", "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}
+
+        response = make_app(ops={"test.op": lambda *a: {}}).test_client().post("/v1/tasks", headers=HEADERS, json=spec)
+
+        # Below 500: the app reads any 5xx as a node that didn't answer, and would bounce the file instead.
+        assert response.status_code == 400
+        error = response.get_json()["error"]
+        assert error["kind"] == protocol.KIND_FAILED and "is full (No space left on device)" in error["message"]
+
     def test_unknown_op_is_400(self, make_app):
         response = make_app().test_client().post("/v1/tasks", headers=HEADERS, json={"op": "x", "path": "/a"})
 
@@ -398,6 +436,28 @@ class TestRoles:
 
         assert client.post("/v1/gpus/rescan", headers=HEADERS).status_code == 400
         assert client.post("/v1/tasks", headers=HEADERS, json={"op": "preview.frames", "path": "/a"}).status_code == 400
+
+    def test_plex_db_only_node_lists_no_folders(self, make_app, monkeypatch, tmp_path):
+        fake = types.ModuleType("media_preview_generator.nodes.server.plex_db")
+        fake.register_plex_db = lambda app, **kwargs: None
+        fake.agent_block = lambda: {}
+        monkeypatch.setitem(sys.modules, fake.__name__, fake)
+        monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
+        monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
+        private = tmp_path / "Users" / "steve" / "Documents"
+        private.mkdir(parents=True)
+        (private / "passwords.kdbx").write_bytes(b"secret")
+        body = {
+            "mapping": [{"app_prefix": "/x", "node_prefix": str(tmp_path)}],
+            "files": [{"path": "/x/Users/steve/Documents/nope/a.mkv"}],
+        }
+
+        response = make_app(roles=["plex_db"]).test_client().post("/v1/access-check", headers=HEADERS, json=body)
+
+        assert response.status_code == 400
+        answer = response.get_json()
+        assert answer["error"]["kind"] == protocol.KIND_REQUEST and "nearby" not in answer
+        assert "passwords" not in response.get_data(as_text=True)
 
     def test_plex_db_only_node_loads_no_worker_modules(self, tmp_path):
         script = f"""

@@ -304,6 +304,23 @@ class TestStdlibLogging:
             assert "Checking chapters" not in text
             assert "Failed: unreadable" in text
 
+    def test_a_console_only_line_reaches_the_console_and_nothing_else(self, start):
+        from loguru import logger
+
+        read = start("DEBUG")
+        logger.bind(**{_logging_mod.CONSOLE_ONLY: True}).warning("This node made its key: k3y-0nly-f0r-the-c0ns0le")
+        logger.warning("an ordinary line")
+
+        console, app_log, live = read()
+        assert "k3y-0nly-f0r-the-c0ns0le" in console
+        assert "k3y-0nly-f0r-the-c0ns0le" not in app_log and "k3y-0nly-f0r-the-c0ns0le" not in live
+        assert "an ordinary line" in app_log and "an ordinary line" in live
+
+    def test_the_console_only_name_is_the_node_logs_secret_name(self):
+        from media_preview_generator.nodes.server import nodelog
+
+        assert _logging_mod.CONSOLE_ONLY == nodelog.SECRET_EXTRA
+
     def test_a_per_file_job_log_line_is_written_when_the_app_logs_at_debug(self, start):
         from media_preview_generator.markers.job_log import write_line
 

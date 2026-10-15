@@ -257,6 +257,7 @@ class NodeRegistry:
         record_uid: Persists the ``node_uid`` a node reported on first contact.
         quick_access: Checks one file per mapping row on a node; True when every one is visible.
         app_version: This app's version (a worker node must match it exactly).
+        app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
         attempt_gap_s: Seconds between the attempts of one check.
         clock: Monotonic seconds.
         wall_clock: Epoch seconds (for ``last_seen``).
@@ -272,6 +273,7 @@ class NodeRegistry:
         record_uid: Callable[[str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
         app_version: Callable[[], str] = _app_version,
+        app_build: Callable[[], str] = protocol.build_sha,
         attempt_gap_s: float = ATTEMPT_GAP_S,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -286,6 +288,7 @@ class NodeRegistry:
         self._record_uid = record_uid
         self._quick_access = quick_access
         self._app_version = app_version
+        self._app_build = app_build
         self._attempt_gap_s = attempt_gap_s
         self._clock = clock
         self._wall_clock = wall_clock
@@ -805,6 +808,14 @@ class NodeRegistry:
                 STATE_UPDATE_NEEDED,
                 f"{name} runs version {version or 'unknown'} and this app runs {app_version}. Update the node to "
                 f"{app_version}.",
+                **outcome,
+            )
+        build, app_build = str(block.get("build") or ""), self._app_build()
+        if protocol.ROLE_WORKER in roles and build and app_build and build != app_build:
+            return _Outcome(
+                STATE_UPDATE_NEEDED,
+                f"{name} runs another build of version {version} ({build[:7]}) than this app ({app_build[:7]}). "
+                "Update the node to the app's image.",
                 **outcome,
             )
         agent = info.get("agent")

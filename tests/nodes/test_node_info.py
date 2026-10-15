@@ -64,6 +64,61 @@ class TestDetection:
         finally:
             worker.stop()
 
+    def test_a_detection_that_raises_reports_no_gpus_and_its_error(self, tmp_path):
+        def detect():
+            raise OSError("vulkaninfo: device lost")
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+
+        block = worker.block(busy=0)
+
+        assert block["gpus"] == [] and block["gpu_checked_at"] is not None
+        assert block["gpu_error"] == "OSError: vulkaninfo: device lost"
+
+    def test_a_working_detection_clears_the_error(self, tmp_path):
+        results = [OSError("device lost"), [("NVIDIA", "cuda:0", {"name": "GPU 0"})]]
+
+        def detect():
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+        worker.rescan()
+
+        worker.rescan()
+
+        block = worker.block(busy=0)
+        assert [g["device"] for g in block["gpus"]] == ["cuda:0"] and block["gpu_error"] is None
+
+    def test_the_cached_answer_doesnt_wait_for_a_recheck(self, tmp_path):
+        recheck_started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def detect():
+            calls.append(1)
+            if len(calls) > 1:
+                recheck_started.set()
+                release.wait(10)  # a slow re-check: a busy or wedged GPU's FFmpeg test
+            return [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+        worker.rescan()
+        recheck = threading.Thread(target=worker.rescan, daemon=True)
+        recheck.start()
+        try:
+            assert recheck_started.wait(5)
+            answered = []
+            reader = threading.Thread(target=lambda: answered.append(worker.block(busy=0)), daemon=True)
+            reader.start()
+            reader.join(2)
+
+            assert answered and answered[0]["gpus"][0]["device"] == "cuda:0"
+        finally:
+            release.set()
+            recheck.join(5)
+
     def test_entries_are_json_safe(self):
         entry = info._gpu_entry(("AMD", "/dev/dri/renderD128", {"status": "failed", "error": ValueError("x")}))
 

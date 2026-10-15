@@ -7,5 +7,5 @@ urllib3>=2.8.0,<3.0.0
 loguru==0.7.3
 flask>=3.0.0,<4
 werkzeug>=3.1.9,<3.2
-gunicorn>=22.0.0,<24
+waitress==3.0.2
 pillow>=12.2.0,<14
