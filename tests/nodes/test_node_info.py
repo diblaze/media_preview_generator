@@ -137,6 +137,41 @@ class TestDetection:
             release.set()
             recheck.join(5)
 
+    def test_info_during_the_first_detection_waits_for_it_instead_of_detecting_again(self, tmp_path):
+        # A second detection right after the first doubled the first /v1/info's time and logged every GPU twice.
+        calls = []
+        first_started = threading.Event()
+
+        def detect():
+            calls.append(1)
+            first_started.set()
+            time.sleep(0.5)
+            return [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), recheck_s=3600, detect=detect)
+        worker.start()
+        try:
+            assert first_started.wait(5)
+
+            block = worker.block(busy=0)
+        finally:
+            worker.stop()
+
+        assert [g["device"] for g in block["gpus"]] == ["cuda:0"]
+        assert len(calls) == 1
+
+    def test_info_detects_itself_when_the_loop_ended_without_an_answer(self, tmp_path):
+        calls = []
+        worker = info.WorkerInfo(
+            temp_root=str(tmp_path), detect=lambda: calls.append(1) or [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+        )
+        # A loop thread that ended before its first pass stored anything: waiting for it would wait forever.
+        worker._thread = threading.Thread(target=lambda: None)
+        worker._thread.start()
+        worker._thread.join(5)
+
+        assert [g["device"] for g in worker.gpus()] == ["cuda:0"] and len(calls) == 1
+
     def test_entries_are_json_safe(self):
         entry = info._gpu_entry(("AMD", "/dev/dri/renderD128", {"status": "failed", "error": ValueError("x")}))
 

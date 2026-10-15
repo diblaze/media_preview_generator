@@ -141,6 +141,8 @@ class WorkerInfo:
         self._cache_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
+        # Set once any detection has stored its answer.
+        self._detected = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -189,10 +191,19 @@ class WorkerInfo:
                 error = f"{type(exc).__name__}: {exc}"
             with self._cache_lock:
                 self._gpus, self._checked_at, self._gpu_error = found, time.time(), error
+            self._detected.set()
             return [dict(entry) for entry in found]
 
     def gpus(self) -> list[dict[str, Any]]:
-        """The cached GPU list (detected now if nothing has detected yet), with ``credit_text`` where known."""
+        """The cached GPU list, with ``credit_text`` where known.
+
+        Before any detection has answered, it waits for the background loop's first pass (one detection, not a second
+        of its own after it), or detects now when no loop is running.
+        """
+        thread = self._thread
+        if thread is not None:
+            while not self._detected.wait(1.0) and thread.is_alive():
+                pass
         with self._cache_lock:
             cached = self._gpus
         found = cached if cached is not None else self.rescan()
