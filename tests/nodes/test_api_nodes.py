@@ -1054,9 +1054,11 @@ class TestHealthAndLog:
 
     def test_the_log_of_an_older_plex_helper_says_it_cant_share_one_in_plain_words(self, client, nodes):
         """Not a failure: the Log tab of every older helper logged a 502 in the browser console."""
-        node_id = _add(client).get_json()["id"]
         refusal = "This Plex marker agent is version 1.0.0 and speaks protocol 1; the app asked for none."
+        nodes("http://nuc:9494").info_answer = NodeProtocolError(refusal)
         nodes("http://nuc:9494").log_answer = NodeProtocolError(refusal)
+        node_id = _add(client).get_json()["id"]
+        assert _checked(client, node_id)["legacy"] is True
         resp = client.get(f"/api/nodes/{node_id}/log")
         assert resp.status_code == 200
         assert resp.get_json() == {
@@ -1064,6 +1066,24 @@ class TestHealthAndLog:
             "message": "This Plex database node is an older release and can't share its log. Update it to see its "
             "log here.",
         }
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            NodeProtocolError("http://nuc:9494 answered with a web page", web_page=True),
+            NodeProtocolError("http://nuc:9494 is this app", app_instance="abc"),
+        ],
+        ids=["web_page", "this_app"],
+    )
+    def test_the_log_of_something_else_at_a_worker_nodes_address_says_so(self, client, nodes, refusal):
+        """Only a node the check found to be an older Plex helper is called one: a worker node whose address now
+        answers with a web page (or this app) read "This Plex database node is an older release"."""
+        node_id = _add(client).get_json()["id"]
+        assert _checked(client, node_id)["legacy"] is False
+        nodes("http://nuc:9494").log_answer = refusal
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 502
+        assert resp.get_json() == {"error": "Something else answers at nuc's address."}
 
 
 class TestAuth:

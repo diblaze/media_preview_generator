@@ -217,6 +217,27 @@ def test_dashboard_shows_node_chip_zero_reason_and_offline_worker_card(
     expect(local.locator(".node-chip")).to_have_count(0)
 
 
+def test_an_offline_nodes_line_doesnt_say_other_devices_keep_working_when_none_do(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    """Every other group off: nothing else runs, so "other devices keep working" wasn't true."""
+    offline_node_group(group_api)
+    state = group_api["state"]
+    state["groups"][0]["enabled"] = False
+    state["capacity"]["groups"][0]["members"][0].update(target=0, busy=0)
+    state["groups"][1]["members"] = [m for m in state["groups"][1]["members"] if m["id"] != "m-gpu"]
+    video = state["capacity"]["groups"][1]
+    video["members"] = [m for m in video["members"] if m["id"] != "m-gpu"]
+    mock_dashboard_defaults(authed_page)
+    authed_page.goto(app_url + "/")
+    block = authed_page.locator('[data-member-block="gpu-video:m-laptop"]')
+    expect(block.locator(".msg")).to_have_text("old-laptop · GTX 1650: node offline. Its jobs wait. Open old-laptop")
+    chip = block.locator("[data-node-zero]")
+    expect(chip).to_have_attribute("data-bs-title", "Its jobs wait for old-laptop.")
+
+
 @pytest.mark.parametrize(
     ("node_state", "text", "tone"),
     [
@@ -253,6 +274,42 @@ def test_a_worker_cards_node_state_has_the_nodes_pages_name_and_colour(
     badge = authed_page.locator('[data-worker-key="GPU_4"] [data-status-badge]')
     expect(badge).to_have_text(text)
     expect(badge).to_have_class(f"pill {tone}")
+
+
+@pytest.mark.parametrize(
+    ("cause", "text"),
+    [
+        ("restarting", "Node restarting"),
+        ("rate_limited", "Node asks to wait"),
+        ("unreachable", "Node offline"),
+        ("", "Node offline"),
+    ],
+)
+def test_a_worker_card_says_why_its_offline_node_is_offline(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+    cause: str,
+    text: str,
+) -> None:
+    """A restarting node's card read "Node offline" while the bell and Workers said it is restarting."""
+    offline_node_group(group_api)
+    mock_dashboard_defaults(authed_page)
+    worker = {
+        "worker_id": 4,
+        "worker_type": "GPU",
+        "worker_name": "old-laptop · GPU Worker 1 (GTX 1650)",
+        "group_name": "Video",
+        "group_id": "gpu-video",
+        "member_id": "m-laptop",
+        "status": "idle",
+        "node": {"id": "laptop", "name": "old-laptop"},
+        "node_state": "offline",
+        "node_cause": cause,
+    }
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [worker]}))
+    authed_page.goto(app_url + "/")
+    expect(authed_page.locator('[data-worker-key="GPU_4"] [data-status-badge]')).to_have_text(text)
 
 
 LONG_REASON = (

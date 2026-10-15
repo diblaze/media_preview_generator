@@ -3320,7 +3320,10 @@ function _patchWorkerCard(col, worker) {
     const nodeStateText = String(nodeState ? nodeState.label : worker.node_state);
     // "Node offline", "Node FFmpeg missing": only a capitalised word is lowered, never a name like FFmpeg or GPU.
     const nodeStatus = /^[A-Z][a-z]/.test(nodeStateText) ? nodeStateText[0].toLowerCase() + nodeStateText.slice(1) : nodeStateText;
-    const workerStatus = nodeDown ? `Node ${nodeStatus}` : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
+    // An offline node that answered ("node restarting", "node asks to wait") isn't called offline.
+    const nodeCause = nodeState?.causes?.[worker.node_cause];
+    const nodeText = nodeCause ? nodeCause[0].toUpperCase() + nodeCause.slice(1) : `Node ${nodeStatus}`;
+    const workerStatus = nodeDown ? nodeText : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
     if (statusEl.textContent !== workerStatus) {
         statusEl.textContent = workerStatus;
     }

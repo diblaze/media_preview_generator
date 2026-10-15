@@ -662,3 +662,16 @@ class TestWorkerStatuses:
         pool.reconcile_groups(groups, [])
         (status,) = JobDispatcher(pool)._build_worker_statuses()
         assert (status["node_state"], status["retiring"]) == ("offline", True)
+
+    @pytest.mark.parametrize("cause", ["restarting", "rate_limited", "unreachable"])
+    def test_a_worker_on_an_offline_node_carries_why_it_is_offline(self, registry, cause):
+        """The dashboard card called a restarting node "offline": it only had the state to go by."""
+        registry.put("storage")
+        pool = WorkerPool(0, 0, [])
+        groups = [group("g", member("ncpu", count=1, node="storage"))]
+        pool.reconcile_groups(groups, [])
+        pool.workers[0].is_busy = True
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline", cause=cause)
+        pool.reconcile_groups(groups, [])
+        (status,) = JobDispatcher(pool)._build_worker_statuses()
+        assert (status["node_state"], status["node_cause"]) == ("offline", cause)

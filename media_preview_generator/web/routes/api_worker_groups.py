@@ -195,6 +195,16 @@ def _member_label(policy: dict, nodes: NodeHardware) -> str:
     return f"{nodes.node_name(policy['node'])} · {named or label}"
 
 
+def _others_working(rows: list[dict], group_id: str, member_id: str) -> bool:
+    """Whether any device but this group member has workers now."""
+    return any(
+        member["target"] > 0
+        for row in rows
+        for member in row["members"]
+        if (row["id"], member["id"]) != (group_id, member_id)
+    )
+
+
 def worker_group_payload(settings=None) -> dict:
     """Read current policy and activity without exposing private configuration."""
     from ._helpers import _ensure_gpu_cache
@@ -228,7 +238,7 @@ def worker_group_payload(settings=None) -> dict:
                         "group_id": group["id"],
                         "member_id": policy["member_id"],
                         "message": f"{group['name']}: {_member_label(policy, nodes)} has no workers now "
-                        f"({row['reason'] or 'node unavailable'}). Its jobs wait; other devices keep working.",
+                        f"({row['reason'] or 'node unavailable'}). Its jobs wait",
                     }
                 )
             if group["enabled"] and row["state"] == "hardware_unavailable":
@@ -237,8 +247,7 @@ def worker_group_payload(settings=None) -> dict:
                         "code": "hardware_unavailable",
                         "group_id": group["id"],
                         "member_id": policy["member_id"],
-                        "message": f"{group['name']}: GPU {policy['device']} not detected. "
-                        "Its jobs wait; other devices keep working.",
+                        "message": f"{group['name']}: GPU {policy['device']} not detected. Its jobs wait",
                     }
                 )
         for key in [key for key in live if key[0] == group["id"]]:
@@ -246,6 +255,10 @@ def worker_group_payload(settings=None) -> dict:
                 member_rows.append(_draining_member_row(live[key]))
             del live[key]
         rows.append(_group_row(group["id"], group["name"], group["enabled"], member_rows))
+    # Only known once every row is built: with every other group off (or out of hours) nothing else runs.
+    for warning in warnings:
+        others = _others_working(rows, warning["group_id"], warning["member_id"])
+        warning["message"] += "; other devices keep working." if others else "."
     removed: dict[str, list[dict]] = {}
     names: dict[str, str] = {}
     for (group_id, _member_id), row in live.items():

@@ -394,10 +394,15 @@
         renderAgentState(tab.status);
     }
 
+    // Not an edit of this server: the dialog counts its input and change events as edits, and neither reaches it.
+    function onDbChoiceInput(event) {
+        if (event.target.value === DB_ADD_NODE) event.stopPropagation();
+    }
+
     function onDbChoiceChange(event) {
         const select = event.target;
         if (select.value === DB_ADD_NODE) {
-            // Not an edit of this server: put the choice back without the dialog counting it as a change.
+            // Put the choice back: picking it only opens the Nodes page.
             event.stopPropagation();
             select.value = tab.dbChoice;
             const opened = window.open('/nodes#add', '_blank');
@@ -737,7 +742,10 @@
 
     function wire() {
         const dbSelect = $('#markersPlexDatabase');
-        if (dbSelect) dbSelect.addEventListener('change', onDbChoiceChange);
+        if (dbSelect) {
+            dbSelect.addEventListener('input', onDbChoiceInput);
+            dbSelect.addEventListener('change', onDbChoiceChange);
+        }
         const agentState = $('#markersAgentState');
         if (agentState) {
             agentState.addEventListener('click', (event) => {

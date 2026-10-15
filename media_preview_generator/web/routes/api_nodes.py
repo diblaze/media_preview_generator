@@ -673,13 +673,17 @@ def node_log(node_id: str):
     try:
         answer = _make_client(record["url"], record["key"]).log(lines)
     except NodeError as exc:
-        # What refuses without a node block is an older Plex helper (as for a check); it has no log to share, which
-        # is how it is, not a failure (the page logged a 502 for it).
         if isinstance(exc, NodeProtocolError) and exc.node is None:
-            message = (
-                "This Plex database node is an older release and can't share its log. Update it to see its log here."
-            )
-            return jsonify({"lines": [], "message": message})
+            # An older Plex helper (the check found one here) has no log to share, which is how it is, not a failure
+            # (the page logged a 502 for it). Anything else refusing without a node block isn't a node at all.
+            view = get_registry().view(node_id)
+            if view is not None and view.legacy:
+                message = (
+                    "This Plex database node is an older release and can't share its log. "
+                    "Update it to see its log here."
+                )
+                return jsonify({"lines": [], "message": message})
+            return jsonify({"error": f"Something else answers at {record.get('name')}'s address."}), 502
         return jsonify({"error": f"Couldn't read {record.get('name')}'s log: {exc}"}), 502
     raw = answer.get("lines")
     return jsonify({"lines": [_log_line(line) for line in raw] if isinstance(raw, list) else []})

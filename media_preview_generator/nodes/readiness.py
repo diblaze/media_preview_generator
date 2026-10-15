@@ -382,7 +382,7 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
     return rows
 
 
-def _members_using(node_id: str, groups: object) -> int:
+def _members_using(node_id: str, groups: object, resource: str | None = None) -> int:
     if not isinstance(groups, list):
         return 0
     return sum(
@@ -390,7 +390,9 @@ def _members_using(node_id: str, groups: object) -> int:
         for group in groups
         if isinstance(group, dict)
         for member in group.get("members") or []
-        if isinstance(member, dict) and member.get("node") == node_id
+        if isinstance(member, dict)
+        and member.get("node") == node_id
+        and (resource is None or member.get("resource") == resource)
     )
 
 
@@ -430,11 +432,12 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
     explained = any(gpu.get("status") != "ok" for gpu in view.gpus)
     if view.state == STATE_GPU_LOST and not explained:
         # The GPU is gone from the node's list, or no detection has worked yet: no GPU row above says why its GPU
-        # workers are paused.
+        # workers are paused. A node used only for CPU work has none to pause.
+        paused = _members_using(view.id, worker_groups, resource="gpu") > 0
         rows.append(
             _row(
                 "node_gpu_lost",
-                f"{view.name}'s GPU workers are paused",
+                f"{view.name}'s GPU workers are paused" if paused else f"{view.name} can't use its GPU",
                 severity=CRITICAL,
                 ok=False,
                 explanation="The node tests each GPU when it starts, every 5 minutes, and after a GPU error.",

@@ -1908,6 +1908,7 @@ class JobDispatcher:
                     "chapter_progress": progress_data.get("chapter_progress") if has_task else None,
                     "node": node,
                     "node_state": nodes.node_state(node_id) if node_id else None,
+                    "node_cause": nodes.node_cause(node_id) if node_id else None,
                 }
             )
         return statuses
