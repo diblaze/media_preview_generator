@@ -583,6 +583,38 @@ class TestUpdate:
         assert resp.status_code == 400
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
 
+    @pytest.mark.parametrize(
+        ("change", "forgotten"),
+        [
+            ({"url": "http://nuc2:9494", "key": "node-key"}, True),
+            ({"key": "another-key"}, True),
+            ({"enabled": False}, True),
+            ({"name": "renamed"}, False),
+        ],
+        ids=["moved", "new-key", "turned-off", "renamed"],
+    )
+    def test_a_change_of_address_key_or_switch_forgets_its_servers_intro_and_credits_answers(
+        self, client, nodes, change, forgotten
+    ):
+        """A server names only its node: the node's address lives here, so the server's cached answer can't see it."""
+        from media_preview_generator.markers import inspect
+        from media_preview_generator.servers.registry import server_config_from_dict
+
+        nodes("http://nuc2:9494")
+        node_id = _add(client).get_json()["id"]
+        other = {**_plex_server({"enabled": True, "node_id": "another-node"}), "id": "p2"}
+        _sm().set("media_servers", [_plex_server({"enabled": True, "node_id": node_id}), other])
+        inspect.clear_capability_cache()
+        configs = [server_config_from_dict(entry) for entry in _sm().get("media_servers")]
+        for config in configs:
+            inspect._CAPABILITY_CACHE.get(config, "status", lambda: "old node's answer")
+
+        assert client.put(f"/api/nodes/{node_id}", json=change).status_code == 200
+
+        answers = [inspect._CAPABILITY_CACHE.get(config, "status", lambda: "asked again") for config in configs]
+        assert answers == ["asked again" if forgotten else "old node's answer", "old node's answer"]
+        inspect.clear_capability_cache()
+
 
 class TestDelete:
     def test_a_list_that_wont_save_is_a_400_not_a_500(self, client, nodes, monkeypatch):
