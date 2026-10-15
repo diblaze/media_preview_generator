@@ -3810,3 +3810,19 @@ class TestFreshInstallNotice:
         run_migrations(sm)
 
         assert sm.get("_pending_migration_notice")["from"] == 20
+
+    def test_an_install_set_up_with_environment_variables_only_still_gets_the_card(self, tmp_path, monkeypatch):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        # Before settings.json existed the app was set up with env vars alone: no file, but a real Plex setup.
+        monkeypatch.setenv("PLEX_URL", "http://plex.lan:32400")
+        monkeypatch.setenv("PLEX_TOKEN", "abc123token")
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("media_servers")[0]["url"] == "http://plex.lan:32400"
+        notice = sm.get("_pending_migration_notice")
+        assert notice and any("multi-server" in note for note in notice["notes"])
+        # What's New already treats it as an upgrade; the card now agrees.
+        assert sm.get("last_seen_version") == "0.0.0"

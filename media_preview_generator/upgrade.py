@@ -218,10 +218,12 @@ def run_migrations(settings_manager) -> None:
 
     """
     # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
-    # the user set, so no "Settings migrated" card is shown for them.
+    # the user set, so no "Settings migrated" card is shown for them. An install set up with environment variables
+    # alone has no file either, but the steps rewrite the setup seeded from them, so that one still gets the card.
     settings_file = getattr(settings_manager, "settings_file", None)
-    fresh_install = bool(settings_file) and not os.path.exists(str(settings_file))
-    _migrate_env_vars(settings_manager)
+    no_settings_file = bool(settings_file) and not os.path.exists(str(settings_file))
+    seeded_from_env = _migrate_env_vars(settings_manager)
+    fresh_install = no_settings_file and not seeded_from_env
     _migrate_schema(settings_manager, announce=not fresh_install)
     _seed_last_seen_version_for_upgraders(settings_manager)
 
@@ -284,7 +286,7 @@ def _clamp_seeded_cpu_threads(value: int, source: str) -> int:
     return clamped
 
 
-def _migrate_env_vars(sm) -> None:
+def _migrate_env_vars(sm) -> bool:
     """Seed settings.json from environment variables.
 
     Only runs once.  After migration, settings.json is the sole source of
@@ -294,9 +296,12 @@ def _migrate_env_vars(sm) -> None:
     Also migrates legacy GPU env vars (GPU_THREADS, GPU_SELECTION,
     FFMPEG_THREADS) into the new ``gpu_config`` structure, and converts
     legacy path mapping env vars into the ``path_mappings`` list.
+
+    Returns:
+        True when at least one setting was seeded from the environment.
     """
     if sm.get("_env_migrated"):
-        return
+        return False
 
     updates: dict[str, Any] = {}
     migrated_keys: list[str] = []
@@ -358,6 +363,7 @@ def _migrate_env_vars(sm) -> None:
                 "Environment variable {} is deprecated and ignored. Use the Settings page in the web UI instead.",
                 env_name,
             )
+    return bool(migrated_keys)
 
 
 # =========================================================================
