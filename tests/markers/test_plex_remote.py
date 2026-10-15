@@ -6,6 +6,7 @@ containers' round trip.
 
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -51,14 +52,22 @@ def _deadline(seconds: float = 8.0) -> float:
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: object) -> None:
-        self.status_code = status_code
-        self._payload = payload
+    """A streamed ``requests`` response: a payload that is an exception stands for a body that isn't JSON."""
 
-    def json(self):
-        if isinstance(self._payload, Exception):
-            raise self._payload
-        return self._payload
+    def __init__(self, status_code: int, payload: object, *, headers: dict | None = None, body: bytes | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
+        if body is None:
+            body = b"not json" if isinstance(payload, Exception) else json.dumps(payload).encode()
+        self._body = body
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self._body), chunk_size):
+            yield self._body[start : start + chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeSession:
@@ -68,8 +77,8 @@ class FakeSession:
         self.answers = list(answers)
         self.calls: list[dict] = []
 
-    def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+    def post(self, url, json=None, headers=None, timeout=None, **kwargs):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout, **kwargs})
         answer = self.answers.pop(0) if self.answers else FakeResponse(200, {})
         if isinstance(answer, Exception):
             raise answer
@@ -382,6 +391,40 @@ class TestFailuresLookLikeTodays:
         remote = RemotePlexDb("", TOKEN, session=FakeSession())
         report = remote.file_checks(deadline=_deadline())
         assert report.state is Capability.AGENT_UNAVAILABLE
+
+    def test_a_redirect_is_never_followed_and_says_so(self):
+        moved = FakeResponse(307, {}, headers={"Location": "http://elsewhere.example/v1/item/write"})
+        remote, session = _remote(moved)
+        with pytest.raises(AgentError, match="redirect") as ei:
+            remote.read_item(7, deadline=_deadline())
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert session.calls[0]["allow_redirects"] is False and moved.closed
+
+    def test_a_compressed_answer_is_refused_unread(self):
+        # requests would inflate it: a megabyte on the wire can become gigabytes here.
+        bomb = FakeResponse(200, {}, headers={"Content-Encoding": "gzip"}, body=b"\x1f\x8b" + b"\0" * 64)
+        remote, session = _remote(bomb)
+        with pytest.raises(AgentError, match="compressed"):
+            remote.read_item(7, deadline=_deadline())
+        assert session.calls[0]["headers"]["Accept-Encoding"] == "identity" and session.calls[0]["stream"] is True
+
+    def test_an_answer_past_the_size_cap_is_refused(self, monkeypatch):
+        monkeypatch.setattr(plex_remote, "MAX_ANSWER_BYTES", 1024)
+        big = _envelope({"item": {"exists": True, "parts": [], "pad": "x" * 2048}})
+        remote, _ = _remote(big)
+        with pytest.raises(AgentError, match="too large"):
+            remote.read_item(7, deadline=_deadline())
+        assert big.closed
+
+    def test_a_connection_cut_mid_answer_is_unreachable(self):
+        class _Cut(FakeResponse):
+            def iter_content(self, chunk_size=1):
+                yield b'{"ok": '
+                raise requests.exceptions.ChunkedEncodingError("cut")
+
+        remote, _ = _remote(_Cut(200, {}))
+        report = remote.file_checks(deadline=_deadline())
+        assert report.state is Capability.AGENT_UNAVAILABLE and "Can't reach" in report.message
 
 
 class TestWhatIsSent:
