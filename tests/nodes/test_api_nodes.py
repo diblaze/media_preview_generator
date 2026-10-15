@@ -319,6 +319,25 @@ class TestCreate:
         assert resp.status_code == 400 and resp.get_json()["error"]
         assert _sm().nodes == []
 
+    @pytest.mark.parametrize(
+        ("fields", "error"),
+        [
+            ({"name": ["nuc"]}, "The node's name must be text"),
+            ({"url": ["http://nuc:9494"]}, "The node's address must be text"),
+            ({"key": 5}, "The node's key must be text"),
+            ({"key": {"k": "v"}}, "The node's key must be text"),
+        ],
+        ids=["name-list", "url-list", "key-number", "key-object"],
+    )
+    def test_a_name_address_or_key_that_isnt_text_is_refused_not_turned_into_text(self, client, nodes, fields, error):
+        resp = _add(client, **fields)
+        assert (resp.status_code, resp.get_json()["error"]) == (400, error)
+        assert _sm().nodes == []
+
+    def test_a_probe_with_a_key_that_isnt_text_is_refused(self, client, nodes):
+        resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": 12345678})
+        assert resp.status_code == 400
+
     def test_a_duplicate_name_is_refused(self, client, nodes):
         _add(client)
         nodes("http://other:9494").info_answer = _info(uid="uid-2")

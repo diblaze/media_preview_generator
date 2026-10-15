@@ -76,7 +76,9 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
         ``(url, "")`` without a trailing slash, its scheme and host in lower case (``http://NUC:9494`` is the same
         address as ``http://nuc:9494``), or ``(None, message)``.
     """
-    url = str(raw or "").strip().rstrip("/")
+    if raw is not None and not isinstance(raw, str):
+        return None, "The node's address must be text"
+    url = (raw or "").strip().rstrip("/")
     if not url:
         return None, "Enter the node's address, e.g. http://nuc.lan:9494"
     shape_err = "The node's address must be an http(s) address, e.g. http://nuc.lan:9494"
@@ -105,7 +107,9 @@ def normalise_key(raw: object, stored: str) -> tuple[str | None, str]:
     Returns:
         ``(key, "")`` or ``(None, message)``.
     """
-    key = stored if raw is None or raw == KEY_MASK else str(raw).strip()
+    if raw is not None and not isinstance(raw, str):
+        return None, "The node's key must be text"
+    key = stored if raw is None or raw == KEY_MASK else raw.strip()
     if not key:
         return None, "Enter the node's key (shown in the node's log the first time it starts)"
     if key != stored and not (len(key) <= KEY_MAX_LEN and sendable_key(key)):
@@ -168,7 +172,10 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     if not isinstance(raw, dict):
         return None, "A node must be an object"
     base = existing or {}
-    name = str(raw.get("name", base.get("name", "")) or "").strip()
+    name = raw.get("name", base.get("name", ""))
+    if name is not None and not isinstance(name, str):
+        return None, "The node's name must be text"
+    name = (name or "").strip()
     if not name:
         return None, "Give the node a name"
     if len(name) > NAME_MAX_LEN:
