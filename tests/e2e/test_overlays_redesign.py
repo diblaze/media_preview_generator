@@ -500,7 +500,7 @@ class TestJobDetails:
 class TestNavbarMenus:
     @pytest.mark.parametrize(
         ("toggle", "menu", "count"),
-        [("#navAutomationDropdown", "#navAutomationMenu", 2), ("#navSettingsDropdown", "#navSettingsMenu", 8)],
+        [("#navAutomationDropdown", "#navAutomationMenu", 2), ("#navSettingsDropdown", "#navSettingsMenu", 9)],
     )
     def test_menu_opens_by_keyboard_and_caret_and_closes_on_escape(
         self, overlay_page, toggle: str, menu: str, count: int
@@ -546,7 +546,7 @@ class TestNavbarMenus:
             expect(drawer.get_by_role("link", name=label).first).to_be_visible()
         for toggle, menu, count in (
             ("#navAutomationDropdown", "#navAutomationMenu", 2),
-            ("#navSettingsDropdown", "#navSettingsMenu", 8),
+            ("#navSettingsDropdown", "#navSettingsMenu", 9),
             ("#navToolsDropdown", "#navToolsMenu", 5),
         ):
             page.locator(toggle).click()
