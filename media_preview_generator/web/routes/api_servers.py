@@ -482,8 +482,7 @@ def _validate_server_payload(
 
     stored_markers = base.get("markers")
     if "markers" in data:
-        # stored_markers is passed on as well: it holds the Plex marker agent's key, which a posted ``****`` means
-        # "keep" (markers.settings), exactly like TheIntroDB's.
+        # stored_markers is passed on as well: only a newly chosen Plex database node is checked (markers.settings).
         markers_block, err = _validate_markers(
             _merge_markers_update(stored_markers, data.get("markers")), type_value, stored_markers
         )

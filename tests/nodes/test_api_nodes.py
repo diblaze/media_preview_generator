@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1033,3 +1034,27 @@ class TestRemovedDuringAGroupSave:
 
         assert deleted == [409]
         assert [n["id"] for n in _sm().nodes] == [node_id]
+
+
+class TestTheReference:
+    """docs/reference.md is what a script follows: it must describe the routes and the stored shape as they are."""
+
+    REFERENCE = Path(__file__).resolve().parents[2] / "docs" / "reference.md"
+
+    def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        missing = []
+        for rule in client.application.url_map.iter_rules():
+            if rule.rule.startswith("/api/nodes"):
+                path = rule.rule.replace("<node_id>", "{id}")
+                methods = sorted(rule.methods - {"HEAD", "OPTIONS"})
+                missing += [f"{m} {path}" for m in methods if f"| {m} | `{path}` |" not in text]
+        assert missing == []
+
+    def test_a_plex_servers_database_node_choice_is_documented_as_it_is_stored(self):
+        from media_preview_generator.markers.settings import default_plex_agent
+
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        assert default_plex_agent() == {"enabled": False, "node_id": None}
+        assert '"agent": {"enabled": false, "node_id": null}' in text and "`plex.agent.node_id`" in text
+        assert "`plex.agent.url`" not in text and "`plex.agent.token`" not in text
