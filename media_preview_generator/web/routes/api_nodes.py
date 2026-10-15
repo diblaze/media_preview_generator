@@ -25,7 +25,7 @@ from ...nodes.client import (
     NodeProtocolError,
     NodeRequestError,
 )
-from ...nodes.mappings import default_mappings_for, run_test_access
+from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
 from ...nodes.readiness import node_readiness
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
 from ...nodes.settings import KEY_MASK, find_node, normalise_key, normalise_mappings, normalise_url, validate_node
@@ -347,10 +347,26 @@ def probe_node():
     own_id = record["id"] if record else None
     twin = next((n for n in sm.nodes if uid and n.get("node_uid") == uid and n["id"] != own_id), None)
     info["already_added"] = {"id": twin["id"], "name": twin.get("name", "")} if twin else None
+    servers = sm.get("media_servers") or []
     info["suggested_path_mappings"] = (
-        default_mappings_for(sm.get("media_servers") or []) if protocol.ROLE_WORKER in info["node"]["roles"] else []
+        default_mappings_for(servers) if protocol.ROLE_WORKER in info["node"]["roles"] else []
     )
+    info["media_setup"] = _media_setup(servers)
     return jsonify(result)
+
+
+def _media_setup(servers: list[dict]) -> dict[str, int]:
+    """How many media servers are on and how many libraries they list, so an empty list of rows can say which is missing.
+
+    Args:
+        servers: The stored ``media_servers`` list.
+
+    Returns:
+        ``{"servers": n, "libraries": n}``.
+    """
+    on = [s for s in servers if isinstance(s, dict) and s.get("enabled", True)]
+    libraries = {(root.server_id, root.library_id) for root in library_roots(on)}
+    return {"servers": len(on), "libraries": len(libraries)}
 
 
 def _probed_uid(url: str, key: str) -> str | None:
@@ -503,9 +519,24 @@ def test_node_access(node_id: str):
         result = run_test_access(_make_client(record["url"], record["key"]), mappings, sm.get("media_servers") or [])
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
+    result["media_setup"] = _media_setup(sm.get("media_servers") or [])
     # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.
     get_registry().record_access_result(node_id, result, tested_mappings=rows)
     return jsonify(result)
+
+
+@api.route("/nodes/<node_id>/suggested-mappings", methods=["GET"])
+@api_token_required
+def suggested_node_mappings(node_id: str):
+    """Rows to pre-fill for a node with none saved: one per library folder, the same path on the node.
+
+    A node added before any library was loaded got no rows in Add node; its Media tab fills them in later from this.
+    """
+    sm = get_settings_manager()
+    if find_node(sm.nodes, node_id) is None:
+        return _not_found(node_id)
+    servers = sm.get("media_servers") or []
+    return jsonify({"path_mappings": default_mappings_for(servers), "media_setup": _media_setup(servers)})
 
 
 @api.route("/nodes/<node_id>/health", methods=["GET"])

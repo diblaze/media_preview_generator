@@ -30,6 +30,8 @@ CHECK_BATCH = 30
 # read in the kernel where no timeout reaches it, so each library is read on its own thread and one that isn't done
 # by then is reported as timed out; the request answers with what the others found.
 SAMPLE_BUDGET_S = 20.0
+# The longest Add node waits to learn which library folders this app can open, before it suggests rows.
+SUGGEST_BUDGET_S = 3.0
 
 
 def _video_extensions() -> frozenset[str]:
@@ -399,15 +401,43 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping]) -> bool:
     return all(bool((results.get(f["path"]) or {}).get("ok")) for f in files)
 
 
-def default_mappings_for(servers: list[dict]) -> list[dict[str, str]]:
-    """Pre-filled rows for Add node: one per distinct library folder, mapped to the same path on the node.
+def _folders_this_app_cant_open(folders: list[str], budget_s: float) -> set[str]:
+    """The folders whose read failed outright. One still stuck after ``budget_s`` (a stalled mount) isn't counted:
+    it may be fine, and it shouldn't hold up the answer."""
+    failed: set[str] = set()
+    threads = []
+    for folder in folders:
 
-    A folder inside another listed folder is covered by that one's row, so it gets none of its own.
+        def run(folder: str = folder) -> None:
+            try:
+                with os.scandir(folder):
+                    pass
+            except OSError:
+                failed.add(folder)
+
+        thread = threading.Thread(target=run, name="add-node-suggest", daemon=True)
+        thread.start()
+        threads.append(thread)
+    deadline = time.monotonic() + budget_s
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return set(failed)
+
+
+def default_mappings_for(servers: list[dict], *, budget_s: float = SUGGEST_BUDGET_S) -> list[dict[str, str]]:
+    """Pre-filled rows for Add node: one per distinct library folder this app can open, mapped to the same path on
+    the node.
+
+    A folder inside another listed folder is covered by that one's row, so it gets none of its own. A folder this app
+    can't open itself would only fail Test access on this app's side, so it isn't suggested.
 
     Args:
         servers: The stored ``media_servers`` list.
+        budget_s: The longest spent checking that this app can open the folders.
     """
-    roots = sorted({root.app_root for root in library_roots(servers)}, key=lambda p: (len(p), p))
+    folders = sorted({root.app_root for root in library_roots(servers)}, key=lambda p: (len(p), p))
+    unopenable = _folders_this_app_cant_open(folders, budget_s)
+    roots = [folder for folder in folders if folder not in unopenable]
     kept: list[str] = []
     for root in roots:
         if any(root == k or root.startswith(k.rstrip("/") + "/") for k in kept):

@@ -325,6 +325,15 @@
     }
 
     // One editor for Add node step 2 and the node dialog's Media tab.
+    // What to do first when there is no library to map, from media_setup ({servers, libraries}).
+    function noLibrariesHtml(setup) {
+        const servers = setup && Number(setup.servers);
+        if (servers) {
+            return `Your media servers have no libraries loaded yet. <a href="/servers">Refresh libraries on Media Servers</a> first.`;
+        }
+        return 'No media server yet. <a href="/servers">Add a media server</a> first.';
+    }
+
     function createMappingEditor(root, { getNodeId, onChange }) {
         root.innerHTML = `
             <div class="nd-map">
@@ -481,12 +490,16 @@
                 + `<ul>${items}</ul><a href="/servers">Fix on Media Servers</a></details>`;
         }
 
-        function renderResults(libraries) {
+        function note(html) {
+            results.innerHTML = html ? `<div class="sm-hint nd-map-note">${html}</div>` : '';
+        }
+
+        function renderResults(libraries, setup) {
             lastLibraries = libraries;
             revealEnds();
             $$('.nd-chip-slot', rows).forEach((slot) => { slot.innerHTML = ''; });
             if (!libraries.length) {
-                results.innerHTML = '<div class="sm-hint">No libraries to test yet. Add a media server with libraries first.</div>';
+                note(`No libraries to test yet. ${noLibrariesHtml(setup)}`);
                 return;
             }
             // A library this app couldn't sample itself was never asked about: not the node's problem, so they all
@@ -543,7 +556,7 @@
                     return;
                 }
                 showError('');
-                renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : []);
+                renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : [], r.data && r.data.media_setup);
             } finally {
                 enable(btn);
                 btn.innerHTML = '<i class="bi bi-play-fill me-1"></i>Test access';
@@ -566,6 +579,7 @@
             set,
             read,
             test,
+            note,
             revealEnds,
             showError,
             applySuggestion,
@@ -575,7 +589,8 @@
 
     // ---------- Add node -----------------------------------------------------------------------------------------
 
-    const add = { probe: null, node: null, editor: null };
+    // finished: step 2 was saved with Finish; closing it any other way still keeps its rows.
+    const add = { probe: null, node: null, editor: null, finished: false };
 
     // What to check, by why nothing answered (error.reason); url is the address that was tried.
     function unreachableText(reason, url) {
@@ -694,6 +709,7 @@
     function openAdd() {
         add.probe = null;
         add.node = null;
+        add.finished = false;
         ['#addNodeName', '#addNodeUrl', '#addNodeKey'].forEach((sel) => {
             const el = $(sel);
             el.value = '';
@@ -794,6 +810,8 @@
             : (Array.isArray(add.probe.suggested_path_mappings) ? add.probe.suggested_path_mappings : []);
         add.editor.setName(add.node.name || name);
         add.editor.set(suggested);
+        const setup = add.probe.media_setup;
+        if (!suggested.length && setup && !Number(setup.libraries)) add.editor.note(noLibrariesHtml(setup));
         setAddStep(2);
     }
 
@@ -811,9 +829,19 @@
             return;
         }
         errorEl.classList.add('d-none');
+        add.finished = true;
         replaceNode(r.data);
         bootstrap.Modal.getOrCreateInstance($('#addNodeModal')).hide();
         if (typeof showToast === 'function') showToast('Node added', `${(r.data && r.data.name) || add.node.name} is set up.`, 'success');
+    }
+
+    // Finish later (or Esc) in step 2: the rows shown there, suggested or typed, are saved so the Media tab has them.
+    async function keepStep2Rows() {
+        if (add.finished || $('#addNodeStep2').classList.contains('d-none')) return;
+        const rows = add.editor.read();
+        if (!rows || !rows.length) return;
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: rows });
+        if (r.ok) replaceNode(r.data);
     }
 
     // ---------- node dialog --------------------------------------------------------------------------------------
@@ -942,6 +970,7 @@
         detail.editor.setName(node.name || node.id);
         detail.editor.set(node.path_mappings);
         $('#nodeMediaResult').textContent = '';
+        if (isWorker(node) && !(Array.isArray(node.path_mappings) && node.path_mappings.length)) suggestMappings(node.id);
         $('#nodeLog').textContent = '';
         $('#nodeHealthBody').innerHTML = '';
         $('#nodeHealthSummary').innerHTML = '';
@@ -953,6 +982,21 @@
         if (wanted === 'log') loadLog();
         if (window.location.hash !== `#node-${node.id}`) history.replaceState(null, '', `#node-${node.id}`);
         bootstrap.Modal.getOrCreateInstance($('#nodeModal')).show();
+    }
+
+    // Not marked as an edit: closing without saving loses nothing, the same rows come back next time.
+    async function suggestMappings(id) {
+        const r = await api('GET', `/api/nodes/${encodeURIComponent(id)}/suggested-mappings`);
+        if (!r.ok || !r.data || page.openId !== String(id) || detail.mapDirty) return;
+        const rows = Array.isArray(r.data.path_mappings) ? r.data.path_mappings : [];
+        if (rows.length) {
+            detail.editor.set(rows);
+            const result = $('#nodeMediaResult');
+            result.className = 'sm-tres warn';
+            result.textContent = 'Suggested from your libraries. Not saved yet';
+        } else if (r.data.media_setup && !Number(r.data.media_setup.libraries)) {
+            detail.editor.note(noLibrariesHtml(r.data.media_setup));
+        }
     }
 
     // A poll refreshes what the open dialog shows about the node, never the fields being edited.
@@ -1330,9 +1374,11 @@
                 else connect();
             }
         });
-        $('#addNodeModal').addEventListener('hidden.bs.modal', () => {
+        $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
-            if (add.node) loadNodes();
+            if (!add.node) return;
+            await keepStep2Rows();
+            loadNodes();
         });
 
         $('#nodeModal').addEventListener('hide.bs.modal', guardClose);

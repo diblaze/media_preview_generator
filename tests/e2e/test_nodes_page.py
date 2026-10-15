@@ -115,6 +115,7 @@ class NodesApi:
         self.log_answer: dict = {"lines": [_log("14:01:02", "node started"), _log("14:01:03", "1 GPU found")]}
         self.delete_answer: tuple[int, dict] = (200, {"ok": True})
         self.rescan_answer: tuple[int, dict] | None = None
+        self.suggest_answer: dict = {"path_mappings": [], "media_setup": {"servers": 1, "libraries": 1}}
         page.route("**/api/nodes**", self._handle)
 
     def bodies(self, method: str, suffix: str) -> list:
@@ -164,6 +165,8 @@ class NodesApi:
             return _fulfill(route, node)
         if action == "test-access":
             return _fulfill(route, self.test_answers.pop(0) if self.test_answers else {"libraries": []})
+        if action == "suggested-mappings":
+            return _fulfill(route, self.suggest_answer)
         if action == "health":
             return _fulfill(route, self.health_answer)
         if action == "log":
@@ -480,6 +483,44 @@ class TestAddNode:
         ]
         expect(page.locator("#node-n-new")).to_be_visible()
 
+    def _to_step_2(self, page: Page) -> None:
+        page.locator("#addNodeUrl").fill("http://nas.lan:9494")
+        page.locator("#addNodeKey").fill("secret-key")
+        page.locator("#addNodeConnect").click()
+        expect(page.locator("#addNodeProbe")).to_contain_text("Connected")
+        page.locator("#addNodeNext").click()
+        expect(page.locator("#addNodeStep2")).to_be_visible()
+
+    def test_finish_later_keeps_the_rows_shown_in_step_2(self, authed_page: Page, app_url: str) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        _open_add(page)
+        self._to_step_2(page)
+        expect(page.locator("#addNodeMappings .nd-app").first).to_have_value("/data/TV Shows")
+
+        with page.expect_response(lambda r: r.request.method == "PUT" and r.url.endswith("/api/nodes/n-new")):
+            page.locator("#addNodeCancel").click()
+
+        expect(page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        assert api.bodies("PUT", "/nodes/n-new") == [
+            {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}]}
+        ]
+
+    def test_step_2_with_servers_but_no_libraries_says_to_refresh_them(self, authed_page: Page, app_url: str) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        api.probe_answer["info"]["suggested_path_mappings"] = []
+        api.probe_answer["info"]["media_setup"] = {"servers": 1, "libraries": 0}
+        _open_add(page)
+        self._to_step_2(page)
+
+        note = page.locator("#addNodeMappings .nd-map-note")
+        expect(note).to_contain_text("Your media servers have no libraries loaded yet.")
+        expect(note.get_by_role("link", name="Refresh libraries on Media Servers")).to_have_attribute(
+            "href", "/servers"
+        )
+        expect(page.locator("#addNodeMappings")).not_to_contain_text("Add a media server")
+
     def test_plex_database_node_skips_the_media_step(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         modal = _open_add(authed_page)
@@ -662,6 +703,38 @@ class TestNodeDialog:
         assert api.bodies("PUT", "/nodes/n-storage") == [
             {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
         ]
+
+    def test_a_node_with_no_rows_gets_the_library_folders_suggested(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [_node("n-nas", "nas")])
+        api.suggest_answer = {
+            "path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/data/Movies"}],
+            "media_setup": {"servers": 1, "libraries": 1},
+        }
+        _open_node(authed_page, "n-nas")
+        pane = _node_tab(authed_page, "media")
+
+        expect(pane.locator(".nd-app").first).to_have_value("/data/Movies")
+        expect(pane.locator(".nd-node").first).to_have_value("/data/Movies")
+        expect(authed_page.locator("#nodeMediaResult")).to_have_text("Suggested from your libraries. Not saved yet")
+        # Nothing typed, so closing loses nothing and doesn't ask.
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        assert not api.bodies("PUT", "/nodes/n-nas")
+
+    def test_test_access_with_servers_but_no_libraries_says_to_refresh_them(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.test_answers = [{"libraries": [], "media_setup": {"servers": 2, "libraries": 0}}]
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-test").click()
+
+        note = pane.locator(".nd-map-note")
+        expect(note).to_contain_text("No libraries to test yet. Your media servers have no libraries loaded yet.")
+        expect(note.get_by_role("link", name="Refresh libraries on Media Servers")).to_have_attribute(
+            "href", "/servers"
+        )
 
     def test_closing_with_unsaved_mappings_asks_first(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())

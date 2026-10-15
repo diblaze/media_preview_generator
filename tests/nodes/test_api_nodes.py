@@ -149,6 +149,7 @@ class TestListAndProbe:
             "version_match": True,
             "already_added": None,
             "suggested_path_mappings": [],
+            "media_setup": {"servers": 0, "libraries": 0},
         }
         assert _sm().nodes == []
 
@@ -552,6 +553,27 @@ class TestTestAccess:
         node_id = _add(client).get_json()["id"]
         resp = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": [{"app_prefix": "x"}]})
         assert resp.status_code == 400
+
+    def test_servers_without_libraries_are_told_apart_from_no_server(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        _sm().set("media_servers", [{"id": "p1", "type": "plex", "name": "Home", "enabled": True, "libraries": []}])
+        body = client.post(f"/api/nodes/{node_id}/test-access", json={}).get_json()
+        assert (body["libraries"], body["media_setup"]) == ([], {"servers": 1, "libraries": 0})
+        probe = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert probe["media_setup"] == {"servers": 1, "libraries": 0}
+
+    def test_a_node_added_before_any_library_gets_rows_suggested_later(self, client, nodes, tmp_path):
+        node_id = _add(client).get_json()["id"]
+        before = client.get(f"/api/nodes/{node_id}/suggested-mappings").get_json()
+        assert before == {"path_mappings": [], "media_setup": {"servers": 0, "libraries": 0}}
+        movies = self._library(tmp_path)
+        after = client.get(f"/api/nodes/{node_id}/suggested-mappings").get_json()
+        assert after == {
+            "path_mappings": [{"app_prefix": str(movies), "node_prefix": str(movies)}],
+            "media_setup": {"servers": 1, "libraries": 1},
+        }
+        assert _sm().nodes[0]["path_mappings"] == []
+        assert client.get("/api/nodes/nope/suggested-mappings").status_code == 404
 
     def test_a_node_that_cant_be_asked_is_502(self, client, nodes, tmp_path, monkeypatch):
         self._library(tmp_path)
