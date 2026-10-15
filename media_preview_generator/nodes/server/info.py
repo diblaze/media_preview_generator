@@ -291,11 +291,13 @@ class WorkerInfo:
         else:
             logger.info("The node's temp folder {} can be used again", self._temp_root)
 
-    def block(self, *, busy: int) -> dict[str, Any]:
+    def block(self, *, busy: int, filled: str | None = None) -> dict[str, Any]:
         """The ``worker`` block of /v1/info.
 
         Args:
             busy: How many tasks are running.
+            filled: The temp folder's problem after a task filled it (``TaskTable.filled_problem``), reported when the
+                folder can be used otherwise.
 
         Returns:
             The block.
@@ -304,7 +306,7 @@ class WorkerInfo:
         ram_total, ram_available = _meminfo()
         # Every start makes a folder there; one that can't would refuse each file the app sends, so the app reads
         # this and sends none.
-        temp_problem = probe_temp_folder(self._temp_root)
+        temp_problem = probe_temp_folder(self._temp_root) or filled
         self._note_temp_problem(temp_problem)
         try:
             free_bytes: int | None = shutil.disk_usage(self._temp_root).free

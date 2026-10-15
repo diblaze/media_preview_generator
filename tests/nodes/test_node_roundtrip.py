@@ -31,7 +31,7 @@ from media_preview_generator.nodes.executor import (
 from media_preview_generator.nodes.protocol import PathMapping
 from media_preview_generator.nodes.registry import set_registry
 from media_preview_generator.nodes.server import app as node_app
-from media_preview_generator.nodes.server import info
+from media_preview_generator.nodes.server import info, tasks
 
 from .executor_fakes import NODE_ID, identity_registry, write_file
 
@@ -329,6 +329,24 @@ class TestATempFolderThatFillsMidTask:
         assert raised.value.started is False and "temp folder" in str(raised.value) and "is full" in str(raised.value)
         assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_the_node_reads_full_after_it_so_the_app_holds_it(self, node, tmp_path, monkeypatch):
+        # The check the app runs at once after the file came back found an empty folder that works: the node read
+        # ready and was sent the next big file, five times over with only node workers, until the file failed as
+        # "couldn't start the file 5 times". The app holds a node whose info names a temp problem (test_registry).
+        # Free space held still: other tests share this disk.
+        monkeypatch.setattr(tasks, "_free_bytes", lambda path: 4 << 20)
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        client = _client(node[0])
+        set_registry(identity_registry(client))
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError):
+                run_on_node("test.fills_temp", media, {}, gpu=None, cancel_check=None)
+        finally:
+            set_registry(None)
+
+        temp = client.info()["worker"]["temp"]
+        assert temp["problem"] == f"The node's temp folder {temp['path']} filled up while working on a file (4 MB free)"
 
 
 class TestANodeThatIsStopping:
