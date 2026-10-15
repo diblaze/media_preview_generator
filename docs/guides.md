@@ -673,7 +673,8 @@ docker run -d --name media-preview-node -p 9494:9494 \
 - Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
   they are.
 - Pass the GPU the same way you pass it to the app: for NVIDIA, `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`
-  (Dolby Vision tone mapping needs the second). Keep `--device /dev/dri:/dev/dri` only
+  (Dolby Vision tone mapping needs the second; if the node's log still says Dolby Vision Profile 5 thumbnails will
+  have the wrong colours, also add `--runtime=nvidia`). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").
 - The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key

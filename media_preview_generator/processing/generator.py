@@ -1971,7 +1971,7 @@ def generate_images(
                 #    rasterizer (llvmpipe/lavapipe) produces a green
                 #    overlay on DV5 output.  Probe the Vulkan state
                 #    first and drop to the DV-safe filter when software.
-                from ..gpu.vulkan_probe import DV5_NO_VULKAN_FIX, get_vulkan_device_info
+                from ..gpu.vulkan_probe import dv5_no_vulkan_fix, get_vulkan_device_info
 
                 vulkan_info = get_vulkan_device_info()
                 vk_device = vulkan_info.device
@@ -1979,7 +1979,7 @@ def generate_images(
                 if vk_is_software or vk_device is None:
                     # A node has no dashboard: the fix is for its own container, so it is said here.
                     how_to_fix = (
-                        DV5_NO_VULKAN_FIX
+                        dv5_no_vulkan_fix()
                         if is_node_mode()
                         else "See the dashboard notification centre for steps to enable Vulkan."
                     )

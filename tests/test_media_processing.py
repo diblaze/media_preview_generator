@@ -1999,6 +1999,89 @@ class TestProactiveDVSkip:
         assert "hwdownload" in vf
         assert vf.startswith("fps=fps=")
 
+    @pytest.mark.parametrize(
+        ("node", "caps", "says", "doesnt_say"),
+        [
+            pytest.param(True, None, "set NVIDIA_DRIVER_CAPABILITIES=all", "--runtime=nvidia", id="node-caps-unset"),
+            pytest.param(
+                True,
+                "all",
+                "start the container with --runtime=nvidia",
+                "set NVIDIA_DRIVER_CAPABILITIES",
+                id="node-caps-all",
+            ),
+            pytest.param(
+                False, "all", "See the dashboard notification centre", "NVIDIA_DRIVER_CAPABILITIES", id="app-caps-all"
+            ),
+        ],
+    )
+    @patch("media_preview_generator.processing.generator.MediaInfo")
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    @patch("media_preview_generator.processing.generator.os.rename")
+    @patch("media_preview_generator.processing.generator.os.remove")
+    @patch("os.path.exists")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("time.sleep")
+    @patch("media_preview_generator.processing.generator.glob.glob")
+    @patch("media_preview_generator.processing.generator._detect_codec_error")
+    def test_a_dv5_file_without_vulkan_names_the_fix_its_container_still_needs(
+        self,
+        mock_detect,
+        mock_glob,
+        mock_sleep,
+        mock_file,
+        mock_exists,
+        mock_remove,
+        mock_rename,
+        mock_run,
+        mock_popen,
+        mock_mediainfo,
+        temp_dir,
+        mock_config,
+        monkeypatch,
+        node,
+        caps,
+        says,
+        doesnt_say,
+    ):
+        """On a node the file's own line is the only place the fix is said; it mustn't ask for a setting already made."""
+        from loguru import logger
+
+        if caps is None:
+            monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        else:
+            monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", caps)
+        monkeypatch.setattr("media_preview_generator.processing.generator.is_node_mode", lambda: node)
+        messages: list[str] = []
+        sink_id = logger.add(lambda msg: messages.append(str(msg)), level="WARNING", format="{message}")
+        try:
+            self._run_generate(
+                "Dolby Vision",
+                "/test/dv_profile5_sw_vulkan.mkv",
+                mock_detect,
+                mock_glob,
+                mock_sleep,
+                mock_file,
+                mock_exists,
+                mock_remove,
+                mock_rename,
+                mock_run,
+                mock_popen,
+                mock_mediainfo,
+                temp_dir,
+                mock_config,
+                gpu="NVIDIA",
+                vulkan_device_info={"device": "llvmpipe (LLVM 18.1.3, 256 bits) (software)", "is_software": True},
+            )
+        finally:
+            logger.remove(sink_id)
+
+        hits = [m for m in messages if "needs a real GPU with Vulkan" in m]
+        assert len(hits) == 1, messages
+        assert says in hits[0]
+        assert doesnt_say not in hits[0]
+
     @patch("media_preview_generator.processing.generator.MediaInfo")
     @patch("subprocess.Popen")
     @patch("subprocess.run")
