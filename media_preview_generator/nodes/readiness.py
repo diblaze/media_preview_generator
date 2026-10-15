@@ -228,7 +228,10 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
                 f"{label}: the node sees its files" if ok else f"{label}: the node can't see its files",
                 severity=CRITICAL,
                 ok=ok,
-                explanation=f"Checked {lib.get('checked', 0)} file(s) under {lib.get('app_root')}.",
+                # The explanation is shown as HTML, so it stays literal; the folder, a media server's path that nobody
+                # escapes, goes in the tooltip, which the page escapes.
+                explanation="Test access checked a few files from this library through this node's folder mappings.",
+                tooltip=f"Checked {lib.get('checked', 0)} file(s) under {lib.get('app_root')}.",
                 current=suggestion.get("from") if suggestion else None,
                 recommended=suggestion.get("to") if suggestion else None,
                 reason=reason,

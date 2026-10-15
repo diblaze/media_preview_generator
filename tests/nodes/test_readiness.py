@@ -118,6 +118,24 @@ def test_test_access_results_are_one_row_per_library_with_the_suggestion():
     assert envelope["overall_ok"] is False
 
 
+def test_no_explanation_carries_library_data():
+    """An explanation is shown as HTML; a library folder named like markup must only reach escaped fields."""
+    evil = "/media/<img src=x onerror=alert(1)>"
+    library = {"server": evil, "library": evil, "app_root": evil, "error": evil, "files": []}
+    access = {
+        "libraries": [
+            {**library, "checked": 3, "ok": True},
+            {**library, "checked": 1, "ok": False, "suggestion": {"from": evil, "to": evil}},
+            {**library, "checked": 0, "ok": False},
+            {**library, "checked": 0, "ok": False, "empty": True},
+        ]
+    }
+    envelope = _envelope(_details(access=access))
+    rows = [c for s in envelope["sections"] for c in s["checks"]]
+    assert [r["explanation"] for r in rows if "<" in r["explanation"]] == []
+    assert evil in _check(envelope, "node_access_0")["tooltip"]
+
+
 @pytest.mark.parametrize(
     "error", ["This app can't open /data/kids", "Timed out reading /data/kids (no answer within 20 s)"]
 )
