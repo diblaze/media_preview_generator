@@ -1180,10 +1180,11 @@ class JobDispatcher:
     def _claim_worker(self, tracker: JobTracker, stranded: list) -> tuple[Worker, Any] | None:
         """Claim a free worker and the first queued file of the job it may run; the caller holds both locks.
 
-        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped goes to
-        a worker elsewhere when one is free, else back to that node. One that no configured worker can run any more is
-        taken off the queue into ``stranded`` (counted in ``active_processing`` until it is failed). A worker claimed
-        for a file a cancel has since cleared off the queue is given back.
+        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped waits
+        for a worker elsewhere while one runs its kind now (busy or not), and goes back to that node only when none
+        does (``WorkerPool.runs_kind_outside``). One that no configured worker can run any more is taken off the
+        queue into ``stranded`` (counted in ``active_processing`` until it is failed). A worker claimed for a file a
+        cancel has since cleared off the queue is given back.
 
         Args:
             tracker: The job.
@@ -1208,9 +1209,12 @@ class JobDispatcher:
             dropped_on = tracker.dropped_on.get(item.canonical_path)
             worker = None
             if dropped_on is not None:
-                worker = pool._find_available_worker(
-                    claim=True, kind=tracker.kind, exclude_nodes={*excluded, dropped_on}
-                )
+                avoid = {*excluded, dropped_on}
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid)
+                if worker is None and pool.runs_kind_outside(tracker.kind, avoid):
+                    # Back on the node that just dropped it, a second drop fails the file. The free worker there
+                    # takes a later file instead.
+                    continue
             if worker is None:
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
             if worker is not None:

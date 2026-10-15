@@ -222,6 +222,94 @@ class TestNodeDrops:
         assert tracker.get_result()["node_failures"] == {"/m/a.mkv": "node NAS unavailable (it dropped the file twice)"}
         assert tracker.active_processing == 0
 
+    @pytest.mark.parametrize(("other", "other_name"), [("b", "B"), (None, "")], ids=["other-node", "this-app"])
+    def test_a_dropped_file_waits_for_the_busy_worker_elsewhere_while_the_node_that_dropped_it_takes_the_next(
+        self, other, other_name
+    ):
+        """A flapping node (it checks ready again right after each drop) would drop the file again: a second drop
+        fails it, though the healthy worker that's busy now would run it a moment later."""
+        calls: list[tuple[str, str | None]] = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            node = _node()
+            with lock:
+                calls.append((item.canonical_path, node))
+            if node == "a" and item.canonical_path == "/m/x.mkv":
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            if item.canonical_path == "/m/long.mkv":
+                time.sleep(1.0)
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool((other, other_name), ("a", "A")), process, "/m/long.mkv", "/m/x.mkv", "/m/y.mkv")
+
+        assert [node for path, node in calls if path == "/m/x.mkv"] == ["a", other]
+        assert [node for path, node in calls if path == "/m/y.mkv"] == ["a"]
+        assert [r.args[1].value for r in rows if r.args[1].value == "failed"] == []
+        assert (tracker.successful, tracker.failed) == (3, 0)
+        assert tracker.active_processing == 0
+
+    def test_a_dropped_file_no_other_worker_can_run_goes_back_to_the_node_that_dropped_it(self):
+        calls: list[str | None] = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            node = _node()
+            with lock:
+                calls.append(node)
+                drops_on_a = calls.count("a")
+            if node == "b":
+                raise FileNotVisibleError("b", "B", "missing", f"{item.canonical_path} isn't there")
+            if drops_on_a == 1:
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool(("b", "B"), ("a", "A")), process, "/m/x.mkv")
+
+        assert calls == ["b", "a", "a"]
+        assert (tracker.successful, tracker.failed) == (1, 0)
+        assert [r.args[0] for r in rows] == ["/m/x.mkv"]
+
+    @pytest.mark.parametrize("why", ["outside-its-hours", "gpu-not-listed"])
+    def test_a_dropped_file_doesnt_wait_for_a_member_that_runs_nothing_now(self, monkeypatch, why):
+        """Node B's member is outside its hours (back later) or names a GPU B doesn't list (back only once someone
+        acts): waiting for it would hold the file and its job open for hours, while A is ready again."""
+        from media_preview_generator import worker_groups
+
+        class Registry(_Registry):
+            revision = 0  # shadows the real registry's property
+
+            def capacity(self, node_id: str) -> NodeCapacity:
+                return NodeCapacity(True, True, "")
+
+        set_registry(Registry())
+        if why == "outside-its-hours":
+            monkeypatch.setattr(
+                worker_groups, "group_is_available", lambda policy, now=None: policy.get("group_id") != "b"
+            )
+            b_member = {"resource": "cpu", "device": None, "node": "b"}
+        else:
+            b_member = {"resource": "gpu", "device": "cuda:0", "node": "b"}
+
+        def group(gid: str, member: dict) -> dict:
+            return {"id": gid, "name": gid, "enabled": True, "availability": {"mode": "always", "windows": []},
+                    "members": [{"id": "m", "count": 1, "job_types": ["intro_credits"], **member}]}  # fmt: skip
+
+        pool = WorkerPool(cpu_workers=0, gpu_workers=0, selected_gpus=[])
+        pool.reconcile_groups([group("a", {"resource": "cpu", "device": None, "node": "a"}), group("b", b_member)], [])
+        calls: list[str | None] = []
+
+        def process(item, **_kwargs):
+            calls.append(_node())
+            if len(calls) == 1:
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, _ = _run(pool, process, "/m/x.mkv")
+
+        assert calls == ["a", "a"]
+        assert (tracker.successful, tracker.failed) == (1, 0)
+
     def test_one_drop_on_each_of_two_nodes_fails_naming_both(self):
         seen: list[str] = []
         lock = threading.Lock()
@@ -350,6 +438,25 @@ class TestClaimWorker:
         tracker = JobTracker(job_id="j", items=[], config=_config(), registry=MagicMock())
         tracker.item_queue = deque(_items(*paths))
         return tracker
+
+    def test_a_file_a_free_node_dropped_waits_for_the_busy_one_and_the_free_node_takes_the_next(self):
+        pool = _pool(("a", "A"), ("b", "B"))
+        pool.workers[1].is_busy = True
+        tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
+        tracker.dropped_on = {"/m/1.mkv": "a"}
+
+        worker, item = JobDispatcher(pool)._claim_worker(tracker, [])
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/2.mkv")
+        assert [i.canonical_path for i in tracker.item_queue] == ["/m/1.mkv"]
+
+    def test_a_file_a_node_dropped_goes_back_to_it_when_no_other_worker_runs_its_kind(self):
+        pool = _pool(("a", "A"))
+        tracker = self._tracker("/m/1.mkv")
+        tracker.dropped_on = {"/m/1.mkv": "a"}
+
+        worker, item = JobDispatcher(pool)._claim_worker(tracker, [])
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/1.mkv")
+        assert not tracker.item_queue
 
     def test_files_a_free_node_cant_see_are_passed_over_for_one_it_can(self):
         pool = _pool(("a", "A"))

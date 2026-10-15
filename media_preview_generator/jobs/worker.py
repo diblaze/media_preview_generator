@@ -1277,10 +1277,16 @@ class WorkerPool:
             self._worker_done_event.set()
         return {"added": added, "removed": removed, "retiring": retiring}
 
-    def _worker_supports_kind(self, worker: "Worker", kind: str) -> bool:
+    def _worker_supports_kind(self, worker: "Worker", kind: str, *, budget: bool = True) -> bool:
         """Check intrinsic capability, member policy and shared draining budget.
 
         Caller holds ``_workers_lock`` through assignment reservation.
+
+        Args:
+            worker: The worker.
+            kind: The job kind.
+            budget: Also require a free slot in its resource's shared budget; False asks only whether it runs
+                ``kind`` now, busy or not.
         """
         if kind == "loudness" and worker.worker_type != "CPU":
             return False
@@ -1294,6 +1300,8 @@ class WorkerPool:
 
         if not group_is_available(self._policies[worker.policy_id]):
             return False
+        if not budget:
+            return True
         busy = sum(w.is_busy and w.group_resource == worker.group_resource for w in self.workers)
         return busy < self._resource_targets.get(worker.group_resource, 0)
 
@@ -1376,6 +1384,24 @@ class WorkerPool:
                 ]
                 return any(node is None or node not in exclude_nodes for node in nodes)
             return not nodes or any(node is None or node not in exclude_nodes for node in nodes)
+
+    def runs_kind_outside(self, kind: str, exclude_nodes: Collection[str]) -> bool:
+        """Whether a worker outside ``exclude_nodes`` runs ``kind`` now, busy or not.
+
+        Narrower than :meth:`can_run_outside`: a member outside its hours, or on a node that is offline, has no worker
+        that runs now, so a file waiting for one of those could wait hours.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids left out. This app's own workers are never left out.
+        """
+        with self._workers_lock:
+            return any(
+                not worker._pending_removal
+                and getattr(worker, "node_id", None) not in exclude_nodes
+                and self._worker_supports_kind(worker, kind, budget=False)
+                for worker in self.workers
+            )
 
     def stuck_node_members(self, kind: str, exclude_nodes: Collection[str]) -> list[str]:
         """``"<node> (<reason>)"`` for each node that has members for ``kind`` it won't give work until someone acts.
