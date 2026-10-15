@@ -239,3 +239,49 @@ class TestAProtocolRefusal:
         with pytest.raises(NodeProtocolError) as raised:
             self._client(serve, body).info()
         assert raised.value.node is None
+
+
+class TestWhyNothingAnswered:
+    """The error says why in plain words (never a Python class name) and carries a code Add node words."""
+
+    def test_a_closed_port_is_connection_refused(self):
+        with socket.create_server(("127.0.0.1", 0)) as closed:
+            port = closed.getsockname()[1]
+        with pytest.raises(NodeUnreachableError) as raised:
+            _local(f"http://127.0.0.1:{port}").info()
+        assert raised.value.reason == client_mod.UNREACHABLE_REFUSED
+        assert str(raised.value) == f"http://127.0.0.1:{port} didn't answer (connection refused)"
+
+    def test_a_name_that_does_not_resolve_says_so(self):
+        with pytest.raises(NodeUnreachableError) as raised:
+            _local("http://no-such-node.invalid:9494").info()
+        assert raised.value.reason == client_mod.UNREACHABLE_DNS
+        assert "no machine called no-such-node.invalid was found" in str(raised.value)
+
+    def test_https_at_a_plain_http_answer_says_https(self):
+        with pytest.raises(NodeUnreachableError) as raised:
+            _client(requests.exceptions.SSLError("wrong version number")).info()
+        assert raised.value.reason == client_mod.UNREACHABLE_TLS
+        assert str(raised.value) == "http://node:9494 didn't answer over https"
+
+    @pytest.mark.parametrize(
+        "error", [requests.ReadTimeout("x"), requests.ConnectTimeout("x"), requests.ConnectionError("x")]
+    )
+    def test_no_message_names_an_exception_class(self, error):
+        with pytest.raises(NodeUnreachableError) as raised:
+            _client(error).info()
+        assert type(error).__name__ not in str(raised.value)
+
+
+class TestSomethingThatIsNotANode:
+    def test_a_web_page_is_flagged(self, serve):
+        url, _ = serve(404, b"<!doctype html><title>404</title>", {"Content-Type": "text/html; charset=utf-8"})
+        with pytest.raises(NodeProtocolError) as raised:
+            _local(url).info()
+        assert raised.value.web_page is True and raised.value.app_instance == ""
+
+    def test_this_apps_web_side_is_named_by_its_instance_header(self, serve):
+        url, _ = serve(404, b"<html></html>", {"Content-Type": "text/html", "X-MPG-App-Instance": "abc123"})
+        with pytest.raises(NodeProtocolError) as raised:
+            _local(url).info()
+        assert raised.value.app_instance == "abc123"

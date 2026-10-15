@@ -104,7 +104,8 @@ class TestPayload:
         message = next(w["message"] for w in payload["warnings"] if w.get("member_id") == "ngpu")
         assert (
             message
-            == "night: storage · GPU cuda:0 has no workers now (node offline). Its jobs wait; other devices keep working."
+            == f"night: storage · {NODE_GPU['name']} has no workers now (node offline). Its jobs wait; other devices "
+            "keep working."
         )
 
     def test_group_of_only_offline_node_members_reads_node_unavailable(self, client, registry):

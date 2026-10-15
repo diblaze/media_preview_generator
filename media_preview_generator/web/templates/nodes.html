@@ -20,7 +20,7 @@
             </p>
         </div>
         <div class="page-actions">
-            <button type="button" class="btn btn-outline-secondary" id="nodesCheckNow" disabled>
+            <button type="button" class="btn btn-outline-secondary d-none" id="nodesCheckNow" disabled>
                 <i class="bi bi-arrow-repeat me-1"></i>Check now
             </button>
             <button type="button" class="btn btn-primary" id="nodesAddBtn">
@@ -157,7 +157,7 @@
 
                     <div class="tab-pane fade" id="node-tab-media">
                         <div id="nodeMediaEditor"></div>
-                        <div class="sm-testrow">
+                        <div class="sm-testrow nd-savebar">
                             <button type="button" class="btn btn-primary btn-sm" id="nodeSaveMappings">Save mappings</button>
                             <span class="sm-tres" id="nodeMediaResult" role="status"></span>
                         </div>
@@ -234,6 +234,14 @@
                             <div class="sm-warnline bad d-none" id="nodeRemoveResult" role="alert"></div>
                         </section>
                     </div>
+                </div>
+            </div>
+            <!-- Shown only when closing would drop edits that weren't saved. -->
+            <div class="modal-footer sm-footer d-none" id="nodeDiscardFoot">
+                <div class="sm-discard" role="alert">
+                    <span id="nodeDiscardText">Discard unsaved changes?</span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="nodeKeepEditing">Keep editing</button>
+                    <button type="button" class="btn btn-sm btn-danger" id="nodeDiscardConfirm">Discard</button>
                 </div>
             </div>
         </div>

@@ -9,7 +9,7 @@ import pytest
 from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
-from media_preview_generator.nodes.readiness import node_readiness
+from media_preview_generator.nodes.readiness import UPDATE_DOCS_URL, node_readiness, to_fix
 
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok"}
 
@@ -97,10 +97,17 @@ def test_an_offline_node_shows_only_its_connection():
     assert [s["id"] for s in _envelope(_details(reg.STATE_OFFLINE))["sections"]] == ["node_connection"]
 
 
-def test_a_disabled_node_is_all_good_and_shows_nothing_else():
+def test_a_disabled_node_is_one_neutral_note_and_nothing_else():
     envelope = _envelope(_details(reg.STATE_DISABLED))
     assert envelope["overall_ok"] is True
     assert [c["id"] for s in envelope["sections"] for c in s["checks"]] == ["node_disabled"]
+    row = _check(envelope, "node_disabled")
+    assert (row["label"], row["severity"], row["ok"], row["informational"]) == (
+        "Turned off — no work is sent",
+        "info",
+        False,
+        True,
+    )
 
 
 def test_test_access_results_are_one_row_per_library_with_the_suggestion():
@@ -161,13 +168,29 @@ def test_a_library_this_app_cant_sample_never_blames_the_node(error):
         ]
     }  # fmt: skip
     envelope = _envelope(_details(access=access))
-    row = _check(envelope, "node_access_1")
-    assert (row["ok"], row["severity"], row["reason"]) == (False, "recommended", error)
-    assert row["label"] == "Home · Kids: not tested, this app can't read it itself"
-    assert (row["help_url"], row["help_label"]) == ("/servers", "Open Media Servers")
+    row = _check(envelope, "node_access_skipped")
+    assert (row["ok"], row["severity"], row["informational"], row["reason"]) == (False, "info", True, "Home · Kids")
+    assert row["label"] == "1 library skipped: this app can't open it"
+    assert (row["help_url"], row["help_label"]) == ("/servers", "Fix on Media Servers")
     assert not {"fix_tab", "fix_action", "suggestion"} & set(row)
     assert _section(envelope, "node_media_access")["severity"] == "recommended"
     assert envelope["overall_ok"] is True
+
+
+def test_libraries_this_app_cant_open_share_one_neutral_note():
+    """Seven Synth libraries the app had no mount for made seven Recommended rows on every node, drowning the one
+    library the node really couldn't see."""
+    skipped = [
+        {"server": "Home", "library": f"Synth {i}", "app_root": f"/media/synth{i}", "checked": 0, "ok": False,
+         "files": [], "error": f"This app can't open /media/synth{i}", "suggestion": None}
+        for i in range(7)
+    ]  # fmt: skip
+    envelope = _envelope(_details(access={"libraries": skipped}))
+    rows = _section(envelope, "node_media_access")["checks"]
+    notes = [r for r in rows if r["id"].startswith("node_access_")]
+    assert [r["id"] for r in notes] == ["node_access_skipped"]
+    assert notes[0]["label"] == "7 libraries skipped: this app can't open them"
+    assert not [r for r in rows if r["ok"] is False and r["severity"] in ("critical", "recommended")]
 
 
 def test_an_empty_library_is_not_a_problem():
@@ -326,3 +349,29 @@ def test_a_worker_on_another_version_shows_the_versions_only():
 def test_a_worker_nodes_version_row_says_it_matches():
     row = _check(_envelope(_details()), "node_version")
     assert (row["ok"], row["label"]) == (True, "The node's version matches this app")
+
+
+def test_a_failed_gpu_says_what_its_test_found_and_what_to_do():
+    view_gpu = {**GPU, "status": "failed"}
+    details = _details(gpus=(view_gpu,))
+    details = reg.NodeDetails(**{**details.__dict__, "gpus": ({**view_gpu, "error": "CUDA acceleration test failed"},)})
+    row = _check(_envelope(details), "node_gpu_cuda:0")
+    assert row["reason"] == (
+        "CUDA acceleration test failed. Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
+    )
+
+
+def test_a_node_that_needs_an_update_links_the_steps():
+    row = _check(_envelope(_details(reg.STATE_UPDATE_NEEDED)), "node_version")
+    assert (row["docs_url"], row["help_label"]) == (UPDATE_DOCS_URL, "How to update a node")
+    assert UPDATE_DOCS_URL.endswith("docs/guides.md#updating-a-node")
+    assert "docs_url" not in _check(_envelope(_details()), "node_version")
+
+
+def test_the_count_to_fix_matches_the_buckets_and_skips_the_plex_database_checks():
+    failed = _details(roles=(ROLE_WORKER, ROLE_PLEX_DB), gpus=({**GPU, "status": "failed"},))
+    envelope = node_readiness(failed, key="k", worker_groups=[], app_version="9.9.9", file_checks=None)
+    assert "node_plex_db" not in [s["id"] for s in envelope["sections"]]
+    # The failed GPU is a must fix; untested access and no worker group are recommended.
+    assert to_fix(envelope) == {"must_fix": 1, "recommended": 2}
+    assert to_fix(_envelope(_details(reg.STATE_DISABLED))) == {"must_fix": 0, "recommended": 0}

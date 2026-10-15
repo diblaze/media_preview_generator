@@ -12,6 +12,7 @@ is a secret: it leaves the app only in the node's Authorization header and comes
 from __future__ import annotations
 
 import copy
+import re
 import urllib.parse
 import uuid
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ NAME_MAX_LEN = 80
 URL_MAX_LEN = 500
 KEY_MAX_LEN = 200
 MAX_MAPPINGS = 50
+# "/v1", or a route under it, at the end of an address ("http://nuc:9494/v1/health").
+_NODE_ROUTE_TAIL = re.compile(r"/v1(?:/[a-z/-]*)?$")
 
 
 def new_node_id() -> str:
@@ -45,6 +48,8 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
         ``(url, "")`` without a trailing slash, or ``(None, message)``.
     """
     url = str(raw or "").strip().rstrip("/")
+    # Every node route starts /v1/, so an address ending in one is a route pasted from the docs or the node's log.
+    url = _NODE_ROUTE_TAIL.sub("", url)
     if not url:
         return None, "Enter the node's address, e.g. http://nuc.lan:9494"
     shape_err = "The node's address must be an http(s) address, e.g. http://nuc.lan:9494"

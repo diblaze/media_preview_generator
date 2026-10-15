@@ -288,6 +288,22 @@ class TestPlexTab:
         expect(authed_page.locator("#markersEmbyRedetectGroup")).to_be_hidden()
         expect(authed_page.locator("#markersEnabled")).not_to_be_checked()
 
+    def test_ready_status_through_a_node_names_the_plex_database_node(self, authed_page: Page, app_url: str) -> None:
+        server = _plex_server()
+        details = {**_plex_ready_details(), "agent": {"state": "connected", "url": "http://plexbox:9494"}}
+        status = _status(server, "ready", "Written into this Plex server's database", details)
+        _mock_server_page(authed_page, server, status)
+        _open_tab(authed_page, app_url, server)
+
+        block = authed_page.locator("#markersStatusBlock")
+        expect(block).to_contain_text("through the Plex database node", timeout=5000)
+        titles = " ".join(
+            block.locator("[title], [data-bs-original-title]").evaluate_all(
+                "els => els.map(e => e.getAttribute('title') || e.getAttribute('data-bs-original-title'))"
+            )
+        )
+        assert "agent" not in (block.inner_text() + titles).lower()
+
     def test_tab_points_to_the_libraries_tab_instead_of_listing_libraries(
         self, authed_page: Page, app_url: str
     ) -> None:

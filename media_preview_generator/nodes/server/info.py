@@ -28,9 +28,14 @@ def _gpu_entry(raw: object) -> dict[str, Any]:
     gpu_type, device, details = raw if isinstance(raw, tuple | list) and len(raw) == 3 else (raw, "", {})
     details = details if isinstance(details, dict) else {}
     error = details.get("error")
+    device = str(device or "")
+    # An NVIDIA card that passes its test is cuda:<index>; one that fails it (and Windows' single card) comes back as
+    # bare "cuda". Both mean the first card, and a worker group member saved as cuda:0 must still find it.
+    if device == "cuda":
+        device = "cuda:0"
     return {
         "type": str(gpu_type or ""),
-        "device": str(device or ""),
+        "device": device,
         "name": str(details.get("name") or gpu_type or ""),
         # detect_all_gpus only adds a status to entries that can fail; one without it was tested working.
         "status": str(details.get("status") or "ok"),

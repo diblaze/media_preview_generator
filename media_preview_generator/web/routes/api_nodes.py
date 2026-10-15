@@ -13,7 +13,7 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
-from flask import jsonify, request
+from flask import current_app, jsonify, request
 from loguru import logger
 
 from ...nodes import protocol
@@ -25,8 +25,8 @@ from ...nodes.client import (
     NodeProtocolError,
     NodeRequestError,
 )
-from ...nodes.mappings import default_mappings_for, run_test_access
-from ...nodes.readiness import node_readiness
+from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
+from ...nodes.readiness import node_readiness, to_fix
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
 from ...nodes.settings import KEY_MASK, find_node, normalise_key, normalise_mappings, normalise_url, validate_node
 from ..auth import api_token_required
@@ -36,6 +36,10 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# Why something that answered isn't a node (``error.reason`` next to the protocol kind).
+PROBE_THIS_APP = "this_app"
+PROBE_OTHER_APP = "other_app"
+PROBE_WEB_PAGE = "web_page"
 # Bounds on what a node sends that is passed on to the browser.
 NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
@@ -138,7 +142,26 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "last_seen": view.last_seen if view else None,
         "path_mappings": list(record.get("path_mappings") or []),
         "used_by": _used_by(record["id"]),
+        "to_fix": _to_fix(record, details),
     }
+
+
+def _to_fix(record: dict, details: NodeDetails | None) -> dict[str, int]:
+    """The Setup Health counts the card shows, so a "Ready" card still says when its Setup Health has rows to fix.
+
+    The Plex database checks ask the node, so they are left out here; its Setup Health tab runs them.
+    """
+    if details is None:
+        return {"must_fix": 0, "recommended": 0}
+    sm = get_settings_manager()
+    envelope = node_readiness(
+        details,
+        key=str(record.get("key") or ""),
+        worker_groups=sm.get("worker_groups"),
+        app_version=_app_version(),
+        file_checks=None,
+    )
+    return to_fix(envelope)
 
 
 def _row_for(node_id: str) -> dict[str, Any] | None:
@@ -157,8 +180,28 @@ def _same_address(url: str, record: dict) -> bool:
     return url == normalise_url(record.get("url"))[0]
 
 
-def _probe_error(kind: str, message: str) -> dict[str, Any]:
-    return {"ok": False, "error": {"kind": kind, "message": message}}
+def _probe_error(kind: str, message: str, reason: str = "") -> dict[str, Any]:
+    """A failed probe; ``reason`` narrows ``kind`` down to what to check (Add node words each one)."""
+    error = {"kind": kind, "message": message}
+    if reason:
+        error["reason"] = reason
+    return {"ok": False, "error": error}
+
+
+def _not_a_node(exc: NodeProtocolError) -> dict[str, Any] | None:
+    """The probe's answer when the address is this app (or another copy of it) or a web page, else None."""
+    if exc.app_instance:
+        own = exc.app_instance == current_app.config.get("APP_INSTANCE_ID")
+        return _probe_error(
+            protocol.KIND_PROTOCOL,
+            "This address is this app itself, not a node."
+            if own
+            else "This address is another copy of this app, not a node.",
+            PROBE_THIS_APP if own else PROBE_OTHER_APP,
+        )
+    if exc.web_page:
+        return _probe_error(protocol.KIND_PROTOCOL, "This address answers with a web page, not a node.", PROBE_WEB_PAGE)
+    return None
 
 
 def _credit_notes(gpus: list[dict]) -> list[dict[str, str]]:
@@ -233,11 +276,13 @@ def _probe(url: str, key: str) -> dict[str, Any]:
             )
             answer["error"]["node_version"] = node_version
             return answer
+        if exc.app_instance:
+            return _not_a_node(exc)
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
         if state != AGENT_CONNECTED:
-            return _probe_error(
+            return _not_a_node(exc) or _probe_error(
                 protocol.KIND_PROTOCOL,
                 "Something answered at this address, but not as a node this app can use.",
             )
@@ -253,7 +298,7 @@ def _probe(url: str, key: str) -> dict[str, Any]:
             },
         }
     except NodeError as exc:
-        return _probe_error(KIND_UNREACHABLE, str(exc))
+        return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
     return {"ok": True, "info": _probe_info(info)}
 
 
@@ -325,10 +370,26 @@ def probe_node():
     own_id = record["id"] if record else None
     twin = next((n for n in sm.nodes if uid and n.get("node_uid") == uid and n["id"] != own_id), None)
     info["already_added"] = {"id": twin["id"], "name": twin.get("name", "")} if twin else None
+    servers = sm.get("media_servers") or []
     info["suggested_path_mappings"] = (
-        default_mappings_for(sm.get("media_servers") or []) if protocol.ROLE_WORKER in info["node"]["roles"] else []
+        default_mappings_for(servers) if protocol.ROLE_WORKER in info["node"]["roles"] else []
     )
+    info["media_setup"] = _media_setup(servers)
     return jsonify(result)
+
+
+def _media_setup(servers: list[dict]) -> dict[str, int]:
+    """How many media servers are on and how many libraries they list, so an empty list of rows can say which is missing.
+
+    Args:
+        servers: The stored ``media_servers`` list.
+
+    Returns:
+        ``{"servers": n, "libraries": n}``.
+    """
+    on = [s for s in servers if isinstance(s, dict) and s.get("enabled", True)]
+    libraries = {(root.server_id, root.library_id) for root in library_roots(on)}
+    return {"servers": len(on), "libraries": len(libraries)}
 
 
 def _probed_uid(url: str, key: str) -> str | None:
@@ -486,9 +547,24 @@ def test_node_access(node_id: str):
         )
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
+    result["media_setup"] = _media_setup(sm.get("media_servers") or [])
     # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.
     get_registry().record_access_result(node_id, result, tested_mappings=rows, tested_url=record["url"])
     return jsonify(result)
+
+
+@api.route("/nodes/<node_id>/suggested-mappings", methods=["GET"])
+@api_token_required
+def suggested_node_mappings(node_id: str):
+    """Rows to pre-fill for a node with none saved: one per library folder, the same path on the node.
+
+    A node added before any library was loaded got no rows in Add node; its Media tab fills them in later from this.
+    """
+    sm = get_settings_manager()
+    if find_node(sm.nodes, node_id) is None:
+        return _not_found(node_id)
+    servers = sm.get("media_servers") or []
+    return jsonify({"path_mappings": default_mappings_for(servers), "media_setup": _media_setup(servers)})
 
 
 @api.route("/nodes/<node_id>/health", methods=["GET"])
@@ -532,7 +608,12 @@ def node_log(node_id: str):
 @api.route("/nodes/<node_id>/rescan-gpus", methods=["POST"])
 @api_token_required
 def rescan_node_gpus(node_id: str):
-    """Ask the node to detect its GPUs again and answer with the fresh ``NODE_ROW``."""
-    if get_registry().rescan_gpus(node_id) is None:
+    """Ask the node to detect its GPUs again and answer with the fresh ``NODE_ROW`` (502 when it can't be asked)."""
+    try:
+        view = get_registry().rescan_gpus(node_id)
+    except NodeError as exc:
+        record = find_node(get_settings_manager().nodes, node_id) or {}
+        return jsonify({"error": f"Couldn't ask {record.get('name') or 'the node'}: {exc}"}), 502
+    if view is None:
         return _not_found(node_id)
     return jsonify(_row_for(node_id))

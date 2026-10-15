@@ -537,8 +537,9 @@ class NodeRegistry:
                 return
             name = live.record.get("name") or "The node"
             live.access_problem = (
-                f"{name} couldn't see {len(distinct)} different files{where} in 10 minutes (last: {reason}). "
-                "Its workers are paused: run Test access on the Nodes page and fix the folder mappings."
+                f"{name} couldn't see {len(distinct)} different files{where} in 10 minutes (the last one: "
+                f"{protocol.not_visible_text(reason)}). Its workers are paused: run Test access and fix the folder "
+                "mappings."
             )
             logger.warning(
                 "Node {} couldn't see {} different files{} in 10 minutes; pausing its workers until media access "
@@ -622,14 +623,18 @@ class NodeRegistry:
         return self.view(node_id)
 
     def rescan_gpus(self, node_id: str) -> NodeView | None:
-        """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back."""
+        """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back.
+
+        Raises:
+            NodeError: The node couldn't be asked, so the GPUs it reported before are all there is.
+        """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return None
             device = live.lost_device
-        self._gpu_check(node_id, device or None)
+        self._gpu_check(node_id, device or None, raise_unreachable=True)
         return self.view(node_id)
 
     # ------------------------------------------------------------------ lifecycle
@@ -1123,7 +1128,7 @@ class NodeRegistry:
                 live.not_visible.clear()
                 self._touch()
 
-    def _gpu_check(self, node_id: str, device: str | None) -> None:
+    def _gpu_check(self, node_id: str, device: str | None, raise_unreachable: bool = False) -> None:
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
@@ -1135,6 +1140,8 @@ class NodeRegistry:
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)
             self.report_unavailable(node_id)
+            if raise_unreachable:
+                raise
             return
         with self._lock:
             if self._nodes.get(node_id) is not live or live.client is not client:
@@ -1148,7 +1155,10 @@ class NodeRegistry:
                 else:
                     if not live.gpu_lost:
                         logger.warning("Node {} lost its GPU {} ({}); its GPU workers are paused", name, device, why)
-                    live.gpu_lost = f"{name} lost its GPU {device} ({why}). Its CPU workers keep running."
+                    live.gpu_lost = (
+                        f"{name} lost its GPU {device} ({why}). Its CPU workers keep running. Check the GPU driver on "
+                        "the node."
+                    )
                     live.lost_device = device
                     live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
             self._note_gpu_detection(live, answer)

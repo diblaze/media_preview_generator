@@ -439,6 +439,15 @@ class TestErrors:
         assert (raised.value.node_id, raised.value.node_name, raised.value.reason) == (NODE_ID, NODE_NAME, "missing")
         assert registry.reports == [("not_visible", NODE_ID, media, "missing")]
 
+    def test_file_not_visible_says_why_in_plain_words_without_the_nodes_path(self, media):
+        error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file: /mnt/nas/a.mkv", "reason": "missing"}
+        _install(ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)]))
+
+        with pytest.raises(FileNotVisibleError) as raised:
+            _run(media)
+
+        assert str(raised.value) == f"{NODE_NAME} can't see the file: not found on the node"
+
     def test_codec_not_supported_raises_the_apps_exception_with_its_kind(self, media):
         error = {"kind": protocol.KIND_CODEC_NOT_SUPPORTED, "message": "GPU can't", "fallback_kind": FALLBACK_STALL}
         client = ScriptedClient([finished(protocol.STATUS_FAILED, error=error)])
@@ -611,6 +620,22 @@ class TestLogsAndProgress:
         finally:
             logger.remove(sink)
         assert ("WARNING", "NAS/GPU0 · decode {braces} slow") in lines
+
+    def test_node_lines_name_the_file_by_this_apps_path(self, media, monkeypatch):
+        app_root = os.path.dirname(os.path.dirname(media))
+        node_path = "/mnt/nas" + media[len(app_root) :]
+        lines = []
+        state = running(log=[{"seq": 0, "level": "INFO", "message": f"decoding {node_path} at 3x"}], next_log=1)
+        registry = _install(ScriptedClient([state, finished(protocol.STATUS_DONE, result={})]))
+        monkeypatch.setattr(
+            registry, "mappings", lambda node_id: [protocol.PathMapping(app_prefix=app_root, node_prefix="/mnt/nas")]
+        )
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+        try:
+            _run(media)
+        finally:
+            logger.remove(sink)
+        assert f"NAS/CPU · decoding {media} at 3x" in lines
 
     @pytest.mark.parametrize(
         ("op", "gpu", "expected"),

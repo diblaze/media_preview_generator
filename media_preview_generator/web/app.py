@@ -9,6 +9,7 @@ import hmac
 import json
 import logging  # stdlib logging only — required to mute werkzeug's own logger; app code must use loguru
 import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from loguru import logger
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
+from ..nodes.protocol import APP_INSTANCE_HEADER
 from .auth import log_token_on_startup
 from .jobs import JobStatus, get_job_manager
 from .scheduler import get_schedule_manager
@@ -727,6 +729,8 @@ def create_app(config_dir: str | None = None) -> Flask:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["CONFIG_DIR"] = config_dir
+    # Identifies this running app to Add node, which refuses its own address (protocol.APP_INSTANCE_HEADER).
+    app.config["APP_INSTANCE_ID"] = secrets.token_hex(8)
     # Flask-WTF's own check can't tell a script's API token from a browser session, so
     # _require_csrf_for_browser_requests (below) runs the check instead.
     app.config["WTF_CSRF_CHECK_DEFAULT"] = False
@@ -970,6 +974,7 @@ def create_app(config_dir: str | None = None) -> Flask:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(APP_INSTANCE_HEADER, app.config["APP_INSTANCE_ID"])
         return response
 
     # Auto-requeue jobs that were interrupted by the server restart. Kept ahead of schedule ticks; leftover Intro &

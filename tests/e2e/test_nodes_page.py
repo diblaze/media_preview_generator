@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -114,6 +115,8 @@ class NodesApi:
         self.health_answer: dict = {"overall_ok": True, "sections": []}
         self.log_answer: dict = {"lines": [_log("14:01:02", "node started"), _log("14:01:03", "1 GPU found")]}
         self.delete_answer: tuple[int, dict] = (200, {"ok": True})
+        self.rescan_answer: tuple[int, dict] | None = None
+        self.suggest_answer: dict = {"path_mappings": [], "media_setup": {"servers": 1, "libraries": 1}}
         page.route("**/api/nodes**", self._handle)
 
     def bodies(self, method: str, suffix: str) -> list:
@@ -156,10 +159,15 @@ class NodesApi:
         if action == "check":
             return _fulfill(route, node)
         if action == "rescan-gpus":
+            if self.rescan_answer:
+                status, answer = self.rescan_answer
+                return _fulfill(route, answer, status)
             node["gpus"] = [{"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4070", "status": "ok"}]
             return _fulfill(route, node)
         if action == "test-access":
             return _fulfill(route, self.test_answers.pop(0) if self.test_answers else {"libraries": []})
+        if action == "suggested-mappings":
+            return _fulfill(route, self.suggest_answer)
         if action == "health":
             return _fulfill(route, self.health_answer)
         if action == "log":
@@ -235,12 +243,13 @@ def _node_tab(page: Page, tab: str) -> Locator:
 @pytest.mark.e2e
 class TestNodeList:
     def test_each_state_gets_its_chip_colour_and_button(self, authed_page: Page, app_url: str) -> None:
+        # Red is a node that gets no work (Setup Health's Must fix); every problem state's button says Fix.
         states = {
             "ready": ("✓ Ready", "ok", "Open"),
-            "update_needed": ("Update needed", "warn", "Fix"),
-            "access_problem": ("Access problem", "warn", "Fix"),
+            "update_needed": ("Update needed", "bad", "Fix"),
+            "access_problem": ("Access problem", "bad", "Fix"),
             "gpu_lost": ("GPU lost", "warn", "Fix"),
-            "offline": ("Offline", "bad", "Open"),
+            "offline": ("Offline", "bad", "Fix"),
             "key_refused": ("Key refused", "bad", "Fix"),
             "connecting": ("Connecting…", "off", "Open"),
             "disabled": ("Turned off", "off", "Open"),
@@ -257,8 +266,74 @@ class TestNodeList:
                 expect(pill).to_have_class("pill")
             else:
                 expect(pill).to_have_class(f"pill {tone}")
-            expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
+            if chip == "Turned off":
+                expect(row.locator(".nd-status")).not_to_contain_text(f"why {i}")
+            else:
+                expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
             expect(row.locator(".nd-open")).to_have_text(button)
+
+    def test_a_turned_off_node_says_so_once(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(
+            authed_page,
+            app_url,
+            [_node("n-off", "spare", "disabled", enabled=False, reason="Turned off on the Nodes page")],
+        )
+        api.health_answer = {
+            "overall_ok": True,
+            "sections": [
+                {
+                    "id": "node_connection",
+                    "title": "Connection",
+                    "checks": [
+                        {
+                            "id": "node_disabled",
+                            "label": "Turned off — no work is sent",
+                            "ok": False,
+                            "severity": "info",
+                            "informational": True,
+                        }
+                    ],
+                }
+            ],
+        }
+        status = authed_page.locator("#node-n-off .nd-status")
+        expect(status.locator(".pill")).to_have_text("Turned off")
+        expect(status).not_to_contain_text("Turned off on the Nodes page")
+
+        _open_node(authed_page, "n-off")
+        pane = _node_tab(authed_page, "health")
+        expect(pane.locator(".nd-note")).to_have_text("Turned off — no work is sent.")
+        expect(pane.locator(".readiness-bucket")).to_have_count(0)
+        expect(authed_page.locator("#nodeHealthSummary")).to_have_text("")
+
+    def test_a_ready_card_says_how_many_setup_health_rows_to_fix(self, authed_page: Page, app_url: str) -> None:
+        nodes = [
+            _node("n-gpu", "gpu-box", to_fix={"must_fix": 1, "recommended": 2}),
+            _node("n-new", "new-box", to_fix={"must_fix": 0, "recommended": 1}),
+            _node("n-ok", "ok-box", to_fix={"must_fix": 0, "recommended": 0}),
+            _node("n-off", "off-box", "offline", to_fix={"must_fix": 1, "recommended": 0}),
+        ]
+        _open_nodes(authed_page, app_url, nodes)
+
+        gpu = authed_page.locator("#node-n-gpu")
+        expect(gpu.locator(".nd-to-fix")).to_have_text("1 to fix")
+        expect(gpu.locator(".nd-to-fix")).to_have_class("pill bad nd-to-fix")
+        expect(gpu.locator(".nd-open")).to_have_text("Fix")
+        expect(gpu.locator(".nd-open")).to_have_attribute("data-tab", "health")
+        new = authed_page.locator("#node-n-new")
+        expect(new.locator(".nd-to-fix")).to_have_text("1 to fix")
+        expect(new.locator(".nd-to-fix")).to_have_class("pill warn nd-to-fix")
+        expect(new.locator(".nd-open")).to_have_text("Open")
+        expect(new.locator(".nd-open")).to_have_attribute("data-tab", "health")
+        expect(authed_page.locator("#node-n-ok .nd-to-fix")).to_have_count(0)
+        expect(authed_page.locator("#node-n-ok .nd-open")).to_have_attribute("data-tab", "overview")
+        # The state chip already says what is wrong with a node that isn't ready.
+        expect(authed_page.locator("#node-n-off .nd-to-fix")).to_have_count(0)
+
+        watch_modal_shown(authed_page, "nodeModal")
+        gpu.locator(".nd-open").click()
+        expect_modal_shown(authed_page, "nodeModal")
+        expect(authed_page.locator("#node-tab-health")).to_be_visible()
 
     def test_rows_show_roles_hardware_busy_and_who_uses_them(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
@@ -287,7 +362,8 @@ class TestNodeList:
         expect(empty.locator("a")).to_have_attribute(
             "href", "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
         )
-        expect(authed_page.locator("#nodesCheckNow")).to_be_disabled()
+        # Nothing to check yet: the button is hidden, not greyed out.
+        expect(authed_page.locator("#nodesCheckNow")).to_be_hidden()
         watch_modal_shown(authed_page, "addNodeModal")
         empty.locator(".nd-add").click()
         expect_modal_shown(authed_page, "addNodeModal")
@@ -315,6 +391,19 @@ class TestNodeList:
         expect(authed_page.locator("#nodeModalName")).to_have_text("nuc")
         expect(authed_page.locator("#nodeModalState")).to_have_text("Access problem")
 
+    def test_a_hash_with_a_tab_opens_that_tab(self, authed_page: Page, app_url: str) -> None:
+        # The bell's "Fix key" links here.
+        _open_nodes(authed_page, app_url, _four_nodes(), path="/nodes#node-n-storage/settings")
+        expect(authed_page.locator("#node-tab-settings")).to_be_visible()
+        expect(authed_page.locator("#nodeModalName")).to_have_text("storage")
+
+    def test_the_bells_test_access_link_opens_media_and_runs_the_test(self, authed_page: Page, app_url: str) -> None:
+        api = NodesApi(authed_page, _four_nodes())
+        with authed_page.expect_response(lambda r: r.url.endswith("/test-access")):
+            authed_page.goto(f"{app_url}/nodes#node-n-nuc/media/test")
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+        assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/n-nuc/test-access"]
+
     def test_fix_opens_the_tab_with_the_fix(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         _open_node(authed_page, "n-nuc")
@@ -340,6 +429,24 @@ class TestNodeList:
         assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         _node_tab(authed_page, "media")
         expect(authed_page.locator("#nodeMediaEditor .nd-app")).to_be_visible()
+
+    def test_on_a_phone_every_tab_shows_and_each_path_field_is_labelled(self, authed_page: Page, app_url: str) -> None:
+        authed_page.set_viewport_size(PHONE)
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        width = authed_page.viewport_size["width"]
+        for tab in ("overview", "media", "health", "log", "settings"):
+            box = authed_page.locator(f'#nodeModal .sm-rail [data-tab="{tab}"]').bounding_box()
+            assert box["x"] >= 0 and box["x"] + box["width"] <= width, tab
+        _node_tab(authed_page, "media")
+        row = authed_page.locator("#nodeMediaEditor .nd-map-row").first
+        expect(row.locator(".nd-mini-app")).to_have_text("Path on this app")
+        expect(row.locator(".nd-mini-app")).to_be_visible()
+        expect(row.locator(".nd-mini-node")).to_have_text("Path on the node")
+        expect(row.locator(".nd-mini-node")).to_be_visible()
+        # On a wide screen the column headers say it once instead.
+        authed_page.set_viewport_size({"width": 1440, "height": 900})
+        expect(row.locator(".nd-mini-app")).to_be_hidden()
 
     def test_info_icons_follow_the_app_rule(self, authed_page: Page, app_url: str) -> None:
         nodes = _four_nodes()
@@ -463,6 +570,44 @@ class TestAddNode:
         ]
         expect(page.locator("#node-n-new")).to_be_visible()
 
+    def _to_step_2(self, page: Page) -> None:
+        page.locator("#addNodeUrl").fill("http://nas.lan:9494")
+        page.locator("#addNodeKey").fill("secret-key")
+        page.locator("#addNodeConnect").click()
+        expect(page.locator("#addNodeProbe")).to_contain_text("Connected")
+        page.locator("#addNodeNext").click()
+        expect(page.locator("#addNodeStep2")).to_be_visible()
+
+    def test_finish_later_keeps_the_rows_shown_in_step_2(self, authed_page: Page, app_url: str) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        _open_add(page)
+        self._to_step_2(page)
+        expect(page.locator("#addNodeMappings .nd-app").first).to_have_value("/data/TV Shows")
+
+        with page.expect_response(lambda r: r.request.method == "PUT" and r.url.endswith("/api/nodes/n-new")):
+            page.locator("#addNodeCancel").click()
+
+        expect(page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        assert api.bodies("PUT", "/nodes/n-new") == [
+            {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}]}
+        ]
+
+    def test_step_2_with_servers_but_no_libraries_says_to_refresh_them(self, authed_page: Page, app_url: str) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        api.probe_answer["info"]["suggested_path_mappings"] = []
+        api.probe_answer["info"]["media_setup"] = {"servers": 1, "libraries": 0}
+        _open_add(page)
+        self._to_step_2(page)
+
+        note = page.locator("#addNodeMappings .nd-map-note")
+        expect(note).to_contain_text("Your media servers have no libraries loaded yet.")
+        expect(note.get_by_role("link", name="Refresh libraries on Media Servers")).to_have_attribute(
+            "href", "/servers"
+        )
+        expect(page.locator("#addNodeMappings")).not_to_contain_text("Add a media server")
+
     def test_plex_database_node_skips_the_media_step(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         modal = _open_add(authed_page)
@@ -521,6 +666,31 @@ class TestAddNode:
         expect(authed_page.locator("#addNodeError")).to_contain_text(text)
         expect(authed_page.locator("#addNodeNext")).to_be_hidden()
 
+    @pytest.mark.parametrize(
+        ("url", "kind", "reason", "text"),
+        [
+            ("http://nas:9494", "protocol", "this_app", "This address is this app itself, not a node."),
+            ("http://nas:8080", "protocol", "other_app", "This address is another copy of this app, not a node."),
+            ("http://nas:80", "protocol", "web_page", "This address answers with a web page, not a node."),
+            ("https://nas:9494", "unreachable", "tls", "It doesn't answer over https."),
+            ("https://nas:9494", "unreachable", "timeout", "No answer over https in time."),
+            ("http://nass.lan:9494", "unreachable", "dns", "Can't find nass.lan."),
+            ("http://nas:9495", "unreachable", "refused", "Nothing is listening on that port."),
+        ],
+        ids=["this-app", "other-app", "web-page", "https", "https-timeout", "dns", "refused"],
+    )
+    def test_probe_errors_say_what_to_check(
+        self, authed_page: Page, app_url: str, url: str, kind: str, reason: str, text: str
+    ) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.probe_answer = {"ok": False, "error": {"kind": kind, "message": "raw detail", "reason": reason}}
+        authed_page.locator("#addNodeUrl").fill(url)
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text(text)
+        expect(authed_page.locator("#addNodeError")).not_to_contain_text("Update the node")
+
     def test_a_node_on_another_protocol_names_both_versions(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)
@@ -578,9 +748,29 @@ class TestNodeDialog:
 
         authed_page.locator("#nodeRescanGpus").click()
 
-        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 GPU")
+        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 working GPU")
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("RTX 4070")
         assert api.bodies("POST", "/nodes/n-storage/rescan-gpus") == [None]
+
+    def test_rescan_of_a_node_that_does_not_answer_says_so_in_red(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.rescan_answer = (502, {"error": "Couldn't ask storage: http://storage.lan:9494 didn't answer"})
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        result = authed_page.locator("#nodeRescanResult")
+        expect(result).to_have_text("Couldn't ask storage: http://storage.lan:9494 didn't answer")
+        expect(result).to_have_class("sm-tres bad")
+
+    def test_rescan_does_not_count_a_gpu_that_failed_its_test(self, authed_page: Page, app_url: str) -> None:
+        nodes = _four_nodes()
+        api = _open_nodes(authed_page, app_url, nodes)
+        failed = {"type": "NVIDIA", "device": "cuda:0", "name": "Quadro P5000", "status": "failed"}
+        api.rescan_answer = (200, {**nodes[0], "gpus": [failed]})
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        result = authed_page.locator("#nodeRescanResult")
+        expect(result).to_have_text("No working GPU found · 1 not working")
+        expect(result).to_have_class("sm-tres warn")
 
     def test_plex_database_node_has_no_media_tab(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
@@ -600,6 +790,92 @@ class TestNodeDialog:
         assert api.bodies("PUT", "/nodes/n-storage") == [
             {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
         ]
+
+    def test_a_node_with_no_rows_gets_the_library_folders_suggested(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [_node("n-nas", "nas")])
+        api.suggest_answer = {
+            "path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/data/Movies"}],
+            "media_setup": {"servers": 1, "libraries": 1},
+        }
+        _open_node(authed_page, "n-nas")
+        pane = _node_tab(authed_page, "media")
+
+        expect(pane.locator(".nd-app").first).to_have_value("/data/Movies")
+        expect(pane.locator(".nd-node").first).to_have_value("/data/Movies")
+        expect(authed_page.locator("#nodeMediaResult")).to_have_text("Suggested from your libraries. Not saved yet")
+        # Nothing typed, so closing loses nothing and doesn't ask.
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        assert not api.bodies("PUT", "/nodes/n-nas")
+
+    def test_test_access_with_servers_but_no_libraries_says_to_refresh_them(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.test_answers = [{"libraries": [], "media_setup": {"servers": 2, "libraries": 0}}]
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-test").click()
+
+        note = pane.locator(".nd-map-note")
+        expect(note).to_contain_text("No libraries to test yet. Your media servers have no libraries loaded yet.")
+        expect(note.get_by_role("link", name="Refresh libraries on Media Servers")).to_have_attribute(
+            "href", "/servers"
+        )
+
+    def test_closing_with_unsaved_mappings_asks_first(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        _node_tab(authed_page, "overview")
+
+        authed_page.keyboard.press("Escape")
+        foot = authed_page.locator("#nodeDiscardFoot")
+        expect(foot).to_be_visible()
+        expect(foot).to_contain_text("Discard the unsaved mappings?")
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+
+        authed_page.locator("#nodeKeepEditing").click()
+        expect(foot).to_be_hidden()
+        expect(pane.locator(".nd-node").first).to_have_value("/mnt/media/Movies")
+
+        authed_page.locator("#nodeModal .btn-close").click()
+        authed_page.locator("#nodeDiscardConfirm").click()
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    def test_focus_stays_in_the_dialog_after_a_button_finishes(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 working GPU")
+        assert authed_page.evaluate("() => !!document.activeElement.closest('#nodeModal')")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    def test_closing_with_unsaved_settings_asks_first(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetName").fill("storage-2")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeDiscardFoot")).to_contain_text("Discard the unsaved settings?")
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+
+    def test_saved_mappings_close_without_asking_and_are_tested(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        with authed_page.expect_response(lambda r: r.url.endswith("/test-access")):
+            authed_page.locator("#nodeSaveMappings").click()
+        assert api.bodies("POST", "/nodes/n-storage/test-access") == [
+            {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
+        ]
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#nodeDiscardFoot")).to_be_hidden()
 
     def test_use_this_edits_the_row_of_the_library_it_was_suggested_for(self, authed_page: Page, app_url: str) -> None:
         # Both libraries pointed at the node's media root: the natural mistake, and the one a real node can list.
@@ -683,6 +959,85 @@ class TestNodeDialog:
         card = pane.locator('.nd-fail[data-library="Open Films"]')
         expect(card).to_contain_text(f"Open Films: {reason}")
         expect(card.locator(".nd-use")).to_have_count(0)
+
+    def test_libraries_this_app_cant_open_share_one_neutral_note(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        skipped = [
+            {"server": "Home", "library": f"Synth {i}", "app_root": f"/media/synth{i}", "checked": 0, "ok": False,
+             "files": [], "error": f"This app can't open /media/synth{i}"}
+            for i in range(3)
+        ]  # fmt: skip
+        api.test_answers = [
+            {"libraries": [_library("Movies", "/data/Movies", False, "/mnt/nas/Movies"), *skipped]},
+        ]
+        pane.locator(".nd-test").click()
+
+        results = pane.locator(".nd-map-results")
+        expect(results.locator(".nd-fail")).to_have_count(1)
+        expect(results.locator(".nd-fail")).to_contain_text("Movies")
+        note = results.locator(".nd-skipped")
+        expect(note).to_have_count(1)
+        expect(note.locator("summary")).to_have_text("3 libraries skipped: this app can't open them.")
+        expect(note.locator("a")).to_have_attribute("href", "/servers")
+        expect(results).not_to_contain_text("Synth 0: no files to test")
+
+    def test_setup_health_shows_an_informational_failure_as_a_note_not_a_bucket(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        api = NodesApi(authed_page, _four_nodes())
+        note = {
+            "id": "node_access_skipped",
+            "label": "7 libraries skipped: this app can't open them",
+            "ok": False,
+            "severity": "info",
+            "informational": True,
+            "reason": "Home · Synth",
+            "help_url": "/servers",
+            "help_label": "Fix on Media Servers",
+        }
+        passing = {"id": "lib_movies", "label": "Movies visible", "ok": True, "severity": "critical"}
+        api.health_answer = {"overall_ok": True, "sections": [{"id": "a", "title": "Media", "checks": [passing, note]}]}
+        authed_page.goto(f"{app_url}/nodes")
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "health")
+        body = authed_page.locator("#nodeHealthBody")
+        expect(body.locator(".nd-note")).to_have_text(
+            "7 libraries skipped: this app can't open them. Fix on Media Servers"
+        )
+        expect(body.locator('.readiness-bucket[data-tier="recommended"]')).to_have_count(0)
+        expect(authed_page.locator("#nodeHealthSummary")).to_have_text("✓ All good")
+
+    def test_a_node_that_needs_an_update_links_the_steps(self, authed_page: Page, app_url: str) -> None:
+        docs = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
+        api = _open_nodes(authed_page, app_url, [_node("n-old", "old", "update_needed")])
+        api.health_answer = {
+            "overall_ok": False,
+            "sections": [
+                {
+                    "id": "node_connection",
+                    "title": "Connection",
+                    "checks": [
+                        {
+                            "id": "node_version",
+                            "label": "The node needs an update",
+                            "ok": False,
+                            "severity": "critical",
+                            "fix_where": "node",
+                            "docs_url": docs,
+                            "help_label": "How to update a node",
+                        }
+                    ],
+                }
+            ],
+        }
+        _open_node(authed_page, "n-old")
+        pane = _node_tab(authed_page, "health")
+        link = pane.get_by_role("link", name="How to update a node")
+        expect(link).to_have_attribute("href", docs)
+        expect(link).to_have_attribute("target", "_blank")
+        expect(authed_page.locator("#node-n-old .nd-status .pill").first).to_have_class("pill bad")
 
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())
@@ -778,7 +1133,70 @@ class TestNodeDialog:
         expect(authed_page.locator("#nodeModalName")).to_have_text("storage-2")
         expect(authed_page.locator("#node-n-storage .nd-name")).to_have_text("storage-2")
 
+    def test_a_new_key_the_node_refuses_is_not_saved(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.probe_answer = {"ok": False, "error": {"kind": "auth", "message": "The node refused this key."}}
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetKey").fill("wrong-key")
+        authed_page.locator("#nodeSettingsSave").click()
+
+        result = authed_page.locator("#nodeSettingsResult")
+        expect(result).to_contain_text("Key refused.")
+        expect(result).to_contain_text("Nothing was saved.")
+        expect(result).to_have_class("sm-tres bad")
+        expect(authed_page.locator("#nodeSetKey")).to_have_class(re.compile(r"\bis-invalid\b"))
+        assert api.bodies("POST", "/nodes/probe") == [
+            {"id": "n-storage", "url": "http://storage.lan:9494", "key": "wrong-key"}
+        ]
+        assert not api.bodies("PUT", "/nodes/n-storage")
+
+    def test_a_new_key_the_node_accepts_is_saved(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetKey").fill("right-key")
+        authed_page.locator("#nodeSettingsSave").click()
+        expect(authed_page.locator("#nodeSettingsResult")).to_have_text("Saved")
+        assert [b["key"] for b in api.bodies("PUT", "/nodes/n-storage")] == ["right-key"]
+
+    def test_a_node_that_does_not_answer_still_saves_and_says_so(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.probe_answer = {
+            "ok": False,
+            "error": {"kind": "unreachable", "message": "down", "reason": "refused"},
+        }
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetUrl").fill("http://storage2.lan:9494")
+        authed_page.locator("#nodeSetKey").fill("right-key")
+        authed_page.locator("#nodeSettingsSave").click()
+        result = authed_page.locator("#nodeSettingsResult")
+        expect(result).to_contain_text("Saved. ")
+        expect(result).to_have_class("sm-tres warn")
+        assert len(api.bodies("PUT", "/nodes/n-storage")) == 1
+
+    def test_send_work_switch_and_its_label_have_room(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        switch = authed_page.locator("#nodeSetEnabled").bounding_box()
+        label = authed_page.locator("label[for='nodeSetEnabled']").bounding_box()
+        assert label["x"] - (switch["x"] + switch["width"]) >= 6
+
+    def test_remove_of_a_node_in_use_says_by_what_before_asking(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeRemove").click()
+        expect(authed_page.locator("#nodeRemoveResult")).to_have_text(
+            'Still in use by worker group "GPU box". Take it out of those first.'
+        )
+        expect(authed_page.locator("#appConfirmModal")).to_be_hidden()
+        assert not [c for c in api.calls if c[0] == "DELETE"]
+
     def test_remove_refused_while_in_use_names_the_users(self, authed_page: Page, app_url: str) -> None:
+        # The list said nothing used it; the server, which knows better, refuses.
         api = _open_nodes(authed_page, app_url, _four_nodes())
         api.delete_answer = (
             409,
@@ -790,7 +1208,7 @@ class TestNodeDialog:
                 ],
             },
         )
-        _open_node(authed_page, "n-storage")
+        _open_node(authed_page, "n-nuc")
         _node_tab(authed_page, "settings")
         authed_page.locator("#nodeRemove").click()
         accept_app_confirm(authed_page)

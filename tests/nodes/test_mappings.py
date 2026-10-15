@@ -494,10 +494,42 @@ def test_default_mappings_are_one_row_per_top_library_folder(tmp_path):
         )
     ]
     movies, tv = str(tmp_path / "media" / "Movies"), str(tmp_path / "media" / "TV")
+    for folder in (movies, tv, f"{movies}/4K"):
+        os.makedirs(folder)
     assert nm.default_mappings_for(servers) == [
         {"app_prefix": movies, "node_prefix": movies},
         {"app_prefix": tv, "node_prefix": tv},
     ]
+
+
+def test_default_mappings_leave_out_folders_this_app_cant_open(tmp_path):
+    """The lab's Synth libraries weren't mounted in the app: Add node suggested a row for each, and each then failed
+    Test access on this app's side."""
+    servers = [
+        _server(
+            tmp_path,
+            [
+                {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                {"id": "2", "name": "Synth", "remote_paths": ["/plexmedia/Synth"]},
+            ],
+        )
+    ]
+    movies = str(tmp_path / "media" / "Movies")
+    os.makedirs(movies)
+    assert nm.default_mappings_for(servers) == [{"app_prefix": movies, "node_prefix": movies}]
+
+
+def test_default_mappings_keep_a_folder_whose_read_hangs(tmp_path, monkeypatch):
+    import threading
+
+    servers = [_server(tmp_path, [{"id": "1", "name": "TV", "remote_paths": ["/plexmedia/TV"]}])]
+    release = threading.Event()
+    monkeypatch.setattr(nm.os, "scandir", lambda path: release.wait(5))
+    try:
+        tv = str(tmp_path / "media" / "TV")
+        assert nm.default_mappings_for(servers, budget_s=0.2) == [{"app_prefix": tv, "node_prefix": tv}]
+    finally:
+        release.set()
 
 
 class TestAStalledMount:

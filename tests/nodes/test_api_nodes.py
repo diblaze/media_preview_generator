@@ -33,6 +33,7 @@ NODE_ROW_KEYS = {
     "last_seen",
     "path_mappings",
     "used_by",
+    "to_fix",
 }
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok", "error": None}
 GPU_ON_CPU_TEXT = {**GPU, "credit_text": {"on_gpu": False, "reason": "Vulkan reports no hardware GPU"}}
@@ -149,6 +150,7 @@ class TestListAndProbe:
             "version_match": True,
             "already_added": None,
             "suggested_path_mappings": [],
+            "media_setup": {"servers": 0, "libraries": 0},
         }
         assert _sm().nodes == []
 
@@ -203,6 +205,36 @@ class TestListAndProbe:
         nodes("http://nuc:9494").info_answer = error
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["ok"] is False and body["error"]["kind"] == kind and body["error"]["message"]
+
+    def test_probe_that_nothing_answered_says_why(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("x", reason="refused")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
+
+    def test_probe_of_this_apps_own_address_says_it_is_this_app(self, client, nodes):
+        own = client.application.config["APP_INSTANCE_ID"]
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance=own)
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"] == {
+            "kind": "protocol",
+            "message": "This address is this app itself, not a node.",
+            "reason": "this_app",
+        }
+
+    def test_probe_of_another_copy_of_this_app_says_so(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance="someone-else")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["reason"] == "other_app"
+
+    def test_probe_of_a_web_page_that_is_no_plex_helper_says_web_page(self, client, nodes, monkeypatch):
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("unreachable", ""))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("html", web_page=True)
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["reason"] == "web_page"
+
+    def test_this_apps_answers_carry_its_instance_id(self, client, nodes):
+        resp = client.get("/v1/info")
+        assert resp.headers["X-MPG-App-Instance"] == client.application.config["APP_INSTANCE_ID"]
 
     def test_probe_of_an_old_helper(self, client, nodes):
         nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
@@ -345,6 +377,20 @@ class TestRowState:
         resp = client.post(f"/api/nodes/{node_id}/rescan-gpus")
         assert resp.status_code == 200 and resp.get_json()["gpus"][0]["device"] == "cuda:0"
 
+    def test_rescan_gpus_on_a_node_that_does_not_answer_is_a_502_not_the_old_gpus(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        assert client.post(f"/api/nodes/{node_id}/check").get_json()["state"] == "ready"
+        fake = nodes("http://nuc:9494")
+
+        def down():
+            raise NodeUnreachableError("http://nuc:9494 didn't answer (connection refused)")
+
+        fake.rescan_gpus = down
+        fake.info_answer = NodeUnreachableError("http://nuc:9494 didn't answer (connection refused)")
+        resp = client.post(f"/api/nodes/{node_id}/rescan-gpus")
+        assert resp.status_code == 502
+        assert resp.get_json()["error"].startswith("Couldn't ask nuc:")
+
     @pytest.mark.parametrize(
         ("method", "path"),
         [
@@ -422,6 +468,14 @@ class TestDelete:
         resp = client.delete(f"/api/nodes/{node_id}")
         assert resp.status_code == 400
         assert resp.get_json() == {"error": "The node's name must be at most 80 characters"}
+
+    def test_each_row_counts_its_setup_health_rows_to_fix(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        reg.get_registry().check_now(node_id)
+        row = next(n for n in client.get("/api/nodes").get_json()["nodes"] if n["id"] == node_id)
+        assert row["state"] == "ready"
+        # Not tested and in no worker group: two recommendations, nothing that stops it working.
+        assert row["to_fix"] == {"must_fix": 0, "recommended": 2}
 
     def test_a_node_nothing_uses_is_removed(self, client, nodes):
         node_id = _add(client).get_json()["id"]
@@ -517,6 +571,27 @@ class TestTestAccess:
         node_id = _add(client).get_json()["id"]
         resp = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": [{"app_prefix": "x"}]})
         assert resp.status_code == 400
+
+    def test_servers_without_libraries_are_told_apart_from_no_server(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        _sm().set("media_servers", [{"id": "p1", "type": "plex", "name": "Home", "enabled": True, "libraries": []}])
+        body = client.post(f"/api/nodes/{node_id}/test-access", json={}).get_json()
+        assert (body["libraries"], body["media_setup"]) == ([], {"servers": 1, "libraries": 0})
+        probe = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert probe["media_setup"] == {"servers": 1, "libraries": 0}
+
+    def test_a_node_added_before_any_library_gets_rows_suggested_later(self, client, nodes, tmp_path):
+        node_id = _add(client).get_json()["id"]
+        before = client.get(f"/api/nodes/{node_id}/suggested-mappings").get_json()
+        assert before == {"path_mappings": [], "media_setup": {"servers": 0, "libraries": 0}}
+        movies = self._library(tmp_path)
+        after = client.get(f"/api/nodes/{node_id}/suggested-mappings").get_json()
+        assert after == {
+            "path_mappings": [{"app_prefix": str(movies), "node_prefix": str(movies)}],
+            "media_setup": {"servers": 1, "libraries": 1},
+        }
+        assert _sm().nodes[0]["path_mappings"] == []
+        assert client.get("/api/nodes/nope/suggested-mappings").status_code == 404
 
     def test_a_node_that_cant_be_asked_is_502(self, client, nodes, tmp_path, monkeypatch):
         self._library(tmp_path)

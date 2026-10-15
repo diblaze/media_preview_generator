@@ -3570,3 +3570,25 @@ class TestUpgradedAutoPauseResumes:
             for g in get_settings_manager().worker_groups
             for m in g["members"]
         )
+
+
+class TestFreshInstallNotice:
+    def test_a_brand_new_install_gets_no_settings_migrated_card(self, tmp_path):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("_schema_version") == _CURRENT_SCHEMA_VERSION
+        assert sm.get("_pending_migration_notice") is None
+
+    def test_an_install_upgraded_from_an_older_version_still_gets_the_card(self, tmp_path):
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        (tmp_path / "settings.json").write_text(json.dumps({"_schema_version": 20, "cpu_threads": 2}))
+        sm = SettingsManager(config_dir=str(tmp_path))
+        run_migrations(sm)
+
+        assert sm.get("_pending_migration_notice")["from"] == 20

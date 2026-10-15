@@ -57,6 +57,15 @@ class TestValidateNode:
     def test_plain_addresses_are_kept(self, url):
         assert ns.normalise_url(url) == (url, "")
 
+    @pytest.mark.parametrize(
+        "url", ["http://nuc:9494/v1", "http://nuc:9494/v1/", "http://nuc:9494/v1/health", "http://nuc:9494/v1/info"]
+    )
+    def test_a_node_route_pasted_after_the_address_is_dropped(self, url):
+        assert ns.normalise_url(url) == ("http://nuc:9494", "")
+
+    def test_a_proxy_path_before_the_route_is_kept(self):
+        assert ns.normalise_url("https://proxy.lan/node/v1/") == ("https://proxy.lan/node", "")
+
     def test_a_trailing_slash_is_dropped(self):
         record, _ = ns.validate_node(_post(url="https://nuc.lan:9494/"), existing=None, others=[])
         assert record["url"] == "https://nuc.lan:9494"

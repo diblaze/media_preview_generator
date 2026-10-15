@@ -197,3 +197,28 @@ def test_week_legend_names_a_node_device_apart_from_this_apps(
     legend = authed_page.locator("#workerWeekLegend")
     expect(legend).to_contain_text("old-laptop · ")
     expect(legend.locator("span", has_text="old-laptop · ")).to_have_count(1)
+
+
+def test_the_dashboard_says_a_node_problem_once_and_links_the_node(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    offline_node_group(group_api)
+    group_api["state"]["warnings"] = [
+        {
+            "code": "node_unavailable",
+            "group_id": "gpu-video",
+            "member_id": "m-laptop",
+            "message": "Video: old-laptop · GTX 1650 has no workers now (node offline). Its jobs wait; other devices "
+            "keep working.",
+        },
+        {"code": "loudness_without_cpu", "message": "Loudness needs a CPU group."},
+    ]
+    mock_dashboard_defaults(authed_page)
+    authed_page.goto(app_url + "/")
+    block = authed_page.locator('[data-member-block="gpu-video:m-laptop"]')
+    expect(block).to_contain_text("old-laptop · GTX 1650: node offline.")
+    expect(block.get_by_role("link", name="Open old-laptop")).to_have_attribute("href", "/nodes#node-laptop")
+    expect(authed_page.locator("#workerGroupLiveWarnings")).to_have_text("Loudness needs a CPU group.")
+    expect(authed_page.get_by_text("has no workers now")).to_have_count(0)

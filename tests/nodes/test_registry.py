@@ -399,6 +399,15 @@ class TestAccessProblem:
         paths = ["/media/openfilms/Movies/a.mkv", "/media/openfilms/Movies/b.mkv", "/media/other/c.mkv", "/elsewhere"]
         assert reg._default_library_names(paths) == ["Open Films", "Media"]
 
+    def test_the_access_problem_reason_is_plain_words(self, h):
+        self._ready(h)
+        for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):
+            h.registry.report_not_visible("n1", path, "missing")
+        reason = h.registry.view("n1").reason
+        assert "(the last one: not found on the node)" in reason
+        # Shown on the Nodes page itself, and in the bell next to a "Test access" button.
+        assert "on the Nodes page" not in reason and "run Test access" in reason
+
     def test_the_same_file_three_times_is_not(self, h):
         self._ready(h)
         for _ in range(3):
@@ -517,6 +526,12 @@ class TestGpuLost:
     def test_it_clears_when_the_gpu_is_back(self, h):
         self.test_a_gpu_error_whose_rescan_fails_is_gpu_lost_and_cpu_keeps_running(h)
         assert h.registry.rescan_gpus("n1").state == reg.STATE_READY
+
+    def test_a_rescan_the_node_does_not_answer_raises_instead_of_answering_the_old_gpus(self, h):
+        self._ready_with_gpu(h)
+        h.client().rescans = [NodeUnreachableError("gone")]
+        with pytest.raises(NodeUnreachableError):
+            h.registry.rescan_gpus("n1")
 
     def test_the_health_loop_rechecks_a_lost_gpu_every_five_minutes(self, h):
         self.test_a_gpu_error_whose_rescan_fails_is_gpu_lost_and_cpu_keeps_running(h)

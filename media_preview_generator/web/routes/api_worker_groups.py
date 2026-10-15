@@ -182,7 +182,13 @@ def node_rows() -> list[dict]:
 
 def _member_label(policy: dict, nodes: NodeHardware) -> str:
     label = "CPU" if policy["resource"] == "cpu" else f"GPU {policy['device']}"
-    return f"{nodes.node_name(policy['node'])} · {label}" if policy.get("node") else label
+    if not policy.get("node"):
+        return label
+    # A node's GPU goes by the name its member row shows ("storage · Quadro P5000"), not its device id.
+    view = nodes.views.get(policy["node"])
+    gpus = getattr(view, "gpus", ()) if policy["resource"] != "cpu" else ()
+    named = next((g.get("name") for g in gpus if isinstance(g, dict) and g.get("device") == policy["device"]), None)
+    return f"{nodes.node_name(policy['node'])} · {named or label}"
 
 
 def worker_group_payload(settings=None) -> dict:

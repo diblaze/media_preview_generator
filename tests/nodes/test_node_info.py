@@ -143,6 +143,14 @@ class TestDetection:
         assert entry == {"type": "AMD", "device": "/dev/dri/renderD128", "name": "AMD", "status": "failed",
                          "error": "x"}  # fmt: skip
 
+    def test_an_nvidia_card_that_failed_its_test_is_the_same_device_as_when_it_works(self):
+        # Detection names a working card cuda:0 and the same card cuda once its CUDA test fails.
+        failed = info._gpu_entry(("NVIDIA", "cuda", {"name": "Quadro P5000", "status": "failed", "error": "test"}))
+        working = info._gpu_entry(("NVIDIA", "cuda:0", {"name": "Quadro P5000", "status": "ok"}))
+
+        assert failed["device"] == working["device"] == "cuda:0"
+        assert info._gpu_entry(("NVIDIA", "cuda:1", {"status": "ok"}))["device"] == "cuda:1"
+
 
 class TestHost:
     def test_meminfo_read_in_bytes(self, tmp_path):

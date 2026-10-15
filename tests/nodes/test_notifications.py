@@ -48,25 +48,60 @@ def _cards(*views):
 
 
 @pytest.mark.parametrize(
-    ("state", "name", "title"),
+    ("state", "name", "title", "href"),
     [
-        (reg.STATE_OFFLINE, "old-laptop", "old-laptop is offline"),
-        (reg.STATE_UPDATE_NEEDED, "nuc", "nuc needs an update"),
-        (reg.STATE_KEY_REFUSED, "nuc", "nuc refused the key"),
-        (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media"),
-        (reg.STATE_GPU_LOST, "storage", "storage lost its GPU"),
-        (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg"),
+        (reg.STATE_OFFLINE, "old-laptop", "old-laptop is offline", "/nodes#node-abc123"),
+        (reg.STATE_UPDATE_NEEDED, "nuc", "nuc needs an update", "/nodes#node-abc123/health"),
+        (reg.STATE_KEY_REFUSED, "nuc", "nuc refused the key", "/nodes#node-abc123/settings"),
+        (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media", "/nodes#node-abc123/media/test"),
+        (reg.STATE_GPU_LOST, "storage", "storage lost its GPU", "/nodes#node-abc123/health"),
+        (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg", "/nodes#node-abc123/health"),
     ],
 )
-def test_each_alert_state_gets_a_plain_card(state, name, title):
+def test_each_alert_state_gets_a_plain_card_whose_action_opens_the_tab_with_the_fix(state, name, title, href):
     (card,) = _cards(_view(state, name=name))
     assert card["id"] == f"node:abc123:{state}"
     assert card["title"] == title
     assert card["severity"] == "warning"
     assert (card["dismissable"], card["permanent_dismissable"], card["source"]) == (True, False, "nodes")
-    assert card["action"]["href"] == "/nodes#node-abc123" and card["action"]["label"]
+    assert card["action"]["href"] == href and card["action"]["label"]
     assert "It went quiet." in card["body_html"]
     assert "secret-host" not in card["body_html"]
+
+
+# What the registry says for each state: every one already ends with what to do.
+REGISTRY_REASONS = {
+    reg.STATE_OFFLINE: ("flaky-node didn't answer. Check that it is running and reachable from this app.", "running"),
+    reg.STATE_UPDATE_NEEDED: (
+        "old-node runs version 4.4.2 and this app runs 4.4.3. Update the node to 4.4.3.",
+        "update the node",
+    ),
+    reg.STATE_KEY_REFUSED: (
+        "flaky-node refused the key. Copy the key from the node's log or settings into this node's key field.",
+        "copy",
+    ),
+    reg.STATE_ACCESS_PROBLEM: (
+        "flaky-node couldn't see 3 different files in 10 minutes (last: not found on the node). Its workers are "
+        "paused: run Test access and fix the folder mappings.",
+        "test access",
+    ),
+    reg.STATE_GPU_LOST: (
+        "flaky-node lost its GPU cuda:0 (not found). Its CPU workers keep running. Check the GPU driver on the node.",
+        "cpu workers keep running",
+    ),
+}
+
+
+@pytest.mark.parametrize("state", sorted(REGISTRY_REASONS))
+def test_the_card_says_what_to_do_once(state):
+    reason, instruction = REGISTRY_REASONS[state]
+    (card,) = _cards(_view(state, reason=reason))
+    assert card["body_html"].lower().count(instruction) == 1, card["body_html"]
+
+
+def test_a_node_without_a_reason_still_gets_what_to_do():
+    (card,) = _cards(_view(reg.STATE_OFFLINE, reason=""))
+    assert "Check that the node is running" in card["body_html"]
 
 
 @pytest.mark.parametrize("state", [reg.STATE_READY, reg.STATE_CONNECTING, reg.STATE_DISABLED])

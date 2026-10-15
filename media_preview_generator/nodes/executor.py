@@ -290,6 +290,7 @@ class _TaskRun:
         cancel_check: Callable[[], bool] | None,
         pause_check: Callable[[], bool] | None,
         progress_callback: Callable[[dict], None] | None,
+        path_swap: tuple[str, str] | None = None,
     ) -> None:
         self._registry = registry
         self._client = client
@@ -308,6 +309,8 @@ class _TaskRun:
         self._paused_at: float | None = None
         self._forgotten = False
         self._node_gone = False
+        # (node's path, app's path) of the file: the job log names it by this app's path throughout.
+        self._path_swap = path_swap
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
         self._node_gone = True
@@ -413,7 +416,10 @@ class _TaskRun:
             if not isinstance(line, dict):
                 continue
             level = str(line.get("level") or "INFO").upper()
-            logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, line.get("message", ""))
+            message = str(line.get("message", ""))
+            if self._path_swap:
+                message = message.replace(*self._path_swap)
+            logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, message)
         next_log = state.get("next_log")
         if isinstance(next_log, int):
             self._next_log = next_log
@@ -473,7 +479,9 @@ class _TaskRun:
         if status == protocol.STATUS_FILE_NOT_VISIBLE or kind == protocol.KIND_FILE_NOT_VISIBLE:
             reason = str(error.get("reason") or protocol.NOT_VISIBLE_MISSING)
             _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
-            raise FileNotVisibleError(node_id, name, reason, f"{name} can't see the file ({reason}): {message}")
+            # The job log names the file by this app's path already; the node's message would add its own path.
+            plain = protocol.not_visible_text(reason)
+            raise FileNotVisibleError(node_id, name, reason, f"{name} can't see the file: {plain}")
         error_type = str(error.get("error_type") or "")
         extra = {k: v for k, v in error.items() if k not in ("kind", "message", "error_type")}
         if status == protocol.STATUS_CANCELLED or kind == protocol.KIND_CANCELLED:
@@ -584,6 +592,7 @@ def run_on_node(
         "gpu": None if gpu is None else {"type": gpu[0], "device": gpu[1]},
         "params": params,
     }
+    node_path = protocol.map_app_path(app_path, mappings)
     run = _TaskRun(
         registry,
         client,
@@ -592,6 +601,7 @@ def run_on_node(
         cancel_check=cancel_check,
         pause_check=pause_check,
         progress_callback=progress_callback,
+        path_swap=(node_path, app_path) if node_path and node_path != app_path else None,
     )
     run.start(spec)
     try:

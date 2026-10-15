@@ -38,6 +38,13 @@
         return r.status ? `${fallback} (HTTP ${r.status})` : `${fallback} (no answer from this app)`;
     }
 
+    // Disabling the focused button drops focus to <body>, outside the dialog, where Esc and Tab no longer reach it;
+    // focus goes back to the button once it works again.
+    function enable(btn) {
+        btn.disabled = false;
+        if (!document.activeElement || document.activeElement === document.body) btn.focus();
+    }
+
     function initTooltips(scope) {
         if (typeof window._initBootstrapTooltips === 'function') window._initBootstrapTooltips(scope);
     }
@@ -59,11 +66,12 @@
 
     // ---------- facts about a node ---------------------------------------------------------------------------
 
-    // [tone, chip text]. Green ready, amber needs attention, red down, grey not checked / switched off.
+    // [tone, chip text]. Green ready, amber still works in part, red gets no work (Setup Health's Must fix), grey not
+    // checked / switched off.
     const STATES = {
         ready: ['ok', '✓ Ready'],
-        update_needed: ['warn', 'Update needed'],
-        access_problem: ['warn', 'Access problem'],
+        update_needed: ['bad', 'Update needed'],
+        access_problem: ['bad', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
         no_ffmpeg: ['bad', 'FFmpeg missing'],
         offline: ['bad', 'Offline'],
@@ -72,7 +80,15 @@
         disabled: ['off', 'Turned off'],
     };
     // The row's button says Fix for these, and opens the tab where the fix is.
-    const FIX_TAB = { access_problem: 'media', key_refused: 'settings', update_needed: 'health', gpu_lost: 'health', no_ffmpeg: 'health' };
+    const FIX_TAB = {
+        access_problem: 'media',
+        key_refused: 'settings',
+        update_needed: 'health',
+        gpu_lost: 'health',
+        no_ffmpeg: 'health',
+        offline: 'health',
+    };
+    const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];
 
     function stateOf(node) {
         return STATES[node.state] || ['off', node.state || 'Unknown'];
@@ -189,12 +205,24 @@
         return 'bi-pc-display-horizontal';
     }
 
+    // A Ready card whose Setup Health still has rows to fix says how many, counted as the dialog's rail badge counts.
+    function toFixBadge(node) {
+        const counts = node.to_fix || {};
+        const mustFix = Number(counts.must_fix) || 0;
+        const recommended = Number(counts.recommended) || 0;
+        if (node.state !== 'ready' || (!mustFix && !recommended)) return null;
+        return mustFix ? { tone: 'bad', count: mustFix, fix: true } : { tone: 'warn', count: recommended, fix: false };
+    }
+
     function nodeRow(node) {
         const [tone, text] = stateOf(node);
-        const fixTab = FIX_TAB[node.state];
+        const badge = toFixBadge(node);
+        const fixTab = FIX_TAB[node.state] || (badge && badge.fix ? 'health' : '');
+        const openTab = fixTab || (badge ? 'health' : 'overview');
         const used = usedByParts(node.used_by);
         const busy = isWorker(node) ? busyText(node.busy) : '';
-        const reason = node.reason ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
+        // A turned-off node's reason ("Turned off on the Nodes page") only repeats its chip.
+        const reason = node.reason && node.state !== 'disabled' ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
         const version = versionLine(node);
         const name = esc(node.name || node.id);
         return `
@@ -205,9 +233,9 @@
                     <div class="nd-url" title="${esc(node.url)}">${esc(node.url)}</div>
                 </div>
                 <div class="nd-chips">${roleChips(node)}${hardwareChips(node)}${busy ? `<span class="nd-faint nd-busy">${esc(busy)}</span>` : ''}${used.length ? `<span class="nd-faint">used by ${esc(used.join(', '))}</span>` : ''}</div>
-                <div class="nd-status">${pill(tone, text)}${reason}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
+                <div class="nd-status">${pill(tone, text)}${badge ? `<span class="pill ${badge.tone} nd-to-fix" title="Open Setup Health to see what to fix">${badge.count} to fix</span>` : ''}${reason}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
                 <div class="nd-acts">
-                    <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${fixTab || 'overview'}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
+                    <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${openTab}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
                 </div>
             </article>`;
     }
@@ -230,7 +258,11 @@
         list.innerHTML = page.nodes.length ? page.nodes.map(nodeRow).join('') : emptyState();
         initTooltips(list);
         const checkNow = $('#nodesCheckNow');
-        if (checkNow) checkNow.disabled = !page.nodes.length;
+        // With no node there is nothing to check: the button is hidden, not left greyed out.
+        if (checkNow) {
+            checkNow.disabled = !page.nodes.length;
+            checkNow.classList.toggle('d-none', !page.nodes.length);
+        }
     }
 
     async function loadNodes() {
@@ -287,11 +319,13 @@
             return;
         }
         if (!hash.startsWith('node-')) return;
-        const id = hash.slice('node-'.length);
+        // "node-<id>", "node-<id>/<tab>", or "node-<id>/media/test" (the bell's Test access: open Media and run it).
+        const [id, tab, action] = hash.slice('node-'.length).split('/');
         if (!nodeById(id)) return;
         const row = document.getElementById(`node-${id}`);
         if (row) row.scrollIntoView({ block: 'center' });
-        openNode(id);
+        openNode(id, NODE_TABS.includes(tab) ? tab : undefined);
+        if (tab === 'media' && action === 'test' && isWorker(nodeById(id))) detail.editor.test();
     }
 
     // ---------- path mappings + Test access ------------------------------------------------------------------------
@@ -315,6 +349,15 @@
     }
 
     // One editor for Add node step 2 and the node dialog's Media tab.
+    // What to do first when there is no library to map, from media_setup ({servers, libraries}).
+    function noLibrariesHtml(setup) {
+        const servers = setup && Number(setup.servers);
+        if (servers) {
+            return `Your media servers have no libraries loaded yet. <a href="/servers">Refresh libraries on Media Servers</a> first.`;
+        }
+        return 'No media server yet. <a href="/servers">Add a media server</a> first.';
+    }
+
     function createMappingEditor(root, { getNodeId, onChange }) {
         root.innerHTML = `
             <div class="nd-map">
@@ -346,9 +389,12 @@
             const m = mapping || {};
             const row = document.createElement('div');
             row.className = 'nd-map-row';
+            // The mini labels stand in for the column headers on a phone, where the fields stack.
             row.innerHTML = `
+                <span class="nd-mini-lab nd-mini-app" aria-hidden="true">Path on this app</span>
                 <input type="text" class="form-control font-monospace nd-app" aria-label="Path on this app" placeholder="/data/Movies" value="${esc(m.app_prefix)}">
                 <span class="nd-arrow" aria-hidden="true">→</span>
+                <span class="nd-mini-lab nd-mini-node" aria-hidden="true">Path on the node</span>
                 <input type="text" class="form-control font-monospace nd-node" aria-label="Path on the node" placeholder="/mnt/nas/Movies" value="${esc(m.node_prefix)}">
                 <div class="nd-chip-slot"></div>
                 <button type="button" class="btn btn-sm btn-outline-danger nd-remove" aria-label="Remove mapping" title="Remove mapping"><i class="bi bi-x-lg"></i></button>`;
@@ -463,26 +509,45 @@
             return `${html}</div>`;
         }
 
-        function renderResults(libraries) {
+        function skippedNote(skipped) {
+            if (!skipped.length) return '';
+            const count = skipped.length;
+            const items = skipped.map((lib) => `<li><b>${esc([lib.server, lib.library].filter(Boolean).join(' · '))}</b> <span class="nd-faint">${esc(lib.error)}</span></li>`).join('');
+            return `<details class="nd-note nd-skipped"><summary><i class="bi bi-info-circle" aria-hidden="true"></i>`
+                + `${count} ${count === 1 ? 'library' : 'libraries'} skipped: this app can't open ${count === 1 ? 'it' : 'them'}.</summary>`
+                + `<ul>${items}</ul><a href="/servers">Fix on Media Servers</a></details>`;
+        }
+
+        function note(html) {
+            results.innerHTML = html ? `<div class="sm-hint nd-map-note">${html}</div>` : '';
+        }
+
+        function renderResults(libraries, setup) {
             lastLibraries = libraries;
             revealEnds();
             $$('.nd-chip-slot', rows).forEach((slot) => { slot.innerHTML = ''; });
             if (!libraries.length) {
-                results.innerHTML = '<div class="sm-hint">No libraries to test yet. Add a media server with libraries first.</div>';
+                note(`No libraries to test yet. ${noLibrariesHtml(setup)}`);
                 return;
             }
+            // A library this app couldn't sample itself was never asked about: not the node's problem, so they all
+            // share one collapsed note instead of a chip and a red card each.
+            const skipped = libraries.filter((lib) => !Number(lib.checked) && lib.empty !== true && !!lib.error);
             const loose = [];
             libraries.forEach((lib) => {
+                if (skipped.includes(lib)) return;
                 const row = rowFor(lib.app_root);
                 if (row) $('.nd-chip-slot', row).insertAdjacentHTML('beforeend', libraryChip(lib));
                 else loose.push(libraryChip(lib));
             });
             // A library with no video yet has nothing to test; its chip says so and it isn't a failure.
-            const passed = (lib) => lib.ok || lib.empty === true;
+            const passed = (lib) => lib.ok || lib.empty === true || skipped.includes(lib);
             const failures = libraries.map((lib, i) => (passed(lib) ? '' : failureCard(lib, i))).join('');
-            const allOk = libraries.every(passed);
+            const allOk = libraries.every(passed) && skipped.length < libraries.length;
+            const okText = skipped.length ? 'The node sees every library it was asked about, same files.' : 'The node sees every library, same files.';
             results.innerHTML = (loose.length ? `<div class="nd-lib-chips">${loose.join('')}</div>` : '')
-                + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>The node sees every library, same files.</div>` : failures);
+                + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>${okText}</div>` : failures)
+                + skippedNote(skipped);
         }
 
         // The suggestion swaps the node-side path of the row covering the library (two rows may share a node path, so
@@ -519,9 +584,9 @@
                     return;
                 }
                 showError('');
-                renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : []);
+                renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : [], r.data && r.data.media_setup);
             } finally {
-                btn.disabled = false;
+                enable(btn);
                 btn.innerHTML = '<i class="bi bi-play-fill me-1"></i>Test access';
             }
         }
@@ -542,6 +607,7 @@
             set,
             read,
             test,
+            note,
             revealEnds,
             showError,
             applySuggestion,
@@ -551,18 +617,47 @@
 
     // ---------- Add node -----------------------------------------------------------------------------------------
 
-    const add = { probe: null, node: null, editor: null };
+    // finished: step 2 was saved with Finish; closing it any other way still keeps its rows.
+    const add = { probe: null, node: null, editor: null, finished: false };
 
-    function probeErrorText(error) {
+    // What to check, by why nothing answered (error.reason); url is the address that was tried.
+    function unreachableText(reason, url) {
+        const https = /^https:/i.test(url || '');
+        switch (reason) {
+            case 'dns':
+                return `Can't find ${hostOf(url) || 'that machine'}. Check the name, or use the node's IP address.`;
+            case 'tls':
+                return "It doesn't answer over https. A node speaks http unless you put it behind an https proxy: use http:// instead.";
+            case 'refused':
+                return 'Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node is running.';
+            case 'timeout':
+                return https
+                    ? 'No answer over https in time. A node speaks http unless you put it behind an https proxy: try http:// instead.'
+                    : 'No answer in time. Check the address, that the node is running, and that a firewall lets this app reach it.';
+            default:
+                return 'Nothing answered at this address. Check the address and port, and that the node is running.';
+        }
+    }
+
+    function probeErrorText(error, url) {
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
                 return "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set.";
             case 'unreachable':
-                return 'Nothing answered at this address. Check the address and port, and that the node is running.';
+                return unreachableText(error.reason, url);
             case 'protocol':
                 // A node on another protocol says which version it runs; anything else isn't a node of this app.
                 if (error.node_version) return error.message;
+                if (error.reason === 'this_app') {
+                    return "This address is this app itself, not a node. Use the address of the machine running the node, with the node's port (9494 unless you set NODE_PORT).";
+                }
+                if (error.reason === 'other_app') {
+                    return "This address is another copy of this app, not a node. Run that machine as a node (MODE=node) and use the node's port (9494 unless you set NODE_PORT).";
+                }
+                if (error.reason === 'web_page') {
+                    return "This address answers with a web page, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.";
+                }
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
             case 'request':
                 return "The node didn't accept the request. Update the node and this app to the same version.";
@@ -642,6 +737,7 @@
     function openAdd() {
         add.probe = null;
         add.node = null;
+        add.finished = false;
         ['#addNodeName', '#addNodeUrl', '#addNodeKey'].forEach((sel) => {
             const el = $(sel);
             el.value = '';
@@ -680,13 +776,13 @@
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Connecting…';
         const r = await api('POST', '/api/nodes/probe', { url, key });
-        btn.disabled = false;
+        enable(btn);
         btn.innerHTML = '<i class="bi bi-plug me-1"></i>Connect';
         if (!r.ok || !r.data || r.data.ok === false || !r.data.info) {
             add.probe = null;
             $('#addNodeProbe').classList.add('d-none');
             const error = r.data && typeof r.data.error === 'object' ? r.data.error : { message: errorText(r, "Couldn't connect") };
-            addError(probeErrorText(error));
+            addError(probeErrorText(error, url));
             setAddStep(1);
             return;
         }
@@ -721,7 +817,7 @@
         const btn = $('#addNodeNext');
         btn.disabled = true;
         const r = await api('POST', '/api/nodes', body);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             if (r.status === 409) {
                 addError(alreadyAddedText(r.data && r.data.name));
@@ -742,6 +838,8 @@
             : (Array.isArray(add.probe.suggested_path_mappings) ? add.probe.suggested_path_mappings : []);
         add.editor.setName(add.node.name || name);
         add.editor.set(suggested);
+        const setup = add.probe.media_setup;
+        if (!suggested.length && setup && !Number(setup.libraries)) add.editor.note(noLibrariesHtml(setup));
         setAddStep(2);
     }
 
@@ -751,7 +849,7 @@
         const btn = $('#addNodeFinish');
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: mappings });
-        btn.disabled = false;
+        enable(btn);
         const errorEl = $('#addNodeSaveError');
         if (!r.ok) {
             errorEl.textContent = errorText(r, "Couldn't save the mappings");
@@ -759,14 +857,52 @@
             return;
         }
         errorEl.classList.add('d-none');
+        add.finished = true;
         replaceNode(r.data);
         bootstrap.Modal.getOrCreateInstance($('#addNodeModal')).hide();
         if (typeof showToast === 'function') showToast('Node added', `${(r.data && r.data.name) || add.node.name} is set up.`, 'success');
     }
 
+    // Finish later (or Esc) in step 2: the rows shown there, suggested or typed, are saved so the Media tab has them.
+    async function keepStep2Rows() {
+        if (add.finished || $('#addNodeStep2').classList.contains('d-none')) return;
+        const rows = add.editor.read();
+        if (!rows || !rows.length) return;
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: rows });
+        if (r.ok) replaceNode(r.data);
+    }
+
     // ---------- node dialog --------------------------------------------------------------------------------------
 
-    const detail = { editor: null, healthSeq: 0, healthStartedAt: 0 };
+    // mapDirty / setDirty: the Media rows / the Settings fields were edited and not saved; discardOk lets one close
+    // through after the user said Discard.
+    const detail = { editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false };
+
+    function setMapDirty(dirty) {
+        detail.mapDirty = dirty;
+        if (!dirty && !detail.setDirty) hideDiscard();
+    }
+
+    function setSettingsDirty(dirty) {
+        detail.setDirty = dirty;
+        if (!dirty && !detail.mapDirty) hideDiscard();
+    }
+
+    function hideDiscard() {
+        $('#nodeDiscardFoot').classList.add('d-none');
+    }
+
+    // Close, Esc and the backdrop all end in hide(): while there are edits, ask first, on the tab that holds them.
+    function guardClose(event) {
+        if (event.target !== $('#nodeModal') || detail.discardOk || !(detail.mapDirty || detail.setDirty)) return;
+        event.preventDefault();
+        showTab(detail.mapDirty ? 'media' : 'settings');
+        $('#nodeDiscardText').textContent = detail.mapDirty && detail.setDirty
+            ? 'Discard the unsaved mappings and settings?'
+            : `Discard the unsaved ${detail.mapDirty ? 'mappings' : 'settings'}?`;
+        $('#nodeDiscardFoot').classList.remove('d-none');
+        $('#nodeKeepEditing').focus();
+    }
 
     function openNodeObj() {
         return page.openId ? nodeById(page.openId) : null;
@@ -853,6 +989,8 @@
         const node = nodeById(id);
         if (!node) return;
         page.openId = String(node.id);
+        detail.mapDirty = detail.setDirty = detail.discardOk = false;
+        hideDiscard();
         renderHeader(node);
         renderOverview(node);
         renderSettings(node);
@@ -860,6 +998,7 @@
         detail.editor.setName(node.name || node.id);
         detail.editor.set(node.path_mappings);
         $('#nodeMediaResult').textContent = '';
+        if (isWorker(node) && !(Array.isArray(node.path_mappings) && node.path_mappings.length)) suggestMappings(node.id);
         $('#nodeLog').textContent = '';
         $('#nodeHealthBody').innerHTML = '';
         $('#nodeHealthSummary').innerHTML = '';
@@ -871,6 +1010,21 @@
         if (wanted === 'log') loadLog();
         if (window.location.hash !== `#node-${node.id}`) history.replaceState(null, '', `#node-${node.id}`);
         bootstrap.Modal.getOrCreateInstance($('#nodeModal')).show();
+    }
+
+    // Not marked as an edit: closing without saving loses nothing, the same rows come back next time.
+    async function suggestMappings(id) {
+        const r = await api('GET', `/api/nodes/${encodeURIComponent(id)}/suggested-mappings`);
+        if (!r.ok || !r.data || page.openId !== String(id) || detail.mapDirty) return;
+        const rows = Array.isArray(r.data.path_mappings) ? r.data.path_mappings : [];
+        if (rows.length) {
+            detail.editor.set(rows);
+            const result = $('#nodeMediaResult');
+            result.className = 'sm-tres warn';
+            result.textContent = 'Suggested from your libraries. Not saved yet';
+        } else if (r.data.media_setup && !Number(r.data.media_setup.libraries)) {
+            detail.editor.note(noLibrariesHtml(r.data.media_setup));
+        }
     }
 
     // A poll refreshes what the open dialog shows about the node, never the fields being edited.
@@ -890,7 +1044,7 @@
         result.className = 'sm-tres';
         result.innerHTML = '<span class="sm-spin"></span>Checking the GPUs…';
         const r = await api('POST', `/api/nodes/${encodeURIComponent(node.id)}/rescan-gpus`);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't rescan");
@@ -898,9 +1052,13 @@
         }
         replaceNode(r.data);
         refreshOpenNode();
-        const count = gpus(r.data).length;
-        result.className = 'sm-tres ok';
-        result.textContent = count ? `Found ${count} ${count === 1 ? 'GPU' : 'GPUs'}` : 'No GPU found';
+        // A GPU that failed its test can't take work, so it isn't counted as found.
+        const all = gpus(r.data);
+        const working = all.filter((gpu) => !gpu.status || gpu.status === 'ok').length;
+        const broken = all.length - working;
+        result.className = `sm-tres ${working ? 'ok' : 'warn'}`;
+        result.textContent = (working ? `Found ${working} working ${working === 1 ? 'GPU' : 'GPUs'}` : 'No working GPU found')
+            + (broken ? ` · ${broken} not working` : '');
     }
 
     async function saveMappings() {
@@ -912,7 +1070,7 @@
         const btn = $('#nodeSaveMappings');
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { path_mappings: mappings });
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -920,8 +1078,11 @@
         }
         replaceNode(r.data);
         refreshOpenNode();
+        setMapDirty(false);
         result.className = 'sm-tres ok';
         result.textContent = 'Saved';
+        // What was just saved is what the node runs with now: check it sees the files there.
+        detail.editor.test();
     }
 
     async function saveSettings() {
@@ -947,8 +1108,31 @@
         };
         const btn = $('#nodeSettingsSave');
         btn.disabled = true;
+        // A new key or address is tried first: a key the node refuses is never saved (it used to show "Saved", then
+        // "Key refused" on the next check). A node that doesn't answer may just be down, so that still saves.
+        let unanswered = '';
+        if (body.key !== '****' || body.url !== (node.url || '')) {
+            result.className = 'sm-tres';
+            result.innerHTML = '<span class="sm-spin"></span>Asking the node…';
+            const probe = await api('POST', '/api/nodes/probe', { id: node.id, url: body.url, key: body.key });
+            const error = probe.data && typeof probe.data.error === 'object' ? probe.data.error : null;
+            if (probe.ok && probe.data && probe.data.ok === false && error && error.kind === 'auth') {
+                enable(btn);
+                keyEl.classList.add('is-invalid');
+                result.className = 'sm-tres bad';
+                result.textContent = `${probeErrorText(error, body.url)} Nothing was saved.`;
+                return;
+            }
+            if (!probe.ok) {
+                enable(btn);
+                result.className = 'sm-tres bad';
+                result.textContent = errorText(probe, "Couldn't check the key");
+                return;
+            }
+            if (probe.data && probe.data.ok === false) unanswered = probeErrorText(error || {}, body.url);
+        }
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, body);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -958,8 +1142,9 @@
         refreshOpenNode();
         detail.editor.setName(r.data.name || r.data.id);
         keyEl.value = '****';
-        result.className = 'sm-tres ok';
-        result.textContent = 'Saved';
+        setSettingsDirty(false);
+        result.className = unanswered ? 'sm-tres warn' : 'sm-tres ok';
+        result.textContent = unanswered ? `Saved. ${unanswered}` : 'Saved';
     }
 
     async function removeNode() {
@@ -967,6 +1152,13 @@
         if (!node) return;
         const out = $('#nodeRemoveResult');
         out.classList.add('d-none');
+        // A node still in use can't be removed: say by what before asking, not after.
+        const inUse = usedByParts(node.used_by);
+        if (inUse.length) {
+            out.textContent = `Still in use by ${inUse.join(', ')}. Take it out of those first.`;
+            out.classList.remove('d-none');
+            return;
+        }
         const ok = await window.appConfirm(
             `Remove node "${node.name || node.id}"? The node keeps running; this app stops using it.`,
             { title: 'Remove node', confirmText: 'Remove' },
@@ -1027,20 +1219,31 @@
 
     // Same buckets as server Setup Health: critical + failing must be fixed, recommended + failing is recommended,
     // everything passing is all good; informational rows only show when they say they're meant to be seen.
+    // A failing informational row is a note about something other than the node (libraries this app can't open):
+    // one neutral line above the buckets.
     function partitionChecks(sections) {
         const mustFix = [];
         const recommended = [];
         const allGood = [];
+        const notes = [];
         (sections || []).forEach((section) => {
             (section.checks || []).forEach((check) => {
                 if ((check.severity || 'info') === 'info' && check.informational !== true) return;
                 const item = { check, sectionId: section.id || '', sectionTitle: section.title || section.id || '' };
-                if (check.ok === false && check.severity === 'critical') mustFix.push(item);
+                if (check.ok === false && (check.severity || 'info') === 'info') notes.push(item);
+                else if (check.ok === false && check.severity === 'critical') mustFix.push(item);
                 else if (check.ok === false && check.severity === 'recommended' && check.dismissed !== true) recommended.push(item);
                 else allGood.push(item);
             });
         });
-        return { mustFix, recommended, allGood };
+        return { mustFix, recommended, allGood, notes };
+    }
+
+    function noteLine(check) {
+        const link = typeof check.help_url === 'string' && check.help_url.startsWith('/')
+            ? ` <a href="${esc(check.help_url)}">${esc(check.help_label || 'Open')}</a>` : '';
+        const title = check.reason ? ` title="${esc(check.reason)}"` : '';
+        return `<div class="nd-note"${title}><i class="bi bi-info-circle" aria-hidden="true"></i><span>${esc(check.label)}.${link}</span></div>`;
     }
 
     function healthValue(value) {
@@ -1117,6 +1320,15 @@
             link.textContent = check.help_label || 'Open';
             acts.appendChild(link);
         }
+        if (!ok && typeof check.docs_url === 'string' && check.docs_url.startsWith('https://')) {
+            const link = document.createElement('a');
+            link.className = 'btn btn-sm btn-outline-secondary nd-health-docs';
+            link.href = check.docs_url;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            link.innerHTML = `${esc(check.help_label || 'How to fix this')} <i class="bi bi-box-arrow-up-right" aria-hidden="true"></i>`;
+            acts.appendChild(link);
+        }
         return row;
     }
 
@@ -1156,7 +1368,8 @@
         const summary = [];
         if (partition.mustFix.length) summary.push(pill('bad', `${partition.mustFix.length} must fix`));
         if (partition.recommended.length) summary.push(pill('warn', `${partition.recommended.length} recommended`));
-        if (!summary.length) summary.push(pill('ok', '✓ All good'));
+        // Only notes (a turned-off node): no verdict, the note says it.
+        if (!summary.length && partition.allGood.length) summary.push(pill('ok', '✓ All good'));
         $('#nodeHealthSummary').innerHTML = summary.join('');
         if (partition.mustFix.length) {
             body.appendChild(bucket('critical', 'Must fix', partition.mustFix, true, '<i class="bi bi-x-octagon-fill text-danger me-2"></i>'));
@@ -1167,6 +1380,7 @@
         if (partition.allGood.length) {
             body.appendChild(bucket('ok', 'All good', partition.allGood, !partition.mustFix.length && !partition.recommended.length, '<i class="bi bi-check-circle-fill text-success me-2"></i>'));
         }
+        if (partition.notes.length) body.insertAdjacentHTML('afterbegin', partition.notes.map((item) => noteLine(item.check)).join(''));
         if (!body.children.length) body.innerHTML = '<div class="sm-hint">No checks to show yet.</div>';
         const firstFix = $('.nd-health-fix', body);
         if (firstFix) firstFix.classList.add('rd-primary');
@@ -1196,6 +1410,7 @@
         detail.editor = createMappingEditor($('#nodeMediaEditor'), {
             getNodeId: async () => page.openId,
             onChange: () => {
+                setMapDirty(true);
                 const result = $('#nodeMediaResult');
                 result.className = 'sm-tres warn';
                 result.textContent = 'Not saved yet';
@@ -1227,12 +1442,25 @@
                 else connect();
             }
         });
-        $('#addNodeModal').addEventListener('hidden.bs.modal', () => {
+        $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
-            if (add.node) loadNodes();
+            if (!add.node) return;
+            await keepStep2Rows();
+            loadNodes();
         });
 
+        $('#nodeModal').addEventListener('hide.bs.modal', guardClose);
+        $('#nodeKeepEditing').addEventListener('click', hideDiscard);
+        $('#nodeDiscardConfirm').addEventListener('click', () => {
+            detail.discardOk = true;
+            bootstrap.Modal.getOrCreateInstance($('#nodeModal')).hide();
+        });
+        ['input', 'change'].forEach((type) => $('#node-tab-settings').addEventListener(type, (event) => {
+            if (event.target.matches('#nodeSetName, #nodeSetUrl, #nodeSetKey, #nodeSetEnabled')) setSettingsDirty(true);
+        }));
         $('#nodeModal').addEventListener('hidden.bs.modal', () => {
+            detail.mapDirty = detail.setDirty = detail.discardOk = false;
+            hideDiscard();
             page.openId = null;
             if (window.location.hash.startsWith('#node-')) history.replaceState(null, '', window.location.pathname);
         });
