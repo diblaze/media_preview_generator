@@ -370,6 +370,17 @@ class TestNodeList:
         expect(pc.locator(".nd-chips")).not_to_contain_text("Worker")
         expect(pc.locator(".nd-ico i")).to_have_class("bi bi-windows")
 
+    @pytest.mark.parametrize("count", [0, 4], ids=["no-nodes", "four-nodes"])
+    def test_the_header_links_the_guide_whatever_the_list_holds(
+        self, authed_page: Page, app_url: str, count: int
+    ) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes()[:count])
+        guide = authed_page.locator(".page-header").get_by_role("link", name="Nodes guide")
+        expect(guide).to_have_attribute(
+            "href", "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
+        )
+        expect(guide).to_have_attribute("target", "_blank")
+
     def test_empty_list_explains_nodes_and_links_the_docs(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, [])
         empty = authed_page.locator(".nd-empty")
