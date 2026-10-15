@@ -218,8 +218,15 @@ _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
 # The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
 # in software, nor GPU frames in a format the chain wasn't built for.
 _FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
-# The input's video codec as FFmpeg lists it: "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p, ...".
-_INPUT_VIDEO_CODEC_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)")
+# The input's video codec and pixel format as FFmpeg lists them:
+# "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), ...".
+_INPUT_VIDEO_STREAM_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)(?:[^,]*, (\w+))?")
+# Pixel formats other than 4:2:0 (4:2:2, 4:4:4, 4:4:0, RGB, grey). FFmpeg offers most GPU decoders 4:2:0 video only and
+# decodes the rest in software without a word: MPEG-2 4:2:2 on NVDEC and VAAPI, VP9 4:4:4 on NVDEC (jellyfin-ffmpeg
+# 8.1.3 on a Quadro P5000, a TITAN RTX and a UHD 770). Where a GPU does decode one (HEVC 4:4:4 on the TITAN RTX, HEVC
+# 4:2:2 and VP9 4:4:4 on the UHD 770) the GPU scaler takes its frames, so frames of such a video refused by that scaler
+# were decoded in software.
+_NOT_4_2_0_PIXEL_FORMAT_RE = re.compile(r"yuvj?a?4(?:22|44|40)p|gbra?p|gray")
 # The codecs FFmpeg has a GPU decoder for, by ``-hwaccel``: libavcodec's *_nvdec, *_vaapi, *_d3d11va and *_videotoolbox
 # hwaccels (jellyfin-ffmpeg 8.1.3 has the same NVDEC and VAAPI ones). It decodes any other codec in software without a
 # word at -loglevel info: ProRes on CUDA and VAAPI, H.263 and VVC on CUDA, MPEG-1 on VAAPI, DivX 3 and WMV 7/8 on all.
@@ -255,8 +262,8 @@ FALLBACK_SIGNAL = "signal"
 
 def _io_error_places() -> str:
     """Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder."""
-    folder, setting = working_folder_hint()
-    return f"the disk or network share the video is on, and that {folder} ({setting}) isn't full and is writable"
+    folder, _move = working_folder_hint()
+    return f"the disk or network share the video is on, and that {folder} isn't full and is writable"
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +542,7 @@ def working_folder_failure(exc: OSError) -> str:
     Returns:
         The sentence.
     """
-    folder, setting = working_folder_hint()
+    folder, move = working_folder_hint()
     where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
     why = exc.strerror or os.strerror(exc.errno or 0)
     if exc.errno == errno.EROFS:
@@ -545,7 +552,7 @@ def working_folder_failure(exc: OSError) -> str:
     else:
         state = "is full"
     fix = folder_write_fix(exc.errno)
-    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or choose another folder ({setting})."
+    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or {move}."
 
 
 def folder_write_fix(code: int | None) -> str:
@@ -866,17 +873,9 @@ def _gpu_hand_off(
     )
     if should_fallback and reason == "codec error":
         return FALLBACK_CODEC, reason
-    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
-    # A decoder whose GPU set-up failed in the driver falls back to software and ends the same way, so this counts
-    # only without a driver error in any run. A run that asked for no GPU decoder decoded in software on purpose: the
-    # GPU filters refusing its frames is theirs, not a codec's.
-    if (
-        frames_refused
-        and hwaccel is not None
-        and _decoded_in_software(stderr_lines, hwaccel)
-        and not _detect_hwaccel_runtime_error(stderr_lines_all)
-    ):
+    if _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel, stderr_lines_all):
         return FALLBACK_CODEC, "codec error"
+    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
     # Judged on the last run's own stderr: a GPU error in an earlier tier's run doesn't make this run's plain 251 one.
     if _io_cut_off(rc, stderr_lines):
         return FALLBACK_IO_ERROR, "I/O error"
@@ -894,8 +893,34 @@ def _gpu_hand_off(
     return None
 
 
+def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None, stderr_lines_all: list[str]) -> bool:
+    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software without a
+    word and the GPU scaler refused those frames (ProRes, WMV, DivX 3, H.263 or VP8 on NVIDIA, MPEG-2 4:2:2…).
+
+    A normal hand-off to the CPU, and the same on every run: full-frame decode asks the same decoder.
+
+    Args:
+        rc: The run's exit code.
+        stderr_lines: The run's stderr.
+        hwaccel: The GPU decoder the run asked for (``hwaccel_in``).
+        stderr_lines_all: Every run's stderr so far, this one's included.
+
+    Returns:
+        True for a codec the GPU lacks. False otherwise, and for a driver error in any run: a decoder whose GPU
+        set-up failed in the driver falls back to software and ends the same way. False too for a run that asked for
+        no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its frames is theirs.
+    """
+    return (
+        rc != 0
+        and hwaccel is not None
+        and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
+        and _decoded_in_software(stderr_lines, hwaccel)
+        and not _detect_hwaccel_runtime_error(stderr_lines_all)
+    )
+
+
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
-    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec and profile.
+    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec, profile and pixel format.
 
     Args:
         stderr_lines: One FFmpeg run's stderr, with FFmpeg's listing of the input.
@@ -903,14 +928,15 @@ def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
 
     Returns:
         True when FFmpeg has no ``hwaccel`` decoder for the input's video (ProRes on CUDA or VAAPI, DivX 3, WMV 7/8,
-        H.264 4:2:2 or 4:4:4 on VAAPI); False when it has one, or the listing is missing.
+        H.264 4:2:2 or 4:4:4 on VAAPI), or the video isn't 4:2:0 (MPEG-2 4:2:2, VP9 4:4:4: true of a run whose frames
+        the GPU scaler refused, see ``_NOT_4_2_0_PIXEL_FORMAT_RE``); False when it has one, or the listing is missing.
     """
     for line in stderr_lines:
-        found = _INPUT_VIDEO_CODEC_RE.match(line)
+        found = _INPUT_VIDEO_STREAM_RE.match(line)
         if found is None or "(attached pic)" in line:
             continue
         codec = found.group(1)
-        if hwaccel is None:
+        if hwaccel is None or _NOT_4_2_0_PIXEL_FORMAT_RE.match(found.group(2) or ""):
             return True
         if codec == "h264":
             return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
@@ -2189,8 +2215,13 @@ def generate_images(
     retry_rc = rc
     retry_stderr_lines = stderr_lines
 
-    # Not after the decoder said it can't decode the file (on this GPU, or at all): full-frame decode asks the same one.
-    cant_decode = GPU_CANT_DECODE_LINE in stderr_lines or video_has_no_decoder(stderr_lines)
+    # Not after the decoder said it can't decode the file (on this GPU, or at all), nor after the GPU turned out to have
+    # no decoder for it: full-frame decode asks the same one.
+    cant_decode = (
+        GPU_CANT_DECODE_LINE in stderr_lines
+        or video_has_no_decoder(stderr_lines)
+        or _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel_in(last_command), stderr_lines)
+    )
     # Nor after the stall watchdog: the mount is stuck and a rerun would wait out another full timeout.
     stalled = STALL_WATCHDOG_LINE in stderr_lines
     if rc != 0 and use_skip_initial and not cant_decode and not stalled:
@@ -2611,7 +2642,7 @@ def generate_bif(
     except PermissionError as e:
         logger.error(
             "Cannot read the temporary thumbnails folder at {}: permission denied ({}). "
-            "Verify the working folder (Settings → Advanced) is readable by the user running this "
+            "Verify the working folder is readable by the user running this "
             "tool. In Docker, check PUID/PGID. This file is skipped; the queue continues.",
             images_path,
             e,

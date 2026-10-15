@@ -100,8 +100,9 @@ def _runner(tmp_path, mock_config, gpu, device):
     )
 
 
-def _fake_ffmpeg(stderr_lines: list[str], procs: list):
-    """A ``Popen`` whose process prints ``stderr_lines``, runs for two polls, then exits 69 unless terminated."""
+def _fake_ffmpeg(stderr_lines: list[str], procs: list, exit_code: int = LEFT_ALONE_EXIT):
+    """A ``Popen`` whose process prints ``stderr_lines``, runs for two polls, then exits ``exit_code`` unless
+    terminated."""
 
     def popen(args, **kwargs):
         kwargs["stderr"].write("\n".join(stderr_lines) + "\n")
@@ -111,7 +112,7 @@ def _fake_ffmpeg(stderr_lines: list[str], procs: list):
 
         def poll():
             if proc.returncode is None and next(polls_left, "exited") == "exited":
-                proc.returncode = LEFT_ALONE_EXIT
+                proc.returncode = exit_code
             return proc.returncode
 
         def terminate():
@@ -531,8 +532,152 @@ class TestACodecTheGpuHasNoDecoderFor:
         assert outcome.result.kind == "hwaccel"
 
 
+MPEG2_422_STREAM = (
+    "Stream #0:0[0x1e0]: Video: mpeg2video (4:2:2), yuv422p(tv, progressive), 640x360 [SAR 1:1 DAR 16:9], 24 fps, "
+    "24 tbr, 90k tbn, start 0.541667"
+)
+VP9_444_STREAM = (
+    "Stream #0:0: Video: vp9 (Profile 1), yuv444p(tv, progressive), 640x360, SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 1k tbn"
+)
+
+
+class TestAChromaFormatTheGpuDecoderLacks:
+    """FFmpeg offers its MPEG-2 and VP9 GPU decoders 4:2:0 video only: the rest it decodes in software without a word.
+
+    Captured with jellyfin-ffmpeg 8.1.3 on a Quadro P5000, a TITAN RTX and an Intel UHD 770: an MPEG-2 4:2:2 file on
+    NVDEC and VAAPI, and a VP9 Profile 1 (4:4:4) file on NVDEC, end with the GPU scaler refusing the frames, exit 218.
+    Judged by codec alone, those were handed off as the GPU's filters failing: "check the GPU driver", and on a node a
+    GPU re-check and a GPU rescan on the app for every such file.
+    """
+
+    @pytest.mark.parametrize(
+        ("gpu", "stream", "scaler"),
+        [
+            pytest.param("NVIDIA", MPEG2_422_STREAM, "scale_cuda", id="mpeg2-422-on-nvdec"),
+            pytest.param("INTEL", MPEG2_422_STREAM, "scale_vaapi", id="mpeg2-422-on-vaapi"),
+            pytest.param("NVIDIA", VP9_444_STREAM, "scale_cuda", id="vp9-444-on-nvdec"),
+        ],
+    )
+    def test_is_handed_to_the_cpu_as_a_codec_the_gpu_cant_decode(self, run, gpu, stream, scaler):  # noqa: F811
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused(scaler))], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert not _warned(outcome, "GPU driver"), outcome.warnings
+
+    @pytest.mark.parametrize(
+        ("gpu", "stream", "scaler"),
+        [
+            pytest.param(
+                "NVIDIA",
+                "Stream #0:0[0x1e0]: Video: mpeg2video (Main), yuv420p(tv, progressive), 640x360, 24 fps",
+                "scale_cuda",
+                id="mpeg2-420-on-nvdec",
+            ),
+            pytest.param(
+                "NVIDIA",
+                "Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv, progressive), 640x360, 24 fps",
+                "scale_cuda",
+                id="vp9-420-on-nvdec",
+            ),
+        ],
+    )
+    def test_the_same_codec_in_4_2_0_is_still_refused_as_a_gpu_error(self, run, gpu, stream, scaler):  # noqa: F811
+        """The GPU decodes these, so its filters failed on frames it decoded, as for H.264 above."""
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused(scaler))], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+
+
 def _stream(codec: str, rest: str = "yuv420p(tv, progressive), 1920x1080, 23.98 fps") -> list[str]:
     return [f"Stream #0:0: Video: {codec}, {rest}"]
+
+
+PRORES_ON_NVDEC = [
+    "Stream #0:0[0x1]: Video: prores (4444) (ap4h / 0x68347061), yuv444p12le(progressive), 640x360, 9427 kb/s, "
+    "SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 12288 tbn (default)",
+    *_frames_refused("scale_cuda"),
+]
+
+
+class TestAGpuWithoutTheDecoderIsAQuietHandOff:
+    """A ProRes, WMV, DivX 3, H.263 or VP8 file on a GPU worker is a normal CPU fallback ("No action needed").
+
+    It used to log two ERROR "FFmpeg failed …" lines, two "unusual exit code … broken hardware acceleration driver"
+    warnings and two stderr dumps, around a full-frame rerun that decodes in software the same way and fails the
+    same way (jellyfin-ffmpeg 8.1.3 on a Quadro P5000).
+    """
+
+    @staticmethod
+    def _run_real(run, stderr: list[str], gpu: str = "NVIDIA"):  # noqa: F811
+        procs: list[MagicMock] = []
+        records: list[str] = []
+        sink = logger.add(lambda m: records.append(str(m)), level="INFO", format="{level}|{message}")
+        try:
+            with patch(
+                "media_preview_generator.processing.ffmpeg_runner.subprocess.Popen",
+                side_effect=_fake_ffmpeg(stderr, procs, exit_code=SOFTWARE_FRAMES_EXIT),
+            ):
+                outcome = run([], gpu=gpu, keyframe_gap=1.0, runner_factory=create_ffmpeg_runner)
+        finally:
+            logger.remove(sink)
+        return outcome, procs, records
+
+    @pytest.mark.parametrize(
+        ("gpu", "stderr"),
+        [
+            pytest.param("NVIDIA", PRORES_ON_NVDEC, id="prores-on-nvdec"),
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: wmv2 (WMV2 / 0x32564D57), yuv420p, 640x360, 356 kb/s, 24 fps",
+                    *_frames_refused("scale_vaapi"),
+                ],
+                id="wmv8-on-vaapi",
+            ),
+        ],
+    )
+    def test_one_gpu_run_and_no_error_before_the_cpu_takes_it(self, run, gpu, stderr):  # noqa: F811
+        outcome, procs, records = self._run_real(run, stderr, gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert len(procs) == 1, "a full-frame rerun decodes in software the same way"
+        assert not [line for line in records if line.startswith("ERROR|")], records
+        assert not _warned(outcome, "unusual exit code"), outcome.warnings
+        assert not _warned(outcome, "stderr lines"), outcome.warnings
+        assert not _warned(outcome, "retrying with full-frame"), outcome.warnings
+        assert any(line.startswith("INFO|The GPU can't decode the video of") for line in records), records
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            pytest.param(
+                [
+                    "Stream #0:0(eng): Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, 23.98 fps",
+                    *_frames_refused("scale_cuda"),
+                ],
+                id="frames-the-gpu-decoded",
+            ),
+            pytest.param(
+                [
+                    PRORES_ON_NVDEC[0],
+                    "[AVHWFramesContext @ 0x6470e4f1a2c0] Failed to create surface: 2 (resource allocation failed).",
+                    *_frames_refused("scale_cuda"),
+                ],
+                id="a-driver-error-first",
+            ),
+        ],
+    )
+    def test_a_gpu_failure_still_says_so_and_gets_its_full_frame_rerun(self, run, stderr):  # noqa: F811
+        outcome, procs, records = self._run_real(run, stderr)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+        assert len(procs) == 2
+        assert any(line.startswith("ERROR|FFmpeg failed while extracting frames") for line in records), records
+        assert not any("The GPU can't decode the video of" in line for line in records), records
 
 
 class TestEachGpuDecoderHasItsOwnCodecs:

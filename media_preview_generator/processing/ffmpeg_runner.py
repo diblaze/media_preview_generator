@@ -164,11 +164,13 @@ def create_ffmpeg_runner(
         _crash_signal,
         _diagnose_ffmpeg_exit_code,
         _folder_write_errno,
+        _gpu_lacks_the_decoder,
         _io_cut_off,
         _is_signal_killed,
         _save_ffmpeg_failure_log,
         _without_metadata_tags,
         folder_write_fix,
+        hwaccel_in,
         parse_ffmpeg_progress_line,
     )
 
@@ -780,25 +782,41 @@ def create_ffmpeg_runner(
                 video_file,
                 proc.returncode,
             )
+        # A normal hand-off to the CPU, the same on every try: no error lines, stderr dump or failure log.
+        gpu_lacks_decoder = not stalled and _gpu_lacks_the_decoder(
+            proc.returncode, ffmpeg_output_lines, hwaccel_in(args), ffmpeg_output_lines
+        )
+        if gpu_lacks_decoder:
+            logger.info(
+                "The GPU can't decode the video of {} (FFmpeg exit code {}); the CPU makes its thumbnails instead.",
+                video_file,
+                proc.returncode,
+            )
         # Error logging (skip generic failure log when we stopped FFmpeg ourselves; already logged above)
-        if proc.returncode != 0 and not stalled and not gpu_cant_decode and not chapter_without_frame:
+        if (
+            proc.returncode != 0
+            and not stalled
+            and not gpu_cant_decode
+            and not gpu_lacks_decoder
+            and not chapter_without_frame
+        ):
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
             no_decoder = exit_diagnosis == "no_decoder"
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
-                folder, setting = working_folder_hint()
+                folder, move = working_folder_hint()
                 fix = folder_write_fix(refused)
                 logger.error(
                     "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
-                    "{}, or choose another folder ({}). Other files in the queue will keep processing.",
+                    "{}, or {}. Other files in the queue will keep processing.",
                     video_file,
                     folder,
                     output_folder,
                     _FOLDER_WRITE_TEXT[refused][0],
                     proc.returncode,
                     fix,
-                    setting,
+                    move,
                 )
             elif no_decoder:
                 # The file's only failure line: the caller neither reruns it nor logs it again.
@@ -856,18 +874,17 @@ def create_ffmpeg_runner(
             elif refused is None and _io_cut_off(proc.returncode, ffmpeg_output_lines):
                 # Exit 251 with a GPU error in the stderr is the GPU's, not a disk's: the stderr lines below say so.
                 # One the folder refused (it couldn't create a frame file) was said above.
-                folder, setting = working_folder_hint()
+                folder, _move = working_folder_hint()
                 logger.warning(
                     "FFmpeg hit an I/O error on {}: reading the video from its disk or network share, or writing "
                     "thumbnails to {} ({}, exists: {}), failed. Check that disk or share, and that "
-                    "{} isn't full and is writable ({}). "
+                    "{} isn't full and is writable. "
                     "Other files in the queue will keep processing.",
                     video_file,
                     folder,
                     output_folder,
                     os.path.isdir(output_folder),
                     folder,
-                    setting,
                 )
             elif exit_diagnosis == "high_exit_non_signal":
                 logger.warning(

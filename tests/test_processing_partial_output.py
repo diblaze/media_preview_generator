@@ -751,7 +751,7 @@ class TestTheRunnersFailureLines:
             (
                 PERMISSION_DENIED,
                 "\n".join(FOLDER_PERMISSION_DENIED_STDERR),
-                "Let the app's user write to it (in Docker, check PUID and PGID), or choose another folder",
+                "Let the app's user write to it (in Docker, check PUID and PGID), or mount a bigger, writable disk",
             ),
         ],
         ids=["full", "read-only", "over-quota", "no-permission"],
