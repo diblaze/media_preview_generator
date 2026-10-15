@@ -96,6 +96,8 @@ jobs:
           $said = ./dist/PlexDbNode/PlexDbNode-debug.exe --undo-loudness --config-dir $empty --plex-config-dir $empty 2>&1
           if ($LASTEXITCODE -ne 1 -or "$said" -notmatch "No loudness undo record") { throw "--undo-loudness: $said" }
           "ok   --undo-loudness runs in the build"
+          # The undo's expected exit code 1 is still $LASTEXITCODE; pwsh would end the step with it.
+          exit 0
       - name: Smoke-test the windowed build
         if: steps.ready.outputs.run == 'true'
         shell: pwsh

@@ -7,6 +7,7 @@ containers' round trip.
 from __future__ import annotations
 
 import json
+import os
 import time
 from unittest.mock import MagicMock
 
@@ -692,7 +693,9 @@ class TestWhichDatabaseHalfAServerGets:
         )
         publisher = publisher_for(MagicMock(), config)
         assert isinstance(publisher._db, LocalPlexDb)
-        assert publisher.db_path() == "/local/plex/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+        assert publisher.db_path() == os.path.join(
+            "/local/plex", "Plug-in Support", "Databases", "com.plexapp.plugins.library.db"
+        )
 
 
 class TestTheAgentMustBeNextToThisPlex:
