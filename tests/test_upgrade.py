@@ -2801,6 +2801,47 @@ class TestMigrationNoticeBackupAndDismissal:
         assert notice["backup"] != str(earlier)
         assert json.loads(Path(notice["backup"]).read_text()) == seeded
 
+    def test_an_upgrade_with_no_notes_still_points_an_unread_notice_at_this_boots_backup(self, tmp_path):
+        """A 5.1.0 install's unread card names its fresh-install copy (pre-v1.bak, holding nothing); v24 on a server
+        with no helper writes no notes, and the card must still move on to the copy this upgrade took."""
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.web import notifications as notif
+
+        earlier = tmp_path / "settings.json.pre-v1.bak"
+        earlier.write_text('{"_env_migrated": true}')
+        unread = {"from": 1, "to": 23, "backup": str(earlier), "notes": ["An unread note."]}
+        seeded = {"_schema_version": 23, "thumbnail_interval": 5, "_pending_migration_notice": unread}
+        sm = self._boot(tmp_path, seeded)
+
+        _migrate_schema(sm)
+
+        notice = sm.get("_pending_migration_notice")
+        assert (notice["from"], notice["to"], notice["notes"]) == (1, _CURRENT_SCHEMA_VERSION, ["An unread note."])
+        assert json.loads(Path(notice["backup"]).read_text()) == seeded
+        with patch("media_preview_generator.web.settings_manager.get_settings_manager", return_value=sm):
+            body = notif._build_schema_migration_notification()["body_html"]
+        assert "pre-v1.bak" not in body
+        assert f"<code>{notice['backup']}</code>" in body
+
+    @pytest.mark.parametrize("earlier", ["none", "dismissed"])
+    def test_an_upgrade_with_no_notes_and_no_unread_notice_writes_no_card(self, tmp_path, earlier):
+        from media_preview_generator.upgrade import _migrate_schema
+        from media_preview_generator.web.notifications import SCHEMA_MIGRATION_ID
+
+        extra = {}
+        if earlier == "dismissed":
+            extra = {
+                "_pending_migration_notice": {"from": 1, "to": 23, "backup": "", "notes": []},
+                "dismissed_notifications": [SCHEMA_MIGRATION_ID],
+            }
+        sm = self._boot(tmp_path, {"_schema_version": 23, **extra})
+
+        _migrate_schema(sm)
+
+        assert sm.get("_schema_version") == _CURRENT_SCHEMA_VERSION
+        assert sm.get("_pending_migration_notice") == extra.get("_pending_migration_notice")
+        assert sm.get("dismissed_notifications") == extra.get("dismissed_notifications")
+
     def test_the_notice_backup_survives_fifteen_ordinary_saves(self, tmp_path, monkeypatch):
         """Saves rotate timestamped backups (keep 10); the pre-upgrade copy must not be one of them."""
         from datetime import UTC, datetime, timedelta

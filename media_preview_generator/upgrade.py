@@ -558,7 +558,9 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
 
     if log_notes:
         logger.info("Settings schema migrated to v{}: {}", _CURRENT_SCHEMA_VERSION, ", ".join(log_notes))
-    if log_notes and announce:
+    # A version move with no notes still has to reach an unread card: left alone, it keeps naming the older
+    # upgrade's copy as the way back (a fresh install's first-boot copy holds nothing) and the older "to".
+    if announce and (log_notes or current < _CURRENT_SCHEMA_VERSION):
         # J5: drop a one-shot flag the dashboard's notification bell reads
         # so the user sees a single "we migrated your config" card on next
         # login. Dismissal removes the flag (see notifications.py).
@@ -570,9 +572,13 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         # Older versions stored a permanent dismissal of this card, which would hide this new notice as well. They
         # also left the dismissed notice in place: the user has read it, so its notes don't go into the new card.
         dismissed = sm.get("dismissed_notifications")
-        if isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed:
-            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
+        stale_dismissal = isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed
+        if stale_dismissal:
             existing = {}
+        if not log_notes and not existing:
+            return
+        if stale_dismissal:
+            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
         # The card always names this boot's snapshot, never an unread notice's older one: rolling back means
         # restoring the settings as this build found them (an older notice's copy can be from a fresh install's
         # first boot, holding nothing), and only the build that wrote them reads them as they are.
