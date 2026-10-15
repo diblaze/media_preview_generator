@@ -354,7 +354,7 @@ def _read_then_sent(
     the last 16 MB of it, which a slow or stalled app (gone from the network without hanging up) made minutes or for
     good, and every check and write on the node waited. So it is kept compressed in memory, one block per piece, and
     let go of ``held`` before its first byte: memory, not a temp file, because a node may run with a read-only
-    filesystem.
+    filesystem (the server keeps the part the app hasn't read yet in memory too: ``wsgi.OUTBUF_OVERFLOW_BYTES``).
     """
     packer = zlib.compressobj(ROWS_PACK_LEVEL)
     blocks = []

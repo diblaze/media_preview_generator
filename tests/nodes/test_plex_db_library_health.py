@@ -7,15 +7,18 @@ counting the same database locally gives.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import sqlite3
+import tempfile
 import threading
 import time
 import tracemalloc
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -560,15 +563,16 @@ class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
             waiting.close()
         assert busy == 0
 
-    def test_an_app_that_stopped_reading_a_big_answer_over_http_leaves_the_database_free(self, tmp_path):
+    @staticmethod
+    def _served(tmp_path: Path, movies: int, extra_chars: int) -> Any:
+        """A node on waitress, as both entry points serve it, beside a library of ``movies`` films."""
         from media_preview_generator.nodes.server import wsgi
 
-        # Bigger than waitress's 16 MB of unsent answer plus the sockets' buffers, so its sending thread stops.
-        folder = tmp_path / "huge" / "Plex Media Server"
+        folder = tmp_path / "served" / "Plex Media Server"
         path = Path(plex_db_path(str(folder)))
         path.parent.mkdir(parents=True)
-        extra = "x" * 4000
-        build_plex_db(path, [_movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", extra, [None]) for i in range(8000)])
+        extra = "x" * extra_chars
+        build_plex_db(path, [_movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", extra, [None]) for i in range(movies)])
         conn = sqlite3.connect(path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.close()
@@ -576,7 +580,10 @@ class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
             node_app(str(folder), mountinfo_path=_mountinfo(tmp_path)), host="127.0.0.1", port=0, threads=4
         )
         threading.Thread(target=server.run, daemon=True).start()
-        port = server.effective_port
+        return server
+
+    def _asked_over_http(self, port: int) -> socket.socket:
+        """A connection that has sent the Library Health request, reading its answer through a 64 KB buffer."""
         body = json.dumps(self.BODY).encode()
         head = "\r\n".join(
             [
@@ -588,10 +595,17 @@ class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
                 "Connection: close",
             ]
         )
-        stalled = socket.create_connection(("127.0.0.1", port))
+        app = socket.create_connection(("127.0.0.1", port))
+        app.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
+        app.sendall(head.encode() + b"\r\n\r\n" + body)
+        return app
+
+    def test_an_app_that_stopped_reading_a_big_answer_over_http_leaves_the_database_free(self, tmp_path):
+        # Bigger than waitress's 16 MB of unsent answer plus the sockets' buffers, so its sending thread stops.
+        server = self._served(tmp_path, 8000, 4000)
+        port = server.effective_port
+        stalled = self._asked_over_http(port)
         try:
-            stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
-            stalled.sendall(head.encode() + b"\r\n\r\n" + body)
             received = stalled.recv(64 * 1024)
             assert received.startswith(b"HTTP/1.1 200")
             # The app stops reading here without hanging up; a Setup Health or job check of the node follows.
@@ -609,3 +623,31 @@ class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
         # And the answer that waited is whole once the app reads again: the capability comes last.
         assert len(received) > 32_000_000
         assert f'"capability":"{plex_rows.LIBRARY_HEALTH_CAPABILITY}"}}}}'.encode() in received[-200:]
+
+    def test_an_app_reading_slowly_gets_the_whole_answer_from_a_node_without_a_writable_temp_folder(
+        self, tmp_path, monkeypatch
+    ):
+        # waitress moved the part of an answer the app hadn't read yet past 1 MB to a temp file: on a node run with
+        # --read-only there is none, so the answer stopped partway and Library Health never counted the library.
+        read_only = tmp_path / "read-only-tmp"
+        read_only.mkdir()
+        read_only.chmod(0o500)  # what --read-only makes of /tmp, and of every other folder tempfile tries
+        monkeypatch.setattr(tempfile, "tempdir", str(read_only))
+        server = self._served(tmp_path, 12000, 600)  # a ~9 MB answer
+        app = self._asked_over_http(server.effective_port)
+        received = b""
+        try:
+            app.settimeout(15)
+            with contextlib.suppress(TimeoutError):
+                while piece := app.recv(64 * 1024):
+                    received += piece
+                    time.sleep(0.02)  # an app on another machine reads slower than the node sends
+        finally:
+            app.close()
+            server.close()
+            read_only.chmod(0o700)
+        assert received.startswith(b"HTTP/1.1 200")
+        # The capability comes last (then the end of waitress's chunked encoding).
+        assert f'"capability":"{plex_rows.LIBRARY_HEALTH_CAPABILITY}"}}}}'.encode() in received[-200:], (
+            f"the answer stopped after {len(received):,} bytes"
+        )

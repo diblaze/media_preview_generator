@@ -64,6 +64,14 @@ MAX_REQUEST_BODY_BYTES = 512 * 1024
 # 512 KB: 4 MB bodies from a thousand connections held 4 GB of the node's temp disk for REQUEST_READ_S). Twice the
 # body limit, as a chunked body is cut off up to one read past it: no body is ever written out.
 INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
+# How much of an answer may wait for a slow app before the thread sending it waits too (waitress's own default, named
+# here for OUTBUF_OVERFLOW_BYTES).
+OUTBUF_HIGH_WATERMARK_BYTES = 16 * 1024 * 1024
+# waitress moves what waits past this to a temp file (its default is 1 MB), and a Plex database node may run with
+# --read-only, without one: Library Health's answer (~1 KB a file) went past it whenever the app read slower than the
+# node sent, and the answer stopped partway. Twice the high watermark, so the waiting part plus one more piece of an
+# answer (a few MB at most; an artifact is sent from its file) stays in memory.
+OUTBUF_OVERFLOW_BYTES = 2 * OUTBUF_HIGH_WATERMARK_BYTES
 # waitress reads each request whole in memory before the app checks its key, so a thousand connections sending bodies
 # near MAX_REQUEST_BODY_BYTES would hold half a gigabyte of a small node's memory. The bytes of requests being read (or
 # waiting for a thread) beyond the first REQUEST_BYTES_FREE of each count against REQUEST_BYTES_BUDGET; a connection
@@ -289,6 +297,8 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
         asyncore_use_poll=True,
         max_request_body_size=MAX_REQUEST_BODY_BYTES,
         inbuf_overflow=INBUF_OVERFLOW_BYTES,
+        outbuf_high_watermark=OUTBUF_HIGH_WATERMARK_BYTES,
+        outbuf_overflow=OUTBUF_OVERFLOW_BYTES,
         ident=ident,
     )
     accept = _limited_channels(listen_map)

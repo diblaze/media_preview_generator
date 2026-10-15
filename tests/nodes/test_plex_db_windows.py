@@ -258,6 +258,7 @@ class TestTheWindowsEntryPoint:
         assert settings["max_request_body_size"] == wsgi.MAX_REQUEST_BODY_BYTES
         assert settings["connection_limit"] in (wsgi.CONNECTION_LIMIT, wsgi.SELECT_CONNECTION_LIMIT)
         assert settings["asyncore_use_poll"] is True and settings["ident"] == "mpg-plex-db-node"
+        assert settings["outbuf_overflow"] == wsgi.OUTBUF_OVERFLOW_BYTES > settings["outbuf_high_watermark"]
 
     def test_a_windows_node_without_its_own_folder_writes_no_loudness(self, monkeypatch):
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)

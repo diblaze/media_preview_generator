@@ -185,8 +185,9 @@ def create_node_app(
     _env_from_files()
     chosen_roles = _resolve_roles(roles)
     worker = protocol.ROLE_WORKER in chosen_roles
-    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only). Made
-    # before the identity, so a node that can't start hasn't spent the one-time notice of its new key.
+    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only; the
+    # server keeps answers waiting for the app in memory, wsgi.OUTBUF_OVERFLOW_BYTES). Made before the identity, so a
+    # node that can't start hasn't spent the one-time notice of its new key.
     temp_root = _worker_temp_root() if worker else None
     me = identity.load_identity(config_dir, key=key)
     node_block = {
