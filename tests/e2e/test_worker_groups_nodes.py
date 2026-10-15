@@ -185,3 +185,15 @@ def test_dashboard_shows_node_chip_zero_reason_and_offline_worker_card(
     expect(card.locator("[data-status-badge]")).to_have_class("pill bad")
     local = authed_page.locator('[data-member-block="gpu-video:m-gpu"] .mem-h')
     expect(local.locator(".node-chip")).to_have_count(0)
+
+
+def test_week_legend_names_a_node_device_apart_from_this_apps(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    offline_node_group(group_api)
+    settings_page(authed_page, app_url)
+    legend = authed_page.locator("#workerWeekLegend")
+    expect(legend).to_contain_text("old-laptop · ")
+    expect(legend.locator("span", has_text="old-laptop · ")).to_have_count(1)

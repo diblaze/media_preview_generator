@@ -278,8 +278,10 @@
         graph.innerHTML = lanes.length ? window.WeekGraph.render(lanes, window.WeekGraph.pauseSegments(), { timeZone: snapshot.timezone })
             : '<div class="wkg-empty">No enabled groups. Jobs wait until a compatible group is available.</div>';
         const devices = new Map();
-        for (const member of enabled.flatMap(group => group.members)) devices.set(member.resource === 'cpu' ? 'cpu' : member.device, member);
-        legend.innerHTML = [...devices.values()].map(member => `<span><i class="swatch" style="--c:${deviceColor(member)}"></i>${escapeHtml(deviceName(member))}</span>`).join('')
+        for (const member of enabled.flatMap(group => group.members)) {
+            devices.set(`${member.node || ''}|${member.resource === 'cpu' ? 'cpu' : member.device}`, member);
+        }
+        legend.innerHTML = [...devices.values()].map(member => `<span><i class="swatch" style="--c:${deviceColor(member)}"></i>${escapeHtml(deviceTitle(member))}</span>`).join('')
             + '<span><i class="swatch swatch-pause"></i>Global pause</span><span><i class="swatch swatch-now"></i>Now</span>';
         document.querySelectorAll('#workerWeekTz, [data-week-tz]').forEach(node => { node.innerHTML = `<i class="bi bi-globe2" aria-hidden="true"></i> ${escapeHtml(timezoneLabel())}`; });
     }
