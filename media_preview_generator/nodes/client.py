@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
-from urllib3.exceptions import HTTPError, NameResolutionError, NewConnectionError, ProtocolError
+from urllib3.exceptions import HTTPError, NameResolutionError, NewConnectionError, ProtocolError, ReadTimeoutError
 
 from . import protocol
 
@@ -26,8 +26,10 @@ READ_TIMEOUT_S = 10.0
 INFO_TIMEOUT_S = 10.0
 # A rescan runs GPU detection while the request waits (measured 0.7-1.3 s; a slow Vulkan probe can take longer).
 GPU_RESCAN_TIMEOUT_S = 60.0
-# A preview's frames are a few MB; the artifact download gets its own, longer read timeout.
-ARTIFACT_TIMEOUT_S = 300.0
+# The longest wait for the next byte of a task's frames. The node sends the tar it already wrote, so bytes start at
+# once and keep coming however slow the link: this long with none is a stalled link. A job's cancel, or the app's
+# stop, waits for a stalled download no longer than this (a stalled poll is given up on within ~30 s too).
+ARTIFACT_TIMEOUT_S = 30.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
@@ -289,6 +291,11 @@ class NodeClient:
                     raise NodeProtocolError(f"{self._address.base} sent more than {limit // (1024 * 1024)} MB")
         except requests.RequestException as exc:
             # The answer had started, so the node may have acted on the request.
+            if exc.args and isinstance(exc.args[0], ReadTimeoutError):
+                # It waited out its whole read timeout, like no answer at all: asking again waits as long again.
+                raise NodeTimeoutError(
+                    f"{self._address.base} stopped sending partway through its answer", reason=UNREACHABLE_TIMEOUT
+                ) from exc
             raise NodeTimeoutError(f"{self._address.base} dropped the connection while answering") from exc
         return body
 
