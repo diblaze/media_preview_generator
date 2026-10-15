@@ -3323,7 +3323,8 @@ class JobManager:
                         status,
                         job_kind=job.kind if job else None,
                         paused=bool(job_pause_reasons(job)) if job else False,
-                        **({"fallback_active": False, "fallback_title": ""} if aged_out else {}),
+                        fallback_active=status.fallback_active and not aged_out,
+                        fallback_title="" if aged_out else status.fallback_title,
                     )
                 )
             return statuses
