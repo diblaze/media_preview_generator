@@ -38,6 +38,11 @@
         }
 
         select.addEventListener('change', function () {
+            // The Nodes entry is a page, not a section of this one.
+            if (select.value.startsWith('/')) {
+                window.location.href = select.value;
+                return;
+            }
             history.pushState(null, '', `#${select.value}`);
             showSection(select.value, true);
         });

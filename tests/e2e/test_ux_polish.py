@@ -72,6 +72,13 @@ def test_mobile_settings_selection_and_hash_navigation_agree(settings_page: Page
     expect(selector).to_have_value("section-logging")
 
 
+def test_mobile_settings_picker_has_a_nodes_entry_that_opens_the_nodes_page(settings_page: Page) -> None:
+    page = settings_page
+    page.set_viewport_size(PHONE)
+    page.locator("#settingsMobileSection").select_option(label="Nodes")
+    expect(page).to_have_url(re.compile(r"/nodes$"))
+
+
 def test_settings_extra_guidance_can_be_opened_and_closed_with_keyboard(settings_page: Page) -> None:
     info = settings_page.get_by_role("button", name="Explain auto-requeue interrupted jobs")
     hint = settings_page.locator("label[for='autoRequeueOnRestart'] + .sr-hint")
