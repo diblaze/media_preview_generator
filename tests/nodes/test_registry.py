@@ -413,6 +413,53 @@ class TestGpuLost:
         h.registry._tick()
         assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_READY)
 
+    def test_a_node_that_couldnt_detect_its_gpus_yet_pauses_gpu_members_until_it_can(self, h):
+        from media_preview_generator.jobs.node_members import NodeHardware
+
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_GPU_LOST and "couldn't check its GPUs" in view.reason
+        capacity = h.registry.capacity("n1")
+        assert (capacity.cpu, capacity.gpu) == (True, False)
+        hardware = NodeHardware(1, {"n1": view}, {"n1": capacity})
+        assert hardware.member_can_come_back({"node": "n1", "resource": "gpu", "device": "cuda:0"})
+
+        h.client().default_info = _info(gpus=[GPU_OK])
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
+    def test_the_health_loop_rescans_a_node_that_couldnt_detect_its_gpus(self, h):
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+        h.registry.check_now("n1")
+        h.registry._nodes["n1"].next_check = h.clock.now + 10_000
+        h.clock.now += reg.GPU_LOST_RECHECK_S
+
+        h.registry._tick()
+
+        assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_READY)
+        assert h.client().rescan_calls == 1
+
+    def test_a_rescan_that_still_cant_detect_keeps_the_check_pending(self, h):
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+        h.registry.check_now("n1")
+        h.client().rescans = [{"worker": {"gpus": [], "gpu_error": "RuntimeError: GPU busy"}}]
+
+        assert h.registry.rescan_gpus("n1").state == reg.STATE_GPU_LOST
+
+    def test_a_plex_database_only_node_with_a_detection_error_stays_ready(self, h):
+        failing = _info(roles=(ROLE_PLEX_DB,))
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
 
 class TestRevisionAndSettings:
     def test_revision_moves_on_state_changes_only(self, h):

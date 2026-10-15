@@ -159,11 +159,12 @@ class WorkerInfo:
     def rescan(self) -> list[dict[str, Any]]:
         """Run GPU detection now.
 
-        A detection that raises counts as no GPUs, its error kept: the node still answers (its CPU can work), and the
-        app reads a GPU it had before as lost.
+        A detection that raises keeps the last list it found, its error kept: one failed pass on a busy GPU must not
+        read as a lost GPU. With no earlier list the node reports no GPUs and the error, which the app reads as a
+        check still to come, not as a missing GPU.
 
         Returns:
-            The fresh, JSON-safe GPU list.
+            The JSON-safe GPU list now reported.
         """
         with self._detect_lock:
             detect = self._detect
@@ -175,8 +176,10 @@ class WorkerInfo:
                     detect = gpu_detect.detect_all_gpus
                 found = [_gpu_entry(raw) for raw in detect() or []]
             except Exception as exc:  # noqa: BLE001 - a broken probe must not take /v1/info down with it
-                logger.opt(exception=True).warning("GPU detection failed on this node, so it reports no GPUs")
-                found, error = [], f"{type(exc).__name__}: {exc}"
+                logger.opt(exception=True).warning("GPU detection failed on this node; it keeps its last GPU list")
+                with self._cache_lock:
+                    found = list(self._gpus) if self._gpus is not None else []
+                error = f"{type(exc).__name__}: {exc}"
             with self._cache_lock:
                 self._gpus, self._checked_at, self._gpu_error = found, time.time(), error
             return [dict(entry) for entry in found]
@@ -201,6 +204,11 @@ class WorkerInfo:
     @property
     def gpu_checked_at(self) -> float | None:
         return self._checked_at
+
+    @property
+    def gpu_error(self) -> str | None:
+        """Why the last GPU detection failed, or None when it worked."""
+        return self._gpu_error
 
     def block(self, *, busy: int) -> dict[str, Any]:
         """The ``worker`` block of /v1/info.

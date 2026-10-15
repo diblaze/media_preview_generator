@@ -254,6 +254,19 @@ def _gpus_in(answer: object) -> tuple[dict, ...]:
     return _clean_gpus(worker.get("gpus")) if isinstance(worker, dict) else ()
 
 
+def _gpu_detection_pending(answer: object) -> str:
+    """Why a node couldn't detect its GPUs yet: its ``gpu_error`` while it has no GPU list at all, else "".
+
+    A node keeps its last list when a detection fails, so an error beside an empty list means no detection has
+    worked since it started; its GPUs may still be there.
+    """
+    if not isinstance(answer, dict) or _gpus_in(answer):
+        return ""
+    worker = answer.get("worker")
+    error = worker.get("gpu_error") if isinstance(worker, dict) else None
+    return str(error) if error else ""
+
+
 def _gpu_ok(gpus: tuple[dict, ...], device: str) -> tuple[bool, str]:
     match = next((g for g in gpus if g["device"] == device), None)
     if match is None:
@@ -779,7 +792,28 @@ class NodeRegistry:
             live.gpus = _gpus_in(outcome.info)
             if live.gpu_lost and live.lost_device and _gpu_ok(live.gpus, live.lost_device)[0]:
                 live.gpu_lost = live.lost_device = ""
+            self._note_gpu_detection(live, outcome.info)
         self._touch()
+
+    def _note_gpu_detection(self, live: _Live, answer: object) -> None:
+        """Pause a worker node's GPU members while it couldn't detect its GPUs yet (the caller holds the lock).
+
+        Read as a GPU check still to come (``gpu_lost`` with no ``lost_device``), so its members come back once a
+        detection works rather than waiting on someone.
+        """
+        error = _gpu_detection_pending(answer) if protocol.ROLE_WORKER in live.roles else ""
+        if error and not live.gpu_lost:
+            name = str(live.record.get("name") or "The node")
+            logger.warning(
+                "Node {} couldn't detect its GPUs ({}); its GPU workers wait for its next check", name, error
+            )
+            live.gpu_lost = (
+                f"{name} couldn't check its GPUs yet ({error}). It tries again in a few minutes; its CPU workers "
+                "keep running."
+            )
+            live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
+        elif not error and live.gpu_lost and not live.lost_device:
+            live.gpu_lost = ""
 
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
@@ -917,7 +951,8 @@ class NodeRegistry:
                 return
             client, name = live.client, str(live.record.get("name") or "The node")
         try:
-            gpus = _gpus_in(client.rescan_gpus())
+            answer = client.rescan_gpus()
+            gpus = _gpus_in(answer)
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)
             self.report_unavailable(node_id)
@@ -937,6 +972,7 @@ class NodeRegistry:
                     live.gpu_lost = f"{name} lost its GPU {device} ({why}). Its CPU workers keep running."
                     live.lost_device = device
                     live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
+            self._note_gpu_detection(live, answer)
             self._touch()
 
 
