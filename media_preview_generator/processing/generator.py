@@ -59,6 +59,7 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
     build_hdr10_zscale_chain,
+    rotation_filter,
 )
 from .hdr_detection import (
     is_dolby_vision,
@@ -1859,6 +1860,27 @@ def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
         return MediaInfo(_UNREAD_MEDIA_INFO_XML)
 
 
+def display_rotation(media_info: MediaInfo) -> int:
+    """How far clockwise the video is shown turned from how it is stored, as MediaInfo reads it (a phone's portrait
+    video stored landscape is 90).
+
+    MediaInfo reads it from MP4 and MOV (where phones write it) but not from Matroska, and doesn't say when the turn
+    is mirrored too: on a GPU a rotated Matroska file's thumbnails stay as stored, and a mirrored one's stay mirrored.
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        0, 90, 180 or 270; 0 for any other angle (FFmpeg turns those only on the CPU, with ``rotate``).
+    """
+    tracks = media_info.video_tracks
+    try:
+        degrees = round(float(getattr(tracks[0], "rotation", None))) % 360 if tracks else 0
+    except (TypeError, ValueError):
+        return 0
+    return degrees if degrees in (90, 180, 270) else 0
+
+
 def is_greyscale_h264(media_info: MediaInfo) -> bool:
     """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
     4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
@@ -2073,11 +2095,14 @@ def generate_images(
                             and gpu_device_path.startswith("/dev/dri/")
                         )
                         path_kind = DV5_PATH_VAAPI_VULKAN if use_vaapi_dv5_path else DV5_PATH_LIBPLACEBO
+                    # The VAAPI paths' frames stay on the GPU until their download, which FFmpeg doesn't turn
+                    # upright; the libplacebo path uploads frames FFmpeg has already turned.
+                    turn = rotation_filter(display_rotation(media_info)) if path_kind != DV5_PATH_LIBPLACEBO else None
                     libplacebo_vf = build_dv5_vf(
                         path_kind=path_kind,
                         tonemap_algorithm=config.tonemap_algorithm,
                         fps_value=fps_value,
-                        base_scale=base_scale,
+                        base_scale=f"{turn},{base_scale}" if turn else base_scale,
                     )
             elif is_dolby_vision(hdr_fmt):
                 # Dolby Vision Profile 7/8/10 with an HDR10 or HLG
@@ -2142,6 +2167,7 @@ def generate_images(
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
         last_command=last_command,
+        rotation=display_rotation(media_info),
     )
 
     def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:

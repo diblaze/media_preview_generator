@@ -49,6 +49,7 @@ from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
     DV5_PATH_VAAPI_VULKAN,
+    rotation_filter,
 )
 from .hwaccel import hwaccel_decode_args
 
@@ -147,6 +148,7 @@ def create_ffmpeg_runner(
     chapter_output: str | None = None,
     active_timeout_s: float | None = None,
     last_command: list[str] | None = None,
+    rotation: int = 0,
 ) -> Callable[..., tuple[int, float, str, list[str]]]:
     """Factory: return a configured ffmpeg-runner closure for one media item.
 
@@ -160,6 +162,9 @@ def create_ffmpeg_runner(
     ``last_command``, when given, holds each run's FFmpeg command from the moment it starts: a tier can decode with
     another ``-hwaccel`` than the worker's GPU (the software Dolby Vision tier has none), and the CPU hand-off judges
     a run by the decoder it asked for.
+
+    ``rotation`` is how far the stream is shown turned (:func:`generator.display_rotation`). FFmpeg turns frames in
+    memory upright by itself but not frames that stay on the GPU, so the GPU scale paths turn them after download.
     """
     # Import at factory-call time to avoid a circular dependency at module
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
@@ -197,14 +202,23 @@ def create_ffmpeg_runner(
         """
         if not hw_decode_active:
             return None
+        # A rotated stream's frames are turned upright after download (``_assemble_vf``) and then sized by the CPU
+        # path's own scale (``base_scale``), so its thumbnails match the CPU's; the GPU first shrinks them to twice
+        # that box, as stored (portrait boxes for a quarter turn).
+        if rotation in (90, 270):
+            box = "w=480:h=640"
+        elif rotation == 180:
+            box = "w=640:h=480"
+        else:
+            box = "w=320:h=240"
         if effective_gpu == "NVIDIA":
             return (
-                f"scale_cuda=w=320:h=240:force_original_aspect_ratio=decrease:"
+                f"scale_cuda={box}:force_original_aspect_ratio=decrease:"
                 f"force_divisible_by=2:format={fmt},hwdownload,format={fmt}"
             )
         if effective_gpu in {"INTEL", "AMD"}:
             return (
-                f"scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease:"
+                f"scale_vaapi={box}:force_original_aspect_ratio=decrease:"
                 f"format={fmt},hwdownload,format={fmt},"
                 f"scale=trunc(iw/2)*2:trunc(ih/2)*2"
             )
@@ -241,16 +255,20 @@ def create_ffmpeg_runner(
         }:
             assert libplacebo_vf is not None
             return libplacebo_vf
+        fmt = "p010le" if effective_kind == "hdr10_zscale" else "nv12"
+        gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, fmt)
+        if gpu_seg is None:
+            if effective_kind == "hdr10_zscale":
+                return f"{fps_filter},{hdr10_zscale_chain},{base_scale}"
+            # SDR (also covers dv5_software_fallback — DV-safe fps+scale).
+            return f"{fps_filter},{base_scale}"
+        vf = f"{fps_filter},{gpu_seg}"
         if effective_kind == "hdr10_zscale":
-            gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, "p010le")
-            if gpu_seg is not None:
-                return f"{fps_filter},{gpu_seg},{hdr10_zscale_chain}"
-            return f"{fps_filter},{hdr10_zscale_chain},{base_scale}"
-        # SDR (also covers dv5_software_fallback — DV-safe fps+scale).
-        gpu_seg = _gpu_scale_segment(effective_gpu, hw_decode_active, "nv12")
-        if gpu_seg is not None:
-            return f"{fps_filter},{gpu_seg}"
-        return f"{fps_filter},{base_scale}"
+            vf += f",{hdr10_zscale_chain}"
+        turn = rotation_filter(rotation)
+        if turn is not None:
+            vf += f",{turn},{base_scale}"
+        return vf
 
     def _run_ffmpeg(
         use_skip: bool,

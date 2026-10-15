@@ -17,6 +17,19 @@ DV5_PATH_VAAPI_VULKAN = "libplacebo_vaapi"
 DV5_PATH_LIBPLACEBO = "libplacebo_dv5"
 
 
+def rotation_filter(rotation: int) -> str | None:
+    """The filters that turn a stream shown ``rotation`` degrees clockwise upright, the ones FFmpeg's own autorotation
+    puts in front of the filter graph for frames in memory (it skips frames that stay on the GPU).
+
+    Args:
+        rotation: 0, 90, 180 or 270 (:func:`generator.display_rotation`).
+
+    Returns:
+        The filters, or None for a stream shown as stored.
+    """
+    return {90: "transpose=clock", 180: "hflip,vflip", 270: "transpose=cclock"}.get(rotation)
+
+
 def build_hdr10_zscale_chain(tonemap_algorithm: str, input_options: Sequence[str] = ()) -> str:
     """Return the software tone-map chain that turns HDR10 (or a DV base layer) into SDR yuv420p.
 
