@@ -308,6 +308,53 @@ class TestSettingsManagerNodes:
         other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
         assert sm.update_nodes([*sm.nodes, other]) == 6
 
+    def test_a_node_copied_by_hand_with_the_same_id_gets_its_own_that_is_saved(self, tmp_path):
+        """The copy kept the first record's id: the registry listed only the first, and every save of the node list
+        was refused "Node id ... is used twice"."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        first["node_uid"] = "uid-of-nuc"
+        copied = {**first, "name": "nas", "url": "http://nas.lan:9494", "key": "k-456"}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [first, copied], "nodes_revision": 3}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        kept, renamed = sm.nodes
+        assert kept == first
+        assert renamed["id"] != first["id"] and len(renamed["id"]) == 32 and renamed["name"] == "nas"
+        assert renamed["node_uid"] is None  # learnt at nuc's address, not at nas's
+        assert sm.nodes_revision == 4
+        assert SettingsManager(str(tmp_path)).nodes[1]["id"] == renamed["id"]  # the same id after a restart
+        other, _ = ns.validate_node(_post(name="other", url="http://other.lan:9494"), existing=None, others=sm.nodes)
+        assert sm.update_nodes([*sm.nodes, other]) == 5
+
+    @pytest.mark.parametrize("hand_written", ["false", "true", "off", 0, None])
+    def test_a_hand_written_switch_that_isnt_true_or_false_turns_the_node_off(self, tmp_path, hand_written):
+        """Read as it was, "false" in quotes counted as on: a node meant to be off was checked and sent work."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"nodes": [{**first, "enabled": hand_written}], "nodes_revision": 3})
+        )
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes[0]["enabled"] is False and sm.nodes_revision == 4
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["enabled"] is False
+        sm.update_nodes([{**sm.nodes[0], "enabled": True}])  # the record is valid again: it can be switched on
+
+    def test_a_switch_that_is_true_or_false_is_left_alone(self, tmp_path):
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [first], "nodes_revision": 3}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes == [first] and sm.nodes_revision == 3
+
     def test_a_bad_record_written_by_hand_holds_up_only_a_change_to_itself(self, tmp_path):
         import json
 
@@ -321,6 +368,21 @@ class TestSettingsManagerNodes:
         with pytest.raises(ValueError, match=r"^nas: "):
             sm.update_nodes([{**bad, "enabled": False}, other])
         assert sm.nodes == [bad, other]
+
+    def test_the_id_the_node_reports_is_still_recorded_on_a_bad_record_written_by_hand(self, tmp_path):
+        """Without it a Plex database node's requests never name the saved id, so another machine at the address
+        isn't refused."""
+        import json
+
+        bad = {"id": "bad1", "node_uid": None, "name": "nas‏", "url": "http://nas:9494", "key": "k" * 24}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [bad]}))
+        sm = SettingsManager(str(tmp_path))
+
+        sm.update_nodes([{**bad, "node_uid": "uid-from-node"}])
+
+        assert sm.nodes == [{**bad, "node_uid": "uid-from-node"}]
+        with pytest.raises(ValueError, match=r"^nas‏: "):
+            sm.update_nodes([{**bad, "node_uid": "uid-2", "url": "http://nas2:9494"}])
 
     def test_an_invalid_list_is_refused_and_nothing_is_saved(self, tmp_path):
         sm = SettingsManager(str(tmp_path))

@@ -1126,9 +1126,9 @@ class _LockProbingStore(AccessResultStore):
         thread.join()
         return free[0]
 
-    def load(self, node_id, mappings):
+    def load(self, node_id, url, mappings):
         self.calls.append(("load", self._lock_free()))
-        return super().load(node_id, mappings)
+        return super().load(node_id, url, mappings)
 
     def forget(self, node_id, **kwargs):
         self.calls.append(("forget", self._lock_free()))
@@ -1142,7 +1142,7 @@ class TestAccessStoreIoOutsideTheLock:
     RESULT = {"libraries": [{"checked": 3, "ok": True}]}
 
     def test_a_new_nodes_saved_result_is_read_outside_the_lock_and_still_handed_out(self, tmp_path):
-        AccessResultStore(lambda: str(tmp_path)).save("n1", MAPPINGS, self.RESULT, 5.0)
+        AccessResultStore(lambda: str(tmp_path)).save("n1", "http://nuc:9494", MAPPINGS, self.RESULT, 5.0)
         store = _LockProbingStore(str(tmp_path))
         h = Harness(access_store=store)
         store.registry = h.registry
@@ -1166,11 +1166,11 @@ class TestAccessStoreIoOutsideTheLock:
     def test_a_result_saved_for_the_new_mappings_before_the_old_one_is_forgotten_is_kept(self, tmp_path):
         store = AccessResultStore(lambda: str(tmp_path))
         new = [{"app_prefix": "/data", "node_prefix": "/volume1"}]
-        store.save("n1", new, self.RESULT, 5.0)
+        store.save("n1", "http://nuc:9494", new, self.RESULT, 5.0)
 
-        store.forget("n1", keep_mappings=new)
+        store.forget("n1", keep_url="http://nuc:9494", keep_mappings=new)
 
-        assert store.load("n1", new) == (self.RESULT, 5.0)
+        assert store.load("n1", "http://nuc:9494", new) == (self.RESULT, 5.0)
 
 
 class TestAccessResultSurvivesRestart:
@@ -1193,6 +1193,7 @@ class TestAccessResultSurvivesRestart:
         assert details.access_checked_at == 1_700_000_000.0
         saved = json.loads((tmp_path / "node_access_results.json").read_text())
         assert saved["n1"]["mappings"] == [{"app_prefix": "/data", "node_prefix": "/mnt"}]
+        assert saved["n1"]["url"] == "http://nuc:9494"
 
     def test_changing_the_nodes_mappings_forgets_its_result(self, store):
         h = Harness(access_store=store)
@@ -1204,8 +1205,26 @@ class TestAccessResultSurvivesRestart:
         assert Harness(nodes=list(h.nodes), access_store=store).registry.details("n1").access_result is None
 
     def test_a_result_saved_for_other_mappings_is_never_handed_out(self, store):
-        store.save("n1", [{"app_prefix": "/data", "node_prefix": "/old"}], self.RESULT, 1.0)
+        store.save("n1", "http://nuc:9494", [{"app_prefix": "/data", "node_prefix": "/old"}], self.RESULT, 1.0)
         assert Harness(access_store=store).registry.details("n1").access_result is None
+
+    def test_a_result_saved_at_another_address_is_never_handed_out(self, store):
+        """settings.json restored or edited by hand while the app was down: the old machine's result stayed."""
+        store.save("n1", "http://old-machine:9494", MAPPINGS, self.RESULT, 1.0)
+        assert Harness(access_store=store).registry.details("n1").access_result is None
+
+    @pytest.mark.parametrize(
+        "moved", [{"url": "http://new-machine:9494", "key": "its-key"}, {"key": "typed-again"}], ids=["address", "key"]
+    )
+    def test_a_new_address_or_key_forgets_the_result_with_the_same_mappings(self, store, moved):
+        """Setup Health went on saying "the node sees its files" from the machine at the old address."""
+        h = Harness(access_store=store)
+        h.registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
+
+        h.change(**moved)
+
+        assert h.registry.details("n1").access_result is None
+        assert Harness(nodes=list(h.nodes), access_store=store).registry.details("n1").access_result is None
 
     def test_a_result_for_mappings_replaced_during_the_test_is_not_saved(self, store, tmp_path):
         h = Harness(access_store=store)
@@ -1218,7 +1237,7 @@ class TestAccessResultSurvivesRestart:
         assert Harness(nodes=list(h.nodes), access_store=store).registry.details("n1").access_result is None
 
     def test_removed_nodes_are_dropped_from_the_file_on_the_next_save(self, store, tmp_path):
-        store.save("gone", [], self.RESULT, 1.0)
+        store.save("gone", "http://gone:9494", [], self.RESULT, 1.0)
         Harness(access_store=store).registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
         assert set(json.loads((tmp_path / "node_access_results.json").read_text())) == {"n1"}
 
@@ -1663,6 +1682,56 @@ class TestTwinOfAPlexDatabaseNode:
         h.registry.stop()
 
 
+def _plex_using(server_id: str, identity: str, *, enabled: bool = True, node_on: bool = True) -> dict:
+    return {
+        "id": server_id,
+        "type": "plex",
+        "name": server_id,
+        "enabled": enabled,
+        "server_identity": identity,
+        "markers": {"enabled": True, "plex": {"agent": {"enabled": node_on, "node_id": "n1"}}},
+    }
+
+
+class TestServersThatWriteThroughANode:
+    """Which Plex servers ``_default_served_plex_ids`` says write through a node (their new-id check)."""
+
+    @pytest.fixture
+    def sm(self, tmp_path):
+        from media_preview_generator.web import settings_manager as sm_mod
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        manager = SettingsManager(config_dir=str(tmp_path))
+        sm_mod._settings_manager = manager
+        yield manager
+        sm_mod.reset_settings_manager()
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            _plex_using("old", "plex-b", enabled=False),
+            _plex_using("old", "", enabled=False),
+            _plex_using("old", "plex-b", node_on=False),
+        ],
+        ids=["server-switched-off", "server-switched-off-never-connected", "its-node-switched-off"],
+    )
+    def test_a_server_that_writes_nothing_through_the_node_doesnt_count(self, sm, other):
+        """Counted, it turned a clean "same Plex" answer into "two Plexes": the node's new id was held and its Plex
+        database work refused until the key was typed again."""
+        sm.apply_changes(updates={"media_servers": [_plex_using("home", "plex-a"), other]})
+
+        assert reg._default_served_plex_ids("n1") == ["plex-a"]
+
+        h = Harness(nodes=[_record(node_uid="uid-1")])
+        h.registry._served_plex_ids = reg._default_served_plex_ids
+        info = _info(uid="uid-2", roles=(ROLE_PLEX_DB,))
+        info["plex_db"] = {"machine_identifier": "plex-a"}
+        h.client().default_info = info
+        h.registry.check_now("n1")
+        assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+
 class TestRecordedNodeId:
     """What ``_default_record_uid`` writes to settings.json."""
 
@@ -1681,6 +1750,15 @@ class TestRecordedNodeId:
         reg._default_record_uid("n1", "uid-first", "http://nuc:9494")
         reg._default_record_uid("n1", "uid-reinstalled", "http://nuc:9494")
         assert sm.nodes[0]["node_uid"] == "uid-reinstalled"
+
+    def test_the_id_is_recorded_on_a_record_whose_name_breaks_the_rules(self, sm):
+        """A record "invalid as saved" (a v24 name made from a Plex server's) refused every check's write of the id,
+        so a Plex database node never got the saved id its requests name."""
+        sm.apply_changes(updates={"nodes": [{**sm.nodes[0], "name": "Plex helper (Casa ‍)"}]})
+
+        reg._default_record_uid("n1", "uid-first", "http://nuc:9494")
+
+        assert sm.nodes[0]["node_uid"] == "uid-first"
 
     def test_an_id_learnt_at_an_address_the_node_no_longer_has_is_not_recorded(self, sm):
         reg._default_record_uid("n1", "uid-old-machine", "http://old-nuc:9494")

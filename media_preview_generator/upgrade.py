@@ -1941,9 +1941,10 @@ def _migrate_to_v24(sm) -> list[str]:
 
     ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
     (the address and key now live only on the node record). Servers that share one helper (same address and key)
-    share one node. The node is on when a server had the helper switched on, whatever Intro & Credits says: chapter
-    thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off everywhere becomes a
-    node turned off, so it is never checked or reported offline.
+    share one node. The node is on when a switched-on server had the helper switched on, whatever Intro & Credits
+    says: chapter thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off
+    everywhere, or used only by switched-off servers (never contacted before the upgrade), becomes a node turned off,
+    so it is never checked or reported offline; the server keeps its helper switch for when it is switched on again.
 
     A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
     that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
@@ -1960,7 +1961,7 @@ def _migrate_to_v24(sm) -> list[str]:
     ``node_id`` keeps them until it restores the backup taken before that upgrade (``settings.json.pre-v<N>.bak``)
     and upgrades again. No released build ever wrote v24.
     """
-    from .nodes.settings import NAME_MAX_LEN, default_record, normalise_url
+    from .nodes.settings import NAME_MAX_LEN, default_record, name_key, normalise_url, visible_name
 
     stored = sm.get_all()
     servers = stored.get("media_servers")
@@ -1968,7 +1969,7 @@ def _migrate_to_v24(sm) -> list[str]:
         return []
     nodes = copy.deepcopy([n for n in stored.get("nodes") or [] if isinstance(n, dict)])
     by_address = {(normalise_url(n.get("url"))[0], str(n.get("key") or "")): n for n in nodes}
-    names = {str(n.get("name") or "").casefold() for n in nodes}
+    names = {name_key(str(n.get("name") or "").strip()) for n in nodes}
     servers_out = copy.deepcopy(servers)
     changed = created = 0
     nodes_changed = False
@@ -1997,15 +1998,18 @@ def _migrate_to_v24(sm) -> list[str]:
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})
             continue
+        node_on = enabled and bool(entry.get("enabled", True))
         node = by_address.get((url, token))
         if node is None:
-            name = _helper_node_name(str(entry.get("name") or "").strip() or "Plex", names, NAME_MAX_LEN)
-            names.add(name.casefold())
-            node = default_record(name=name, url=url, key=token, enabled=enabled)
+            # A server's name takes any text; a node's name follows the Nodes page's rules, or every later save of
+            # the node (the registry's record of the id the node reports included) is refused.
+            name = _helper_node_name(visible_name(str(entry.get("name") or "")) or "Plex", names, NAME_MAX_LEN)
+            names.add(name_key(name))
+            node = default_record(name=name, url=url, key=token, enabled=node_on)
             nodes.append(node)
             by_address[(url, token)] = node
             created += 1
-        elif enabled and not node.get("enabled"):
+        elif node_on and not node.get("enabled"):
             node["enabled"] = nodes_changed = True
         agent.update({"enabled": enabled, "node_id": node["id"]})
     if not changed:
@@ -2024,17 +2028,19 @@ def _helper_node_name(server_name: str, taken: set[str], limit: int) -> str:
     """``Plex helper (<server name>)``, numbered when taken, with the server name cut so it fits ``limit``.
 
     Args:
-        server_name: The Plex server's name.
-        taken: Casefolded names already used.
+        server_name: The Plex server's name, with what a node's name can't hold taken out.
+        taken: The names already used, as ``nodes.settings.name_key`` compares them.
         limit: The longest name a node may have.
     """
+    from .nodes.settings import name_key
+
     suffix = 1
     while True:
         tail = f") {suffix}" if suffix > 1 else ")"
         room = limit - len("Plex helper (") - len(tail)
         short = server_name if len(server_name) <= room else server_name[: room - 1].rstrip() + "…"
         name = f"Plex helper ({short}{tail}"
-        if name.casefold() not in taken:
+        if name_key(name) not in taken:
             return name
         suffix += 1
 

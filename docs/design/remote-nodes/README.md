@@ -37,8 +37,8 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     the node never took don't count toward the two-drop limit (max 5 per file). Retries prefer another worker.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
-  - Test access results persist in `node_access_results.json` until that node's mappings change. A test of rows
-    not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
+  - Test access results persist in `node_access_results.json` until that node's address, key or mappings change.
+    A test of rows not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
   - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
     restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating; named in the Settings
@@ -227,8 +227,9 @@ retry runs (on the **node's** CPU, see §6).
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.
 * Plex servers: `markers.plex.agent` becomes `{"enabled", "node_id"}`. Migration v24 turns every helper (`url` +
-  `token`) into a `nodes` entry with the Plex database role (turned on only when a server uses it: helper, Intro &
-  Credits and server all on) and points the server's `agent.node_id` at it. A switched-on helper it can't move
+  `token`) into a `nodes` entry with the Plex database role (turned on only when a server uses it: helper and
+  server both on, whatever Intro & Credits says, as chapter thumbnails went through a switched-on helper with it
+  off) and points the server's `agent.node_id` at it. A switched-on helper it can't move
   (no key, bad address) stays on with no node, so it is refused rather than opening this app's own copy. The
   client resolves url + key from the node, so one record holds the address and key. A server with its node
   switched off doesn't count as using it (Remove clears its remembered `node_id`).

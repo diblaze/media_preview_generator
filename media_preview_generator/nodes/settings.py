@@ -158,10 +158,23 @@ def normalise_mappings(raw: object) -> tuple[list[dict[str, str]] | None, str]:
     return rows, ""
 
 
-def _name_key(name: str) -> str:
+def name_key(name: str) -> str:
     """A name as the unique-name rule compares it: names that look the same ("Café" typed two ways, "ＮＵＣ" and
     "nuc") compare equal."""
     return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+
+
+def _hidden(ch: str) -> bool:
+    """Whether the name rule refuses ``ch``: a control or format character (a tab, a zero-width joiner, a
+    right-to-left mark) or a line or paragraph break."""
+    category = unicodedata.category(ch)
+    return category[0] == "C" or category in ("Zl", "Zp")
+
+
+def visible_name(text: str) -> str:
+    """``text`` with what the name rule refuses taken out, for a name the app makes from other text (a Plex server's
+    name): line breaks and tabs become spaces, hidden characters go, and runs of spaces become one."""
+    return " ".join("".join(" " if ch.isspace() else ch for ch in text if ch.isspace() or not _hidden(ch)).split())
 
 
 def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> tuple[dict | None, str]:
@@ -192,11 +205,11 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
         return None, f"The node's name must be at most {NAME_MAX_LEN} characters"
     # The name starts every job-log line of the node: a line break would forge a second line, and a hidden or
     # right-to-left character would make it read as something else.
-    if any(unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in ("Zl", "Zp") for ch in name):
+    if any(_hidden(ch) for ch in name):
         return None, "The node's name can't have line breaks, tabs or hidden characters"
     if not any(unicodedata.category(ch)[0] in "LNPS" for ch in name):
         return None, "Give the node a name"
-    if any(_name_key(str(o.get("name") or "").strip()) == _name_key(name) for o in others):
+    if any(name_key(str(o.get("name") or "").strip()) == name_key(name) for o in others):
         return None, f"Another node is already called {name}"
     url, err = normalise_url(raw.get("url", base.get("url")))
     if url is None:
@@ -234,11 +247,16 @@ def _record_label(entry: dict, fallback: str) -> str:
     return name.strip() if isinstance(name, str) and name.strip() else fallback
 
 
+def _without_uid(entry: dict | None) -> dict | None:
+    return None if entry is None else {k: v for k, v in entry.items() if k != "node_uid"}
+
+
 def validate_nodes(raw: object, saved: list[dict] | None = None) -> tuple[list[dict] | None, str]:
     """Validate a whole ``nodes`` list as stored (each record keeps its id, uid and key).
 
-    A record that isn't valid but is exactly as saved (written into settings.json by hand) is kept as it is: it holds
-    up only a change to itself, never a save of the other nodes.
+    A record that isn't valid but is as saved (written into settings.json by hand) is kept as it is: it holds up only
+    a change to itself, never a save of the other nodes. The id the node reports may still be recorded on it: the
+    registry writes that by itself, and without it a Plex database node's requests never name the saved id.
 
     Args:
         raw: The list to store.
@@ -270,7 +288,7 @@ def validate_nodes(raw: object, saved: list[dict] | None = None) -> tuple[list[d
         }
         record, err = validate_node({**entry, "key": None}, existing=stored, others=out)
         if record is None:
-            if as_saved.get(node_id) == entry:
+            if _without_uid(as_saved.get(node_id)) == _without_uid(entry):
                 out.append(copy.deepcopy(entry))
                 continue
             return None, f"{_record_label(entry, node_id)}: {err}"

@@ -117,33 +117,60 @@ class SettingsManager:
         else:
             self._settings = {}
         self._migrate_global_plex_webhook_to_per_server()
-        self._give_nodes_ids()
+        self._repair_hand_written_nodes()
 
-    def _give_nodes_ids(self) -> None:
-        """Give each node record written into settings.json without an ``id`` one, and save it.
+    def _repair_hand_written_nodes(self) -> None:
+        """Repair node records written into settings.json by hand that would otherwise misbehave, and save them.
 
-        Without one the record is never checked or listed on the Nodes page, and every save of the node list is
+        A record without an ``id``, or with one an earlier record has (a block copied by hand), gets an id of its own:
+        without one the record is never checked or listed on the Nodes page, and every save of the node list is
         refused. The id is saved at once so it stays the same across restarts (worker group members and Plex servers
-        point at it).
+        point at it). A copy's recorded node id is dropped too: it was learnt at the record it was copied from, and
+        is recorded again when the node answers.
+
+        An on/off switch that isn't ``true`` or ``false`` (``"false"`` typed in quotes) is turned off: read as it
+        was, any text counted as on, so a node meant to be off was checked and sent work.
         """
         raw = self._settings.get("nodes")
         if not isinstance(raw, list):
             return
         from ..nodes.settings import new_node_id
 
-        named = []
+        named: list[str] = []
+        switched_off: list[str] = []
+        seen: set[str] = set()
         for node in raw:
-            if isinstance(node, dict) and not str(node.get("id") or ""):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "")
+            if node_id in seen:
+                node["node_uid"] = None
+            if not node_id or node_id in seen:
                 node["id"] = new_node_id()
                 named.append(str(node.get("name") or node["id"]))
-        if not named:
+            seen.add(str(node["id"]))
+            if "enabled" in node and type(node["enabled"]) is not bool:
+                node["enabled"] = False
+                switched_off.append(str(node.get("name") or node["id"]))
+        if not (named or switched_off):
             return
         self._settings["nodes_revision"] = self.nodes_revision + 1
-        logger.info("Gave {} node(s) in settings.json without an id one: {}", len(named), ", ".join(named))
+        if named:
+            logger.info(
+                "Gave {} node(s) in settings.json with no id, or one another node has, an id: {}",
+                len(named),
+                ", ".join(named),
+            )
+        if switched_off:
+            logger.warning(
+                "The on/off switch of {} in settings.json isn't true or false, so it is turned off. Switch it on on "
+                "the Nodes page if it should be on.",
+                ", ".join(switched_off),
+            )
         try:
             self._save()
         except Exception:
-            logger.warning("The new node ids hold until the app restarts; the next settings save stores them.")
+            logger.warning("These node fixes hold until the app restarts; the next settings save stores them.")
 
     def _migrate_global_plex_webhook_to_per_server(self) -> None:
         """One-shot migration: move legacy global Plex webhook keys onto the Plex server entry.

@@ -30,6 +30,7 @@ from .test_intro_credits_server_tab import (
 
 APP_VERSION = "5.2.0"
 CHANGED_ELSEWHERE = "This node was changed in another tab. Reload the page, then make your change again."
+NODE_REMOVED = "This node was removed in another tab."
 PHONE = {"width": 390, "height": 844}
 
 
@@ -172,7 +173,9 @@ class NodesApi:
             row["path_mappings"] = body["path_mappings"]
             self.nodes.append(row)
             return _fulfill(route, row)
-        node = self._find(parts[1])
+        node = next((n for n in self.nodes if n["id"] == parts[1]), None)
+        if node is None:
+            return _fulfill(route, {"error": NODE_REMOVED}, 404)
         if len(parts) == 2 and request.method == "PUT":
             # As the app does: a save from a dialog opened before the node last changed is refused.
             if "edit_tag" in body and body["edit_tag"] != node["edit_tag"]:
@@ -1415,6 +1418,53 @@ class TestNodeDialog:
         expect(page.locator("#nodeSettingsResult")).to_have_text(CHANGED_ELSEWHERE)
         assert [body["edit_tag"] for body in api.bodies("PUT", "/nodes/n-storage")] == ["n-storage-1"]
         assert (api._find("n-storage")["name"], api._find("n-storage")["enabled"]) == ("storage-renamed", True)
+
+    def test_a_node_removed_in_another_tab_closes_its_dialog_on_the_next_poll(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """The dialog stayed open on a node that was gone, and its Save did nothing."""
+        page = authed_page
+        page.clock.install()
+        api = _open_nodes(page, app_url, _four_nodes())
+        _open_node(page, "n-storage")
+        _node_tab(page, "settings")
+        page.locator("#nodeSetName").fill("storage-2")  # unsaved edits can't be saved anywhere now
+        api.nodes.remove(api._find("n-storage"))
+
+        page.clock.run_for(10_500)
+
+        expect(page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(page.locator("#toastBody")).to_have_text("storage was removed in another tab.")
+        expect(page.locator("#node-n-storage")).to_have_count(0)
+
+    @pytest.mark.parametrize("tab", ["settings", "media", "remove"])
+    def test_a_save_after_the_node_was_removed_in_another_tab_closes_the_dialog_and_says_so(
+        self, authed_page: Page, app_url: str, tab: str
+    ) -> None:
+        """Before this tab's next poll: the save answered "No node with id <hex>"."""
+        page = authed_page
+        nodes = _four_nodes()
+        nodes[0]["used_by"] = {"groups": [], "servers": []}  # so Remove asks the app
+        api = _open_nodes(page, app_url, nodes)
+        _open_node(page, "n-storage")
+        api.nodes.remove(api._find("n-storage"))
+
+        if tab == "settings":
+            _node_tab(page, "settings")
+            page.locator("#nodeSetName").fill("storage-2")
+            page.locator("#nodeSettingsSave").click()
+        elif tab == "media":
+            pane = _node_tab(page, "media")
+            pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+            page.locator("#nodeSaveMappings").click()
+        else:
+            _node_tab(page, "settings")
+            page.locator("#nodeRemove").click()
+            accept_app_confirm(page)
+
+        expect(page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(page.locator("#toastBody")).to_have_text("storage was removed in another tab.")
+        expect(page.locator("#node-n-storage")).to_have_count(0)
 
     def test_a_settings_save_then_a_mappings_save_in_one_dialog_both_go_through(
         self, authed_page: Page, app_url: str

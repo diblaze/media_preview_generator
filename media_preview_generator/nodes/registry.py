@@ -34,7 +34,7 @@ from .client import (
     unreachable_advice,
 )
 from .protocol import PathMapping
-from .settings import find_node, node_mappings
+from .settings import find_node, node_mappings, server_agent
 
 STATE_CONNECTING = "connecting"
 STATE_READY = "ready"
@@ -280,17 +280,19 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
 
 
 def _default_served_plex_ids(node_id: str) -> list[str]:
-    """The machine identifier of every Plex server whose Plex database node is ``node_id`` ("" where unknown)."""
+    """The machine identifier of every Plex server that writes through ``node_id`` ("" where unknown).
+
+    A server switched off, or with its Plex database node switched off, writes nothing through the node though it
+    remembers it, so it doesn't hold back the node's new id.
+    """
     from ..web.settings_manager import get_settings_manager
 
     out = []
     for entry in get_settings_manager().get("media_servers") or []:
-        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        agent = server_agent(entry)
+        if agent is None or not agent.get("enabled") or agent.get("node_id") != node_id:
             continue
-        markers = entry.get("markers")
-        plex = markers.get("plex") if isinstance(markers, dict) else None
-        agent = plex.get("agent") if isinstance(plex, dict) else None
-        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+        if entry.get("enabled", True):
             out.append(str(entry.get("server_identity") or ""))
     return out
 
@@ -794,7 +796,7 @@ class NodeRegistry:
             mappings, keep = self._adopt_access(live, result, checked_at), set(self._nodes)
             self._touch()
         if self._access_store is not None:
-            self._access_store.save(node_id, mappings, result, checked_at, keep=keep)
+            self._access_store.save(node_id, url, mappings, result, checked_at, keep=keep)
 
     def _adopt_access(self, live: _Live, result: dict, checked_at: float) -> list:
         """Make ``result`` the node's Test access result (the caller holds the lock); answers the saved rows."""
@@ -968,22 +970,28 @@ class NodeRegistry:
             return
         for action, node_id, payload in work:
             if action == "forget":
-                store.forget(node_id, keep_mappings=payload)
+                keep_url, keep_mappings = payload if payload is not None else (None, None)
+                store.forget(node_id, keep_url=keep_url, keep_mappings=keep_mappings)
                 continue
             if action == "save":
-                rows, result, checked_at = payload
+                url, rows, result, checked_at = payload
                 with self._lock:
                     keep = set(self._nodes)
-                store.save(node_id, rows, result, checked_at, keep=keep)
+                store.save(node_id, url, rows, result, checked_at, keep=keep)
                 continue
-            mappings = payload
-            stored = store.load(node_id, mappings)
+            url, mappings = payload
+            stored = store.load(node_id, url, mappings)
             if stored is None:
                 continue
             with self._lock:
                 live = self._nodes.get(node_id)
-                # A test recorded meanwhile, or mappings changed again, wins over what was on disk.
-                if live is not None and live.access_result is None and live.record.get("path_mappings") == mappings:
+                # A test recorded meanwhile, or the address or mappings changed again, wins over what was on disk.
+                if (
+                    live is not None
+                    and live.access_result is None
+                    and str(live.record.get("url") or "") == url
+                    and live.record.get("path_mappings") == mappings
+                ):
                     live.access_result, live.access_checked_at = stored
 
     def _merge(self, live: _Live | None, record: dict, store_work: list[tuple[str, str, Any]]) -> _Live:
@@ -992,13 +1000,15 @@ class NodeRegistry:
         Args:
             live: The node's live record, or None for a new node.
             record: Its stored record.
-            store_work: Collects ``("load" | "forget", node id, mappings)`` and ``("save", node id, (mappings,
-                result, checked_at))`` for :meth:`_run_store_work`.
+            store_work: Collects ``("load", node id, (url, mappings))``, ``("forget", node id, (url, mappings) to
+                keep, or None)`` and ``("save", node id, (url, mappings, result, checked_at))`` for
+                :meth:`_run_store_work`.
         """
+        url, mappings = str(record.get("url") or ""), copy.deepcopy(record.get("path_mappings"))
         if live is None:
             live = _Live(record=copy.deepcopy(record), client=self._client_factory(record))
             if self._access_store is not None:
-                store_work.append(("load", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
+                store_work.append(("load", str(record.get("id")), (url, mappings)))
             return live
         old = live.record
         address_changed = (old.get("url"), old.get("key")) != (record.get("url"), record.get("key"))
@@ -1043,22 +1053,26 @@ class NodeRegistry:
                 live.gpu_lost = live.lost_device = ""
                 # A test held aside was another machine's answer, or one asked with the old key.
                 live.pending_access = None
-        if old.get("path_mappings") != record.get("path_mappings"):
-            # A test of other mappings says nothing about these, unless it tested exactly the rows just saved.
+        if address_changed or old.get("path_mappings") != record.get("path_mappings"):
+            # A test of another address or key (another machine, as far as anyone knows) or of other mappings says
+            # nothing about these, unless it tested exactly the rows just saved, at this address.
             pending, live.pending_access = live.pending_access, None
             if (
                 pending is not None
                 and pending.rows == (record.get("path_mappings") or [])
-                and pending.url == str(record.get("url") or "")
+                and pending.url == url
                 and self._clock() - pending.held_at <= PENDING_ACCESS_TTL_S
             ):
                 rows = self._adopt_access(live, pending.result, pending.checked_at)
                 if self._access_store is not None:
-                    store_work.append(("save", str(record.get("id")), (rows, pending.result, pending.checked_at)))
+                    store_work.append(("save", str(record.get("id")), (url, rows, pending.result, pending.checked_at)))
             else:
                 live.access_result = live.access_checked_at = None
                 if self._access_store is not None:
-                    store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
+                    # Only a mappings change keeps a result a test just saved for the new rows: the file doesn't
+                    # know the key, so a result saved at this address may be the old key's machine.
+                    keep = None if address_changed else (url, mappings)
+                    store_work.append(("forget", str(record.get("id")), keep))
         return live
 
     # ------------------------------------------------------------------ state
