@@ -34,6 +34,7 @@ from .plex_db import (
     LocalPlexDb,
     beside_another_plex,
     is_tested_pms_version,
+    node_wording,
     plex_db_path,
     plex_machine_identifier,
     publish_error_from_sqlite,
@@ -229,11 +230,19 @@ def _chapters_match(own_starts: list[int] | None, shared_rows: list[tuple]) -> b
 
 
 class LocalChapters:
-    """Chapter operations sharing the marker writer's filesystem and SQLite locks."""
+    """Chapter operations sharing the marker writer's filesystem and SQLite locks.
 
-    def __init__(self, config_dir: str, *, mountinfo_path: str = "/proc/self/mountinfo") -> None:
+    Args:
+        config_dir: Plex's config folder.
+        mountinfo_path: For tests.
+        on_node: It runs on a Plex database node, so a database file check's refusal is said about the node
+            (``node_wording``), as markers and loudness say it, rather than about this app.
+    """
+
+    def __init__(self, config_dir: str, *, mountinfo_path: str = "/proc/self/mountinfo", on_node: bool = False) -> None:
         self.folder = Path(config_dir)
         self.database = LocalPlexDb(lambda: plex_db_path(config_dir), mountinfo_path=mountinfo_path)
+        self._on_node = on_node
 
     def _identity(self, expected: str, version: str) -> None:
         actual = plex_machine_identifier(str(self.folder))
@@ -290,6 +299,8 @@ class LocalChapters:
     def _file_checks(self, deadline: float) -> None:
         report = self.database.file_checks(deadline=deadline)
         if not report.ready:
+            # The refusal travels as its message alone, so a node words it before it is sent.
+            report = node_wording(report) if self._on_node else report
             raise ChapterError(report.message, code="registration", state=report.state)
 
     def _media_root(self) -> Path:

@@ -521,7 +521,7 @@ def register_plex_db(
     _registered_config_dir = folder
 
     database = LocalPlexDb(lambda: plex_db_path(folder), label="agent", mountinfo_path=mountinfo_path)
-    chapters = LocalChapters(folder, mountinfo_path=mountinfo_path)
+    chapters = LocalChapters(folder, mountinfo_path=mountinfo_path, on_node=True)
     bp = Blueprint("plex_db", __name__)
     wrong_keys = wrong_key_limit(app)
     slots = RequestSlots()
