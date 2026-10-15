@@ -421,9 +421,36 @@ def _registration_key(plan: ChapterPlan, images: dict[str, dict]) -> dict:
 
 def _verified(plan: ChapterPlan, images: dict[str, dict]) -> bool:
     try:
-        return json.loads(plan.manifest_path.read_text()).get("verified") == _registration_key(plan, images)
-    except (OSError, ValueError, AttributeError):
+        manifest = json.loads(plan.manifest_path.read_text())
+        key = _registration_key(plan, images)
+        return manifest.get("verified") == key or key in (manifest.get("also_verified") or [])
+    except (OSError, ValueError, AttributeError, TypeError):
         return False
+
+
+def _other_items_verified(plan: ChapterPlan, key: dict) -> list[dict]:
+    """The registrations already proven for the other Plex items of this file, with these same images.
+
+    One file can be several Plex items (a double episode lists as both), each with its own media and part ids but one
+    bundle and so one manifest: keeping only the last item's proof made every scan register the item it reached again.
+    """
+    try:
+        manifest = json.loads(plan.manifest_path.read_text())
+        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+            return []
+        found = [manifest.get("verified"), *(manifest.get("also_verified") or [])]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    others: dict[object, dict] = {}
+    for other in found:
+        if (
+            isinstance(other, dict)
+            and other.get("item") != key["item"]
+            and other.get("machine") == key["machine"]
+            and other.get("images") == key["images"]
+        ):
+            others[other.get("item")] = other
+    return list(others.values())
 
 
 def chapter_work_needed(plan: ChapterPlan, *, regenerate: bool = False) -> bool:
@@ -454,7 +481,11 @@ def _write_manifest(
     if failed:
         payload["failed"] = failed
     if verified:
-        payload["verified"] = _registration_key(plan, images)
+        key = _registration_key(plan, images)
+        others = _other_items_verified(plan, key)
+        payload["verified"] = key
+        if others:
+            payload["also_verified"] = others
     _replace_manifest(plan, payload)
 
 
