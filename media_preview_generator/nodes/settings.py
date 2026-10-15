@@ -163,8 +163,8 @@ def normalise_mappings(raw: object) -> tuple[list[dict[str, str]] | None, str]:
 
 def name_key(name: str) -> str:
     """A name as the unique-name rule compares it: names that look the same ("Café" typed two ways, "ＮＵＣ" and
-    "nuc") compare equal."""
-    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+    "nuc", "nuc  1" and "nuc 1", which a page shows alike) compare equal."""
+    return " ".join(unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold()).split())
 
 
 def _hidden(ch: str) -> bool:

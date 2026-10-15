@@ -137,10 +137,18 @@ class TestValidateNode:
 
     @pytest.mark.parametrize(
         ("taken", "typed"),
-        [("Café", "Café"), ("nuc", "ＮＵＣ"), ("Straße", "STRASSE")],
-        ids=["combining-accent", "full-width", "sharp-s"],
+        [
+            ("Café", "Café"),
+            ("nuc", "ＮＵＣ"),
+            ("Straße", "STRASSE"),
+            ("nuc 1", "nuc  1"),
+            ("nuc  1", "nuc 1"),
+            ("nuc 1", "nuc\u3000 1"),
+        ],
+        ids=["combining-accent", "full-width", "sharp-s", "double-space", "taken-with-double-space", "wide-space"],
     )
     def test_names_that_look_the_same_count_as_the_same_name(self, taken, typed):
+        """A page shows a run of spaces as one, so "nuc  1" and "nuc 1" read as the same node."""
         record, err = ns.validate_node(_post(name=typed), existing=None, others=[{"name": taken}])
         assert record is None and err == f"Another node is already called {typed}"
 
@@ -377,6 +385,28 @@ class TestSettingsManagerNodes:
 
         assert sm.nodes[0]["key"] == "" and sm.nodes_revision == 4
         assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["key"] == ""
+
+    @pytest.mark.parametrize(
+        "hand_written",
+        ["/media", {"app_prefix": "/media", "node_prefix": "D:\\Media"}, 5],
+        ids=["text", "one-mapping-not-in-a-list", "number"],
+    )
+    def test_hand_written_folder_mappings_that_arent_a_list_are_cleared(self, tmp_path, hand_written):
+        """Read as they were, the Nodes page showed text as one mapping per character, and every save of the node was
+        refused "path_mappings must be a list"."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"nodes": [{**first, "path_mappings": hand_written}], "nodes_revision": 3})
+        )
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes[0]["path_mappings"] == [] and sm.nodes_revision == 4
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["path_mappings"] == []
+        record, err = ns.validate_node({"name": "nuc renamed"}, existing=sm.nodes[0], others=[])
+        assert err == "" and record["path_mappings"] == []
 
     def test_a_switch_that_is_true_or_false_is_left_alone(self, tmp_path):
         import json

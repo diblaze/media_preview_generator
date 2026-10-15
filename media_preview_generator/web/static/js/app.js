@@ -4629,14 +4629,16 @@ async function refreshBackupsPanel() {
                         <select id="${selectId}" class="form-select form-select-sm"
                                 aria-label="Backup snapshot for ${escapeHtml(f.name)}">
                             ${backups.map((b) => {
+                                const unreadable = b.readable === false;
                                 const label = escapeHtml(_formatBackupLabel(b))
-                                    + (b.legacy ? ' (legacy)' : '');
-                                return `<option value="${escapeHtml(b.filename)}">${label}</option>`;
+                                    + (b.legacy ? ' (legacy)' : '')
+                                    + (unreadable ? " (can't be read)" : '');
+                                return `<option value="${escapeHtml(b.filename)}"${unreadable ? ' disabled' : ''}>${label}</option>`;
                             }).join('')}
                         </select>
                         <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0"
                                 data-restore-file="${escapeHtml(f.name)}"
-                                data-restore-select="${selectId}">
+                                data-restore-select="${selectId}"${backups.some((b) => b.readable !== false) ? '' : ' disabled'}>
                             <i class="bi bi-arrow-counterclockwise me-1"></i>Restore selected
                         </button>
                     </div>

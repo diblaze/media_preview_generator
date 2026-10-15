@@ -2150,7 +2150,7 @@ unless noted.
 | POST | `/api/settings/validate-plex-config-folder` | Pre-flight a Plex config folder (looks for `Cache/Media/Metadata`). Body `{"path": "..."}` |
 | POST | `/api/settings/validate-jellyfin-config-folder` | Pre-flight a Jellyfin config folder. Body `{"path": "..."}` |
 | GET | `/api/settings/backups` | List the backups of each config file (`settings.json`, `schedules.json`, `webhook_history.json`, `setup_state.json`) |
-| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. |
+| POST | `/api/settings/backups/restore` | Restore a backup of one config file. Body `{"file": "settings.json", "backup": "<filename from the list>"}`; without `backup` the newest is restored. The current file is backed up first. A backup that can't be read, or one a newer version saved, is refused with `409` and nothing changes. |
 | POST | `/api/setup/skip` | Skip the setup wizard (advanced — saves `setup_complete=true` with minimal state) |
 | POST | `/api/setup/validate-paths` | Pre-flight wizard path fields in bulk |
 | POST | `/api/setup/preview-file-path` | Resolve one real file against draft mappings and report container file/read-access status; does not save or start processing |

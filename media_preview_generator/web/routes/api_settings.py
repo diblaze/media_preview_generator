@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1664,6 +1665,41 @@ def validate_paths():
 
 _BACKUP_FILES = ("settings.json", "schedules.json", "webhook_history.json", "setup_state.json")
 
+# Whether a file's contents have its shape. A backup that doesn't (cut short by a full disk during the copy, or edited
+# by hand) is read as empty once restored: settings.json as a new install, open without signing in, and schedules.json
+# as no schedules while their crons go on running.
+_BACKUP_SHAPES: dict[str, Callable[[Any], bool]] = {
+    "settings.json": lambda data: isinstance(data, dict),
+    # Its schedules an object too: a load that meets anything else fails part way, as on a corrupt file.
+    "schedules.json": lambda data: isinstance(data, dict) and isinstance(data.get("schedules", {}), dict),
+    "webhook_history.json": lambda data: isinstance(data, list),
+    "setup_state.json": lambda data: isinstance(data, dict),
+}
+
+_UNREADABLE_BACKUP = (
+    "This backup can't be read: it may have been cut short when it was saved. Nothing was changed. Restore another one."
+)
+
+
+def _read_backup(name: str, path: str) -> tuple[bool, Any]:
+    """Read a backup of ``name`` as the file's owner would read it.
+
+    Args:
+        name: The managed file it backs up.
+        path: The backup file.
+
+    Returns:
+        ``(True, contents)``, or ``(False, None)`` when it doesn't parse as the file's shape.
+    """
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False, None
+    return (True, data) if _BACKUP_SHAPES[name](data) else (False, None)
+
 
 def _list_backups_for(live_path: str) -> list[dict]:
     """Return all backup snapshots for a single live file, newest first.
@@ -1720,10 +1756,13 @@ def _backup_inventory() -> list[dict]:
         live = os.path.join(cfg_dir, name)
         live_mtime = os.path.getmtime(live) if os.path.exists(live) else None
         backups = _list_backups_for(live)
+        for backup in backups:
+            backup["readable"] = _read_backup(name, backup["path"])[0]
         # If any backup is newer than the live file the user has likely been
         # clobbered (e.g. by an old container truncating settings.json) — UI
-        # surfaces this as a "restore me" highlight.
-        newest_bak_mtime = backups[0]["mtime"] if backups else None
+        # surfaces this as a "restore me" highlight. Never for one that can't be restored.
+        readable = [b for b in backups if b["readable"]]
+        newest_bak_mtime = readable[0]["mtime"] if readable else None
         bak_newer = live_mtime is not None and newest_bak_mtime is not None and newest_bak_mtime > live_mtime
         rows.append(
             {
@@ -1745,7 +1784,33 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
-def _bring_restored_settings_up_to_date(settings: Any, live_revisions: tuple[int, int]) -> None:
+def _live_plex_server_id(live_servers: Any, restored_plex_url: Any) -> str | None:
+    """The id of the live file's one Plex server, when the restored file's legacy Plex address is that server's.
+
+    A 3.x settings.json has no server list: its upgrade builds the Plex server with a new random id, and what the app
+    records from then on (job and webhook history, markers, the server's webhook address) names that id.
+
+    Args:
+        live_servers: ``media_servers`` before the restore.
+        restored_plex_url: The restored file's ``plex_url``.
+    """
+    plex = (
+        [s for s in live_servers if isinstance(s, dict) and s.get("type") == "plex"]
+        if isinstance(live_servers, list)
+        else []
+    )
+    if len(plex) != 1 or not isinstance(restored_plex_url, str):
+        return None
+    # A trailing slash doesn't name another server.
+    address = restored_plex_url.strip().rstrip("/")
+    if not address or str(plex[0].get("url") or "").strip().rstrip("/") != address:
+        return None
+    return str(plex[0].get("id") or "") or None
+
+
+def _bring_restored_settings_up_to_date(
+    settings: Any, live_revisions: tuple[int, int], *, setup_finished: bool, live_servers: Any
+) -> None:
     """Run the start-up migrations on a restored settings.json from before this build's schema, and move its worker
     groups and nodes revisions past the live ones.
 
@@ -1757,24 +1822,37 @@ def _bring_restored_settings_up_to_date(settings: Any, live_revisions: tuple[int
     every Workers save after it, until one passed the old number) would wait for a restart. And an editor still open
     on the old groups or nodes must get "changed elsewhere", not save over the restored ones at a matching number.
 
+    A finished setup stays finished: until it is, the setup pages and the settings they save answer without signing
+    in, and a backup from before it (every install's first one holds nothing else) would start it again. And a
+    restored 3.x file's Plex server keeps the id the live one has (``_live_plex_server_id``).
+
     Args:
         settings: The settings manager, holding the restored file.
         live_revisions: ``worker_groups_revision`` and ``nodes_revision`` before the restore.
+        setup_finished: Whether setup was finished before the restore.
+        live_servers: ``media_servers`` before the restore.
+
+    Raises:
+        ValueError: The restored file couldn't be read; nothing is saved over it.
     """
     from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
 
+    if settings.load_failed:
+        # Migrated and saved, the nothing a failed read leaves would replace the file with a new install.
+        raise ValueError("the restored file can't be read")
     try:
         if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
-            run_migrations(settings)
+            run_migrations(settings, plex_server_id=_live_plex_server_id(live_servers, settings.get("plex_url")))
     finally:
         # Even when a migration failed: the restored file is in place either way, and the pool must follow it.
         live_groups, live_nodes = live_revisions
-        settings.apply_changes(
-            updates={
-                "worker_groups_revision": max(settings.worker_groups_revision, live_groups) + 1,
-                "nodes_revision": max(settings.nodes_revision, live_nodes) + 1,
-            }
-        )
+        updates = {
+            "worker_groups_revision": max(settings.worker_groups_revision, live_groups) + 1,
+            "nodes_revision": max(settings.nodes_revision, live_nodes) + 1,
+        }
+        if setup_finished:
+            updates["setup_complete"] = True
+        settings.apply_changes(updates=updates)
 
 
 def _settings_replaced(settings: Any) -> str | None:
@@ -1802,30 +1880,63 @@ def _settings_replaced(settings: Any) -> str | None:
     return reconcile_group_settings(settings)
 
 
-def _newer_settings_refusal(path: str) -> str:
-    """Why a settings.json backup can't be put back by this build ("" when it can).
+def _restored_pause_applied(settings: Any, paused_before: bool) -> None:
+    """Apply the restored settings.json's quiet hours as a start-up does, then do what Pause or Resume does when the
+    restore pauses processing, or stops pausing it.
 
-    A backup a newer build wrote holds fields this one doesn't know: its next save would drop them, and the next
-    start would refuse the file (``SchemaDowngradeError``).
+    Quiet hours pause and resume processing from a once-a-minute recheck that only a start-up or a quiet-hours save
+    registers: without one, restored quiet hours wouldn't pause processing, and a restored quiet-hours pause wouldn't
+    end. The pause is read from the settings, so the restore alone changes it, but nothing else: the jobs the old
+    pause held would stay pending until the next Resume, and the dashboard would go on showing the old state.
 
     Args:
-        path: The backup file.
+        settings: The settings manager, holding the restored file.
+        paused_before: Whether processing was paused before the restore.
     """
-    import json
-
-    from ...upgrade import _CURRENT_SCHEMA_VERSION
+    from ..jobs import get_job_manager
+    from ..scheduler import get_schedule_manager
+    from .job_runner import resume_running_and_drain_pending
 
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return ""  # Not this check's to judge: the file is copied back as it always was.
-    version = data.get("_schema_version", 1) if isinstance(data, dict) else 1
+        # Without draining: the pending jobs are started below, once, whichever owner's pause changed.
+        get_schedule_manager().apply_quiet_hours(settings.get("quiet_hours") or {}, drain=False)
+    except Exception:
+        logger.exception("Could not apply the restored quiet hours; they apply from the next restart")
+    paused = settings.processing_paused
+    if paused == paused_before:
+        return
+    logger.info("Processing {} by the restored settings", "paused" if paused else "resumed")
+    get_job_manager().emit_processing_paused_changed(paused)
+    if not paused:
+        resume_running_and_drain_pending()
+
+
+def _restore_refusal(name: str, path: str, settings: Any) -> str:
+    """Why a backup can't be put back by this build ("" when it can).
+
+    A backup that can't be read is refused (``_BACKUP_SHAPES``). A settings.json a newer build wrote holds fields
+    this one doesn't know: its next save would drop them, and the next start would refuse the file
+    (``SchemaDowngradeError``). The setup wizard's progress is only kept while setup isn't finished: put back after
+    that, it starts setup again, and setup's pages answer without signing in.
+
+    Args:
+        name: The managed file it backs up.
+        path: The backup file.
+        settings: The settings manager.
+    """
+    from ...upgrade import _CURRENT_SCHEMA_VERSION
+
+    readable, data = _read_backup(name, path)
+    if not readable:
+        return _UNREADABLE_BACKUP
+    version = data.get("_schema_version", 1) if name == "settings.json" else 1
     if isinstance(version, int) and version > _CURRENT_SCHEMA_VERSION:
         return (
             "This backup was saved by a newer version of the app, and this version can't read all of it. Nothing "
             "was changed. Update the app, then restore it."
         )
+    if name == "setup_state.json" and settings.is_setup_complete():
+        return "Setup is already finished, and this backup would start it again. Nothing was changed."
     return ""
 
 
@@ -1896,22 +2007,26 @@ def restore_backup():
         bak_path = match["path"]
     else:
         bak_path = available[0]["path"]
-    refusal = _newer_settings_refusal(bak_path) if name == "settings.json" else ""
-    if refusal:
-        return jsonify({"success": False, "error": refusal}), 409
-
     # Each file's owner keeps it in memory, so it must re-read the restored file (under its lock where it has one);
     # otherwise the next save would write the old in-memory content back over the restore.
     settings = get_settings_manager()
+    refusal = _restore_refusal(name, bak_path, settings)
+    if refusal:
+        return jsonify({"success": False, "error": refusal}), 409
+
     # settings.json too: its pre-v4 upgrade creates a schedule, under this same order.
     schedules = get_schedule_manager() if name in ("schedules.json", "settings.json") else None
     tmp_path = f"{live}.restore.tmp"
     replaced = False
+    paused_before = False
     failure = None
     try:
         # The schedules lock first: a schedule save takes it, then the settings lock.
         with schedules.locked() if schedules is not None else nullcontext(), settings.locked():
             live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
+            setup_finished = settings.is_setup_complete()
+            paused_before = settings.processing_paused
+            live_servers = settings.get("media_servers")
             # Copied before the snapshot: trimming the backups to the number kept (or by age) can delete this one.
             shutil.copy2(bak_path, tmp_path)
             _snapshot_before_restore(live)
@@ -1919,7 +2034,9 @@ def restore_backup():
             replaced = True
             if name == "settings.json":
                 settings.reload()
-                _bring_restored_settings_up_to_date(settings, live_revisions)
+                _bring_restored_settings_up_to_date(
+                    settings, live_revisions, setup_finished=setup_finished, live_servers=live_servers
+                )
             elif name == "setup_state.json":
                 settings.reload_setup_state()
             elif name == "schedules.json":
@@ -1938,6 +2055,9 @@ def restore_backup():
             os.unlink(tmp_path)
     # Whenever the file was replaced, even with its update failed: what read the old file must read this one.
     warning = _settings_replaced(settings) if replaced and name == "settings.json" else None
+    if replaced and name == "settings.json" and not settings.load_failed:
+        # Outside the locks: a resume starts the waiting jobs.
+        _restored_pause_applied(settings, paused_before)
     if failure:
         return jsonify({"success": False, "error": failure}), 500
 

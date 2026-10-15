@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from media_preview_generator.config import normalize_path_mappings
+from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION
 from media_preview_generator.web.app import create_app
 from media_preview_generator.web.settings_manager import reset_settings_manager
 
@@ -7207,7 +7208,7 @@ class TestBackupRestore:
         def node(url):
             return {"id": "n1", "name": "nuc", "url": url, "key": "node-key-123456", "enabled": True}
 
-        def failing_migrations(settings):
+        def failing_migrations(settings, **kwargs):
             raise RuntimeError("a migration broke")
 
         sm = get_settings_manager()
@@ -7338,6 +7339,432 @@ class TestBackupRestore:
         with open(live) as f:
             assert f.read() == before
         assert sm.get("log_retention_count") == 9
+
+    @staticmethod
+    def _anonymous_settings_answer_after_a_restart(config_dir: str) -> int:
+        """GET /api/settings without signing in, on the app started again from ``config_dir``."""
+        reset_settings_manager()
+        restarted = create_app(config_dir=config_dir)
+        restarted.config["TESTING"] = True
+        return restarted.test_client().get("/api/settings").status_code
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param(None, id="cut-short"),
+            pytest.param("[]", id="a-list"),
+            pytest.param('"settings"', id="text"),
+            pytest.param("null", id="null"),
+        ],
+    )
+    def test_a_settings_backup_that_cant_be_read_is_refused_and_sign_in_stays_required(self, client, contents):
+        """A backup cut short by a full disk was restored as a new install: no ``setup_complete``, so after the next
+        start the setup pages (and the settings they save) answered without signing in."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        sm.set("log_retention_count", 9)
+        live = os.path.join(sm.config_dir, "settings.json")
+        with open(live) as f:
+            before = f.read()
+        backup = "settings.json.20261101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            f.write(before[: len(before) // 2] if contents is None else contents)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        with open(live) as f:
+            assert f.read() == before
+        assert sm.get("log_retention_count") == 9
+        assert client.application.test_client().get("/api/settings").status_code == 401
+        assert self._anonymous_settings_answer_after_a_restart(str(sm.config_dir)) == 401
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param({"_env_migrated": True}, id="an-installs-first-backup"),
+            pytest.param({}, id="empty"),
+            pytest.param({"setup_complete": False, "_schema_version": _CURRENT_SCHEMA_VERSION}, id="setup-unfinished"),
+        ],
+    )
+    def test_a_settings_restore_never_starts_setup_again(self, client, contents):
+        """Until setup is finished its pages, and the settings they save, answer without signing in. Every install's
+        first backup holds nothing but ``_env_migrated``, and the Backups list offers it."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        assert sm.is_setup_complete()
+        backup = "settings.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(contents, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.is_setup_complete()
+        with open(os.path.join(sm.config_dir, "settings.json")) as f:
+            assert json.load(f)["setup_complete"] is True
+        assert client.application.test_client().get("/api/settings").status_code == 401
+        assert self._anonymous_settings_answer_after_a_restart(str(sm.config_dir)) == 401
+
+    def test_a_restored_settings_file_that_cant_be_read_back_is_not_written_over(self, client, monkeypatch):
+        """Migrated and saved, the nothing a failed read leaves would replace the restored file with a new install
+        (no ``setup_complete``), open without signing in after the next start."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        live = os.path.join(sm.config_dir, "settings.json")
+        backup = "settings.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(sm.get_all(), f)
+        read_back = sm.reload
+
+        def reload_after_the_file_was_cut_short() -> None:
+            with open(live, "r+") as f:
+                f.truncate(10)
+            read_back()
+
+        monkeypatch.setattr(sm, "reload", reload_after_the_file_was_cut_short)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 500
+        assert "can't be read" in resp.get_json()["error"]
+        with open(os.path.join(sm.config_dir, backup)) as f:
+            cut_short = f.read()[:10]
+        with open(live) as f:
+            assert f.read() == cut_short
+        assert sm.is_setup_complete()
+
+    @pytest.mark.parametrize("finished_by", ["the-setup-flag", "a-configured-server"])
+    def test_a_setup_progress_backup_is_refused_once_setup_is_finished(self, client, finished_by):
+        """The wizard's progress is only kept while setup isn't finished: put back, a step in progress outranks a
+        configured server and starts setup again, open without signing in."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        if finished_by == "a-configured-server":
+            server = {
+                "id": "s1",
+                "type": "plex",
+                "name": "Plex",
+                "enabled": True,
+                "url": "http://plex:32400",
+                "auth": {"method": "token", "token": "t" * 20},
+            }
+            sm.apply_changes(updates={"media_servers": [server]}, deletes=["setup_complete"])
+        assert sm.is_setup_complete()
+        backup = "setup_state.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"step": 2, "data": {}}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "setup_state.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "Setup is already finished" in resp.get_json()["error"]
+        assert not os.path.exists(os.path.join(sm.config_dir, "setup_state.json"))
+        assert sm.get_setup_step() == 0
+        assert client.application.test_client().get("/api/settings").status_code == 401
+
+    def test_a_setup_progress_backup_is_restored_while_setup_is_unfinished(self, client):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        sm.apply_changes(deletes=["setup_complete"])
+        assert not sm.is_setup_complete()
+        backup = "setup_state.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"step": 2, "data": {"plex_url": "http://plex:32400"}}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "setup_state.json", "backup": backup},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.get_setup_step() == 2
+
+    def test_a_setup_progress_backup_that_cant_be_read_is_refused(self, client):
+        """Read as it was, a list put back made every setup page fail (``setup_state.get``)."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        sm.apply_changes(deletes=["setup_complete"])
+        backup = "setup_state.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            f.write("[2]")
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "setup_state.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        assert client.get("/api/setup/status").status_code == 200
+
+    @pytest.mark.parametrize(
+        ("paused_live", "paused_backup"),
+        [(True, False), (False, True), (True, True), (False, False)],
+        ids=["resumed-by-the-restore", "paused-by-the-restore", "stays-paused", "stays-running"],
+    )
+    def test_a_restore_that_changes_the_pause_does_what_pause_or_resume_does(
+        self, client, monkeypatch, paused_live, paused_backup
+    ):
+        """A pause saves settings.json, so the newest backup is the file from just before it. Restored, processing read
+        "not paused", but the jobs the pause held stayed pending until the next Resume, and the dashboard wasn't told."""
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes import job_runner
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        backup = "settings.json.20260101-100000.bak"
+        reasons = ["manual"] if paused_backup else []
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(dict(sm.get_all(), processing_pause_reasons=reasons, processing_paused=paused_backup), f)
+        sm.processing_paused = paused_live
+        jm = get_job_manager()
+        job = jm.create_job(library_name="Movies", config={})
+        started: list[str] = []
+        told: list[bool] = []
+        monkeypatch.setattr(job_runner, "_start_job_async", lambda job_id, cfg=None: started.append(job_id))
+        monkeypatch.setattr(jm, "emit_processing_paused_changed", told.append)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.processing_paused is paused_backup
+        assert told == ([paused_backup] if paused_live != paused_backup else [])
+        assert started == ([job.id] if paused_live and not paused_backup else [])
+
+    # Every minute of every week, in any time zone.
+    ALWAYS_QUIET = {
+        "enabled": True,
+        "day_basis": "start",
+        "windows": [{"start": "00:00", "end": "12:00"}, {"start": "12:00", "end": "00:00"}],
+    }
+
+    @staticmethod
+    def _quiet_an_hour_six_hours_from_now() -> dict:
+        from datetime import timedelta
+
+        from media_preview_generator.worker_groups import local_now
+
+        now = local_now()
+        start, end = now + timedelta(hours=6), now + timedelta(hours=7)
+        window = {"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")}
+        return {"enabled": True, "day_basis": "start", "windows": [window]}
+
+    @pytest.mark.parametrize(
+        "case",
+        ["restored-window-is-now", "restored-quiet-pause-has-ended", "restored-file-has-no-quiet-hours"],
+    )
+    def test_restored_quiet_hours_apply_at_once_as_at_start_up(self, client, monkeypatch, case):
+        """Quiet hours pause and resume processing from a once-a-minute recheck that only a start-up or a quiet-hours
+        save registered: restored quiet hours didn't pause processing, a restored quiet-hours pause never ended, and
+        quiet hours the restore dropped went on pausing until a restart."""
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes import job_runner
+        from media_preview_generator.web.scheduler import (
+            _QUIET_HOURS_RECHECK,
+            get_schedule_manager,
+            is_now_in_any_quiet_window,
+        )
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        manager = get_schedule_manager()
+        restored = dict(sm.get_all())
+        if case == "restored-window-is-now":
+            restored["quiet_hours"] = self.ALWAYS_QUIET
+        elif case == "restored-quiet-pause-has-ended":
+            restored.update(
+                quiet_hours=self._quiet_an_hour_six_hours_from_now(),
+                processing_pause_reasons=["quiet_hours"],
+                processing_paused=True,
+            )
+        else:
+            sm.set("quiet_hours", self.ALWAYS_QUIET)
+            manager.apply_quiet_hours(self.ALWAYS_QUIET)
+            assert manager.scheduler.get_job(_QUIET_HOURS_RECHECK) is not None
+        sm.processing_paused = True  # what holds the pending job below
+        backup = "settings.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(restored, f)
+        job = get_job_manager().create_job(library_name="Movies", config={})
+        started: list[str] = []
+        monkeypatch.setattr(job_runner, "_start_job_async", lambda job_id, cfg=None: started.append(job_id))
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        quiet_now = case == "restored-window-is-now"
+        assert is_now_in_any_quiet_window(sm.get("quiet_hours")) is quiet_now
+        assert sm.processing_paused is quiet_now
+        assert sm.processing_pause_reasons == (["quiet_hours"] if quiet_now else [])
+        has_quiet_hours = case != "restored-file-has-no-quiet-hours"
+        assert (manager.scheduler.get_job(_QUIET_HOURS_RECHECK) is not None) is has_quiet_hours
+        assert started == ([] if quiet_now else [job.id])
+
+    @pytest.mark.parametrize(
+        ("live_urls", "kept"),
+        [
+            (["http://plex:32400"], True),
+            (["http://plex:32400/"], True),
+            (["http://other-plex:32400"], False),
+            (["http://plex:32400", "http://plex-2:32400"], False),
+        ],
+        ids=["same-address", "trailing-slash", "another-address", "two-plex-servers"],
+    )
+    def test_a_restored_3x_backup_keeps_the_live_plex_servers_id(self, client, live_urls, kept):
+        """A 3.x settings.json has no server list: restored, its upgrade built the same Plex server under a second
+        random id, and the job history, webhook history and webhook address recorded since named no server."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        servers = [
+            {
+                "id": f"live-plex-{i}",
+                "type": "plex",
+                "name": f"Plex {i}",
+                "enabled": True,
+                "url": url,
+                "auth": {"method": "token", "token": "t" * 20},
+            }
+            for i, url in enumerate(live_urls)
+        ]
+        sm.apply_changes(updates={"media_servers": servers})
+        backup = "settings.json.20250101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"_schema_version": 6, "plex_url": "http://plex:32400", "plex_token": "p" * 20}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        (restored,) = sm.get("media_servers")
+        assert restored["url"] == "http://plex:32400"
+        if kept:
+            assert restored["id"] == "live-plex-0"
+        else:
+            assert restored["id"] not in {s["id"] for s in servers}
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param(None, id="cut-short"),
+            pytest.param("[]", id="a-list"),
+            pytest.param('{"schedules": []}', id="its-schedules-a-list"),
+        ],
+    )
+    def test_a_schedules_backup_that_cant_be_read_is_refused_and_the_schedules_keep_running(self, client, contents):
+        """Restored, it was read as no schedules: one cut short left their crons running with none listed (the next
+        schedule save then stored none), and a list removed every cron."""
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        resp = client.post(
+            "/api/schedules", headers=_api_headers(), json={"name": "Nightly", "cron_expression": "0 3 * * *"}
+        )
+        assert resp.status_code == 201, resp.get_json()
+        schedule_id = resp.get_json()["id"]
+        manager = get_schedule_manager()
+        with open(manager.schedules_file) as f:
+            before = f.read()
+        backup = "schedules.json.20260101-100000.bak"
+        with open(os.path.join(manager.config_dir, backup), "w") as f:
+            f.write(before[: len(before) // 2] if contents is None else contents)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "schedules.json", "backup": backup}
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        with open(manager.schedules_file) as f:
+            assert f.read() == before
+        listed = client.get("/api/schedules", headers=_api_headers()).get_json()["schedules"]
+        assert [s["name"] for s in listed] == ["Nightly"]
+        assert manager.scheduler.get_job(schedule_id) is not None
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param('{"events": []}', id="an-object"),
+            pytest.param("null", id="null"),
+            pytest.param('[{"title": "Ki', id="cut-short"),
+        ],
+    )
+    def test_a_webhook_history_backup_that_cant_be_read_is_refused(self, client, monkeypatch, contents):
+        """Restored, it was ignored: the Webhooks page kept the events it replaced, the next event wrote them back
+        over it, and the restore answered that it was restored."""
+        from collections import deque
+
+        from media_preview_generator.web import webhooks
+
+        monkeypatch.setattr(webhooks, "_webhook_history", deque(maxlen=webhooks._HISTORY_MAX))
+        webhooks._add_history_entry(source="sonarr", event_type="Download", title="Kept", status="queued")
+        live = str(webhooks._history_file_path())
+        with open(live) as f:
+            before = f.read()
+        backup = "webhook_history.json.20260101-100000.bak"
+        with open(os.path.join(os.path.dirname(live), backup), "w") as f:
+            f.write(contents)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "webhook_history.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        with open(live) as f:
+            assert f.read() == before
+        events = client.get("/api/webhooks/history", headers=_api_headers()).get_json()["events"]
+        assert [e["title"] for e in events] == ["Kept"]
+
+    def test_the_backups_list_marks_a_backup_that_cant_be_read(self, client):
+        """A backup cut short is newer than the live file, so it was marked "backup is newer", inviting the restore."""
+        from media_preview_generator.utils import timestamped_backups
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        live = os.path.join(sm.config_dir, "settings.json")
+        for path in timestamped_backups(live):
+            os.remove(path)
+        os.utime(live, (1000, 1000))
+        good, cut = "settings.json.20260101-100000.bak", "settings.json.20260201-100000.bak"
+        with open(os.path.join(sm.config_dir, good), "w") as f:
+            json.dump(sm.get_all(), f)
+        with open(os.path.join(sm.config_dir, cut), "w") as f:
+            f.write('{"setup_compl')
+        os.utime(os.path.join(sm.config_dir, good), (500, 500))
+        os.utime(os.path.join(sm.config_dir, cut), (3000, 3000))
+
+        files = client.get("/api/settings/backups", headers=_api_headers()).get_json()["files"]
+
+        row = next(f for f in files if f["name"] == "settings.json")
+        assert {b["filename"]: b["readable"] for b in row["backups"]} == {good: True, cut: False}
+        assert row["bak_newer"] is False
 
 
 class TestSettingsManagerWebhookMigration:
