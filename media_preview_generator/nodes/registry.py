@@ -328,14 +328,18 @@ def _count(raw: object) -> int:
 def _bounded(value: object, depth: int = 0) -> Any:
     """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
 
-    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, and a deeply nested answer breaks ``deepcopy``.
+    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, a 400-digit whole number is too big for a float, and a
+    deeply nested answer breaks ``deepcopy``.
     """
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value[:INFO_TEXT_MAX]
     if isinstance(value, int | float):
-        return value if math.isfinite(value) else None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:  # isfinite turns a whole number into a float first
+            return None
     if depth >= INFO_DEPTH_MAX:
         return None
     if isinstance(value, dict):

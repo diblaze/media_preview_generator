@@ -77,10 +77,14 @@ def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
 
 
 def _finite(value: object) -> int | float | None:
-    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON)."""
+    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON), or is
+    a whole number too big for a float."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return value if math.isfinite(value) else None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:  # isfinite turns a whole number into a float first
+        return None
 
 
 def _node_sent(value: object, depth: int = 0) -> Any:
@@ -298,19 +302,25 @@ def _in_app_time(ts: object, node_time: str) -> str:
     """A node log line's moment in this app's time zone (as the app's own log reads), ISO 8601 with its offset.
 
     ``ts`` is epoch seconds; a node older than ``ts`` sends only ``time`` with its own offset, read instead. A time
-    that can't be read is passed on as the node wrote it.
+    that can't be read, or lies outside the years a ``datetime`` holds, is passed on as the node wrote it.
     """
     when = None
-    if isinstance(ts, int | float) and not isinstance(ts, bool) and math.isfinite(ts):
-        when = datetime.fromtimestamp(ts, UTC)
-    else:
+    if isinstance(ts, int | float) and not isinstance(ts, bool):
+        try:
+            when = datetime.fromtimestamp(ts, UTC)
+        except (OverflowError, ValueError, OSError):  # NaN, infinity, or a moment outside the years 1-9999
+            when = None
+    if when is None:
         try:
             parsed = datetime.fromisoformat(node_time)
         except ValueError:
             parsed = None
         if parsed is not None and parsed.tzinfo is not None:
             when = parsed
-    return when.astimezone().isoformat(timespec="seconds") if when is not None else node_time
+    try:
+        return when.astimezone().isoformat(timespec="seconds") if when is not None else node_time
+    except (OverflowError, ValueError, OSError):  # year 1 or 9999 moved past the edge by this app's offset
+        return node_time
 
 
 def _json_body() -> dict:
