@@ -429,6 +429,19 @@ class TestRunTestAccess:
         assert movies["error"] == f"This app can't open {missing}"
         assert reg.access_passed({"libraries": [movies]}) is False
 
+    def test_an_unreadable_inner_row_is_named_though_another_inner_row_is_empty(self, tmp_path):
+        (tmp_path / "media" / "Movies" / "A").mkdir(parents=True)
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        missing = tmp_path / "media" / "Movies" / "B"
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A"),
+            PathMapping(str(missing), "/mnt/B"),
+        ]
+
+        (movies,) = nm.run_test_access(FakeClient(), rows, servers)["libraries"]
+
+        assert (movies["ok"], movies["error"]) == (False, f"This app can't open {missing}")
+
     def test_overlapping_rows_inside_a_library_test_each_file_once(self, tmp_path):
         _video(tmp_path / "media" / "Movies" / "A" / "sub" / "s.mkv")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
@@ -606,6 +619,15 @@ class TestQuickAccessCheck:
         rows = [PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A")]
         assert nm.quick_access_check(client, rows, servers) is True
         assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
+
+    def test_an_inner_row_this_app_cant_open_fails_it_as_test_access_does(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "A" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A"),
+            PathMapping(str(tmp_path / "media" / "Movies" / "B"), "/mnt/B"),
+        ]
+        assert nm.quick_access_check(FakeClient(), rows, servers) is False
 
     def test_a_file_the_node_cant_see_fails_it(self, tmp_path):
         servers = self._media(tmp_path)

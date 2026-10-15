@@ -487,16 +487,16 @@ def run_test_access(
         seen_nearby = _nearby_for(rows, nearby)
         error = None
         empty = False
-        if not picked and sampling.timed_out:
+        if root in unread:
+            ok = False
+            error = unread[root]
+        elif not picked and sampling.timed_out:
             error = f"Timed out reading {sampling.folder or root.app_root} (no answer within {SAMPLE_BUDGET_S:g} s)"
         elif not picked and not sampling.opened:
             error = f"This app can't open {root.app_root}"
         elif not picked:
             empty = True
             error = f"No video files found near the top of {root.app_root}"
-        elif root in unread:
-            ok = False
-            error = unread[root]
         libraries.append(
             {
                 "server": root.server,
@@ -536,18 +536,17 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers:
     Returns:
         Whether every sampled file was visible.
     """
-    folders = list(
-        dict.fromkeys(
-            folder
-            for root in library_roots(servers)
-            for folder in (
-                [root.app_root] if _covering_row(root.app_root, mappings) else _rows_inside(root.app_root, mappings)
-            )
-        )
-    )
+    roots = library_roots(servers)
+    inner = list(dict.fromkeys(folder for root in roots for folder in _rows_inside(root.app_root, mappings)))
+    whole = [root.app_root for root in roots if _covering_row(root.app_root, mappings)]
+    folders = list(dict.fromkeys(whole + inner))
     samplings = _sample_folders(folders, SAMPLE_BUDGET_S, limit=1)
     if any(sampling.timed_out for sampling in samplings):
         logger.debug("Quick access check gave up: this app's own library folder didn't answer")
+        return False
+    # As in Test access: a row inside a library that this app can't open fails the library.
+    if any(not sampling.opened for folder, sampling in zip(folders, samplings, strict=True) if folder in inner):
+        logger.debug("Quick access check failed: a mapped folder inside a library can't be opened here")
         return False
     files = [f for sampling in samplings for f in sampling.found]
     if not files:
