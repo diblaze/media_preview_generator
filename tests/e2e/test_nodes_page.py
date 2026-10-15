@@ -505,7 +505,10 @@ class TestAddNode:
     @pytest.mark.parametrize(
         ("kind", "text"),
         [
-            ("auth", "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set."),
+            (
+                "auth",
+                "Key refused. Copy the key again from the node's log, or use the NODE_KEY (or AGENT_TOKEN) you set.",
+            ),
             ("unreachable", "Nothing answered at this address. Check the address and port"),
             ("protocol", "not as a node this app can use. Update the node"),
             ("request", "didn't accept the request"),
@@ -647,6 +650,32 @@ class TestNodeDialog:
 
         expect(pane.locator(".nd-map-row").nth(0).locator(".nd-chip-slot")).to_have_text("✓ Movies 3/3")
         expect(pane.locator(".nd-map-results .nd-lib-chips")).to_have_count(0)
+
+    def test_libraries_of_the_same_name_on_two_servers_name_their_server(self, authed_page: Page, app_url: str) -> None:
+        """Every Plex has its "Films": three chips reading "Films 0/3" can't be told apart."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        api.test_answers = [
+            {
+                "libraries": [
+                    _library("Films", "/data/Movies", False, "/mnt/nas/Movies"),
+                    {**_library("Films", "/data/Movies2", False, "/mnt/nas/Movies2"), "server": "Lab"},
+                    _library("TV Shows", "/data/TV", True, "/mnt/nas/TV"),
+                ]
+            }
+        ]
+
+        pane.locator(".nd-test").click()
+
+        results = pane.locator(".nd-map")
+        expect(pane.locator(".nd-fail").first).to_contain_text("Films (Home):")
+        expect(pane.locator(".nd-fail").nth(1)).to_contain_text("Films (Lab):")
+        expect(results).to_contain_text("✗ Films (Home) 0/3")
+        expect(results).to_contain_text("✗ Films (Lab) 0/3")
+        # A name only one server uses stays as it is.
+        expect(results).to_contain_text("✓ TV Shows 3/3")
+        expect(results).not_to_contain_text("TV Shows (Home)")
 
     def test_an_empty_library_is_not_a_failure(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
