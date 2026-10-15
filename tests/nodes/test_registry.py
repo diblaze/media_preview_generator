@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import threading
 import time
 
@@ -353,6 +355,36 @@ class TestStates:
         assert view.reason.startswith("nuc's temp folder can't be used, so it gets no files: the node can't write")
         assert "/node-tmp (Permission denied)" in view.reason and "NODE_TEMP_DIR" in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node's temp folder can't be used")
+
+    @pytest.mark.parametrize(
+        ("problem", "advice"),
+        [
+            (errno.EROFS, "Mount it writable (not read-only)"),
+            (errno.ENOSPC, "Free up space there"),
+            (errno.EDQUOT, "Free up space there"),
+            ("The node's temp folder /node-tmp filled up while working on a file (300 MB free)", "Free up space there"),
+            (errno.EACCES, "Let the node's user write to it (in Docker, check PUID and PGID)"),
+            (errno.EPERM, "Let the node's user write to it (in Docker, check PUID and PGID)"),
+            (errno.ENOENT, "Create or mount that folder"),
+            (errno.EIO, "Set NODE_TEMP_DIR on the node to a folder it can write to."),
+        ],
+        ids=["read-only", "full", "over-quota", "filled-by-a-task", "permission", "not-permitted", "missing", "other"],
+    )
+    def test_the_temp_folder_advice_fits_its_cause(self, h, problem, advice):
+        # "Free up space there" was the advice for every cause, a read-only or unwritable folder too.
+        from media_preview_generator.nodes.server.tasks import temp_folder_problem
+
+        if isinstance(problem, int):
+            problem = temp_folder_problem("/node-tmp", OSError(problem, os.strerror(problem)))
+        info = _info()
+        info["worker"]["temp"] = {"path": "/node-tmp", "free_bytes": 10**9, "problem": problem}
+        h.client().default_info = info
+
+        reason = h.registry.check_now("n1").reason
+
+        assert reason.endswith(advice) or f". {advice}" in reason, reason
+        assert "NODE_TEMP_DIR" in reason
+        assert ("Free up space" in reason) == (advice == "Free up space there")
 
     def test_a_node_that_is_stopping_gets_no_work_and_says_it_is_restarting(self, h):
         # It answers /v1/info while it waits for its cancelled tasks' FFmpeg: read as ready, it was sent files again.

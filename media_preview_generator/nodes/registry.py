@@ -320,6 +320,30 @@ def _default_library_names(app_paths: list[str]) -> list[str]:
     return names
 
 
+def _temp_folder_advice(problem: str) -> str:
+    """What to do about a node's temp folder, by the cause in the node's words (its own, or the OS's error text).
+
+    Args:
+        problem: The node's sentence about its temp folder.
+
+    Returns:
+        One sentence of advice.
+    """
+    said = problem.lower()
+    if any(cause in said for cause in (" is full", "filled up", "no space left", "quota")):
+        return "Free up space there, or set NODE_TEMP_DIR on the node to a folder with more room."
+    if "read-only" in said:
+        return "Mount it writable (not read-only), or set NODE_TEMP_DIR on the node to a folder it can write to."
+    if any(cause in said for cause in ("permission denied", "access is denied", "not permitted")):
+        return (
+            "Let the node's user write to it (in Docker, check PUID and PGID), or set NODE_TEMP_DIR on the node to a "
+            "folder it can write to."
+        )
+    if any(cause in said for cause in ("no such file", "cannot find")):
+        return "Create or mount that folder, or set NODE_TEMP_DIR on the node to a folder it can write to."
+    return "Set NODE_TEMP_DIR on the node to a folder it can write to."
+
+
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
     from ..web.settings_manager import get_settings_manager
     from .mappings import quick_access_check
@@ -1309,8 +1333,8 @@ class NodeRegistry:
             said = temp_problem.strip()[:TEMP_PROBLEM_MAX]
             return _Outcome(
                 STATE_TEMP_PROBLEM,
-                f"{name}'s temp folder can't be used, so it gets no files: {said[:1].lower()}{said[1:]}. Free up "
-                "space there, or set NODE_TEMP_DIR on the node to a folder it can write to.",
+                f"{name}'s temp folder can't be used, so it gets no files: {said[:1].lower()}{said[1:]}. "
+                f"{_temp_folder_advice(said)}",
                 **outcome,
             )
         agent = info.get("agent")
