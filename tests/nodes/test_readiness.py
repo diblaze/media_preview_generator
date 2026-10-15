@@ -568,7 +568,8 @@ def test_a_failed_gpu_says_what_its_test_found_and_what_to_do():
 def test_a_node_whose_gpu_is_gone_from_its_list_has_a_must_fix_row_saying_so(reason):
     """The card said "GPU lost" and its Fix opened Setup Health, which listed only the GPUs the node still reports:
     none, so nothing there said its GPU workers were paused, and the card's count left it out."""
-    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=(), reason=reason))
+    groups = [{"id": "g", "members": [{"id": "m1", "node": "n1", "resource": "gpu", "device": "cuda:0"}]}]
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=(), reason=reason), groups=groups)
     row = _check(envelope, "node_gpu_lost")
     assert (row["ok"], row["severity"], row["label"], row["reason"], row["fix_where"]) == (
         False,
@@ -578,6 +579,25 @@ def test_a_node_whose_gpu_is_gone_from_its_list_has_a_must_fix_row_saying_so(rea
         "node",
     )
     assert to_fix(envelope)["must_fix"] == 1
+
+
+@pytest.mark.parametrize(
+    "members",
+    [[], [{"id": "m1", "node": "n1", "resource": "cpu"}], [{"id": "m1", "node": "other", "resource": "gpu"}]],
+    ids=["unused", "cpu_member_only", "gpu_member_on_another_node"],
+)
+def test_a_node_with_no_gpu_workers_doesnt_say_its_gpu_workers_are_paused(members):
+    """A node used only for CPU work read "glost's GPU workers are paused": it has none."""
+    reason = "nuc couldn't check its GPUs yet (nvidia-smi failed). It tries again in a few minutes."
+    groups = [{"id": "g", "members": members}]
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=(), reason=reason), groups=groups)
+    row = _check(envelope, "node_gpu_lost")
+    assert (row["ok"], row["severity"], row["label"], row["reason"]) == (
+        False,
+        "critical",
+        "nuc can't use its GPU",
+        reason,
+    )
 
 
 def test_a_lost_gpu_the_node_still_lists_as_failed_is_one_row_not_two():
