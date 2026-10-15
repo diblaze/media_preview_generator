@@ -257,6 +257,21 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
 
+    @pytest.mark.parametrize(
+        ("url", "reason", "advice"),
+        [
+            ("https://nuc:9494", "tls_certificate", "REQUESTS_CA_BUNDLE"),
+            ("https://nuc:9494", "timeout", "use http://"),
+            ("http://nuc:9494", "dns", "Can't find nuc."),
+        ],
+        ids=["untrusted-certificate", "https-timeout", "unknown-host"],
+    )
+    def test_probe_that_nothing_answered_says_what_to_check(self, client, nodes, url, reason, advice):
+        # The node's card words an offline node the same way (unreachable_advice), so the two can't drift apart.
+        nodes(url).info_answer = NodeUnreachableError("x", reason=reason)
+        body = client.post("/api/nodes/probe", json={"url": url, "key": "k"}).get_json()
+        assert advice in body["error"]["advice"], body["error"]
+
     def test_probe_of_a_node_holding_this_address_back_says_so(self, client, nodes):
         # It answered (429): Add node must not word it as "Nothing answered at this address".
         nodes("http://nuc:9494").info_answer = NodeRateLimitedError("http://nuc:9494 asks this app to wait")

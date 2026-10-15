@@ -23,7 +23,7 @@ from typing import Any
 
 from loguru import logger
 
-from ..protocol import sendable_key
+from ..protocol import KEY_MAX_LEN, sendable_key
 from .nodelog import SECRET_EXTRA
 
 IDENTITY_FILE = "node.json"
@@ -210,6 +210,11 @@ def _check_key(key: str, source: str, *, min_length: int = 0) -> str:
     if len(key) < min_length:
         raise SystemExit(
             f"{source} is too short to be safe ({len(key)} characters; use at least {min_length}). Remove it and the "
+            f"node makes a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
+        )
+    if len(key) > KEY_MAX_LEN:
+        raise SystemExit(
+            f"{source} is too long ({len(key)} characters; the app takes at most {KEY_MAX_LEN}). Remove it and the "
             f"node makes a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
         )
     return key

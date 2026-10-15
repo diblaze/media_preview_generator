@@ -24,6 +24,7 @@ from media_preview_generator.nodes.client import (
     NodeAddress,
     NodeCantStartError,
     NodeClient,
+    NodeError,
     NodeProtocolError,
     NodeRequestError,
     NodeStoppingError,
@@ -117,6 +118,21 @@ class TestEveryFailureIsANodeError:
         url, _ = serve(200, b"[" * 100_000 + b"]" * 100_000)
         with pytest.raises(NodeProtocolError):
             _local(url).info()
+
+    @pytest.mark.parametrize("call", ["start", "poll", "info"])
+    def test_a_503_nested_deeper_than_the_parser_goes_is_a_node_error(self, call):
+        # The 503's body is read to tell a stopping node from a gateway error; its RecursionError ended the file as a
+        # crash instead of queueing it again (the executor catches NodeError only).
+        session = MagicMock(spec=requests.Session)
+        session.request.return_value = _response(503, b"[" * 100_000 + b"]" * 100_000)
+        client = NodeClient(NodeAddress("http://node:9494", "k"), session=session)
+        with pytest.raises(NodeError):
+            if call == "start":
+                client.start_task({"op": "x"})
+            elif call == "poll":
+                client.poll_task("t" * 32)
+            else:
+                client.info()
 
 
 class TestAStartAfterItsDelete:

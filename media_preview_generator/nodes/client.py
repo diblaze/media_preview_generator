@@ -11,6 +11,7 @@ import threading
 from dataclasses import dataclass
 from json import loads as parse_json
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from urllib3.exceptions import HTTPError, NameResolutionError, NewConnectionError, ProtocolError
@@ -45,6 +46,51 @@ UNREACHABLE_DNS = "dns"
 UNREACHABLE_TLS = "tls"
 # It answered over https, but this app refused its certificate (self-signed, a private authority, another name).
 UNREACHABLE_TLS_CERTIFICATE = "tls_certificate"
+# It answered, but holds this app's address back after too many wrong keys (429).
+UNREACHABLE_RATE_LIMITED = "rate_limited"
+
+
+def unreachable_advice(reason: str, url: str, name: str = "It") -> str:
+    """What to check when a node didn't answer, in plain words: Add node and the node's card both say this.
+
+    Args:
+        reason: One of the ``UNREACHABLE_*`` codes, or "" when it isn't known.
+        url: The address that was tried.
+        name: Who starts a sentence about the node: "It" in Add node, the node's name on its card.
+
+    Returns:
+        One or two sentences.
+    """
+    https = url.lower().startswith("https:")
+    if reason == UNREACHABLE_DNS:
+        host = urlsplit(url).hostname or "that machine"
+        return f"Can't find {host}. Check the name, or use the node's IP address."
+    if reason == UNREACHABLE_TLS or (reason == UNREACHABLE_TIMEOUT and https):
+        # A node without an https proxy in front never answers the TLS handshake: https to it times out.
+        start = f"{name} doesn't answer over https" if reason == UNREACHABLE_TLS else "No answer over https in time"
+        return f"{start}. A node speaks http unless you put it behind an https proxy: use http:// instead."
+    if reason == UNREACHABLE_TLS_CERTIFICATE:
+        return (
+            f"{name} answers over https, but this app doesn't trust its certificate (self-signed, or from your own "
+            "certificate authority). Let this app trust it with REQUESTS_CA_BUNDLE (see the guide), or use http://."
+        )
+    if reason == UNREACHABLE_REFUSED:
+        return (
+            "Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node "
+            "is running."
+        )
+    if reason == UNREACHABLE_TIMEOUT:
+        return (
+            "No answer in time. Check the address, that the node is running, and that a firewall lets this app "
+            "reach it."
+        )
+    if reason == UNREACHABLE_RATE_LIMITED:
+        return (
+            "The node is holding back requests from this address after too many wrong keys. Wait a minute and try "
+            "again. If it keeps happening, something else reaching the node from the same address (or through the "
+            "same proxy) is using an old key."
+        )
+    return "Nothing answered at this address. Check the address and port, and that the node is running."
 
 
 class NodeUnreachableError(NodeError):
@@ -245,7 +291,7 @@ class NodeClient:
         """The ``error.kind`` of a node's JSON answer, or "" when the answer isn't one (a proxy's error page)."""
         try:
             body = parse_json(self._read(response, MAX_ANSWER_BYTES))
-        except (ValueError, NodeError):
+        except (ValueError, RecursionError, NodeError):  # RecursionError: JSON nested deeper than the parser goes
             return ""
         error = body.get("error") if isinstance(body, dict) else None
         return str(error.get("kind") or "") if isinstance(error, dict) else ""

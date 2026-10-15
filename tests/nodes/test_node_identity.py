@@ -178,6 +178,19 @@ class TestPublicOrWeakKeys:
         with pytest.raises(SystemExit, match=f"too short to be safe \\({len(short)} characters; use at least 16\\)"):
             identity.load_identity(str(tmp_path))
 
+    @pytest.mark.parametrize("variable", ["NODE_KEY", "AGENT_TOKEN"])
+    def test_a_key_longer_than_the_app_takes_refuses_to_start(self, tmp_path, monkeypatch, variable):
+        # The app refuses to store a key over 200 characters, so a node started with one could never be added.
+        monkeypatch.setenv(variable, "k" * 201)
+
+        with pytest.raises(SystemExit, match=r"too long \(201 characters; the app takes at most 200\)"):
+            identity.load_identity(str(tmp_path))
+
+    def test_a_node_key_of_200_characters_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NODE_KEY", "k" * 200)
+
+        assert identity.load_identity(str(tmp_path)).key == "k" * 200
+
     def test_a_node_key_of_16_characters_is_kept(self, tmp_path, monkeypatch):
         monkeypatch.setenv("NODE_KEY", "sixteen-chars-ok")
 

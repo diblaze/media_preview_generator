@@ -13,6 +13,10 @@ import pytest
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.access_results import AccessResultStore
 from media_preview_generator.nodes.client import (
+    UNREACHABLE_DNS,
+    UNREACHABLE_REFUSED,
+    UNREACHABLE_TIMEOUT,
+    UNREACHABLE_TLS_CERTIFICATE,
     NodeAuthError,
     NodeProtocolError,
     NodeTimeoutError,
@@ -170,7 +174,7 @@ class TestStates:
         client.infos = [NodeUnreachableError("x")] * 3
         view = h.registry.check_now("n1")
         assert client.info_calls == 3
-        assert view.state == reg.STATE_OFFLINE and "didn't answer" in view.reason
+        assert view.state == reg.STATE_OFFLINE and view.reason.startswith("Nothing answered at this address.")
         assert "http://" not in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
 
@@ -180,6 +184,31 @@ class TestStates:
         view = h.registry.check_now("n1")
         assert view.state == reg.STATE_OFFLINE
         assert view.reason.startswith("nuc accepts connections but doesn't answer.")
+
+    @pytest.mark.parametrize(
+        ("reason", "hint"),
+        [
+            (UNREACHABLE_TLS_CERTIFICATE, "nuc answers over https, but this app doesn't trust its certificate"),
+            (UNREACHABLE_DNS, "Can't find nuc."),
+            (UNREACHABLE_REFUSED, "Nothing is listening on that port."),
+        ],
+        ids=["untrusted-certificate", "unknown-host", "refused"],
+    )
+    def test_an_offline_node_says_why_nothing_answered(self, h, reason, hint):
+        # It always read "didn't answer. Check that it is running": the card never told a node behind a private
+        # certificate authority to set REQUESTS_CA_BUNDLE, though Add node did.
+        h.client().default_info = NodeUnreachableError("http://nuc:9494 didn't answer", reason=reason)
+        view = h.registry.check_now("n1")
+        assert (view.state, view.cause) == (reg.STATE_OFFLINE, reg.OFFLINE_UNREACHABLE)
+        assert hint in view.reason, view.reason
+
+    def test_https_to_a_node_that_speaks_http_says_use_http_not_restart_it(self, h):
+        # The node's server never answers a TLS handshake: every attempt times out, which read "stuck: restart it".
+        h.change(url="https://nuc:9494")
+        h.client().default_info = NodeTimeoutError("https://nuc:9494 didn't answer in time", reason=UNREACHABLE_TIMEOUT)
+        view = h.registry.check_now("n1")
+        assert (view.state, view.cause) == (reg.STATE_OFFLINE, reg.OFFLINE_UNREACHABLE)
+        assert "use http://" in view.reason and "restart" not in view.reason, view.reason
 
     @pytest.mark.parametrize("where", ["info", "older-helper-ping"])
     def test_a_check_that_cant_read_the_answer_takes_a_ready_node_offline(self, h, where):

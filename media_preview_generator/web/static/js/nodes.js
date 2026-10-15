@@ -699,36 +699,14 @@
     // finished: step 2 was saved with Finish; closing it any other way still keeps its rows.
     const add = { probe: null, node: null, editor: null, finished: false };
 
-    // What to check, by why nothing answered (error.reason); url is the address that was tried.
-    function unreachableText(reason, url) {
-        const https = /^https:/i.test(url || '');
-        switch (reason) {
-            case 'dns':
-                return `Can't find ${hostOf(url) || 'that machine'}. Check the name, or use the node's IP address.`;
-            case 'tls':
-                return "It doesn't answer over https. A node speaks http unless you put it behind an https proxy: use http:// instead.";
-            case 'tls_certificate':
-                return "It answers over https, but this app doesn't trust its certificate (self-signed, or from your own certificate authority). Let this app trust it with REQUESTS_CA_BUNDLE (see the guide), or use http://.";
-            case 'refused':
-                return 'Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node is running.';
-            case 'timeout':
-                return https
-                    ? 'No answer over https in time. A node speaks http unless you put it behind an https proxy: try http:// instead.'
-                    : 'No answer in time. Check the address, that the node is running, and that a firewall lets this app reach it.';
-            case 'rate_limited':
-                return 'The node is holding back requests from this address after too many wrong keys. Wait a minute and try again. If it keeps happening, something else reaching the node from the same address (or through the same proxy) is using an old key.';
-            default:
-                return 'Nothing answered at this address. Check the address and port, and that the node is running.';
-        }
-    }
-
-    function probeErrorText(error, url) {
+    function probeErrorText(error) {
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
                 return "Key refused. Copy the key again from the node's log, or use the NODE_KEY (or AGENT_TOKEN) you set.";
             case 'unreachable':
-                return unreachableText(error.reason, url);
+                // What to check, worded by the app by why nothing answered: the node's card says the same.
+                return error.advice || error.message || "Couldn't connect to the node.";
             case 'protocol':
                 // A node on another protocol says which version it runs; anything else isn't a node of this app.
                 if (error.node_version) return error.message;
@@ -868,7 +846,7 @@
             add.probe = null;
             $('#addNodeProbe').classList.add('d-none');
             const error = r.data && typeof r.data.error === 'object' ? r.data.error : { message: errorText(r, "Couldn't connect") };
-            addError(probeErrorText(error, url));
+            addError(probeErrorText(error));
             setAddStep(1);
             return;
         }
@@ -1227,7 +1205,7 @@
                 enable(btn);
                 keyEl.classList.add('is-invalid');
                 result.className = 'sm-tres bad';
-                result.textContent = `${probeErrorText(error, body.url)} Nothing was saved.`;
+                result.textContent = `${probeErrorText(error)} Nothing was saved.`;
                 return;
             }
             if (!probe.ok) {
@@ -1236,7 +1214,7 @@
                 result.textContent = errorText(probe, "Couldn't check the key");
                 return;
             }
-            if (probe.data && probe.data.ok === false) unanswered = probeErrorText(error || {}, body.url);
+            if (probe.data && probe.data.ok === false) unanswered = probeErrorText(error || {});
         }
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { ...body, edit_tag: detail.editTag });
         enable(btn);
