@@ -158,8 +158,23 @@ class TestInfo:
         assert worker["temp"]["path"] == os.environ["NODE_TEMP_DIR"] and worker["temp"]["free_bytes"] > 0
         assert worker["busy"] == 0
         assert worker["ffmpeg"] == {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"}
-        assert worker["gpu_checked_at"] is not None
+        assert worker["gpu_checked_at"] is not None and worker["gpu_error"] is None
         assert "plex_db" not in body
+
+    def test_info_still_answers_when_gpu_detection_raises(self, make_app, monkeypatch):
+        import media_preview_generator.gpu.detect as gpu_detect
+
+        def detect():
+            raise OSError("vulkaninfo: device lost")
+
+        monkeypatch.setattr(gpu_detect, "detect_all_gpus", detect)
+
+        response = make_app().test_client().get("/v1/info", headers=HEADERS)
+
+        assert response.status_code == 200
+        worker = response.get_json()["worker"]
+        assert worker["gpus"] == [] and worker["gpu_error"] == "OSError: vulkaninfo: device lost"
+        assert worker["cpu"]["cores"] >= 1
 
     def test_rescan_runs_detection_again(self, make_app, monkeypatch):
         import media_preview_generator.gpu.detect as gpu_detect

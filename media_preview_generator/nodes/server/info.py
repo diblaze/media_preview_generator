@@ -126,8 +126,12 @@ class WorkerInfo:
         self._detect = detect
         self._gpus: list[dict[str, Any]] | None = None
         self._checked_at: float | None = None
+        self._gpu_error: str | None = None
         self._ffmpeg: dict[str, Any] | None = None
+        # Two locks: one detection at a time (each runs FFmpeg on every device), and a short one for the cached
+        # answer, so /v1/info never waits out a re-check that may take a minute on a busy or wedged GPU.
         self._detect_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -144,10 +148,7 @@ class WorkerInfo:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self.rescan()
-            except Exception:  # noqa: BLE001 - one failed detection must not end the re-checks
-                logger.opt(exception=True).warning("GPU detection failed on this node")
+            self.rescan()
             self._wake.wait(self._recheck_s)
             self._wake.clear()
 
@@ -158,22 +159,31 @@ class WorkerInfo:
     def rescan(self) -> list[dict[str, Any]]:
         """Run GPU detection now.
 
+        A detection that raises counts as no GPUs, its error kept: the node still answers (its CPU can work), and the
+        app reads a GPU it had before as lost.
+
         Returns:
             The fresh, JSON-safe GPU list.
         """
         with self._detect_lock:
             detect = self._detect
-            if detect is None:
-                from ...gpu import detect as gpu_detect
+            error: str | None = None
+            try:
+                if detect is None:
+                    from ...gpu import detect as gpu_detect
 
-                detect = gpu_detect.detect_all_gpus
-            found = [_gpu_entry(raw) for raw in detect() or []]
-            self._gpus, self._checked_at = found, time.time()
+                    detect = gpu_detect.detect_all_gpus
+                found = [_gpu_entry(raw) for raw in detect() or []]
+            except Exception as exc:  # noqa: BLE001 - a broken probe must not take /v1/info down with it
+                logger.opt(exception=True).warning("GPU detection failed on this node, so it reports no GPUs")
+                found, error = [], f"{type(exc).__name__}: {exc}"
+            with self._cache_lock:
+                self._gpus, self._checked_at, self._gpu_error = found, time.time(), error
             return [dict(entry) for entry in found]
 
     def gpus(self) -> list[dict[str, Any]]:
         """The cached GPU list (detected now if nothing has detected yet), with ``credit_text`` where known."""
-        with self._detect_lock:
+        with self._cache_lock:
             cached = self._gpus
         found = cached if cached is not None else self.rescan()
         out = []
@@ -221,4 +231,5 @@ class WorkerInfo:
             "busy": busy,
             "ffmpeg": dict(self._ffmpeg),
             "gpu_checked_at": self._checked_at,
+            "gpu_error": self._gpu_error,
         }
