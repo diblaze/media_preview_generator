@@ -276,7 +276,7 @@ class TestNodeList:
         for i, (chip, tone, button) in enumerate(states.values()):
             row = authed_page.locator(f"#node-n-{i}")
             expect(row).to_have_attribute("data-tone", tone)
-            pill = row.locator(".nd-status .pill")
+            pill = row.locator(".nd-status .pill:not(.nd-to-fix)")
             expect(pill).to_have_text(chip)
             if tone == "off":
                 expect(pill).to_have_class("pill")
@@ -396,10 +396,10 @@ class TestNodeList:
 
         expect(button).to_have_text("Checking…")
         expect(button).to_be_disabled()
-        expect(authed_page.locator("#node-n-old .nd-status .pill")).not_to_have_text("✓ Ready")
+        expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).not_to_have_text("✓ Ready")
         expect(button).to_have_text("Check now", timeout=10000)
         expect(button).to_be_enabled()
-        expect(authed_page.locator("#node-n-old .nd-status .pill")).to_have_text("✓ Ready")
+        expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready")
         assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/check"]
 
     def test_list_is_polled(self, authed_page: Page, app_url: str) -> None:
@@ -409,7 +409,7 @@ class TestNodeList:
         nodes[3]["state"] = "ready"
         nodes[3]["reason"] = ""
         authed_page.clock.run_for(10_500)
-        expect(authed_page.locator("#node-n-old .nd-status .pill")).to_have_text("✓ Ready")
+        expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready")
 
     def test_the_url_hash_opens_that_node(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes(), path="/nodes#node-n-nuc")
@@ -1092,7 +1092,7 @@ class TestNodeDialog:
         link = pane.get_by_role("link", name="How to update a node")
         expect(link).to_have_attribute("href", docs)
         expect(link).to_have_attribute("target", "_blank")
-        expect(authed_page.locator("#node-n-old .nd-status .pill").first).to_have_class("pill bad")
+        expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)").first).to_have_class("pill bad")
 
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())
