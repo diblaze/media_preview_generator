@@ -421,7 +421,7 @@
         return 'No media server yet. <a href="/servers">Add a media server</a> first.';
     }
 
-    function createMappingEditor(root, { getNodeId, onChange }) {
+    function createMappingEditor(root, { getNodeId, onChange, onTested }) {
         root.innerHTML = `
             <div class="nd-map">
                 <div class="nd-map-head">
@@ -665,6 +665,7 @@
                 }
                 showError('');
                 renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : [], r.data && r.data.media_setup);
+                if (onTested) onTested();
             } finally {
                 enable(btn);
                 btn.innerHTML = '<i class="bi bi-play-fill me-1"></i>Test access';
@@ -1524,6 +1525,9 @@
                 result.className = 'sm-tres warn';
                 result.textContent = 'Not saved yet';
             },
+            // A Test access of the saved rows ends or starts an access problem: Setup Health and its badge said the
+            // old count until the dialog was opened again.
+            onTested: loadHealth,
         });
 
         $('#nodesAddBtn').addEventListener('click', openAdd);

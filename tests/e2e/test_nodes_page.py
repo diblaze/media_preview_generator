@@ -1072,6 +1072,33 @@ class TestNodeDialog:
         authed_page.keyboard.press("Escape")
         expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
 
+    def test_saving_mappings_that_fix_access_updates_the_setup_health_badge(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """The header turned Ready after the save and its Test access, while the Setup Health badge kept its 1."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        problem = {"id": "node_access_problem", "label": "nuc couldn't see files it was sent", "ok": False}
+        api.health_answer = {
+            "overall_ok": False,
+            "sections": [
+                {"id": "node_media_access", "title": "Media access", "checks": [{**problem, "severity": "critical"}]}
+            ],
+        }
+        _open_node(authed_page, "n-nuc")
+        badge = authed_page.locator("#nodeHealthTabBadge")
+        expect(badge).to_have_text("1")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-add-row").click()
+        pane.locator(".nd-app").last.fill("/data/TV Shows")
+        pane.locator(".nd-node").last.fill("/media/tv")
+        api.test_answers = [{"libraries": [_library("TV Shows", "/data/TV Shows", True, "/media/tv")]}]
+        api.health_answer = {"overall_ok": True, "sections": []}
+
+        authed_page.locator("#nodeSaveMappings").click()
+
+        expect(pane).to_contain_text("The node sees every library, same files.")
+        expect(badge).to_be_hidden()
+
     def test_closing_with_unsaved_settings_asks_first(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         _open_node(authed_page, "n-storage")
