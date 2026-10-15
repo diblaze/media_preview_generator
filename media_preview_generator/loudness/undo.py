@@ -7,7 +7,7 @@ job's values. A row whose added fields Plex changed is left alone.
 
 Stop Plex first: it refuses while another process has the database open. Inside the app's container:
 
-    python -m media_preview_generator.loudness.undo --db ".../com.plexapp.plugins.library.db" \
+    python3 -m media_preview_generator.loudness.undo --db ".../com.plexapp.plugins.library.db" \
         --log /config/loudness-writes.jsonl
 """
 

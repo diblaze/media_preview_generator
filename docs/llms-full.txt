@@ -1593,7 +1593,7 @@ Through a Plex database node, the node keeps this record instead, in its own `/c
 To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
 ```
-docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \
+docker exec -it media-preview-generator python3 -m media_preview_generator.loudness.undo \
   --db "/path/to/com.plexapp.plugins.library.db" --log /config/loudness-writes.jsonl
 ```
 

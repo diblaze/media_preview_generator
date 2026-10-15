@@ -252,3 +252,16 @@ def test_replaced_source_keeps_its_native_item_mark_and_streams(db, tmp_path):  
     with sqlite3.connect(db._path()) as conn:
         assert conn.execute("SELECT extra_data FROM metadata_items WHERE id=1").fetchone()[0] == marked
     conn.close()
+
+
+def test_the_documented_command_uses_the_interpreter_the_images_ship():
+    """The app image (Alpine, linuxserver/ffmpeg) has ``python3`` and no ``python``: ``docker exec ... python`` fails
+    with "executable file not found" exactly when someone needs to undo."""
+    from pathlib import Path
+
+    import media_preview_generator.loudness.undo as undo_module
+
+    page = (Path(__file__).resolve().parents[2] / "docs" / "plex-loudness-normalization.md").read_text()
+    commands = [line for line in page.splitlines() if "media_preview_generator.loudness.undo" in line]
+    assert commands and all("python3 -m" in line for line in commands), commands
+    assert "python3 -m media_preview_generator.loudness.undo" in (undo_module.__doc__ or "")

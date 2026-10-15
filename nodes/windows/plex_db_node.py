@@ -126,7 +126,7 @@ def _recorded_databases(log: str) -> set[str]:
 def undo_loudness(args: argparse.Namespace) -> int:
     """Run the loudness undo (``loudness.undo``) on this node's undo record and the Plex database it wrote.
 
-    The Windows counterpart of running ``python -m media_preview_generator.loudness.undo`` in a node's container.
+    The Windows counterpart of running ``python3 -m media_preview_generator.loudness.undo`` in a node's container.
     Without ``--plex-config-dir`` it undoes the database the record names, so a node installed with ``-PlexConfigDir``
     needs nothing more: the undo itself still refuses any file that isn't that exact database.
 
