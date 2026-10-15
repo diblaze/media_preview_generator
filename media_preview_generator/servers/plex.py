@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import threading
 import time
 import unicodedata
@@ -62,6 +63,15 @@ SERVER_MARKER_DETECTION_PREFS: dict[str, str] = {
 # request after a short pause usually works.
 _ANALYZE_ATTEMPTS = 2
 _ANALYZE_RETRY_DELAY_S = 2.0
+
+# A bulk scan reads every part's bundle hash from Plex's database at once instead of asking /tree once per file: Plex
+# answers those one at a time (70-150 ms each under a scan's load, against 0.4 s to read a 117k-file library, sflix
+# 2026-10-15). Read again once older than this, so a file Plex re-hashes during a long job is seen within that time.
+_BUNDLE_PARTS_READ_TTL_S = 300.0
+# Short: /tree answers while the database is busy (a marker write holding it), so nothing waits on it for long.
+_BUNDLE_PARTS_READ_DEADLINE_S = 2.0
+# Read to tell whether Plex's database is on a local disk (tests point it at their own).
+_MOUNTINFO_PATH = "/proc/self/mountinfo"
 
 
 def _pref_bool(value: Any) -> bool | None:
@@ -197,6 +207,12 @@ class PlexServer(MediaServer):
         self._hidden_types: dict[str, frozenset[str]] = {}
         self._hidden_locks: dict[str, threading.Lock] = {}
         self._hidden_guard = threading.Lock()
+        # Bulk scans' read of every part from Plex's database (``_parts_from_database``): None until read, or after a
+        # read that failed (then /tree answers until the next read is due).
+        self._db_parts: dict[str, list[tuple[str, str, int]]] | None = None
+        self._db_parts_read_at: float | None = None
+        self._db_parts_reading = False
+        self._db_parts_lock = threading.Lock()
 
     @property
     def type(self) -> ServerType:
@@ -2208,6 +2224,9 @@ class PlexServer(MediaServer):
         With ``quiet=True`` (the per-file fast path in bulk scans) the call is not
         retried and a failure logs at DEBUG: the caller falls back to hashing the
         file, so a Plex outage must not stall or flood the log for every item.
+        The parts then come from one read of Plex's database for all items, made
+        again after ``_BUNDLE_PARTS_READ_TTL_S`` (only on a local disk); /tree
+        answers an item not in that read, and every item when it can't be made.
 
         Returns an empty list when the lookup fails or the item has no parts.
         Failures now WARN (not DEBUG) so the next time we malform a URL it
@@ -2222,6 +2241,10 @@ class PlexServer(MediaServer):
         if not bare_id:
             logger.warning("Plex /tree called with empty item_id; cannot compute bundle hash")
             return []
+        if quiet:
+            from_database = self._parts_from_database(bare_id)
+            if from_database is not None:
+                return from_database
 
         try:
             data = retry_plex_call(
@@ -2244,6 +2267,73 @@ class PlexServer(MediaServer):
                 size = part.attrib.get("size", "")
                 results.append((bundle_hash, file_path, int(size) if size.isdigit() else -1))
         return results
+
+    def _parts_from_database(self, bare_id: str) -> list[tuple[str, str, int]] | None:
+        """An item's parts from this client's read of Plex's database, as /tree gives them (bulk scans only).
+
+        Returns:
+            Its parts with a hash; None when the item isn't in the read (added since) or the database can't be read,
+            so the caller asks /tree.
+        """
+        with self._db_parts_lock:
+            started = time.monotonic()
+            due = not self._db_parts_reading and (
+                self._db_parts_read_at is None or started - self._db_parts_read_at > _BUNDLE_PARTS_READ_TTL_S
+            )
+            self._db_parts_reading |= due
+            parts = self._db_parts
+        if due:
+            # Read outside the lock: the other workers keep the last read (or ask /tree) meanwhile, never waiting on it.
+            try:
+                parts = self._read_parts_from_database()
+            finally:
+                with self._db_parts_lock:
+                    self._db_parts, self._db_parts_read_at, self._db_parts_reading = parts, started, False
+        return None if parts is None else parts.get(bare_id)
+
+    def _read_parts_from_database(self) -> dict[str, list[tuple[str, str, int]]] | None:
+        """Every item's live parts with a hash, keyed by ratingKey; None without a Plex config folder, when the database
+        isn't on a local disk or Plex doesn't hold it open through this same file (SQLite's shared index of a database in
+        use can't be kept right across machines or two cached views of one file: even a reader could damage Plex's),
+        or when it can't be read."""
+        folder = str(
+            ((self._server_config.output or {}) if self._server_config else {}).get("plex_config_folder") or ""
+        )
+        if not folder:
+            return None
+        from ..markers.fs import filesystem_type, is_local_filesystem
+        from ..markers.publishers.plex_db import LocalPlexDb, PublishError, plex_db_path, shm_lock_held_elsewhere
+
+        path = plex_db_path(folder)
+        if not os.path.isfile(path) or not is_local_filesystem(
+            filesystem_type(os.path.realpath(path), mountinfo_path=_MOUNTINFO_PATH)
+        ):
+            return None
+        started = time.monotonic()
+        try:
+            if not shm_lock_held_elsewhere(path, deadline=started + _BUNDLE_PARTS_READ_DEADLINE_S):
+                return None
+        except (PublishError, RuntimeError):
+            return None
+        database = LocalPlexDb(lambda: path, label=self.name)
+        try:
+            with database._database(read_only=True, deadline=started + _BUNDLE_PARTS_READ_DEADLINE_S) as conn:
+                rows = conn.execute(
+                    "SELECT mi.metadata_item_id, mp.hash, mp.file, mp.size FROM media_parts mp "
+                    "JOIN media_items mi ON mi.id = mp.media_item_id "
+                    "WHERE mp.deleted_at IS NULL AND mi.deleted_at IS NULL"
+                ).fetchall()
+        except Exception as exc:
+            logger.debug("[{}] Can't read part hashes from Plex's database ({}); asking Plex per file", self.name, exc)
+            return None
+        parts: dict[str, list[tuple[str, str, int]]] = {}
+        for item, bundle_hash, file_path, size in rows:
+            entry = parts.setdefault(str(item), [])
+            if bundle_hash and file_path:
+                entry.append((str(bundle_hash), str(file_path), size if isinstance(size, int) else -1))
+        logger.debug("[{}] Read {} part hashes from Plex's database in {:.2f} s", self.name, len(rows),
+                     time.monotonic() - started)  # fmt: skip
+        return parts
 
     def get_external_ids(self, item_id: str) -> dict[str, Any] | None:
         """Plex guids (``includeGuids=1``).
