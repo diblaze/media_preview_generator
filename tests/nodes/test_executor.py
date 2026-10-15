@@ -403,6 +403,31 @@ class TestNodeDrops:
         assert raised.value.started is False  # nothing the node or the file did: no drop counts against the file
         assert registry.reports == [("unavailable", NODE_ID)]
 
+    def test_a_task_the_node_expired_while_its_polls_were_held_back_gives_the_file_back_with_no_drop(
+        self, media, monkeypatch
+    ):
+        # The 429s end between the node's unpolled-task expiry and this app's give-up: the next poll reaches the node,
+        # which has dropped the task by then and answers 404. Read as "it restarted?", that counted a drop.
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+        held_until = clock.now + protocol.TASK_UNPOLLED_EXPIRY_S + 5.0
+
+        def poll(client):
+            if clock.now < held_until:
+                return NodeRateLimitedError("http://n asks this app to wait")
+            return NodeUnknownTaskError("unknown_task")
+
+        client = ScriptedClient([running(), *([poll] * 200)])
+        registry = _install(client)
+
+        with pytest.raises(NodeUnavailableError, match="kept asking this app to wait") as raised:
+            _run(media)
+
+        assert raised.value.started is False
+        assert registry.reports == [("unavailable", NODE_ID)]
+        assert client.named("delete") == []
+
     def test_polls_held_back_now_and_then_keep_waiting_for_a_task_the_node_still_runs(self, media, monkeypatch):
         clock = _FakeTime()
         monkeypatch.setattr(executor, "time", clock)

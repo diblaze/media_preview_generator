@@ -479,6 +479,14 @@ class _TaskRun:
                 state = self._client.poll_task(self._task_id, log_from=self._next_log)
             except NodeUnknownTaskError as exc:
                 self._forgotten = True
+                if asked_at - reached_at > protocol.TASK_UNPOLLED_EXPIRY_S:
+                    # No poll reached the task for the node's unpolled-task expiry (they were held back with 429s),
+                    # so the node dropped it for that, not for going away: no drop counts against the file.
+                    raise self._unavailable(
+                        f"{name} kept asking this app to wait (too many wrong keys came from this app's address), "
+                        "so it dropped the task",
+                        started=False,
+                    ) from exc
                 raise self._unavailable(f"{name} no longer knows the task (it restarted?)") from exc
             except NodeStoppingError as exc:
                 # A routine stop (a restart, an update) cancelled it: not the file's doing, so no drop is counted.
