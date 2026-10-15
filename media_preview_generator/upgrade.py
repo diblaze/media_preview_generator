@@ -761,6 +761,32 @@ def _migrate_to_v3(sm) -> list:
     return []
 
 
+def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bool:
+    """Whether a Recently Added schedule already scans what v4 would make one for.
+
+    A settings file from before v4 restored over an install that already ran it (Settings -> Backups, or copied back
+    by hand) runs v4 again; the schedules it made the first time are still in schedules.json, maybe renamed or
+    retimed since.
+
+    Args:
+        schedules: Every stored schedule.
+        entry: A ``recently_added_libraries`` entry (a library id, or a name), or None for every library.
+    """
+    for schedule in schedules:
+        if (schedule.get("config") or {}).get("job_type") != "recently_added":
+            continue
+        ids = {str(x.get("library_id") if isinstance(x, dict) else x) for x in schedule.get("library_ids") or []}
+        if schedule.get("library_id"):
+            ids.add(str(schedule["library_id"]))
+        name = str(schedule.get("library_name") or "")
+        if entry is None:
+            if not ids and not name:
+                return True
+        elif (entry in ids) if entry.isdigit() else (name == entry):
+            return True
+    return False
+
+
 def _migrate_to_v4(sm) -> list:
     """Convert legacy ``recently_added_*`` settings into schedule entries.
 
@@ -777,6 +803,8 @@ def _migrate_to_v4(sm) -> list:
       3. Deletes all four legacy keys from settings.
       4. Best-effort removes the obsolete ``system_recently_added_scan``
          APScheduler job if it exists in the persistent jobstore.
+
+    A schedule it would make that is already there (a restored settings file from before v4) is not made twice.
     """
     notes: list[str] = []
     legacy_keys = [
@@ -807,7 +835,10 @@ def _migrate_to_v4(sm) -> list:
             # (and any caller using a non-default CONFIG_DIR) end up with
             # a ScheduleManager writing to the right jobstore location.
             manager = get_schedule_manager(config_dir=str(sm.config_dir))
-            if not library_entries:
+            existing = manager.get_all_schedules()
+            if not library_entries and _has_recently_added_schedule(existing, None):
+                notes.append("v4: the recently-added schedule is already there")
+            elif not library_entries:
                 schedule = manager.create_schedule(
                     name="Recently Added Scanner",
                     interval_minutes=interval,
@@ -821,7 +852,8 @@ def _migrate_to_v4(sm) -> list:
                 )
                 notes.append(f"v4: created 1 recently-added schedule ({schedule['id']})")
             else:
-                for entry in library_entries:
+                missing = [entry for entry in library_entries if not _has_recently_added_schedule(existing, entry)]
+                for entry in missing:
                     schedule = manager.create_schedule(
                         name=f"Recently Added Scanner — {entry}",
                         interval_minutes=interval,
@@ -833,9 +865,10 @@ def _migrate_to_v4(sm) -> list:
                         },
                         enabled=True,
                     )
-                notes.append(
-                    f"v4: created {len(library_entries)} recently-added schedule(s) from legacy library override"
-                )
+                if missing:
+                    notes.append(f"v4: created {len(missing)} recently-added schedule(s) from legacy library override")
+                if len(missing) < len(library_entries):
+                    notes.append(f"v4: {len(library_entries) - len(missing)} recently-added schedule(s) already there")
 
             # Best-effort: remove the stale system job if it's still in
             # the persistent APScheduler jobstore.

@@ -985,6 +985,53 @@ class TestMigrateToV4:
         library_ids = {s["library_id"] for s in schedules}
         assert library_ids == {"1", "2"}
 
+    @pytest.mark.parametrize("libraries", [[], ["1", "TV Shows"]], ids=["all-libraries", "per-library"])
+    def test_restoring_a_settings_file_from_before_v4_adds_no_second_scanner(
+        self, settings_manager, _fresh_schedule_manager, libraries
+    ):
+        """A 2.x backup restored over an install that already made its scanner schedules (the upgrade from 2.x)
+        runs v4 again: the schedules it would make are already there, renamed or retimed or not."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {
+            "recently_added_enabled": True,
+            "recently_added_interval_minutes": 15,
+            "recently_added_lookback_hours": 24,
+            "recently_added_libraries": libraries,
+        }
+        settings_manager.apply_changes(updates=legacy)
+        _migrate_to_v4(settings_manager)
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        first = manager.get_all_schedules()
+        manager.update_schedule(first[0]["id"], name="My scanner", interval_minutes=60)
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert sorted(s["id"] for s in manager.get_all_schedules()) == sorted(s["id"] for s in first)
+        assert settings_manager.get("recently_added_enabled") is None
+        assert not any("created" in n for n in notes)
+
+    def test_a_scanner_for_another_library_is_still_made(self, settings_manager, _fresh_schedule_manager):
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        manager.create_schedule(
+            name="Movies scanner",
+            interval_minutes=15,
+            library_id="1",
+            library_name="",
+            config={"job_type": "recently_added", "lookback_hours": 24},
+            enabled=True,
+        )
+        settings_manager.apply_changes(updates={"recently_added_enabled": True, "recently_added_libraries": ["2"]})
+
+        _migrate_to_v4(settings_manager)
+
+        assert sorted(s["library_id"] for s in manager.get_all_schedules()) == ["1", "2"]
+
 
 class TestMigrateToV6:
     """Tests for the v6 migration that strips stale generic 'cuda' gpu_config entries."""
