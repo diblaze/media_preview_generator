@@ -295,6 +295,8 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             return refuse(protocol.KIND_REQUEST, 400, str(exc))
         except tasks.TaskDeletedError as exc:
             return refuse(protocol.KIND_TASK_DELETED, 409, str(exc))
+        except tasks.TaskStartError as exc:
+            return refuse(protocol.KIND_FAILED, 400, str(exc))
         return answer({"id": task_id}, 202)
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")

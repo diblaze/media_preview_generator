@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -301,6 +302,22 @@ class TestTaskRoutes:
         response = client.get(f"/v1/tasks/{task_id}/artifact", headers=HEADERS)
 
         assert response.status_code == 404 and response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
+
+    def test_a_full_temp_disk_is_400_with_the_cause_not_500(self, make_app, media, monkeypatch):
+        import tempfile
+
+        def full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkdtemp", full)
+        spec = {"op": "test.op", "path": "/data/a.mkv", "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}
+
+        response = make_app(ops={"test.op": lambda *a: {}}).test_client().post("/v1/tasks", headers=HEADERS, json=spec)
+
+        # Below 500: the app reads any 5xx as a node that didn't answer, and would bounce the file instead.
+        assert response.status_code == 400
+        error = response.get_json()["error"]
+        assert error["kind"] == protocol.KIND_FAILED and "is full (No space left on device)" in error["message"]
 
     def test_unknown_op_is_400(self, make_app):
         response = make_app().test_client().post("/v1/tasks", headers=HEADERS, json={"op": "x", "path": "/a"})

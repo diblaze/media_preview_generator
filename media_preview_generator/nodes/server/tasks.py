@@ -8,6 +8,7 @@ so the app can still fetch the artifact, unless the app deletes it first.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -71,6 +72,11 @@ class TaskSpecError(ValueError):
 
 class TaskDeletedError(Exception):
     """The app deleted this task id before its start arrived (answered 409, kind ``task_deleted``): nothing runs."""
+
+
+class TaskStartError(Exception):
+    """The node can't take the task (its temp folder is full or can't be written): answered 400, kind ``failed``,
+    so the app fails the file with this message instead of reading a 500 as a node that didn't answer."""
 
 
 def default_temp_root() -> str:
@@ -334,6 +340,7 @@ class TaskTable:
         Raises:
             TaskSpecError: The spec is malformed or names an op this node doesn't have.
             TaskDeletedError: The app deleted this id in the last ``DELETED_ID_KEEP_S``.
+            TaskStartError: The task's temp folder can't be made.
         """
         if not isinstance(spec, dict):
             raise TaskSpecError("the task spec must be an object")
@@ -353,7 +360,7 @@ class TaskTable:
             self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
-        temp_dir = tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
+        temp_dir = self._make_temp_dir(task_id)
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
             try:
@@ -367,6 +374,24 @@ class TaskTable:
             self._tasks[task_id] = task
         threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True).start()
         return task_id
+
+    def _make_temp_dir(self, task_id: str) -> str:
+        """The task's own temp dir, the temp root made again first (a host's tmp cleaner may have removed it).
+
+        Raises:
+            TaskStartError: The folder can't be made (a full disk, no permission).
+        """
+        try:
+            os.makedirs(self.temp_root, exist_ok=True)
+            return tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
+        except OSError as exc:
+            why = exc.strerror or str(exc) or type(exc).__name__
+            if exc.errno == errno.ENOSPC:
+                message = f"The node's temp folder {self.temp_root} is full ({why})"
+            else:
+                message = f"The node couldn't make a folder for the task in its temp folder {self.temp_root} ({why})"
+            logger.warning("Task {} not started: {}", task_id[:8], message)
+            raise TaskStartError(message) from exc
 
     def _run(self, task: NodeTask) -> None:
         try:

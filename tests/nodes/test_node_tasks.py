@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import threading
 import time
 
@@ -211,6 +213,28 @@ class TestSpecValidation:
     def test_non_object_spec_is_refused(self, make_table):
         with pytest.raises(tasks.TaskSpecError):
             make_table({}).start([])
+
+
+class TestTempFolder:
+    def test_a_temp_root_removed_after_start_is_made_again(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {}})
+        shutil.rmtree(table.temp_root)  # a host's tmp cleaner, or a share remounted under NODE_TEMP_DIR
+
+        task_id = table.start(_spec(media))
+
+        assert _finished(table, task_id)["status"] == protocol.STATUS_DONE
+
+    def test_a_full_temp_disk_refuses_the_start_with_the_cause(self, make_table, media, monkeypatch):
+        table = make_table({"test.op": lambda *a: {}})
+
+        def full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(tasks.tempfile, "mkdtemp", full)
+
+        with pytest.raises(tasks.TaskStartError, match="temp folder .* is full \\(No space left on device\\)"):
+            table.start(_spec(media))
+        assert table.busy() == 0
 
 
 class TestClientTaskId:
