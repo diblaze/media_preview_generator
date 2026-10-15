@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1664,9 +1665,16 @@ def validate_paths():
 
 _BACKUP_FILES = ("settings.json", "schedules.json", "webhook_history.json", "setup_state.json")
 
-# What each file holds at its top level. A backup that doesn't read as that (cut short by a full disk during the copy,
-# or edited by hand) is read as empty once restored: settings.json as a new install, open without signing in.
-_BACKUP_SHAPES: dict[str, type] = {"settings.json": dict, "setup_state.json": dict}
+# Whether a file's contents have its shape. A backup that doesn't (cut short by a full disk during the copy, or edited
+# by hand) is read as empty once restored: settings.json as a new install, open without signing in, and schedules.json
+# as no schedules while their crons go on running.
+_BACKUP_SHAPES: dict[str, Callable[[Any], bool]] = {
+    "settings.json": lambda data: isinstance(data, dict),
+    # Its schedules an object too: a load that meets anything else fails part way, as on a corrupt file.
+    "schedules.json": lambda data: isinstance(data, dict) and isinstance(data.get("schedules", {}), dict),
+    "webhook_history.json": lambda data: isinstance(data, list),
+    "setup_state.json": lambda data: isinstance(data, dict),
+}
 
 _UNREADABLE_BACKUP = (
     "This backup can't be read: it may have been cut short when it was saved. Nothing was changed. Restore another one."
@@ -1685,15 +1693,12 @@ def _read_backup(name: str, path: str) -> tuple[bool, Any]:
     """
     import json
 
-    shape = _BACKUP_SHAPES.get(name)
-    if shape is None:
-        return True, None
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
         return False, None
-    return (True, data) if isinstance(data, shape) else (False, None)
+    return (True, data) if _BACKUP_SHAPES[name](data) else (False, None)
 
 
 def _list_backups_for(live_path: str) -> list[dict]:

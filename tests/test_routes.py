@@ -7668,6 +7668,80 @@ class TestBackupRestore:
         else:
             assert restored["id"] not in {s["id"] for s in servers}
 
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param(None, id="cut-short"),
+            pytest.param("[]", id="a-list"),
+            pytest.param('{"schedules": []}', id="its-schedules-a-list"),
+        ],
+    )
+    def test_a_schedules_backup_that_cant_be_read_is_refused_and_the_schedules_keep_running(self, client, contents):
+        """Restored, it was read as no schedules: one cut short left their crons running with none listed (the next
+        schedule save then stored none), and a list removed every cron."""
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        resp = client.post(
+            "/api/schedules", headers=_api_headers(), json={"name": "Nightly", "cron_expression": "0 3 * * *"}
+        )
+        assert resp.status_code == 201, resp.get_json()
+        schedule_id = resp.get_json()["id"]
+        manager = get_schedule_manager()
+        with open(manager.schedules_file) as f:
+            before = f.read()
+        backup = "schedules.json.20260101-100000.bak"
+        with open(os.path.join(manager.config_dir, backup), "w") as f:
+            f.write(before[: len(before) // 2] if contents is None else contents)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "schedules.json", "backup": backup}
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        with open(manager.schedules_file) as f:
+            assert f.read() == before
+        listed = client.get("/api/schedules", headers=_api_headers()).get_json()["schedules"]
+        assert [s["name"] for s in listed] == ["Nightly"]
+        assert manager.scheduler.get_job(schedule_id) is not None
+
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            pytest.param('{"events": []}', id="an-object"),
+            pytest.param("null", id="null"),
+            pytest.param('[{"title": "Ki', id="cut-short"),
+        ],
+    )
+    def test_a_webhook_history_backup_that_cant_be_read_is_refused(self, client, monkeypatch, contents):
+        """Restored, it was ignored: the Webhooks page kept the events it replaced, the next event wrote them back
+        over it, and the restore answered that it was restored."""
+        from collections import deque
+
+        from media_preview_generator.web import webhooks
+
+        monkeypatch.setattr(webhooks, "_webhook_history", deque(maxlen=webhooks._HISTORY_MAX))
+        webhooks._add_history_entry(source="sonarr", event_type="Download", title="Kept", status="queued")
+        live = str(webhooks._history_file_path())
+        with open(live) as f:
+            before = f.read()
+        backup = "webhook_history.json.20260101-100000.bak"
+        with open(os.path.join(os.path.dirname(live), backup), "w") as f:
+            f.write(contents)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "webhook_history.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "can't be read" in resp.get_json()["error"]
+        with open(live) as f:
+            assert f.read() == before
+        events = client.get("/api/webhooks/history", headers=_api_headers()).get_json()["events"]
+        assert [e["title"] for e in events] == ["Kept"]
+
     def test_the_backups_list_marks_a_backup_that_cant_be_read(self, client):
         """A backup cut short is newer than the live file, so it was marked "backup is newer", inviting the restore."""
         from media_preview_generator.utils import timestamped_backups
