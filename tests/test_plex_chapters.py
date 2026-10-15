@@ -704,3 +704,57 @@ def test_agent_validates_a_subset_of_chapter_revisions(backend, monkeypatch):
     assert register([{"index": True, "sha256": revisions[1]}]) == 400
     assert register([{"index": 7, "sha256": revisions[1]}]) == 409
     assert register([first]) == 200
+
+
+def test_a_missing_image_names_where_plex_reads_it(backend):
+    """Through a node the app writes the images and the node looks for them in Plex's own folder: the refusal says
+    which file it looked for, and which folder has to be this Plex's."""
+    target = read(backend)
+    folder, revisions = images(backend)
+    (folder / "chapter2.jpg").unlink()
+    with pytest.raises(ChapterError) as ei:
+        backend.register(target, revisions, VERSION, deadline=time.monotonic() + 3)
+    assert str(ei.value) == (
+        f"Chapter 2 image isn't at {folder / 'chapter2.jpg'}, where this Plex reads it. The Plex config folder "
+        "chapter images are written to must be this Plex's own folder."
+    )
+
+
+class TestThroughANodeTheAppsFolderMustBeThisPlexs:
+    """Through a Plex database node this app still writes the images, into its own Plex config folder."""
+
+    @staticmethod
+    def _folder(tmp_path, prefs_machine):
+        folder = tmp_path / "app-side Plex"
+        folder.mkdir()
+        if prefs_machine is not None:
+            (folder / "Preferences.xml").write_text(f'<Preferences ProcessedMachineIdentifier="{prefs_machine}"/>')
+        return folder
+
+    @staticmethod
+    def _context(folder, monkeypatch):
+        from media_preview_generator.markers.publishers import plex_chapters
+
+        settings = SimpleNamespace(agent_enabled=True, agent_url="http://plex-host:9494", agent_token="k" * 32)
+        monkeypatch.setattr(plex_chapters, "load_server", lambda *_a: settings)
+        monkeypatch.setattr(plex_chapters, "node_refusal", lambda _s: None)
+        server = MagicMock()
+        server._connect.return_value.query.return_value = {"machineIdentifier": MACHINE, "version": VERSION}
+        config = SimpleNamespace(markers={}, output={"plex_config_folder": str(folder)})
+        return plex_chapters._context(server, config)
+
+    def test_another_plexs_folder_is_refused_before_anything_is_generated(self, tmp_path, monkeypatch):
+        folder = self._folder(tmp_path, "another-plex")
+        with pytest.raises(ChapterError) as ei:
+            self._context(folder, monkeypatch)
+        assert ei.value.state is Capability.MISCONFIGURED
+        assert str(ei.value).startswith(f"This server's Plex config folder ({folder}) belongs to a different Plex")
+        # Every file would fail the same way: not one the job retries.
+        assert _failure(ei.value).retryable is False
+
+    @pytest.mark.parametrize("prefs_machine", [MACHINE, None], ids=["this-plex", "unknown"])
+    def test_this_plexs_folder_or_one_that_cant_say_goes_to_the_node(self, tmp_path, monkeypatch, prefs_machine):
+        from media_preview_generator.markers.publishers.plex_remote import AgentClient
+
+        backend, machine, _version, _plex = self._context(self._folder(tmp_path, prefs_machine), monkeypatch)
+        assert isinstance(backend, AgentClient) and machine == MACHINE
