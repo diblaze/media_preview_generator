@@ -37,6 +37,18 @@ def test_explicit_empty_groups_survive_a_repeated_migration(tmp_path):
     assert settings.worker_groups_revision == 4
 
 
+# A revision edited by hand into something other than a whole number counts as 0, as the settings read it.
+HAND_EDITED_REVISIONS = [pytest.param(None, id="null"), pytest.param("abc", id="text"), pytest.param("3", id="digits")]
+
+
+@pytest.mark.parametrize("revision", HAND_EDITED_REVISIONS)
+def test_v21_reads_a_hand_edited_revision_as_zero(tmp_path, revision):
+    settings = SettingsManager(str(tmp_path))
+    settings.update({"cpu_threads": 2, "worker_groups_revision": revision})
+    _migrate_to_v21(settings)
+    assert settings.get("worker_groups_revision") == 0
+
+
 def test_ambiguous_existing_pause_remains_manual(tmp_path):
     settings = SettingsManager(str(tmp_path))
     settings.update({"processing_paused": True, "cpu_threads": 2})
@@ -280,6 +292,13 @@ def test_v22_keeps_an_explicit_empty_list_and_its_revision(tmp_path):
     settings.update({"worker_groups": [], "worker_groups_revision": 4})
     assert _migrate_to_v22(settings) == []
     assert settings.worker_groups_revision == 4
+
+
+@pytest.mark.parametrize("revision", HAND_EDITED_REVISIONS)
+def test_v22_reads_a_hand_edited_revision_as_zero(tmp_path, revision):
+    settings = _store_v21(tmp_path, revision=revision)
+    assert len(_migrate_to_v22(settings)) == 1
+    assert settings.get("worker_groups_revision") == 1
 
 
 def test_v22_refuses_a_stored_list_that_fails_validation(tmp_path):

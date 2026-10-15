@@ -1879,7 +1879,7 @@ def _migrate_to_v21(sm) -> list[str]:
     reasons = sorted(set(reasons) & {"manual", "quiet_hours"})
     updates: dict[str, Any] = {
         "worker_groups": groups,
-        "worker_groups_revision": int(stored.get("worker_groups_revision", 0)),
+        "worker_groups_revision": sm.worker_groups_revision,
         "processing_pause_reasons": reasons,
         "processing_paused": bool(reasons),
     }
@@ -1906,9 +1906,7 @@ def _migrate_to_v22(sm) -> list[str]:
     groups = validate_worker_groups(stored["worker_groups"])
     if groups == stored["worker_groups"]:
         return []
-    sm.apply_changes(
-        updates={"worker_groups": groups, "worker_groups_revision": int(stored.get("worker_groups_revision", 0)) + 1}
-    )
+    sm.apply_changes(updates={"worker_groups": groups, "worker_groups_revision": sm.worker_groups_revision + 1})
     return ["v22: worker groups now hold devices; every existing group kept its device, count, jobs and hours"]
 
 
