@@ -32,7 +32,9 @@ from .registry import NodeRegistry, get_registry
 # How often a running task is polled; a cancel or a pause flip is forwarded within one slice of it.
 POLL_INTERVAL_S = 1.0
 _SLICE_S = 0.2
-# Failed polls in a row after which the node counts as gone (each waits up to the client's 3 s connect timeout: ~12 s).
+# A task's node counts as gone once its polls have failed for this long, and at least MAX_FAILED_POLLS of them in a
+# row (spec §6). By time, not count alone: a refused connection fails at once, so three polls would be a 2 s blip.
+NODE_GONE_AFTER_S = 12.0
 MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
@@ -249,14 +251,14 @@ class _TaskRun:
         self._next_log = 0
         self._last_progress: dict | None = None
         self._progress_warned = False
-        self._cancel_sent_at: float | None = None
+        self._cancel_seen_at: float | None = None
+        self._cancel_delivered = False
         self._paused_at: float | None = None
-        self.gone = False
+        self._forgotten = False
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
-        self.gone = True
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
-        if self._cancel_sent_at is not None:
+        if self._cancel_seen_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
             return NodeTaskCancelledError(protocol.KIND_CANCELLED, message)
         return NodeUnavailableError(self._placement.node_id, self._placement.node_name, message, started=started)
@@ -293,20 +295,29 @@ class _TaskRun:
     def _pause_wanted(self) -> bool:
         return bool(self._pause_check and self._pause_check())
 
-    def _forward_controls(self) -> None:
-        """Send the job's cancel once, and each pause flip, to the node; a failed send is tried again next slice."""
-        if self._cancel_sent_at is None and self._cancel_requested():
-            self._cancel_sent_at = time.monotonic()
+    def _forward_controls(self) -> bool:
+        """Send the job's cancel, and each pause flip, to the node; a failed send is tried again next slice.
+
+        Returns:
+            True when a cancel or a pause flip reached the node.
+        """
+        if self._cancel_seen_at is None and self._cancel_requested():
+            self._cancel_seen_at = time.monotonic()
+        if self._cancel_seen_at is not None:
+            if self._cancel_delivered:
+                return False
             try:
                 self._client.cancel_task(self._task_id)
             except NodeError as exc:
                 logger.debug("{}cancel not delivered yet: {}", self._prefix, exc)
-            return
-        if self._cancel_sent_at is not None or self._pause_check is None:
-            return
+                return False
+            self._cancel_delivered = True
+            return True
+        if self._pause_check is None:
+            return False
         wanted = self._pause_wanted()
         if wanted == (self._paused_at is not None):
-            return
+            return False
         try:
             if wanted:
                 self._client.pause_task(self._task_id)
@@ -317,6 +328,8 @@ class _TaskRun:
                 self._paused_at = None
         except NodeError as exc:
             logger.debug("{}pause/resume not delivered yet: {}", self._prefix, exc)
+            return False
+        return True
 
     def _add_held(self, seconds: float) -> None:
         # A shared markers Freeze carries the time held, so deadlines the app keeps across steps move out by a pause
@@ -326,19 +339,19 @@ class _TaskRun:
             self._pause_check.held_s = held + seconds  # type: ignore[union-attr]
 
     def _controls_changed(self) -> bool:
-        if self._cancel_sent_at is None and self._cancel_requested():
+        if self._cancel_seen_at is not None:
+            return not self._cancel_delivered
+        if self._cancel_requested():
             return True
-        return (
-            self._pause_check is not None
-            and self._cancel_sent_at is None
-            and (self._pause_wanted() != (self._paused_at is not None))
-        )
+        return self._pause_check is not None and (self._pause_wanted() != (self._paused_at is not None))
 
     def _sleep(self) -> None:
+        # A control that reached the node ends the wait so the next poll shows its effect; one that didn't is sent
+        # again each slice without polling any faster.
         deadline = time.monotonic() + POLL_INTERVAL_S
         while (left := deadline - time.monotonic()) > 0:
             time.sleep(min(_SLICE_S, left))
-            if self._controls_changed():
+            if self._controls_changed() and self._forward_controls():
                 return
 
     def _relay(self, state: dict) -> None:
@@ -365,15 +378,20 @@ class _TaskRun:
         """Poll until the task finishes; its last state."""
         name = self._placement.node_name
         failed_polls = 0
+        failing_since = 0.0
         while True:
             self._forward_controls()
+            asked_at = time.monotonic()
             try:
                 state = self._client.poll_task(self._task_id, log_from=self._next_log)
             except NodeUnknownTaskError as exc:
+                self._forgotten = True
                 raise self._unavailable(f"{name} no longer knows the task (it restarted?)") from exc
             except NodeError as exc:
+                if failed_polls == 0:
+                    failing_since = asked_at
                 failed_polls += 1
-                if failed_polls >= MAX_FAILED_POLLS:
+                if failed_polls >= MAX_FAILED_POLLS and time.monotonic() - failing_since >= NODE_GONE_AFTER_S:
                     raise self._unavailable(f"{name} stopped answering: {exc}") from exc
                 self._sleep()
                 continue
@@ -381,7 +399,7 @@ class _TaskRun:
             self._relay(state)
             if state.get("status") in protocol.FINISHED_STATUSES:
                 return state
-            if self._cancel_sent_at is not None and time.monotonic() - self._cancel_sent_at > CANCEL_WAIT_S:
+            if self._cancel_seen_at is not None and time.monotonic() - self._cancel_seen_at > CANCEL_WAIT_S:
                 raise NodeTaskCancelledError(protocol.KIND_CANCELLED, f"{name} didn't stop the cancelled task")
             self._sleep()
 
@@ -424,7 +442,9 @@ class _TaskRun:
         extract_artifact(data, dest)
 
     def delete(self) -> None:
-        if not self._task_id or self.gone:
+        # Also after the node stopped answering: when it comes back, a task it still runs stops now rather than at
+        # its unpolled-task expiry, beside the file's next try.
+        if not self._task_id or self._forgotten:
             return
         try:
             self._client.delete_task(self._task_id)

@@ -7,6 +7,7 @@ import os
 import re
 import tarfile
 import threading
+import time
 
 import pytest
 from loguru import logger
@@ -40,6 +41,8 @@ PLACEMENT = Placement(NODE_ID, NODE_NAME)
 @pytest.fixture(autouse=True)
 def _fast_polls(monkeypatch):
     monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.0)
+    # Polls take no time here, so the node counts as gone on the failed-poll count alone.
+    monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.0)
     yield
     set_registry(None)
 
@@ -217,7 +220,42 @@ class TestNodeDrops:
         assert "stopped answering" in str(raised.value)
         assert len(client.named("poll")) == 4
         assert registry.reports == [("unavailable", NODE_ID)]
-        assert client.named("delete") == []  # nobody to tell
+        # Still asked to drop it: a node back from a blip stops the task now, not beside the file's next try.
+        assert client.named("delete") == [("delete",)]
+
+    def test_a_blip_shorter_than_the_give_up_time_does_not_drop_a_task_the_node_still_runs(self, media, monkeypatch):
+        # Refused connections fail at once: four failed polls in a row take a fraction of the give-up time.
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.02)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 1.0)
+        client = ScriptedClient(
+            [running(), unreachable(), unreachable(), unreachable(), unreachable(),
+             finished(protocol.STATUS_DONE, result={"ok": 1})]
+        )  # fmt: skip
+        registry = _install(client)
+
+        assert _run(media) == {"ok": 1}
+        assert registry.reports == []
+
+    def test_polls_failing_for_the_whole_give_up_time_drop_it(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.02)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.3)
+        client = ScriptedClient([running(), unreachable()])
+        _install(client)
+
+        started = time.monotonic()
+        with pytest.raises(NodeUnavailableError, match="stopped answering"):
+            _run(media)
+
+        assert time.monotonic() - started >= 0.3
+        assert len(client.named("poll")) > executor.MAX_FAILED_POLLS + 1
+        assert client.named("delete") == [("delete",)]
+
+    def test_a_node_that_forgot_the_task_is_not_asked_to_delete_it(self, media):
+        client = ScriptedClient([running(), NodeUnknownTaskError("unknown_task")])
+        _install(client)
+        with pytest.raises(NodeUnavailableError):
+            _run(media)
+        assert client.named("delete") == []
 
     def test_two_failed_polls_then_an_answer_carry_on(self, media):
         client = ScriptedClient(
@@ -375,6 +413,47 @@ class TestCancelAndPause:
 
         assert len(client.named("cancel")) == 1
         assert client.named("delete") == [("delete",)]
+
+    def test_a_cancel_lost_to_one_transient_error_is_sent_again(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "CANCEL_WAIT_S", 0.3)
+
+        class FlakyCancel(ScriptedClient):
+            def cancel_task(self, task_id: str) -> None:
+                super().cancel_task(task_id)
+                if len(self.named("cancel")) == 1:
+                    raise unreachable()
+
+        client = FlakyCancel([running()])
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError):
+            _run(media, cancel_check=lambda: True)
+
+        assert len(client.named("cancel")) == 2  # sent again until delivered, then never again
+
+    def test_an_undelivered_cancel_is_sent_again_each_slice_without_extra_polls(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.5)
+        monkeypatch.setattr(executor, "_SLICE_S", 0.05)
+
+        class CancelLostTwice(ScriptedClient):
+            def cancel_task(self, task_id: str) -> None:
+                super().cancel_task(task_id)
+                if len(self.named("cancel")) <= 2:
+                    raise unreachable()
+
+        def answer(client):
+            if len(client.named("cancel")) >= 3:
+                return finished(protocol.STATUS_CANCELLED, error={"kind": "cancelled", "message": "stopped"})
+            return running()
+
+        client = CancelLostTwice([answer])
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError):
+            _run(media, cancel_check=lambda: True)
+
+        assert len(client.named("cancel")) == 3
+        assert len(client.named("poll")) == 2  # the retries rode the slices; one poll after the delivered cancel
 
     def test_a_cancel_while_the_node_goes_away_ends_as_cancelled(self, media):
         cancel = threading.Event()
