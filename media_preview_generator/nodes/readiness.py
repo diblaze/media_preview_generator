@@ -106,7 +106,9 @@ def _section(section_id: str, title: str, checks: list[dict[str, Any]]) -> dict[
     }
 
 
-def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> list[dict[str, Any]]:
+def _connection(
+    details: NodeDetails, app_version: str, app_build: str = "", node_uid: str = ""
+) -> list[dict[str, Any]]:
     view = details.view
     if view.state == STATE_DISABLED:
         row = _row(
@@ -188,7 +190,9 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
         return rows
     from ..markers.publishers.plex_remote import MIN_AGENT_VERSION
 
-    version_ok = view.state != STATE_UPDATE_NEEDED
+    # A saved id means a node that gives one answered here before: an older release that gives none is refused.
+    rolled_back = view.legacy and bool(node_uid)
+    version_ok = view.state != STATE_UPDATE_NEEDED and not rolled_back
     # The registry holds a worker to this app's exact version, a Plex database node only to a minimum one.
     worker = protocol.ROLE_WORKER in view.roles or not view.roles
     if worker:
@@ -217,7 +221,14 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
             explanation=explanation,
             current=current,
             recommended=recommended,
-            reason=None if version_ok else view.reason,
+            reason=None
+            if version_ok
+            else (
+                "It answers as an older release that gives no id, so this app can't confirm it is the same Plex. "
+                "Update the node, or type its key again on its Settings tab if it is the same Plex."
+                if rolled_back
+                else view.reason
+            ),
             fix_where=FIX_ON_NODE,
             docs_url=UPDATE_DOCS_URL,
             help_label="How to update a node",
@@ -249,7 +260,7 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
                 fix_where=FIX_ON_NODE,
             )
         )
-    if view.legacy:
+    if view.legacy and not rolled_back:
         from .server.plex_db import AGENT_VERSION
 
         rows.append(
@@ -591,7 +602,7 @@ def node_readiness(
         ``{"overall_ok", "sections"}``.
     """
     view = details.view
-    sections = [_section("node_connection", "Connection", _connection(details, app_version, app_build))]
+    sections = [_section("node_connection", "Connection", _connection(details, app_version, app_build, node_uid))]
     usable = view.state not in (STATE_DISABLED, STATE_OFFLINE, STATE_CONNECTING, STATE_KEY_REFUSED, STATE_DUPLICATE)
     worker = protocol.ROLE_WORKER in view.roles or not view.roles
     if usable and worker and not view.legacy:
