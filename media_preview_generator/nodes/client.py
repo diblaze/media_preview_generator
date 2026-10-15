@@ -42,7 +42,17 @@ class NodeAuthError(NodeError):
 
 
 class NodeProtocolError(NodeError):
-    """The node speaks another protocol, or answered with something that isn't this protocol."""
+    """The node speaks another protocol, or answered with something that isn't this protocol.
+
+    Args:
+        message: What went wrong.
+        node: The ``node`` block of a node that refused this app's protocol (it names the node's version); None when
+            whatever answered isn't a node of this app (an older Plex helper answers without one).
+    """
+
+    def __init__(self, message: str, *, node: dict | None = None) -> None:
+        super().__init__(message)
+        self.node = node
 
 
 class NodeUnknownTaskError(NodeError):
@@ -152,7 +162,8 @@ class NodeClient:
             # A Plex helper from before nodes existed answers its own routes but 404s the node ones.
             raise NodeProtocolError(f"{self._address.base} doesn't know {path} (an older Plex helper?)")
         if response.status_code == 409 and kind == protocol.KIND_PROTOCOL:
-            raise NodeProtocolError(message)
+            node = body.get("node")
+            raise NodeProtocolError(message, node=node if isinstance(node, dict) else None)
         if response.status_code == 409 and kind == protocol.KIND_TASK_DELETED:
             raise NodeTaskDeletedError(message)
         if response.status_code == 400:

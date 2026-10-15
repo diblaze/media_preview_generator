@@ -187,8 +187,9 @@ retry runs (on the **node's** CPU, see §6).
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
-  agent's existing `MIN_AGENT_VERSION` rule. An old helper that has no `/v1/info` is a Plex database node in
-  "legacy" mode — it keeps working and Setup Health recommends updating it.
+  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block). A node that refuses the app's
+  node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
+  `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.

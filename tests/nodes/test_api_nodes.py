@@ -258,6 +258,21 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id}).get_json()
         assert body["ok"] is True and body["info"]["already_added"] is None
 
+    def test_probe_of_a_node_on_another_node_protocol_names_both_versions(self, client, nodes, monkeypatch):
+        node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": ["worker"]}
+
+        class OtherProtocol:
+            def info(self):
+                raise NodeProtocolError("another protocol", node=node)
+
+        pinged = []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: OtherProtocol())
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: pinged.append(url) or ("connected", "1"))
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["ok"] is False and body["error"]["kind"] == "protocol"
+        assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
+        assert pinged == []
+
 
 class TestCreate:
     def test_adding_a_node_saves_it_and_answers_with_its_row(self, client, nodes):

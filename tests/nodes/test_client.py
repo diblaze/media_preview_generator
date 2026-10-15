@@ -13,6 +13,7 @@ import requests
 from media_preview_generator.nodes.client import (
     NodeAddress,
     NodeClient,
+    NodeProtocolError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnreachableError,
@@ -94,3 +95,25 @@ class TestAStartAfterItsDelete:
         client = NodeClient(NodeAddress("http://node:9494", "k"), session=session)
         with pytest.raises(NodeTaskDeletedError, match="deleted"):
             client.start_task({"op": "x"})
+
+
+class TestAProtocolRefusal:
+    def _client(self, body: dict) -> NodeClient:
+        response = MagicMock(status_code=409)
+        response.json.return_value = body
+        session = MagicMock(spec=requests.Session)
+        session.request.return_value = response
+        return NodeClient(NodeAddress("http://node:9494", "k"), session=session)
+
+    def test_from_a_node_carries_its_node_block(self):
+        node = {"id": "u1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": ["worker"]}
+        body = {"ok": False, "node": node, "error": {"kind": "protocol", "message": "speaks 2"}}
+        with pytest.raises(NodeProtocolError) as raised:
+            self._client(body).info()
+        assert raised.value.node == node
+
+    def test_from_an_older_plex_helper_carries_none(self):
+        body = {"ok": False, "agent": {"version": "1.2.0"}, "error": {"kind": "protocol", "message": "speaks 1"}}
+        with pytest.raises(NodeProtocolError) as raised:
+            self._client(body).info()
+        assert raised.value.node is None

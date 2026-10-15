@@ -521,6 +521,16 @@ class TestAddNode:
         expect(authed_page.locator("#addNodeError")).to_contain_text(text)
         expect(authed_page.locator("#addNodeNext")).to_be_hidden()
 
+    def test_a_node_on_another_protocol_names_both_versions(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        message = f"This node runs version 9.10.0 and this app runs {APP_VERSION}, and they don't speak the same node"
+        api.probe_answer = {"ok": False, "error": {"kind": "protocol", "message": message, "node_version": "9.10.0"}}
+        authed_page.locator("#addNodeUrl").fill("http://nas:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text(message)
+
     def test_missing_fields_are_flagged_inline(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)

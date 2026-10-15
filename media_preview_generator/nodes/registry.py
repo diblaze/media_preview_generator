@@ -757,7 +757,9 @@ class NodeRegistry:
                     STATE_KEY_REFUSED,
                     f"{name} refused the key. Copy the key from the node's log or settings into this node's key field.",
                 )
-            except NodeProtocolError:
+            except NodeProtocolError as exc:
+                if exc.node is not None:
+                    return self._other_protocol(name, exc.node)
                 return self._probe_legacy(record)
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
@@ -769,6 +771,19 @@ class NodeRegistry:
                 f"{name} didn't answer. Check that it is running and reachable from this app.",
             )
         return self._read_info(record, info)
+
+    def _other_protocol(self, name: str, block: dict) -> _Outcome:
+        """A node that refused this app's node protocol: one of the two needs an update (it is a node: no ping)."""
+        version = str(block.get("version") or "")
+        roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
+        return _Outcome(
+            STATE_UPDATE_NEEDED,
+            f"{name} runs version {version or 'unknown'} and this app runs {self._app_version()}, and they don't "
+            "speak the same node protocol. Update the older one so both run the same version.",
+            info={"node": dict(block)},
+            version=version,
+            roles=roles,
+        )
 
     def _read_info(self, record: dict, info: dict) -> _Outcome:
         from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_too_old

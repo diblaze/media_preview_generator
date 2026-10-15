@@ -207,7 +207,16 @@ def _probe(url: str, key: str) -> dict[str, Any]:
         return _probe_error(protocol.KIND_AUTH, "The node refused this key.")
     except NodeRequestError as exc:
         return _probe_error(protocol.KIND_REQUEST, str(exc))
-    except NodeProtocolError:
+    except NodeProtocolError as exc:
+        if exc.node is not None:
+            node_version = str(exc.node.get("version") or "")[:NODE_TEXT_MAX] or "unknown"
+            answer = _probe_error(
+                protocol.KIND_PROTOCOL,
+                f"This node runs version {node_version} and this app runs {_app_version()}, and they don't speak the "
+                "same node protocol. Update the older one so both run the same version.",
+            )
+            answer["error"]["node_version"] = node_version
+            return answer
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")

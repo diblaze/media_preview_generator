@@ -219,6 +219,22 @@ class TestStates:
         h.registry.check_now("n1")
         assert h.uids == []
 
+    def test_a_node_on_another_node_protocol_needs_an_update_naming_both_versions(self, h):
+        node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": [ROLE_WORKER]}
+        legacy_asked = []
+        h.registry._legacy_ping = lambda url, key: legacy_asked.append(url) or ("connected", "1.2.0")
+        h.client().default_info = NodeProtocolError("another protocol", node=node)
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_UPDATE_NEEDED
+        assert "9.10.0" in view.reason and APP_VERSION in view.reason
+        assert (view.version, view.legacy) == ("9.10.0", False)
+        assert legacy_asked == []
+
+    def test_an_answer_without_a_node_block_is_tried_as_an_older_plex_helper(self, h):
+        h.client().default_info = NodeProtocolError("doesn't know /v1/info")
+        view = h.registry.check_now("n1")
+        assert (view.state, view.legacy) == (reg.STATE_READY, True)
+
     def test_a_turned_off_node_is_disabled_and_never_asked(self, h):
         h.change(enabled=False)
         view = h.registry.check_now("n1")
@@ -642,3 +658,58 @@ class TestRecordedNodeId:
         check.join(5)
 
         assert (sm.nodes[0]["url"], sm.nodes[0]["node_uid"]) == ("http://new-nuc:9494", None)
+
+
+class TestAgainstARealNode:
+    """The registry's check against the node's own server."""
+
+    KEY = "registry-real-node-key-0123456789"
+
+    @pytest.fixture
+    def node_url(self, tmp_path, monkeypatch):
+        from werkzeug.serving import make_server
+
+        from media_preview_generator.nodes.server import app as node_app
+        from media_preview_generator.nodes.server import info
+
+        for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_ROLES"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
+        monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+        app = node_app.create_node_app(config_dir=str(tmp_path / "config"), roles=["worker"], key=self.KEY, ops={})
+        app.extensions[node_app.EXTENSION].worker_info._detect = lambda: []
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_port}"
+        server.shutdown()
+        thread.join(5)
+        app.extensions[node_app.EXTENSION].close()
+
+    def test_a_worker_node_on_another_node_protocol_needs_an_update(self, node_url):
+        import requests
+
+        from media_preview_generator import __version__
+        from media_preview_generator.nodes import protocol
+        from media_preview_generator.nodes.client import NodeAddress, NodeClient
+
+        class NewerAppClient(NodeClient):
+            """The app after a protocol bump (it asks for protocol 2); the node is still on protocol 1."""
+
+            def _headers(self):
+                return {"Authorization": f"Bearer {TestAgainstARealNode.KEY}", protocol.PROTOCOL_HEADER: "2"}
+
+        record = _record(url=node_url, key=self.KEY, path_mappings=[])
+        session = requests.Session()
+        session.trust_env = False
+        registry = reg.NodeRegistry(
+            revision_provider=lambda: 1,
+            nodes_provider=lambda: [record],
+            record_uid=lambda *_: None,
+            legacy_ping=lambda url, key: pytest.fail("a node is never asked the old helper's ping"),
+            app_version=lambda: "0.0.1",
+            attempt_gap_s=0.0,
+        )
+        outcome = registry._probe(record, NewerAppClient(NodeAddress(node_url, self.KEY), session=session))
+        assert outcome.state == reg.STATE_UPDATE_NEEDED, outcome.reason
+        assert __version__ in outcome.reason and "0.0.1" in outcome.reason

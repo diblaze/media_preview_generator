@@ -552,6 +552,8 @@
             case 'unreachable':
                 return 'Nothing answered at this address. Check the address and port, and that the node is running.';
             case 'protocol':
+                // A node on another protocol says which version it runs; anything else isn't a node of this app.
+                if (error.node_version) return error.message;
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
             case 'request':
                 return "The node didn't accept the request. Update the node and this app to the same version.";
