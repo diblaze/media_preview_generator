@@ -379,26 +379,55 @@ def test_one_address_cant_hold_every_connection_the_node_takes(served):
             conn.close()
 
 
-def test_connections_are_counted_per_caller_network_not_per_address(served, monkeypatch):
-    """An IPv6 caller can use a new address in its /64 for each connection: they all count as one caller."""
+def test_each_address_in_an_ipv6_64_has_its_own_limit_and_the_64_a_looser_one(served, monkeypatch):
+    """A machine holding its limit doesn't lock out the app beside it in its /64; a new address in the /64 for every
+    connection is held to the /64's limit."""
     from media_preview_generator.nodes.server import wsgi
 
-    # Loopback has one IPv6 address, so two IPv4 loopback addresses stand in for two addresses in one /64.
-    same_64 = {"127.0.0.2": "2001:db8:1:2::/64", "127.0.0.3": "2001:db8:1:2::/64"}
-    monkeypatch.setattr(wsgi, "caller_key", lambda address: same_64.get(address, address), raising=False)
-    port = served(CONNECTION_LIMIT=20, CONNECTIONS_PER_ADDRESS=5)
+    # Loopback has one IPv6 address, so IPv4 loopback addresses stand in for addresses in one /64.
+    in_64 = {"127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"}
+    monkeypatch.setattr(wsgi, "caller_network", lambda address: "2001:db8:1:2::/64" if address in in_64 else None)
+    port = served(CONNECTION_LIMIT=40, CONNECTIONS_PER_ADDRESS=5, CONNECTIONS_PER_NETWORK=8)
     held = [_half_sent(port, "127.0.0.2") for _ in range(5)]
     try:
         time.sleep(0.5)
-        try:
-            refused = b" 200 " not in _health_from(port, "127.0.0.3")
-        except OSError:
-            refused = True
-        assert refused
-        assert b" 200 " in _health_from(port, "127.0.0.1")
+        assert b" 200 " in _answer_from(port, "127.0.0.3")
+        held += [_half_sent(port, "127.0.0.4") for _ in range(3)]
+        time.sleep(0.5)
+        assert _answer_from(port, "127.0.0.5") == b""
+        assert b" 200 " in _answer_from(port, "127.0.0.1")
     finally:
         for conn in held:
             conn.close()
+
+
+def _half_sent_body(port: int, source: str, size: int) -> socket.socket:
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0))
+    conn.sendall(b"POST /v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % (2 * size) + b"x" * size)
+    return conn
+
+
+def test_request_bodies_the_node_holds_before_any_key_check_have_a_budget(served):
+    # waitress holds each request whole in memory before the key is checked: a thousand connections sending bodies
+    # near the body limit held half a gigabyte, enough to take down a small node.
+    port = served(REQUEST_BYTES_FREE=10_000, REQUEST_BYTES_BUDGET=200_000)
+    first = _half_sent_body(port, "127.0.0.2", 120_000)
+    try:
+        time.sleep(0.5)
+        second = _half_sent_body(port, "127.0.0.3", 120_000)
+        try:
+            assert _closed_by_the_node(second)
+        finally:
+            second.close()
+        assert b" 200 " in _answer_from(port, "127.0.0.1"), "a request within its free bytes is still read"
+    finally:
+        first.close()
+    time.sleep(0.5)
+    third = _half_sent_body(port, "127.0.0.3", 120_000)
+    try:
+        assert not _closed_by_the_node(third), "the budget comes back once the first connection is gone"
+    finally:
+        third.close()
 
 
 def _keep_alive(port: int, source: str) -> socket.socket:
@@ -458,8 +487,10 @@ def test_one_address_may_hold_a_connection_for_every_worker_one_app_can_give_a_n
     from media_preview_generator.worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
 
     assert wsgi.CONNECTIONS_PER_ADDRESS > MAX_CPU_WORKERS + MAX_GPU_WORKERS
-    # And still no single machine takes every connection the node has, Windows' smaller limit included.
-    assert wsgi.CONNECTIONS_PER_ADDRESS < wsgi.SELECT_CONNECTION_LIMIT <= wsgi.CONNECTION_LIMIT
+    assert wsgi.CONNECTIONS_PER_ADDRESS <= wsgi.CONNECTIONS_PER_NETWORK
+    # And it takes several machines (or /64s) to take every connection the node has, Windows' smaller limit included.
+    assert 3 * wsgi.CONNECTIONS_PER_ADDRESS <= wsgi.SELECT_CONNECTION_LIMIT <= wsgi.CONNECTION_LIMIT
+    assert 2 * wsgi.CONNECTIONS_PER_NETWORK <= wsgi.SELECT_CONNECTION_LIMIT
 
 
 def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):

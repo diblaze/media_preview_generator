@@ -174,11 +174,14 @@ Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `
 filled up or went read-only mid-task: the app queues the file again with no drop counted and checks the node), plus
 request-level `auth`, `protocol`, `unknown_task`, `request`, `task_deleted`, `node_stopping`, `rate_limited`.
 
-Wrong keys: a caller (an IPv4 address, or an IPv6 address's /64) may send 20 at once, then one more every 3 s. Past
-that, every request from it (the Plex database role's too) answers 429 `rate_limited` with `Retry-After`, whatever
-its key, which isn't compared: an app with the right key behind a shared address (NAT, a proxy, an old copy with an
-old key) reads it as a wait like no answer, never as a refused key, and the node logs the address once. The
-per-caller connection cap (100) counts the same way.
+Wrong keys: a caller address may send 20 at once, then one more every 3 s; an IPv6 address's /64 as a whole 10 times
+that (200 at once, one more every 0.3 s), so a device with an old key holds back only itself, not the rest of its
+network. Past that, every request from it (the Plex database role's too) answers 429 `rate_limited` with
+`Retry-After`, whatever its key, which isn't compared: an app with the right key behind a shared address (NAT, a
+proxy, an old copy with an old key) reads it as a wait like no answer, never as a refused key, and the node logs the
+address once. Connections are capped the same two ways: 160 per address (one app's every worker plus its checks), 250
+per /64. Request bytes being read beyond each request's first 64 KB share a 64 MB budget, so connections that send
+large bodies before the key is checked can't fill a small node's memory.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is
