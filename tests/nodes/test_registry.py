@@ -1285,6 +1285,54 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
 
         assert h.registry.plex_db_hold("n1").waits
 
+    @pytest.mark.parametrize("after", ["app-start", "node-down"])
+    def test_an_older_release_that_gives_no_id_is_held_until_updated_or_confirmed(self, h, after):
+        # An answer without an id used to count as hearing the node: an older Plex helper beside another Plex, with
+        # the saved key at the saved address, got this server's markers.
+        client = h.client()
+        if after == "node-down":
+            client.default_info = self._answer("uid-1")
+            h.registry.check_now("n1")
+            client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
+            h.registry.check_now("n1")
+        client.default_info = NodeProtocolError("404")  # an older Plex helper doesn't know /v1/info
+        h.legacy = ("connected", "1.2.0")
+        if after == "node-down":
+            h.registry.check_now("n1")
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold is not None and not hold.waits
+        assert "older release that gives no id" in hold.message
+        assert h.registry.view("n1").state == reg.STATE_READY
+        h.change(node_uid=None)  # its key typed again
+        assert h.registry.plex_db_hold("n1") is None
+
+    def test_a_node_that_refuses_the_key_without_an_id_is_held_with_its_own_reason(self, h):
+        h.client().default_info = NodeAuthError("401")
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold is not None and not hold.waits
+        assert hold.message.startswith("nuc refused the key.")
+
+    def test_a_new_id_isnt_taken_for_the_saved_one_while_it_is_being_settled(self, h):
+        client = h.client()
+        client.default_info = self._answer("uid-1")
+        h.registry.check_now("n1")
+        seen = []
+        confirmed = h.registry._new_uid_confirmed
+
+        def spy(node_id, record, outcome):
+            seen.append(h.registry._nodes["n1"].heard_uid)
+            return confirmed(node_id, record, outcome)
+
+        h.registry._new_uid_confirmed = spy
+        client.default_info = self._answer("uid-2")
+        h.registry.check_now("n1")
+
+        assert seen == [None]
+
     def test_a_node_without_a_saved_id_is_never_held(self, h):
         h.change(node_uid=None)
         h.client().default_info = NodeUnreachableError("down")

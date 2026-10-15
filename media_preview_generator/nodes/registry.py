@@ -602,7 +602,8 @@ class NodeRegistry:
 
         A Plex database node that reports a new id could be a different machine that was given the same key and
         address; unless its Plex is the one the server uses, the user confirms it by typing its key again. A node
-        that answers as another saved node is refused too: its answer is that other machine's, not this one's.
+        that answers as another saved node is refused too: its answer is that other machine's, not this one's. So is
+        one with a saved id that answers with none (an older release): nothing says which Plex it is beside.
 
         Either is known only from a check that reached the node, so until one has since this app started (or since
         the node last didn't answer, or got another address) a node with a saved id gets nothing either: its work
@@ -625,8 +626,18 @@ class NodeRegistry:
                         f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key "
                         "again on its Settings tab to confirm."
                     )
-                if not live.record.get("node_uid") or live.heard_uid is not None:
+                # ``heard_uid`` holds only the saved id or one ``_new_uid`` accepted; an answer with no id ("") says
+                # nothing about which Plex is there.
+                if not live.record.get("node_uid") or live.heard_uid:
                     return None
+                if live.heard_uid == "":
+                    if live.probe_state == STATE_READY:
+                        return PlexDbHold(
+                            f"{name} answers as an older release that gives no id, so this app can't confirm it is "
+                            "the same Plex. Update the node, or type its key again on its Settings tab if it is the "
+                            "same Plex."
+                        )
+                    return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
                 if not live.checking and not waited and live.record.get("enabled", True):
                     live.checking = True
                     self._submit(self._run_check, node_id, False, True)
@@ -1138,8 +1149,11 @@ class NodeRegistry:
                         )
                     self._apply(live, outcome, number)
                     new_uid = bool(outcome.uid and not twin and outcome.uid != record.get("node_uid"))
-                    if not new_uid and (outcome.uid or outcome.state != STATE_OFFLINE):
-                        # A new id is settled by ``_new_uid`` first: until then nothing may reach the node.
+                    if new_uid:
+                        # A new id is settled by ``_new_uid`` first: until then nothing may reach the node (the saved
+                        # id heard before is another machine's now).
+                        live.heard_uid = None
+                    elif outcome.uid or outcome.state != STATE_OFFLINE:
                         live.heard_uid = outcome.uid
                     has_access_problem = bool(live.access_problem)
                     access = access or live.access_wanted
