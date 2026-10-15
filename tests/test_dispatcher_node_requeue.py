@@ -412,3 +412,75 @@ class TestClaimWorker:
         finally:
             stop.set()
             appender.join(timeout=5)
+
+
+class TestParkAndResume:
+    """A parked job resumes with the per-file node counts it had: a park must not give a file fresh tries."""
+
+    NODE_STATE = {
+        "node_drops": {"/m/a.mkv": 1},
+        "node_start_failures": {"/m/b.mkv": 4},
+        "dropped_on": {"/m/a.mkv": "n1"},
+        "excluded_nodes": {"/m/b.mkv": {"n2": "NAS"}},
+    }
+
+    def _parked_snapshot(self) -> dict:
+        dispatcher = JobDispatcher(_pool(("n1", "N1")))
+        tracker = JobTracker(job_id="j", items=_items("/m/a.mkv", "/m/b.mkv"), config=_config(), registry=MagicMock())
+        for field, value in self.NODE_STATE.items():
+            setattr(tracker, field, {path: (dict(v) if isinstance(v, dict) else v) for path, v in value.items()})
+        tracker.park_requested = True
+        dispatcher._trackers["j"] = tracker
+        try:
+            return dispatcher.park_snapshot("j")
+        finally:
+            dispatcher.shutdown()
+
+    def test_the_node_counts_survive_a_checkpoint_round_trip(self, tmp_path):
+        from media_preview_generator.jobs.checkpoints import read_checkpoint, write_checkpoint
+
+        snapshot = self._parked_snapshot()
+        reference = write_checkpoint(tmp_path, "j", snapshot)
+        state = read_checkpoint(tmp_path, "j", reference)["state"]
+
+        resumed = JobTracker(job_id="j", items=[], config=_config(), registry=MagicMock(), carried_state=state)
+
+        for field, value in self.NODE_STATE.items():
+            assert getattr(resumed, field) == value, field
+
+    def test_a_snapshot_from_before_the_node_counts_resumes_with_none(self, tmp_path):
+        from media_preview_generator.jobs.checkpoints import read_checkpoint, write_checkpoint
+
+        snapshot = self._parked_snapshot()
+        for field in self.NODE_STATE:
+            del snapshot["state"][field]
+        state = read_checkpoint(tmp_path, "j", write_checkpoint(tmp_path, "j", snapshot))["state"]
+
+        resumed = JobTracker(job_id="j", items=[], config=_config(), registry=MagicMock(), carried_state=state)
+
+        assert (resumed.node_drops, resumed.node_start_failures, resumed.dropped_on, resumed.excluded_nodes) == (
+            {},
+            {},
+            {},
+            {},
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "bad"),
+        [
+            ("node_drops", {"/m/a.mkv": "1"}),
+            ("node_drops", {"/m/a.mkv": -1}),
+            ("node_start_failures", {"/m/a.mkv": True}),
+            ("dropped_on", {"/m/a.mkv": 5}),
+            ("excluded_nodes", {"/m/a.mkv": "n2"}),
+            ("excluded_nodes", {"/m/a.mkv": {"n2": 3}}),
+            ("excluded_nodes", []),
+        ],
+    )
+    def test_corrupt_node_counts_are_refused(self, tmp_path, field, bad):
+        from media_preview_generator.jobs.checkpoints import write_checkpoint
+
+        snapshot = self._parked_snapshot()
+        snapshot["state"][field] = bad
+        with pytest.raises(ValueError, match="node"):
+            write_checkpoint(tmp_path, "j", snapshot)

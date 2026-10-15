@@ -210,6 +210,11 @@ class JobTracker:
             self.failed = int(carried_state.get("failed", 0))
             self.failed_paths = list(carried_state.get("failed_paths", []))
             self.node_failures = dict(carried_state.get("node_failures", {}))
+            # Older snapshots have none of these: their files start with no node tries counted.
+            self.node_drops = dict(carried_state.get("node_drops", {}))
+            self.node_start_failures = dict(carried_state.get("node_start_failures", {}))
+            self.dropped_on = dict(carried_state.get("dropped_on", {}))
+            self.excluded_nodes = {path: dict(nodes) for path, nodes in carried_state.get("excluded_nodes", {}).items()}
             self.outcome_counts.update(carried_state.get("outcome_counts", {}))
             self.publishers_aggregate = dict(carried_state.get("publishers_aggregate", {}))
             self.cpu_fallback_files = int(carried_state.get("cpu_fallback_files", 0))
@@ -822,6 +827,10 @@ class JobDispatcher:
                             "failed": tracker.failed,
                             "failed_paths": tracker.failed_paths,
                             "node_failures": tracker.node_failures,
+                            "node_drops": tracker.node_drops,
+                            "node_start_failures": tracker.node_start_failures,
+                            "dropped_on": tracker.dropped_on,
+                            "excluded_nodes": tracker.excluded_nodes,
                             "outcome_counts": tracker.outcome_counts,
                             "publishers_aggregate": tracker.publishers_aggregate,
                             "cpu_fallback_files": tracker.cpu_fallback_files,
