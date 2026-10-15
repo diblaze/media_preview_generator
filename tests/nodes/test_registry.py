@@ -507,6 +507,22 @@ class TestAccessProblem:
         paths = ["/media/openfilms/Movies/a.mkv", "/media/openfilms/Movies/b.mkv", "/media/other/c.mkv", "/elsewhere"]
         assert reg._default_library_names(paths) == ["Open Films", "Media"]
 
+    def test_check_nows_quick_access_check_samples_the_stored_libraries(self, monkeypatch):
+        from media_preview_generator.nodes import mappings
+        from media_preview_generator.web import settings_manager
+
+        servers = [{"id": "p1", "type": "plex", "name": "Home", "libraries": []}]
+
+        class Settings:
+            def get(self, key, default=None):
+                return servers if key == "media_servers" else default
+
+        asked = []
+        monkeypatch.setattr(settings_manager, "get_settings_manager", lambda: Settings())
+        monkeypatch.setattr(mappings, "quick_access_check", lambda *args: asked.append(args) or True)
+        assert reg._default_quick_access("client", list(MAPPINGS)) is True
+        assert asked == [("client", list(MAPPINGS), servers)]
+
     def test_the_access_problem_reason_is_plain_words(self, h):
         self._ready(h)
         for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):

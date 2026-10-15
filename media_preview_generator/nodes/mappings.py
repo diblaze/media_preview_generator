@@ -433,20 +433,23 @@ def run_test_access(
     return {"libraries": libraries}
 
 
-def quick_access_check(client: NodeClient, mappings: list[PathMapping]) -> bool:
-    """One file per mapping row: True when the node sees every one (and there was at least one to check).
+def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers: list[dict]) -> bool:
+    """One file per library folder: True when the node sees every one (and there was at least one to check).
 
-    Reading this app's folders has the same budget as Test access, so a stalled mount fails the check instead of
-    holding up the node's check.
+    Every library, as Test access samples them: one file per mapping row passes while a library under the same row
+    is out of the node's sight. Reading this app's folders has the same budget as Test access, so a stalled mount
+    fails the check instead of holding up the node's check.
 
     Args:
         client: The node.
         mappings: Its saved rows.
+        servers: The stored ``media_servers`` list.
 
     Returns:
         Whether every sampled file was visible.
     """
-    samplings = _sample_folders([row.app_prefix for row in mappings], SAMPLE_BUDGET_S, limit=1)
+    folders = list(dict.fromkeys(root.app_root for root in library_roots(servers)))
+    samplings = _sample_folders(folders, SAMPLE_BUDGET_S, limit=1)
     if any(sampling.timed_out for sampling in samplings):
         logger.debug("Quick access check gave up: this app's own library folder didn't answer")
         return False

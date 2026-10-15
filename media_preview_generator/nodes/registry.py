@@ -321,9 +321,10 @@ def _default_library_names(app_paths: list[str]) -> list[str]:
 
 
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
+    from ..web.settings_manager import get_settings_manager
     from .mappings import quick_access_check
 
-    return quick_access_check(client, mappings)
+    return quick_access_check(client, mappings, get_settings_manager().get("media_servers") or [])
 
 
 def _clean_gpus(raw: object) -> tuple[dict, ...]:
@@ -415,7 +416,7 @@ class NodeRegistry:
         client_factory: Builds the client for one record.
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
         record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
-        quick_access: Checks one file per mapping row on a node; True when every one is visible.
+        quick_access: Checks one file per library on a node; True when every one is visible.
         served_plex_ids: The machine identifiers of the Plex servers that use a node as their Plex database node.
         app_version: This app's version (a worker node must match it exactly).
         app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
@@ -727,7 +728,7 @@ class NodeRegistry:
 
     def check_now(self, node_id: str) -> NodeView | None:
         """Run a health check now (blocking). When the node has an access problem, a passing quick access check
-        (one file per mapping row) clears it.
+        (one file per library) clears it.
 
         Returns:
             The view after the check, or None for an unknown node.
