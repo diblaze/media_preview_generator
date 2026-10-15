@@ -1103,7 +1103,7 @@ class NodeRegistry:
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
         info: dict | None = None
-        timeouts = 0
+        timeouts = rate_limited = 0
         for attempt in range(CHECK_ATTEMPTS):
             try:
                 info = _bounded(client.info())
@@ -1117,17 +1117,20 @@ class NodeRegistry:
                 if exc.node is not None:
                     return self._other_protocol(name, _bounded(exc.node))
                 return self._probe_legacy(record)
-            except NodeRateLimitedError:
-                return _Outcome(
-                    STATE_OFFLINE,
-                    f"{name} asks this app to wait: too many wrong keys came from this app's address. Something else "
-                    "there (another app, an old copy) has an old key: give it the right one, or stop it.",
-                )
             except NodeError as exc:
+                # A wait (429) is tried again too: the node lets one more key through every few seconds, so a check
+                # held back once by something else sharing this app's address mustn't read the node as offline.
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
                 timeouts += isinstance(exc, NodeTimeoutError)
+                rate_limited += isinstance(exc, NodeRateLimitedError)
                 if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
                     break
+        if info is None and rate_limited:
+            return _Outcome(
+                STATE_OFFLINE,
+                f"{name} asks this app to wait: too many wrong keys came from this app's address. Something else "
+                "there (another app, an old copy) has an old key: give it the right one, or stop it.",
+            )
         if info is None and timeouts == CHECK_ATTEMPTS:
             return _Outcome(
                 STATE_OFFLINE,

@@ -1054,7 +1054,15 @@ def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h
 
     assert view.state == reg.STATE_OFFLINE
     assert "too many wrong keys came from this app's address" in view.reason
-    assert h.client().info_calls == 1  # asking again at once only keeps the address held back
+
+
+def test_one_wait_then_an_answer_is_ready_not_offline(h):
+    """Something sharing the address keeps it at the edge of the limit: a check held back once must not flap."""
+    from media_preview_generator.nodes.client import NodeRateLimitedError
+
+    h.client().infos = [NodeRateLimitedError("http://nuc:9494 asks this app to wait")]
+
+    assert h.registry.check_now("n1").state == reg.STATE_READY
 
 
 class TestTwinOfAPlexDatabaseNode:
