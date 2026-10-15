@@ -244,6 +244,76 @@ class TestHost:
     def test_meminfo_missing_is_none(self, tmp_path):
         assert info._meminfo(str(tmp_path / "nope")) == (None, None)
 
+    GB = 1 << 30
+
+    @pytest.fixture
+    def host_meminfo(self, tmp_path):
+        # A 192 GB host with 128 GB available, as a container sees /proc/meminfo whatever its own limit.
+        path = tmp_path / "meminfo"
+        path.write_text(f"MemTotal: {192 * self.GB // 1024} kB\nMemAvailable: {128 * self.GB // 1024} kB\n")
+        return str(path)
+
+    @staticmethod
+    def _cgroup(folder, files: dict[str, str]) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (folder / name).write_text(text)
+
+    def test_ram_is_the_containers_memory_limit_not_the_hosts(self, tmp_path, host_meminfo):
+        # A node started with --memory 2g on a 192 GB host said it had 192 GB, 128 GB of it free (cgroup v2).
+        cgroup = tmp_path / "cgroup"
+        self._cgroup(cgroup, {"memory.max": f"{2 * self.GB}\n", "memory.current": f"{self.GB}\n",
+                              "memory.stat": f"anon 1\ninactive_file {self.GB // 4}\nactive_file 5\n"})  # fmt: skip
+
+        total, available = info._memory(host_meminfo, str(cgroup))
+
+        assert (total, available) == (2 * self.GB, 2 * self.GB - (self.GB - self.GB // 4))
+
+    def test_ram_is_the_containers_memory_limit_on_cgroup_v1(self, tmp_path, host_meminfo):
+        cgroup = tmp_path / "cgroup"
+        self._cgroup(cgroup / "memory", {"memory.limit_in_bytes": f"{2 * self.GB}\n",
+                                         "memory.usage_in_bytes": f"{self.GB}\n",
+                                         "memory.stat": f"cache 9\ntotal_inactive_file {self.GB // 2}\n"})  # fmt: skip
+
+        assert info._memory(host_meminfo, str(cgroup)) == (2 * self.GB, 2 * self.GB - self.GB // 2)
+
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            {"memory.max": "max\n", "memory.current": "1048576\n"},  # v2, no --memory
+            {"memory/memory.limit_in_bytes": "9223372036854771712\n", "memory/memory.usage_in_bytes": "1048576\n"},
+            {},  # not in a container: no cgroup files at this root
+        ],
+        ids=["v2-no-limit", "v1-no-limit", "no-cgroup"],
+    )
+    def test_ram_without_a_memory_limit_is_the_hosts(self, tmp_path, host_meminfo, layout):
+        cgroup = tmp_path / "cgroup"
+        cgroup.mkdir()
+        for name, text in layout.items():
+            (cgroup / name).parent.mkdir(parents=True, exist_ok=True)
+            (cgroup / name).write_text(text)
+
+        assert info._memory(host_meminfo, str(cgroup)) == (192 * self.GB, 128 * self.GB)
+
+    def test_a_container_near_its_limit_never_reads_more_free_than_the_host_has(self, tmp_path, host_meminfo):
+        cgroup = tmp_path / "cgroup"
+        self._cgroup(cgroup, {"memory.max": f"{512 * self.GB}\n", "memory.current": f"{self.GB}\n"})
+
+        assert info._memory(host_meminfo, str(cgroup)) == (192 * self.GB, 128 * self.GB)
+
+    @pytest.mark.parametrize(("cores", "shown"), [(20, True), (4, False), (1, False)])
+    def test_load_is_shown_only_for_a_node_that_may_use_every_core(self, tmp_path, monkeypatch, cores, shown):
+        # The host's load average (21 on a busy 20-core host) beside a node held to one core read as a 21x overload.
+        monkeypatch.setattr(info, "_cores", lambda: cores)
+        monkeypatch.setattr(info.os, "cpu_count", lambda: 20)
+        monkeypatch.setattr(info.os, "getloadavg", lambda: (21.0, 20.0, 19.0))
+        monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=list)
+
+        cpu = worker.block(busy=0)["cpu"]
+
+        assert cpu["cores"] == cores and cpu["load1"] == (21.0 if shown else None)
+
     def test_cores_are_the_ones_the_node_may_use_not_the_hosts(self, tmp_path, monkeypatch):
         # A node started with --cpus 0.5 (or pinned to one core) on a 20-core host said it had 20.
         monkeypatch.setattr(info.os, "sched_getaffinity", lambda pid: {0}, raising=False)

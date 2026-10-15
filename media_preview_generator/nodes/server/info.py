@@ -85,6 +85,73 @@ def _meminfo(path: str = "/proc/meminfo") -> tuple[int | None, int | None]:
     return values.get("MemTotal"), values.get("MemAvailable")
 
 
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _inactive_file(path: str, key: str) -> int:
+    try:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                name, _, value = line.partition(" ")
+                if name == key and value.strip().isdigit():
+                    return int(value)
+    except OSError:
+        pass
+    return 0
+
+
+def _cgroup_memory(cgroup_root: str = "/sys/fs/cgroup") -> tuple[int | None, int | None]:
+    """A container's memory limit (``--memory``) and how much of it is free, from cgroup v2 or v1.
+
+    Free is the limit less what the container uses, its page cache that the kernel drops first not counted (as
+    ``docker stats`` counts it).
+
+    Args:
+        cgroup_root: Where the cgroup files are (v2's ``memory.max``, or v1's ``memory/memory.limit_in_bytes``).
+
+    Returns:
+        ``(limit, free)`` in bytes, or ``(None, None)`` with no limit to read (v2's ``max``, or not in a cgroup). v1's
+        "no limit" is a huge number, which the caller's host figures cap.
+    """
+    v1 = os.path.join(cgroup_root, "memory")
+    for folder, limit_name, usage_name, inactive_key in (
+        (cgroup_root, "memory.max", "memory.current", "inactive_file"),
+        (v1, "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file"),
+    ):
+        if not os.path.exists(os.path.join(folder, limit_name)):
+            continue
+        limit = _read_int(os.path.join(folder, limit_name))
+        usage = _read_int(os.path.join(folder, usage_name))
+        if limit is None or usage is None:
+            return None, None
+        used = max(0, usage - _inactive_file(os.path.join(folder, "memory.stat"), inactive_key))
+        return limit, max(0, limit - used)
+    return None, None
+
+
+def _memory(meminfo_path: str = "/proc/meminfo", cgroup_root: str = "/sys/fs/cgroup") -> tuple[int | None, int | None]:
+    """The RAM this node may use and how much of it is free: the host's, capped by a container's memory limit.
+
+    ``/proc/meminfo`` is the host's: a node started with ``--memory 2g`` on a 192 GB host said it had 192 GB.
+
+    Returns:
+        ``(total, available)`` in bytes; either is None when it can't be read.
+    """
+    total, available = _meminfo(meminfo_path)
+    limit, free = _cgroup_memory(cgroup_root)
+    if limit is not None:
+        total = min(total, limit) if total is not None else limit
+    if free is not None:
+        available = min(available, free) if available is not None else free
+    return total, available
+
+
 def _cores(cpu_max_path: str = "/sys/fs/cgroup/cpu.max") -> int:
     """The CPU cores this node may use: the ones it may run on, capped by a container's CPU limit (``--cpus``).
 
@@ -303,7 +370,11 @@ class WorkerInfo:
             The block.
         """
         gpus = self.gpus()
-        ram_total, ram_available = _meminfo()
+        ram_total, ram_available = _memory()
+        cores = _cores()
+        # The load average is the whole host's: beside a node held to fewer cores (--cpus, --cpuset-cpus) it reads as
+        # an overload that isn't the node's, and there is no per-container load to show instead.
+        load1 = _load1() if cores >= (os.cpu_count() or 1) else None
         # Every start makes a folder there; one that can't would refuse each file the app sends, so the app reads
         # this and sends none.
         temp_problem = probe_temp_folder(self._temp_root) or filled
@@ -317,8 +388,8 @@ class WorkerInfo:
         return {
             "gpus": gpus,
             "cpu": {
-                "cores": _cores(),
-                "load1": _load1(),
+                "cores": cores,
+                "load1": load1,
                 "ram_total": ram_total,
                 "ram_available": ram_available,
             },  # fmt: skip
