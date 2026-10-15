@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -190,6 +190,27 @@ def wake_group_runtime() -> None:
         dispatcher._worker_done.set()
 
 
+def _opening_text(opening: object) -> str:
+    """When a worker group opens, in the app's time zone: ``03:00`` within a day, ``Fri 03:00`` within a week.
+
+    The message is written once, not redrawn, so "within a day" (not "today") keeps a bare time unambiguous.
+    """
+    from ..worker_groups import application_timezone, local_now
+
+    try:
+        when = datetime.fromisoformat(str(opening))
+    except ValueError:
+        return str(opening)
+    zone = application_timezone()
+    when = (when if when.tzinfo is not None else when.replace(tzinfo=zone)).astimezone(zone)
+    ahead = when - local_now()
+    if ahead < timedelta(days=1):
+        return when.strftime("%H:%M")
+    if ahead < timedelta(days=7):
+        return when.strftime("%a %H:%M")
+    return when.strftime("%Y-%m-%d %H:%M")
+
+
 def capacity_wait_message(capacity: dict) -> str:
     """Explain resource waiting separately from the start-up gate."""
     reason = capacity.get("reason")
@@ -200,7 +221,9 @@ def capacity_wait_message(capacity: dict) -> str:
         return f"Waiting for a node — {detail}" if detail else "Waiting for a node to come back"
     if reason == "off_hours":
         opening = capacity.get("next_opening")
-        return f"Waiting for worker availability until {opening}" if opening else "Waiting for worker availability"
+        if not opening:
+            return "Waiting for worker availability"
+        return f"Waiting for worker availability until {_opening_text(opening)}"
     return "Waiting for worker configuration — add or enable a compatible worker group"
 
 
