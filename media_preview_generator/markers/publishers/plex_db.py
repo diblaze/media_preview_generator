@@ -137,7 +137,7 @@ _REQUIRED_COLUMNS = {
     },
     "media_parts": {"id", "media_item_id", "file", "extra_data", "deleted_at", "updated_at"},
     "media_items": {"id", "metadata_item_id", "deleted_at", "proxy_type"},
-    "metadata_items": {"id"},
+    "metadata_items": {"id", "library_section_id"},
 }
 # SQLite primary result codes (sqlite3.h): BUSY, LOCKED, PROTOCOL (a transient WAL race) / PERM, IOERR,
 # READONLY, CANTOPEN, AUTH, NOTADB / FULL / CORRUPT.
@@ -1190,6 +1190,26 @@ def _a_part_records(mtype: MarkerType, rows: list[_TaggingRow], parts: list[Part
     return False
 
 
+def _sibling_shown(
+    served: dict[MarkerType, list[tuple[int, int]]],
+    ours: list[Marker],
+    kept_types: frozenset[MarkerType],
+    keep_plex: bool | None,
+) -> Shown:
+    """What an item sharing a written item's files shows, judged by what a write leaves on it.
+
+    A write plans each sibling from its own rows (``LocalPlexDb._plans``), so it shows ours or, while the server keeps
+    Plex's, Plex's own rows of a type. Every type ours or kept must have rows there; under "Use ours" each of our types
+    must show exactly ours. With the setting unknown (an app older than ``ShownAsk.keep_plex``) only a missing type
+    counts, so the answer never asks for a write that would change nothing.
+    """
+    if any(not served.get(mtype) for mtype in kept_types):
+        return Shown.MISSING
+    if keep_plex is not False:
+        ours = [m for m in ours if not served.get(m.type)]
+    return compare_shown(ours, served, others_alongside=False)
+
+
 class ItemRead(NamedTuple):
     """One item as Plex's database has it right now."""
 
@@ -1232,6 +1252,9 @@ class ShownAsk(NamedTuple):
     ours: list[Marker]
     kept_types: frozenset[MarkerType]
     item_files: tuple[str, ...] | None
+    # "Keep Plex's" is on for this server, which lets an episode sharing the item's file show Plex's own rows of a
+    # type (``_sibling_shown``); None from an app older than this field.
+    keep_plex: bool | None = None
 
 
 class ShownAnswer(NamedTuple):
@@ -1443,6 +1466,39 @@ class LocalPlexDb(PlexDatabase):
         ).fetchall()
         return [Part(*row) for row in rows]
 
+    @classmethod
+    def _sibling_items(
+        cls, conn: sqlite3.Connection, rating_key: int, parts: list[Part]
+    ) -> list[tuple[int, list[Part]]]:
+        """The other items in this item's library that hold exactly its version files, each with its live parts.
+
+        Plex gives each episode of a multi-episode file ("S03E01-E02") its own item, with its own copy of the file's
+        parts, and serves each item only its own marker rows, so every one of them needs the file's markers. An item
+        that also holds a version this one doesn't is left out: its marker set is agreed across versions this item
+        doesn't have.
+        """
+        files = _version_files(parts)
+        if not files:
+            return []
+        marks = ",".join("?" * len(files))
+        keys = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT mi.metadata_item_id FROM media_parts mp JOIN media_items mi ON mi.id = mp.media_item_id "
+                "JOIN metadata_items md ON md.id = mi.metadata_item_id "
+                f"WHERE mp.file IN ({marks}) AND mp.deleted_at IS NULL AND mi.deleted_at IS NULL "  # noqa: S608
+                "AND mi.metadata_item_id != ? "
+                "AND md.library_section_id IS (SELECT library_section_id FROM metadata_items WHERE id=?) ORDER BY 1",
+                (*files, rating_key, rating_key),
+            )
+        ]
+        siblings = []
+        for key in keys:
+            sibling_parts = cls._item_parts(conn, key)
+            if _version_files(sibling_parts) == files:
+                siblings.append((key, sibling_parts))
+        return siblings
+
     @staticmethod
     def _item_rows(conn: sqlite3.Connection, rating_key: int, tag_id: int) -> list[_TaggingRow]:
         # "+tag_id" keeps SQLite off the tag_id index: the marker tag is on every marker row in the library, so
@@ -1599,6 +1655,10 @@ class LocalPlexDb(PlexDatabase):
     def write_item(self, request: WriteRequest, *, deadline: float) -> WriteResult:
         """Plan the item on a read-only snapshot first, and take Plex's write lock only for a real change.
 
+        Every other item holding the same files (``_sibling_items``: the other episodes of a multi-episode file) is
+        written the same request in the same transaction, each planned from its own rows and parts, so "Keep Plex's"
+        keeps Plex's own rows per item. ``changed`` counts them too; the rest of the result is the item's own.
+
         Args:
             request: The item, the parts its markers were decided for, and those markers.
             deadline: When to stop waiting for the database locks.
@@ -1616,7 +1676,7 @@ class LocalPlexDb(PlexDatabase):
                 same_files = _same_files(snapshot, request.parts)
                 if same_files:
                     tag_id = self._marker_tag_id(conn)
-                    plan = self._plan(
+                    plan, siblings = self._plans(
                         conn,
                         request.rating_key,
                         tag_id,
@@ -1630,7 +1690,7 @@ class LocalPlexDb(PlexDatabase):
                         request.keep_plex,
                         limits=request.limits,
                     )
-            if same_files and _nothing_to_write(plan):
+            if same_files and all(_nothing_to_write(p) for p in (plan, *(p for _key, p in siblings))):
                 changed = False
             else:
                 with self._database(read_only=False, deadline=deadline) as conn:
@@ -1682,7 +1742,7 @@ class LocalPlexDb(PlexDatabase):
                         self._check_schema_for_read(conn)
                         tag_id = self._marker_tag_id(conn)
                     shown, parts = self._shown_in(
-                        conn, tag_id, ask.rating_key, ask.ours, ask.kept_types, ask.item_files
+                        conn, tag_id, ask.rating_key, ask.ours, ask.kept_types, ask.item_files, ask.keep_plex
                     )
                 answers.append(ShownAnswer(shown, _version_files(parts)))
             except PublishError as exc:
@@ -1714,6 +1774,43 @@ class LocalPlexDb(PlexDatabase):
                 return self._item_exists(conn, rating_key)
         except sqlite3.Error as exc:
             raise publish_error_from_sqlite(exc) from exc
+
+    def _plans(
+        self,
+        conn: sqlite3.Connection,
+        rating_key: int,
+        tag_id: int,
+        parts: list[Part],
+        wanted: list[Marker],
+        prior: list[Marker],
+        duration_ms: int | None,
+        own_prior: list[Marker],
+        calling_part_ids: set[int],
+        kept_before: frozenset[MarkerType],
+        keep_plex: bool,
+        *,
+        limits: FileLimits | None = None,
+    ) -> tuple[_Plan, list[tuple[int, _Plan]]]:
+        """The item's plan, and one per item sharing its files (``_sibling_items``), each from its own rows and parts.
+
+        A sibling has no record of its own: what this app left on the item (``prior``) and the types it kept are what
+        it left on every sibling, since they are written together. Its own copies of the calling parts are its
+        calling parts.
+        """
+        plan = self._plan(
+            conn, rating_key, tag_id, parts, wanted, prior, duration_ms, own_prior, calling_part_ids, kept_before,
+            keep_plex, limits=limits,
+        )  # fmt: skip
+        calling_files = {p.file for p in parts if p.id in calling_part_ids}
+        siblings = []
+        for key, sibling_parts in self._sibling_items(conn, rating_key, parts):
+            sibling_calling = {p.id for p in sibling_parts if p.file in calling_files}
+            sibling_plan = self._plan(
+                conn, key, tag_id, sibling_parts, wanted, prior, duration_ms, own_prior, sibling_calling, kept_before,
+                keep_plex, limits=limits,
+            )  # fmt: skip
+            siblings.append((key, sibling_plan))
+        return plan, siblings
 
     def _plan(
         self,
@@ -1874,7 +1971,7 @@ class LocalPlexDb(PlexDatabase):
             fresh = self._item_parts(conn, rating_key)
             if not _same_files(fresh, parts):
                 raise PublishError("Plex changed this item's files while we were writing; trying again on the next run")
-            plan = self._plan(
+            plan, siblings = self._plans(
                 conn,
                 rating_key,
                 tag_id,
@@ -1888,30 +1985,60 @@ class LocalPlexDb(PlexDatabase):
                 keep_plex,
                 limits=limits,
             )
-            if _nothing_to_write(plan):
+            to_write = [(key, p) for key, p in ((rating_key, plan), *siblings) if not _nothing_to_write(p)]
+            if not to_write:
                 conn.execute("ROLLBACK")
                 return False, plan
-            if plan.replaced_texts:
-                placeholders = ",".join("?" * len(plan.replaced_texts))
-                conn.execute(
-                    f"DELETE FROM taggings WHERE metadata_item_id=? AND +tag_id=? AND text IN ({placeholders})",  # noqa: S608
-                    (rating_key, tag_id, *plan.replaced_texts),
-                )
             created_at = int(time.time())
-            for index, text, start, end, extra in plan.inserts:
-                conn.execute(
-                    "INSERT INTO taggings (metadata_item_id, tag_id, [index], text, time_offset, end_time_offset, "
-                    "thumb_url, created_at, extra_data) VALUES (?,?,?,?,?,?,'',?,?)",
-                    (rating_key, tag_id, index, text, start, end, created_at, extra),
-                )
-            conn.executemany("UPDATE taggings SET [index]=? WHERE id=?", plan.reindex)
-            conn.executemany("UPDATE media_parts SET extra_data=? WHERE id=?", plan.part_updates)
+            for key, item_plan in to_write:
+                self._apply_plan(conn, key, tag_id, item_plan, created_at)
             conn.execute("COMMIT")
+            also = [key for key, _plan in to_write if key != rating_key]
+            if also:
+                logger.info(
+                    "Plex {}: item(s) {} hold the same file as item {} (one file, several episodes); "
+                    "wrote their markers too",
+                    self._label, ", ".join(map(str, also)), rating_key,
+                )  # fmt: skip
             return True, plan
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _apply_plan(conn: sqlite3.Connection, rating_key: int, tag_id: int, plan: _Plan, created_at: int) -> None:
+        """Run one item's plan inside the open write transaction."""
+        if plan.replaced_texts:
+            placeholders = ",".join("?" * len(plan.replaced_texts))
+            conn.execute(
+                f"DELETE FROM taggings WHERE metadata_item_id=? AND +tag_id=? AND text IN ({placeholders})",  # noqa: S608
+                (rating_key, tag_id, *plan.replaced_texts),
+            )
+        for index, text, start, end, extra in plan.inserts:
+            conn.execute(
+                "INSERT INTO taggings (metadata_item_id, tag_id, [index], text, time_offset, end_time_offset, "
+                "thumb_url, created_at, extra_data) VALUES (?,?,?,?,?,?,'',?,?)",
+                (rating_key, tag_id, index, text, start, end, created_at, extra),
+            )
+        conn.executemany("UPDATE taggings SET [index]=? WHERE id=?", plan.reindex)
+        conn.executemany("UPDATE media_parts SET extra_data=? WHERE id=?", plan.part_updates)
+
+    @staticmethod
+    def _served_on(conn: sqlite3.Connection, tag_id: int, rating_key: int) -> dict[MarkerType, list[tuple[int, int]]]:
+        """Per type, the served times of the item's marker rows."""
+        rows = conn.execute(
+            "SELECT text, time_offset, end_time_offset, extra_data FROM taggings WHERE metadata_item_id=? AND +tag_id=?",
+            (rating_key, tag_id),
+        ).fetchall()
+        return {
+            mtype: [
+                _served_times(mtype, start, end, _row_is_final(extra))
+                for text, start, end, extra in rows
+                if text == name
+            ]
+            for mtype, name in _TYPE_TEXT.items()
+        }
 
     def _shown_in(
         self,
@@ -1921,31 +2048,30 @@ class LocalPlexDb(PlexDatabase):
         ours: list[Marker],
         kept_types: frozenset[MarkerType],
         item_files: tuple[str, ...] | None,
+        keep_plex: bool | None = None,
     ) -> tuple[Shown, list[Part]]:
         """One item's rows compared with ``ours`` on an open connection, and the item's live parts.
 
-        ``ours`` is already projected to the types this publisher writes (``ShownAsk``).
+        ``ours`` is already projected to the types this publisher writes (``ShownAsk``). An item showing ours is
+        answered by the first item sharing its files (``_sibling_items``) that doesn't (``_sibling_shown``): a write
+        gives them all the same markers.
         """
         if not self._item_exists(conn, rating_key):
             return Shown.GONE, []
-        rows = conn.execute(
-            "SELECT text, time_offset, end_time_offset, extra_data FROM taggings WHERE metadata_item_id=? AND +tag_id=?",
-            (rating_key, tag_id),
-        ).fetchall()
+        served = self._served_on(conn, tag_id, rating_key)
         parts = self._item_parts(conn, rating_key)
         if item_files is not None and _version_files(parts) != tuple(item_files):
             return Shown.VERSIONS_CHANGED, parts
-        served = {
-            mtype: [
-                _served_times(mtype, start, end, _row_is_final(extra))
-                for text, start, end, extra in rows
-                if text == name
-            ]
-            for mtype, name in _TYPE_TEXT.items()
-        }
         if any(not served.get(mtype) for mtype in kept_types):
             return Shown.MISSING, parts
-        return compare_shown(ours, served, others_alongside=False), parts
+        shown = compare_shown(ours, served, others_alongside=False)
+        if shown is not Shown.OURS:
+            return shown, parts
+        for key, _sibling_parts in self._sibling_items(conn, rating_key, parts):
+            sibling = _sibling_shown(self._served_on(conn, tag_id, key), ours, kept_types, keep_plex)
+            if sibling is not Shown.OURS:
+                return sibling, parts
+        return Shown.OURS, parts
 
 
 class PlexMarkerPublisher(MarkerPublisher):
@@ -2445,6 +2571,7 @@ class PlexMarkerPublisher(MarkerPublisher):
             return {item_id: None for item_id, *_ in items}
         asked: list[str] = []
         asks: list[ShownAsk] = []
+        keep_plex = self._live_settings().on_plex_redetect == "keep_plex"
         for item_id, ours, kept_types, item_files in items:
             try:
                 rating_key = _rating_key(item_id)
@@ -2452,7 +2579,7 @@ class PlexMarkerPublisher(MarkerPublisher):
                 out[item_id] = None
                 continue
             asked.append(item_id)
-            asks.append(ShownAsk(rating_key, self.project(ours), frozenset(kept_types), item_files))
+            asks.append(ShownAsk(rating_key, self.project(ours), frozenset(kept_types), item_files, keep_plex))
         batch = self._db.shown_many(asks, timeout_s=self._db_timeout(), cancel_check=cancel_check)
         for item_id, answer in zip(asked, batch.answers, strict=False):
             out[item_id] = answer.shown

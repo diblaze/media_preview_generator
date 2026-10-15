@@ -5848,6 +5848,39 @@ class TestRealPlexPublisher:
         server.get_server_status.assert_called_with()  # the capability check did reach Plex
         server.get_marker_detection_prefs.assert_not_called()
 
+    def test_a_run_puts_back_an_episode_of_a_multi_episode_file_missing_its_markers(
+        self, store, media, tmp_path, monkeypatch
+    ):
+        # One file, two episode items (each with its own copy of the part); the item id the job carries is the first.
+        from media_preview_generator.markers.publishers import plex_db
+        from tests.markers.test_plex_db_publisher import PLEX_VERSION, _add_item, _exec, _make_db, _served
+
+        folder = tmp_path / "Plex Media Server"
+        db = str(_make_db(folder, parts=((media, None),)))
+        _exec(db, "UPDATE metadata_items SET library_section_id=1 WHERE id=7")
+        second_part = _add_item(db, 8, [media])[0]
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
+        monkeypatch.setattr(plex_db, "filesystem_type", lambda _path, **_kw: "ext4")
+        reg = _registry(media, ServerType.PLEX)
+        reg.configs_by_id["plex-1"].output = {"plex_config_folder": str(folder)}
+        server = reg.get("plex-1")
+        server.resolve_remote_path_to_item_id.return_value = "7"
+        server.get_server_status.return_value = {"plex_pass": True, "version": PLEX_VERSION}
+
+        def run() -> dict:
+            with patch.object(pipeline, "probe_media", return_value=_probe(CHAPTERS_BOTH)):
+                return _rows(check_item(_item(media), ctx=_ctx(store, reg)))["plex-1"]
+
+        assert run()["status"] == ServerStatus.WRITTEN.value
+        assert [row[0] for row in _served(db, 8)] == [row[0] for row in _served(db, 7)] == ["intro", "credits"]
+        # What a run from before this fix left: the first episode only.
+        _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8")
+        _exec(db, "UPDATE media_parts SET extra_data=NULL WHERE id=?", second_part)
+
+        assert run()["status"] == ServerStatus.WRITTEN.value
+        assert [row[0] for row in _served(db, 8)] == ["intro", "credits"]
+        assert run()["status"] == ServerStatus.UP_TO_DATE.value
+
 
 def test_markers_for_path(store, media):
     assert pipeline.markers_for_path(store, media) is None

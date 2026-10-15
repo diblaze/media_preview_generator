@@ -525,6 +525,27 @@ class TestTheAppWritesPlexThroughTheAgent:
         assert publisher.write("7", [], previous=ours, duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv") == []
         assert _served(plex_config) == []
 
+    def test_every_episode_of_a_multi_episode_file_is_written_and_read_back_on_the_node(self, agent, plex_config):
+        conn = sqlite3.connect(_db_file(plex_config))
+        conn.execute("UPDATE metadata_items SET library_section_id=1 WHERE id=7")
+        conn.execute("INSERT INTO metadata_items (id, metadata_type, title, library_section_id) VALUES (8, 4, 'E2', 1)")
+        conn.execute("INSERT INTO media_items (id, metadata_item_id) VALUES (2, 8)")
+        conn.execute("INSERT INTO media_parts (id, media_item_id, file) VALUES (2, 2, '/data/tv/S01E01.mkv')")
+        conn.commit()
+        conn.close()
+        publisher = _publisher_through(FlaskSession(agent), keep_plex=True)
+
+        ours = publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
+
+        assert _served(plex_config, 8) == _served(plex_config, 7) == [("intro", 11_000, 37_000)]
+        files = publisher.last_item_files
+        assert publisher.shows_many([("7", ours, frozenset(), files)]) == {"7": Shown.OURS}
+        conn = sqlite3.connect(_db_file(plex_config))
+        conn.execute("DELETE FROM taggings WHERE metadata_item_id=8")
+        conn.commit()
+        conn.close()
+        assert publisher.shows_many([("7", ours, frozenset(), files)]) == {"7": Shown.MISSING}
+
     def test_the_second_run_changes_nothing(self, agent, plex_config):
         publisher = _publisher_through(FlaskSession(agent))
         publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")

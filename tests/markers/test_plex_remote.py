@@ -207,6 +207,18 @@ class TestCodec:
         ask = ShownAsk(7, [INTRO], frozenset({T.CREDITS}), files)
         assert plex_remote.shown_ask_from_json(plex_remote.shown_ask_to_json(ask)) == ask
 
+    @pytest.mark.parametrize("keep_plex", [True, False, None])
+    def test_a_read_back_ask_carries_the_keep_plexs_setting(self, keep_plex):
+        ask = ShownAsk(7, [INTRO], frozenset(), None, keep_plex)
+        body = plex_remote.shown_ask_to_json(ask)
+        assert body["keep_plex"] is keep_plex
+        assert plex_remote.shown_ask_from_json(body) == ask
+
+    def test_an_older_apps_read_back_ask_leaves_the_setting_unknown(self):
+        body = plex_remote.shown_ask_to_json(ShownAsk(7, [INTRO], frozenset(), None, True))
+        body.pop("keep_plex")
+        assert plex_remote.shown_ask_from_json(body).keep_plex is None
+
     @pytest.mark.parametrize("shown", list(Shown) + [None])
     def test_a_read_back_batch_round_trips_every_answer(self, shown):
         batch = ShownBatch([ShownAnswer(shown, ("/a.mkv",)), ShownAnswer(None, ())], True)
@@ -1084,7 +1096,13 @@ class TestThePublisherTalksToWhicheverDatabaseItWasGiven:
         assert ask.ours == [INTRO]  # Plex shows no recap: projected away before the database is asked
         assert ask.kept_types == frozenset({T.CREDITS})
         assert ask.item_files == ("/plexmedia/tv/S01E01.mkv",)
+        assert ask.keep_plex is False
         assert publisher.live_files("7") == ("/data/tv/S01E01.mkv",)
+
+    def test_the_read_back_asks_with_the_servers_keep_plexs_setting(self):
+        database = FakeDatabase()
+        _publisher(database, keep_plex=True).shows_many([("7", [INTRO], frozenset(), None)])
+        assert database.asks[0].keep_plex is True
 
     def test_the_publish_now_deadline_reaches_the_database_half(self):
         database = FakeDatabase()

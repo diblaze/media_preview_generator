@@ -409,6 +409,7 @@ def shown_ask_to_json(ask: ShownAsk) -> dict:
         "ours": [marker_to_json(m) for m in ask.ours],
         "kept_types": _types_to_json(ask.kept_types),
         "item_files": None if ask.item_files is None else list(ask.item_files),
+        "keep_plex": ask.keep_plex,
     }
 
 
@@ -422,11 +423,13 @@ def shown_ask_from_json(raw: Any) -> ShownAsk:
         raise ValueError("read-back item must be an object")
     try:
         files = raw.get("item_files")
+        keep_plex = raw.get("keep_plex")
         return ShownAsk(
             _as_int(raw["rating_key"]),
             _markers_from_json(raw["ours"]),
             _types_from_json(raw.get("kept_types")),
             None if files is None else tuple(str(f) for f in files),
+            None if keep_plex is None else bool(keep_plex),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"not a read-back item: {exc}") from exc
