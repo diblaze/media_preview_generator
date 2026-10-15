@@ -112,6 +112,36 @@ def test_an_offline_node_shows_only_its_connection():
     assert [s["id"] for s in _envelope(_details(reg.STATE_OFFLINE))["sections"]] == ["node_connection"]
 
 
+def _offline(cause: str) -> reg.NodeDetails:
+    details = _details(reg.STATE_OFFLINE, reason="why")
+    return dataclasses.replace(details, view=dataclasses.replace(details.view, cause=cause))
+
+
+@pytest.mark.parametrize(
+    ("cause", "label", "fix_where"),
+    [
+        (reg.OFFLINE_RESTARTING, "nuc is restarting", None),
+        (reg.OFFLINE_STUCK, "nuc accepts connections but doesn't answer", "node"),
+        (reg.OFFLINE_RATE_LIMITED, "nuc asks this app to wait", None),
+    ],
+    ids=["restarting", "stuck", "asks_to_wait"],
+)
+def test_a_node_that_answered_at_its_address_isnt_sent_to_check_it(cause, label, fix_where):
+    """All three read "nuc isn't answering" with a Check the address button, for an address that is right."""
+    envelope = _envelope(_offline(cause))
+    assert [c["id"] for s in envelope["sections"] for c in s["checks"]] == ["node_reachable"]
+    row = _check(envelope, "node_reachable")
+    assert (row["ok"], row["severity"], row["label"], row["reason"]) == (False, "critical", label, "why")
+    assert row.get("fix_where") == fix_where
+    assert not {"fix_tab", "fix_label"} & set(row)
+
+
+@pytest.mark.parametrize("cause", [reg.OFFLINE_UNREACHABLE, reg.OFFLINE_NOT_A_NODE, ""])
+def test_a_node_that_didnt_answer_as_a_node_is_sent_to_check_its_address(cause):
+    row = _check(_envelope(_offline(cause)), "node_reachable")
+    assert (row["label"], row["fix_tab"], row["fix_label"]) == ("nuc isn't answering", "settings", "Check the address")
+
+
 def test_a_node_added_twice_is_one_must_fix_row_pointing_at_its_remove_button():
     """Its Setup Health showed only "Run Test access" and "Not used in any worker group": nothing said it gets no
     work, and the list's count had no must fix."""

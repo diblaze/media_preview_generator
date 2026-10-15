@@ -19,6 +19,9 @@ from ..markers.readiness import CRITICAL, RECOMMENDED
 from ..markers.readiness import _row as readiness_row
 from . import protocol
 from .registry import (
+    OFFLINE_RATE_LIMITED,
+    OFFLINE_RESTARTING,
+    OFFLINE_STUCK,
     STATE_ACCESS_PROBLEM,
     STATE_CONNECTING,
     STATE_DISABLED,
@@ -45,6 +48,13 @@ SERVERS_URL = "/servers"
 UPDATE_DOCS_URL = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
 # Node-only row keys; the shared row builder doesn't know them.
 _NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label", "docs_url")
+# An offline node that answered at its address: (row label, where the fix is). A restart ends by itself, and a node
+# asking this app to wait is held back by something else at this app's address, so neither has a fix on the node.
+_ANSWERED_OFFLINE = {
+    OFFLINE_RESTARTING: ("{name} is restarting", None),
+    OFFLINE_STUCK: ("{name} accepts connections but doesn't answer", FIX_ON_NODE),
+    OFFLINE_RATE_LIMITED: ("{name} asks this app to wait", None),
+}
 
 
 def _row(
@@ -101,6 +111,21 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
         row["informational"] = True
         return [row]
     reachable = view.state not in (STATE_OFFLINE, STATE_CONNECTING)
+    answered = _ANSWERED_OFFLINE.get(view.cause) if view.state == STATE_OFFLINE else None
+    if answered is not None:
+        # It answered at this address, so the address is right: "Check the address" would send the user astray.
+        label, fix_where = answered
+        return [
+            _row(
+                "node_reachable",
+                label.format(name=view.name),
+                severity=CRITICAL,
+                ok=False,
+                explanation="The app checks every node every 30 seconds.",
+                reason=view.reason,
+                fix_where=fix_where,
+            )
+        ]
     rows = [
         _row(
             "node_reachable",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from media_preview_generator.nodes import registry as reg
@@ -123,6 +125,18 @@ def test_the_card_says_what_to_do_once(state):
     reason, instruction = REGISTRY_REASONS[state]
     (card,) = _cards(_view(state, reason=reason))
     assert card["body_html"].lower().count(instruction) == 1, card["body_html"]
+
+
+def test_a_restarting_node_is_called_restarting_not_offline():
+    view = dataclasses.replace(
+        _view(reg.STATE_OFFLINE, reason="old-laptop is restarting; it gets no files until it is back."),
+        cause=reg.OFFLINE_RESTARTING,
+    )
+    (card,) = _cards(view)
+    assert card["title"] == "old-laptop is restarting"
+    assert card["id"] == "node:abc123:offline"
+    (other,) = _cards(dataclasses.replace(view, cause=reg.OFFLINE_UNREACHABLE))
+    assert other["title"] == "old-laptop is offline"
 
 
 def test_a_node_without_a_reason_still_gets_what_to_do():

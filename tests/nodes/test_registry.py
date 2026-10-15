@@ -1056,6 +1056,39 @@ def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h
     assert "too many wrong keys came from this app's address" in view.reason
 
 
+def _stopping_info():
+    info = _info()
+    info["stopping"] = True
+    return info
+
+
+@pytest.mark.parametrize(
+    ("answer", "cause"),
+    [
+        (lambda: NodeUnreachableError("http://nuc:9494 didn't answer"), reg.OFFLINE_UNREACHABLE),
+        (lambda: NodeTimeoutError("http://nuc:9494 didn't answer in time"), reg.OFFLINE_STUCK),
+        (_stopping_info, reg.OFFLINE_RESTARTING),
+    ],
+    ids=["unreachable", "stuck", "restarting"],
+)
+def test_an_offline_node_says_why_so_only_a_node_that_didnt_answer_is_sent_to_its_address(h, answer, cause):
+    """Restarting, stuck and asking to wait all read "isn't answering" with a "Check the address" button."""
+    h.client().default_info = answer()
+    assert h.registry.check_now("n1").cause == cause
+    h.client().default_info = _info()
+    assert (h.registry.check_now("n1").state, h.registry.view("n1").cause) == (reg.STATE_READY, "")
+
+
+def test_a_node_asking_to_wait_and_something_that_isnt_a_node_say_why_they_are_offline(h):
+    from media_preview_generator.nodes.client import NodeRateLimitedError
+
+    h.client().default_info = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+    assert h.registry.check_now("n1").cause == reg.OFFLINE_RATE_LIMITED
+    h.client().default_info = NodeProtocolError("not a node")
+    h.legacy = ("unreachable", "")
+    assert h.registry.check_now("n1").cause == reg.OFFLINE_NOT_A_NODE
+
+
 def test_one_wait_then_an_answer_is_ready_not_offline(h):
     """Something sharing the address keeps it at the edge of the limit: a check held back once must not flap."""
     from media_preview_generator.nodes.client import NodeRateLimitedError

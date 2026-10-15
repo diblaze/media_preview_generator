@@ -48,6 +48,13 @@ STATE_DISABLED = "disabled"
 # The machine is already added as another node (the same node id answers at both addresses).
 STATE_DUPLICATE = "duplicate"
 
+# Why an offline node gets no work (``NodeView.cause``): only "didn't answer" and "not a node" are about its address.
+OFFLINE_UNREACHABLE = "unreachable"
+OFFLINE_NOT_A_NODE = "not_a_node"
+OFFLINE_RESTARTING = "restarting"
+OFFLINE_STUCK = "stuck"
+OFFLINE_RATE_LIMITED = "rate_limited"
+
 # States that raise a bell notification (``web.notifications``).
 ALERT_STATES = (
     STATE_OFFLINE,
@@ -113,6 +120,8 @@ class NodeView:
     last_seen: float | None
     # A health check is running or queued for it.
     checking: bool = False
+    # Why an offline node is offline (``OFFLINE_*``); "" in every other state.
+    cause: str = ""
 
 
 @dataclass(frozen=True)
@@ -152,6 +161,7 @@ class _Outcome:
     version: str = ""
     roles: tuple[str, ...] = ()
     uid: str = ""
+    cause: str = ""
 
 
 class _PendingAccess(NamedTuple):
@@ -170,6 +180,7 @@ class _Live:
     client: NodeClient
     probe_state: str = STATE_CONNECTING
     probe_reason: str = ""
+    probe_cause: str = ""
     info: dict | None = None
     legacy: bool = False
     version: str = ""
@@ -875,7 +886,7 @@ class NodeRegistry:
             live.client = self._client_factory(record)
         if reconnect:
             # A new address, key or mapping set is a different node as far as anything learnt before goes.
-            live.probe_state, live.probe_reason = STATE_CONNECTING, ""
+            live.probe_state, live.probe_reason, live.probe_cause = STATE_CONNECTING, "", ""
             live.offline_streak = 0
             live.next_check = 0.0
             live.access_problem = ""
@@ -936,6 +947,7 @@ class NodeRegistry:
             legacy=live.legacy,
             last_seen=live.last_seen,
             checking=live.checking,
+            cause=live.probe_cause if state == STATE_OFFLINE else "",
         )
 
     def _touch(self) -> None:
@@ -1058,7 +1070,7 @@ class NodeRegistry:
         return bool(theirs) and all(ours == theirs for ours in served)
 
     def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
-        live.probe_state, live.probe_reason = outcome.state, outcome.reason
+        live.probe_state, live.probe_reason, live.probe_cause = outcome.state, outcome.reason, outcome.cause
         if outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
@@ -1130,16 +1142,19 @@ class NodeRegistry:
                 STATE_OFFLINE,
                 f"{name} asks this app to wait: too many wrong keys came from this app's address. Something else "
                 "there (another app, an old copy) has an old key: give it the right one, or stop it.",
+                cause=OFFLINE_RATE_LIMITED,
             )
         if info is None and timeouts == CHECK_ATTEMPTS:
             return _Outcome(
                 STATE_OFFLINE,
                 f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it.",
+                cause=OFFLINE_STUCK,
             )
         if info is None:
             return _Outcome(
                 STATE_OFFLINE,
                 f"{name} didn't answer. Check that it is running and reachable from this app.",
+                cause=OFFLINE_UNREACHABLE,
             )
         return self._read_info(record, info)
 
@@ -1167,7 +1182,12 @@ class NodeRegistry:
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         if info.get("stopping") is True:
             # It refuses every start until it is back (SIGTERM: a restart or an image update).
-            return _Outcome(STATE_OFFLINE, f"{name} is restarting; it gets no files until it is back.", **outcome)
+            return _Outcome(
+                STATE_OFFLINE,
+                f"{name} is restarting; it gets no files until it is back.",
+                cause=OFFLINE_RESTARTING,
+                **outcome,
+            )
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
             return _Outcome(
@@ -1253,6 +1273,7 @@ class NodeRegistry:
         return _Outcome(
             STATE_OFFLINE,
             "Something answered at this address, but not as a node this app can use. Check the address.",
+            cause=OFFLINE_NOT_A_NODE,
         )
 
     def _quick_access_clear(self, node_id: str, live: _Live, client: NodeClient) -> None:
