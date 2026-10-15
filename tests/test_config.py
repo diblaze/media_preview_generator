@@ -229,6 +229,21 @@ class TestExpandPathMappingCandidates:
         assert "F:/Videos/TV Shows/Show/S01E01.mkv" in candidates
         assert "/data/tv/Show/S01E01.mkv" in candidates
 
+    @pytest.mark.parametrize("prefix", ["D:\\Media", "D:/Media"])
+    def test_expand_candidates_include_a_windows_servers_own_backslashed_path(self, prefix):
+        """Plex on Windows stores ``D:\\Media\\TV\\...``; the chapter lookup asks for that exact path."""
+        candidates = expand_path_mapping_candidates(
+            "/data/TV/Show/S01E01.mkv", [{"plex_prefix": prefix, "local_prefix": "/data"}]
+        )
+        assert r"D:\Media\TV\Show\S01E01.mkv" in candidates
+        assert "D:/Media/TV/Show/S01E01.mkv" in candidates
+
+    def test_expand_candidates_never_add_backslashes_for_linux_servers(self):
+        candidates = expand_path_mapping_candidates(
+            "/data/TV/Show/S01E01.mkv", [{"plex_prefix": "/media", "local_prefix": "/data"}]
+        )
+        assert candidates == ["/data/TV/Show/S01E01.mkv", "/media/TV/Show/S01E01.mkv"]
+
     @pytest.mark.parametrize(
         "row",
         [

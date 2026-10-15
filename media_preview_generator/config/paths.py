@@ -128,6 +128,28 @@ def normalize_path_mappings(settings: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+# A drive letter ("D:", "D:\Media", "D:/Media") or a UNC share ("\\nas\media"): a path on a Windows server.
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:(?:[\\/]|$)|\\\\[^\\/])")
+
+
+def windows_native_path(prefix: str, path: str) -> str | None:
+    """``path`` with backslashes, as a server on Windows stores it, when ``prefix`` is a Windows path; else None.
+
+    The mapping helpers build every path with forward slashes, which a Plex on Windows never stores: its database
+    names ``D:\\Media\\TV\\x.mkv``, and the loudness and chapter lookups compare paths exactly.
+
+    Args:
+        prefix: The mapping prefix ``path`` was built from, as the user typed it.
+        path: The mapped path.
+    """
+    if not _WINDOWS_PATH_RE.match((prefix or "").strip()):
+        return None
+    native = path.replace("/", "\\")
+    # A prefix typed with its trailing separator ("D:\") leaves a doubled one at the join; a UNC path keeps its two.
+    head = "\\\\" if native.startswith("\\\\") else ""
+    return head + re.sub(r"\\{2,}", r"\\", native[len(head) :])
+
+
 def _path_matches_prefix(path: str, prefix: str) -> bool:
     """Return True if path equals prefix or has prefix as a path prefix (no partial segment).
 
@@ -331,9 +353,10 @@ def expand_path_mapping_candidates(path: str, path_mappings: list[dict[str, Any]
             return
         rest = nfc_path[len(source) :].lstrip("/")
         candidate = f"{target.rstrip('/')}/{rest}" if rest else (target or "/")
-        if candidate not in seen:
-            seen.add(candidate)
-            candidates.append(candidate)
+        for form in (candidate, windows_native_path(target_prefix, candidate)):
+            if form and form not in seen:
+                seen.add(form)
+                candidates.append(form)
 
     for mapping in path_mappings:
         plex_prefix = mapping.get("remote_prefix") or mapping.get("plex_prefix") or ""
