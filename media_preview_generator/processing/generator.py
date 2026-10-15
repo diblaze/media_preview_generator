@@ -1304,7 +1304,8 @@ def _detect_hwaccel_runtime_error(stderr_lines: list[str]) -> bool:
 
     These errors indicate that the hardware decoder started successfully but
     hit a driver-level failure at runtime (surface sync errors, transfer
-    failures, etc.).  They are distinct from codec-not-found errors and
+    failures, etc.), or that the GPU couldn't start the decode at all (its
+    device can't be set up).  They are distinct from codec-not-found errors and
     typically produce non-standard exit codes (e.g. 251).
 
     Retrying on CPU almost always succeeds because these are driver bugs,
@@ -1336,6 +1337,10 @@ def _detect_hwaccel_runtime_error(stderr_lines: list[str]) -> bool:
         "failed to get hw frames constraints",
         "failed to initialise vaapi connection",
         "failed to create surface",
+        # The decoder's GPU device couldn't be set up, so nothing decoded: FFmpeg 7+ says "Hardware device setup failed
+        # for decoder", older builds "Device setup failed for decoder on input stream". A running container that lost
+        # its GPU (NVML "Unknown Error" after a host daemon-reload) exits 187 after "cuInit(0) failed".
+        "device setup failed for decoder",
         # OpenCL filters (Intel and AMD tone-map Dolby Vision Profile 5 in OpenCL); these often end in exit 251. Not a
         # bare "opencl": at -loglevel debug a working run names OpenCL on many lines (platforms, devices, formats).
         "failed to enqueue kernel",
