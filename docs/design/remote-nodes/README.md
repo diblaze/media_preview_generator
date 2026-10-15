@@ -62,7 +62,7 @@ media_preview_generator/nodes/
     app.py           create_node_app(): auth, /v1/health, /v1/info, /v1/access-check, task routes, role mounting
     identity.py      node id + key (<CONFIG_DIR>/node.json, 0600; NODE_KEY / AGENT_TOKEN env override the key)
     tasks.py         task table: start, poll (progress + log lines), cancel, artifacts, expiry when unpolled
-    access.py        app path -> node path, roots guard, size + mtime_ns identity check
+    access.py        app path -> node path, roots guard, size + mtime identity check (mtime within 2 s)
     info.py          GPU detection (cached, re-checked every 5 min and after a GPU error), CPU/RAM/temp, FFmpeg
     ops.py           op registry: the app's own heavy functions, called with node paths
     plex_db.py       the Plex database role (today's agent routes, moved; same protocol, same tests)
@@ -124,6 +124,11 @@ package version; the Plex database role also keeps the agent's `"agent"` block f
 | `GET /v1/tasks/<id>/artifact` | – | the task's artifact (preview: a tar of the JPEGs) |
 | `DELETE /v1/tasks/<id>` | – | frees the task's temp dir |
 | `GET /v1/log?lines=N` | – | `{"lines": [{time, ts, level, message}]}`, the node's last N lines oldest first: `time` ISO 8601 with the node's offset, `ts` epoch seconds (added later; an older node sends no `ts`) |
+
+Same file: the size must match exactly and the mtime must be less than 2 s from the app's `mtime_ns`. A node may
+read the media through a filesystem that keeps coarser timestamps than the app's (SMB2/3: 100 ns; sshfs, SMB1: 1 s;
+FAT: 2 s), so an exact `mtime_ns` match would refuse every file there. The same rule (`access.same_mtime`) applies to
+Test access and to every task.
 
 `gpus[]` entries: `{"type", "device", "name", "status", "error"}` — the same tuple `gpu.detect.detect_all_gpus()`
 returns, made JSON-safe.
@@ -203,9 +208,10 @@ retry runs (on the **node's** CPU, see §6).
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until the registry's next check of it comes back
   ready (60 s at most), and the item's retry goes to another node or this app when one is free.
-* **File not visible**: the item goes to the next eligible worker on a different node (or this app); when every
-  eligible worker has failed it, the item fails "not visible on X, Y". Three different files not visible on one node
-  within 10 minutes → node state `access_problem` (workers paused, alert).
+* **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the
+  item goes to the next eligible worker on a different node (or this app); when every eligible worker has failed it,
+  the item fails "not visible on X, Y". Three different files not visible on one node within 10 minutes → node state
+  `access_problem` (workers paused, alert).
 * **GPU failure / codec not supported** on a node: retry on the same node's CPU, never on the app's. GPU lost
   (detection fails after a GPU error) → state `gpu_lost`.
 * Cancel and pause act on the node task: the executor forwards the job's cancel and pause state to

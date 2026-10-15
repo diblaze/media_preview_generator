@@ -2,8 +2,9 @@
 
 The app sends its own path, the mapping rows, and the size and mtime_ns it saw. The node maps the path, resolves it
 (``..`` and symlinks included) and refuses it unless the real path is inside one of the mapped roots, then checks the
-size and mtime_ns so a different file at the same path is never processed in its place (measured identical across
-ZFS, NFS 4.2, bind mounts and mergerfs; dev and inode are not, so they aren't compared).
+size and mtime so a different file at the same path is never processed in its place. Sizes must be equal; mtimes may
+differ by less than :data:`MTIME_TOLERANCE_NS`, because the node may read the files through a filesystem with coarser
+timestamps than the app's (dev and inode differ across mounts, so they aren't compared).
 """
 
 from __future__ import annotations
@@ -22,6 +23,10 @@ from ..protocol import (
 )
 
 NEARBY_MAX_NAMES = 50
+# ZFS, ext4, NFS 4.x keep nanoseconds; SMB2/3 keeps 100 ns, sshfs and SMB1 whole seconds, FAT 2 seconds. The same file
+# seen through any of them stays within FAT's granularity; a different file at the same path rarely does, and its
+# size must match exactly too.
+MTIME_TOLERANCE_NS = 2_000_000_000
 
 
 class NotVisible(Exception):
@@ -42,6 +47,11 @@ def _within(path: str, root: str) -> bool:
         return False
 
 
+def same_mtime(app_mtime_ns: int, node_mtime_ns: int) -> bool:
+    """Whether two mtimes can be the same file's, seen through filesystems that keep different precision."""
+    return abs(app_mtime_ns - node_mtime_ns) < MTIME_TOLERANCE_NS
+
+
 def mapped_roots(mappings: list[PathMapping]) -> list[str]:
     """The real paths of every row's ``node_prefix``."""
     return [os.path.realpath(row.node_prefix) for row in mappings]
@@ -59,7 +69,7 @@ def resolve(app_path: str, size: int | None, mtime_ns: int | None, mappings: lis
     Args:
         app_path: The app's path.
         size: The size the app saw (None: not compared).
-        mtime_ns: The mtime the app saw, in ns (None: not compared).
+        mtime_ns: The mtime the app saw, in ns (None: not compared; otherwise it must be within 2 s of the node's).
         mappings: The node's mapping rows.
 
     Returns:
@@ -94,10 +104,10 @@ def resolve(app_path: str, size: int | None, mtime_ns: int | None, mappings: lis
             f"{mapped} is a different file here: {st.st_size} bytes, the app's has {size}",
             node_path=mapped,
         )
-    if mtime_ns is not None and st.st_mtime_ns != mtime_ns:
+    if mtime_ns is not None and not same_mtime(mtime_ns, st.st_mtime_ns):
         raise NotVisible(
             NOT_VISIBLE_DIFFERENT_FILE,
-            f"{mapped} is a different file here: modified at another time than the app's",
+            f"{mapped} is a different file here: its modified time is 2 or more seconds off the app's",
             node_path=mapped,
         )
     if not os.access(real, os.R_OK):

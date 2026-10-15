@@ -21,6 +21,10 @@ def media(tmp_path):
     return root
 
 
+# A real library file's mtime as ZFS / NFS 4.2 report it, with digits below 100 ns.
+APP_MTIME_NS = 1771246996454097483
+
+
 def _rows(root) -> list[PathMapping]:
     return [PathMapping("/data", str(root))]
 
@@ -92,13 +96,31 @@ class TestResolve:
 
         assert caught.value.reason == protocol.NOT_VISIBLE_DIFFERENT_FILE
 
-    def test_different_mtime_is_a_different_file(self, media):
+    def test_an_mtime_2_seconds_off_is_a_different_file(self, media):
         size, mtime_ns = _stat(media / "Movies" / "a.mkv")
 
         with pytest.raises(access.NotVisible) as caught:
-            access.resolve("/data/Movies/a.mkv", size, mtime_ns + 1, _rows(media))
+            access.resolve("/data/Movies/a.mkv", size, mtime_ns + access.MTIME_TOLERANCE_NS, _rows(media))
 
         assert caught.value.reason == protocol.NOT_VISIBLE_DIFFERENT_FILE
+
+    @pytest.mark.parametrize(
+        "node_mtime_ns",
+        [
+            APP_MTIME_NS // 100 * 100,  # SMB2/3: 100 ns
+            APP_MTIME_NS // 10**9 * 10**9,  # sshfs, SMB1: whole seconds
+            APP_MTIME_NS // (2 * 10**9) * (2 * 10**9),  # FAT: 2 seconds
+            APP_MTIME_NS + access.MTIME_TOLERANCE_NS - 1,
+        ],
+        ids=["smb-100ns", "whole-seconds", "fat-2s", "just-under-2s"],
+    )
+    def test_the_same_file_through_a_coarser_timestamp_filesystem_is_the_same_file(self, media, node_mtime_ns):
+        movie = media / "Movies" / "a.mkv"
+        os.utime(movie, ns=(node_mtime_ns, node_mtime_ns))
+
+        got = access.resolve("/data/Movies/a.mkv", 100, APP_MTIME_NS, _rows(media))
+
+        assert got == os.path.realpath(movie)
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
     def test_unreadable(self, media):

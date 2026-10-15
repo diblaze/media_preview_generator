@@ -679,7 +679,7 @@ docker run -d --name media-preview-node -p 9494:9494 \
 1. **Settings → Nodes → Add node**: a name, the node's address (`http://machine:9494`) and its key.
 2. **Media**: for each library, the folder this app uses and the folder the node sees the same files at.
    **Test access** picks 3 real files per library and checks the node sees each one with the same size and
-   modified time. A wrong mapping shows the exact path tried.
+   modified time (within 2 seconds, for shares that store coarser times). A wrong mapping shows the exact path tried.
 3. **Settings → Workers**: add the node's GPU or CPU to a worker group. Devices are listed under **This app** first,
    then under each node's name. Hours, job types and worker counts work as for this app's devices.
 
