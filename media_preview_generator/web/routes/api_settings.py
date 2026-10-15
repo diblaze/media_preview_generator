@@ -1778,8 +1778,8 @@ def _bring_restored_settings_up_to_date(settings: Any, live_revisions: tuple[int
 
 
 def _settings_replaced(settings: Any) -> str | None:
-    """Make everything that read the old settings.json read the restored one: the config cache, the node registry and
-    the running worker pool.
+    """Make everything that read the old settings.json read the restored one: the config cache, the node registry,
+    the cached Intro & Credits checks and the running worker pool.
 
     Args:
         settings: The settings manager, holding the restored file.
@@ -1788,10 +1788,13 @@ def _settings_replaced(settings: Any) -> str | None:
         A warning when the worker pool couldn't be refreshed, else None.
     """
     from ...config import clear_config_cache
+    from ...markers.inspect import clear_capability_cache
     from ...nodes.registry import get_registry
 
     clear_config_cache()
     get_registry().settings_replaced()
+    # A server's cached check names only its Plex database node: the restored file can give that node another address.
+    clear_capability_cache()
     if not isinstance(settings.get("worker_groups"), list):
         return None
     from .api_worker_groups import reconcile_group_settings
