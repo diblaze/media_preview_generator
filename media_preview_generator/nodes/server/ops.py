@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import tarfile
 import uuid
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
@@ -83,6 +84,26 @@ class _Reporter:
         self._send()
 
 
+def _choice(params: dict, name: str, allowed: Collection[str], *, optional: bool = False) -> str | None:
+    """``params[name]`` when it is one of ``allowed`` (or None when ``optional``).
+
+    These values are written into FFmpeg filter strings, where a comma or a colon starts another filter or option: only
+    the names the app itself can send are let through.
+
+    Raises:
+        OpError: Kind ``failed``: any other value.
+    """
+    value = params.get(name)
+    if (value is None and optional) or (isinstance(value, str) and value in allowed):
+        return value
+    raise OpError(protocol.KIND_FAILED, f"{name} must be one of {', '.join(sorted(allowed))}, not {value!r}")
+
+
+def _optional_float(params: dict, name: str) -> float | None:
+    value = params.get(name)
+    return None if value is None else float(value)
+
+
 def _op_error(ctx: TaskContext, exc: BaseException, *, gpu_failed: bool = False, **extra: object) -> OpError:
     """The OpError for an exception the app raises again by name: cancelled once the job is, else a GPU or plain failure."""
     if ctx.cancel_check():
@@ -109,6 +130,7 @@ class PreviewConfig:
 
 def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
     """``generate_images`` into the task's temp dir; the JPEGs (sorted) become the task's artifact tar."""
+    from ...config.validation import VALID_TONEMAP_ALGORITHMS
     from ...processing.generator import (
         FALLBACK_HWACCEL,
         FALLBACK_SIGNAL,
@@ -122,7 +144,7 @@ def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
 
     config = PreviewConfig(
         plex_bif_frame_interval=int(params["frame_interval"]),
-        tonemap_algorithm=str(params["tonemap_algorithm"]),
+        tonemap_algorithm=_choice(params, "tonemap_algorithm", VALID_TONEMAP_ALGORITHMS),
         thumbnail_quality=int(params["thumbnail_quality"]),
         ffmpeg_threads=int(params["ffmpeg_threads"]),
         log_level=str(params.get("log_level") or "INFO"),
@@ -268,7 +290,7 @@ def intro_end_picture(ctx: TaskContext, node_path: str, params: dict) -> dict:
             gpu_device_path=device,
             container_start_s=float(params["container_start_s"]),
             cancel_check=ctx.cancel_check,
-            download_format=params.get("download_format"),
+            download_format=_choice(params, "download_format", set(frames.DOWNLOAD_FORMATS.values()), optional=True),
             pause_check=ctx.pause_check,
             ffmpeg_threads=None if threads is None else int(threads),
             fallback_callback=reporter.fallback,
@@ -305,7 +327,7 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
             node_path,
             duration_ms=int(params["duration_ms"]),
             is_episode=bool(params["is_episode"]),
-            tail_s=params.get("tail_s"),
+            tail_s=_optional_float(params, "tail_s"),
             ffmpeg=_node_ffmpeg(),
             detect_boxes=lambda planes: pool.detect_boxes(planes, **detect),
             read_text=(lambda planes: pool.read_text(planes, **detect)) if params.get("read_text", True) else None,
@@ -313,7 +335,7 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
             gpu_device_path=device,
             cancel_check=ctx.cancel_check,
             phase=reporter.phase,
-            earliest_start_s=params.get("earliest_start_s"),
+            earliest_start_s=_optional_float(params, "earliest_start_s"),
             pause_check=ctx.pause_check,
             ffmpeg_threads=None if threads is None else int(threads),
             progress_callback=reporter.worker_progress if params.get("progress") else None,
