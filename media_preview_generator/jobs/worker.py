@@ -1307,7 +1307,7 @@ class WorkerPool:
                         removed += 1
                 for _ in range(max(0, desired - len(owned))):
                     if policy.get("node"):
-                        worker = self._create_node_worker(policy, hardware)
+                        worker = self._create_node_worker(policy, hardware or nodes.member(policy))
                     else:
                         if policy["resource"] == "gpu":
                             self._next_gpu_assignment_index = next(
