@@ -3191,6 +3191,23 @@ function updateWorkerStatuses(workers, options = {}) {
     }
 }
 
+// One name and colour per node state for every page that shows one (Nodes, Workers, the dashboard): red gets no
+// work (its Setup Health has a Must fix), amber still works in part, grey isn't checked yet or is switched off.
+// ``short`` is the "0 now" chip's text, the same words the server gives a member with no workers.
+window.NODE_STATES = Object.freeze({
+    ready: { tone: 'ok', label: 'Ready', short: '' },
+    update_needed: { tone: 'bad', label: 'Update needed', short: 'node needs an update' },
+    access_problem: { tone: 'bad', label: 'Access problem', short: 'fix media access first' },
+    gpu_lost: { tone: 'warn', label: 'GPU lost', short: 'GPU lost' },
+    no_ffmpeg: { tone: 'bad', label: 'FFmpeg missing', short: 'FFmpeg missing on node' },
+    duplicate: { tone: 'bad', label: 'Added twice', short: 'node added twice' },
+    temp_problem: { tone: 'bad', label: 'Temp folder problem', short: "node's temp folder can't be used" },
+    offline: { tone: 'bad', label: 'Offline', short: 'node offline' },
+    key_refused: { tone: 'bad', label: 'Key refused', short: 'key refused' },
+    connecting: { tone: 'off', label: 'Connecting…', short: 'connecting to node' },
+    disabled: { tone: 'off', label: 'Turned off', short: 'node turned off' },
+});
+
 function _patchWorkerCard(col, worker) {
     const fallbackActive = !!worker.fallback_active;
     const isProcessing = worker.status === 'processing';
@@ -3298,12 +3315,15 @@ function _patchWorkerCard(col, worker) {
     // Status badge: only the exceptional states get a pill; busy and idle show through the card style.
     // A node that stopped answering outranks pause and retirement: it is why the card's file is not progressing.
     const nodeDown = !!worker.node && !!worker.node_state && !['ready', 'gpu_lost'].includes(worker.node_state);
-    const nodeStateText = { offline: 'Offline', key_refused: 'Key refused', update_needed: 'Update needed', access_problem: 'Access problem', no_ffmpeg: 'FFmpeg missing', duplicate: 'Added twice', temp_problem: 'Temp folder problem', connecting: 'Connecting', disabled: 'Disabled' }[worker.node_state] || worker.node_state;
-    const workerStatus = nodeDown ? `Node ${String(nodeStateText).toLowerCase()}` : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
+    const nodeState = window.NODE_STATES[worker.node_state];
+    const nodeStateText = String(nodeState ? nodeState.label : worker.node_state);
+    // "Node offline", "Node FFmpeg missing": only a capitalised word is lowered, never a name like FFmpeg or GPU.
+    const nodeStatus = /^[A-Z][a-z]/.test(nodeStateText) ? nodeStateText[0].toLowerCase() + nodeStateText.slice(1) : nodeStateText;
+    const workerStatus = nodeDown ? `Node ${nodeStatus}` : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
     if (statusEl.textContent !== workerStatus) {
         statusEl.textContent = workerStatus;
     }
-    const nodeBad = nodeDown && ['offline', 'key_refused'].includes(worker.node_state);
+    const nodeBad = nodeDown && nodeState?.tone === 'bad';
     statusEl.classList.toggle('bad', nodeBad);
     statusEl.classList.toggle('warn', !nodeBad);
     statusEl.hidden = !(nodeDown || paused || worker.retiring);

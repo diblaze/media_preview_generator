@@ -70,21 +70,6 @@
 
     // ---------- facts about a node ---------------------------------------------------------------------------
 
-    // [tone, chip text]. Green ready, amber still works in part, red gets no work (Setup Health's Must fix), grey not
-    // checked / switched off.
-    const STATES = {
-        ready: ['ok', '✓ Ready'],
-        update_needed: ['bad', 'Update needed'],
-        access_problem: ['bad', 'Access problem'],
-        gpu_lost: ['warn', 'GPU lost'],
-        no_ffmpeg: ['bad', 'FFmpeg missing'],
-        duplicate: ['bad', 'Added twice'],
-        temp_problem: ['bad', 'Temp folder problem'],
-        offline: ['bad', 'Offline'],
-        key_refused: ['bad', 'Key refused'],
-        connecting: ['off', 'Connecting…'],
-        disabled: ['off', 'Turned off'],
-    };
     // The row's button says Fix for these, and opens the tab where the fix is.
     const FIX_TAB = {
         access_problem: 'media',
@@ -99,8 +84,12 @@
     };
     const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];
 
+    // [tone, chip text], from the names and colours every page uses (app.js NODE_STATES, read when used: this file
+    // loads before app.js); here Ready gets a tick.
     function stateOf(node) {
-        return STATES[node.state] || ['off', node.state || 'Unknown'];
+        const state = (window.NODE_STATES || {})[node.state];
+        if (!state) return ['off', node.state || 'Unknown'];
+        return [state.tone, node.state === 'ready' ? `✓ ${state.label}` : state.label];
     }
 
     function roles(node) {

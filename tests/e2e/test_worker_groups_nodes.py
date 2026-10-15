@@ -116,7 +116,8 @@ def test_member_on_a_node_that_cannot_work_shows_why_it_has_zero(
     row = page.locator('[data-member="m-cpu"]')
     expect(row.locator(".node-chip")).to_have_text("nuc")
     expect(row.locator("[data-node-zero]")).to_have_text("fix access first · 0 now")
-    expect(row.locator("[data-node-zero]")).to_have_class("node-zero warn")
+    # Red, as on the Nodes page: a node with an access problem gets no work at all.
+    expect(row.locator("[data-node-zero]")).to_have_class("node-zero bad")
     expect(row).to_contain_text("nuc: fix access first · 0 workers now.")
     page.locator('[data-member="m-cpu"] [data-pick]').select_option("cpu")
     expect(row.locator(".node-chip")).to_have_count(0)
@@ -185,6 +186,44 @@ def test_dashboard_shows_node_chip_zero_reason_and_offline_worker_card(
     expect(card.locator("[data-status-badge]")).to_have_class("pill bad")
     local = authed_page.locator('[data-member-block="gpu-video:m-gpu"] .mem-h')
     expect(local.locator(".node-chip")).to_have_count(0)
+
+
+@pytest.mark.parametrize(
+    ("node_state", "text", "tone"),
+    [
+        ("update_needed", "Node update needed", "bad"),
+        ("no_ffmpeg", "Node FFmpeg missing", "bad"),
+        ("temp_problem", "Node temp folder problem", "bad"),
+        ("disabled", "Node turned off", "warn"),
+    ],
+)
+def test_a_worker_cards_node_state_has_the_nodes_pages_name_and_colour(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+    node_state: str,
+    text: str,
+    tone: str,
+) -> None:
+    """The dashboard showed these amber (red on the Nodes page) and a turned-off node as "Node disabled"."""
+    offline_node_group(group_api)
+    mock_dashboard_defaults(authed_page)
+    worker = {
+        "worker_id": 4,
+        "worker_type": "GPU",
+        "worker_name": "old-laptop · GPU Worker 1 (GTX 1650)",
+        "group_name": "Video",
+        "group_id": "gpu-video",
+        "member_id": "m-laptop",
+        "status": "idle",
+        "node": {"id": "laptop", "name": "old-laptop"},
+        "node_state": node_state,
+    }
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [worker]}))
+    authed_page.goto(app_url + "/")
+    badge = authed_page.locator('[data-worker-key="GPU_4"] [data-status-badge]')
+    expect(badge).to_have_text(text)
+    expect(badge).to_have_class(f"pill {tone}")
 
 
 def test_week_legend_names_a_node_device_apart_from_this_apps(

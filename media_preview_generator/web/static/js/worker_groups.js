@@ -70,18 +70,16 @@
         }
     }
 
-    const NODE_STATES = {
-        connecting: 'Connecting', ready: 'Ready', offline: 'Offline', update_needed: 'Update needed', key_refused: 'Key refused',
-        access_problem: 'Access problem', gpu_lost: 'GPU lost', no_ffmpeg: 'FFmpeg missing',
-        temp_problem: 'Temp folder problem', disabled: 'Disabled', duplicate: 'Added twice',
-    };
-    // Red when the node is down or refuses us; amber when it needs attention but is reachable.
-    const nodeTone = state => (!state || ['offline', 'key_refused'].includes(state) ? 'bad' : 'warn');
+    // The names and colours every page uses for a node's state (app.js NODE_STATES).
+    const nodeState = state => window.NODE_STATES?.[state] || null;
+    // Red when the node (or a removed one) gets no work at all, as on the Nodes page; amber when it still works in part
+    // or isn't checked yet.
+    const nodeTone = state => (!state || nodeState(state)?.tone === 'bad' ? 'bad' : 'warn');
     const nodesList = () => snapshot.nodes || [];
     // A node's roles are known once it has answered; until then it may still turn out to run workers.
     const runsWorkers = node => !(node.roles || []).length || node.roles.includes('worker');
     const nodeFor = member => (member.node ? nodesList().find(node => node.id === member.node) || null : null);
-    const nodeStateLabel = node => (node ? NODE_STATES[node.state] || node.state || '' : 'Removed');
+    const nodeStateLabel = node => (node ? nodeState(node.state)?.label || node.state || '' : 'Removed');
     const hardwareFor = member => (member.node
         ? (nodeFor(member)?.devices || []).find(item => item.device === member.device)
         : (snapshot.hardware || []).find(item => item.device === member.device));
