@@ -55,8 +55,12 @@ def _group_off(*node_ids):
 
 
 @pytest.fixture(autouse=True)
-def _clean(tmp_path):
+def _clean(tmp_path, monkeypatch):
     from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+    # The bell also builds the Vulkan card from a real FFmpeg probe: on a machine that reports a software device
+    # (CI) it adds a card these tests don't count.
+    monkeypatch.setattr(notif, "_build_vulkan_software_fallback_notification", lambda: None)
 
     notif.reset_session()
     reset_settings_manager()

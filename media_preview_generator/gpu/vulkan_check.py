@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import glob
 import os
 import re
@@ -289,6 +288,8 @@ def read_i915_params(fd: int) -> dict[str, int | None]:
     Returns:
         Parameter name to its value, None where the ioctl failed. Includes ``I915_PARAM_HAS_LLC``.
     """
+    import fcntl  # POSIX only; an i915 render node never exists on Windows, where the node never gets here
+
     wanted = [("I915_PARAM_HAS_LLC", I915_PARAM_HAS_LLC)] + [
         (name, number) for name, number, _, _ in I915_REQUIRED_PARAMS
     ]

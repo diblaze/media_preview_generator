@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -72,7 +73,7 @@ def host(monkeypatch):
             raise OSError(errno.EINVAL, "invalid")
         arg.value[0] = value
 
-    monkeypatch.setattr(vc.fcntl, "ioctl", fake_ioctl)
+    monkeypatch.setattr(fcntl, "ioctl", fake_ioctl)
     return state
 
 
@@ -361,3 +362,13 @@ class TestLoaderLine:
 def test_a_node_with_no_sysfs_driver_link_has_no_driver(path):
     with patch.object(vc.os.path, "realpath", side_effect=lambda p: p):
         assert vc.drm_driver_of("/dev/dri/renderD128") is None
+
+
+def test_the_module_imports_where_there_is_no_fcntl():
+    """The Windows node imports the GPU modules; fcntl exists only on POSIX, so the check may not need it at import."""
+    import subprocess
+    import sys
+
+    code = "import sys; sys.modules['fcntl'] = None; import media_preview_generator.gpu.vulkan_check"
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr

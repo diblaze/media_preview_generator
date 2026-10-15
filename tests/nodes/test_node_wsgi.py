@@ -17,6 +17,13 @@ KEY = "wsgi-test-key-0123456789"
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+@pytest.fixture(autouse=True)
+def _forget_node_mode(monkeypatch):
+    """``wsgi.main`` sets MODE=node in this process; a later test would then log FFmpeg into <system temp>/mpg-node."""
+    monkeypatch.setenv("MODE", "")
+    monkeypatch.delenv("MODE")
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

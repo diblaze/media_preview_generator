@@ -510,6 +510,8 @@ def create_ffmpeg_runner(
 
         # Use file polling approach for non-blocking, high-frequency progress monitoring
         thread_id = threading.get_ident()
+        # A node's temp folder can be swept away under a running task; FFmpeg's log must not fail the file for it.
+        os.makedirs(scratch_dir(), exist_ok=True)
         output_file = os.path.join(
             scratch_dir(),
             f"{FFMPEG_LOG_PREFIX}{os.getpid()}_{thread_id}_{time.time_ns()}.log",

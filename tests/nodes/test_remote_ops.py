@@ -540,6 +540,18 @@ class TestRealMedia:
         assert names == sorted(os.listdir(remote_dir))
         assert all((local_dir / n).read_bytes() == (remote_dir / n).read_bytes() for n in names)
 
+    def test_a_node_temp_folder_removed_under_it_does_not_fail_the_file(self, clip, tmp_path, monkeypatch):
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "gone"))
+        out = tmp_path / "out"
+        out.mkdir()
+        config = ops.PreviewConfig(5, "hable", 4, 2, "INFO", None, FFMPEG)
+
+        with failure_scope("job-gone"):
+            result = generator.generate_images(clip, str(out), None, None, config)
+
+        assert result[0] is True and result[1] > 0
+
     def test_fingerprint_on_the_node_equals_the_local_one(self, clip):
         ffmpeg = fingerprint.chromaprint_ffmpeg(FFMPEG)
         if ffmpeg is None:
