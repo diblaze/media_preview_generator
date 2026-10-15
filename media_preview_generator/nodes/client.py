@@ -31,8 +31,13 @@ ARTIFACT_TIMEOUT_S = 300.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
-# Every other answer is a small JSON object; the largest (a long film's audio fingerprint) is a few MB.
-MAX_ANSWER_BYTES = 64 * 1024 * 1024
+# JSON parses into ~25x its size here (each 3-byte ``[],`` is a 64-byte list), so each answer gets a cap that fits it.
+# Most answers are one small object: health 164 bytes and info under 1 KB measured, a few KB with many GPUs.
+MAX_ANSWER_BYTES = 1024 * 1024
+# A poll carries up to 2000 log lines and the task's result; the node's log 2000 lines; an access check 200 files.
+# Measured: 2000 log lines with a traceback each 1.3 MB, the largest credits result of 43,144 real files 235 KB, an
+# access check of 200 files 49 KB. The costliest 8 MB of JSON parses into ~220 MB.
+MAX_LIST_ANSWER_BYTES = 8 * 1024 * 1024
 
 
 class NodeError(Exception):
@@ -246,7 +251,7 @@ class NodeClient:
 
     def _call(
         self, method: str, path: str, *, json: dict | None = None, read_timeout: float = READ_TIMEOUT_S,
-        auth: bool = True, raw: bool = False,
+        auth: bool = True, raw: bool = False, limit: int = MAX_ANSWER_BYTES,
     ) -> Any:  # fmt: skip
         # A node never compresses its answers, and requests would inflate a compressed one in memory past any cap.
         headers = {"Accept-Encoding": "identity", **(self._headers() if auth else {})}
@@ -272,7 +277,7 @@ class NodeClient:
             # connects; such a node can never answer.
             raise NodeUnreachableError(f"{self._address.base} can't be reached: {type(exc).__name__}") from exc
         with response:
-            return self._answer(response, path, raw=raw)
+            return self._answer(response, path, raw=raw, limit=limit)
 
     def _read(self, response: requests.Response, limit: int) -> bytearray:
         """The body, refused once it passes ``limit`` bytes (returned as read: a copy of an artifact is ~1 GB)."""
@@ -296,8 +301,9 @@ class NodeClient:
         error = body.get("error") if isinstance(body, dict) else None
         return str(error.get("kind") or "") if isinstance(error, dict) else ""
 
-    def _answer(self, response: requests.Response, path: str, *, raw: bool) -> Any:
-        """The node's answer to ``path``: the JSON body, or the bytes when ``raw``; anything else raises."""
+    def _answer(self, response: requests.Response, path: str, *, raw: bool, limit: int) -> Any:
+        """The node's answer to ``path``: the JSON body (refused unparsed past ``limit`` bytes), or the bytes when
+        ``raw``; anything else raises."""
         app_instance = str(response.headers.get(protocol.APP_INSTANCE_HEADER) or "")
         if app_instance:
             raise NodeProtocolError(
@@ -321,7 +327,7 @@ class NodeClient:
         if raw and response.status_code == 200:
             return self._read(response, MAX_ARTIFACT_BYTES)
         try:
-            body = parse_json(self._read(response, MAX_ANSWER_BYTES))
+            body = parse_json(self._read(response, limit))
         except (ValueError, RecursionError) as exc:  # RecursionError: JSON nested deeper than Python's parser goes
             web_page = "html" in str(response.headers.get("Content-Type") or "").lower()
             raise NodeProtocolError(
@@ -366,7 +372,9 @@ class NodeClient:
     def access_check(self, mappings: list[protocol.PathMapping], files: list[dict]) -> dict:
         """``POST /v1/access-check`` for up to a few dozen ``{"path", "size", "mtime_ns"}`` files."""
         body = {"mapping": [m.to_json() for m in mappings], "files": files}
-        return self._call("POST", protocol.ROUTE_ACCESS_CHECK, json=body, read_timeout=30.0)
+        return self._call(
+            "POST", protocol.ROUTE_ACCESS_CHECK, json=body, read_timeout=30.0, limit=MAX_LIST_ANSWER_BYTES
+        )
 
     def start_task(self, spec: dict) -> str:
         """``POST /v1/tasks``; returns the task id (the spec's ``client_task_id`` when it carries one)."""
@@ -378,7 +386,9 @@ class NodeClient:
 
     def poll_task(self, task_id: str, *, log_from: int = 0) -> dict:
         """``GET /v1/tasks/<id>?log_from=N``: the task state with log lines from ``log_from`` on."""
-        return self._call("GET", f"{protocol.ROUTE_TASKS}/{task_id}?log_from={int(log_from)}")
+        return self._call(
+            "GET", f"{protocol.ROUTE_TASKS}/{task_id}?log_from={int(log_from)}", limit=MAX_LIST_ANSWER_BYTES
+        )
 
     def cancel_task(self, task_id: str) -> None:
         """``POST /v1/tasks/<id>/cancel``."""
@@ -404,4 +414,4 @@ class NodeClient:
 
     def log(self, lines: int = 200) -> dict:
         """``GET /v1/log?lines=N``: the node's own recent log."""
-        return self._call("GET", f"{protocol.ROUTE_LOG}?lines={int(lines)}")
+        return self._call("GET", f"{protocol.ROUTE_LOG}?lines={int(lines)}", limit=MAX_LIST_ANSWER_BYTES)

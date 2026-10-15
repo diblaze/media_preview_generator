@@ -123,8 +123,8 @@ class NodeUnavailableError(Exception):
     Attributes:
         node_id: The node.
         node_name: Its name.
-        started: False when the node never ran the task (it didn't take the start), or stopped it for its own temp
-            folder or its own routine stop (a restart), so the drop doesn't count.
+        started: False when the node never ran the task (it didn't take the start), stopped it for its own temp
+            folder or its own routine stop (a restart), or refused the key mid-task, so the drop doesn't count.
     """
 
     def __init__(self, node_id: str, node_name: str, message: str, *, started: bool = True) -> None:
@@ -344,8 +344,17 @@ class _TaskRun:
         self._cancel_delivered = False
         self._paused_at: float | None = None
         self._forgotten = False
+        # The node refused the key mid-task (recreated with a new one, or its NODE_KEY changed): nothing more is sent
+        # to it, since each wrong key from this address brings the node closer to holding it back (429).
+        self._key_refused = False
         # (node's path, app's path) of the file: the job log names it by this app's path throughout.
         self._path_swap = path_swap
+
+    def _refused_key(self) -> Exception:
+        """The file's end once the node refused the key: queued again with no drop counted (not the file's doing),
+        and the node checked now, whose check then reads the refused key for its card."""
+        self._key_refused = True
+        return self._unavailable(f"{self._placement.node_name} refused the key", started=False)
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
@@ -392,11 +401,16 @@ class _TaskRun:
         """
         if self._cancel_seen_at is None and self._cancel_requested():
             self._cancel_seen_at = time.monotonic()
+        if self._key_refused:
+            return False
         if self._cancel_seen_at is not None:
             if self._cancel_delivered:
                 return False
             try:
                 self._client.cancel_task(self._task_id)
+            except NodeAuthError:
+                self._key_refused = True
+                return False
             except NodeError as exc:
                 logger.debug("{}cancel not delivered yet: {}", self._prefix, exc)
                 return False
@@ -415,6 +429,9 @@ class _TaskRun:
                 self._client.resume_task(self._task_id)
                 self._add_held(time.monotonic() - (self._paused_at or time.monotonic()))
                 self._paused_at = None
+        except NodeAuthError:
+            self._key_refused = True
+            return False
         except NodeError as exc:
             logger.debug("{}pause/resume not delivered yet: {}", self._prefix, exc)
             return False
@@ -475,9 +492,15 @@ class _TaskRun:
         held_back = False
         while True:
             self._forward_controls()
+            if self._key_refused:
+                raise self._refused_key()
             asked_at = time.monotonic()
             try:
                 state = self._client.poll_task(self._task_id, log_from=self._next_log)
+            except NodeAuthError as exc:
+                # Polled again, the refusals from this address soon reached the node's limit, and it held back the
+                # app's own address (its check and the right key pasted next included) for a minute or more.
+                raise self._refused_key() from exc
             except NodeUnknownTaskError as exc:
                 self._forgotten = True
                 if held_back and asked_at - reached_at > protocol.TASK_UNPOLLED_EXPIRY_S:
@@ -567,6 +590,8 @@ class _TaskRun:
     def _download(self, dest: str) -> None:
         try:
             data = self._client.fetch_artifact(self._task_id)
+        except NodeAuthError as exc:
+            raise self._refused_key() from exc
         except NodeError as exc:
             raise self._unavailable(
                 f"{self._placement.node_name} didn't send the frames: {exc}",
@@ -581,7 +606,7 @@ class _TaskRun:
         published, or the file queued again, at once: a node that answers in time stops a task it still runs rather
         than at its unpolled-task expiry; one that doesn't stops it at that expiry.
         """
-        if not self._task_id or self._forgotten:
+        if not self._task_id or self._forgotten or self._key_refused:
             return
         self._free_later(self._task_id)
 

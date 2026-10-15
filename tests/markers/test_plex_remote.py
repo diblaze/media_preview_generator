@@ -86,6 +86,9 @@ class FakeSession:
             raise answer
         return answer
 
+    def get(self, url, headers=None, timeout=None, **kwargs):
+        return self.post(url, headers=headers, timeout=timeout, **kwargs)
+
 
 def _envelope(result: dict, *, version: str = "1.0.0", protocols=(1,)) -> FakeResponse:
     return FakeResponse(
@@ -325,6 +328,58 @@ class TestVersionSkew:
         assert report.details["agent"]["state"] == "incompatible"
 
 
+_CAPABILITIES = ["loudness_v1", "library_health_v1"]
+
+
+def _answer_of(size: int, result: dict) -> FakeResponse:
+    """An agent's answer with ``result``, exactly ``size`` bytes long (padded with whitespace, which JSON allows)."""
+    agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+    body = json.dumps({"ok": True, "agent": agent, "result": result}).encode()
+    return FakeResponse(200, {}, body=body + b" " * (size - len(body)))
+
+
+def _answering(answer: FakeResponse) -> RemotePlexDb:
+    """A node that answered before (its capabilities are known, so a request goes straight to its route)."""
+    remote, _ = _remote(answer)
+    remote._client.capabilities = list(_CAPABILITIES)
+    return remote
+
+
+def _outcome(call, remote: RemotePlexDb) -> str:
+    """What the call said: the refusal it raised, or the message of the report it returned."""
+    try:
+        answer = call(remote)
+    except PublishError as exc:
+        return str(exc)
+    return str(getattr(answer, "message", ""))
+
+
+def _library_health_rows(remote: RemotePlexDb) -> dict:
+    return remote.library_health_rows([1], want_markers=False, want_chapters=False, deadline=_deadline(), needs="1")
+
+
+_REPORT = {"report": {"state": "ok", "message": "", "details": {}}}
+_SMALL_ANSWER_CALLS = [
+    pytest.param(lambda r: r.read_item(7, deadline=_deadline()), {"item": {"exists": True, "parts": []}}, id="read"),
+    pytest.param(
+        lambda r: r.write_item(
+            WriteRequest(7, [PART], [INTRO], [], 1, [], (1,), frozenset(), False), deadline=_deadline()
+        ),
+        {"write": {"changed": True, "shown": "ours", "replaced_own": [], "replaced_stale": []}},
+        id="write",
+    ),
+    pytest.param(lambda r: r.item_exists(7, deadline=_deadline()), {"exists": True}, id="exists"),
+    pytest.param(
+        lambda r: r.loudness("streams", {}, deadline=_deadline(), needs="1"),
+        {"capability": "loudness_v1"},
+        id="loudness",
+    ),
+    pytest.param(lambda r: r.node_machine_identifier(), {"machine_identifier": "m1"}, id="ping"),
+    pytest.param(lambda r: r.file_checks(deadline=_deadline()), _REPORT, id="file-checks"),
+    pytest.param(lambda r: r.db_checks(deadline=_deadline()), _REPORT, id="db-checks"),
+]
+
+
 class TestFailuresLookLikeTodays:
     """Whatever goes wrong, the app sees the same exception shape it sees from a local database."""
 
@@ -456,13 +511,20 @@ class TestFailuresLookLikeTodays:
             remote.read_item(7, deadline=_deadline())
         assert session.calls[0]["headers"]["Accept-Encoding"] == "identity" and session.calls[0]["stream"] is True
 
-    def test_an_answer_past_the_size_cap_is_refused(self, monkeypatch):
-        monkeypatch.setattr(plex_remote, "MAX_ANSWER_BYTES", 1024)
-        big = _envelope({"item": {"exists": True, "parts": [], "pad": "x" * 2048}})
-        remote, _ = _remote(big)
-        with pytest.raises(AgentError, match="too large"):
-            remote.read_item(7, deadline=_deadline())
+    @pytest.mark.parametrize(("call", "result"), _SMALL_ANSWER_CALLS)
+    def test_every_answer_but_library_health_rows_is_refused_past_1_mb(self, call, result):
+        # JSON parses into ~25x its size: one 512 MB cap for every answer let any of them cost the app gigabytes.
+        assert "too large" not in _outcome(call, _answering(_answer_of(1024 * 1024, result)))
+        big = _answer_of(1024 * 1024 + 1, result)
+        assert "too large" in _outcome(call, _answering(big))
         assert big.closed
+
+    def test_library_health_rows_read_past_1_mb_up_to_their_own_cap(self, monkeypatch):
+        monkeypatch.setattr(plex_remote, "MAX_ANSWER_BYTES", 2 * 1024 * 1024)
+        rows = {"capability": "library_health_v1", "rows": {"parts": []}}
+        assert _library_health_rows(_answering(_answer_of(2 * 1024 * 1024, rows))) == {"parts": []}
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(_answer_of(2 * 1024 * 1024 + 1, rows)))
 
     def test_a_connection_cut_mid_answer_is_unreachable(self):
         class _Cut(FakeResponse):

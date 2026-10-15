@@ -11,8 +11,10 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -222,6 +224,53 @@ def _local(url: str) -> NodeClient:
     return NodeClient(NodeAddress(url, "k"), session=session)
 
 
+def _json_of(size: int) -> bytes:
+    """A node's JSON answer exactly ``size`` bytes long (padded with whitespace, which JSON allows)."""
+    body = json.dumps({"ok": True, "id": "t1", "status": "running", "lines": [], "results": []}).encode()
+    return body + b" " * (size - len(body))
+
+
+class _Streamed:
+    """A streamed ``requests`` answer of ``body`` (no socket: a server that doesn't read a POST's body resets it)."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status_code = status
+        self.headers = {"Content-Type": "application/json"}
+        self._body = body
+
+    def iter_content(self, chunk_size: int = 1):
+        for start in range(0, len(self._body), chunk_size):
+            yield self._body[start : start + chunk_size]
+
+    def __enter__(self) -> _Streamed:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _answering(status: int, body: bytes) -> NodeClient:
+    session = MagicMock(spec=requests.Session)
+    session.request.side_effect = lambda *args, **kwargs: _Streamed(status, body)
+    return NodeClient(NodeAddress("http://node:9494", "k"), session=session)
+
+
+_ROUTE_CAPS = [
+    pytest.param(lambda c: c.health(), 1, id="health"),
+    pytest.param(lambda c: c.info(), 1, id="info"),
+    pytest.param(lambda c: c.rescan_gpus(), 1, id="gpu-rescan"),
+    pytest.param(lambda c: c.start_task({"op": "x"}), 1, id="start"),
+    pytest.param(lambda c: c.cancel_task("t1"), 1, id="cancel"),
+    pytest.param(lambda c: c.pause_task("t1"), 1, id="pause"),
+    pytest.param(lambda c: c.resume_task("t1"), 1, id="resume"),
+    pytest.param(lambda c: c.delete_task("t1"), 1, id="delete"),
+    # Up to 2000 log lines with the task's result; the node's last 2000 log lines; 200 files' results.
+    pytest.param(lambda c: c.poll_task("t1"), 8, id="poll"),
+    pytest.param(lambda c: c.log(), 8, id="log"),
+    pytest.param(lambda c: c.access_check([], []), 8, id="access-check"),
+]
+
+
 class TestAnswersAreBounded:
     """A node (or whatever answers at its address) can't make the app hold more than a preview's worth of bytes."""
 
@@ -242,11 +291,23 @@ class TestAnswersAreBounded:
         with pytest.raises(NodeProtocolError, match="more than 1 MB"):
             _local(url).fetch_artifact("t1")
 
-    def test_a_json_answer_past_the_cap_is_refused(self, serve, monkeypatch):
-        monkeypatch.setattr(client_mod, "MAX_ANSWER_BYTES", 1024 * 1024)
-        url, _ = serve(200, b'{"pad": "' + b"x" * (3 * 1024 * 1024) + b'"}')
-        with pytest.raises(NodeProtocolError, match="more than 1 MB"):
-            _local(url).poll_task("t1")
+    @pytest.mark.parametrize(("call", "cap_mb"), _ROUTE_CAPS)
+    def test_each_route_reads_up_to_its_own_cap_and_refuses_past_it(self, call, cap_mb):
+        # JSON parses into ~25x its size, so each route reads only what its answer can need (one 64 MB cap for all of
+        # them let a 60 MB /v1/info cost the app 1.4 GB).
+        cap = cap_mb * 1024 * 1024
+        call(_answering(200, _json_of(cap)))
+        with pytest.raises(NodeProtocolError, match=f"more than {cap_mb} MB"):
+            call(_answering(200, _json_of(cap + 1)))
+
+    def test_an_error_answer_past_the_small_cap_is_not_parsed(self):
+        # A 503's body is read only to tell a stopping node apart: past 1 MB it isn't parsed, so it is a plain 503.
+        stopping = json.dumps({"ok": False, "error": {"kind": "node_stopping", "message": "stopping"}}).encode()
+        with pytest.raises(NodeStoppingError):
+            _answering(503, stopping).info()
+        with pytest.raises(NodeUnreachableError, match="answered HTTP 503") as raised:
+            _answering(503, stopping + b" " * (1024 * 1024)).info()
+        assert not isinstance(raised.value, NodeStoppingError)
 
     def test_an_artifact_is_held_once_not_copied(self, serve):
         import tracemalloc
@@ -268,6 +329,74 @@ class TestAnswersAreBounded:
         assert _local(url).fetch_artifact("t1") == b"tar bytes"
         url, _ = serve(200, b'{"id": "t1", "status": "running"}', {"Content-Type": "application/json"})
         assert _local(url).poll_task("t1")["status"] == "running"
+
+
+# Run in a child so its peak memory is the answer's alone. The answer is ``size`` bytes of empty lists, JSON's costliest
+# shape to parse (each 3-byte ``[],`` becomes a 64-byte list).
+_PARSE_COST_CHILD = r"""
+import json, resource, sys
+from media_preview_generator.nodes.client import NodeAddress, NodeClient, NodeError
+
+route, size = sys.argv[1], int(sys.argv[2])
+
+def peak_mb():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+class Answer:
+    status_code = 200
+    headers = {"Content-Type": "application/json"}
+    def __init__(self):
+        head = b'{"ok": true, "id": "t1", "status": "running", "filler": ['
+        tail = b"[]]}"
+        self.parts = [head, b"[]," * ((size - len(head) - len(tail)) // 3), tail]
+    def iter_content(self, chunk_size=1):
+        for part in self.parts:
+            for start in range(0, len(part), chunk_size):
+                yield part[start:start + chunk_size]
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+class Session:
+    def request(self, *args, **kwargs):
+        return Answer()
+
+before = peak_mb()
+client = NodeClient(NodeAddress("http://node.lan:9494", "k" * 24), session=Session())
+try:
+    client.info() if route == "info" else client.poll_task("t1")
+    outcome = "parsed"
+except NodeError as exc:
+    outcome = "refused"
+print(outcome, peak_mb() - before)
+"""
+
+
+class TestAnAnswerCannotCostTheAppGigabytes:
+    """Whatever answers at a node's address (``/v1/health`` and ``/v1/info`` need no right key) can't make the app
+    parse its answer into gigabytes: a 60 MB info answer under the old 64 MB cap took the app from 118 to 1558 MiB."""
+
+    @pytest.mark.parametrize(
+        ("route", "size", "outcome"),
+        [
+            pytest.param("info", 60_000_000, "refused", id="info-60MB"),
+            pytest.param("poll", 60_000_000, "refused", id="poll-60MB"),
+            pytest.param("poll", 8 * 1024 * 1024 - 3, "parsed", id="poll-largest-accepted"),
+        ],
+    )
+    def test_the_parse_stays_under_512_mb(self, route, size, outcome):
+        done = subprocess.run(
+            [sys.executable, "-c", _PARSE_COST_CHILD, route, str(size)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True,
+        )
+        seen, grew_mb = done.stdout.split()[0], int(done.stdout.split()[-1])
+        assert seen == outcome
+        assert grew_mb < 512, f"{route} {seen} {size} bytes and the peak memory grew by {grew_mb} MB"
 
 
 class TestRedirects:
