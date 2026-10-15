@@ -531,6 +531,64 @@ class TestACodecTheGpuHasNoDecoderFor:
         assert outcome.result.kind == "hwaccel"
 
 
+MPEG2_422_STREAM = (
+    "Stream #0:0[0x1e0]: Video: mpeg2video (4:2:2), yuv422p(tv, progressive), 640x360 [SAR 1:1 DAR 16:9], 24 fps, "
+    "24 tbr, 90k tbn, start 0.541667"
+)
+VP9_444_STREAM = (
+    "Stream #0:0: Video: vp9 (Profile 1), yuv444p(tv, progressive), 640x360, SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 1k tbn"
+)
+
+
+class TestAChromaFormatTheGpuDecoderLacks:
+    """FFmpeg offers its MPEG-2 and VP9 GPU decoders 4:2:0 video only: the rest it decodes in software without a word.
+
+    Captured with jellyfin-ffmpeg 8.1.3 on a Quadro P5000, a TITAN RTX and an Intel UHD 770: an MPEG-2 4:2:2 file on
+    NVDEC and VAAPI, and a VP9 Profile 1 (4:4:4) file on NVDEC, end with the GPU scaler refusing the frames, exit 218.
+    Judged by codec alone, those were handed off as the GPU's filters failing: "check the GPU driver", and on a node a
+    GPU re-check and a GPU rescan on the app for every such file.
+    """
+
+    @pytest.mark.parametrize(
+        ("gpu", "stream", "scaler"),
+        [
+            pytest.param("NVIDIA", MPEG2_422_STREAM, "scale_cuda", id="mpeg2-422-on-nvdec"),
+            pytest.param("INTEL", MPEG2_422_STREAM, "scale_vaapi", id="mpeg2-422-on-vaapi"),
+            pytest.param("NVIDIA", VP9_444_STREAM, "scale_cuda", id="vp9-444-on-nvdec"),
+        ],
+    )
+    def test_is_handed_to_the_cpu_as_a_codec_the_gpu_cant_decode(self, run, gpu, stream, scaler):  # noqa: F811
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused(scaler))], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert not _warned(outcome, "GPU driver"), outcome.warnings
+
+    @pytest.mark.parametrize(
+        ("gpu", "stream", "scaler"),
+        [
+            pytest.param(
+                "NVIDIA",
+                "Stream #0:0[0x1e0]: Video: mpeg2video (Main), yuv420p(tv, progressive), 640x360, 24 fps",
+                "scale_cuda",
+                id="mpeg2-420-on-nvdec",
+            ),
+            pytest.param(
+                "NVIDIA",
+                "Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv, progressive), 640x360, 24 fps",
+                "scale_cuda",
+                id="vp9-420-on-nvdec",
+            ),
+        ],
+    )
+    def test_the_same_codec_in_4_2_0_is_still_refused_as_a_gpu_error(self, run, gpu, stream, scaler):  # noqa: F811
+        """The GPU decodes these, so its filters failed on frames it decoded, as for H.264 above."""
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused(scaler))], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+
+
 def _stream(codec: str, rest: str = "yuv420p(tv, progressive), 1920x1080, 23.98 fps") -> list[str]:
     return [f"Stream #0:0: Video: {codec}, {rest}"]
 

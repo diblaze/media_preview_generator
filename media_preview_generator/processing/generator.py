@@ -218,8 +218,15 @@ _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
 # The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
 # in software, nor GPU frames in a format the chain wasn't built for.
 _FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
-# The input's video codec as FFmpeg lists it: "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p, ...".
-_INPUT_VIDEO_CODEC_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)")
+# The input's video codec and pixel format as FFmpeg lists them:
+# "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), ...".
+_INPUT_VIDEO_STREAM_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)(?:[^,]*, (\w+))?")
+# Pixel formats other than 4:2:0 (4:2:2, 4:4:4, 4:4:0, RGB, grey). FFmpeg offers most GPU decoders 4:2:0 video only and
+# decodes the rest in software without a word: MPEG-2 4:2:2 on NVDEC and VAAPI, VP9 4:4:4 on NVDEC (jellyfin-ffmpeg
+# 8.1.3 on a Quadro P5000, a TITAN RTX and a UHD 770). Where a GPU does decode one (HEVC 4:4:4 on the TITAN RTX, HEVC
+# 4:2:2 and VP9 4:4:4 on the UHD 770) the GPU scaler takes its frames, so frames of such a video refused by that scaler
+# were decoded in software.
+_NOT_4_2_0_PIXEL_FORMAT_RE = re.compile(r"yuvj?a?4(?:22|44|40)p|gbra?p|gray")
 # The codecs FFmpeg has a GPU decoder for, by ``-hwaccel``: libavcodec's *_nvdec, *_vaapi, *_d3d11va and *_videotoolbox
 # hwaccels (jellyfin-ffmpeg 8.1.3 has the same NVDEC and VAAPI ones). It decodes any other codec in software without a
 # word at -loglevel info: ProRes on CUDA and VAAPI, H.263 and VVC on CUDA, MPEG-1 on VAAPI, DivX 3 and WMV 7/8 on all.
@@ -895,7 +902,7 @@ def _gpu_hand_off(
 
 
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
-    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec and profile.
+    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec, profile and pixel format.
 
     Args:
         stderr_lines: One FFmpeg run's stderr, with FFmpeg's listing of the input.
@@ -903,14 +910,15 @@ def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
 
     Returns:
         True when FFmpeg has no ``hwaccel`` decoder for the input's video (ProRes on CUDA or VAAPI, DivX 3, WMV 7/8,
-        H.264 4:2:2 or 4:4:4 on VAAPI); False when it has one, or the listing is missing.
+        H.264 4:2:2 or 4:4:4 on VAAPI), or the video isn't 4:2:0 (MPEG-2 4:2:2, VP9 4:4:4: true of a run whose frames
+        the GPU scaler refused, see ``_NOT_4_2_0_PIXEL_FORMAT_RE``); False when it has one, or the listing is missing.
     """
     for line in stderr_lines:
-        found = _INPUT_VIDEO_CODEC_RE.match(line)
+        found = _INPUT_VIDEO_STREAM_RE.match(line)
         if found is None or "(attached pic)" in line:
             continue
         codec = found.group(1)
-        if hwaccel is None:
+        if hwaccel is None or _NOT_4_2_0_PIXEL_FORMAT_RE.match(found.group(2) or ""):
             return True
         if codec == "h264":
             return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
