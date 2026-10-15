@@ -284,6 +284,41 @@ class TestTheHandOff:
             proc.terminate.assert_not_called()
 
 
+# A running container that lost its GPU, as after a host daemon-reload (nvidia-smi: "Failed to initialize NVML: Unknown
+# Error"): r6 image on a Quadro P5000, Tears of Steel (2012).mov, keyframe-only and full-decode runs alike.
+GONE_GPU_STDERR = [
+    "Stream #0:0[0x1](eng), 2, 1/24: Video: h264 (Main), 1 reference frame (avc1 / 0x31637661), "
+    "yuv420p(progressive, left), 1920x800 [SAR 1:1 DAR 12:5], 0/1, 6162 kb/s, 24 fps, 24 tbr, 24 tbn (default)",
+    "[CUDA @ 0x630c839ac3c0] Loaded lib: libcuda.so.1",
+    "[CUDA @ 0x630c839ac3c0] cu->cuInit(0) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected",
+    "Device creation failed: -542398533.",
+    "[vist#0:0/h264 @ 0x630c83638200] [dec:h264 @ 0x630c836c0c80] No device available for decoder: device type cuda "
+    "needed for codec h264.",
+    "[vist#0:0/h264 @ 0x630c83638200] [dec:h264 @ 0x630c836c0c80] Hardware device setup failed for decoder: Generic "
+    "error in an external library",
+    "Error opening output file /tmp/gone-9094581566807085525/img-%06d.jpg.",
+    "Error opening output files: Generic error in an external library",
+    "Exiting with exit code -542398533",
+]
+EXTERNAL_LIBRARY_EXIT = 187  # AVERROR_EXTERNAL, as the process exit code
+
+
+class TestAGpuThatCantStartTheDecode:
+    """FFmpeg couldn't set up the GPU for the decoder and decoded nothing: the worker's CPU rerun makes the preview.
+
+    A keyframe-only file failed outright (exit 187); the full-decode file next to it reached the CPU only because its
+    probe happened to print "Could not find codec parameters", which reads as a codec error.
+    """
+
+    @pytest.mark.parametrize("keyframe_gap", [2.0, None], ids=["keyframe-only", "full-decode"])
+    def test_hands_off_to_the_cpu_as_a_gpu_failure(self, run, keyframe_gap):  # noqa: F811
+        outcome = run([(EXTERNAL_LIBRARY_EXIT, 0, *GONE_GPU_STDERR)] * 2, gpu="NVIDIA", keyframe_gap=keyframe_gap)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+        assert _warned(outcome, "retrying it on the CPU", "check the GPU driver"), outcome.warnings
+
+
 # A real NVIDIA GPU (Quadro P5000) on an H.264 High 10 file: NVDEC has no decoder for that profile, the driver is fine.
 # FFmpeg ends the run itself (exit 218); a High 4:4:4 file prints the same lines.
 H264_HI10P_ON_NVDEC = [

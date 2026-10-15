@@ -520,6 +520,6 @@ class TestNodeWorkerLogLines:
     )
     def test_a_gpu_workers_cpu_fallback_lines_name_the_cpu(self, worker, tag):
         # The GPU couldn't take the file and this worker retries it on the CPU: "GPU" lines read as the GPU working.
-        worker.fallback_active = True
+        worker.decoding_on_cpu = True
         lines = self._lines(worker, (40.0, 4.0, 10.0, "3.0x", 2.0))
         assert lines == [f"{tag} Started processing /m/film.mkv", f"{tag} Film - 40.0% (speed=3.0x)"]

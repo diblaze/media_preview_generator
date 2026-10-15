@@ -468,6 +468,19 @@ class TestDetectHwaccelRuntimeError:
         stderr_lines = ["hwaccel initialisation returned error"]
         assert _detect_hwaccel_runtime_error(stderr_lines) is True
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[vist#0:0/h264 @ 0x630c] [dec:h264 @ 0x630c] Hardware device setup failed for decoder: Generic error in an "
+            "external library",
+            "Device setup failed for decoder on input stream #0:0 : Generic error in an external library",
+        ],
+        ids=["ffmpeg-7-and-later", "older-ffmpeg"],
+    )
+    def test_detect_a_gpu_that_cant_start_the_decode(self, line):
+        """A container that lost its GPU: the decoder's GPU device can't be set up, and nothing decodes."""
+        assert _detect_hwaccel_runtime_error([line]) is True
+
     def test_no_match_on_normal_errors(self):
         """Test that non-hwaccel errors are not detected."""
         stderr_lines = [
