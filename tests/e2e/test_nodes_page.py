@@ -429,6 +429,24 @@ class TestNodeList:
         _node_tab(authed_page, "media")
         expect(authed_page.locator("#nodeMediaEditor .nd-app")).to_be_visible()
 
+    def test_on_a_phone_every_tab_shows_and_each_path_field_is_labelled(self, authed_page: Page, app_url: str) -> None:
+        authed_page.set_viewport_size(PHONE)
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        width = authed_page.viewport_size["width"]
+        for tab in ("overview", "media", "health", "log", "settings"):
+            box = authed_page.locator(f'#nodeModal .sm-rail [data-tab="{tab}"]').bounding_box()
+            assert box["x"] >= 0 and box["x"] + box["width"] <= width, tab
+        _node_tab(authed_page, "media")
+        row = authed_page.locator("#nodeMediaEditor .nd-map-row").first
+        expect(row.locator(".nd-mini-app")).to_have_text("Path on this app")
+        expect(row.locator(".nd-mini-app")).to_be_visible()
+        expect(row.locator(".nd-mini-node")).to_have_text("Path on the node")
+        expect(row.locator(".nd-mini-node")).to_be_visible()
+        # On a wide screen the column headers say it once instead.
+        authed_page.set_viewport_size({"width": 1440, "height": 900})
+        expect(row.locator(".nd-mini-app")).to_be_hidden()
+
     def test_info_icons_follow_the_app_rule(self, authed_page: Page, app_url: str) -> None:
         nodes = _four_nodes()
         nodes[1]["legacy"] = True

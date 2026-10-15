@@ -385,9 +385,12 @@
             const m = mapping || {};
             const row = document.createElement('div');
             row.className = 'nd-map-row';
+            // The mini labels stand in for the column headers on a phone, where the fields stack.
             row.innerHTML = `
+                <span class="nd-mini-lab nd-mini-app" aria-hidden="true">Path on this app</span>
                 <input type="text" class="form-control font-monospace nd-app" aria-label="Path on this app" placeholder="/data/Movies" value="${esc(m.app_prefix)}">
                 <span class="nd-arrow" aria-hidden="true">→</span>
+                <span class="nd-mini-lab nd-mini-node" aria-hidden="true">Path on the node</span>
                 <input type="text" class="form-control font-monospace nd-node" aria-label="Path on the node" placeholder="/mnt/nas/Movies" value="${esc(m.node_prefix)}">
                 <div class="nd-chip-slot"></div>
                 <button type="button" class="btn btn-sm btn-outline-danger nd-remove" aria-label="Remove mapping" title="Remove mapping"><i class="bi bi-x-lg"></i></button>`;
