@@ -1491,8 +1491,8 @@ class TestDetailsMediaInfoCantRead:
         assert len(warnings) == 1 and video_mediainfo_cant_read in warnings[0], warnings
 
 
-class TestDetailsMediaInfoCantReadKeepsHdrAndRotation:
-    """When MediaInfo's answer can't be read, ffprobe still tells an HDR file from an SDR one, and its rotation."""
+class TestDetailsMediaInfoCantReadKeepsHdr:
+    """When MediaInfo's answer can't be read, ffprobe still tells an HDR file from an SDR one."""
 
     def test_hdr10_clip_is_still_seen_as_hdr(self, hdr10_video_mediainfo_cant_read):
         track = read_media_info(hdr10_video_mediainfo_cant_read).video_tracks[0]
@@ -1516,8 +1516,6 @@ class TestDetailsMediaInfoCantReadKeepsHdrAndRotation:
     @pytest.mark.parametrize(
         "side_data,expected",
         [
-            pytest.param([{"rotation": -90}], {"Rotation": "90"}, id="turned-90-clockwise"),
-            pytest.param([{"rotation": 180}], {"Rotation": "180"}, id="upside-down"),
             pytest.param(
                 [{"dv_profile": 5, "dv_bl_signal_compatibility_id": 0}], {"HDR_format": "Dolby Vision"}, id="dv-p5"
             ),
@@ -3445,12 +3443,36 @@ class TestGpuScaleOptimisation:
 
 
 CPU_SCALE = "scale=w=320:h=240:force_original_aspect_ratio=decrease"
-# MediaInfo's Rotation (clockwise; a phone's portrait video is 90), the filters FFmpeg's autorotation would use, and
-# the GPU's box: twice the thumbnail, as the frame is stored.
-ROTATIONS = [
-    pytest.param("90.000", "transpose=clock", "w=480:h=640", id="90"),
-    pytest.param("270.000", "transpose=cclock", "w=480:h=640", id="270"),
-    pytest.param("180.000", "hflip,vflip", "w=640:h=480", id="180"),
+ONE = 65536  # 1.0 in a display matrix's 16.16 fixed point
+
+
+def _matrix(a: int, b: int, c: int, d: int) -> tuple[int, ...]:
+    """A display matrix as ffprobe prints it for ``ffmpeg -display_rotation/-display_hflip/-display_vflip``."""
+    return (a, b, 0, c, d, 0, 0, 0, 1 << 30)
+
+
+def _ffprobe_side_data(matrix: tuple[int, ...] | None) -> str:
+    """ffprobe's JSON for ``-show_entries stream_side_data=displaymatrix``, as it prints it."""
+    if matrix is None:
+        return json.dumps({"programs": [], "streams": [{}]})
+    rows = "".join(
+        f"{row:08x}: {matrix[row * 3]:11d} {matrix[row * 3 + 1]:11d} {matrix[row * 3 + 2]:11d}\n" for row in range(3)
+    )
+    return json.dumps({"programs": [], "streams": [{"side_data_list": [{"displaymatrix": f"\n{rows}"}]}]})
+
+
+# Each display matrix ffmpeg writes (the same in MP4 and Matroska, measured with ffprobe 8.1), the filters FFmpeg's
+# own autorotation puts in front of the CPU's filter graph for it, and the GPU's box: twice the thumbnail, as the frame
+# is stored. ``-display_rotation`` is counter-clockwise.
+TURNS = [
+    pytest.param(_matrix(0, -ONE, ONE, 0), "transpose=cclock", "w=480:h=640", id="rotation-90"),
+    pytest.param(_matrix(-ONE, 0, 0, -ONE), "hflip,vflip", "w=640:h=480", id="rotation-180"),
+    pytest.param(_matrix(0, ONE, -ONE, 0), "transpose=clock", "w=480:h=640", id="rotation-270"),
+    pytest.param(_matrix(-ONE, 0, 0, ONE), "hflip", "w=640:h=480", id="hflip"),
+    # A lone vflip makes the filter before it write bottom-up, which hwdownload can't: the copy takes the download.
+    pytest.param(_matrix(ONE, 0, 0, -ONE), "copy,vflip", "w=640:h=480", id="vflip"),
+    pytest.param(_matrix(0, -ONE, -ONE, 0), "transpose=clock_flip", "w=480:h=640", id="rotation-90-hflip"),
+    pytest.param(_matrix(0, ONE, ONE, 0), "transpose=cclock_flip", "w=480:h=640", id="rotation-270-hflip"),
 ]
 SURFACE_GPUS = [
     pytest.param("NVIDIA", "cuda", "scale_cuda", id="cuda"),
@@ -3459,18 +3481,150 @@ SURFACE_GPUS = [
 ]
 
 
+class TestDisplayMatrixTurn:
+    """The filters for a display matrix are the ones FFmpeg's autorotation picks: the angle, then the mirroring."""
+
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    def test_each_matrix_gets_ffmpegs_own_filters(self, matrix, turn, box):
+        from media_preview_generator.processing.filter_chain import rotation_filter
+
+        assert rotation_filter(matrix) == turn
+
+    @pytest.mark.parametrize(
+        "matrix",
+        [None, _matrix(ONE, 0, 0, ONE), (0,) * 9, (ONE, 0, 0), _matrix(46341, -46341, 46341, 46341)],
+        ids=["none", "identity", "all-zero", "short", "45-degrees"],
+    )
+    def test_a_stream_shown_as_stored_or_at_an_angle_the_gpu_cant_mirror_gets_none(self, matrix):
+        from media_preview_generator.processing.filter_chain import rotation_filter
+
+        assert rotation_filter(matrix) is None
+
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    def test_the_matrix_is_read_from_ffprobes_side_data(self, matrix, turn, box):
+        from media_preview_generator.processing.filter_chain import display_matrix
+
+        assert display_matrix(json.loads(_ffprobe_side_data(matrix))["streams"][0]) == matrix
+
+    @pytest.mark.parametrize(
+        "stream",
+        [
+            {},
+            {"side_data_list": None},
+            {"side_data_list": 7},
+            {"side_data_list": ["x", {"dv_profile": 5}]},
+            {"side_data_list": [{"displaymatrix": "\n00000000: 1 2 x\n"}]},
+            {"side_data_list": [{"displaymatrix": "\n00000000: 1 2 3\n"}]},
+        ],
+        ids=["no-side-data", "null", "number", "other-side-data", "not-numbers", "one-row"],
+    )
+    def test_a_stream_without_a_readable_matrix_has_none(self, stream):
+        from media_preview_generator.processing.filter_chain import display_matrix
+
+        assert display_matrix(stream) is None
+
+    def test_the_matrix_after_other_side_data_is_still_found(self):
+        from media_preview_generator.processing.filter_chain import display_matrix
+
+        stream = json.loads(_ffprobe_side_data(_matrix(-ONE, 0, 0, ONE)))["streams"][0]
+        stream["side_data_list"].insert(0, {"dv_profile": 8})
+        assert display_matrix(stream) == _matrix(-ONE, 0, 0, ONE)
+
+
+class TestDisplayTurn:
+    """``generator.display_turn``: one ffprobe of the first video stream's display matrix, None when it can't say."""
+
+    def test_asks_ffprobe_for_the_first_pictures_display_matrix_only(self):
+        from media_preview_generator.processing.generator import display_turn
+
+        done = subprocess.CompletedProcess([], 0, stdout=_ffprobe_side_data(_matrix(0, -ONE, -ONE, 0)))
+        with patch("media_preview_generator.processing.generator.subprocess.run", return_value=done) as run:
+            assert display_turn("/m/v.mkv") == "transpose=clock_flip"
+        assert run.call_args.args[0] == [
+            "ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries", "stream_side_data=displaymatrix",
+            "-of", "json", "/m/v.mkv",
+        ]  # fmt: skip
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            OSError("no ffprobe"),
+            subprocess.TimeoutExpired("ffprobe", 30),
+            subprocess.CompletedProcess([], 1, stdout=""),
+            subprocess.CompletedProcess([], 0, stdout="not json"),
+            subprocess.CompletedProcess([], 0, stdout="[]"),
+            subprocess.CompletedProcess([], 0, stdout='{"streams": []}'),
+            subprocess.CompletedProcess([], 0, stdout='{"streams": ["x"]}'),
+        ],
+        ids=["missing", "timeout", "failed", "not-json", "list", "no-video", "not-a-stream"],
+    )
+    def test_a_file_ffprobe_cant_read_is_taken_as_stored(self, outcome):
+        from media_preview_generator.processing.generator import display_turn
+
+        kwargs = {"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome}
+        with patch("media_preview_generator.processing.generator.subprocess.run", **kwargs):
+            assert display_turn("/m/v.mkv") is None
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None, reason="needs ffmpeg")
+    @pytest.mark.parametrize("container", ["mp4", "mkv"])
+    @pytest.mark.parametrize(
+        "display",
+        [["-display_rotation", "90"], ["-display_rotation", "180"], ["-display_rotation", "270"], ["-display_hflip"],
+         ["-display_vflip"], ["-display_rotation", "90", "-display_hflip"], ["-display_rotation", "270", "-display_hflip"]],
+        ids=["90", "180", "270", "hflip", "vflip", "90-hflip", "270-hflip"],
+    )  # fmt: skip
+    def test_the_turn_read_from_the_file_is_the_one_ffmpeg_makes_itself(self, container, display, tmp_path):
+        """Real files and FFmpeg: the filters read from the file, with FFmpeg's own turn off, give the CPU path's
+        thumbnail, pixel for pixel and at its size, for MP4 and for Matroska (which MediaInfo reads no angle from)."""
+        from PIL import Image, ImageChops
+
+        from media_preview_generator.processing.generator import display_turn
+
+        ffmpeg = shutil.which("ffmpeg")
+        stored = tmp_path / "stored.mp4"
+        shown = tmp_path / f"shown.{container}"
+        quiet = [ffmpeg, "-nostdin", "-loglevel", "error"]
+        subprocess.run(
+            [*quiet, "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=5:duration=1", "-c:v", "mpeg4", str(stored)],
+            check=True,
+            timeout=60,
+        )
+        subprocess.run([*quiet, *display, "-i", str(stored), "-c", "copy", str(shown)], check=True, timeout=60)
+        turn = display_turn(str(shown))
+        assert turn is not None
+        theirs, ours = tmp_path / "ffmpeg.png", tmp_path / "ours.png"
+        subprocess.run([*quiet, "-i", str(shown), "-frames:v", "1", "-vf", CPU_SCALE, str(theirs)], check=True)
+        subprocess.run(
+            [*quiet, "-noautorotate", "-i", str(shown), "-frames:v", "1", "-vf", f"{turn},{CPU_SCALE}", str(ours)],
+            check=True,
+        )
+
+        with Image.open(theirs) as expected, Image.open(ours) as actual:
+            assert actual.size == expected.size == ((135, 240) if "transpose" in turn else (320, 180))
+            assert ImageChops.difference(actual.convert("RGB"), expected.convert("RGB")).getbbox() is None
+
+
 class TestRotatedVideo:
-    """FFmpeg turns a rotated stream's frames upright by itself only when they are in memory: the CPU's, and those of
-    a GPU whose frames FFmpeg downloads (VideoToolbox, D3D11VA). Frames that stay on the GPU (CUDA, VAAPI) are turned
-    after their download and sized by the CPU's scale, so a portrait 16:9 video's thumbnails are 135x240 there too."""
+    """FFmpeg turns and mirrors a stream's frames as its display matrix says only when they are in memory: the CPU's,
+    and those of a GPU whose frames FFmpeg downloads (VideoToolbox, D3D11VA). Frames that stay on the GPU (CUDA, VAAPI)
+    are turned after their download and sized by the CPU's scale, so a portrait 16:9 video's thumbnails are 135x240
+    there too."""
 
     @staticmethod
-    def _command(mock_config, gpu, device, rotation, *, hdr_fmt=None, transfer=None) -> list[str]:
+    def _command(mock_config, gpu, device, matrix, *, hdr_fmt=None, transfer=None, probes=None) -> list[str]:
         info = MagicMock()
-        info.video_tracks = [MagicMock(hdr_format=hdr_fmt, transfer_characteristics=transfer, rotation=rotation)]
+        info.video_tracks = [MagicMock(hdr_format=hdr_fmt, transfer_characteristics=transfer)]
         proc = MagicMock()
         proc.poll.side_effect = [None, 0]
         proc.returncode = 0
+
+        def run(cmd, *args, **kwargs):
+            if "stream_side_data=displaymatrix" in cmd:
+                if probes is not None:
+                    probes.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout=_ffprobe_side_data(matrix))
+            return MagicMock(returncode=0)
+
         with (
             patch("media_preview_generator.processing.generator.MediaInfo") as mediainfo,
             patch("subprocess.Popen", return_value=proc) as popen,
@@ -3482,19 +3636,19 @@ class TestRotatedVideo:
             patch("builtins.open", new_callable=mock_open),
             patch("time.sleep"),
             patch("media_preview_generator.processing.generator.glob.glob", return_value=[]),
-            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("subprocess.run", side_effect=run),
         ):
             mediainfo.parse.return_value = info
-            generate_images("/test/v.mp4", "/tmp/o", gpu, device, mock_config)
+            generate_images("/test/v.mkv", "/tmp/o", gpu, device, mock_config)
         return popen.call_args_list[0][0][0]
 
-    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
     @pytest.mark.parametrize(("gpu", "device", "scaler"), SURFACE_GPUS)
     @pytest.mark.parametrize(("hdr_fmt", "fmt"), [(None, "nv12"), ("SMPTE ST 2086", "p010le")], ids=["sdr", "hdr10"])
     def test_frames_kept_on_the_gpu_are_turned_after_download_and_sized_as_on_the_cpu(
-        self, mock_config, gpu, device, scaler, rotation, turn, box, hdr_fmt, fmt
+        self, mock_config, gpu, device, scaler, matrix, turn, box, hdr_fmt, fmt
     ):
-        args = self._command(mock_config, gpu, device, rotation, hdr_fmt=hdr_fmt)
+        args = self._command(mock_config, gpu, device, matrix, hdr_fmt=hdr_fmt)
         vf = args[args.index("-vf") + 1]
 
         assert args[args.index("-hwaccel_output_format") + 1] in {"cuda", "vaapi"}
@@ -3504,30 +3658,47 @@ class TestRotatedVideo:
         if hdr_fmt:
             assert vf.index("tonemap=hable") < vf.index(turn), "tone mapped on the even-sized frame, then turned"
 
-    @pytest.mark.parametrize("rotation", ["0.000", None, "45.000", "bad"])
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    def test_on_cuda_the_turn_follows_the_download_directly(self, mock_config, matrix, turn, box):
+        args = self._command(mock_config, "NVIDIA", "cuda", matrix)
+
+        assert args[args.index("-vf") + 1] == (
+            f"fps=fps=0.2:round=up,scale_cuda={box}:force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            f"format=nv12,hwdownload,format=nv12,{turn},{CPU_SCALE}"
+        )
+
+    @pytest.mark.parametrize(
+        "matrix", [None, _matrix(ONE, 0, 0, ONE), _matrix(46341, -46341, 46341, 46341)], ids=["none", "identity", "45"]
+    )
     @pytest.mark.parametrize(("gpu", "device", "scaler"), SURFACE_GPUS)
-    def test_a_stream_shown_as_stored_keeps_its_gpu_scale(self, mock_config, gpu, device, scaler, rotation):
-        args = self._command(mock_config, gpu, device, rotation)
+    def test_a_stream_shown_as_stored_keeps_its_gpu_scale(self, mock_config, gpu, device, scaler, matrix):
+        args = self._command(mock_config, gpu, device, matrix)
         vf = args[args.index("-vf") + 1]
 
         assert f"{scaler}=w=320:h=240:force_original_aspect_ratio=decrease" in vf
         assert "transpose" not in vf and "flip" not in vf
         assert CPU_SCALE not in vf
 
-    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
     @pytest.mark.parametrize(
         ("gpu", "device"),
         [(None, None), ("APPLE", None), ("WINDOWS_GPU", None)],
         ids=["cpu", "videotoolbox", "d3d11va"],
     )
-    def test_frames_in_memory_are_left_to_ffmpegs_own_turn(self, mock_config, gpu, device, rotation, turn, box):
-        args = self._command(mock_config, gpu, device, rotation)
+    def test_frames_in_memory_are_left_to_ffmpegs_own_turn(self, mock_config, gpu, device, matrix, turn, box):
+        args = self._command(mock_config, gpu, device, matrix)
         vf = args[args.index("-vf") + 1]
 
         assert "-hwaccel_output_format" not in args
         assert vf.endswith(f",{CPU_SCALE}") and turn not in vf, vf
 
-    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
+    def test_a_cpu_worker_doesnt_probe_the_turn(self, mock_config):
+        probes: list[list[str]] = []
+        self._command(mock_config, None, None, _matrix(0, -ONE, ONE, 0), probes=probes)
+
+        assert probes == []
+
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
     @pytest.mark.parametrize(
         ("gpu", "device", "download"),
         [("INTEL", "/dev/dri/renderD128", "hwdownload,format=nv12,format=yuv420p"),
@@ -3535,68 +3706,20 @@ class TestRotatedVideo:
         ids=["intel-opencl", "amd-vulkan"],
     )  # fmt: skip
     def test_dolby_vision_profile_5_on_vaapi_is_turned_after_its_download(
-        self, mock_config, gpu, device, download, rotation, turn, box
+        self, mock_config, gpu, device, download, matrix, turn, box
     ):
-        args = self._command(mock_config, gpu, device, rotation, hdr_fmt="Dolby Vision")
+        args = self._command(mock_config, gpu, device, matrix, hdr_fmt="Dolby Vision")
         vf = args[args.index("-vf") + 1]
 
         assert vf.endswith(f"{download},{turn},{CPU_SCALE}"), vf
 
-    @pytest.mark.parametrize(("rotation", "turn", "box"), ROTATIONS)
-    def test_dolby_vision_profile_5_on_nvidia_uploads_frames_ffmpeg_turned(self, mock_config, rotation, turn, box):
-        args = self._command(mock_config, "NVIDIA", "cuda", rotation, hdr_fmt="Dolby Vision")
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    def test_dolby_vision_profile_5_on_nvidia_uploads_frames_ffmpeg_turned(self, mock_config, matrix, turn, box):
+        args = self._command(mock_config, "NVIDIA", "cuda", matrix, hdr_fmt="Dolby Vision")
         vf = args[args.index("-vf") + 1]
 
         assert "-hwaccel_output_format" not in args
         assert "hwupload" in vf and turn not in vf, vf
-
-    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-    @pytest.mark.parametrize("rotation", ["inf", "-inf", "nan", "abc", None, "45"])
-    def test_a_rotation_that_isnt_a_quarter_turn_is_read_as_none(self, rotation):
-        from types import SimpleNamespace
-
-        from media_preview_generator.processing.generator import display_rotation as read_rotation
-
-        assert read_rotation(SimpleNamespace(video_tracks=[SimpleNamespace(rotation=rotation)])) == 0
-
-    @pytest.mark.parametrize("display_rotation", ["-90", "90", "180"])
-    def test_the_turn_read_from_mediainfo_is_the_one_ffmpeg_makes_itself(self, display_rotation, tmp_path):
-        """Real files and FFmpeg: the filters for MediaInfo's angle, with FFmpeg's own turn off, give the CPU path's
-        thumbnail, pixel for pixel and at its size."""
-        import subprocess
-
-        from PIL import Image, ImageChops
-        from pymediainfo import MediaInfo
-
-        from media_preview_generator.processing.filter_chain import rotation_filter
-        from media_preview_generator.processing.generator import display_rotation as read_rotation
-
-        ffmpeg = shutil.which("ffmpeg")
-        stored = tmp_path / "stored.mp4"
-        shown = tmp_path / "shown.mp4"
-        quiet = [ffmpeg, "-nostdin", "-loglevel", "error"]
-        subprocess.run(
-            [*quiet, "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=5:duration=1", "-c:v", "mpeg4", str(stored)],
-            check=True,
-            timeout=60,
-        )
-        subprocess.run(
-            [*quiet, "-display_rotation", display_rotation, "-i", str(stored), "-c", "copy", str(shown)],
-            check=True,
-            timeout=60,
-        )
-        turn = rotation_filter(read_rotation(MediaInfo.parse(str(shown))))
-        assert turn is not None
-        theirs, ours = tmp_path / "ffmpeg.png", tmp_path / "ours.png"
-        subprocess.run([*quiet, "-i", str(shown), "-frames:v", "1", "-vf", CPU_SCALE, str(theirs)], check=True)
-        subprocess.run(
-            [*quiet, "-noautorotate", "-i", str(shown), "-frames:v", "1", "-vf", f"{turn},{CPU_SCALE}", str(ours)],
-            check=True,
-        )
-
-        with Image.open(theirs) as expected, Image.open(ours) as actual:
-            assert actual.size == expected.size == ((320, 180) if display_rotation == "180" else (135, 240))
-            assert ImageChops.difference(actual.convert("RGB"), expected.convert("RGB")).getbbox() is None
 
 
 class TestFfmpegThreadFlags:

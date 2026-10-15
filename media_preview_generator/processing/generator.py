@@ -59,6 +59,7 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
     build_hdr10_zscale_chain,
+    display_matrix,
     rotation_filter,
 )
 from .hdr_detection import (
@@ -1840,14 +1841,13 @@ _FFPROBE_FALLBACK_TIMEOUT_S = 30
 
 
 def _video_details_from_ffprobe(video_file: str) -> dict[str, str]:
-    """The HDR and rotation details of the first video stream, in MediaInfo's field names; empty if ffprobe can't say.
+    """The HDR details of the first video stream, in MediaInfo's field names; empty if ffprobe can't say.
 
     Args:
         video_file: The file.
 
     Returns:
-        ``Transfer_characteristics`` (PQ or HLG), ``HDR_format`` (Dolby Vision) and ``Rotation`` (clockwise degrees),
-        for those the stream declares.
+        ``Transfer_characteristics`` (PQ or HLG) and ``HDR_format`` (Dolby Vision), for those the stream declares.
     """
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", video_file]
     try:
@@ -1862,29 +1862,25 @@ def _video_details_from_ffprobe(video_file: str) -> dict[str, str]:
             details["HDR_format"] = "Dolby Vision"
             # Profile 5 (compatibility id 0) has no HDR10/HLG base layer: MediaInfo declares no transfer for it.
             transfer = {0: None, 1: "PQ", 4: "HLG"}.get(side_data.get("dv_bl_signal_compatibility_id"), transfer)
-        if "rotation" in side_data:
-            # ffprobe's angle is counter-clockwise; MediaInfo's is clockwise.
-            with contextlib.suppress(TypeError, ValueError):
-                details["Rotation"] = str(round(-float(side_data["rotation"])) % 360)
     if transfer:
         details["Transfer_characteristics"] = transfer
     return details
 
 
 def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
-    """The file's details as MediaInfo reads them; a file it can't read gets its HDR and rotation from ffprobe, and
-    one warning.
+    """The file's details as MediaInfo reads them; a file it can't read gets its HDR details from ffprobe, and one
+    warning.
 
     MediaInfo copies a tag into its XML as it is, so a title holding U+FFFF makes the XML unreadable and pymediainfo
-    raises ``ParseError``. FFmpeg reads the file fine, so it is processed on what ffprobe says about its HDR and
-    rotation (an HDR file is still tone mapped) rather than failed over a tag.
+    raises ``ParseError``. FFmpeg reads the file fine, so it is processed on what ffprobe says about its HDR (an HDR
+    file is still tone mapped) rather than failed over a tag.
 
     Args:
         video_file: The file.
         **parse_options: Passed on to ``MediaInfo.parse`` (``parse_speed``).
 
     Returns:
-        The file's details, or a video track holding ffprobe's HDR and rotation when MediaInfo's answer can't be read.
+        The file's details, or a video track holding ffprobe's HDR details when MediaInfo's answer can't be read.
 
     Raises:
         OSError: The file is missing, or the MediaInfo library can't be loaded.
@@ -1894,7 +1890,7 @@ def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
         return MediaInfo.parse(video_file, **parse_options)
     except ET.ParseError as exc:
         logger.warning(
-            "MediaInfo couldn't read the details of {} ({}); using what ffprobe says about its HDR and rotation.",
+            "MediaInfo couldn't read the details of {} ({}); using what ffprobe says about its HDR.",
             video_file,
             exc,
         )
@@ -1902,25 +1898,29 @@ def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
         return MediaInfo(f'<Mediainfo><File><track type="Video">{fields}</track></File></Mediainfo>')
 
 
-def display_rotation(media_info: MediaInfo) -> int:
-    """How far clockwise the video is shown turned from how it is stored, as MediaInfo reads it (a phone's portrait
-    video stored landscape is 90).
+def display_turn(video_file: str) -> str | None:
+    """The filters that show the first video stream's frames as FFmpeg shows them on the CPU, from its display matrix
+    (a phone's portrait video stored landscape is turned a quarter; a selfie video may be mirrored too).
 
-    MediaInfo reads it from MP4 and MOV (where phones write it) but not from Matroska, and doesn't say when the turn
-    is mirrored too: on a GPU a rotated Matroska file's thumbnails stay as stored, and a mirrored one's stay mirrored.
+    Read from ffprobe, not MediaInfo: MediaInfo reads the angle from MP4 and MOV but not from Matroska, and reads a
+    mirrored stream as a turn (a mirror image as upside down).
 
     Args:
-        media_info: The file's ``MediaInfo.parse`` result.
+        video_file: The file.
 
     Returns:
-        0, 90, 180 or 270; 0 for any other angle (FFmpeg turns those only on the CPU, with ``rotate``).
+        The filters (:func:`filter_chain.rotation_filter`), or None for a stream shown as stored or one ffprobe can't
+        read.
     """
-    tracks = media_info.video_tracks
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries", "stream_side_data=displaymatrix",
+           "-of", "json", video_file]  # fmt: skip
     try:
-        degrees = round(float(getattr(tracks[0], "rotation", None) or 0)) % 360 if tracks else 0
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return degrees if degrees in (90, 180, 270) else 0
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFPROBE_FALLBACK_TIMEOUT_S, check=False)
+        streams = json.loads(proc.stdout or "{}").get("streams") or [{}]
+        return rotation_filter(display_matrix(streams[0]))
+    except (subprocess.SubprocessError, OSError, ValueError, AttributeError, TypeError) as exc:
+        logger.debug("Couldn't read how {} is shown turned, so it is taken as stored: {}", video_file, exc)
+        return None
 
 
 def is_greyscale_h264(media_info: MediaInfo) -> bool:
@@ -1986,6 +1986,8 @@ def generate_images(
             f"GPU processing skipped (the GPU decodes greyscale H.264 into the wrong colours) for {video_file}",
             kind=FALLBACK_CODEC,
         )
+    # Only a GPU's frames need turning by the app: FFmpeg turns the CPU's itself.
+    shown_turn = display_turn(video_file) if gpu is not None else None
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
 
     # Filter primitives.  The final vf chain is assembled inside
@@ -2139,7 +2141,7 @@ def generate_images(
                         path_kind = DV5_PATH_VAAPI_VULKAN if use_vaapi_dv5_path else DV5_PATH_LIBPLACEBO
                     # The VAAPI paths' frames stay on the GPU until their download, which FFmpeg doesn't turn
                     # upright; the libplacebo path uploads frames FFmpeg has already turned.
-                    turn = rotation_filter(display_rotation(media_info)) if path_kind != DV5_PATH_LIBPLACEBO else None
+                    turn = shown_turn if path_kind != DV5_PATH_LIBPLACEBO else None
                     libplacebo_vf = build_dv5_vf(
                         path_kind=path_kind,
                         tonemap_algorithm=config.tonemap_algorithm,
@@ -2209,7 +2211,7 @@ def generate_images(
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
         last_command=last_command,
-        rotation=display_rotation(media_info),
+        turn=shown_turn,
     )
 
     def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:

@@ -49,7 +49,6 @@ from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
     DV5_PATH_VAAPI_VULKAN,
-    rotation_filter,
 )
 from .hwaccel import hwaccel_decode_args
 
@@ -148,7 +147,7 @@ def create_ffmpeg_runner(
     chapter_output: str | None = None,
     active_timeout_s: float | None = None,
     last_command: list[str] | None = None,
-    rotation: int = 0,
+    turn: str | None = None,
 ) -> Callable[..., tuple[int, float, str, list[str]]]:
     """Factory: return a configured ffmpeg-runner closure for one media item.
 
@@ -163,8 +162,9 @@ def create_ffmpeg_runner(
     another ``-hwaccel`` than the worker's GPU (the software Dolby Vision tier has none), and the CPU hand-off judges
     a run by the decoder it asked for.
 
-    ``rotation`` is how far the stream is shown turned (:func:`generator.display_rotation`). FFmpeg turns frames in
-    memory upright by itself but not frames that stay on the GPU, so the GPU scale paths turn them after download.
+    ``turn`` is the filters that show the stream as FFmpeg shows it (:func:`generator.display_turn`). FFmpeg turns
+    and mirrors frames in memory by itself but not frames that stay on the GPU, so the GPU scale paths turn them after
+    download.
     """
     # Import at factory-call time to avoid a circular dependency at module
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
@@ -202,15 +202,15 @@ def create_ffmpeg_runner(
         """
         if not hw_decode_active:
             return None
-        # A rotated stream's frames are turned upright after download (``_assemble_vf``) and then sized by the CPU
+        # A turned or mirrored stream's frames are turned after download (``_assemble_vf``) and then sized by the CPU
         # path's own scale (``base_scale``), so its thumbnails match the CPU's; the GPU first shrinks them to twice
         # that box, as stored (portrait boxes for a quarter turn).
-        if rotation in (90, 270):
-            box = "w=480:h=640"
-        elif rotation == 180:
-            box = "w=640:h=480"
-        else:
+        if turn is None:
             box = "w=320:h=240"
+        elif turn.startswith("transpose"):
+            box = "w=480:h=640"
+        else:
+            box = "w=640:h=480"
         if effective_gpu == "NVIDIA":
             return (
                 f"scale_cuda={box}:force_original_aspect_ratio=decrease:"
@@ -265,7 +265,6 @@ def create_ffmpeg_runner(
         vf = f"{fps_filter},{gpu_seg}"
         if effective_kind == "hdr10_zscale":
             vf += f",{hdr10_zscale_chain}"
-        turn = rotation_filter(rotation)
         if turn is not None:
             vf += f",{turn},{base_scale}"
         return vf
