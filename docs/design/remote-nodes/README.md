@@ -125,7 +125,7 @@ an update, since pull request and local images all report one version; the Plex 
 | Route | Body | Answer |
 |---|---|---|
 | `GET /v1/health` | – | `{"ok": true, "node": …}` (no auth; container HEALTHCHECK) |
-| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
+| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes, problem}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
 | `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |
@@ -201,7 +201,7 @@ retry runs (on the **node's** CPU, see §6).
 ## 5. Node states (app side)
 
 `connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `no_ffmpeg`,
-`disabled`.
+`temp_problem`, `disabled`.
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
@@ -209,6 +209,9 @@ retry runs (on the **node's** CPU, see §6).
   node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
+* `temp_problem`: a worker node whose `/v1/info` reports `worker.temp.problem` (it can't make a task folder in its
+  temp folder: full, read-only, no permission); it gets no work. A start the node refuses for that reason (400
+  `failed`) gives the file back as never started, and the node is checked at once.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.
@@ -405,7 +408,7 @@ reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `
 {"node": {id, name, version, roles},          # id null and name "" for an older Plex helper
  "legacy": bool,                              # an older Plex helper (no /v1/info; answered its /v1/ping)
  "platform": {os, arch, python},              # {} for a helper
- "worker": {gpus: [{type, device, name, status, error, credit_text?}], cpu: {...}, temp: {path, free_bytes},
+ "worker": {gpus: [{type, device, name, status, error, credit_text?}], cpu: {...}, temp: {path, free_bytes, problem},
             notes: [{title, chip, message}]} | null,   # null without the worker role; notes = credits text on CPU
  "plex_db": {config_dir, db_present, machine_identifier} | null,
  "version_match": bool | null,                # null without the worker role (only a worker must match exactly)

@@ -91,7 +91,13 @@ class NodeUnknownTaskError(NodeError):
 
 
 class NodeRequestError(NodeError):
-    """The node refused the request as malformed (400). A bug on one side, never a user problem."""
+    """The node refused the request (400, kind ``request``): it is malformed, or asks for a role the node wasn't
+    started with (a GPU rescan or an access check on a node without the worker role)."""
+
+
+class NodeCantStartError(NodeError):
+    """The node couldn't take the task (400, kind ``failed``: its temp folder is full or can't be written). Nothing
+    ran, so the file can go to another worker."""
 
 
 class NodeTaskDeletedError(NodeError):
@@ -247,6 +253,8 @@ class NodeClient:
             raise NodeProtocolError(message, node=node if isinstance(node, dict) else None)
         if response.status_code == 409 and kind == protocol.KIND_TASK_DELETED:
             raise NodeTaskDeletedError(message)
+        if response.status_code == 400 and kind == protocol.KIND_FAILED:
+            raise NodeCantStartError(message)
         if response.status_code == 400:
             raise NodeRequestError(message)
         if response.status_code >= 400:

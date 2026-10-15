@@ -56,6 +56,7 @@ def _cards(*views):
         (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media", "/nodes#node-abc123/media/test"),
         (reg.STATE_GPU_LOST, "storage", "storage lost its GPU", "/nodes#node-abc123/health"),
         (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg", "/nodes#node-abc123/health"),
+        (reg.STATE_TEMP_PROBLEM, "nuc", "nuc can't use its temp folder", "/nodes#node-abc123/health"),
     ],
 )
 def test_each_alert_state_gets_a_plain_card_whose_action_opens_the_tab_with_the_fix(state, name, title, href):

@@ -560,6 +560,12 @@ _NODE_CARD_TEXT = {
         "Open Nodes",
         "health",
     ),
+    "temp_problem": (
+        "{name} can't use its temp folder",
+        "Nothing is sent to it until it can write to its temp folder again.",
+        "Open Nodes",
+        "health",
+    ),
 }
 
 

@@ -19,6 +19,8 @@ from typing import Any
 
 from loguru import logger
 
+from .tasks import probe_temp_folder
+
 GPU_RECHECK_S = 300.0
 FFMPEG_VERSION_TIMEOUT_S = 30.0
 
@@ -226,6 +228,9 @@ class WorkerInfo:
         """
         gpus = self.gpus()
         ram_total, ram_available = _meminfo()
+        # Every start makes a folder there; one that can't would refuse each file the app sends, so the app reads
+        # this and sends none.
+        temp_problem = probe_temp_folder(self._temp_root)
         try:
             free_bytes: int | None = shutil.disk_usage(self._temp_root).free
         except OSError:
@@ -240,7 +245,7 @@ class WorkerInfo:
                 "ram_total": ram_total,
                 "ram_available": ram_available,
             },  # fmt: skip
-            "temp": {"path": self._temp_root, "free_bytes": free_bytes},
+            "temp": {"path": self._temp_root, "free_bytes": free_bytes, "problem": temp_problem},
             "busy": busy,
             "ffmpeg": dict(self._ffmpeg),
             "gpu_checked_at": self._checked_at,

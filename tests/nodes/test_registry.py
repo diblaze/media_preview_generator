@@ -298,6 +298,28 @@ class TestStates:
         h.client().default_info = info
         assert h.registry.check_now("n1").state == reg.STATE_READY
 
+    def test_a_worker_node_that_cant_use_its_temp_folder_gets_no_work(self, h):
+        # Every start there would be refused, so a "ready" node would take each file and give it straight back.
+        info = _info()
+        problem = "The node can't write to its temp folder /node-tmp (Permission denied)"
+        info["worker"]["temp"] = {"path": "/node-tmp", "free_bytes": 10**9, "problem": problem}
+        h.client().default_info = info
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_TEMP_PROBLEM and reg.STATE_TEMP_PROBLEM in reg.ALERT_STATES
+        assert view.reason.startswith("nuc's temp folder can't be used, so it gets no files: the node can't write")
+        assert "/node-tmp (Permission denied)" in view.reason and "NODE_TEMP_DIR" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node's temp folder can't be used")
+
+    @pytest.mark.parametrize("temp", [{"path": "/node-tmp", "problem": None}, {"path": "/node-tmp"}, None])
+    def test_a_temp_folder_without_a_problem_leaves_the_node_ready(self, h, temp):
+        info = _info()
+        info["worker"]["temp"] = temp
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
     def test_a_node_on_another_node_protocol_needs_an_update_naming_both_versions(self, h):
         node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": [ROLE_WORKER]}
         legacy_asked = []

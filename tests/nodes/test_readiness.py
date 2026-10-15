@@ -75,6 +75,7 @@ def test_a_ready_worker_that_is_untested_and_unused_has_only_recommendations():
         (reg.STATE_KEY_REFUSED, "node_key"),
         (reg.STATE_UPDATE_NEEDED, "node_version"),
         (reg.STATE_NO_FFMPEG, "node_ffmpeg"),
+        (reg.STATE_TEMP_PROBLEM, "node_temp"),
     ],
 )
 def test_connection_problems_are_must_fix(state, failing):
@@ -91,6 +92,19 @@ def test_a_worker_node_without_ffmpeg_says_so_and_the_fix_is_on_the_node():
     assert _check(_envelope(_details()), "node_ffmpeg")["ok"] is True
     no_workers = _envelope(_details(roles=()))
     assert all(c["id"] != "node_ffmpeg" for s in no_workers["sections"] for c in s["checks"])
+
+
+def test_a_worker_node_that_cant_use_its_temp_folder_says_so_and_the_fix_is_on_the_node():
+    row = _check(_envelope(_details(reg.STATE_TEMP_PROBLEM, reason="nuc's temp folder can't be used")), "node_temp")
+    assert (row["label"], row["fix_where"], row["reason"]) == (
+        "The node can't use its temp folder",
+        "node",
+        "nuc's temp folder can't be used",
+    )
+    assert _check(_envelope(_details()), "node_temp")["ok"] is True
+    # No FFmpeg is checked first: the temp folder isn't known then, so no row claims it is fine.
+    no_ffmpeg = _envelope(_details(reg.STATE_NO_FFMPEG))
+    assert all(c["id"] != "node_temp" for s in no_ffmpeg["sections"] for c in s["checks"])
 
 
 def test_an_offline_node_shows_only_its_connection():

@@ -74,6 +74,7 @@
         access_problem: ['bad', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
         no_ffmpeg: ['bad', 'FFmpeg missing'],
+        temp_problem: ['bad', 'Temp folder problem'],
         offline: ['bad', 'Offline'],
         key_refused: ['bad', 'Key refused'],
         connecting: ['off', 'Connecting…'],
@@ -86,6 +87,7 @@
         update_needed: 'health',
         gpu_lost: 'health',
         no_ffmpeg: 'health',
+        temp_problem: 'health',
         offline: 'health',
     };
     const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];

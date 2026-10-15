@@ -101,7 +101,8 @@ def placed_on(placement: Placement | None) -> Iterator[None]:
 
 
 class NodeUnavailableError(Exception):
-    """The node stopped answering mid-task, or no longer knows the task. Not the file's failure: it is queued again.
+    """The node stopped answering mid-task, no longer knows the task, or couldn't take its start (no answer, or a
+    temp folder it can't use). Not the file's failure: it is queued again.
 
     Attributes:
         node_id: The node.
@@ -332,6 +333,8 @@ class _TaskRun:
             self._drop_unanswered(spec[protocol.CLIENT_TASK_ID_FIELD])
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         except NodeError as exc:
+            # No answer, or NodeCantStartError (its temp folder can't be used): nothing ran, so the file goes back in
+            # the queue and the node is checked now, whose /v1/info then names the folder and stops its work.
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
         logger.info(

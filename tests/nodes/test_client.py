@@ -18,8 +18,10 @@ import requests
 from media_preview_generator.nodes import client as client_mod
 from media_preview_generator.nodes.client import (
     NodeAddress,
+    NodeCantStartError,
     NodeClient,
     NodeProtocolError,
+    NodeRequestError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnreachableError,
@@ -239,6 +241,20 @@ class TestAProtocolRefusal:
         with pytest.raises(NodeProtocolError) as raised:
             self._client(serve, body).info()
         assert raised.value.node is None
+
+
+class TestARefusedStart:
+    def _start(self, serve, kind: str) -> None:
+        body = {"ok": False, "error": {"kind": kind, "message": "The node's temp folder /node-tmp is full (ENOSPC)"}}
+        url, _ = serve(400, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        _local(url).start_task({"op": "preview.frames", "path": "/a"})
+
+    def test_a_node_that_cant_take_the_task_is_told_apart_from_a_malformed_request(self, serve):
+        # 400 `failed` is the node's temp folder (nothing ran, the file can go elsewhere); 400 `request` is a bug.
+        with pytest.raises(NodeCantStartError, match="temp folder /node-tmp is full"):
+            self._start(serve, "failed")
+        with pytest.raises(NodeRequestError):
+            self._start(serve, "request")
 
 
 class TestWhyNothingAnswered:
