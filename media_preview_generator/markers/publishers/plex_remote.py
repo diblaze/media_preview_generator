@@ -989,6 +989,16 @@ class RemotePlexDb(PlexDatabase):
             raise self._unreadable(ValueError("no exists flag"))
         return result["exists"]
 
+    def node_machine_identifier(self, *, timeout: float = 5.0) -> str:
+        """The machine identifier of the Plex the node is beside, as it reads it now ("" when it can't say).
+
+        Raises:
+            PublishError: The node couldn't be asked.
+        """
+        answer = self._client.ping(timeout=timeout).get("machine_identifier")
+        self._client.machine_identifier = answer if isinstance(answer, str) else ""
+        return self._client.machine_identifier
+
     def loudness(self, operation: str, body: dict, *, deadline: float, needs: str) -> dict:
         """Run one fixed loudness operation (``/v1/loudness/{operation}``) on the helper.
 

@@ -303,6 +303,33 @@ class TestTheNodeProvesWhichPlexItWrites:
         assert ei.value.state is Capability.MISCONFIGURED
         assert _extra(folder, "media_streams", 11) == BEFORE
 
+    def test_a_node_beside_another_plex_is_told_as_intro_and_credits_tells_it(self, node, folder):
+        """Naming the node and the server, and what to check, instead of "Cannot prove this database belongs..."."""
+        session = FlaskSession(node)
+        db = RemoteLoudnessDb(
+            _plex(machine="plex-b"), RemotePlexDb(NODE_URL, TOKEN, session=session), server_name="Home"
+        )
+        wrong_plex = (
+            f"The Plex database node at {NODE_URL} is next to a different Plex server than Home. Check the address: "
+            "loudness measurements would have gone into the wrong database."
+        )
+
+        report = db.capability(deadline=_deadline())
+        with pytest.raises(PublishError) as ei:
+            loudness_db.read_streams(db, [FILE], deadline=_deadline())
+
+        assert (report.state, report.message) == (Capability.MISCONFIGURED, wrong_plex)
+        assert (ei.value.state, str(ei.value)) == (Capability.MISCONFIGURED, wrong_plex)
+
+    def test_a_node_that_cant_say_which_plex_it_is_beside_still_cant_prove_it(self, node, folder):
+        (folder / "Preferences.xml").unlink()
+        db, _ = _remote(node)
+        report = db.capability(deadline=_deadline())
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            "Cannot prove this database belongs to the connected Plex server",
+        )
+
     def test_an_untested_plex_version_writes_nothing(self, node, folder):
         db, _ = _remote(node, _plex(version="1.99.0.1-new"))
         with pytest.raises(PublishError) as ei:
