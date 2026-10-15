@@ -129,7 +129,7 @@ Through a Plex database node, the node keeps this record instead, in its own `/c
 To restore the affected tracks and items, stop Plex and run, in the app's container (or the node's):
 
 ```
-docker exec -it media-preview-generator python -m media_preview_generator.loudness.undo \
+docker exec -it media-preview-generator python3 -m media_preview_generator.loudness.undo \
   --db "/path/to/com.plexapp.plugins.library.db" --log /config/loudness-writes.jsonl
 ```
 
@@ -137,7 +137,7 @@ docker exec -it media-preview-generator python -m media_preview_generator.loudne
 
 On the Windows Plex database node there is no container: stop Plex and run
 `PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
-`--dry-run` first). It finds its own record and Plex's database by itself.
+`--dry-run` first). It finds its own record, and Plex's database from that record.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are

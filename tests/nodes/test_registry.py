@@ -264,6 +264,17 @@ class TestStates:
         assert h.registry.check_now("n1").state == reg.STATE_READY
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node doesn't run workers")
 
+    @pytest.mark.parametrize(
+        ("roles", "shown"),
+        [((ROLE_PLEX_DB,), "1.2.0"), ((ROLE_WORKER, ROLE_PLEX_DB), APP_VERSION)],
+        ids=["plex-database-only", "worker-too"],
+    )
+    def test_a_plex_database_only_node_shows_its_plex_database_roles_version(self, h, roles, shown):
+        """Its package version is the app release it was built from (0.0.0.dev0 locally); the docs, the minimum and
+        Servers -> Connection all speak of the Plex database role's version."""
+        h.client().default_info = _info(roles=roles, agent={"version": "1.2.0"})
+        assert h.registry.check_now("n1").version == shown
+
     def test_a_plex_database_role_older_than_the_agent_minimum_needs_an_update(self, h):
         h.client().default_info = _info(roles=(ROLE_PLEX_DB,), agent={"version": "0.1.0"})
         assert h.registry.check_now("n1").state == reg.STATE_UPDATE_NEEDED

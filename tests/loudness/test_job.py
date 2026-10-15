@@ -195,6 +195,22 @@ def test_an_unready_database_keeps_the_file_for_the_retry_without_analysing(ctx,
     assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING
 
 
+@pytest.mark.parametrize("capability_known", [False, True], ids=["first-request", "mid-job"])
+def test_a_plex_database_node_that_does_not_answer_keeps_the_file_waiting(media, capability_known):
+    """A node that is restarting or unplugged is a Plex this app can't reach now: retried, never a failed file."""
+    from .test_guard import _remote_loudness_db
+
+    cfg = _cfg(media)
+    c = job.LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
+    c._dbs[cfg.id] = _remote_loudness_db(capability_known=capability_known)
+    if capability_known:
+        c._ready[cfg.id] = ("", time.monotonic())
+    with patch.object(job, "owners", return_value=[cfg]):
+        outcome = job.check_item(_item(media), ctx=c)
+    assert outcome.outcome_key == job.WAITING, outcome
+    assert "Can't reach the Plex database node" in outcome.message and "Markers" not in outcome.message
+
+
 def test_a_busy_database_read_keeps_the_file_for_the_retry(ctx, media):
     with patch.object(job, "read_streams", side_effect=job.DatabaseBusyError("Plex's database is busy")):
         assert job.check_item(_item(media), ctx=ctx).outcome_key == job.WAITING

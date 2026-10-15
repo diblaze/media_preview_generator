@@ -11,6 +11,7 @@ from media_preview_generator.markers.fs import (
     gone_from_disk,
     is_local_filesystem,
     is_network_filesystem,
+    mount_root,
 )
 
 MOUNTINFO = """\
@@ -48,6 +49,19 @@ def test_longest_mount_point_wins(mountinfo, path, fs):
 
 def test_missing_mountinfo_returns_none(tmp_path):
     assert filesystem_type("/x", mountinfo_path=str(tmp_path / "nope")) is None
+    assert mount_root("/x", mountinfo_path=str(tmp_path / "nope")) is None
+
+
+def test_a_mounts_root_is_the_folder_of_its_filesystem_it_shows(tmp_path):
+    p = tmp_path / "mountinfo"
+    p.write_text(
+        "22 1 259:2 / / rw - ext4 /dev/root rw\n"
+        "40 22 259:2 /var/lib/docker/volumes/abc/_data /config rw - ext4 /dev/root rw\n"
+        "41 22 259:3 /my\\040media /media rw - ext4 /dev/sdb1 rw\n"
+    )
+    assert mount_root("/config/sub/file", mountinfo_path=str(p)) == "/var/lib/docker/volumes/abc/_data"
+    assert mount_root("/media/films", mountinfo_path=str(p)) == "/my media"
+    assert mount_root("/srv", mountinfo_path=str(p)) == "/"
 
 
 @pytest.mark.parametrize(

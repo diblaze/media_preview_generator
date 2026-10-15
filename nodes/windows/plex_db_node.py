@@ -107,10 +107,28 @@ def _plex_folder(args: argparse.Namespace) -> str:
     return args.plex_config_dir or winplatform.default_plex_config_dir()
 
 
+def _recorded_databases(log: str) -> set[str]:
+    """The Plex database files the undo record's writes went to (each record names the exact file it changed)."""
+    import json
+
+    found = set()
+    with open(log, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                path = json.loads(line)["database"]["path"]
+            except (ValueError, TypeError, KeyError):
+                continue  # a line cut short, or not a record: loudness.undo judges those
+            if isinstance(path, str) and path:
+                found.add(path)
+    return found
+
+
 def undo_loudness(args: argparse.Namespace) -> int:
     """Run the loudness undo (``loudness.undo``) on this node's undo record and the Plex database it wrote.
 
-    The Windows counterpart of running ``python -m media_preview_generator.loudness.undo`` in a node's container.
+    The Windows counterpart of running ``python3 -m media_preview_generator.loudness.undo`` in a node's container.
+    Without ``--plex-config-dir`` it undoes the database the record names, so a node installed with ``-PlexConfigDir``
+    needs nothing more: the undo itself still refuses any file that isn't that exact database.
 
     Returns:
         The undo's exit code.
@@ -123,7 +141,19 @@ def undo_loudness(args: argparse.Namespace) -> int:
     if not os.path.isfile(log):
         print(f"No loudness undo record at {log}: this node hasn't written loudness.", file=sys.stderr)
         return 1
-    undo_args = ["--db", plex_db_path(_plex_folder(args)), "--log", log]
+    if args.plex_config_dir:
+        db = plex_db_path(args.plex_config_dir)
+    else:
+        recorded = _recorded_databases(log)
+        if len(recorded) > 1:
+            print(
+                f"The undo record at {log} holds writes to more than one Plex database ({', '.join(sorted(recorded))}). "
+                "Add --plex-config-dir with the folder of the one to put back.",
+                file=sys.stderr,
+            )
+            return 2
+        db = recorded.pop() if recorded else plex_db_path(_plex_folder(args))
+    undo_args = ["--db", db, "--log", log]
     return undo.main([*undo_args, "--dry-run"] if args.dry_run else undo_args)
 
 

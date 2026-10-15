@@ -279,6 +279,72 @@ def plex_busy_error(seconds: float) -> DatabaseBusyError:
     )
 
 
+def unwritable_message(details: dict, *, node: bool = False) -> str:
+    """Why Plex's database can't be written, from the file check's facts: the user to run as, or a read-only folder.
+
+    A writer that already is the database's owner gets "read-only": telling it to run as that user would send the
+    user after a fix that is already in place (a ``:ro`` mount, a read-only folder).
+
+    Args:
+        details: The file check's ``unwritable``, ``writer_uid`` and ``db_owner_uid``.
+        node: Whether the Plex database node ran the check (it, not this app, is the writer).
+
+    Returns:
+        The sentence the file check reports.
+    """
+    who = "The Plex database node" if node else "This app"
+    paths = ", ".join(str(p) for p in details.get("unwritable") or ())
+    writer = str(details.get("writer_uid") or "unknown")
+    owner = str(details.get("db_owner_uid") or "unknown")
+    if writer == owner and writer != "unknown":
+        return (
+            f"{who} (user {writer}) can't write {paths}, though it runs as the user that owns Plex's database: the "
+            "folder is read-only. Make it writable (in Docker, mount Plex's config folder without :ro)."
+        )
+    run = "Run the node as" if node else "Run it with"
+    return f"{who} (user {writer}) can't write {paths}. {run} the user that owns Plex's database (user {owner})."
+
+
+def node_wording(report: CapabilityReport) -> CapabilityReport:
+    """The database file check's refusal, said about the Plex database node that ran it rather than about this app.
+
+    ``LocalPlexDb.file_checks`` runs wherever the database is, but its wording is written from this app's side ("The
+    app must run on the same machine as Plex", "This app (user N) can't write ..."). Through a node that side is the
+    node, so the untouched wording tells the user to change or move the app: the one thing the node exists to avoid.
+
+    Args:
+        report: What the node's file check answered.
+
+    Returns:
+        The same state and details with the node's wording; ``report`` itself when its wording names nobody.
+    """
+    details = report.details
+    if report.state is Capability.NEEDS_LOCAL_DB and "fs_type" in details:
+        fs_type = str(details.get("fs_type") or "")
+        where = (
+            f"Plex's database is on a network share ({fs_type}) where the Plex database node runs."
+            if is_network_filesystem(fs_type)
+            else "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
+            f"({fs_type or 'unknown'})."
+        )
+        return CapabilityReport(
+            report.state,
+            f"{where} Give the node Plex's config folder from a local disk of the Plex machine (in Docker, mount "
+            "it from one); Plex stays read-only.",
+            details,
+        )
+    if report.state is Capability.MISCONFIGURED and details.get("unwritable"):
+        return CapabilityReport(report.state, unwritable_message(details, node=True), details)
+    if report.state is Capability.UNREACHABLE and details.get("lock_holder") is False:
+        return CapabilityReport(
+            report.state,
+            "Plex doesn't have its database open through the folder the Plex database node was given (Plex is "
+            "stopped, or the node sees a different path to the file). Nothing is written while Plex isn't running.",
+            details,
+        )
+    return report
+
+
 def report_of_failure(exc: PublishError, default: Capability, details: dict | None = None) -> CapabilityReport:
     """The capability report of a check that failed with ``exc``.
 
@@ -1433,12 +1499,7 @@ class LocalPlexDb(PlexDatabase):
             # The facts as well as the sentence: with an agent this ran on Plex's machine, and ``capability()``
             # rebuilds the sentence around the agent rather than around this app.
             details.update({"unwritable": list(unwritable), "writer_uid": writer, "db_owner_uid": owner})
-            return CapabilityReport(
-                Capability.MISCONFIGURED,
-                f"This app (user {writer}) can't write {', '.join(unwritable)}. Run it with the user that owns "
-                f"Plex's database (user {owner}).",
-                details,
-            )
+            return CapabilityReport(Capability.MISCONFIGURED, unwritable_message(details), details)
         try:
             held = shm_lock_held_elsewhere(db, deadline=deadline)
         except PublishError as exc:
@@ -1997,48 +2058,20 @@ class PlexMarkerPublisher(MarkerPublisher):
         )
 
     def _through_the_agent(self, local: CapabilityReport) -> CapabilityReport | None:
-        """The database half's refusal, said about the agent's container instead of about this app.
-
-        ``LocalPlexDb.file_checks`` runs wherever the database is, but its wording is written from this app's
-        side ("The app must run on the same machine as Plex", "This app (user N) can't write ..."). Through an
-        agent that side is the agent's container, so the untouched wording tells the user to move the app —
-        the one thing the agent exists to avoid. With an agent the path, the filesystem check and
-        the lock proof are the agent's.
+        """The database half's refusal, said about the agent's container instead of about this app (``node_wording``).
 
         Args:
             local: What the database half answered.
 
         Returns:
-            The same state and details with the agent's wording, or None when no agent ran the check (or its
-            answer says nothing about where the app runs).
+            The same state and details with the agent's wording, or None when no agent ran the check, or its answer
+            says nothing about where the app runs. Plex not holding the file open is left to :meth:`capability`,
+            which tells "Plex stopped" from "a different file" by asking Plex.
         """
-        if not local.details.get("agent"):
+        if not local.details.get("agent") or local.details.get("lock_holder") is False:
             return None
-        details = local.details
-        if local.state is Capability.NEEDS_LOCAL_DB:
-            fs_type = str(details.get("fs_type") or "")
-            where = (
-                f"Plex's database is on a network share ({fs_type}) where the Plex database node runs."
-                if is_network_filesystem(fs_type)
-                else "Plex's database is on a filesystem the Plex database node doesn't recognise as a local disk "
-                f"({fs_type or 'unknown'})."
-            )
-            return CapabilityReport(
-                local.state,
-                f"{where} Give the node Plex's config folder from a local disk of the Plex machine (in Docker, mount "
-                "it from one); Plex stays read-only.",
-                details,
-            )
-        if local.state is Capability.MISCONFIGURED and details.get("unwritable"):
-            paths = ", ".join(str(p) for p in details["unwritable"])
-            return CapabilityReport(
-                local.state,
-                f"The Plex database node (user {details.get('writer_uid') or 'unknown'}) can't write {paths}. Run "
-                f"the node as the user that owns Plex's database "
-                f"(user {details.get('db_owner_uid') or 'unknown'}).",
-                details,
-            )
-        return None
+        reworded = node_wording(local)
+        return None if reworded is local else reworded
 
     def capability(self) -> CapabilityReport:
         """Check settings, DB location and lock sharing, Plex Pass, schema and the marker tag row."""

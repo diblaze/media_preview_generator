@@ -1046,7 +1046,7 @@ class NodeRegistry:
         block = info.get("node") if isinstance(info.get("node"), dict) else {}
         uid = str(block.get("id") or "")
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
-        version = str(block.get("version") or "")
+        version = protocol.node_version(info)
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:

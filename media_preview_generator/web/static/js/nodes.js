@@ -474,13 +474,21 @@
             return best;
         }
 
+        // Library names more than one server uses (every Plex has its "Films"): those chips and cards name the server.
+        let repeatedNames = new Set();
+
+        function libraryLabel(lib) {
+            return repeatedNames.has(lib.library) && lib.server ? `${lib.library} (${lib.server})` : lib.library;
+        }
+
         function libraryChip(lib) {
             const files = Array.isArray(lib.files) ? lib.files : [];
             const checked = Number.isFinite(Number(lib.checked)) ? Number(lib.checked) : files.length;
             const seen = files.filter((f) => f.ok).length;
             const title = [lib.server, lib.app_root].filter(Boolean).join(' · ');
-            if (!checked) return pill('off', `${lib.library}: no files to test`, { title });
-            return pill(lib.ok ? 'ok' : 'bad', `${lib.ok ? '✓' : '✗'} ${lib.library} ${seen}/${checked}`, { title });
+            const name = libraryLabel(lib);
+            if (!checked) return pill('off', `${name}: no files to test`, { title });
+            return pill(lib.ok ? 'ok' : 'bad', `${lib.ok ? '✓' : '✗'} ${name} ${seen}/${checked}`, { title });
         }
 
         function failureCard(lib, index) {
@@ -491,7 +499,7 @@
             const why = lib.error || NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
             const tried = bad.node_path || bad.path || '';
             let html = `<div class="nd-fail" data-library="${esc(lib.library)}">`
-                + `<div><span class="nd-fail-h">${esc(lib.library)}: ${esc(String(why).replace(/\.$/, ''))}.</span>`
+                + `<div><span class="nd-fail-h">${esc(libraryLabel(lib))}: ${esc(String(why).replace(/\.$/, ''))}.</span>`
                 + (tried ? ` <span class="text-muted">Tried</span> <span class="nd-mono">${esc(tried)}</span>` : '')
                 + '</div>';
             const nearby = lib.nearby && typeof lib.nearby === 'object' ? lib.nearby : {};
@@ -524,6 +532,9 @@
 
         function renderResults(libraries, setup) {
             lastLibraries = libraries;
+            const servers = {};
+            libraries.forEach((lib) => { (servers[lib.library] = servers[lib.library] || new Set()).add(lib.server); });
+            repeatedNames = new Set(Object.keys(servers).filter((name) => servers[name].size > 1));
             revealEnds();
             $$('.nd-chip-slot', rows).forEach((slot) => { slot.innerHTML = ''; });
             if (!libraries.length) {
@@ -643,7 +654,7 @@
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
-                return "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set.";
+                return "Key refused. Copy the key again from the node's log, or use the NODE_KEY (or AGENT_TOKEN) you set.";
             case 'unreachable':
                 return unreachableText(error.reason, url);
             case 'protocol':
@@ -929,8 +940,10 @@
         rows.push(kv('Roles', roleChips(node) || '<span class="text-muted">none reported yet</span>'));
         if (node.version) {
             const same = !page.appVersion || node.version === page.appVersion;
-            rows.push(kv('Version', `<span class="nd-mono">${esc(node.version)}</span>`
-                + (same ? '<span class="text-muted">same as this app</span>' : `<span class="text-muted">this app is ${esc(page.appVersion)}</span>`)));
+            // Only a worker runs this app's code; a Plex database node shows its Plex database role's own version.
+            const compared = !isWorker(node) ? ''
+                : (same ? '<span class="text-muted">same as this app</span>' : `<span class="text-muted">this app is ${esc(page.appVersion)}</span>`);
+            rows.push(kv('Version', `<span class="nd-mono">${esc(node.version)}</span>${compared}`));
         }
         const seen = ago(node.last_seen);
         if (seen) rows.push(kv('Last answered', esc(seen)));

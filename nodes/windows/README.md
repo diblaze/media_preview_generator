@@ -23,8 +23,11 @@ You don't need it when:
 
 ## Install
 
-1. Download the `PlexDbNode-windows` build (or build it yourself, below) and unzip it anywhere. The folder holds
-   `install.ps1`, `uninstall.ps1`, this README and the `PlexDbNode` program folder.
+1. Download `PlexDbNode-windows.zip` from the newest **Plex database node** release on the
+   [Releases page](https://github.com/stevezau/media_preview_generator/releases) and unzip it anywhere. It holds
+   `install.ps1`, `uninstall.ps1`, this README and the `PlexDbNode` program folder. No release with it yet? Build it
+   yourself ([Build](#build), below) and run `nodes\windows\install.ps1` from the checkout in step 2: it finds the
+   build in `dist\PlexDbNode`.
 2. Sign in to Windows **as the user Plex runs as**, open PowerShell in the unzipped folder and run:
 
    ```powershell
@@ -58,8 +61,8 @@ Stop Plex, then in PowerShell:
 & "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\PlexDbNode-debug.exe" --undo-loudness --dry-run
 ```
 
-`--dry-run` only counts what would be put back; run it again without `--dry-run` to restore. If you installed with
-`-PlexConfigDir`, add the same `--plex-config-dir "..."` here. What it restores and what it leaves alone is in
+`--dry-run` only counts what would be put back; run it again without `--dry-run` to restore. It finds Plex's database
+from its own record, also when you installed with `-PlexConfigDir`. What it restores and what it leaves alone is in
 [Undoing it](../../docs/plex-loudness-normalization.md#undoing-it).
 
 ## Why it starts at logon instead of as a Windows service
@@ -84,4 +87,5 @@ database role's few libraries are bundled (`requirements-windows.txt`); nothing 
 libraries) is.
 
 `smoke_test.py` starts a build against a throwaway Plex folder and checks it answers and sees the database held open;
-`.github/workflows/windows-node.yml` runs it on every change.
+`.github/workflows/windows-node.yml` runs it on every change. A `marker-agent-v*` tag builds it the same way and attaches
+`PlexDbNode-windows.zip` to that tag's release (`.github/workflows/marker-agent.yml`).

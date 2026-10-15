@@ -670,7 +670,9 @@ docker run -d --name media-preview-node -p 9494:9494 \
 ```
 
 - Mount your media read-only, at any path.
-- Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA).
+- Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA). Keep `--device /dev/dri:/dev/dri` only
+  if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
+  gathering device information").
 - The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
   made by `openssl rand -hex 24`.
 - A compose file is in [`nodes/worker/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/worker/docker-compose.yml).
@@ -684,19 +686,19 @@ docker run -d --name media-preview-node -p 9494:9494 \
 3. **Settings → Workers**: add the node's GPU or CPU to a worker group. Devices are listed under **This app** first,
    then under each node's name. Hours, job types and worker counts work as for this app's devices.
 
-The node card shows its state: **Ready**, **Offline**, **Key refused**, **Update needed**, **Access problem** or
-**GPU lost**. Only a ready node gets work; a node that lost its GPU keeps its CPU workers. Each node also has its own
-**Setup Health** and **Log** tabs.
+The node card shows its state: **Ready**, **Connecting…** (not checked yet), **Offline**, **Key refused**,
+**Update needed**, **FFmpeg missing**, **Access problem**, **GPU lost** or **Turned off**. Only a ready node gets work;
+a node that lost its GPU keeps its CPU workers. Each node also has its own **Setup Health** and **Log** tabs.
 
 If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
 at its mapped path runs elsewhere instead of failing.
 
 ### Updating a node
 
-A worker node gets no work until it runs the same version as the app, and its card says **Update needed**. After you
-update the app, update each worker node to the same tag: pull the image, then remove and start the container again
-with the same `docker run` options (or `docker compose pull && docker compose up -d`). Its key and config folder stay.
-A Plex database node only has to be new enough; its card says **Update needed** when it isn't.
+When you update this app, update every **worker node** to the same image tag: until then its card says **Update
+needed** and it gets no work. Pull the new image and recreate the container with the same settings, keeping its
+`/config` (`docker compose pull && docker compose up -d`, or `docker pull` and the same `docker run` again). Watchtower
+can update nodes too, like the app. A **Plex database node** only has to be new enough: its card says when it isn't.
 
 ### Plex on another machine
 
@@ -720,6 +722,7 @@ docker run -d --name media-preview-node -p 9494:9494 \
   stevezzau/media_preview_generator:latest
 ```
 
+- Keep `--device /dev/dri:/dev/dri` only if the machine has an Intel or AMD GPU.
 - Set `PUID`/`PGID` to the user Plex runs as: the node has to write Plex's database as that user.
 - Don't mount Plex's config folder read-only.
 - Add it once under **Settings → Nodes**, then use it both in a worker group and as your Plex's **Plex database**.
@@ -1325,9 +1328,10 @@ machine: without it that Plex stays read-only for markers. If the app and Plex a
 3. **Servers → your Plex → Edit → Connection → Plex database**: pick the node. The one-time database-write
    confirmation applies when enabling Intro & Credits. Chapter thumbnails have their own opt-in under General and can
    use this node while Intro & Credits is off.
-4. The node's card on the Nodes page shows its state (**Ready**, **Offline**, **Key refused**, **Update needed**).
-   A version the app doesn't accept is refused on the first call, in either direction, with a message saying which
-   side to update.
+4. The node's card on the Nodes page shows its state (**Ready**, **Connecting…**, **Offline**, **Key refused**,
+   **Update needed**, **Turned off**). A version the app doesn't accept is refused on the first call, in either
+   direction, with a message saying which side to update. On the server's **Connection** tab, a node that reports a
+   new id shows **Not confirmed**, and gets nothing until you type its key again on its Settings tab.
 
 A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working. For loudness it
 now needs a volume at `/config` (its old setup had none): add one when you update it, or the node writes no loudness,
@@ -1671,7 +1675,8 @@ table covers every state the check can report, using its exact wording:
 | *(Jellyfin)* "Can't reach this Jellyfin server" / "Can't reach the Media Preview Bridge markers endpoint on this Jellyfin server" | A transient connection problem | Confirm the server is up and reachable; recheck |
 | *(Jellyfin)* "Jellyfin rejected this server's credentials; reconnect it" | The stored token/login no longer works | Reconnect the server from the Servers page |
 | *(Jellyfin)* "Jellyfin refused the Media Preview Bridge markers endpoint; this server's API key or user needs administrator rights" | The connected account isn't an administrator | Reconnect with an admin account or API key |
-| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." | A `PUID`/`PGID` mismatch between the two containers | Set this container's `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." (or "The Plex database node (user N) can't write …. Run the node as …") | A `PUID`/`PGID` mismatch between the two containers | Set this container's (or the node's) `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "… can't write …, though it runs as the user that owns Plex's database: the folder is read-only." | Plex's config folder is mounted read-only (`:ro`) or its folder doesn't allow writes | Mount it read-write |
 | *(Plex)* "Disk full: Plex's database can't take any writes (…)." | The disk holding Plex's database is full | Free up space on that disk |
 | Status block fails to load: "Couldn't check this server's Intro & Credits status" (Processing tab) or "Couldn't read this server's Intro & Credits state (…)" (Inspector row) | An unexpected error while checking (e.g. `markers.db` unreadable) — one server's failure never blocks the rest of the page | Reload; check the logs for the exception type named in the message |
 

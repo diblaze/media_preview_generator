@@ -58,9 +58,9 @@ COPY --from=builder /wheels /tmp/wheels
 # container runs as whichever PUID owns Plex's database, and a fresh named volume copies these permissions.
 RUN pip install --no-cache-dir --no-index --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels \
     && install -d -m 1777 /config
-# A volume, so the undo record and the node's id survive a recreate even when the compose file names none. Name
-# one yourself (docker-compose.yml does) to keep it across `docker compose down`; the node's loudness check refuses
-# while /config is the container's own layer.
+# A volume, so the node's id isn't written into the container's own layer when nothing is mounted. It has no name
+# then, and `docker rm` + `docker run` starts on a new, empty one, so the node's loudness check refuses it as it
+# refuses the container's layer: name one yourself (docker-compose.yml does) to keep the undo record across updates.
 VOLUME /config
 
 WORKDIR /app

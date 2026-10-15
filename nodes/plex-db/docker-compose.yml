@@ -19,6 +19,9 @@
 #
 # Upgrading from the Plex marker agent: the service, container name, image and settings are the same, so replacing
 # the old compose file with this one and running `docker compose up -d` updates it in place.
+#
+# Updating: set the new version's tag below, then `docker compose pull && docker compose up -d` (the /config volume
+# stays). It only has to be new enough for the app, not the app's version: the app says when it needs an update.
 services:
   plex-marker-agent:
     image: ghcr.io/stevezau/plex-marker-agent:1.2.0

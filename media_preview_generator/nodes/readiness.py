@@ -142,7 +142,9 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
             f"A Plex database node needs version {MIN_AGENT_VERSION} or newer of its Plex database role. It doesn't "
             "have to match this app's version."
         )
-    current, recommended = view.version or "unknown", app_version if protocol.ROLE_WORKER in view.roles else None
+    shown = protocol.node_version(details.info) if details.info else ""
+    current = shown or view.version or "unknown"
+    recommended = app_version if protocol.ROLE_WORKER in view.roles else None
     node_block = (details.info or {}).get("node")
     node_build = str(node_block.get("build") or "") if isinstance(node_block, dict) else ""
     if recommended and view.version == app_version and not protocol.same_build(node_build, app_build):
@@ -352,8 +354,10 @@ def _default_file_checks(url: str, key: str) -> Any:
 
 def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
+    from ..markers.publishers.plex_db import node_wording
 
-    report = file_checks(url, key)
+    # The check ran on the node: its refusals are about the node, not this app.
+    report = node_wording(file_checks(url, key))
     details = report.details or {}
     if report.state is Capability.AGENT_UNAVAILABLE:
         return [

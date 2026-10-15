@@ -36,7 +36,13 @@ from .plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from .plex_remote import AgentClient, agent_older_than, node_refusal, report_from_json
+from .plex_remote import (
+    CHAPTERS_WAIT_FOR_THE_NODE,
+    AgentClient,
+    agent_older_than,
+    node_refusal,
+    report_from_json,
+)
 
 CHAPTER_CAPABILITY = "chapters_v1"
 MAX_CHAPTERS = 1000
@@ -454,9 +460,11 @@ class LocalChapters:
                     image.load()
                 stat = path.stat()
                 seen[index] = (stat.st_size, stat.st_mtime_ns)
+            except FileNotFoundError as exc:
+                raise ChapterError(_image_not_found(index, path), code="registration") from exc
             except (OSError, ValueError, Image.DecompressionBombError) as exc:
                 raise ChapterError(
-                    f"Chapter {index} image is missing, invalid, or changed", code="registration"
+                    f"Chapter {index} image is missing, invalid, or changed ({path})", code="registration"
                 ) from exc
         return seen
 
@@ -510,6 +518,35 @@ class LocalChapters:
             raise publish_error_from_sqlite(exc) from exc
 
 
+def _image_not_found(index: int, path: Path) -> str:
+    """The refusal of a chapter image that isn't where Plex reads it.
+
+    Through a Plex database node the app writes the images into its own Plex config folder and the node looks for them
+    in Plex's: a folder of another Plex (or a copy) on the app's side leaves every image missing here.
+    """
+    return (
+        f"Chapter {index} image isn't at {path}, where this Plex reads it. The Plex config folder chapter images are "
+        "written to must be this Plex's own folder."
+    )
+
+
+def _another_plexs_folder(config: Any, machine: str) -> str:
+    """Why this app's Plex config folder for the server is another Plex's, or "" when it isn't (or can't tell).
+
+    Through a Plex database node, this app still writes the chapter images (into that folder) and the node registers
+    them in Plex's database: images written into another Plex's folder are never where this Plex reads them, so each
+    file would fail its retries one by one.
+    """
+    folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "").strip()
+    theirs = plex_machine_identifier(folder) if folder else ""
+    if not theirs or not machine or theirs == machine:
+        return ""
+    return (
+        f"This server's Plex config folder ({folder}) belongs to a different Plex server, so chapter images written "
+        "there never reach this one. Set it to this Plex's own config folder in Edit → Connection."
+    )
+
+
 def _database_checked_recently(key: tuple[str, str, str]) -> bool:
     with _recent_lock:
         checked_at = _recent_database_checks.get(key)
@@ -557,6 +594,9 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
         refusal = node_refusal(settings)
         if refusal is not None:
             raise ChapterError(refusal.message, state=refusal.state)
+        wrong_folder = _another_plexs_folder(config, machine)
+        if wrong_folder:
+            raise ChapterError(wrong_folder, code="unsupported", state=Capability.MISCONFIGURED)
         backend = AgentClient(settings.agent_url, settings.agent_token, refusal=lambda: node_refusal(settings))
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
@@ -599,6 +639,7 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
             **body,
         },
         timeout=13,
+        unreachable=CHAPTERS_WAIT_FOR_THE_NODE,
     )
     if result.get("capability") != CHAPTER_CAPABILITY:
         raise ChapterError("Update the Plex database node for chapter registration", state=Capability.PLUGIN_OUTDATED)
