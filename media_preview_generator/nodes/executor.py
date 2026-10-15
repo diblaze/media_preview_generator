@@ -34,6 +34,7 @@ from .client import (
     NodeCantStartError,
     NodeClient,
     NodeError,
+    NodeRateLimitedError,
     NodeRequestError,
     NodeStoppingError,
     NodeTaskDeletedError,
@@ -133,7 +134,8 @@ class NodeUnavailableError(Exception):
     Attributes:
         node_id: The node.
         node_name: Its name.
-        started: False when the node never ran the task (it didn't take the start), so the drop doesn't count.
+        started: False when the node never ran the task (it didn't take the start) or stopped it for its own temp
+            folder, so the drop doesn't count.
     """
 
     def __init__(self, node_id: str, node_name: str, message: str, *, started: bool = True) -> None:
@@ -300,11 +302,13 @@ def _start_may_have_reached(exc: NodeError) -> bool:
     """Whether a start that failed with ``exc`` may have reached the node, which may then run the task.
 
     Not when the connection was never made (the client names why: refused, no such machine, TLS, a connect timeout)
-    or the node answered that it took nothing (it refused the key, the task id was already deleted, its temp folder
-    can't be used, or it is stopping). Anything else may have: no answer in time, a dropped connection, a 5xx from a
-    gateway in front of the node.
+    or the node answered that it took nothing (it refused the key or asked this address to wait, the task id was
+    already deleted, its temp folder can't be used, or it is stopping). Anything else may have: no answer in time, a
+    dropped connection, a 5xx from a gateway in front of the node.
     """
-    if isinstance(exc, NodeAuthError | NodeTaskDeletedError | NodeCantStartError | NodeStoppingError):
+    if isinstance(
+        exc, NodeAuthError | NodeRateLimitedError | NodeTaskDeletedError | NodeCantStartError | NodeStoppingError
+    ):
         return False
     return isinstance(exc, NodeTimeoutError) or not (isinstance(exc, NodeUnreachableError) and exc.reason)
 
@@ -528,6 +532,10 @@ class _TaskRun:
             _report("a GPU error", self._registry.report_gpu_error, node_id, device)
             if not error_type:
                 raise CodecNotSupportedError(message, kind=fallback_kind or FALLBACK_HWACCEL)
+        if kind == protocol.KIND_TEMP_FOLDER:
+            # The node's temp folder, not the file: as when it can't take a start, the file goes back in the queue
+            # with no drop counted and the node is checked now.
+            raise self._unavailable(f"{name} couldn't finish the task: {message}", started=False)
         raise NodeTaskError(kind or protocol.KIND_FAILED, message, error_type=error_type, extra=extra)
 
     def _download(self, dest: str) -> None:

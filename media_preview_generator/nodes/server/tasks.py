@@ -33,6 +33,7 @@ from ..protocol import (
     KIND_FAILED,
     KIND_FILE_NOT_VISIBLE,
     KIND_GPU_FAILED,
+    KIND_TEMP_FOLDER,
     STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_FAILED,
@@ -518,7 +519,7 @@ class TaskTable:
             if temp_problem is not None:
                 # The node's condition, not a bug: no traceback.
                 quiet.warning("Task {} ({}) failed: {}", task.id[:8], task.op, temp_problem)
-                task.finish(STATUS_FAILED, error={"kind": KIND_FAILED, "message": temp_problem})
+                task.finish(STATUS_FAILED, error={"kind": KIND_TEMP_FOLDER, "message": temp_problem})
                 return
             quiet.opt(exception=exc).error("Task {} ({}) failed", task.id[:8], task.op)
             task.finish(STATUS_FAILED, error={"kind": KIND_FAILED, "message": f"{type(exc).__name__}: {exc}"})

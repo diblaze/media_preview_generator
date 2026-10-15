@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from loguru import logger
 
-from ...utils import kill_with_parent
+from ...utils import dies_with_node
 from ..freeze import Freeze
 from ..fs import gone_from_disk
 from ..locks import KeyedLocks
@@ -410,14 +410,15 @@ def _run_fingerprint(
             command = fingerprint_command(
                 ffmpeg, path, length_s, retime, progress_fd=progress_pipe[1], audio_stream=audio_stream
             )
+        run_args, preexec = dies_with_node(command)  # a node's FFmpeg dies with the node
         # Its own session, so a pause stops ffmpeg's whole group and never the app's.
         proc = subprocess.Popen(
-            command,
+            run_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
             pass_fds=() if progress_pipe is None else (progress_pipe[1],),
-            preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
+            preexec_fn=preexec,
         )
     except BaseException:
         _close_fds(progress_pipe)

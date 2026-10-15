@@ -222,6 +222,28 @@ def test_one_address_cant_hold_every_connection_the_node_takes(served):
             conn.close()
 
 
+def test_connections_are_counted_per_caller_network_not_per_address(served, monkeypatch):
+    """An IPv6 caller can use a new address in its /64 for each connection: they all count as one caller."""
+    from media_preview_generator.nodes.server import wsgi
+
+    # Loopback has one IPv6 address, so two IPv4 loopback addresses stand in for two addresses in one /64.
+    same_64 = {"127.0.0.2": "2001:db8:1:2::/64", "127.0.0.3": "2001:db8:1:2::/64"}
+    monkeypatch.setattr(wsgi, "caller_key", lambda address: same_64.get(address, address), raising=False)
+    port = served(CONNECTION_LIMIT=20, CONNECTIONS_PER_ADDRESS=5)
+    held = [_half_sent(port, "127.0.0.2") for _ in range(5)]
+    try:
+        time.sleep(0.5)
+        try:
+            refused = b" 200 " not in _health_from(port, "127.0.0.3")
+        except OSError:
+            refused = True
+        assert refused
+        assert b" 200 " in _health_from(port, "127.0.0.1")
+    finally:
+        for conn in held:
+            conn.close()
+
+
 def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):
     port = served(REQUEST_READ_S=1)
     started = time.monotonic()

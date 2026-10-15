@@ -37,7 +37,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import gpu_settings_hint, kill_with_parent, working_folder_hint
+from ..utils import dies_with_node, gpu_settings_hint, working_folder_hint
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -481,12 +481,13 @@ def create_ffmpeg_runner(
         proc = None
         stderr_reader = None
         try:
+            run_args, preexec = dies_with_node(args)  # a node's FFmpeg dies with the node
             proc = subprocess.Popen(
-                args,
+                run_args,
                 stderr=stderr_fh,
                 stdout=subprocess.DEVNULL,
                 env=ffmpeg_env,
-                preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
+                preexec_fn=preexec,
             )
 
             # Signal that FFmpeg process has started

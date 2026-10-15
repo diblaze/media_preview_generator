@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import threading
 import time
@@ -54,6 +55,10 @@ def _slow_op(ctx, node_path, params):
     return {}
 
 
+def _fills_temp_op(ctx, node_path, params):
+    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), os.path.join(ctx.temp_dir, "frames.tar"))
+
+
 # When the watched op began and stopped (cleared by the test that uses it).
 WATCHED = {"started": threading.Event(), "stopped": threading.Event()}
 
@@ -75,7 +80,8 @@ def node(tmp_path, monkeypatch):
     monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
     app = node_app.create_node_app(
         config_dir=str(tmp_path / "config"), roles=["worker"], key=KEY,
-        ops={protocol.OP_PREVIEW_FRAMES: _frames_op, "test.slow": _slow_op, "test.watched": _watched_op},
+        ops={protocol.OP_PREVIEW_FRAMES: _frames_op, "test.slow": _slow_op, "test.watched": _watched_op,
+             "test.fills_temp": _fills_temp_op},
     )  # fmt: skip
     server = make_server("127.0.0.1", 0, app, threaded=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -183,6 +189,20 @@ class TestRoundTrip:
         with pytest.raises(NodeAuthError):
             _client(node[0], "wrong").info()
 
+    def test_the_right_key_from_an_address_a_stale_client_shares_is_a_wait_not_a_refused_key(self, node):
+        from media_preview_generator.nodes.client import NodeRateLimitedError, NodeUnreachableError
+        from media_preview_generator.nodes.server import identity
+
+        stale = _client(node[0], "an-old-key")
+        for _ in range(identity.WRONG_KEY_BURST):
+            with pytest.raises(NodeAuthError):
+                stale.info()
+
+        with pytest.raises(NodeRateLimitedError) as raised:
+            _client(node[0]).info()  # this app, behind the same address (NAT, a proxy)
+        assert isinstance(raised.value, NodeUnreachableError) and not isinstance(raised.value, NodeAuthError)
+        assert "too many wrong keys" in str(raised.value)
+
     def test_unknown_task_is_node_unknown_task_error(self, node):
         client = _client(node[0])
 
@@ -289,6 +309,24 @@ class TestATempFolderTheNodeCantWrite:
             set_registry(None)
 
         assert raised.value.started is False and f"temp folder {read_only_temp}" in str(raised.value)
+        assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
+        assert registry.reports == [("unavailable", NODE_ID)]
+
+
+class TestATempFolderThatFillsMidTask:
+    """A big file fills the node's temp folder: not the file's failure, and the next big file mustn't fail too."""
+
+    def test_the_file_goes_back_in_the_queue_with_no_drop_and_the_node_is_checked(self, node, tmp_path):
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        registry = identity_registry(_client(node[0]))
+        set_registry(registry)
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError) as raised:
+                run_on_node("test.fills_temp", media, {}, gpu=None, cancel_check=None)
+        finally:
+            set_registry(None)
+
+        assert raised.value.started is False and "temp folder" in str(raised.value) and "is full" in str(raised.value)
         assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
 

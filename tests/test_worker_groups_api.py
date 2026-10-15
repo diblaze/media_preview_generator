@@ -501,3 +501,34 @@ class TestGroupScale:
 
     def test_unknown_group_is_404(self, client):
         assert client.post("/api/worker-groups/nope/scale", json={"delta": 1}).status_code == 404
+
+
+class TestRestoringAnOlderBackup:
+    """The running pool ignores groups older than the last revision it applied: an older backup's revision must not
+    leave it on the pre-restore groups, nor make it ignore the Workers saves after the restore."""
+
+    def _slots(self, pool) -> int:
+        return sum(1 for worker in pool.workers if worker.policy_id and not worker._pending_removal)
+
+    def test_the_pool_runs_the_restored_groups_and_every_later_save(self, client, hardware, monkeypatch):
+        import os
+        import shutil
+
+        from media_preview_generator.jobs.worker import WorkerPool
+
+        pool = WorkerPool(0, 0, [])
+        monkeypatch.setattr("media_preview_generator.web.routes.api_jobs._get_shared_worker_pool", lambda: pool)
+        settings = get_settings_manager()
+        save(client, [cpu_group(count=2)])
+        backup = "settings.json.20261001-100000.bak"
+        shutil.copy(settings.settings_file, os.path.join(settings.config_dir, backup))
+        save(client, [cpu_group(count=3)])
+        save(client, [cpu_group(count=4)])
+        assert self._slots(pool) == 4
+
+        response = client.post("/api/settings/backups/restore", json={"file": "settings.json", "backup": backup})
+
+        assert response.status_code == 200, response.get_json()
+        assert self._slots(pool) == 2
+        save(client, [cpu_group(count=5)])
+        assert self._slots(pool) == 5

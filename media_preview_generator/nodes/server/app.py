@@ -252,10 +252,7 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
             error["message"] = message
         return answer({"error": error}, status, ok=False)
 
-    def authorised() -> bool:
-        caller = request.remote_addr or ""
-        if wrong_keys.blocked(caller):
-            return False
+    def authorised(caller: str) -> bool:
         header = request.headers.get("Authorization", "")
         offered = header[7:].strip() if header.startswith("Bearer ") else ""
         # Compared as BYTES: werkzeug decodes headers as latin-1, and compare_digest raises TypeError on a str
@@ -269,7 +266,12 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
     def _guard() -> Any:
         if request.path == protocol.ROUTE_HEALTH:
             return None
-        if not authorised():
+        caller = request.remote_addr or ""
+        wait_s = wrong_keys.blocked_for(caller)
+        if wait_s:
+            body, status = refuse(protocol.KIND_RATE_LIMITED, 429)
+            return body, status, {"Retry-After": str(wait_s)}
+        if not authorised(caller):
             # No detail: an unauthenticated caller learns nothing about this node.
             return refuse(protocol.KIND_AUTH, 401)
         asked = request.headers.get(protocol.PROTOCOL_HEADER, "").strip()

@@ -1745,20 +1745,85 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
-def _bring_restored_settings_up_to_date(settings: Any) -> None:
-    """Run the start-up migrations on a restored settings.json from before this build's schema.
+def _bring_restored_settings_up_to_date(settings: Any, live_revisions: tuple[int, int]) -> None:
+    """Run the start-up migrations on a restored settings.json from before this build's schema, and move its worker
+    groups and nodes revisions past the live ones.
 
     A backup taken before an upgrade holds settings this build no longer reads as they are (a Plex helper's address
     on its server instead of on a node). Run on them until the next restart, any save would store them half-moved
     and lose what the migration would have moved.
 
+    The running worker pool ignores groups older than the last revision it applied, so an older backup's groups (and
+    every Workers save after it, until one passed the old number) would wait for a restart. And an editor still open
+    on the old groups or nodes must get "changed elsewhere", not save over the restored ones at a matching number.
+
     Args:
         settings: The settings manager, holding the restored file.
+        live_revisions: ``worker_groups_revision`` and ``nodes_revision`` before the restore.
     """
     from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
 
-    if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
-        run_migrations(settings)
+    try:
+        if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
+            run_migrations(settings)
+    finally:
+        # Even when a migration failed: the restored file is in place either way, and the pool must follow it.
+        live_groups, live_nodes = live_revisions
+        settings.apply_changes(
+            updates={
+                "worker_groups_revision": max(settings.worker_groups_revision, live_groups) + 1,
+                "nodes_revision": max(settings.nodes_revision, live_nodes) + 1,
+            }
+        )
+
+
+def _settings_replaced(settings: Any) -> str | None:
+    """Make everything that read the old settings.json read the restored one: the config cache, the node registry and
+    the running worker pool.
+
+    Args:
+        settings: The settings manager, holding the restored file.
+
+    Returns:
+        A warning when the worker pool couldn't be refreshed, else None.
+    """
+    from ...config import clear_config_cache
+    from ...nodes.registry import get_registry
+
+    clear_config_cache()
+    get_registry().settings_replaced()
+    if not isinstance(settings.get("worker_groups"), list):
+        return None
+    from .api_worker_groups import reconcile_group_settings
+
+    return reconcile_group_settings(settings)
+
+
+def _newer_settings_refusal(path: str) -> str:
+    """Why a settings.json backup can't be put back by this build ("" when it can).
+
+    A backup a newer build wrote holds fields this one doesn't know: its next save would drop them, and the next
+    start would refuse the file (``SchemaDowngradeError``).
+
+    Args:
+        path: The backup file.
+    """
+    import json
+
+    from ...upgrade import _CURRENT_SCHEMA_VERSION
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return ""  # Not this check's to judge: the file is copied back as it always was.
+    version = data.get("_schema_version", 1) if isinstance(data, dict) else 1
+    if isinstance(version, int) and version > _CURRENT_SCHEMA_VERSION:
+        return (
+            "This backup was saved by a newer version of the app, and this version can't read all of it. Nothing "
+            "was changed. Update the app, then restore it."
+        )
+    return ""
 
 
 @api.route("/settings/backups/restore", methods=["POST"])
@@ -1803,6 +1868,9 @@ def restore_backup():
         bak_path = match["path"]
     else:
         bak_path = available[0]["path"]
+    refusal = _newer_settings_refusal(bak_path) if name == "settings.json" else ""
+    if refusal:
+        return jsonify({"success": False, "error": refusal}), 409
 
     # Snapshot the current live contents into a fresh timestamped backup
     # before overwriting. Lets the user undo a restore by restoring this
@@ -1820,29 +1888,36 @@ def restore_backup():
     # the next save of anything would write the old in-memory content back over the restore.
     settings = get_settings_manager()
     tmp_path = f"{live}.restore.tmp"
+    replaced = False
+    failure = None
     try:
         with settings.locked():
+            live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
             shutil.copy2(bak_path, tmp_path)
             os.replace(tmp_path, live)
+            replaced = True
             if name == "settings.json":
                 settings.reload()
-                _bring_restored_settings_up_to_date(settings)
+                _bring_restored_settings_up_to_date(settings, live_revisions)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
-    except OSError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
     except Exception as exc:
-        logger.exception("Restored {} from {}, but updating it to this version failed", live, bak_path)
-        return jsonify({"success": False, "error": f"Restored, but updating it to this version failed: {exc}"}), 500
+        if not replaced:
+            failure = str(exc) if isinstance(exc, OSError) else f"Restore failed: {exc}"
+            logger.warning("Couldn't restore {} from {}: {}", live, bak_path, exc)
+        else:
+            failure = f"Restored, but updating it to this version failed: {exc}"
+            logger.exception("Restored {} from {}, but updating it to this version failed", live, bak_path)
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
-    if name == "settings.json":
-        from ...config import clear_config_cache
-        from ...nodes.registry import get_registry
-
-        clear_config_cache()
-        get_registry().settings_replaced()
+    # Whenever the file was replaced, even with its update failed: what read the old file must read this one.
+    warning = _settings_replaced(settings) if replaced and name == "settings.json" else None
+    if failure:
+        return jsonify({"success": False, "error": failure}), 500
 
     logger.info("Restored {} from {}", live, bak_path)
-    return jsonify({"success": True, "file": name, "backup": os.path.basename(bak_path)})
+    body = {"success": True, "file": name, "backup": os.path.basename(bak_path)}
+    if warning:
+        body["warning"] = warning
+    return jsonify(body)

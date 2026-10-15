@@ -6998,6 +6998,70 @@ class TestBackupRestore:
         finally:
             reg.set_registry(None)
 
+    def test_a_nodes_editor_opened_before_a_restore_is_told_the_nodes_changed(self, client):
+        """The backup can hold other nodes at the revision the open editor loaded: its save must not land on them."""
+        from media_preview_generator.web.settings_manager import NodesConflict, get_settings_manager
+
+        def node(url):
+            return {"id": "n1", "name": "nuc", "url": url, "key": "node-key-123456", "enabled": True}
+
+        sm = get_settings_manager()
+        backup = "settings.json.20261015-030000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(dict(sm.get_all(), nodes=[node("http://machine-a:9494")], nodes_revision=1), f)
+        loaded = sm.update_nodes([node("http://machine-c:9494")])  # the editor loads revision 1
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": backup},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        with pytest.raises(NodesConflict):
+            sm.update_nodes([node("http://machine-c:9494")], expected_revision=loaded)
+        assert sm.nodes[0]["url"] == "http://machine-a:9494"
+
+    def test_a_restore_whose_update_fails_is_still_read_by_everything_that_read_the_old_file(self, client, monkeypatch):
+        """The restored file is in place even when its migration fails: the config cache and the node registry must
+        not go on with the settings it replaced."""
+        from media_preview_generator import config as config_mod
+        from media_preview_generator import upgrade
+        from media_preview_generator.nodes import registry as reg
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        def node(url):
+            return {"id": "n1", "name": "nuc", "url": url, "key": "node-key-123456", "enabled": True}
+
+        def failing_migrations(settings):
+            raise RuntimeError("a migration broke")
+
+        sm = get_settings_manager()
+        registry = reg.NodeRegistry(record_uid=lambda *a: None, attempt_gap_s=0.0)
+        reg.set_registry(registry)
+        try:
+            backup = "settings.json.20261015-020000.bak"
+            snapshot = dict(sm.get_all(), nodes=[node("http://machine-a:9494")], _schema_version=23)
+            with open(os.path.join(sm.config_dir, backup), "w") as f:
+                json.dump(snapshot, f)
+            sm.update_nodes([node("http://machine-c:9494")])
+            assert registry.views()[0].url == "http://machine-c:9494"
+            monkeypatch.setattr(upgrade, "run_migrations", failing_migrations)
+            monkeypatch.setattr(config_mod, "_cached_config", object())
+
+            resp = client.post(
+                "/api/settings/backups/restore",
+                headers=_api_headers(),
+                json={"file": "settings.json", "backup": backup},
+            )
+
+            assert resp.status_code == 500
+            assert "updating it to this version failed: a migration broke" in resp.get_json()["error"]
+            assert config_mod._cached_config is None
+            assert registry.views()[0].url == "http://machine-a:9494"
+        finally:
+            reg.set_registry(None)
+
     def test_restore_defaults_to_newest_when_backup_param_omitted(self, client, monkeypatch, tmp_path):
         """Backwards-compat: restore without `backup` picks the newest snapshot."""
         from media_preview_generator.web.settings_manager import get_settings_manager
@@ -7073,6 +7137,33 @@ class TestBackupRestore:
         body = resp.get_json()
         assert body["success"] is False
         assert "No backups available" in body["error"]
+
+    def test_a_backup_a_newer_version_saved_is_refused_and_nothing_changes(self, client):
+        """Put back, its next save would drop the fields this version doesn't know and the next start would refuse
+        the file; the live settings must stay as they were."""
+        from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        live = os.path.join(sm.config_dir, "settings.json")
+        sm.set("log_retention_count", 9)
+        with open(live) as f:
+            before = f.read()
+        backup = "settings.json.20261101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"_schema_version": _CURRENT_SCHEMA_VERSION + 1, "log_retention_count": 3, "future": 1}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "saved by a newer version of the app" in resp.get_json()["error"]
+        with open(live) as f:
+            assert f.read() == before
+        assert sm.get("log_retention_count") == 9
 
 
 class TestSettingsManagerWebhookMigration:

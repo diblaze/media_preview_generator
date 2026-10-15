@@ -23,7 +23,15 @@ from loguru import logger
 
 from . import protocol
 from .access_results import AccessResultStore
-from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError, NodeTimeoutError
+from .client import (
+    NodeAddress,
+    NodeAuthError,
+    NodeClient,
+    NodeError,
+    NodeProtocolError,
+    NodeRateLimitedError,
+    NodeTimeoutError,
+)
 from .protocol import PathMapping
 from .settings import find_node, node_mappings
 
@@ -512,12 +520,17 @@ class NodeRegistry:
         """Why this app sends no Plex database work to the node now ("" when it may).
 
         A Plex database node that reports a new id could be a different machine that was given the same key and
-        address; unless its Plex is the one the server uses, the user confirms it by typing its key again.
+        address; unless its Plex is the one the server uses, the user confirms it by typing its key again. A node
+        that answers as another saved node is refused too: its answer is that other machine's, not this one's.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
-            if live is None or not live.unconfirmed_uid:
+            if live is None:
+                return ""
+            if live.probe_state == STATE_DUPLICATE:
+                return f"{live.probe_reason} Until then this app doesn't use it for Plex's database."
+            if not live.unconfirmed_uid:
                 return ""
             name = str(live.record.get("name") or "The Plex database node")
         return (
@@ -982,9 +995,14 @@ class NodeRegistry:
                     live.access_wanted = False
                 if outcome.uid and not twin and outcome.uid != record.get("node_uid"):
                     self._new_uid(node_id, live, record, outcome)
-                elif outcome.uid:
+                elif outcome.uid and outcome.uid == record.get("node_uid"):
                     with self._lock:
                         live.unconfirmed_uid = ""
+                elif outcome.uid and record.get("node_uid"):
+                    # A twin's id is never recorded, so another machine stays unconfirmed: once the other node is
+                    # removed, the next check decides whether this one is the same Plex.
+                    with self._lock:
+                        live.unconfirmed_uid = outcome.uid
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -1085,7 +1103,7 @@ class NodeRegistry:
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
         info: dict | None = None
-        timeouts = 0
+        timeouts = rate_limited = 0
         for attempt in range(CHECK_ATTEMPTS):
             try:
                 info = _bounded(client.info())
@@ -1100,10 +1118,19 @@ class NodeRegistry:
                     return self._other_protocol(name, _bounded(exc.node))
                 return self._probe_legacy(record)
             except NodeError as exc:
+                # A wait (429) is tried again too: the node lets one more key through every few seconds, so a check
+                # held back once by something else sharing this app's address mustn't read the node as offline.
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
                 timeouts += isinstance(exc, NodeTimeoutError)
+                rate_limited += isinstance(exc, NodeRateLimitedError)
                 if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
                     break
+        if info is None and rate_limited:
+            return _Outcome(
+                STATE_OFFLINE,
+                f"{name} asks this app to wait: too many wrong keys came from this app's address. Something else "
+                "there (another app, an old copy) has an old key: give it the right one, or stop it.",
+            )
         if info is None and timeouts == CHECK_ATTEMPTS:
             return _Outcome(
                 STATE_OFFLINE,

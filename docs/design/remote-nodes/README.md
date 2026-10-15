@@ -160,15 +160,24 @@ Stopping (SIGTERM): the node cancels every task first, then waits up to 5 s for 
 Meanwhile `stopping` is true in `/v1/health` and `/v1/info` (the registry reads the node as offline, "<node> is
 restarting") and a start answers 503 `node_stopping` and runs nothing; the app gives the file to another worker with
 no drop counted and sends no DELETE for it. On Linux each FFmpeg a node starts gets `PR_SET_PDEATHSIG` (SIGKILL), so
-it dies with a node run outside Docker (`utils.kill_with_parent`).
+it dies with a node run outside Docker (`utils.dies_with_node`): through `setpriv --pdeathsig KILL` in front of the
+command (util-linux, in the image), else a `preexec_fn` where there is no such `setpriv`. The app's FFmpeg is
+started as before.
 
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.
 
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
-`unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`, `task_deleted`, `node_stopping`.
+`unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, `temp_folder` (the node's temp folder
+filled up or went read-only mid-task: the app queues the file again with no drop counted and checks the node), plus
+request-level `auth`, `protocol`, `unknown_task`, `request`, `task_deleted`, `node_stopping`, `rate_limited`.
+
+Wrong keys: a caller (an IPv4 address, or an IPv6 address's /64) may send 20 at once, then one more every 3 s. Past
+that, every request from it (the Plex database role's too) answers 429 `rate_limited` with `Retry-After`, whatever
+its key, which isn't compared: an app with the right key behind a shared address (NAT, a proxy, an old copy with an
+old key) reads it as a wait like no answer, never as a refused key, and the node logs the address once. The
+per-caller connection cap (100) counts the same way.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is

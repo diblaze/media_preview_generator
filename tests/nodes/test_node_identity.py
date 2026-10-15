@@ -285,6 +285,25 @@ class TestName:
         assert identity.load_identity(str(tmp_path)).name == "host-1"
 
 
+class TestCallerKey:
+    @pytest.mark.parametrize(
+        ("address", "key"),
+        [
+            ("10.0.0.66", "10.0.0.66"),
+            ("2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"),
+            ("2001:db8:1:2::1", "2001:db8:1:2::/64"),
+            ("2001:db8:1:3::1", "2001:db8:1:3::/64"),
+            ("::ffff:10.0.0.66", "10.0.0.66"),
+            ("::1", "::/64"),
+            ("", ""),
+            ("not-an-address", "not-an-address"),
+        ],
+        ids=["ipv4", "ipv6", "ipv6-same-64", "ipv6-other-64", "ipv4-mapped", "loopback", "empty", "not-ip"],
+    )
+    def test_ipv4_is_counted_per_address_and_ipv6_per_64(self, address, key):
+        assert identity.caller_key(address) == key
+
+
 class TestWrongKeyLimit:
     def _limit(self):
         now = [0.0]
@@ -293,21 +312,64 @@ class TestWrongKeyLimit:
     def test_an_address_is_blocked_after_its_burst_and_gets_one_more_try_per_refill(self):
         limit, now = self._limit()
         for _ in range(3):
-            assert not limit.blocked("10.0.0.66")
+            assert limit.blocked_for("10.0.0.66") == 0
             limit.note_wrong("10.0.0.66")
-        assert limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 10
+        now[0] = 5.0
+        assert limit.blocked_for("10.0.0.66") == 5
         now[0] = 10.0
-        assert not limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 0
         limit.note_wrong("10.0.0.66")
-        assert limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 10
 
     def test_other_addresses_and_an_address_that_stopped_guessing_are_not_blocked(self):
         limit, now = self._limit()
         for _ in range(3):
             limit.note_wrong("10.0.0.66")
-        assert not limit.blocked("10.0.0.5")
+        assert limit.blocked_for("10.0.0.5") == 0
         now[0] = 30.0
-        assert not limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 0
+
+    def test_an_address_held_back_is_named_in_the_log_once_per_run_of_wrong_keys(self):
+        limit, now = self._limit()
+        lines: list[str] = []
+        sink = identity.logger.add(lambda message: lines.append(str(message)), level="WARNING")
+        try:
+            for _ in range(10):  # an old copy that keeps sending its old key
+                limit.note_wrong("10.0.0.66")
+                now[0] += 1.0
+            now[0] += 100.0  # it stopped long enough to owe nothing...
+            for _ in range(3):  # ...then started again
+                limit.note_wrong("10.0.0.66")
+        finally:
+            identity.logger.remove(sink)
+        named = [line for line in lines if "10.0.0.66" in line]
+        assert len(named) == 2 and "wait, even with the right key" in named[0]
+
+    def test_wrong_keys_from_one_ipv6_64_add_up_while_ipv4_neighbours_dont(self):
+        limit, _now = self._limit()
+        for n in range(3):  # a new address in its /64 for every guess
+            limit.note_wrong(f"2001:db8:1:2::{n + 1:x}")
+        assert limit.blocked_for("2001:db8:1:2:ffff::9") > 0
+        assert limit.blocked_for("2001:db8:1:3::1") == 0
+
+        for n in range(3):
+            limit.note_wrong(f"10.0.0.{n + 1}")
+        assert limit.blocked_for("10.0.0.4") == 0
+
+    def test_wrong_keys_from_other_addresses_never_free_one_held_back(self, monkeypatch):
+        monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)
+        limit, now = self._limit()
+        for _ in range(3):
+            limit.note_wrong("10.0.0.66")
+        now[0] = 1.0
+        limit.note_wrong("10.0.0.67")  # owing, not held back: forgotten before any newer one
+        for n in range(20):  # an attacker cycling addresses to push 10.0.0.66 out of the table
+            now[0] = 2.0 + n * 0.01
+            limit.note_wrong(f"10.0.1.{n}")
+
+        assert limit.blocked_for("10.0.0.66") > 0
+        assert "10.0.0.67" not in limit._owed and len(limit._owed) <= 10
 
     def test_it_remembers_a_bounded_number_of_addresses(self, monkeypatch):
         monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)

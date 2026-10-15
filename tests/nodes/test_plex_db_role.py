@@ -205,7 +205,7 @@ class TestTheGuards:
         app = create_node_app(config_dir=str(tmp_path / "node"), roles=["plex_db"])
         assert "/v1/ping" in {rule.rule for rule in app.url_map.iter_rules()}
 
-    def test_an_address_that_sent_too_many_wrong_keys_is_refused_even_with_the_right_one(self, agent):
+    def test_an_address_that_sent_too_many_wrong_keys_is_asked_to_wait_even_with_the_right_one(self, agent):
         from media_preview_generator.nodes.server import identity
 
         wrong = {"Authorization": "Bearer nope", plex_remote.PROTOCOL_HEADER: "1"}
@@ -213,7 +213,9 @@ class TestTheGuards:
         guesser = {"REMOTE_ADDR": "10.0.0.66"}
         for _ in range(identity.WRONG_KEY_BURST):
             assert agent.get("/v1/ping", headers=wrong, environ_base=guesser).status_code == 401
-        assert agent.get("/v1/ping", headers=right, environ_base=guesser).status_code == 401
+        waited = agent.get("/v1/ping", headers=right, environ_base=guesser)
+        assert waited.status_code == 429 and waited.headers["Retry-After"].isdigit()
+        assert waited.get_json()["error"] == {"kind": "rate_limited"}
         assert agent.get("/v1/ping", headers=right, environ_base={"REMOTE_ADDR": "10.0.0.5"}).status_code == 200
 
     def test_a_wrong_key_says_nothing_about_this_plex(self, agent):
