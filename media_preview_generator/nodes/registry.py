@@ -77,6 +77,10 @@ WAITING_RECHECK_S = 15.0
 # offline back-off, until it answers or for at most RESTART_WINDOW_S after it said so (one stopped for good).
 RESTART_RECHECK_S = 3.0
 RESTART_WINDOW_S = 120.0
+# A node a check found refusing the key isn't checked again for job code's reports this soon after: each running
+# task's next poll is refused and reported, and a check per report spent the node's wrong-key allowance (20 at once,
+# then one every 3 s) on this app's address, so the node held back the right key pasted next too.
+KEY_REFUSED_RECHECK_S = 10.0
 CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
@@ -220,6 +224,8 @@ class _Live:
     next_check: float = 0.0
     # When (``clock``) the node last said it is stopping, until it answers again; None meanwhile.
     restarting_since: float | None = None
+    # When (``clock``) a check last found the node refusing the key.
+    key_refused_at: float | None = None
     checking: bool = False
     # Check now asked for the quick access check too: the next check to finish runs it.
     access_wanted: bool = False
@@ -709,16 +715,24 @@ class NodeRegistry:
         """A node stopped answering mid-task, or another machine refused its Plex database work: check it now rather
         than at its next turn (its Plex database work waits for that check).
 
-        A check already running began before the report, so another one follows it straight away.
+        A check already running began before the report, so another one follows it straight away, unless it finds the
+        node refusing the key. No check runs for a node a check found refusing the key within
+        ``KEY_REFUSED_RECHECK_S``: the report is that refusal again.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return
-            live.next_check = 0.0
             live.reported_at_check = live.checks_begun
             live.heard_uid = None
+            if (
+                live.probe_state == STATE_KEY_REFUSED
+                and live.key_refused_at is not None
+                and self._clock() - live.key_refused_at < KEY_REFUSED_RECHECK_S
+            ):
+                return
+            live.next_check = 0.0
         if self._running():
             self._wake.set()
         else:
@@ -1378,7 +1392,11 @@ class NodeRegistry:
             live.last_seen = self._wall_clock()
         if outcome.state == STATE_READY:
             live.ready_check = number
-        live.next_check = 0.0 if number <= live.reported_at_check else now + delay
+        if outcome.state == STATE_KEY_REFUSED:
+            live.key_refused_at = now
+        # Tasks report the refused key as it reaches each of their polls; checking again would only be refused again.
+        recheck = number <= live.reported_at_check and outcome.state != STATE_KEY_REFUSED
+        live.next_check = 0.0 if recheck else now + delay
         if outcome.info is not None or outcome.legacy:
             live.info = outcome.info
             live.legacy = outcome.legacy
