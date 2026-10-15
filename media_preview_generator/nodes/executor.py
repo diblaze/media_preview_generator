@@ -508,6 +508,9 @@ class _TaskRun:
         error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
         kind = str(error.get("kind") or "")
         message = str(error.get("message") or kind or status or "failed")
+        if self._path_swap:
+            # Shown in the job log and on the worker card, which name the file by this app's path, as _relay does.
+            message = message.replace(*self._path_swap)
         node_id, name = self._placement.node_id, self._placement.node_name
         if status == protocol.STATUS_DONE:
             if artifact_to is not None:

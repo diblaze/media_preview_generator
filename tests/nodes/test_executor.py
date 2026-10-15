@@ -628,6 +628,32 @@ class TestErrors:
         assert raised.value.error_type == "GpuAttemptFailedError" and raised.value.message == "timed out"
         assert registry.reports == [("gpu_error", NODE_ID, "cuda:0")]
 
+    @pytest.mark.parametrize(
+        ("kind", "error_type", "raised_type"),
+        [
+            (protocol.KIND_GPU_FAILED, "", CodecNotSupportedError),
+            (protocol.KIND_CODEC_NOT_SUPPORTED, "", CodecNotSupportedError),
+            ("failed", "RuntimeError", NodeTaskError),
+        ],
+        ids=["gpu_failed", "codec_not_supported", "failed"],
+    )
+    def test_an_error_names_the_file_by_this_apps_path(self, media, monkeypatch, kind, error_type, raised_type):
+        """The CPU-fallback line and the worker card's reason named the file by the node's own path."""
+        app_root = os.path.dirname(os.path.dirname(media))
+        node_path = "/mnt/nas" + media[len(app_root) :]
+        error = {"kind": kind, "message": f"FFmpeg failed for {node_path} (exit code 218)", "error_type": error_type}
+        registry = _install(ScriptedClient([finished(protocol.STATUS_FAILED, error=error)]))
+        monkeypatch.setattr(
+            registry, "mappings", lambda node_id: [protocol.PathMapping(app_prefix=app_root, node_prefix="/mnt/nas")]
+        )
+
+        with pytest.raises(raised_type) as raised:
+            _run(media, gpu=("NVIDIA", "cuda:0"))
+
+        text = str(raised.value) + str(getattr(raised.value, "message", ""))
+        assert node_path not in text
+        assert f"FFmpeg failed for {media} (exit code 218)" in text
+
     def test_failure_carries_the_nodes_message_type_and_extra(self, media):
         error = {"kind": "failed", "message": "boom", "error_type": "LoudnessError", "stderr_tail": ["a"]}
         _install(ScriptedClient([finished(protocol.STATUS_FAILED, error=error)]))
