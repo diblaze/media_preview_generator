@@ -322,6 +322,7 @@ These are not migrated to settings.json and remain in effect:
 | `PLEX_DATA_ROOT` | `/` | Restricts where Plex config folders can be validated. Defaults to the whole filesystem; set it to e.g. `/plex` to refuse anything outside that root. |
 | `MEDIA_ROOT` | `/` | Same as `PLEX_DATA_ROOT` but for media paths (manual jobs, the inspector, the file picker). |
 | `RATELIMIT_STORAGE_URL` | `memory://` | Backend for rate-limit counters. The default in-memory store is fine for a single container. |
+| `REQUESTS_CA_BUNDLE` | Built-in list | A certificate file the app trusts for https instead of its built-in list, e.g. for a [node behind https](guides.md#a-node-behind-a-reverse-proxy) with your own certificate. Keep the public authorities in it: it applies to every https connection. |
 | `CONFIG_BACKUP_KEEP` | `10` | Snapshots kept per config file. Used only until you set it in **Settings → Backups**. 1–100. |
 | `CONFIG_BACKUP_MAX_AGE_DAYS` | `0` | Drop snapshots older than this many days (`0` = off). Used only until you set it in **Settings → Backups**. 0–365. |
 

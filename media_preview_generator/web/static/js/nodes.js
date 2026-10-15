@@ -658,6 +658,8 @@
                 return `Can't find ${hostOf(url) || 'that machine'}. Check the name, or use the node's IP address.`;
             case 'tls':
                 return "It doesn't answer over https. A node speaks http unless you put it behind an https proxy: use http:// instead.";
+            case 'tls_certificate':
+                return "It answers over https, but this app doesn't trust its certificate (self-signed, or from your own certificate authority). Let this app trust it with REQUESTS_CA_BUNDLE (see the guide), or use http://.";
             case 'refused':
                 return 'Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node is running.';
             case 'timeout':

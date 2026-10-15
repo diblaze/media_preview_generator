@@ -734,6 +734,12 @@ after too many wrong keys it holds back everyone using that proxy for a while, a
 connections open. Route only this app to the node through the proxy, and give anything else that reaches it the right
 key.
 
+Over https with a certificate of your own (self-signed, or from your own certificate authority), this app has to
+trust it. Put a file holding the usual public authorities plus yours in the app's container (for example your
+host's `/etc/ssl/certs/ca-certificates.crt` with your certificate added at the end) and set `REQUESTS_CA_BUNDLE` to
+its path. It replaces the app's built-in list for every https connection, Plex, Emby and Jellyfin included, so keep
+the public authorities in it.
+
 ---
 
 ## Webhook Integration
