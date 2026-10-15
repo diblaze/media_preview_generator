@@ -1401,8 +1401,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
                     resolution = result.get("webhook_resolution", {})
                     unresolved_paths = resolution.get("unresolved_paths") or []
-                    # Found and owned, but their node couldn't run them: the dispatcher already wrote their failed
-                    # rows, so they get no "not found" row or path-mapping hint, only a retry.
+                    # Found and owned, but their processing failed or their node couldn't run them: their failed rows
+                    # are already written with why, so they get no "not found" row or path-mapping hint, only a retry.
+                    failed_paths: list[str] = resolution.get("failed_paths") or []
                     node_failed: dict[str, str] = resolution.get("node_failed") or {}
                     total_paths = resolution.get("total_paths", 0)
                     resolved_count = resolution.get("resolved_count", 0)
@@ -1420,9 +1421,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     # Unified-dispatch payload: the orchestrator already
                     # walked every configured server's ownership and
                     # fanned out per-server publishers. Anything left in
-                    # ``unresolved_paths`` is either (a) owned by no
-                    # enabled server, or (b) owned but every publisher
-                    # failed. Per-server outcome counters in ``outcome``
+                    # ``unresolved_paths`` is owned by no enabled
+                    # server. Per-server outcome counters in ``outcome``
                     # carry the precise breakdown \u2014 this row is the
                     # job-level summary line.
                     generic_detail = "file may not be scanned yet, or path mappings in Settings may need adjusting"
@@ -1597,7 +1597,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     for pp in pending_registration_paths:
                         if pp not in retry_paths:
                             retry_paths.append(pp)
-                    for np_ in node_failed:
+                    for np_ in (*failed_paths, *node_failed):
                         if np_ not in retry_paths:
                             retry_paths.append(np_)
 
@@ -1813,6 +1813,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             "pending_by_server": dict(pending_by_server),
                             "chapter_waits_by_server": dict(chapter_waits_by_server),
                         }
+                        if failed_paths:
+                            retry_reason["failed"] = len(failed_paths)
                         if node_failed:
                             retry_reason["node_failed"] = len(node_failed)
 
@@ -1823,6 +1825,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} unresolved")
+                            if failed_paths:
+                                reason_parts.append(f"{len(failed_paths)} failed")
                             reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")
@@ -1849,6 +1853,8 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                             reason_parts = []
                             if unresolved_paths:
                                 reason_parts.append(f"{len(unresolved_paths)} not found on any server")
+                            if failed_paths:
+                                reason_parts.append(f"{len(failed_paths)} failed")
                             reason_parts.extend(_node_failure_clauses(node_failed))
                             if stale_inputs:
                                 reason_parts.append(f"{len(stale_inputs)} stale path(s)")

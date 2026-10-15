@@ -2996,3 +2996,100 @@ def test_proven_chapter_corruption_settles_with_warning_without_spawning_retry(a
     run.assert_called_once()
     assert run.call_args.args[0].webhook_paths == [path]
     assert run.call_args.kwargs["job_id"] == job.id
+
+
+class TestAFileThatFailedIsAFailureNotAFileNoServerFound:
+    """Lab run (a node that couldn't use its temp folder refused every file): the job rewrote each file's row to "Not
+    found on any configured media server … Add the webhook's path root" and said "N not found on any server, retry
+    scheduled … (retry 1 of 5)", though every server owned the files. The orchestrator runs for real here; only the
+    dispatcher is stood in for, writing the row a worker writes."""
+
+    LIBRARY = "/media/movies"
+
+    @pytest.fixture()
+    def owned_movies(self, app):
+        """Both servers' Movies libraries cover ``LIBRARY``."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        manager = get_settings_manager()
+        servers = manager.get("media_servers")
+        for server in servers:
+            for library in server["libraries"]:
+                library["remote_paths"] = [self.LIBRARY]
+        manager.set("media_servers", servers)
+
+    def _run(self, app, path: str, reason: str, worker: str):
+        """Run a one-file webhook job (one retry allowed) whose every dispatch fails ``path`` with ``reason``."""
+        from media_preview_generator.processing.generator import ProcessingResult, _notify_file_result
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes.job_runner import _start_job_async
+
+        dispatched: list[list[str]] = []
+
+        def failing_dispatch(pairs, **kwargs):
+            paths = [item.canonical_path for _, item in pairs]
+            dispatched.append(paths)
+            for failed in paths:
+                _notify_file_result(failed, ProcessingResult.FAILED, reason, worker)
+            return {"completed": 0, "failed": len(paths), "cancelled": False, "outcome": {"failed": len(paths)},
+                    "failed_paths": paths, "node_failures": {}}  # fmt: skip
+
+        with (
+            app.app_context(),
+            patch(
+                "media_preview_generator.jobs.orchestrator._dispatch_processable_items", side_effect=failing_dispatch
+            ),
+        ):
+            jm = get_job_manager()
+            job = jm.create_job(library_name="Film (2024)", config={"source": "radarr"})
+            _start_job_async(job.id, config_overrides={"webhook_paths": [path], "webhook_retry_count": 1})
+            logs = jm.get_logs(job.id) or []
+            rows = [r for r in jm.get_file_results(job.id) if r.get("file") == path]
+            retries = _retries_of(jm, job.id)
+        return dispatched, logs, rows, retries
+
+    @pytest.mark.parametrize(
+        ("reason", "worker"),
+        [
+            ("Frame generation failed: FFmpeg exited with code 1 (Invalid data found when processing input)", "CPU 1"),
+            ("NAS refused the task: The node couldn't make a folder for the task in its temp folder", "NAS CPU 1"),
+        ],
+        ids=["ffmpeg-failed-here", "node-refused-it"],
+    )
+    def test_a_file_every_server_owns_that_failed_keeps_its_failure_and_is_retried(
+        self, app, owned_movies, no_retry_wait, reason, worker
+    ):
+        path = f"{self.LIBRARY}/Film (2024)/Film (2024).mkv"
+
+        dispatched, logs, rows, retries = self._run(app, path, reason, worker)
+
+        assert not any(
+            "not found on any server" in line or "no configured library" in line or "path root" in line for line in logs
+        ), logs
+        assert any("1 failed, retry scheduled in" in line and "(retry 1 of 1)" in line for line in logs), logs
+        assert rows and all(r["outcome"] == "failed" and r["reason"] == reason for r in rows), rows
+        assert dispatched == [[path], [path]]  # still retried, as any failed webhook file is
+        assert retries[0].config["retry_reason"] == {
+            "unresolved": 0,
+            "stale_paths": 0,
+            "pending_by_server": {},
+            "chapter_waits_by_server": {},
+            "failed": 1,
+        }
+
+    def test_a_path_no_server_owns_is_still_not_found_with_its_hint_and_retried(self, app, owned_movies, no_retry_wait):
+        path = "/downloads/complete/Film (2024).mkv"
+
+        dispatched, logs, rows, retries = self._run(app, path, "never dispatched", "CPU 1")
+
+        assert dispatched == []
+        assert any(
+            "1 not found on any server, retry scheduled in" in line and "(retry 1 of 1)" in line for line in logs
+        )
+        assert rows and all(r["outcome"] == "unresolved_vendor" for r in rows), rows
+        assert rows[-1]["reason"].startswith(
+            f"Not found on any configured media server — Webhook sent '{path}' but no configured library matches it."
+        )
+        assert "Add the webhook's path root (e.g. '/downloads')" in rows[-1]["reason"]
+        assert retries[0].config["retry_reason"]["unresolved"] == 1
+        assert "failed" not in retries[0].config["retry_reason"]
