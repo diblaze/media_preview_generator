@@ -108,8 +108,10 @@ on bytes. Node routes also require `X-MPG-Node-Protocol: 1`; a mismatch answers 
 The Plex database routes keep the agent's header and protocol exactly.
 
 Every JSON answer: `{"ok": bool, "node": NODE_BLOCK, ...}` where
-`NODE_BLOCK = {"id", "name", "version", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the app
-package version; the Plex database role also keeps the agent's `"agent"` block for old apps).
+`NODE_BLOCK = {"id", "name", "version", "build", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the
+app package version, `build` = the image's `GIT_SHA` or "": a worker node on the same version but another build needs
+an update, since pull request and local images all report one version; the Plex database role also keeps the agent's
+`"agent"` block for old apps).
 
 | Route | Body | Answer |
 |---|---|---|

@@ -11,6 +11,8 @@ helpers already deployed keep working; the constants below cover the node routes
 from __future__ import annotations
 
 import base64
+import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -28,6 +30,16 @@ DEFAULT_PORT = 9494
 ROLE_WORKER = "worker"
 ROLE_PLEX_DB = "plex_db"
 ROLES = (ROLE_WORKER, ROLE_PLEX_DB)
+
+
+def build_sha() -> str:
+    """This build's git commit: the image's ``GIT_SHA``, or "" when the build wasn't given one.
+
+    Images built without a release version (a pull request's, a local ``docker build``) all report the same version,
+    so the commit is what tells a stale worker node from a current one.
+    """
+    value = os.environ.get("GIT_SHA", "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else ""
 
 
 def sendable_key(key: str) -> bool:

@@ -104,6 +104,7 @@ def create_node_app(
         "id": me.id,
         "name": me.name,
         "version": __version__,
+        "build": protocol.build_sha(),
         "protocols": [protocol.NODE_PROTOCOL],
         "roles": list(chosen_roles),
     }

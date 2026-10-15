@@ -77,6 +77,12 @@ class TestAuth:
         assert body["node"]["protocols"] == [1] and body["node"]["roles"] == ["worker"]
         assert "agent" not in body
 
+    @pytest.mark.parametrize(("sha", "build"), [("ABCDEF0123456789", "abcdef0123456789"), ("unknown", ""), ("", "")])
+    def test_the_node_block_carries_the_images_commit(self, make_app, monkeypatch, sha, build):
+        monkeypatch.setenv("GIT_SHA", sha)
+
+        assert make_app().test_client().get("/v1/health").get_json()["node"]["build"] == build
+
     @pytest.mark.parametrize(
         "headers",
         [
