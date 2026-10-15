@@ -15,8 +15,9 @@ Three kinds of facts are kept:
   sibling's own check does the same when its turn comes. An episode checked just before its sibling was overwritten
   could see the old sibling before this cache existed too (the order of two checks was always a race).
 * What ``markers.db`` says about the season's files (their signature items, signatures and intro-chapter lengths).
-  Valid only while ``MarkerStore.data_generation`` is the value it was read at: any write to the tables they come from,
-  by any thread, ends them before the next read.
+  Valid only while ``MarkerStore.season_generation`` is the value it was read at: any write to the tables they come
+  from, by any thread, ends them before the next read (a server's marker answer, which none of them is read from,
+  doesn't).
 * What the folders a season's show is looked for in say (a TV library's folders, holding thousands of shows, read for
   every season of the job): :meth:`SeasonCache.listing`. A listing is reused while the folder's device, inode and
   mtime are the ones stat'd before it was read (a show added, removed or renamed moves the mtime; a remount moves the
@@ -60,7 +61,7 @@ def _folder_mtime_ns(folder: str) -> int | None:
 
 
 class SeasonResults:
-    """What ``markers.db`` said about a season's files while ``MarkerStore.data_generation`` was ``generation``."""
+    """What ``markers.db`` said about a season's files while ``MarkerStore.season_generation`` was ``generation``."""
 
     def __init__(self, generation: int) -> None:
         self.generation = generation
@@ -78,6 +79,7 @@ class SeasonEntry:
         self._building: dict[str, threading.Lock] = {}
         self._once: dict[str, Any] = {}
         self._results = SeasonResults(-1)
+        self._guards: dict[str, threading.RLock] = {}
         self._watched: dict[str, int | None] = {}
 
     def watch(self, folders: Collection[str]) -> None:
@@ -110,6 +112,14 @@ class SeasonEntry:
             with self._lock:
                 self._once[key] = value
             return value
+
+    def guard(self, key: str) -> threading.RLock:
+        """A lock for one of :meth:`results`' facts (a member's intro-chapter length, a season group's signature), held
+        while it is read: the first episode of the folder to ask reads it and the ones asking meanwhile wait, then
+        find it read, instead of a dozen threads each reading the whole season at once. A read that wrote to the
+        store (a member probed) moves the generation, so the next asker reads it once more, from the store."""
+        with self._lock:
+            return self._guards.setdefault(key, threading.RLock())
 
     def results(self, generation: int) -> SeasonResults:
         """The store-derived facts valid at ``generation``: the ones read at it, else a new empty set."""

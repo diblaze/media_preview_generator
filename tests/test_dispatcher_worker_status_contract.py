@@ -20,13 +20,18 @@ any future field drop fails fast at unit-test time, not as a
 "stuck Working…" UI bug shipped to prod.
 """
 
+import threading
+import time
+
 import pytest
 
 from media_preview_generator.jobs.dispatcher import (
+    FALLBACK_SHOWN_AFTER_S,
     JobDispatcher,
     reset_dispatcher,
 )
 from media_preview_generator.jobs.worker import WorkerPool
+from media_preview_generator.web.jobs import JobManager, WorkerStatus
 
 
 class TestBuildWorkerStatusesContract:
@@ -81,6 +86,7 @@ class TestBuildWorkerStatusesContract:
                 "fallback_active",
                 "fallback_reason",
                 "fallback_title",
+                "fallback_until",
                 "ffmpeg_started",
                 "current_phase",
                 "chapter_progress",
@@ -160,6 +166,7 @@ class TestBuildWorkerStatusesContract:
             worker.current_task = "/media/AV1 Clip 3.mkv" if is_busy else None
             worker.fallback_active = True
             worker.fallback_reason = "GPU processing failed (exit code 255)"
+            worker.task_ended_at = 0.0 if is_busy else time.monotonic()
 
             payload = dispatcher._build_worker_statuses()[0]
 
@@ -169,6 +176,75 @@ class TestBuildWorkerStatusesContract:
             assert payload["current_title"] == ("AV1 Clip 3 (2019)" if is_busy else "")
         finally:
             dispatcher.shutdown()
+
+    def test_an_idle_worker_stops_showing_its_last_files_fallback_once_the_polls_have_seen_it(self):
+        pool = WorkerPool(cpu_workers=0, gpu_workers=1, selected_gpus=[("nvidia", "/dev/nvidia0", {})])
+        dispatcher = JobDispatcher(pool)
+        try:
+            worker = pool._snapshot_workers()[0]
+            worker.is_busy = False
+            worker.media_title = "Marvel's The Punisher S01E11"
+            worker.fallback_active = True
+            worker.fallback_reason = "the GPU can't decode this file's HEVC video (ffmpeg exited 69)"
+            worker.task_ended_at = time.monotonic() - FALLBACK_SHOWN_AFTER_S - 1
+
+            payload = dispatcher._build_worker_statuses()[0]
+
+            assert (payload["status"], payload["fallback_active"], payload["fallback_title"]) == ("idle", False, "")
+        finally:
+            dispatcher.shutdown()
+
+    @pytest.mark.parametrize("is_busy", [True, False], ids=["running", "just-ended"])
+    def test_the_payload_says_when_an_idle_workers_fallback_stops_showing(self, is_busy):
+        pool = WorkerPool(cpu_workers=0, gpu_workers=1, selected_gpus=[("nvidia", "/dev/nvidia0", {})])
+        dispatcher = JobDispatcher(pool)
+        try:
+            worker = pool._snapshot_workers()[0]
+            worker.is_busy = is_busy
+            worker.current_task = "/media/a.mkv" if is_busy else None
+            worker.fallback_active = True
+            worker.task_ended_at = time.monotonic() - 10
+
+            payload = dispatcher._build_worker_statuses()[0]
+
+            if is_busy:
+                assert payload["fallback_until"] is None
+            else:
+                assert payload["fallback_until"] == pytest.approx(time.time() + FALLBACK_SHOWN_AFTER_S - 10, abs=1)
+        finally:
+            dispatcher.shutdown()
+
+    @pytest.mark.parametrize(
+        ("until", "shown"), [(None, True), (+60, True), (-1, False)], ids=["busy", "fresh", "aged"]
+    )
+    def test_the_saved_statuses_age_out_an_idle_workers_fallback(self, tmp_path, until, shown):
+        jm = JobManager(config_dir=str(tmp_path))
+        jm.update_worker_status(
+            "GPU_1",
+            WorkerStatus(
+                worker_id=1,
+                worker_type="GPU",
+                worker_name="GPU Worker 1",
+                status="idle" if until is not None else "processing",
+                fallback_active=True,
+                fallback_reason="the GPU can't decode this file's HEVC video (ffmpeg exited 69)",
+                fallback_title="Marvel's The Punisher S01E11",
+                fallback_until=None if until is None else time.time() + until,
+            ),
+        )
+        status = jm.get_worker_statuses()[0]
+        assert (status.fallback_active, bool(status.fallback_title)) == (shown, shown)
+
+    def test_a_finished_task_stamps_when_it_ended(self):
+        pool = WorkerPool(cpu_workers=0, gpu_workers=1, selected_gpus=[("nvidia", "/dev/nvidia0", {})])
+        worker = pool._snapshot_workers()[0]
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+        worker.is_busy, worker.current_thread = True, thread
+        before = time.monotonic()
+        assert worker.check_completion() is True
+        assert before <= worker.task_ended_at <= time.monotonic()
 
     def test_fallback_title_is_blank_without_a_fallback(self):
         pool = WorkerPool(cpu_workers=1, gpu_workers=0, selected_gpus=[])

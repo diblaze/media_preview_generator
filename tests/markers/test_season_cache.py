@@ -11,9 +11,11 @@ from unittest.mock import patch
 
 import pytest
 
+from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.markers.audio import season
 from media_preview_generator.markers.models import FileIdentity, Source
 from media_preview_generator.markers.pipeline import SEASON_CACHE_TTL_S
+from media_preview_generator.markers.probe import Chapter, MediaProbe, ProbeStalledError
 from media_preview_generator.markers.season_cache import SeasonCache
 from media_preview_generator.markers.store import MarkerStore
 from tests.markers.audio import test_season
@@ -459,3 +461,319 @@ class TestUpsertOfAFileAlreadyStored:
         assert store.mark_missing(rec)
         again = self._upsert(store, path)
         assert again.missing_since is None
+
+
+class TestSeasonGeneration:
+    """A server's marker answer moves ``data_generation`` (a file's run reads it) but not ``season_generation``: nothing
+    a job keeps of a season is read from it, and one in thirty done files has its Plex markers read again."""
+
+    def _file(self, store, tmp_path):
+        return store.upsert_file(
+            FileIdentity(str(tmp_path / "a.mkv"), 10, 20), duration_ms=1000, season_key="/s", is_movie=False
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "also", "season_moves"),
+        [
+            (Source.SERVER_MARKERS, {Source.SERVER_MARKERS_IMPORTED}, False),
+            (Source.SERVER_MARKERS_IMPORTED, {Source.SERVER_MARKERS}, False),
+            (Source.SERVER_MARKERS, {Source.CHAPTERS}, True),  # replaces more than a server's answer
+            (Source.CHAPTERS, set(), True),
+            (Source.INTRODB, set(), True),
+        ],
+        ids=["server", "server-imported", "server-and-chapters", "chapters", "online"],
+    )
+    def test_an_evidence_write_moves_the_season_generation_unless_it_is_a_servers_answer_alone(
+        self, store, tmp_path, source, also, season_moves
+    ):
+        rec = self._file(store, tmp_path)
+        data, seasons = store.data_generation, store.season_generation
+        store.replace_evidence(rec.id, source, [], origin="plex-1", version=1, also_replaces=also)
+        assert store.data_generation == data + 1
+        assert store.season_generation == seasons + int(season_moves)
+
+    @pytest.mark.parametrize(
+        ("source", "season_moves"),
+        [(Source.SERVER_MARKERS, False), (Source.SERVER_MARKERS_IMPORTED, False), (Source.CHAPTERS, True)],
+    )
+    def test_a_restamped_version_moves_the_season_generation_unless_it_is_a_servers(
+        self, store, tmp_path, source, season_moves
+    ):
+        rec = self._file(store, tmp_path)
+        store.replace_evidence(rec.id, source, [], origin="plex-1", version=1)
+        data, seasons = store.data_generation, store.season_generation
+        store.restamp_evidence_version(rec.id, source, "plex-1", 2)
+        assert store.data_generation == data + 1
+        assert store.season_generation == seasons + int(season_moves)
+
+    def test_any_other_write_moves_both(self, store, tmp_path):
+        rec = self._file(store, tmp_path)
+        data, seasons = store.data_generation, store.season_generation
+        store.set_frame_rate(rec.id, 25.0, identity=(rec.size, rec.mtime_ns))
+        assert (store.data_generation, store.season_generation) == (data + 1, seasons + 1)
+
+
+class TestSeasonReadsSurviveAServersAnswer:
+    def _chapter_reads(self, cached, path):
+        with (
+            patch.object(cached.ctx.store, "get_evidence", wraps=cached.ctx.store.get_evidence) as reads,
+            cached.ctx._running(path),
+        ):
+            season.season_intro_chapter_limit(cached.ctx, path)
+        return reads.call_count
+
+    def test_a_siblings_server_answer_keeps_the_seasons_intro_chapter_lengths(self, cached):
+        e1, e2 = cached.paths[:2]
+        self._chapter_reads(cached, e1)
+        sibling = cached.ctx.store.get_file(e2)
+        cached.ctx.store.replace_evidence(sibling.id, Source.SERVER_MARKERS, [], origin="plex-1", version=1)
+        assert self._chapter_reads(cached, e1) == 0
+
+    def test_a_siblings_chapters_end_the_seasons_intro_chapter_lengths(self, cached):
+        e1, e2 = cached.paths[:2]
+        self._chapter_reads(cached, e1)
+        sibling = cached.ctx.store.get_file(e2)
+        cached.ctx.store.replace_evidence(sibling.id, Source.CHAPTERS, [], version=sibling.id)
+        assert self._chapter_reads(cached, e1) == len(cached.paths)
+
+    def test_a_siblings_server_answer_keeps_the_seasons_signatures(self, cached):
+        e1, e2 = cached.paths[:2]
+        assert cached.due(e1) is False
+        sibling = cached.ctx.store.get_file(e2)
+        cached.ctx.store.replace_evidence(sibling.id, Source.SERVER_MARKERS, [], origin="plex-1", version=1)
+        with patch.object(season, "_signature_item", wraps=season._signature_item) as items:
+            assert cached.due(e1) is False
+        assert items.call_count == 0
+
+
+class TestSeasonReadAhead:
+    @pytest.fixture
+    def two_seasons(self, store, show):
+        s1, s2, s3 = show(1, 3), show(2, 3), show(3, 3)
+        ctx = _season_ctx(store, s1[0])
+        ctx.seasons = SeasonCache(ttl_s=SEASON_CACHE_TTL_S)
+        return ctx, s1, s2, s3
+
+    def _settle(self, ahead):
+        ahead._queue.join()
+        ahead.close()
+        for thread in ahead._threads:
+            thread.join(5)
+
+    def test_the_next_seasons_are_listed_before_their_first_episode_is_checked(self, two_seasons, monkeypatch):
+        ctx, s1, s2, s3 = two_seasons
+        monkeypatch.setattr(season, "READ_AHEAD_SEASONS", 1)
+        ahead = season.SeasonReadAhead(ctx, s1 + s2 + s3)
+        with patch.object(season, "folder_videos", wraps=season.folder_videos) as listed:
+            ahead.reached(s1[0])
+            self._settle(ahead)
+        assert [c.args[0] for c in listed.call_args_list] == [os.path.dirname(s2[0])]  # one season ahead, not s3
+        with patch.object(season, "folder_videos", wraps=season.folder_videos) as listed:
+            view = season._SeasonView(ctx, s2[1])
+        assert listed.call_count == 0
+        assert sorted(v.path for v in view.videos) == s2
+
+    def test_a_season_listed_ahead_is_listed_again_once_its_folder_changed(self, two_seasons):
+        ctx, s1, s2, _s3 = two_seasons
+        ahead = season.SeasonReadAhead(ctx, s1 + s2)
+        ahead.reached(s1[0])
+        self._settle(ahead)
+        added = os.path.join(os.path.dirname(s2[0]), "Show (2020) - S02E04.mkv")
+        with open(added, "wb") as f:
+            f.write(b"x" * 104)
+        folder = os.path.dirname(s2[0])
+        os.utime(folder, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))  # mtime moves even on a coarse clock
+        view = season._SeasonView(ctx, s2[0])
+        assert added in [v.path for v in view.videos]
+
+    def test_each_season_is_asked_for_once_however_often_its_episodes_are_reached(self, two_seasons):
+        ctx, s1, s2, s3 = two_seasons
+        ahead = season.SeasonReadAhead(ctx, s1 + s2 + s3)
+        with patch.object(ahead._queue, "put", wraps=ahead._queue.put) as queued:
+            for path in s1 + s2:
+                ahead.reached(path)
+            self._settle(ahead)
+        assert [c.args[0] for c in queued.call_args_list if c.args[0]] == [s2[0], s3[0]]
+
+    def test_nothing_is_listed_for_the_last_season_a_file_outside_the_job_or_once_closed(self, two_seasons):
+        ctx, s1, s2, s3 = two_seasons
+        ahead = season.SeasonReadAhead(ctx, s1 + s2)
+        with patch.object(ahead._queue, "put") as queued:
+            ahead.reached(s2[0])
+            ahead.reached(s3[0])
+            ahead.close()
+            ahead.reached(s1[0])
+        queued.assert_not_called()
+        assert ahead._threads == []
+
+    def test_a_listing_that_fails_is_left_to_the_seasons_first_episode(self, two_seasons):
+        ctx, s1, s2, _s3 = two_seasons
+        ahead = season.SeasonReadAhead(ctx, s1 + s2)
+        with patch.object(season, "season_folders", side_effect=RuntimeError("boom")):
+            ahead.reached(s1[0])
+            self._settle(ahead)
+        with patch.object(season, "folder_videos", wraps=season.folder_videos) as listed:
+            view = season._SeasonView(ctx, s2[0])
+        assert listed.call_count == 1
+        assert sorted(v.path for v in view.videos) == s2
+
+    def test_each_listing_logs_to_the_job_for_its_time_only(self, two_seasons):
+        ctx, s1, s2, _s3 = two_seasons
+        seen = []
+        real = season.season_folders
+
+        def listing(*args, **kwargs):
+            seen.append(threading.get_ident())
+            assert is_job_thread_for(threading.get_ident(), "job-1")
+            return real(*args, **kwargs)
+
+        ahead = season.SeasonReadAhead(ctx, s1 + s2, scope=lambda: job_thread("job-1"))
+        with patch.object(season, "season_folders", side_effect=listing):
+            ahead.reached(s1[0])
+            self._settle(ahead)
+        assert seen
+        assert not any(is_job_thread_for(ident, "job-1") for ident in seen)
+
+    def test_its_threads_never_hold_up_the_apps_exit(self, two_seasons):
+        ctx, s1, s2, _s3 = two_seasons
+        ahead = season.SeasonReadAhead(ctx, s1 + s2)
+        ahead.reached(s1[0])
+        assert ahead._threads
+        assert all(thread.daemon for thread in ahead._threads)
+        self._settle(ahead)
+        assert not any(thread.is_alive() for thread in ahead._threads)
+
+    def test_a_read_ahead_that_cant_start_a_thread_never_fails_the_check(self, two_seasons):
+        ctx, s1, s2, _s3 = two_seasons
+        ctx.season_read_ahead = ahead = season.SeasonReadAhead(ctx, s1 + s2)
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with ctx._running(s1[0]):
+                view = season._season_view(ctx, s1[0])
+        assert sorted(v.path for v in view.videos) == s1
+        assert ahead._closed
+        with patch.object(ahead._queue, "put") as queued:
+            ahead.reached(s1[0])
+        queued.assert_not_called()
+
+    def test_a_check_reaching_a_season_asks_the_read_ahead_once_per_run(self, two_seasons):
+        ctx, s1, _s2, _s3 = two_seasons
+        ctx.season_read_ahead = ahead = season.SeasonReadAhead(ctx, s1)
+        with patch.object(ahead, "reached") as reached, ctx._running(s1[0]):
+            season._season_view(ctx, s1[0])
+            season._season_view(ctx, s1[0])
+        reached.assert_called_once_with(s1[0])
+        self._settle(ahead)
+
+
+class TestSiblingsArrivingTogether:
+    """Episodes of one season checked at the same moment read their siblings' facts once between them, not once each,
+    and each gets the answer it gets checked alone."""
+
+    @staticmethod
+    def _together(ctx, paths, ask):
+        ctx.seasons = SeasonCache(ttl_s=SEASON_CACHE_TTL_S)
+        barrier = threading.Barrier(len(paths))
+        answers = {}
+
+        def one(path):
+            with ctx._running(path):
+                season._season_view(ctx, path)
+                barrier.wait()
+                answers[path] = ask(path)
+
+        threads = [threading.Thread(target=one, args=(path,)) for path in paths]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert not any(thread.is_alive() for thread in threads)
+        return answers
+
+    @staticmethod
+    def _alone(ctx, paths, ask):
+        answers = {}
+        for path in paths:
+            ctx.seasons = SeasonCache(ttl_s=SEASON_CACHE_TTL_S)
+            with ctx._running(path):
+                answers[path] = ask(path)
+        return answers
+
+    def test_the_intro_chapter_lengths_are_read_once_for_the_season(self, cached):
+        store = cached.ctx.store
+        real = store.get_evidence
+
+        def slow(file_id):
+            time.sleep(0.02)  # long enough for every sibling to arrive while the first reads
+            return real(file_id)
+
+        def limit(path):
+            return season.season_intro_chapter_limit(cached.ctx, path)
+
+        with patch.object(store, "get_evidence", side_effect=slow) as reads:
+            together = self._together(cached.ctx, cached.paths, limit)
+        assert reads.call_count == len(cached.paths)
+        assert together == self._alone(cached.ctx, cached.paths, limit)
+
+    def test_the_signature_items_are_read_once_for_the_season(self, cached):
+        real = season._signature_item
+
+        def slow(ctx, path):
+            time.sleep(0.02)
+            return real(ctx, path)
+
+        def signature(path):
+            return season._season_view(cached.ctx, path).signature(path)
+
+        with patch.object(season, "_signature_item", side_effect=slow) as items:
+            together = self._together(cached.ctx, cached.paths, signature)
+        assert sorted(c.args[1] for c in items.call_args_list) == sorted(cached.paths)
+        assert together == self._alone(cached.ctx, cached.paths, signature)
+
+    @pytest.fixture
+    def unprobed(self, store, show):
+        """A season none of whose files the store has seen: the season step probes each member."""
+        paths = show(1, 4)
+        return _season_ctx(store, paths[0]), paths
+
+    @staticmethod
+    def _probe(path, **kwargs):
+        intro_ms = 30_000 + 1000 * int(path[-6:-4])  # each episode's intro chapter a little longer
+        return MediaProbe(
+            1_320_000,
+            (
+                Chapter(0, 60_000, "Recap"),
+                Chapter(60_000, 60_000 + intro_ms, "Intro"),
+                Chapter(90_000, None, "Episode"),
+            ),
+        )
+
+    def test_members_still_to_probe_are_probed_once_each(self, unprobed):
+        ctx, paths = unprobed
+
+        def limit(path):
+            return season.season_intro_chapter_limit(ctx, path)
+
+        with patch.object(season, "probe_media", side_effect=self._probe) as probed:
+            together = self._together(ctx, paths, limit)
+            assert sorted(c.args[0] for c in probed.call_args_list) == sorted(paths)
+            assert together == self._alone(ctx, paths, limit)
+
+    def test_a_member_whose_probe_stalls_counts_as_unread_and_holds_no_one_up(self, unprobed):
+        ctx, paths = unprobed
+        stalled = paths[1]
+
+        def probe(path, **kwargs):
+            if path == stalled:
+                raise ProbeStalledError("earlier ffprobes are stuck")
+            return self._probe(path)
+
+        def lengths(path):
+            view = season._season_view(ctx, path)
+            return season._member_intro_chapter_ms(ctx, view, stalled)
+
+        with patch.object(season, "probe_media", side_effect=probe):
+            together = self._together(ctx, paths, lengths)
+        assert set(together.values()) == {None}
+        guard = ctx.seasons.entry(os.path.dirname(stalled)).guard(f"intro_chapter_ms:{stalled}")
+        assert guard.acquire(blocking=False)
+        guard.release()

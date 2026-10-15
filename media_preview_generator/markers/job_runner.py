@@ -21,7 +21,7 @@ from ..jobs.dispatcher import get_or_create_dispatcher
 from ..jobs.group_runtime import admission_options, refresh_worker_groups, runtime_capacity, wait_for_capacity
 from ..jobs.orchestrator import _build_multi_server_registry
 from ..jobs.parking import JobParked, park_if_unavailable
-from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, unregister_job_thread
+from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, job_thread, register_job_thread, unregister_job_thread
 from ..processing.generator import clear_failures, failure_scope, set_file_result_callback
 from ..processing.retry_queue import retry_policy, scaled_backoff_delay
 from ..processing.types import ProcessableItem
@@ -48,6 +48,7 @@ from ..web.routes.job_runner import (
 )
 from ..web.settings_manager import get_settings_manager
 from .audio.fingerprint import start_fingerprint_sweep
+from .audio.season import SeasonReadAhead
 from .credits import decode_check
 from .job_log import start_line
 from .missing import MISSING_LINE
@@ -1121,6 +1122,7 @@ def worker_cards(jm) -> Callable[[list], None]:
                     fallback_title=w.get("fallback_title", "") or "",
                     node=w.get("node"),
                     node_state=w.get("node_state"),
+                    fallback_until=w.get("fallback_until"),
                 ),
             )
         jm.prune_worker_statuses(keys)
@@ -1148,6 +1150,7 @@ class _PassState:
         listing_on_job: Whether the config holds the Check servers listing (a revived job's from the start): only a
             revive needs it, so the teardown takes it off the ended job (the config ships in every job payload).
         parked: Whether the job parked itself (its listing is kept for the revive).
+        read_ahead: The job's season read-ahead, stopped by the teardown.
     """
 
     cfg: dict
@@ -1157,6 +1160,7 @@ class _PassState:
     sweep_configs: list[ServerConfig] = dataclasses.field(default_factory=list)
     listing_on_job: bool = False
     parked: bool = False
+    read_ahead: SeasonReadAhead | None = None
 
 
 def _run_intro_credits_pass(job_id: str) -> bool | None:
@@ -1256,6 +1260,8 @@ def _tear_down_pass(jm, job_id: str, state: _PassState, handler_id: int, loguru_
     # Same teardown as the preview runner (web/routes/job_runner.py run_job finally): slot first (a job that
     # ended before submitting its files still holds one), then per-job flags, then worker cards once nothing
     # else is running.
+    if state.read_ahead is not None:
+        state.read_ahead.close()
     release_slot(state.slot, get_job_gate())
     set_file_result_callback(None, job_id=job_id)
     jm.clear_pause_flag(job_id)
@@ -1689,6 +1695,9 @@ def _run_job(
             cancel_check=cancel_check,
         ),
         job_id=job_id,
+    )
+    ctx.season_read_ahead = state.read_ahead = SeasonReadAhead(
+        ctx, [item.canonical_path for item in items], scope=lambda: job_thread(job_id)
     )
     dispatcher = _start_dispatcher(jm, settings, job_id, config, state, ctx)
     tracker = dispatcher.submit_items(

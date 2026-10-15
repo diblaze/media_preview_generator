@@ -26,6 +26,7 @@ from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.servers.base import ServerType
 from media_preview_generator.web.job_gate import JobGate
 from media_preview_generator.web.jobs import JobManager, JobStatus, is_user_visible_job
+from media_preview_generator.web.settings_manager import reset_settings_manager
 from tests.markers.fakes import FakeRegistry, ready_publisher, server_config, wait_for
 from tests.markers.test_external_ids import EXTRA_SUFFIXES, EXTRAS_FOLDERS
 
@@ -41,6 +42,9 @@ CHAPTERS = (
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
     """Real JobManager + JobGate + shared dispatcher (1 CPU worker); settings, config and GPUs stubbed."""
+    # The pool reads its worker groups from the live settings singleton first: one an earlier test left behind
+    # would rebuild this test's workers from that test's groups.
+    reset_settings_manager()
     reset_dispatcher()
     jm = JobManager(config_dir=str(tmp_path / "config"))
     gate = JobGate()
@@ -57,6 +61,7 @@ def engine(tmp_path, monkeypatch):
     monkeypatch.setattr(job_runner, "_build_selected_gpus", lambda s, **kw: [])
     yield SimpleNamespace(jm=jm, gate=gate, settings=settings)
     reset_dispatcher()
+    reset_settings_manager()
 
 
 def _outcome(jm, job_id):
@@ -220,6 +225,31 @@ class TestRetryThroughThePipeline:
         assert head.progress.marker_sources == decided
         stored = JobManager(config_dir=engine.jm.config_dir).get_job(first)
         assert (stored.progress.outcome, stored.progress.marker_sources) == ({"markers_published": 1}, decided)
+
+    def test_the_job_reads_its_files_seasons_ahead_and_stops_when_it_ends(self, engine, setup, monkeypatch):
+        registry, publishers = setup.make([("plex-1", ServerType.PLEX)])
+        made = []
+
+        class Recorded(job_runner.SeasonReadAhead):
+            def __init__(self, ctx, paths, **kwargs):
+                super().__init__(ctx, paths, **kwargs)
+                self.paths, self.closed, self.ctx = list(paths), False, ctx
+                made.append(self)
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        monkeypatch.setattr(job_runner, "SeasonReadAhead", Recorded)
+        first_patch, second_patch = self._run_pipeline(publishers)
+        with first_patch, second_patch:
+            job = triggers.create_intro_credits_job(
+                library_name="Intro & Credits · Pilot", priority=2, source="manual", file_paths=[setup.path]
+            ).id
+            job_runner.run_intro_credits_job(job)
+        assert engine.jm.get_job(job).status is JobStatus.COMPLETED
+        assert [(a.paths, a.closed, a.ctx.season_read_ahead is a) for a in made] == [([setup.path], True, True)]
+        assert made[0]._threads == []  # one season: nothing after it to list
 
     def test_a_file_the_first_run_couldnt_find_counts_in_decided_by_once_the_retry_decides_it(
         self, engine, setup, monkeypatch

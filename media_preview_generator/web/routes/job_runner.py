@@ -1015,6 +1015,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         fallback_active=bool(worker_data.get("fallback_active", False)),
                         fallback_reason=worker_data.get("fallback_reason"),
                         fallback_title=worker_data.get("fallback_title", "") or "",
+                        fallback_until=worker_data.get("fallback_until"),
                         group_id=worker_data.get("group_id"),
                         member_id=worker_data.get("member_id"),
                         group_name=worker_data.get("group_name"),

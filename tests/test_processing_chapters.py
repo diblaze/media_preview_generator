@@ -1216,3 +1216,106 @@ class TestImageStamps:
         assert after["failed"] == "worker state"
         assert after["images"]["2"]["sha256"] == "worker-wrote-this" and "ino" not in after["images"]["2"]
         assert "ino" in after["images"]["1"]
+
+
+class TestOneFileSeveralPlexItems:
+    """A double episode is two Plex items over one file: one bundle, one manifest, a registration per item."""
+
+    @staticmethod
+    def _as_item(plan, item, media, part):
+        images = chapters._fresh_images(plan)
+        target = replace(
+            plan.target,
+            rating_key=item,
+            media_id=media,
+            part_id=part,
+            chapters=tuple(
+                replace(
+                    c,
+                    thumb_url=(
+                        f"/library/media/{media}/chapterImages/{c.index}?mpgChapter={images[str(c.index)]['sha256']}"
+                        if str(c.index) in images
+                        else ""
+                    ),
+                )
+                for c in plan.target.chapters
+            ),
+        )
+        return replace(plan, target=target)
+
+    def test_each_item_is_registered_once_and_neither_is_redone_by_later_scans(self, plan, config, extraction):
+        run, register = extraction
+        assert chapters.publish_chapters(plan, config).status == "ready"
+        first, second = self._as_item(plan, 1, 2, 3), self._as_item(plan, 7, 8, 9)
+        assert not chapters.chapter_work_needed(first)
+        assert chapters.chapter_work_needed(second)  # its own registration isn't proven yet
+        register.reset_mock()
+        assert chapters.publish_chapters(second, config).status == "ready"
+        register.assert_called_once()
+        assert register.call_args.args[1] is second.target
+        assert register.call_args.args[2] == {
+            int(index): entry["sha256"] for index, entry in chapters._fresh_images(second).items()
+        }
+        # Scans reach either item, in either order: neither needs work again, nothing registers again.
+        register.reset_mock()
+        for _ in range(2):
+            for item_plan in (first, second):
+                assert not chapters.chapter_work_needed(item_plan)
+                assert chapters.publish_chapters(item_plan, config).status == "ready"
+        register.assert_not_called()
+        run.assert_called()  # only the first publish extracted
+        assert run.call_count == 2
+
+    def test_a_regeneration_drops_the_other_items_proof(self, plan, config, extraction):
+        run, register = extraction
+        chapters.publish_chapters(plan, config)
+        second = self._as_item(plan, 7, 8, 9)
+        chapters.publish_chapters(second, config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert [v["item"] for v in manifest["also_verified"]] == [1]
+        _image(plan.folder / "chapter1.jpg", color="blue")  # the image changed: no registration of it is proven
+        assert chapters.chapter_work_needed(self._as_item(plan, 1, 2, 3))
+        register.reset_mock()
+        chapters.publish_chapters(plan, config, regenerate=True)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert manifest["verified"]["item"] == 1
+        assert "also_verified" not in manifest
+        assert chapters.chapter_work_needed(self._as_item(plan, 7, 8, 9))
+
+    def test_another_servers_or_another_images_proof_is_not_kept(self, plan, config, extraction):
+        chapters.publish_chapters(plan, config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        foreign = {**manifest["verified"], "item": 50, "machine": "other-plex"}
+        stale = {**manifest["verified"], "item": 60, "images": {"1": "0" * 64}}
+        plan.manifest_path.write_text(json.dumps({**manifest, "also_verified": [foreign, stale]}))
+        chapters.publish_chapters(self._as_item(plan, 7, 8, 9), config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert [v["item"] for v in manifest["also_verified"]] == [1]
+
+    def test_a_manifest_written_before_this_reads_as_before(self, plan, config, extraction):
+        """Manifests in Plex bundles today hold one ``verified`` and no ``also_verified``."""
+        chapters.publish_chapters(plan, config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert "also_verified" not in manifest
+        assert not chapters.chapter_work_needed(self._as_item(plan, 1, 2, 3))
+
+    def test_a_changed_image_reextracted_drops_the_other_items_proof(self, plan, config, extraction):
+        run, register = extraction
+        chapters.publish_chapters(plan, config)
+        chapters.publish_chapters(self._as_item(plan, 7, 8, 9), config)
+        (plan.folder / "chapter1.jpg").unlink()  # gone: the next publish extracts it again, a new image
+        run.side_effect = lambda _source, _start, path, *_args, **_kw: _image(path, "green")
+        chapters.publish_chapters(plan, config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert manifest["verified"]["item"] == 1
+        assert "also_verified" not in manifest
+        assert chapters.chapter_work_needed(self._as_item(plan, 7, 8, 9))
+
+    def test_the_same_items_older_proof_is_never_kept_beside_its_new_one(self, plan, config, extraction):
+        """Plex re-adding an item gives it new media and part ids: its old proof must go, not pile up."""
+        chapters.publish_chapters(plan, config)
+        chapters.publish_chapters(self._as_item(plan, 7, 8, 9), config)
+        chapters.publish_chapters(self._as_item(plan, 1, 20, 30), config)
+        manifest = json.loads(plan.manifest_path.read_text())
+        assert (manifest["verified"]["item"], manifest["verified"]["media"]) == (1, 20)
+        assert [(v["item"], v["media"]) for v in manifest["also_verified"]] == [(7, 8)]
