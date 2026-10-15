@@ -32,6 +32,28 @@ APP_VERSION = "5.2.0"
 CHANGED_ELSEWHERE = "This node was changed in another tab. Reload the page, then make your change again."
 NODE_REMOVED = "This node was removed in another tab."
 PHONE = {"width": 390, "height": 844}
+KEY_REFUSED = {
+    "id": "node_key",
+    "label": "The node refused this app's key",
+    "ok": False,
+    "severity": "critical",
+    "reason": "nuc refused the key.",
+    "fix_tab": "settings",
+    "fix_label": "Change the key",
+}
+KEY_ACCEPTED = {"id": "node_key", "label": "The node accepts this app's key", "ok": True, "severity": "critical"}
+
+
+def _health(*checks: dict) -> dict:
+    return {
+        "overall_ok": all(c["ok"] for c in checks),
+        "sections": [{"id": "node_connection", "title": "Connection", "checks": list(checks)}],
+    }
+
+
+def _focus_in_dialog(page: Page, modal_id: str) -> bool:
+    """Whether focus is inside the dialog: on the page behind it, Esc no longer closes it."""
+    return page.evaluate("(id) => !!(document.activeElement && document.activeElement.closest('#' + id))", modal_id)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -609,6 +631,27 @@ class TestAddNode:
         expect(authed_page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
         expect(authed_page.locator("#nodesAddBtn")).to_be_focused()
 
+    @pytest.mark.parametrize("via", ["next_button", "enter_in_key"])
+    def test_going_to_step_2_puts_the_cursor_in_its_first_field(
+        self, authed_page: Page, app_url: str, via: str
+    ) -> None:
+        """Step 1's focused field or Next button hid under the focus, which fell to the page: Esc did nothing."""
+        page = authed_page
+        _open_nodes(page, app_url, [])
+        modal = _open_add(page)
+        page.locator("#addNodeUrl").fill("http://nas.lan:9494")
+        page.locator("#addNodeKey").fill("secret-key")
+        page.locator("#addNodeConnect").click()
+        expect(page.locator("#addNodeProbe")).to_contain_text("Connected")
+        page.locator("#addNodeNext" if via == "next_button" else "#addNodeKey").focus()
+
+        page.keyboard.press("Enter")
+
+        expect(page.locator("#addNodeStep2")).to_be_visible()
+        expect(page.locator("#addNodeStep2 .nd-app").first).to_be_focused()
+        page.keyboard.press("Escape")
+        expect(modal).to_be_hidden(timeout=5000)
+
     def test_connect_save_test_access_use_suggestion_and_save(
         self, authed_page: Page, app_url: str, tmp_path: Path
     ) -> None:
@@ -1151,6 +1194,176 @@ class TestNodeDialog:
 
         expect(pane).to_contain_text("The node sees every library, same files.")
         expect(badge).to_be_hidden()
+
+    @pytest.mark.parametrize(
+        "health",
+        [_health(KEY_ACCEPTED), _health({**KEY_ACCEPTED, "id": "node_reachable", "label": "nuc answers"}, KEY_REFUSED)],
+        ids=["all_good_closed_last", "must_fix_open_then_all_good"],
+    )
+    def test_shift_tab_on_setup_health_stays_in_the_dialog(self, authed_page: Page, app_url: str, health: dict) -> None:
+        """Bootstrap's focus trap sent Shift+Tab to the last bucket's <details>, which can't take focus: the keyboard
+        stayed on the page behind the dialog and Esc no longer closed it."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc")])
+        api.health_answer = health
+        _open_node(authed_page, "n-nuc")
+        pane = _node_tab(authed_page, "health")
+        expect(pane.locator("details.readiness-bucket[data-tier='ok']")).to_have_count(1)
+        authed_page.locator("#nodeModal .btn-close").focus()
+
+        authed_page.keyboard.press("Shift+Tab")
+
+        assert _focus_in_dialog(authed_page, "nodeModal")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    @pytest.mark.parametrize(
+        ("fix_tab", "focused"),
+        [
+            ("settings", "#nodeSetName"),
+            ("media", "#node-tab-media .nd-app >> nth=0"),
+            ("overview", "#nodeModal"),
+        ],
+    )
+    def test_a_setup_health_fix_on_another_tab_keeps_the_focus_in_the_dialog(
+        self, authed_page: Page, app_url: str, fix_tab: str, focused: str
+    ) -> None:
+        """The clicked Fix hid with its tab and focus fell to the page, where Esc no longer closes the dialog."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", "key_refused")])
+        api.health_answer = _health({**KEY_REFUSED, "fix_tab": fix_tab, "fix_label": "Fix it"})
+        _open_node(authed_page, "n-nuc")
+        pane = _node_tab(authed_page, "health")
+        pane.locator(".nd-health-fix").focus()
+
+        authed_page.keyboard.press("Enter")
+
+        expect(authed_page.locator(f"#node-tab-{fix_tab}")).to_be_visible()
+        expect(authed_page.locator(focused)).to_be_focused()
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    @pytest.mark.parametrize(
+        ("rows", "removed", "focused"),
+        [
+            (2, 0, ".nd-remove >> nth=0"),
+            (2, 1, ".nd-remove >> nth=0"),
+            (3, 1, ".nd-remove >> nth=1"),
+            (1, 0, ".nd-add-row"),
+        ],
+        ids=["first_of_two", "last_of_two", "middle_of_three", "only_row"],
+    )
+    def test_removing_a_mapping_row_gives_the_focus_to_its_neighbour(
+        self, authed_page: Page, app_url: str, rows: int, removed: int, focused: str
+    ) -> None:
+        """The removed row's button took the focus with it, to the page: Esc no longer reached the dialog."""
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        for _ in range(rows - 1):
+            pane.locator(".nd-add-row").click()
+        pane.locator(".nd-map-row").nth(removed).locator(".nd-app").fill(f"/data/removed-{removed}")
+        pane.locator(".nd-remove").nth(removed).focus()
+
+        authed_page.keyboard.press("Enter")
+
+        expect(pane.locator(".nd-map-row")).to_have_count(max(1, rows - 1))
+        expect(pane.locator(f"[value='/data/removed-{removed}']")).to_have_count(0)
+        expect(pane.locator(focused)).to_be_focused()
+        # Esc reaches the dialog: with an unsaved edit it asks before closing.
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeDiscardFoot")).to_be_visible()
+
+    @pytest.mark.parametrize(
+        ("tab", "field"),
+        [("settings", "#nodeSetUrl"), ("media", "#node-tab-media .nd-node >> nth=0")],
+    )
+    def test_keep_editing_gives_the_focus_back_to_the_field_being_edited(
+        self, authed_page: Page, app_url: str, tab: str, field: str
+    ) -> None:
+        """The discard bar hid under the focus, which fell to the page: a second Esc did nothing."""
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, tab)
+        authed_page.locator(field).focus()
+        authed_page.keyboard.type("x")
+        # Asked from another tab, the bar opens the tab holding the edits.
+        _node_tab(authed_page, "overview")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeKeepEditing")).to_be_focused()
+
+        authed_page.keyboard.press("Enter")
+
+        expect(authed_page.locator("#nodeDiscardFoot")).to_be_hidden()
+        expect(authed_page.locator(field)).to_be_focused()
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeDiscardFoot")).to_be_visible()
+
+    def test_saving_the_right_key_clears_the_setup_health_badge(self, authed_page: Page, app_url: str) -> None:
+        """The header turned Ready after the save, while the Setup Health badge kept its red 1 and its pane still said
+        the key was refused, until the dialog was opened again."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", "key_refused", reason="nuc refused the key.")])
+        api.health_answer = _health(KEY_REFUSED)
+        _open_node(authed_page, "n-nuc")
+        badge = authed_page.locator("#nodeHealthTabBadge")
+        expect(badge).to_have_text("1")
+        _node_tab(authed_page, "settings")
+        api.nodes[0].update(state="ready", reason="")
+        api.health_answer = _health(KEY_ACCEPTED)
+
+        authed_page.locator("#nodeSetKey").fill("the-right-key-1234567890")
+        authed_page.locator("#nodeSettingsSave").click()
+
+        expect(authed_page.locator("#nodeSettingsResult")).to_have_text("Saved")
+        expect(badge).to_have_class("sm-nb d-none")
+        expect(authed_page.locator("#nodeHealthBody")).to_contain_text("The node accepts this app's key")
+
+    def test_a_poll_that_changes_the_nodes_state_reads_setup_health_again(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """A key fixed on the node's side: the header turned Ready on the next poll, its badge kept the old count."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", "key_refused", reason="nuc refused the key.")])
+        api.health_answer = _health(KEY_REFUSED)
+        _open_node(authed_page, "n-nuc")
+        badge = authed_page.locator("#nodeHealthTabBadge")
+        expect(badge).to_have_text("1")
+        reads = len(api.bodies("GET", "/nodes/n-nuc/health"))
+        api.nodes[0].update(state="ready", reason="")
+        api.health_answer = _health(KEY_ACCEPTED)
+
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        expect(authed_page.locator("#nodeModalState")).to_contain_text("Ready")
+        expect(badge).to_have_class("sm-nb d-none")
+        assert len(api.bodies("GET", "/nodes/n-nuc/health")) == reads + 1
+        # A poll that finds the same state doesn't check again.
+        with authed_page.expect_response(lambda r: r.url.endswith("/api/nodes")):
+            authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        authed_page.wait_for_timeout(300)
+        assert len(api.bodies("GET", "/nodes/n-nuc/health")) == reads + 1
+
+    @pytest.mark.parametrize(
+        ("state", "text"),
+        [
+            ("ready", "No GPU found. CPU work still runs on this node."),
+            ("gpu_lost", "No GPU found. CPU work still runs on this node."),
+            ("offline", "No GPU found."),
+            ("connecting", "No GPU found."),
+            ("disabled", "No GPU found."),
+            ("update_needed", "No GPU found."),
+            ("no_ffmpeg", "No GPU found."),
+            ("temp_problem", "No GPU found."),
+            ("key_refused", "No GPU found."),
+            ("duplicate", "No GPU found."),
+            ("access_problem", "No GPU found."),
+        ],
+    )
+    def test_a_node_without_a_gpu_says_cpu_work_runs_only_when_it_gets_work(
+        self, authed_page: Page, app_url: str, state: str, text: str
+    ) -> None:
+        """Beside "Offline", "Turned off" or "FFmpeg missing", "CPU work still runs on this node" wasn't true."""
+        _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", state, enabled=state != "disabled")])
+        _open_node(authed_page, "n-nuc")
+        _node_tab(authed_page, "overview")
+        expect(authed_page.locator("#nodeGpuList")).to_have_text(text)
 
     def test_closing_with_unsaved_settings_asks_first(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())

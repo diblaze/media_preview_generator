@@ -49,6 +49,11 @@
         if (!document.activeElement || document.activeElement === document.body) btn.focus();
     }
 
+    // The first field in scope a user can type in: focus given there instead of falling to the page.
+    function firstField(scope) {
+        return $$('input, select, textarea', scope).find((el) => !el.disabled && el.getClientRects().length) || null;
+    }
+
     function initTooltips(scope) {
         if (typeof window._initBootstrapTooltips === 'function') window._initBootstrapTooltips(scope);
     }
@@ -97,6 +102,8 @@
     const OLD_FACTS = ['offline', 'connecting', 'disabled', 'key_refused', 'duplicate'];
     // Only these can have files running on them.
     const TAKES_FILES = ['ready', 'gpu_lost', 'access_problem'];
+    // Only these give workers: in every other state the node gets no work at all, CPU work included.
+    const GIVES_WORKERS = ['ready', 'gpu_lost'];
 
     function factsAreCurrent(node) {
         return !OLD_FACTS.includes(node.state);
@@ -462,9 +469,12 @@
                 <div class="nd-chip-slot"></div>
                 <button type="button" class="btn btn-sm btn-outline-danger nd-remove" aria-label="Remove mapping" title="Remove mapping"><i class="bi bi-x-lg"></i></button>`;
             $('.nd-remove', row).addEventListener('click', () => {
+                // The removed button took focus with it, to the page, where Esc no longer closes the dialog.
+                const neighbour = row.nextElementSibling || row.previousElementSibling;
                 row.remove();
                 if (!rows.children.length) addRow();
                 changed();
+                (neighbour ? $('.nd-remove', neighbour) : $('.nd-add-row', root)).focus();
             });
             rows.appendChild(row);
             return row;
@@ -914,6 +924,8 @@
         const setup = add.probe.media_setup;
         if (!suggested.length && setup && !Number(setup.libraries)) add.editor.note(noLibrariesHtml(setup));
         setAddStep(2);
+        // Step 1's field or Next button had focus and is hidden now.
+        (firstField($('#addNodeStep2')) || $('#addNodeModal')).focus();
     }
 
     async function finishAdd() {
@@ -950,10 +962,11 @@
     // mapDirty / setDirty: the Media rows / the Settings fields were edited and not saved; discardOk lets one close
     // through after the user said Discard. editTag: the node's edit_tag as the dialog opened it (or as its own last
     // save left it); polls don't move it, so a save over another tab's change is refused, not applied on top.
-    // rescanning: a Rescan GPUs is under way, so a poll leaves its button off.
+    // rescanning: a Rescan GPUs is under way, so a poll leaves its button off. healthState: the node's state when
+    // Setup Health was last read. editedField: the field last typed in, where Keep editing puts the cursor back.
     const detail = {
         editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false, editTag: undefined,
-        rescanning: false,
+        rescanning: false, healthState: undefined, editedField: null,
     };
 
     function setMapDirty(dirty) {
@@ -968,6 +981,22 @@
 
     function hideDiscard() {
         $('#nodeDiscardFoot').classList.add('d-none');
+    }
+
+    // Back to the field last edited (else the first field of the tab holding the edits): the hidden bar took focus
+    // with it, to the page.
+    function keepEditing() {
+        hideDiscard();
+        const pane = $(`#node-tab-${detail.mapDirty ? 'media' : 'settings'}`);
+        const edited = detail.editedField;
+        const field = edited && pane.contains(edited) && edited.getClientRects().length ? edited : firstField(pane);
+        (field || $('#nodeModal')).focus();
+    }
+
+    // A tab opened from a button on another tab: that button is hidden now, so focus goes to the tab's first field.
+    function showTabFocused(tab) {
+        showTab(tab);
+        (firstField($(`#node-tab-${tab}`)) || $('#nodeModal')).focus();
     }
 
     // Close, Esc and the backdrop all end in hide(): while there are edits, ask first, on the tab that holds them.
@@ -1053,7 +1082,7 @@
                     + (current && gpu.error ? `<span class="nd-faint">${esc(gpu.error)}</span>` : '')
                     + '</div>';
             }).join('')
-            : '<div class="sm-hint">No GPU found. CPU work still runs on this node.</div>';
+            : `<div class="sm-hint">No GPU found.${GIVES_WORKERS.includes(node.state) ? ' CPU work still runs on this node.' : ''}</div>`;
         // A node that isn't answering as itself can't rescan its GPUs. Focus moves to the dialog first: disabling the
         // focused button would drop it to the page, where Esc no longer closes the dialog.
         const rescan = $('#nodeRescanGpus');
@@ -1099,6 +1128,7 @@
         page.openId = String(node.id);
         detail.editTag = node.edit_tag;
         detail.mapDirty = detail.setDirty = detail.discardOk = false;
+        detail.editedField = null;
         hideDiscard();
         renderHeader(node);
         renderOverview(node);
@@ -1136,8 +1166,10 @@
         }
     }
 
-    // A poll refreshes what the open dialog shows about the node, never the fields being edited.
-    function refreshOpenNode() {
+    // A poll refreshes what the open dialog shows about the node, never the fields being edited. Setup Health is
+    // read again when the node's state moved (or when asked): its badge said the old count until the dialog was
+    // opened again.
+    function refreshOpenNode(health) {
         const node = openNodeObj();
         if (!node) {
             closeRemovedNode();
@@ -1145,6 +1177,7 @@
         }
         renderHeader(node);
         renderOverview(node);
+        if (health || node.state !== detail.healthState) loadHealth();
     }
 
     // The open node was removed in another tab: nothing in the dialog can be saved any more, so it closes and says why.
@@ -1282,7 +1315,8 @@
         }
         detail.editTag = r.data.edit_tag;
         replaceNode(r.data);
-        refreshOpenNode();
+        // A new key or address ends or starts a Must fix.
+        refreshOpenNode(true);
         detail.editor.setName(r.data.name || r.data.id);
         keyEl.value = '****';
         setSettingsDirty(false);
@@ -1451,7 +1485,7 @@
             fix.className = 'btn btn-sm btn-warning nd-health-fix';
             fix.textContent = check.fix_label || 'Fix';
             fix.addEventListener('click', () => {
-                showTab(check.fix_tab);
+                showTabFocused(check.fix_tab);
                 if (check.fix_tab !== 'media') return;
                 if (check.suggestion && check.suggestion.to) {
                     detail.editor.applySuggestion({ suggestion: check.suggestion, app_root: check.suggestion.app_root || '' });
@@ -1485,6 +1519,9 @@
         const det = document.createElement('details');
         det.className = 'readiness-bucket';
         det.dataset.tier = tier;
+        // Bootstrap's focus trap counts <details> as focusable but focusing one does nothing: as the dialog's last
+        // such element, a Shift+Tab out of the dialog stayed on the page behind it. Its <summary> stays tabbable.
+        det.tabIndex = -1;
         if (expanded) det.open = true;
         const sum = document.createElement('summary');
         sum.className = 'd-flex align-items-center gap-2 user-select-none';
@@ -1541,7 +1578,10 @@
         if (!node) return;
         const seq = ++detail.healthSeq;
         detail.healthStartedAt = Date.now();
+        detail.healthState = node.state;
         const body = $('#nodeHealthBody');
+        // Its rows are about to be replaced: a focused Fix or Retry would drop focus to the page.
+        if (body.contains(document.activeElement)) $('#nodeModal').focus();
         body.innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>Checking…</div>';
         const r = await api('GET', `/api/nodes/${encodeURIComponent(node.id)}/health`);
         if (seq !== detail.healthSeq || page.openId !== String(node.id)) return;
@@ -1608,7 +1648,8 @@
         });
 
         $('#nodeModal').addEventListener('hide.bs.modal', guardClose);
-        $('#nodeKeepEditing').addEventListener('click', hideDiscard);
+        $('#nodeKeepEditing').addEventListener('click', keepEditing);
+        $('#nodeModal').addEventListener('input', (event) => { detail.editedField = event.target; });
         $('#nodeDiscardConfirm').addEventListener('click', () => {
             detail.discardOk = true;
             bootstrap.Modal.getOrCreateInstance($('#nodeModal')).hide();
