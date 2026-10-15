@@ -1794,11 +1794,36 @@ def test_the_short_reason_a_node_gets_no_work_says_when_it_is_only_restarting_or
     assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, reason)
 
 
-def test_the_workers_page_says_the_same_words_for_each_offline_cause():
+def test_the_workers_page_says_the_same_words_for_each_cause():
     """The editor's chips judge from the node list (app.js NODE_STATES), the saved member rows from capacity()."""
     js = (Path(reg.__file__).resolve().parents[1] / "web" / "static" / "js" / "app.js").read_text(encoding="utf-8")
-    causes = re.search(r"offline: \{[^\n]*causes: \{([^}]*)\}", js).group(1)
-    assert dict(re.findall(r"(\w+): '([^']+)'", causes)) == reg._OFFLINE_CAPACITY_REASONS
+    words = {}
+    for state in reg._CAUSE_STATES:
+        causes = re.search(r"\n    " + state + r": \{[^\n]*causes: \{([^}]*)\}", js).group(1)
+        words.update(re.findall(r"(\w+): '([^']+)'", causes))
+    assert words == reg._CAUSE_CAPACITY_REASONS
+
+
+@pytest.mark.parametrize(
+    ("node_version", "cause", "reason"),
+    [("9.9.10", reg.UPDATE_APP_BEHIND, "app needs an update"), ("9.9.8", "", "node needs an update")],
+    ids=["node-ahead", "node-behind"],
+)
+def test_a_worker_node_ahead_of_this_app_says_the_app_needs_the_update(h, node_version, cause, reason):
+    """Its reason and Setup Health said "Update this app", while its chips said "node needs an update"."""
+    h.client().default_info = _info(version=node_version)
+    view = h.registry.check_now("n1")
+    assert (view.state, view.cause) == (reg.STATE_UPDATE_NEEDED, cause)
+    assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, reason)
+
+
+def test_a_turned_off_node_keeps_no_cause_from_its_last_check(h):
+    h.client().default_info = _info(version="9.9.10")
+    h.registry.check_now("n1")
+    h.change(enabled=False)
+    view = next(v for v in h.registry.views() if v.id == "n1")
+    assert (view.state, view.cause) == (reg.STATE_DISABLED, "")
+    assert h.registry.capacity("n1").reason == "node turned off"
 
 
 @pytest.mark.parametrize(

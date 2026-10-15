@@ -200,8 +200,40 @@ def test_an_offline_node_that_stops_answering_another_way_keeps_its_dismissed_of
     assert notif.build_active_notifications([]) == []
 
 
-def test_the_node_card_kinds_are_the_alert_states_and_the_two_ways_a_node_answers_while_offline():
-    assert set(notif.NODE_CARD_KINDS) == {*reg.ALERT_STATES, reg.OFFLINE_RESTARTING, reg.OFFLINE_RATE_LIMITED}
+def test_the_node_card_kinds_are_the_alert_states_and_the_causes_with_a_card_of_their_own():
+    assert set(notif.NODE_CARD_KINDS) == {
+        *reg.ALERT_STATES,
+        reg.OFFLINE_RESTARTING,
+        reg.OFFLINE_RATE_LIMITED,
+        reg.UPDATE_APP_BEHIND,
+    }
+
+
+def _update_needed(cause, reason):
+    view = _view(reg.STATE_UPDATE_NEEDED, name="nuc", reason=reason)
+    return dataclasses.replace(view, version="9.9.10", cause=cause)
+
+
+def test_the_bell_says_this_app_needs_the_update_when_the_node_is_ahead():
+    """Its reason and Setup Health said "Update this app", while the bell's title said "nuc needs an update"."""
+    reason = "nuc runs version 9.9.10 and this app runs 9.9.9. Update this app to 9.9.10."
+    (card,) = _cards(_update_needed(reg.UPDATE_APP_BEHIND, reason))
+    assert card["title"] == "Update this app for nuc"
+    assert card["id"] == "node:abc123:app_behind"
+    assert escape(reason) in card["body_html"]
+    # Setup Health's version row is where "This app needs an update" is explained.
+    assert card["action"] == {"href": "/nodes#node-abc123/health", "label": "Open Nodes"}
+
+
+def test_the_bell_says_the_node_needs_the_update_when_it_is_behind():
+    reason = "nuc runs version 9.9.8 and this app runs 9.9.9. Update the node to 9.9.9."
+    (card,) = _cards(_update_needed("", reason))
+    assert (card["title"], card["id"]) == ("nuc needs an update", "node:abc123:update_needed")
+
+
+def test_a_cause_only_gives_its_own_card_in_its_own_state():
+    (card,) = _cards(dataclasses.replace(_view(reg.STATE_OFFLINE), cause=reg.UPDATE_APP_BEHIND))
+    assert (card["title"], card["id"]) == ("old-laptop is offline", "node:abc123:offline")
 
 
 def test_a_node_without_a_reason_still_gets_what_to_do():
@@ -243,6 +275,7 @@ def test_a_permanent_dismissal_never_hides_a_node_card():
         ("node:abc123:offline", True),
         ("node:abc123:restarting", True),
         ("node:abc123:rate_limited", True),
+        ("node:abc123:app_behind", True),
         ("node:abc123:gpu_lost", True),
         ("node:abc123:unconfirmed", True),
         ("node:abc123:ready", False),

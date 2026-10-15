@@ -157,17 +157,21 @@ def test_settings_row_and_editor_flag_an_offline_node_member(
 
 
 @pytest.mark.parametrize(
-    ("cause", "reason", "short"),
+    ("state", "cause", "reason", "short"),
     [
-        ("restarting", "old-laptop is restarting; it gets no files until it is back.", "node restarting"),
-        ("rate_limited", "old-laptop asks this app to wait.", "node asks to wait"),
+        ("offline", "restarting", "old-laptop is restarting; it gets no files until it is back.", "node restarting"),
+        ("offline", "rate_limited", "old-laptop asks this app to wait.", "node asks to wait"),
+        # Its reason and Setup Health say "Update this app"; the chip said "node needs an update".
+        ("update_needed", "app_behind", "Update this app to 9.9.10.", "app needs an update"),
+        ("update_needed", "", "Update the node to 9.9.9.", "node needs an update"),
     ],
-    ids=["restarting", "asks_to_wait"],
+    ids=["restarting", "asks_to_wait", "app_behind", "node_behind"],
 )
-def test_editor_says_a_node_member_is_only_restarting_or_asked_to_wait(
+def test_editor_says_why_a_node_member_has_no_workers_when_nothing_on_the_node_is_wrong(
     authed_page: Page,
     app_url: str,
     group_api: dict,  # noqa: F811
+    state: str,
     cause: str,
     reason: str,
     short: str,
@@ -175,7 +179,7 @@ def test_editor_says_a_node_member_is_only_restarting_or_asked_to_wait(
     """Its chip said "node offline · 0 now" while its tooltip, Setup Health and the bell said it is restarting."""
     offline_node_group(group_api)
     laptop = next(node for node in group_api["state"]["nodes"] if node["id"] == "laptop")
-    laptop.update(cause=cause, reason=reason)
+    laptop.update(state=state, cause=cause, reason=reason)
     settings_page(authed_page, app_url)
     authed_page.locator('[data-edit="gpu-video"]').click()
     expect(authed_page.locator('[data-member="m-laptop"] [data-node-zero]')).to_have_text(f"{short} · 0 now")
@@ -277,18 +281,21 @@ def test_a_worker_cards_node_state_has_the_nodes_pages_name_and_colour(
 
 
 @pytest.mark.parametrize(
-    ("cause", "text"),
+    ("state", "cause", "text"),
     [
-        ("restarting", "Node restarting"),
-        ("rate_limited", "Node asks to wait"),
-        ("unreachable", "Node offline"),
-        ("", "Node offline"),
+        ("offline", "restarting", "Node restarting"),
+        ("offline", "rate_limited", "Node asks to wait"),
+        ("offline", "unreachable", "Node offline"),
+        ("offline", "", "Node offline"),
+        ("update_needed", "app_behind", "App needs an update"),
+        ("update_needed", "", "Node update needed"),
     ],
 )
-def test_a_worker_card_says_why_its_offline_node_is_offline(
+def test_a_worker_card_says_why_its_node_gives_it_no_work(
     authed_page: Page,
     app_url: str,
     group_api: dict,  # noqa: F811
+    state: str,
     cause: str,
     text: str,
 ) -> None:
@@ -304,7 +311,7 @@ def test_a_worker_card_says_why_its_offline_node_is_offline(
         "member_id": "m-laptop",
         "status": "idle",
         "node": {"id": "laptop", "name": "old-laptop"},
-        "node_state": "offline",
+        "node_state": state,
         "node_cause": cause,
     }
     authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [worker]}))

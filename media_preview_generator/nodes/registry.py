@@ -55,6 +55,8 @@ OFFLINE_NOT_A_NODE = "not_a_node"
 OFFLINE_RESTARTING = "restarting"
 OFFLINE_STUCK = "stuck"
 OFFLINE_RATE_LIMITED = "rate_limited"
+# Why a worker node needs an update (``NodeView.cause``) when this app is the older side: this app is updated.
+UPDATE_APP_BEHIND = "app_behind"
 
 # States that raise a bell notification (``web.notifications``).
 ALERT_STATES = (
@@ -111,11 +113,15 @@ _CAPACITY_REASONS = {
     STATE_DUPLICATE: "node added twice",
 }
 # An offline node that answered it is restarting, or asked this app to wait, has nothing to fix on it: "node offline"
-# beside it contradicted its Setup Health and bell, which say so.
-_OFFLINE_CAPACITY_REASONS = {
+# beside it contradicted its Setup Health and bell, which say so. A worker node ahead of this app has nothing to fix on
+# it either: this app is the one to update.
+_CAUSE_CAPACITY_REASONS = {
     OFFLINE_RESTARTING: "node restarting",
     OFFLINE_RATE_LIMITED: "node asks to wait",
+    UPDATE_APP_BEHIND: "app needs an update",
 }
+# The states whose ``NodeView.cause`` is kept (a turned-off node's last check doesn't say why it gets nothing).
+_CAUSE_STATES = (STATE_OFFLINE, STATE_UPDATE_NEEDED)
 
 
 @dataclass(frozen=True)
@@ -136,7 +142,8 @@ class NodeView:
     last_seen: float | None
     # A health check is running or queued for it.
     checking: bool = False
-    # Why an offline node is offline (``OFFLINE_*``); "" in every other state.
+    # Why an offline node is offline (``OFFLINE_*``), or ``UPDATE_APP_BEHIND`` for a node that needs an update because
+    # this app is older; "" otherwise.
     cause: str = ""
     # A Plex database node reported a new id this app couldn't tie to its Plex: its key must be typed again.
     plex_db_unconfirmed: bool = False
@@ -625,8 +632,8 @@ class NodeRegistry:
                 return NodeCapacity(True, True, "")
             if state == STATE_GPU_LOST:
                 return NodeCapacity(True, False, reason)
-            if state == STATE_OFFLINE and live.probe_cause in _OFFLINE_CAPACITY_REASONS:
-                return NodeCapacity(False, False, _OFFLINE_CAPACITY_REASONS[live.probe_cause])
+            if state in _CAUSE_STATES and live.probe_cause in _CAUSE_CAPACITY_REASONS:
+                return NodeCapacity(False, False, _CAUSE_CAPACITY_REASONS[live.probe_cause])
             return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
 
     def plex_db_refusal(self, node_id: str) -> str:
@@ -1150,7 +1157,7 @@ class NodeRegistry:
             legacy=live.legacy,
             last_seen=live.last_seen,
             checking=live.checking,
-            cause=live.probe_cause if state == STATE_OFFLINE else "",
+            cause=live.probe_cause if state in _CAUSE_STATES else "",
             plex_db_unconfirmed=bool(live.unconfirmed_uid),
         )
 
@@ -1497,14 +1504,12 @@ class NodeRegistry:
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
             # A node that is ahead is matched by updating this app; one whose version can't be read is updated.
-            update = (
-                f"Update this app to {version}."
-                if agent_older_than(app_version, version)
-                else f"Update the node to {app_version}."
-            )
+            app_behind = agent_older_than(app_version, version)
+            update = f"Update this app to {version}." if app_behind else f"Update the node to {app_version}."
             return _Outcome(
                 STATE_UPDATE_NEEDED,
                 f"{name} runs version {version or 'unknown'} and this app runs {app_version}. {update}",
+                cause=UPDATE_APP_BEHIND if app_behind else "",
                 **outcome,
             )
         build, app_build = str(block.get("build") or ""), self._app_build()

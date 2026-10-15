@@ -524,7 +524,7 @@ def _build_library_health_check_failed_notification() -> dict[str, Any] | None:
 
 
 _NODE_CARD_TEXT = {
-    # kind (the node's state, or how an offline node that answered is offline):
+    # kind (the node's state, or its cause when that has a card of its own, ``_node_card_kind``):
     # (title, what to do when the node has no reason, action label, where on the node dialog the action lands)
     "offline": (
         "{name} is offline",
@@ -549,6 +549,13 @@ _NODE_CARD_TEXT = {
     "update_needed": (
         "{name} needs an update",
         "Update the node so its version matches this app.",
+        "Open Nodes",
+        "health",
+    ),
+    # A worker node ahead of this app: this app is the one to update. Setup Health's version row says so too.
+    "app_behind": (
+        "Update this app for {name}",
+        "The node runs a newer version. Update this app so its version matches the node.",
         "Open Nodes",
         "health",
     ),
@@ -603,16 +610,26 @@ def node_notification_id(node_id: str, kind: str) -> str:
 
 
 def _node_card_kind(state: str, cause: str) -> str:
-    """Which card a node gets: its state, except an offline node that answered (restarting, asks this app to wait).
+    """Which card a node gets: its state, or its cause when that has a card of its own.
 
-    Those two get their own card and id, so dismissing "is restarting" doesn't hide the "is offline" that follows when
-    the node never comes back.
+    An offline node that answered (restarting, asks this app to wait) and a worker node ahead of this app get their own
+    card and id, so dismissing "is restarting" doesn't hide the "is offline" that follows when the node never comes
+    back.
     """
-    from ..nodes.registry import OFFLINE_RATE_LIMITED, OFFLINE_RESTARTING, STATE_OFFLINE
+    from ..nodes.registry import (
+        OFFLINE_RATE_LIMITED,
+        OFFLINE_RESTARTING,
+        STATE_OFFLINE,
+        STATE_UPDATE_NEEDED,
+        UPDATE_APP_BEHIND,
+    )
 
-    if state == STATE_OFFLINE and cause in (OFFLINE_RESTARTING, OFFLINE_RATE_LIMITED):
-        return cause
-    return state
+    carded = {
+        OFFLINE_RESTARTING: STATE_OFFLINE,
+        OFFLINE_RATE_LIMITED: STATE_OFFLINE,
+        UPDATE_APP_BEHIND: STATE_UPDATE_NEEDED,
+    }
+    return cause if cause and carded.get(cause) == state else state
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
