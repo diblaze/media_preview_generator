@@ -292,6 +292,14 @@ class TestStates:
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
         assert reg.STATE_NO_FFMPEG in reg.ALERT_STATES
 
+    def test_a_worker_node_whose_ffmpeg_doesnt_run_is_not_ready_and_gets_no_work(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": None}
+        h.client().default_info = info
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_NO_FFMPEG and "/usr/bin/ffmpeg, but it doesn't run" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
+
     def test_a_worker_node_with_ffmpeg_is_ready(self, h):
         info = _info()
         info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": "7.1"}

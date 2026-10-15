@@ -1121,6 +1121,15 @@ class NodeRegistry:
                 "(or put it on its PATH), then restart the node.",
                 **outcome,
             )
+        # The node answers a path with no version when the FFmpeg it found won't run (wrong architecture, a missing
+        # library, no permission): every file would fail just the same.
+        if protocol.ROLE_WORKER in roles and isinstance(ffmpeg, dict) and not ffmpeg.get("version"):
+            return _Outcome(
+                STATE_NO_FFMPEG,
+                f"{name} found FFmpeg at {ffmpeg.get('path')}, but it doesn't run, so every file sent to it would "
+                "fail. Reinstall FFmpeg on that machine, then restart the node.",
+                **outcome,
+            )
         agent = info.get("agent")
         agent_version = str(agent.get("version") or "") if isinstance(agent, dict) else ""
         if protocol.ROLE_PLEX_DB in roles and agent_version and agent_too_old(agent_version):
