@@ -17,10 +17,15 @@ from loguru import logger
 from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
+    UNREACHABLE_DNS,
+    UNREACHABLE_REFUSED,
+    UNREACHABLE_TIMEOUT,
+    UNREACHABLE_TLS,
     NodeAuthError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnknownTaskError,
+    NodeUnreachableError,
 )
 from media_preview_generator.nodes.executor import (
     FileNotVisibleError,
@@ -371,15 +376,56 @@ class TestNodeDrops:
         assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
 
-    def test_a_start_whose_answer_timed_out_is_cancelled_on_the_node_by_its_client_id(self, media):
-        client = ScriptedClient([running()], start_error=NodeTimeoutError("http://n didn't answer in time"))
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT),
+            NodeTimeoutError("http://n dropped the connection before answering"),
+            NodeUnreachableError("http://n answered HTTP 502"),
+            NodeUnreachableError("http://n answered HTTP 504"),
+        ],
+        ids=["no-answer-in-time", "connection-dropped", "gateway-502", "gateway-504"],
+    )
+    def test_a_start_that_may_have_reached_the_node_is_cancelled_there_by_its_client_id(self, media, error):
+        """A gateway in front of the node forwards the start and answers 502/504 itself: the node runs the task."""
+        timeouts: list = []
+
+        class Client(ScriptedClient):
+            def delete_task(self, task_id, *, read_timeout=None):
+                timeouts.append(read_timeout)
+                super().delete_task(task_id)
+
+        client = Client([running()], start_error=error)
         registry = _install(client)
         with pytest.raises(NodeUnavailableError, match="couldn't start") as raised:
             _run(media)
         assert raised.value.started is False
-        assert client.deleted == [client.started_with["client_task_id"]]
+        assert _wait_until(lambda: client.deleted == [client.started_with["client_task_id"]])
+        assert timeouts == [executor.GONE_DELETE_TIMEOUT_S]
         assert client.named("poll") == []
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_a_start_that_timed_out_doesnt_hold_the_requeue_for_its_delete(self, media):
+        release = threading.Event()
+
+        class HungDelete(ScriptedClient):
+            def delete_task(self, task_id, *, read_timeout=None):
+                release.wait(10)  # a hung node: the DELETE waits out its read timeout
+                super().delete_task(task_id)
+
+        client = HungDelete([running()], start_error=NodeTimeoutError("http://n didn't answer in time"))
+        _install(client)
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(NodeUnavailableError, match="couldn't start"):
+                _run(media)
+            given_up_after = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert given_up_after < 2.0
+        assert _wait_until(lambda: client.deleted == [client.started_with["client_task_id"]])
 
     def test_a_start_the_node_refuses_as_already_deleted_never_ran(self, media):
         client = ScriptedClient(
@@ -401,12 +447,24 @@ class TestNodeDrops:
             ids.append(client.spec["client_task_id"])
         assert ids[0] != ids[1]
 
-    def test_a_refused_start_never_reached_the_node_so_nothing_is_cancelled(self, media):
-        client = ScriptedClient([running()], start_error=unreachable())
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NodeUnreachableError("http://n didn't answer (connection refused)", reason=UNREACHABLE_REFUSED),
+            NodeUnreachableError("http://n didn't answer (no machine called n was found)", reason=UNREACHABLE_DNS),
+            NodeUnreachableError("http://n didn't answer over https", reason=UNREACHABLE_TLS),
+            unreachable(),
+            NodeAuthError("http://n refused the key"),
+        ],
+        ids=["refused", "no-such-machine", "tls", "connect-timeout", "key-refused"],
+    )
+    def test_a_start_that_never_reached_the_node_cancels_nothing(self, media, error):
+        client = ScriptedClient([running()], start_error=error)
         _install(client)
         with pytest.raises(NodeUnavailableError):
             _run(media)
-        assert client.deleted == []
+        time.sleep(0.1)  # a DELETE would be sent from a thread of its own
+        assert client.named("delete") == []
 
     def test_a_removed_node_never_ran_the_task(self, media):
         set_registry(FakeRegistry({}))
@@ -425,6 +483,75 @@ class TestNodeDrops:
             _run(media)
         assert raised.value.started is True
         assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_UNAVAILABLE
+
+
+class _DeleteAnswers(ScriptedClient):
+    """Each DELETE raises the next of ``answers`` (None, or none left: it is delivered)."""
+
+    def __init__(self, script: list, answers: list) -> None:
+        super().__init__(script)
+        self.answers = list(answers)
+        self.timeouts: list = []
+
+    def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
+        self.calls.append(("delete",))
+        self.timeouts.append(read_timeout)
+        answer = self.answers.pop(0) if self.answers else None
+        if answer is not None:
+            raise answer
+        self.deleted.append(task_id)
+
+
+class TestFreeingTheTask:
+    """Until a DELETE reaches it, the node keeps a finished task and its temp dir (a preview's frames) 10 minutes."""
+
+    DONE = [finished(protocol.STATUS_DONE, result={"ok": 1})]
+
+    def test_a_delete_lost_to_a_passing_error_is_sent_again_without_holding_the_file(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.5,))
+        lost = NodeUnreachableError("http://n didn't answer (connection refused)", reason=UNREACHABLE_REFUSED)
+        client = _DeleteAnswers(self.DONE, [lost])
+        _install(client)
+
+        started = time.monotonic()
+        assert _run(media) == {"ok": 1}
+        assert time.monotonic() - started < 0.4
+        assert client.deleted == []
+
+        assert _wait_until(lambda: client.deleted == ["t1"])
+        assert client.timeouts == [None, executor.GONE_DELETE_TIMEOUT_S]
+
+    @pytest.mark.parametrize("node_gone", [False, True], ids=["after-a-finished-task", "after-the-node-went-away"])
+    def test_a_delete_nothing_answers_is_given_up_after_its_retries(self, media, monkeypatch, node_gone):
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.0, 0.0))
+        script = [running(), unreachable()] if node_gone else self.DONE
+        client = _DeleteAnswers(script, [NodeTimeoutError("http://n didn't answer in time")] * 10)
+        _install(client)
+
+        if node_gone:
+            with pytest.raises(NodeUnavailableError):
+                _run(media)
+        else:
+            _run(media)
+
+        assert _wait_until(lambda: len(client.named("delete")) == 3)
+        time.sleep(0.1)
+        assert len(client.named("delete")) == 3 and client.deleted == []
+
+    @pytest.mark.parametrize(
+        "answer",
+        [NodeUnknownTaskError("unknown_task"), NodeAuthError("http://n refused the key")],
+        ids=["node-doesnt-have-it", "key-refused"],
+    )
+    def test_a_delete_the_node_answered_is_not_sent_again(self, media, monkeypatch, answer):
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.0, 0.0))
+        client = _DeleteAnswers(self.DONE, [answer])
+        _install(client)
+
+        _run(media)
+
+        time.sleep(0.1)
+        assert len(client.named("delete")) == 1
 
 
 class TestErrors:
