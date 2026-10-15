@@ -281,6 +281,24 @@ class TestGetShape:
             }
         ]
 
+    @pytest.mark.parametrize(
+        "others",
+        [[], [group(id="night", name="Night", members=[member(id="c2", count=4)], enabled=False)]],
+        ids=["no_other_group", "every_other_group_off"],
+    )
+    def test_a_missing_gpu_with_no_other_device_working_doesnt_say_they_keep_working(self, client, hardware, others):
+        """Its jobs wait, and nothing else runs: "other devices keep working" wasn't true."""
+        hardware.clear()
+        save(client, [group(members=[gpu_member()]), *others])
+        assert stored(client)["warnings"] == [
+            {
+                "code": "hardware_unavailable",
+                "group_id": "off",
+                "member_id": "g1",
+                "message": "Off-hours: GPU cuda:0 not detected. Its jobs wait.",
+            }
+        ]
+
     def test_group_is_hardware_unavailable_when_every_member_is_missing(self, client, hardware):
         hardware.clear()
         save(client, [group(members=[gpu_member(), gpu_member(id="g2", device="cuda:1")])])

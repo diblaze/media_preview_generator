@@ -456,7 +456,7 @@ class TestMemberRows:
                 "available": 1,
                 "finishing": 0,
                 "members": [
-                    {"id": "m1", "resource": "cpu", "device": None, "state": "active", "busy": 1},
+                    {"id": "m1", "resource": "cpu", "device": None, "state": "active", "busy": 1, "target": 2},
                     *[
                         {"id": m["id"], "resource": m["resource"], "device": m["device"], "state": "active", "busy": 0}
                         for m in (extra_members or [])

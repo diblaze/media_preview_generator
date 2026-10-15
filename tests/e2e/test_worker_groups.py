@@ -67,7 +67,15 @@ def group_api(authed_page: Page) -> dict:
                     "state": "busy",
                     "next_available_at": None,
                     "members": [
-                        {"id": "m-cpu", "resource": "cpu", "device": None, "desired": 2, "available": 0, "busy": 2}
+                        {
+                            "id": "m-cpu",
+                            "resource": "cpu",
+                            "device": None,
+                            "desired": 2,
+                            "target": 2,
+                            "available": 0,
+                            "busy": 2,
+                        }
                     ],
                 },
                 {
@@ -79,7 +87,15 @@ def group_api(authed_page: Page) -> dict:
                     "state": "available",
                     "next_available_at": None,
                     "members": [
-                        {"id": "m-gpu", "resource": "gpu", "device": "nvidia0", "desired": 2, "available": 1, "busy": 1}
+                        {
+                            "id": "m-gpu",
+                            "resource": "gpu",
+                            "device": "nvidia0",
+                            "desired": 2,
+                            "target": 2,
+                            "available": 1,
+                            "busy": 1,
+                        }
                     ],
                 },
             ]

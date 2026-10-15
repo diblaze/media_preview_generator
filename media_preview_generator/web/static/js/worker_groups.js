@@ -175,6 +175,14 @@
         return { ...row, busy: row.busy ?? 0, finishing: row.finishing ?? 0, available: row.available ?? 0 };
     }
 
+    // "; the other devices keep working" only while some other device has workers: with every other group off (or
+    // out of hours) nothing else runs.
+    function othersKeepWorking(group, member, the = 'the ') {
+        const working = (snapshot.capacity?.groups || []).some(groupRow => (groupRow.members || [])
+            .some(row => !(groupRow.id === group.id && row.id === member.id) && Number(row.target) > 0));
+        return working ? `; ${the}other devices keep working` : '';
+    }
+
     // "3 GPU + 10 CPU": the System card's one-line summary of a group.
     const memberSummary = group => group.members.map(member => `${member.count} ${member.node ? nodeName(member) + ' ' : ''}${member.resource === 'cpu' ? 'CPU' : 'GPU'}`).join(' + ');
 
@@ -654,15 +662,16 @@
         const tone = nodeTone(nodeFor(member)?.state);
         const occupancy = `${state.busy} of ${member.count} configured ${member.count === 1 ? 'worker' : 'workers'} busy on ${title}.`;
         let chip = `<span class="occ-chip" data-member-indicator role="img" aria-label="${escapeHtml(occupancy)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(occupancy)}">${state.busy}<small>/ ${member.count}</small></span>`;
-        if (missing) chip = `<span class="chip warn" tabindex="0" role="img" aria-label="${escapeHtml(name)} not detected" data-bs-toggle="tooltip" data-bs-title="Its jobs wait; the other devices keep working."><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>Not detected</span>`;
+        if (missing) chip = `<span class="chip warn" tabindex="0" role="img" aria-label="${escapeHtml(name)} not detected" data-bs-toggle="tooltip" data-bs-title="Its jobs wait${othersKeepWorking(group, member)}."><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>Not detected</span>`;
         // The chip has room for a few words; the node's own sentence, when it says more, leads its tooltip.
         const detail = nodeDown ? nodeIssueDetail(member) : '';
         const why = detail && detail !== reason ? `${detail.replace(/\.$/, '')}. ` : '';
-        if (nodeDown) chip = `<span class="chip ${tone}" data-node-zero tabindex="0" role="img" aria-label="${escapeHtml(`${title}: ${reason}, no workers now`)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(`${why}Its jobs wait for ${nodeName(member)}; the other devices keep working.`)}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>${escapeHtml(reason)} · 0 now</span>`;
+        if (nodeDown) chip = `<span class="chip ${tone}" data-node-zero tabindex="0" role="img" aria-label="${escapeHtml(`${title}: ${reason}, no workers now`)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(`${why}Its jobs wait for ${nodeName(member)}${othersKeepWorking(group, member)}.`)}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>${escapeHtml(reason)} · 0 now</span>`;
         const problem = missing || nodeDown;
         const stepper = group.enabled ? memberStepper(group, member, member.count) : '';
-        const note = missing ? `${name}: GPU not detected. Its jobs wait; other devices keep working.`
-            : nodeDown ? `${title}: ${reason}. Its jobs wait; other devices keep working.` : '';
+        const others = othersKeepWorking(group, member, '');
+        const note = missing ? `${name}: GPU not detected. Its jobs wait${others}.`
+            : nodeDown ? `${title}: ${reason}. Its jobs wait${others}.` : '';
         const nodeLink = nodeDown && nodeFor(member)
             ? ` <a class="msg-link" href="/nodes#node-${encodeURIComponent(member.node)}">Open ${escapeHtml(nodeName(member))}</a>` : '';
         return `<div class="mem-h${problem ? ' miss' : ''}"><span class="devname">${nodeChip(member)}<i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="nm" title="${escapeHtml(title)}">${escapeHtml(name)}</span></span>${problem ? '' : capabilityIcons(member.job_types)}${chip}${stepper}</div>${note ? `<p class="msg ${nodeDown && tone === 'bad' ? 'err' : 'warn'}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><span>${escapeHtml(note)}${nodeLink}</span></p>` : ''}`;
@@ -966,9 +975,9 @@
         if (!member.job_types.length) issues.push(['err', `${name}: choose at least one job type.`]);
         if (group.members.findIndex(other => deviceKeyOf(other) === deviceKeyOf(member)) !== group.members.indexOf(member)) issues.push(['err', `${name} is already in this group.`]);
         if (member.resource === 'gpu' && member.job_types.includes('loudness')) issues.push(['err', `${name}: loudness runs on CPU only.`]);
-        if (deviceMissing(member)) issues.push(['warn', 'Not detected — its jobs wait; the other devices keep working.']);
+        if (deviceMissing(member)) issues.push(['warn', `Not detected — its jobs wait${othersKeepWorking(group, member)}.`]);
         const issue = nodeIssue(member);
-        if (issue) issues.push(['warn', `${nodeName(member)}: ${issue} · 0 workers now. Its jobs wait for the node; the other devices keep working.`]);
+        if (issue) issues.push(['warn', `${nodeName(member)}: ${issue} · 0 workers now. Its jobs wait for the node${othersKeepWorking(group, member)}.`]);
         if (memberNotes.has(member.id)) issues.push(['note', memberNotes.get(member.id)]);
         return issues;
     }
