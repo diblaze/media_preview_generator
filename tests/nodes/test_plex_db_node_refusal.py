@@ -1,4 +1,5 @@
-"""Nothing reaches a Plex database node that is turned off (or that the server has no record of).
+"""Nothing reaches a Plex database node that is turned off (or that the server has no record of), nor one the
+registry holds back (a new id it can't confirm, or an id no check has heard yet since the app started).
 
 Every path that resolves a server's Plex database node is covered: markers (``plex_database``), chapters
 (``plex_chapters._context``), loudness (``create_loudness_db``) and Library Health (``library_health.plex._open_db``).
@@ -22,13 +23,15 @@ from media_preview_generator.markers.publishers.plex_remote import (
     AGENT_DISABLED,
     AGENT_NO_NODE,
     AGENT_UNCONFIRMED_NODE,
+    AGENT_UNREACHABLE,
     AgentClient,
     AgentError,
+    AgentUnreachableError,
     RemotePlexDb,
     plex_database,
 )
 from media_preview_generator.markers.settings import load_server
-from media_preview_generator.nodes.registry import set_registry
+from media_preview_generator.nodes.registry import PlexDbHold, set_registry
 from media_preview_generator.servers.base import ServerType
 from tests.loudness.test_plex_db import FIELDS
 
@@ -61,10 +64,11 @@ def node(tmp_path):
     reset_settings_manager()
     sm = get_settings_manager(str(tmp_path))
 
-    def configure(*, enabled: bool, unconfirmed: bool = False) -> None:
+    def configure(*, enabled: bool, held: str | None = None) -> None:
         sm.set("nodes", [{**NODE, "enabled": enabled}])
-        # The registry's word on a new id it couldn't tie to the server's Plex.
-        registry.plex_db_refusal = lambda node_id: MESSAGES[AGENT_UNCONFIRMED_NODE] if unconfirmed else ""
+        # The registry's word: a new id it couldn't tie to the server's Plex, or an id no check has heard yet.
+        hold = PlexDbHold(MESSAGES[held], waits=held == AGENT_UNREACHABLE) if held else None
+        registry.plex_db_hold = lambda node_id: hold
 
     registry = MagicMock()
     set_registry(registry)
@@ -73,15 +77,17 @@ def node(tmp_path):
     reset_settings_manager()
 
 
-# (enabled, new id unconfirmed) -> the refusal's badge state, or None when the node is used.
+# (enabled, the registry's hold) -> the refusal's badge state, or None when the node is used.
 CELLS = [
-    pytest.param((True, False), None, id="enabled"),
-    pytest.param((False, False), AGENT_DISABLED, id="disabled"),
-    pytest.param((True, True), AGENT_UNCONFIRMED_NODE, id="new-id-unconfirmed"),
+    pytest.param((True, None), None, id="enabled"),
+    pytest.param((False, None), AGENT_DISABLED, id="disabled"),
+    pytest.param((True, AGENT_UNCONFIRMED_NODE), AGENT_UNCONFIRMED_NODE, id="new-id-unconfirmed"),
+    pytest.param((True, AGENT_UNREACHABLE), AGENT_UNREACHABLE, id="id-not-checked-yet"),
 ]
 MESSAGES = {
     AGENT_DISABLED: "Plex box is turned off on the Nodes page",
     AGENT_UNCONFIRMED_NODE: "Plex box reports a new id and this app can't confirm it is the same Plex.",
+    AGENT_UNREACHABLE: "Checking Plex box before sending it Plex database work.",
 }
 
 
@@ -98,7 +104,7 @@ def _cfg(tmp_path) -> SimpleNamespace:
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_markers(node, enabled, refused):
-    node(enabled=enabled[0], unconfirmed=enabled[1])
+    node(enabled=enabled[0], held=enabled[1])
     session = MagicMock()
     db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session)
     assert isinstance(db, RemotePlexDb)
@@ -115,7 +121,7 @@ def test_markers(node, enabled, refused):
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_chapters(node, monkeypatch, enabled, refused):
-    node(enabled=enabled[0], unconfirmed=enabled[1])
+    node(enabled=enabled[0], held=enabled[1])
     monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
     config = SimpleNamespace(markers=MARKERS, output={})
     if refused is None:
@@ -130,7 +136,7 @@ def test_chapters(node, monkeypatch, enabled, refused):
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_loudness(node, tmp_path, monkeypatch, enabled, refused):
-    node(enabled=enabled[0], unconfirmed=enabled[1])
+    node(enabled=enabled[0], held=enabled[1])
     sent = MagicMock(side_effect=AssertionError("nothing may be sent"))
     monkeypatch.setattr("requests.Session.post", sent)
     monkeypatch.setattr("requests.Session.get", sent)
@@ -145,14 +151,15 @@ def test_loudness(node, tmp_path, monkeypatch, enabled, refused):
         assert db._remote._client.refusal() is None
         return
     report = loudness_capability(server, cfg)
-    assert report.state is Capability.AGENT_UNAVAILABLE
+    # A node still to be checked reads as one that doesn't answer: the loudness job waits for it (job.py WAITING).
+    assert report.state is (Capability.UNREACHABLE if refused == AGENT_UNREACHABLE else Capability.AGENT_UNAVAILABLE)
     assert report.message.startswith(MESSAGES[refused])
     sent.assert_not_called()
 
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_library_health(node, tmp_path, monkeypatch, enabled, refused):
-    node(enabled=enabled[0], unconfirmed=enabled[1])
+    node(enabled=enabled[0], held=enabled[1])
     sent = MagicMock(side_effect=AssertionError("nothing may be sent"))
     monkeypatch.setattr("requests.Session.post", sent)
     monkeypatch.setattr("requests.Session.get", sent)
@@ -268,3 +275,15 @@ class TestTurnedOffAfterTheDatabaseWasOpened:
         assert db.file_checks(deadline=1e12).details["agent"]["state"] == AGENT_DISABLED
         node(enabled=True)
         assert db._client.refusal() is None
+
+
+def test_a_node_still_to_be_checked_is_refused_as_not_answering_so_the_work_waits(node):
+    """Each feature waits for a node that doesn't answer (loudness waits, chapters retry); a refusal fails the file."""
+    node(enabled=True, held=AGENT_UNREACHABLE)
+    session = MagicMock()
+    db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session)
+    with pytest.raises(AgentUnreachableError) as caught:
+        db._client.post("/v1/item/read", {}, timeout=1)
+    assert str(caught.value).startswith(MESSAGES[AGENT_UNREACHABLE])
+    assert db._client.state == AGENT_UNREACHABLE
+    session.post.assert_not_called()

@@ -485,6 +485,8 @@ class NodeRefusal:
     message: str
     state: Capability
     agent_state: str
+    # The node's id is still to be checked: the work waits, as for a node that doesn't answer, instead of failing.
+    waits: bool = False
 
 
 NO_NODE_REFUSAL = NodeRefusal(
@@ -499,8 +501,9 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
 
     A node turned off on the Nodes page gets nothing, and neither does one that reports a new id this app can't tie
     to the server's Plex (a different machine given the same key and address would write the wrong Plex's database)
-    until its key is typed again. The node's record and the registry are read on every call, so a job that opened
-    the database before the node was turned off is refused from its next request on.
+    until its key is typed again, nor one no check has heard give its id since this app started or since it last
+    didn't answer (that work waits for the check). The node's record and the registry are read on every call, so a
+    job that opened the database before the node was turned off is refused from its next request on.
 
     Args:
         settings: That server's ``ServerMarkersSettings``.
@@ -528,9 +531,11 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
     if node_id:
         from ...nodes.registry import get_registry
 
-        unconfirmed = get_registry().plex_db_refusal(str(node_id))
-        if unconfirmed:
-            return NodeRefusal(unconfirmed, Capability.AGENT_UNAVAILABLE, AGENT_UNCONFIRMED_NODE)
+        hold = get_registry().plex_db_hold(str(node_id))
+        if hold is not None and hold.waits:
+            return NodeRefusal(hold.message, Capability.AGENT_UNAVAILABLE, AGENT_UNREACHABLE, waits=True)
+        if hold is not None:
+            return NodeRefusal(hold.message, Capability.AGENT_UNAVAILABLE, AGENT_UNCONFIRMED_NODE)
     return None
 
 
@@ -673,11 +678,13 @@ class AgentClient:
         return refusal
 
     def _refuse_early(self) -> None:
-        """Raise the node's current refusal (:meth:`refusal`) before sending."""
+        """Raise the node's current refusal (:meth:`refusal`) before sending; one that waits is raised as the node not
+        answering, so each feature's work waits for it as it does for a node that is down."""
         refusal = self.refusal()
         if refusal is not None:
             self.state = refusal.agent_state
-            raise AgentError(refusal.message, state=refusal.state)
+            error = AgentUnreachableError if refusal.waits else AgentError
+            raise error(refusal.message, state=refusal.state)
 
     def require(self, capability: str, *, feature: str, needs: str, timeout: float = 5.0) -> None:
         """Make sure the helper advertises an optional capability before sending its requests.
