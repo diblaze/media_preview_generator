@@ -73,6 +73,7 @@
     const NODE_STATES = {
         connecting: 'Connecting', ready: 'Ready', offline: 'Offline', update_needed: 'Update needed', key_refused: 'Key refused',
         access_problem: 'Access problem', gpu_lost: 'GPU lost', no_ffmpeg: 'FFmpeg missing', disabled: 'Disabled',
+        duplicate: 'Added twice',
     };
     // Red when the node is down or refuses us; amber when it needs attention but is reachable.
     const nodeTone = state => (!state || ['offline', 'key_refused'].includes(state) ? 'bad' : 'warn');

@@ -12,7 +12,7 @@ from json import loads as parse_json
 from typing import Any
 
 import requests
-from urllib3.exceptions import ProtocolError
+from urllib3.exceptions import HTTPError, ProtocolError
 
 from . import protocol
 
@@ -152,6 +152,10 @@ class NodeClient:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
         except requests.RequestException as exc:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
+        except (HTTPError, ValueError, UnicodeError) as exc:
+            # urllib3 refuses some addresses requests prepared (an empty host label: LocationParseError) before it
+            # connects; such a node can never answer.
+            raise NodeUnreachableError(f"{self._address.base} can't be reached: {type(exc).__name__}") from exc
         with response:
             return self._answer(response, path, raw=raw)
 
@@ -183,7 +187,7 @@ class NodeClient:
             return self._read(response, MAX_ARTIFACT_BYTES)
         try:
             body = parse_json(self._read(response, MAX_ANSWER_BYTES))
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:  # RecursionError: JSON nested deeper than Python's parser goes
             raise NodeProtocolError(
                 f"{self._address.base} didn't answer as a node (HTTP {response.status_code})"
             ) from exc

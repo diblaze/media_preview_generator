@@ -47,8 +47,28 @@ class TestValidateNode:
             "http://nuc:9494?",
             9494,
             "plex-host:9494",
+            "http://nas..lan:9494",
+            "http://nas." + "a" * 64 + ":9494",
+            "http://%:9494",
+            "http://\u200b:9494",
+            "http://.:9494",
         ],
-        ids=["open-bracket", "port-too-big", "port-not-a-number", "port-0", "space", "bare-#", "bare-?", "int", "host"],
+        ids=[
+            "open-bracket",
+            "port-too-big",
+            "port-not-a-number",
+            "port-0",
+            "space",
+            "bare-#",
+            "bare-?",
+            "int",
+            "host",
+            "empty-label",
+            "label-over-63",
+            "percent",
+            "zero-width-space",
+            "only-a-dot",
+        ],
     )
     def test_addresses_that_could_never_answer_are_refused_without_raising(self, url):
         assert ns.normalise_url(url)[0] is None
@@ -56,6 +76,13 @@ class TestValidateNode:
     @pytest.mark.parametrize("url", ["http://[::1]:9494", "https://nuc.lan", "http://10.0.0.5:65535"])
     def test_plain_addresses_are_kept(self, url):
         assert ns.normalise_url(url) == (url, "")
+
+    @pytest.mark.parametrize("url", ["http://plex_db:9494", "http://xn--nc-xka.lan:9494", "http://nuc.lan.:9494"])
+    def test_docker_service_names_idna_names_and_a_trailing_dot_are_kept(self, url):
+        assert ns.normalise_url(url) == (url, "")
+
+    def test_the_scheme_and_host_are_lower_cased_and_the_path_kept(self):
+        assert ns.normalise_url("HTTP://NUC.Lan:9494/Node") == ("http://nuc.lan:9494/Node", "")
 
     def test_a_trailing_slash_is_dropped(self):
         record, _ = ns.validate_node(_post(url="https://nuc.lan:9494/"), existing=None, others=[])

@@ -16,7 +16,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 from loguru import logger
@@ -36,6 +36,8 @@ STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
 STATE_NO_FFMPEG = "no_ffmpeg"
 STATE_DISABLED = "disabled"
+# The machine is already added as another node (the same node id answers at both addresses).
+STATE_DUPLICATE = "duplicate"
 
 # States that raise a bell notification (``web.notifications``).
 ALERT_STATES = (
@@ -45,6 +47,7 @@ ALERT_STATES = (
     STATE_ACCESS_PROBLEM,
     STATE_GPU_LOST,
     STATE_NO_FFMPEG,
+    STATE_DUPLICATE,
 )
 
 HEALTH_INTERVAL_S = 30.0
@@ -75,6 +78,7 @@ _CAPACITY_REASONS = {
     STATE_ACCESS_PROBLEM: "fix media access first",
     STATE_NO_FFMPEG: "FFmpeg missing on node",
     STATE_DISABLED: "node turned off",
+    STATE_DUPLICATE: "node added twice",
 }
 
 
@@ -249,6 +253,8 @@ def _default_record_uid(node_id: str, uid: str, url: str) -> None:
             node = find_node(nodes, node_id)
             if node is None or node.get("node_uid") == uid or node.get("url") != url:
                 return
+            if any(other.get("node_uid") == uid and other.get("id") != node_id for other in nodes):
+                return  # Another node is this machine already (two checks can race): this one reads as added twice.
             if node.get("node_uid"):
                 logger.info("{} reports a new id; it was probably reinstalled", node.get("name") or node_id)
             node["node_uid"] = uid
@@ -913,9 +919,18 @@ class NodeRegistry:
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.
+                    twin = self._twin_of(node_id, outcome.uid)
+                    if twin:
+                        # Sent work as two nodes, one machine would get twice its workers' files.
+                        outcome = replace(
+                            outcome,
+                            state=STATE_DUPLICATE,
+                            reason=f"{record.get('name') or 'This node'} is {twin} again, added at another address. "
+                            "Remove one of them.",
+                        )
                     self._apply(live, outcome, number)
                     has_access_problem = bool(live.access_problem)
-                if outcome.uid and outcome.uid != record.get("node_uid"):
+                if outcome.uid and not twin and outcome.uid != record.get("node_uid"):
                     self._new_uid(node_id, live, record, outcome)
                 elif outcome.uid:
                     with self._lock:
@@ -927,6 +942,13 @@ class NodeRegistry:
         finally:
             with self._lock:
                 live.checking = False
+
+    def _twin_of(self, node_id: str, uid: str) -> str:
+        """The name of another node already saved with id ``uid`` ("" when none; the caller holds the lock)."""
+        for other_id, other in self._nodes.items():
+            if uid and other_id != node_id and other.record.get("node_uid") == uid:
+                return str(other.record.get("name") or other_id)
+        return ""
 
     def _new_uid(self, node_id: str, live: _Live, record: dict, outcome: _Outcome) -> None:
         """Record a node's new id, or hold back a Plex database node's until it is tied to its Plex."""

@@ -12,6 +12,8 @@ is a secret: it leaves the app only in the node's Authorization header and comes
 from __future__ import annotations
 
 import copy
+import ipaddress
+import re
 import urllib.parse
 import uuid
 from datetime import UTC, datetime
@@ -24,6 +26,9 @@ NAME_MAX_LEN = 80
 URL_MAX_LEN = 500
 KEY_MAX_LEN = 200
 MAX_MAPPINGS = 50
+# One label of a host name as requests sends it (IDNA-encoded): letters, digits, hyphens and underscores (Docker
+# service names have them), 1 to 63 of them.
+_HOST_LABEL = re.compile(r"[A-Za-z0-9_-]{1,63}")
 
 
 def new_node_id() -> str:
@@ -35,6 +40,32 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _sendable_host(url: str) -> bool:
+    """Whether requests can send to ``url``: it prepares it, and its host is an IP address or a well-formed name.
+
+    requests prepares ``nas..lan`` (an empty label) or a 64-character label, then urllib3 refuses it at connect time;
+    each check of such a node would fail with a traceback instead of reading as a wrong address.
+    """
+    import requests
+    import urllib3
+
+    try:
+        prepared = requests.PreparedRequest()
+        prepared.prepare_url(url, None)
+        host = urllib3.util.parse_url(prepared.url).host or ""
+    except (requests.RequestException, urllib3.exceptions.HTTPError, ValueError, UnicodeError):
+        return False
+    if host.startswith("["):
+        return True  # An IPv6 address, which urllib3 has just parsed.
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    name = host[:-1] if host.endswith(".") else host
+    return 0 < len(name) <= 253 and all(_HOST_LABEL.fullmatch(label) for label in name.split("."))
+
+
 def normalise_url(raw: object) -> tuple[str | None, str]:
     """Validate a node address.
 
@@ -42,7 +73,8 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
         raw: The posted address.
 
     Returns:
-        ``(url, "")`` without a trailing slash, or ``(None, message)``.
+        ``(url, "")`` without a trailing slash, its scheme and host in lower case (``http://NUC:9494`` is the same
+        address as ``http://nuc:9494``), or ``(None, message)``.
     """
     url = str(raw or "").strip().rstrip("/")
     if not url:
@@ -58,7 +90,9 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
     # A bare "?" or "#" parses as an empty query or fragment, and would swallow every route path sent after it.
     if "@" in parsed.netloc or "?" in url or "#" in url or len(url) > URL_MAX_LEN:
         return None, "The node's address must be a plain address with no username, password or query"
-    return url, ""
+    if not _sendable_host(url):
+        return None, "The node's address has a host name that can't be used, e.g. two dots in a row. Check it."
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "")), ""
 
 
 def normalise_key(raw: object, stored: str) -> tuple[str | None, str]:

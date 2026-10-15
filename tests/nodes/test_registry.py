@@ -1009,3 +1009,13 @@ class TestAgainstARealNode:
         outcome = registry._probe(record, NewerAppClient(NodeAddress(node_url, self.KEY), session=session))
         assert outcome.state == reg.STATE_UPDATE_NEEDED, outcome.reason
         assert __version__ in outcome.reason and "0.0.1" in outcome.reason
+
+
+def test_a_saved_address_urllib3_refuses_reads_offline_not_connecting_forever():
+    # Saved before the address rules refused it: requests prepares it, urllib3 refuses it before connecting.
+    record = {"id": "n1", "name": "nas", "url": "http://nas..lan:9494", "key": "k", "enabled": True}
+    registry = reg.NodeRegistry(
+        nodes_provider=lambda: [record], revision_provider=lambda: 1, record_uid=lambda *a: None, attempt_gap_s=0.0
+    )
+    view = registry.check_now("n1")
+    assert view is not None and view.state == reg.STATE_OFFLINE

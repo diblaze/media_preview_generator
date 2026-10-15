@@ -749,6 +749,7 @@ class TestBadAddresses:
         "http://nuc lan:9494",
         "http://nuc:9494#",
         "http://nuc:9494?",
+        "http://nas..lan:9494",
     ]
 
     @pytest.mark.parametrize("url", BAD)
@@ -759,6 +760,38 @@ class TestBadAddresses:
         node_id = _add(client).get_json()["id"]
         assert client.put(f"/api/nodes/{node_id}", json={"url": url, "key": "new-key"}).status_code == 400
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
+
+
+class TestTheSameMachineAddedTwice:
+    def test_an_address_differing_only_in_letter_case_is_already_added(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("didn't answer")
+        nodes("http://NUC:9494").info_answer = NodeUnreachableError("didn't answer")
+        assert _add(client, url="http://nuc:9494").status_code == 201
+        assert _add(client, name="living room", url="http://NUC:9494").status_code == 409
+        assert len(_sm().nodes) == 1
+
+    def test_the_second_record_of_one_machine_is_flagged_and_gets_no_work(self, client, nodes):
+        # Added while the node was off (nothing to compare), at two addresses of the one machine.
+        for url in ("http://nuc:9494", "http://10.0.0.5:9494"):
+            nodes(url).info_answer = NodeUnreachableError("didn't answer")
+        first = _add(client, url="http://nuc:9494").get_json()["id"]
+        second = _add(client, name="nuc by ip", url="http://10.0.0.5:9494").get_json()["id"]
+        registry = reg.get_registry()
+        deadline = time.monotonic() + 10
+        # Adding a node checks it in the background: let those checks end before the machine starts answering.
+        while time.monotonic() < deadline and any(
+            registry._nodes[n].checks_begun < 1 or registry._nodes[n].checking for n in (first, second)
+        ):
+            time.sleep(0.01)
+        for url in ("http://nuc:9494", "http://10.0.0.5:9494"):
+            nodes(url).info_answer = _info(uid="the-one-machine")
+        client.post(f"/api/nodes/{first}/check")
+        client.post(f"/api/nodes/{second}/check")
+
+        assert registry.view(first).state == reg.STATE_READY
+        assert registry.view(second).state == reg.STATE_DUPLICATE and "Remove one" in registry.view(second).reason
+        assert registry.capacity(second).cpu is False
+        assert [n.get("node_uid") for n in _sm().nodes] == ["the-one-machine", None]
 
 
 class TestNodeSentValues:

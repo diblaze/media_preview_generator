@@ -541,6 +541,7 @@ _NODE_CARD_TEXT = {
         "Nothing is sent to it until FFmpeg is installed there.",
         "Open Nodes",
     ),
+    "duplicate": ("{name} is added twice", "Nothing is sent to it until one of the two is removed.", "Open Nodes"),
 }
 
 
