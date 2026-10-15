@@ -63,6 +63,10 @@ ALERT_STATES = (
 HEALTH_INTERVAL_S = 30.0
 # Delay before the next check after the 1st, 2nd, 3rd and later offline checks in a row.
 OFFLINE_BACKOFF_S = (30.0, 60.0, 120.0, 300.0)
+# A node that said it is stopping (a restart, an image update) is back in seconds: it is checked this often, with no
+# offline back-off, until it answers or for at most RESTART_WINDOW_S after it said so (one stopped for good).
+RESTART_RECHECK_S = 3.0
+RESTART_WINDOW_S = 120.0
 CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
@@ -155,6 +159,8 @@ class _Outcome:
     version: str = ""
     roles: tuple[str, ...] = ()
     uid: str = ""
+    # The node said it is stopping (SIGTERM).
+    restarting: bool = False
 
 
 class PlexDbHold(NamedTuple):
@@ -190,6 +196,8 @@ class _Live:
     last_seen: float | None = None
     offline_streak: int = 0
     next_check: float = 0.0
+    # When (``clock``) the node last said it is stopping, until it answers again; None meanwhile.
+    restarting_since: float | None = None
     checking: bool = False
     # Check now asked for the quick access check too: the next check to finish runs it.
     access_wanted: bool = False
@@ -1138,16 +1146,26 @@ class NodeRegistry:
         if outcome.state == STATE_OFFLINE and not outcome.uid:
             # It didn't reach the node: whoever answers there next gives its id again first.
             live.heard_uid = None
-        if outcome.state == STATE_OFFLINE:
+        now = self._clock()
+        if outcome.restarting and live.restarting_since is None:
+            live.restarting_since = now
+        restarting = live.restarting_since is not None and now - live.restarting_since < RESTART_WINDOW_S
+        if outcome.state == STATE_OFFLINE and restarting:
+            # Saying it stops, then not answering while it starts again: neither is a node that went away.
+            live.offline_streak = 0
+            delay = RESTART_RECHECK_S
+        elif outcome.state == STATE_OFFLINE:
+            live.restarting_since = None
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
         else:
+            live.restarting_since = None
             live.offline_streak = 0
             delay = HEALTH_INTERVAL_S
             live.last_seen = self._wall_clock()
         if outcome.state == STATE_READY:
             live.ready_check = number
-        live.next_check = 0.0 if number <= live.reported_at_check else self._clock() + delay
+        live.next_check = 0.0 if number <= live.reported_at_check else now + delay
         if outcome.info is not None or outcome.legacy:
             live.info = outcome.info
             live.legacy = outcome.legacy
@@ -1246,7 +1264,9 @@ class NodeRegistry:
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         if info.get("stopping") is True:
             # It refuses every start until it is back (SIGTERM: a restart or an image update).
-            return _Outcome(STATE_OFFLINE, f"{name} is restarting; it gets no files until it is back.", **outcome)
+            return _Outcome(
+                STATE_OFFLINE, f"{name} is restarting; it gets no files until it is back.", restarting=True, **outcome
+            )
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
             return _Outcome(

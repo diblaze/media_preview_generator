@@ -366,6 +366,38 @@ class TestStates:
         assert view.reason == "nuc is restarting; it gets no files until it is back."
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
 
+    def test_a_restarting_node_is_checked_again_within_seconds_not_after_the_offline_back_off(self, h):
+        # A docker restart is back in ~5 s; the offline back-off left it without files for a minute or more.
+        client = h.client()
+        stopping = _info()
+        stopping["stopping"] = True
+        not_answering = [NodeUnreachableError("starting")] * reg.CHECK_ATTEMPTS
+        client.infos = [stopping, stopping, *not_answering, *not_answering]
+        delays = []
+        for _ in range(4):
+            h.registry.check_now("n1")
+            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
+        assert delays == [reg.RESTART_RECHECK_S] * 4
+        assert h.registry._nodes["n1"].offline_streak == 0
+
+        h.registry.check_now("n1")
+        assert h.registry.view("n1").state == reg.STATE_READY
+        assert h.registry._nodes["n1"].next_check - h.clock.now == reg.HEALTH_INTERVAL_S
+
+    def test_a_node_that_never_comes_back_from_a_restart_goes_back_to_the_offline_back_off(self, h):
+        client = h.client()
+        stopping = _info()
+        stopping["stopping"] = True
+        client.infos = [stopping]
+        client.default_info = NodeUnreachableError("stopped for good")
+        h.registry.check_now("n1")
+        h.clock.now += reg.RESTART_WINDOW_S
+        delays = []
+        for _ in range(2):
+            h.registry.check_now("n1")
+            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
+        assert delays == [30.0, 60.0]
+
     @pytest.mark.parametrize("temp", [{"path": "/node-tmp", "problem": None}, {"path": "/node-tmp"}, None])
     def test_a_temp_folder_without_a_problem_leaves_the_node_ready(self, h, temp):
         info = _info()
