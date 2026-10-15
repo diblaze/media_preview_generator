@@ -560,6 +560,11 @@ def delete_node(node_id: str):
             sm.update_nodes([n for n in nodes if n is not existing])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        from ...markers.inspect import forget_node_capability
+
+        # Before the servers stop naming the node: that is how it finds them. A server pointed at a node with this id
+        # again (a restored backup) would otherwise read the gone node's cached Intro & Credits answer.
+        forget_node_capability(node_id)
         _forget_switched_off_choice(sm, node_id)
     logger.info("Removed node {}", existing.get("name"))
     return jsonify({"ok": True})

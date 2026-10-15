@@ -1063,6 +1063,26 @@ class TestSwitchedOffPlexDatabaseNode:
         # Switching it on again asks for a node instead of pointing at one that is gone.
         assert _sm().get("media_servers")[0]["markers"]["plex"]["agent"] == {"enabled": False, "node_id": None}
 
+    def test_removing_it_forgets_its_servers_intro_and_credits_answers(self, client, nodes):
+        """Pointed at a node with the same id again (a restored backup), the server must not read the gone node's
+        cached answer."""
+        from media_preview_generator.markers import inspect
+        from media_preview_generator.servers.registry import server_config_from_dict
+
+        node_id = _add(client).get_json()["id"]
+        other = {**_plex_server({"enabled": False, "node_id": "another-node"}), "id": "p2"}
+        _sm().set("media_servers", [_plex_server({"enabled": False, "node_id": node_id}), other])
+        inspect.clear_capability_cache()
+        configs = [server_config_from_dict(entry) for entry in _sm().get("media_servers")]
+        for config in configs:
+            inspect._CAPABILITY_CACHE.get(config, "status", lambda: "gone node's answer")
+
+        assert client.delete(f"/api/nodes/{node_id}").status_code == 200
+
+        answers = [inspect._CAPABILITY_CACHE.get(config, "status", lambda: "asked again") for config in configs]
+        assert answers == ["asked again", "gone node's answer"]
+        inspect.clear_capability_cache()
+
     def test_a_v24_migrated_switched_off_helper_can_be_removed(self, client, nodes):
         from media_preview_generator.upgrade import _migrate_schema
 
