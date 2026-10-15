@@ -82,8 +82,15 @@
         return url ? `Through the Plex database node at ${url}` : "Through a Plex database node that isn't on the Nodes page";
     }
 
+    // A node's roles are known once it has answered; until then (just started, or turned off) it may be one.
     function isPlexDbNode(node) {
-        return !!node && ((Array.isArray(node.roles) && node.roles.includes('plex_db')) || !!node.legacy);
+        if (!node) return false;
+        const roles = Array.isArray(node.roles) ? node.roles : [];
+        return !roles.length || roles.includes('plex_db') || !!node.legacy;
+    }
+
+    function dbNodeOptionText(name, node) {
+        return `Through a Plex database node: ${name}${node && node.enabled === false ? ' · turned off' : ''}`;
     }
 
     // ---------- status block ---------------------------------------------------
@@ -347,18 +354,18 @@
         const nodes = tab.plexDbNodes || [];
         let html = dbOption(DB_LOCAL, 'Open it from this app');
         nodes.forEach((node) => {
-            html += dbOption(String(node.id), `Through a Plex database node: ${node.name || node.id}`);
+            html += dbOption(String(node.id), dbNodeOptionText(node.name || node.id, node));
         });
         const stored = storedDbChoice(server);
         if (stored === DB_OLD_HELPER) {
             html += dbOption(DB_OLD_HELPER, oldHelperLabel(server));
         } else if (stored !== DB_LOCAL && !nodes.some((n) => String(n.id) === stored)) {
-            // A saved node that hasn't answered since this app started reports no roles yet, so the filter above
-            // misses it: it is still on the Nodes page.
+            // Kept selectable so a save doesn't change it: the node list hasn't answered yet, the node no longer
+            // reports the Plex database role, or it was removed.
             const known = (tab.allNodes || []).find((n) => String(n.id) === stored);
             const label = known ? (known.name || stored)
                 : (tab.plexDbNodes === null ? stored : `${stored} (not on the Nodes page any more)`);
-            html += dbOption(stored, `Through a Plex database node: ${label}`);
+            html += dbOption(stored, dbNodeOptionText(label, known));
         }
         html += dbOption(DB_ADD_NODE, 'Add a Plex database node…');
         select.innerHTML = html;
@@ -612,8 +619,12 @@
                 out.plex.agent = { ...storedAgent(server) };
             } else if (Object.keys(storedAgent(server)).length || choice !== DB_LOCAL) {
                 // A server that never had a route set and still opens the database itself posts no agent block, so a
-                // save that only changed something else doesn't write a field the user never touched.
-                out.plex.agent = choice === DB_LOCAL ? { enabled: false, node_id: null } : { enabled: true, node_id: choice };
+                // save that only changed something else doesn't write a field the user never touched. One left on this
+                // app keeps the node it remembers for when it is switched back (a helper the upgrade found off).
+                const remembered = storedDbChoice(server) === DB_LOCAL ? storedAgent(server).node_id || null : null;
+                out.plex.agent = choice === DB_LOCAL
+                    ? { enabled: false, node_id: remembered }
+                    : { enabled: true, node_id: choice };
             }
         }
         if (vendorOf(server) === 'emby') {
