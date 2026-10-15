@@ -16,6 +16,7 @@ import pytest
 import requests
 
 from media_preview_generator.nodes import client as client_mod
+from media_preview_generator.nodes import protocol
 from media_preview_generator.nodes.client import (
     NodeAddress,
     NodeCantStartError,
@@ -312,6 +313,21 @@ class TestWhyNothingAnswered:
         with pytest.raises(NodeUnreachableError) as raised:
             _client(error).info()
         assert type(error).__name__ not in str(raised.value)
+
+
+class TestTheNodesOwnWords:
+    def test_a_refusal_is_one_line_of_bounded_length(self, serve):
+        # Whatever answers at the address writes this text; the app logs it and shows it on the file's row.
+        message = "bad spec\n2026-10-15 03:00:00.000 | ERROR    | web.auth:login:88 - forged\u2028" + "x" * 10_000
+        body = json.dumps({"ok": False, "error": {"kind": "request", "message": message}}).encode()
+        url, _ = serve(400, body, {"Content-Type": "application/json"})
+
+        with pytest.raises(NodeRequestError) as raised:
+            _local(url).start_task({"op": "x"})
+
+        text = str(raised.value)
+        assert text.startswith("bad spec\\n2026-10-15") and "\\u2028" in text
+        assert "\n" not in text and "\u2028" not in text and len(text) < protocol.RELAY_LINE_MAX + 100
 
 
 class TestSomethingThatIsNotANode:

@@ -858,6 +858,25 @@ class TestHealthAndLog:
             ]
         }
 
+    def test_a_log_line_with_a_time_outside_what_a_date_holds_keeps_the_log_tab_working(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        nodes("http://nuc:9494").log_answer = {
+            "lines": [
+                {"time": "", "ts": 1e20, "level": "INFO", "message": "far future"},
+                {"time": "", "ts": 253402300800, "level": "INFO", "message": "year 10000"},
+                {"time": "", "ts": 10**400, "level": "INFO", "message": "too big for a float"},
+                {"time": "0001-01-01T00:00:00-12:00", "level": "INFO", "message": "year 1 in the app's zone"},
+            ]
+        }
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 200
+        assert [line["message"] for line in resp.get_json()["lines"]] == [
+            "far future",
+            "year 10000",
+            "too big for a float",
+            "year 1 in the app's zone",
+        ]
+
     def test_log_errors(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         assert client.get(f"/api/nodes/{node_id}/log?lines=x").status_code == 400
@@ -1149,6 +1168,30 @@ class TestNodeSentValues:
         assert resp.status_code == 200
         assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
         assert {v.id for v in reg.get_registry().views()} == {good, bad}
+
+    def test_a_whole_number_too_big_for_a_float_still_updates_the_nodes_state(self, client, nodes):
+        # json.loads makes a 401-digit JSON integer a Python int, and math.isfinite raised OverflowError on it: every
+        # check failed "unexpectedly" and a node that had been ready stayed ready, whatever it answered now.
+        node = nodes("http://nuc:9494")
+        node_id = _add(client).get_json()["id"]
+        assert _checked(client, node_id)["state"] == "ready"
+        answer = _info(version="1.0.0")
+        answer["worker"]["cpu"]["cores"] = 10**400
+        node.info_answer = answer
+
+        row = _checked(client, node_id)
+
+        assert row["state"] == reg.STATE_UPDATE_NEEDED
+        assert row["cpu"]["cores"] is None
+
+    def test_add_nodes_connect_answers_for_a_whole_number_too_big_for_a_float(self, client, nodes):
+        answer = _info()
+        answer["worker"]["cpu"]["cores"] = 10**400
+        nodes("http://nuc:9494").info_answer = answer
+
+        resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "node-key"})
+
+        assert resp.status_code == 200 and resp.get_json()["info"]["worker"]["cpu"]["cores"] is None
 
     def test_a_deeply_nested_answer_from_one_node_keeps_every_node_listed(self, client, nodes):
         import json

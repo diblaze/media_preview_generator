@@ -23,7 +23,8 @@ The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`]
 * The node makes its own key on first start and prints it once in `docker logs`. It is kept in
   `/config/node.json`, so mount `/config`. To pick your own, add `-e NODE_KEY=...` with a key made by
   `openssl rand -hex 24` (at least 16 characters). To keep it in a file (a Docker secret), set `FILE__NODE_KEY`
-  to that file's path instead; any setting works this way.
+  to that file's path instead; any of the node's settings works this way, but not `MODE`, `PUID`, `PGID` or `TZ`,
+  which the container reads before the node starts.
 * `NODE_NAME` is the name the app shows (default: the hostname). The node listens on port **9494** (`NODE_PORT`;
   change the published port, `-p`, to match).
 

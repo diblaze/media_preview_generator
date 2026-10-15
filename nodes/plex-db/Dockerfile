@@ -41,8 +41,8 @@ FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e6
 LABEL org.opencontainers.image.title="Plex database node" \
       org.opencontainers.image.description="Writes intro and credits markers, chapter thumbnails and loudness into Plex's database, and runs Library Health's counts, for Media Preview Generator running on another machine" \
       org.opencontainers.image.source="https://github.com/stevezau/media_preview_generator"
-# NODE_PORT is deliberately not set here: the port is ${NODE_PORT:-${AGENT_PORT:-9494}}, so a setup from the Plex
-# marker agent days that moved AGENT_PORT keeps listening where its published mapping expects.
+# NODE_PORT is deliberately not set here: the node listens on NODE_PORT, else AGENT_PORT, else 9494, so a setup from
+# the Plex marker agent days that moved AGENT_PORT keeps listening where its published mapping expects.
 # NODE_IMAGE_ROLES: the roles this image carries code for. The node refuses to start with NODE_ROLES=worker here (no
 # FFmpeg, no GPU code) instead of looking healthy and failing every file sent to it.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
@@ -78,7 +78,8 @@ EXPOSE 9494
 # One process: the app's "one writer at a time" guarantee is a lock inside it (see nodes/server/plex_db.py). Threads
 # let a read-back and the Edit tab's checks overlap without a second process touching the database; waitress reads
 # each request whole before a thread takes it, so half-sent requests can't hold them (nodes/server/wsgi.py).
-CMD ["sh", "-c", "exec python -m media_preview_generator.nodes.server.wsgi --port ${NODE_PORT:-${AGENT_PORT:-9494}} --threads 8"]
+# No --port: the node reads NODE_PORT (or AGENT_PORT) itself, after FILE__NODE_PORT (a Docker secret) has had its say.
+CMD ["python", "-m", "media_preview_generator.nodes.server.wsgi", "--threads", "8"]
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD exec python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + (os.environ.get('NODE_PORT') or os.environ.get('AGENT_PORT') or '9494') + '/v1/health', timeout=5)"
+    CMD exec python3 -c "import os, urllib.request; e = os.environ; f = e.get('FILE__NODE_PORT'); port = (open(f, encoding='utf-8-sig').read().strip() if f else '') or e.get('NODE_PORT', '').strip() or e.get('AGENT_PORT', '').strip() or '9494'; urllib.request.urlopen('http://127.0.0.1:' + port + '/v1/health', timeout=5)"

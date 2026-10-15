@@ -45,8 +45,8 @@ run_as_user() {
 # Same rule as utils.is_node_mode() and the HEALTHCHECK: case and surrounding spaces don't matter (MODE=Node is a node).
 mode="${MODE:-}"
 if [[ "${mode,,}" =~ ^[[:space:]]*node[[:space:]]*$ ]]; then
-    echo "Starting node on port ${NODE_PORT:-9494}..."
-    run_as_user python3 -m media_preview_generator.nodes.server.wsgi --port "${NODE_PORT:-9494}" --threads 16
+    echo "Starting node..."  # its own log names the port (it may come from FILE__NODE_PORT)
+    run_as_user python3 -m media_preview_generator.nodes.server.wsgi --threads 16
 fi
 
 # Start gunicorn web server

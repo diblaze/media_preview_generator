@@ -326,16 +326,21 @@ def _count(raw: object) -> int:
 
 
 def _bounded(value: object, depth: int = 0) -> Any:
-    """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
+    """A JSON value a node sent, cut to the ``INFO_*`` bounds, each text one line; a number that isn't finite becomes
+    null.
 
-    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, and a deeply nested answer breaks ``deepcopy``.
+    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, a 400-digit whole number is too big for a float, and a
+    deeply nested answer breaks ``deepcopy``.
     """
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value[:INFO_TEXT_MAX]
+        return protocol.relayed_text(value, INFO_TEXT_MAX)
     if isinstance(value, int | float):
-        return value if math.isfinite(value) else None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:  # isfinite turns a whole number into a float first
+            return None
     if depth >= INFO_DEPTH_MAX:
         return None
     if isinstance(value, dict):
@@ -976,7 +981,18 @@ class NodeRegistry:
                 with self._lock:
                     live.checks_begun += 1
                     number = live.checks_begun
-                outcome = self._probe(record, client)
+                try:
+                    outcome = self._probe(record, client)
+                except Exception:
+                    # Still a finished check: one that ended here would leave the node as it was (a ready node
+                    # keeps getting work) whatever it answers now.
+                    name = record.get("name") or "The node"
+                    logger.opt(exception=True).warning("Health check of node {} couldn't read its answer", name)
+                    outcome = _Outcome(
+                        STATE_OFFLINE,
+                        f"{name} answered in a way this app couldn't read. Check that the address is the node's and "
+                        "that the node runs this app's version.",
+                    )
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.

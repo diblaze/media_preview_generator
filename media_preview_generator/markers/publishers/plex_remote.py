@@ -662,7 +662,7 @@ class AgentClient:
             )
         try:
             return json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: JSON nested deeper than Python's parser goes
             return None
 
     def refusal(self) -> NodeRefusal | None:

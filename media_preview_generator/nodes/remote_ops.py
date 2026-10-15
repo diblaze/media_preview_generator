@@ -69,13 +69,13 @@ class _Relay:
         phase = state.get("phase")
         if self._phase is not None and isinstance(phase, str) and phase != self._last_phase:
             self._last_phase = phase
-            self._phase(phase)
+            self._phase(protocol.relayed_text(phase))
         fallbacks = state.get("fallbacks")
         if isinstance(fallbacks, list):
             new, self._fallbacks_seen = fallbacks[self._fallbacks_seen :], max(self._fallbacks_seen, len(fallbacks))
             for reason in new:
                 if self._fallback is not None:
-                    self._fallback(str(reason))
+                    self._fallback(protocol.relayed_text(str(reason)))
         args = state.get("args")
         if self._progress is not None and isinstance(args, list) and args != self._last_args:
             self._last_args = args
@@ -144,8 +144,8 @@ def generate_images(
         record_failure(
             video_file,
             int(failure.get("exit_code") or 0),
-            str(failure.get("reason") or ""),
-            failure.get("worker_type", ""),
+            protocol.relayed_text(str(failure.get("reason") or "")),
+            protocol.relayed_text(str(failure.get("worker_type") or "")),
         )
     success, image_count, hw_used, seconds, speed, error_summary = result["generate_images"]
     return (
@@ -153,8 +153,8 @@ def generate_images(
         int(image_count),
         bool(hw_used),
         float(seconds),
-        str(speed),
-        None if error_summary is None else str(error_summary),
+        protocol.relayed_text(str(speed)),
+        None if error_summary is None else protocol.relayed_text(str(error_summary)),
     )
 
 
@@ -253,7 +253,7 @@ def loudness_run_many(
             out[index] = {str(k): str(v) for k, v in row["fields"].items()}
         else:
             make = errors.get(str(row.get("error_type")), _plain(analyze.LoudnessError))
-            out[index] = make(str(row.get("message") or ""), {})  # type: ignore[assignment]
+            out[index] = make(protocol.relayed_text(str(row.get("message") or "")), {})  # type: ignore[assignment]
     return out
 
 
@@ -316,6 +316,14 @@ def compute_fingerprint(
 # --- intro.end_picture -----------------------------------------------------------------------------------------------
 
 
+def _stderr_tail(raw: object) -> tuple[str, ...]:
+    """FFmpeg's last lines a node sent with a GPU decode failure, as many as the job log shows, each one line."""
+    from ..markers.credits.frames import STDERR_LINES
+
+    lines = raw if isinstance(raw, list) else []
+    return tuple(protocol.relayed_text(str(line)) for line in lines[-STDERR_LINES:])
+
+
 def _frame_errors() -> dict[str, Rebuild]:
     from ..markers.audio.end_picture import GpuAttemptFailedError
     from ..markers.credits import frames
@@ -337,8 +345,8 @@ def _frame_errors() -> dict[str, Rebuild]:
     known["GpuReadNothingError"] = lambda message, _extra: frames.GpuReadNothingError(message)
     known["GpuDecodeError"] = lambda message, extra: frames.GpuDecodeError(
         message,
-        stderr_tail=tuple(str(line) for line in extra.get("stderr_tail") or ()),
-        fallback_kind=str(extra["fallback_kind"]) if extra.get("fallback_kind") else None,
+        stderr_tail=_stderr_tail(extra.get("stderr_tail")),
+        fallback_kind=protocol.relayed_text(str(extra["fallback_kind"])) if extra.get("fallback_kind") else None,
     )
     return known
 
