@@ -2302,6 +2302,8 @@ docker run -d --name media-preview-node -p 9494:9494 \
 2. **Media**: for each library, the folder this app uses and the folder the node sees the same files at.
    **Test access** picks 3 real files per library and checks the node sees each one with the same size and
    modified time (within 2 seconds, for shares that store coarser times). A wrong mapping shows the exact path tried.
+   A library with no mapping row is skipped: the node never takes its files, so other workers do. To leave one
+   library to other workers, remove its mapping row.
 3. **Settings → Workers**: add the node's GPU or CPU to a worker group. Devices are listed under **This app** first,
    then under each node's name. Hours, job types and worker counts work as for this app's devices.
 

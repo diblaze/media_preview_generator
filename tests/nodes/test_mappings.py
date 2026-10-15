@@ -9,6 +9,7 @@ import pytest
 
 from media_preview_generator.nodes import mappings as nm
 from media_preview_generator.nodes import protocol
+from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.protocol import PathMapping, map_app_path
 from media_preview_generator.nodes.server import app as node_app
 from media_preview_generator.nodes.server import info
@@ -210,7 +211,7 @@ class TestRunTestAccess:
     def test_a_missing_library_says_the_app_cant_open_it(self, tmp_path):
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
         client = FakeClient()
-        result = nm.run_test_access(client, [], servers)
+        result = nm.run_test_access(client, [PathMapping(str(tmp_path), "/node")], servers)
         lib = result["libraries"][0]
         assert (lib["checked"], lib["ok"]) == (0, False)
         assert "can't open" in lib["error"]
@@ -220,7 +221,7 @@ class TestRunTestAccess:
     def test_an_empty_library_says_no_videos_were_found(self, tmp_path):
         (tmp_path / "media" / "Movies").mkdir(parents=True)
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
-        lib = nm.run_test_access(FakeClient(), [], servers)["libraries"][0]
+        lib = nm.run_test_access(FakeClient(), [PathMapping(str(tmp_path), "/node")], servers)["libraries"][0]
         assert "No video files" in lib["error"]
         assert lib["empty"] is True
 
@@ -246,7 +247,9 @@ class TestRunTestAccess:
         for disk in ("disk1", "disk2"):
             (tmp_path / disk).mkdir()
 
-        libraries = nm.run_test_access(FakeClient(), [], self._multi_disk(tmp_path, ["disk1", "disk2"]))["libraries"]
+        libraries = nm.run_test_access(
+            FakeClient(), [PathMapping(str(tmp_path), "/node")], self._multi_disk(tmp_path, ["disk1", "disk2"])
+        )["libraries"]
 
         assert [lib["error"] for lib in libraries] == [
             f"This app can't open {tmp_path / 'disk1' / 'Movies'}",
@@ -331,8 +334,41 @@ class TestRunTestAccess:
         assert (movies["ok"], tv["ok"], films["ok"]) == (True, True, False)
         assert films["suggestion"] is None
         assert films["error"] == (
-            "lab-cpu doesn't have this library's folder. Mount it on the node, or leave this library to other workers."
+            "lab-cpu doesn't have this library's folder. Mount it on the node, or remove its folder mapping so other workers take this library's files."
         )
+
+    def test_a_library_no_row_covers_is_listed_as_not_mapped_and_never_sent_to_the_node(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "a.mkv")
+        _video(tmp_path / "media" / "Anime" / "b.mkv")
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                    {"id": "2", "name": "Anime", "remote_paths": ["/plexmedia/Anime"]},
+                ],
+            )
+        ]
+        rows = [PathMapping(str(tmp_path / "media" / "Movies"), "/mnt/Movies")]
+        client = FakeClient()
+
+        movies, anime = nm.run_test_access(client, rows, servers, node_name="nuc")["libraries"]
+
+        assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
+        assert (movies["ok"], movies["mapped"]) == (True, True)
+        assert (anime["mapped"], anime["checked"], anime["ok"]) == (False, 0, False)
+        assert anime["error"] == "Not mapped on nuc. Other workers take its files."
+        assert reg.access_passed({"libraries": [movies, anime]}) is True
+
+    def test_a_covered_library_the_node_lacks_still_fails(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media"), "/mnt")]
+
+        (movies,) = nm.run_test_access(FakeClient(visible=lambda p: False), rows, servers)["libraries"]
+
+        assert (movies["mapped"], movies["ok"]) == (True, False)
+        assert reg.access_passed({"libraries": [movies]}) is False
 
     def test_a_folder_that_is_another_librarys_is_not_suggested(self, tmp_path, real_node):
         _video(tmp_path / "media" / "Films" / "a.mkv", b"x" * 10)
@@ -400,7 +436,9 @@ class TestRunTestAccess:
             _video(tmp_path / "media" / "Movies" / f"{i}.mkv")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
         client = FakeClient()
-        assert nm.run_test_access(client, [], servers)["libraries"][0]["checked"] == 3
+        assert (
+            nm.run_test_access(client, [PathMapping(str(tmp_path), "/node")], servers)["libraries"][0]["checked"] == 3
+        )
         assert [len(files) for _, files in client.requests] == [2, 1]
 
 
@@ -450,7 +488,7 @@ class TestQuickAccessCheck:
         {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
         {"id": "2", "name": "Open Films", "remote_paths": ["/plexmedia/Open Films"]},
     ]
-    ROWS = [PathMapping("/media-app", "/m")]  # what the node is told; the app's folders come from the servers
+    ROWS = [PathMapping("/", "/m")]  # what the node is told; the app's folders come from the servers
 
     def _media(self, tmp_path):
         for name in ("a.mkv", "b.mkv"):
@@ -471,6 +509,13 @@ class TestQuickAccessCheck:
         rows = [PathMapping(str(tmp_path / "media"), "/media")]
         client = FakeClient(visible=lambda p: "Open Films" not in p)
         assert nm.quick_access_check(client, rows, servers) is False
+
+    def test_a_library_no_row_covers_is_not_asked_about(self, tmp_path):
+        servers = self._media(tmp_path)
+        client = FakeClient()
+        rows = [PathMapping(str(tmp_path / "media" / "Movies"), "/m")]
+        assert nm.quick_access_check(client, rows, servers) is True
+        assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
 
     def test_a_file_the_node_cant_see_fails_it(self, tmp_path):
         servers = self._media(tmp_path)

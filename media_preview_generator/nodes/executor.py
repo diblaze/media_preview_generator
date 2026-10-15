@@ -588,7 +588,8 @@ class _TaskRun:
             return result if isinstance(result, dict) else {}
         if status == protocol.STATUS_FILE_NOT_VISIBLE or kind == protocol.KIND_FILE_NOT_VISIBLE:
             reason = protocol.relayed_text(str(error.get("reason") or protocol.NOT_VISIBLE_MISSING))
-            if not _other_file.get():
+            # Unmapped is not the node failing: the file belongs to other workers and must not pause this one.
+            if not _other_file.get() and reason != protocol.NOT_VISIBLE_UNMAPPED:
                 _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
             # The job log names the file by this app's path already; the node's message would add its own path.
             plain = protocol.not_visible_text(reason)
@@ -848,6 +849,15 @@ def run_on_node(
         "params": params,
     }
     node_path = protocol.map_app_path(app_path, mappings)
+    if node_path is None:
+        # A node's worker never takes a file its folder mappings don't cover: the file goes to another worker.
+        reason = protocol.NOT_VISIBLE_UNMAPPED
+        raise FileNotVisibleError(
+            placement.node_id,
+            placement.node_name,
+            reason,
+            f"{placement.node_name} can't see the file: {protocol.not_visible_text(reason)}",
+        )
     run = _TaskRun(
         registry,
         client,

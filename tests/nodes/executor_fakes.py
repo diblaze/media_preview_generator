@@ -36,7 +36,7 @@ class FakeRegistry(NodeRegistry):
     def mappings(self, node_id: str) -> list[PathMapping]:
         if node_id not in self.clients:
             raise KeyError(node_id)
-        return [PathMapping("/data", "/mnt/media")]
+        return [PathMapping("/", "/mnt/media")]
 
     def report_unavailable(self, node_id: str) -> None:
         self.reports.append(("unavailable", node_id))

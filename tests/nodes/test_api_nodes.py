@@ -945,7 +945,8 @@ class TestTestAccess:
             raise NodeUnreachableError("down")
 
         monkeypatch.setattr(nodes("http://nuc:9494"), "access_check", boom)
-        resp = client.post(f"/api/nodes/{node_id}/test-access", json={})
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        resp = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": rows})
         assert resp.status_code == 502 and "down" in resp.get_json()["error"]
 
 

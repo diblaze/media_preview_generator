@@ -1542,7 +1542,8 @@ class TestNodeDialog:
         _open_node(authed_page, "n-storage")
         pane = _node_tab(authed_page, "media")
         reason = (
-            "storage doesn't have this library's folder. Mount it on the node, or leave this library to other workers."
+            "storage doesn't have this library's folder. Mount it on the node, or remove its folder "
+            "mapping so other workers take this library's files."
         )
         api.test_answers = [
             {
@@ -1586,6 +1587,24 @@ class TestNodeDialog:
         expect(note.locator("li")).to_have_count(3)
         expect(note.locator("a")).to_have_attribute("href", "/servers")
         expect(results).not_to_contain_text("Synth 0: no files to test")
+
+    def test_a_library_with_no_mapping_row_is_a_note_not_a_failure(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        unmapped = {
+            "server": "Home", "library": "Anime", "app_root": "/data/Anime", "mapped": False, "checked": 0,
+            "ok": False, "files": [], "error": "Not mapped on storage. Other workers take its files.",
+        }  # fmt: skip
+        api.test_answers = [{"libraries": [_library("Movies", "/data/Movies", True, "/mnt/nas/Movies"), unmapped]}]
+        pane.locator(".nd-test").click()
+
+        results = pane.locator(".nd-map-results")
+        expect(results.locator(".nd-fail")).to_have_count(0)
+        expect(results.locator(".sm-vmsg.ok")).to_have_count(1)
+        note = results.locator(".nd-skipped")
+        expect(note.locator("summary")).to_have_text("1 library is not mapped on this node.")
+        expect(note.locator("li")).to_contain_text("Other workers take its files.")
 
     def test_setup_health_shows_an_informational_failure_as_a_note_not_a_bucket(
         self, authed_page: Page, app_url: str

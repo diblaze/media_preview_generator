@@ -605,6 +605,13 @@
                 + `<ul>${items}</ul><a href="/servers">Fix on Media Servers</a></details>`;
         }
 
+        function unmappedNote(unmapped) {
+            if (!unmapped.length) return '';
+            const items = unmapped.map((lib) => `<li><b>${esc(libraryLabel(lib))}</b> <span class="nd-faint">${esc(lib.error)}</span></li>`).join('');
+            return `<details class="nd-note nd-skipped"><summary><i class="bi bi-info-circle" aria-hidden="true"></i>`
+                + `${unmapped.length} ${unmapped.length === 1 ? 'library is' : 'libraries are'} not mapped on this node.</summary><ul>${items}</ul></details>`;
+        }
+
         function note(html) {
             results.innerHTML = html ? `<div class="sm-hint nd-map-note">${html}</div>` : '';
         }
@@ -622,22 +629,23 @@
             }
             // A library this app couldn't sample itself was never asked about: not the node's problem, so they all
             // share one collapsed note instead of a chip and a red card each.
-            const skipped = libraries.filter((lib) => !Number(lib.checked) && lib.empty !== true && !!lib.error);
+            const unmapped = libraries.filter((lib) => lib.mapped === false);
+            const skipped = libraries.filter((lib) => lib.mapped !== false && !Number(lib.checked) && lib.empty !== true && !!lib.error);
             const loose = [];
             libraries.forEach((lib) => {
-                if (skipped.includes(lib)) return;
+                if (skipped.includes(lib) || unmapped.includes(lib)) return;
                 const row = rowFor(lib.app_root);
                 if (row) $('.nd-chip-slot', row).insertAdjacentHTML('beforeend', libraryChip(lib));
                 else loose.push(libraryChip(lib));
             });
             // A library with no video yet has nothing to test; its chip says so and it isn't a failure.
-            const passed = (lib) => lib.ok || lib.empty === true || skipped.includes(lib);
+            const passed = (lib) => lib.ok || lib.empty === true || skipped.includes(lib) || unmapped.includes(lib);
             const failures = libraries.map((lib, i) => (passed(lib) ? '' : failureCard(lib, i))).join('');
-            const allOk = libraries.every(passed) && skipped.length < libraries.length;
+            const allOk = libraries.every(passed) && skipped.length + unmapped.length < libraries.length;
             const okText = skipped.length ? 'The node sees every library it was asked about, same files.' : 'The node sees every library, same files.';
             results.innerHTML = (loose.length ? `<div class="nd-lib-chips">${loose.join('')}</div>` : '')
                 + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>${okText}</div>` : failures)
-                + skippedNote(skipped);
+                + skippedNote(skipped) + unmappedNote(unmapped);
         }
 
         // The suggestion swaps the node-side path of the row covering the library (two rows may share a node path, so

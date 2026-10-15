@@ -793,6 +793,20 @@ class TestNotVisible:
         assert len(rows) == 3
         assert tracker.active_processing == 0
 
+    def test_a_file_the_only_node_has_no_mapping_for_fails_with_a_reason_and_other_workers_take_the_rest(self):
+        def process(item, **_kwargs):
+            node = _node()
+            if node == "a" and "unmapped" in item.canonical_path:
+                raise FileNotVisibleError("a", "A", "unmapped", "A can't see the file: no folder mapping covers it")
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool(("a", "A")), process, "/m/unmapped.mkv")
+        assert (tracker.successful, tracker.failed) == (0, 1)
+        assert rows[0].args[2] == "not visible on A"
+
+        tracker, _ = _run(_pool(("a", "A"), (None, "")), process, "/m/unmapped.mkv")
+        assert (tracker.successful, tracker.failed) == (1, 0)
+
     def test_this_apps_own_worker_is_never_left_out(self):
         process, seen = self._hidden_on("a")
         tracker, _ = _run(_pool(("a", "A"), (None, "")), process, "/m/1.mkv")

@@ -186,7 +186,7 @@ class TestStartAndResult:
             "path": media,
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
-            "mapping": [{"app_prefix": "/data", "node_prefix": "/mnt/media"}],
+            "mapping": [{"app_prefix": "/", "node_prefix": "/mnt/media"}],
             "gpu": {"type": "NVIDIA", "device": "cuda:0"},
             "params": {"duration_ms": 1000},
         }
@@ -1060,6 +1060,28 @@ class TestErrors:
 
         assert (raised.value.node_id, raised.value.node_name, raised.value.reason) == (NODE_ID, NODE_NAME, "missing")
         assert registry.reports == ([] if other else [("not_visible", NODE_ID, media, "missing")])
+
+    def test_a_file_no_mapping_covers_never_reaches_the_node_and_does_not_count_against_it(self, media, monkeypatch):
+        """Files of a library the node has no row for were sent to it anyway and paused the node's other libraries."""
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        registry = _install(client)
+        monkeypatch.setattr(registry, "mappings", lambda node_id: [protocol.PathMapping("/elsewhere", "/mnt/x")])
+
+        with pytest.raises(FileNotVisibleError) as raised:
+            _run(media)
+
+        assert raised.value.reason == protocol.NOT_VISIBLE_UNMAPPED
+        assert client.spec is None
+        assert registry.reports == []
+
+    def test_a_node_saying_unmapped_does_not_count_against_it(self, media):
+        error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "x", "reason": protocol.NOT_VISIBLE_UNMAPPED}
+        registry = _install(ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)]))
+
+        with pytest.raises(FileNotVisibleError):
+            _run(media)
+
+        assert registry.reports == []
 
     def test_file_not_visible_says_why_in_plain_words_without_the_nodes_path(self, media):
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file: /mnt/nas/a.mkv", "reason": "missing"}

@@ -350,8 +350,8 @@ def _suggest_for(
     if row is not None and id(row) in passed_rows:
         if all(f["kind"] == NOT_VISIBLE_MISSING for f in library["files"] if not f["ok"]):
             return None, (
-                f"{node_name} doesn't have this library's folder. Mount it on the node, or leave this library to "
-                "other workers."
+                f"{node_name} doesn't have this library's folder. Mount it on the node, or remove its folder "
+                "mapping so other workers take this library's files."
             )
         return None, None
     taken = {
@@ -374,11 +374,12 @@ def run_test_access(
         node_name: The node's name, for the reason given when it lacks a library's folder.
 
     Returns:
-        ``{"libraries": [{"server", "library", "app_root", "checked", "ok", "files": [{"path", "ok", "kind",
-        "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
+        ``{"libraries": [{"server", "library", "app_root", "mapped", "checked", "ok", "files": [{"path", "ok",
+        "kind", "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
         "error": str | None, "empty": bool}]}``. ``nearby`` lists what the node does see above the library's
         missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library (never of a row
-        that also maps a library that passed); ``empty`` says this app
+        that also maps a library that passed); ``mapped`` is False for a library no row covers (not tested: other
+        workers take its files); ``empty`` says this app
         opened the folder and found no video near its top. A disk of a multi-disk library that lacks the folder is
         left out while another disk holds it.
 
@@ -389,7 +390,8 @@ def run_test_access(
     samplings = _sample_roots(roots, SAMPLE_BUDGET_S)
     # A copy: a thread that timed out may still be adding to its list.
     samples = {root: list(samplings[root].found) for root in roots}
-    files = [f for picked in samples.values() for f in picked]
+    # A library no row covers is never asked about: the node doesn't run its files, so it can't fail on them.
+    files = [f for root, picked in samples.items() if _covering_row(root.app_root, mappings) for f in picked]
     results, nearby = _check(client, mappings, files) if files else ({}, {})
     # One server folder mapped to several disks: a disk without it is normal while another disk holds it.
     held = {(r.server_id, r.library_id, r.remote) for r in roots if samplings[r].opened}
@@ -397,6 +399,23 @@ def run_test_access(
     for root in roots:
         picked = samples[root]
         sampling = samplings[root]
+        if _covering_row(root.app_root, mappings) is None:
+            libraries.append(
+                {
+                    "server": root.server,
+                    "library": root.library,
+                    "app_root": root.app_root,
+                    "mapped": False,
+                    "checked": 0,
+                    "ok": False,
+                    "files": [],
+                    "nearby": {},
+                    "suggestion": None,
+                    "error": f"Not mapped on {node_name}. Other workers take its files.",
+                    "empty": False,
+                }
+            )
+            continue
         if not picked and not sampling.opened and not sampling.timed_out:
             if (root.server_id, root.library_id, root.remote) in held:
                 continue
@@ -428,6 +447,7 @@ def run_test_access(
                 "server": root.server,
                 "library": root.library,
                 "app_root": root.app_root,
+                "mapped": True,
                 "checked": len(rows),
                 "ok": ok,
                 "files": rows,
@@ -447,7 +467,7 @@ def run_test_access(
 def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers: list[dict]) -> bool:
     """One file per library folder: True when the node sees every one (and there was at least one to check).
 
-    Every library, as Test access samples them: one file per mapping row passes while a library under the same row
+    Every library a row covers, as Test access samples them: one file per mapping row passes while a library under the same row
     is out of the node's sight. Reading this app's folders has the same budget as Test access, so a stalled mount
     fails the check instead of holding up the node's check.
 
@@ -459,7 +479,9 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers:
     Returns:
         Whether every sampled file was visible.
     """
-    folders = list(dict.fromkeys(root.app_root for root in library_roots(servers)))
+    folders = list(
+        dict.fromkeys(root.app_root for root in library_roots(servers) if _covering_row(root.app_root, mappings))
+    )
     samplings = _sample_folders(folders, SAMPLE_BUDGET_S, limit=1)
     if any(sampling.timed_out for sampling in samplings):
         logger.debug("Quick access check gave up: this app's own library folder didn't answer")
