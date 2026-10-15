@@ -295,16 +295,46 @@ class TestArtifact:
         assert len(client.named("poll")) == 1
         assert registry.reports == [("unavailable", NODE_ID)]
 
+    def test_a_fetch_that_waited_out_its_timeout_is_not_tried_again(self, media, tmp_path):
+        # Each fetch waits up to ARTIFACT_TIMEOUT_S (minutes) for the next byte: three of them held the worker ~15 min.
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+
+        def fetch(task_id):
+            client.calls.append(("artifact",))
+            raise NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT)
+
+        client.fetch_artifact = fetch
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError, match="didn't send the frames"):
+            _run(media, artifact_to=str(tmp_path))
+        assert len(client.named("artifact")) == 1
+
+    def test_a_cancel_while_the_frames_fetch_fails_ends_the_file_without_another_fetch(self, media, tmp_path):
+        cancelled = []
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+
+        def fetch(task_id):
+            client.calls.append(("artifact",))
+            cancelled.append(True)  # the job is cancelled while this fetch fails
+            raise NodeUnreachableError("http://n answered HTTP 502")
+
+        client.fetch_artifact = fetch
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError):
+            _run(media, artifact_to=str(tmp_path), cancel_check=lambda: bool(cancelled))
+        assert len(client.named("artifact")) == 1
+
     @pytest.mark.parametrize(
         "error",
         [
             NodeRateLimitedError("http://n asks this app to wait: too many wrong keys came from here"),
-            NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT),
             NodeTimeoutError("http://n dropped the connection while answering"),
             NodeUnreachableError("http://n answered HTTP 502"),
             NodeUnreachableError("http://n can't be reached (connection refused)", reason=UNREACHABLE_REFUSED),
         ],
-        ids=["429", "no-answer-in-time", "connection-dropped", "gateway-502", "refused"],
+        ids=["429", "connection-dropped", "gateway-502", "refused"],
     )
     def test_a_passing_error_fetching_the_finished_frames_is_tried_again_not_a_drop(self, media, tmp_path, error):
         """The node keeps a finished task for minutes: the finished frames were thrown away and the file went back
@@ -334,9 +364,9 @@ class TestArtifact:
         ("error", "started"),
         [
             (NodeRateLimitedError("http://n asks this app to wait"), False),
-            (NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT), True),
+            (NodeUnreachableError("http://n answered HTTP 502"), True),
         ],
-        ids=["429-is-no-drop", "no-answer-is-a-drop"],
+        ids=["429-is-no-drop", "a-5xx-is-a-drop"],
     )
     def test_a_fetch_failing_as_long_as_a_poll_may_is_given_up(self, media, tmp_path, monkeypatch, error, started):
         clock = _FakeTime()

@@ -30,6 +30,7 @@ from ..shutdown import is_shutting_down, request_shutdown
 from . import protocol
 from .client import (
     MAX_ARTIFACT_BYTES,
+    UNREACHABLE_TIMEOUT,
     NodeAuthError,
     NodeCantStartError,
     NodeClient,
@@ -613,9 +614,11 @@ class _TaskRun:
     def _download(self, dest: str) -> None:
         """Fetch the finished task's frames into ``dest``.
 
-        The node keeps a finished task for minutes, so a fetch lost to an error that may pass (a 429, no answer in
-        time, a dropped connection, a 5xx) is tried again, given up by the same rule as the task's polls rather than
-        throwing the finished work away. A 429 given up on is no drop (neither the node's doing nor the file's).
+        The node keeps a finished task for minutes, so a fetch lost to an error that came back at once (a 429, a
+        dropped connection, a 5xx, a refused connection) is tried again, up to MAX_FAILED_POLLS fetches over
+        NODE_GONE_AFTER_S, rather than throwing the finished work away. A fetch that waited out its whole timeout isn't
+        tried again (each try can wait minutes), nor is one the job's cancel or the app's stop is waiting on. A 429
+        given up on is no drop (neither the node's doing nor the file's).
         """
         failed = 0
         failing_since = 0.0
@@ -629,7 +632,15 @@ class _TaskRun:
                 if failed == 0:
                     failing_since = time.monotonic()
                 failed += 1
-                passing = isinstance(exc, NodeUnreachableError) and not isinstance(exc, NodeStoppingError)
+                if self._cancel_requested() or is_shutting_down():
+                    raise NodeTaskCancelledError(
+                        protocol.KIND_CANCELLED, f"{self._placement.node_name} didn't send the frames: {exc}"
+                    ) from exc
+                passing = (
+                    isinstance(exc, NodeUnreachableError)
+                    and not isinstance(exc, NodeStoppingError)
+                    and exc.reason != UNREACHABLE_TIMEOUT
+                )
                 if passing and (failed < MAX_FAILED_POLLS or time.monotonic() - failing_since < NODE_GONE_AFTER_S):
                     logger.debug("{}frames not fetched yet: {}", self._prefix, exc)
                     time.sleep(POLL_INTERVAL_S)
