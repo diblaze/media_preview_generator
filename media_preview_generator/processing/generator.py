@@ -218,6 +218,18 @@ _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
 # The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
 # in software, nor GPU frames in a format the chain wasn't built for.
 _FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
+# A GPU decoder's own verdict that the GPU lacks the video's codec or profile, after which FFmpeg decodes it in software:
+# NVDEC's for a profile it can't decode (VP8 on Pascal, H.264 High 10 / 4:2:2 / 4:4:4, HEVC 4:2:2) and for H.263,
+# VAAPI's for a codec or profile the driver lacks (MPEG-4 part 2, H.263, VP8 on a UHD 770; H.264 High 10 only at
+# -loglevel debug). Lowercase, as matched.
+_GPU_LACKS_CODEC_VERDICTS = (
+    "hardware is lacking required capabilities",
+    "unsupported codec id",
+    "no support for codec",
+    "not supported for hardware decode",
+)
+# FFmpeg's line after any GPU decoder set-up that failed, the decoder's own verdict that it lacks the codec included.
+_HWACCEL_INIT_FAILED = "hwaccel initialisation returned error"
 # The input's video codec and pixel format as FFmpeg lists them:
 # "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), ...".
 _INPUT_VIDEO_STREAM_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)(?:[^,]*, (\w+))?")
@@ -901,8 +913,10 @@ def _gpu_hand_off(
 
 
 def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None, stderr_lines_all: list[str]) -> bool:
-    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software without a
-    word and the GPU scaler refused those frames (ProRes, WMV, DivX 3, H.263 or VP8 on NVIDIA, MPEG-2 4:2:2…).
+    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software, without a
+    word (ProRes, WMV, DivX 3 on NVIDIA, MPEG-2 4:2:2…) or after the decoder said the GPU lacks the codec or profile
+    (``_GPU_LACKS_CODEC_VERDICTS``: VP8, H.264 High 10 or H.263 on NVIDIA, MPEG-4 part 2 on VAAPI…), and the GPU
+    scaler refused those frames.
 
     A normal hand-off to the CPU, and the same on every run: full-frame decode asks the same decoder.
 
@@ -914,16 +928,19 @@ def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None
 
     Returns:
         True for a codec the GPU lacks. False otherwise, and for a driver error in any run: a decoder whose GPU
-        set-up failed in the driver falls back to software and ends the same way. False too for a run that asked for
-        no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its frames is theirs.
+        set-up failed in the driver falls back to software and ends the same way. FFmpeg's generic set-up failure line
+        after the decoder's own verdict isn't one: the verdict says why, as in ``classify_cpu_fallback_reason``. False
+        too for a run that asked for no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its
+        frames is theirs.
     """
-    return (
-        rc != 0
-        and hwaccel is not None
-        and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
-        and _decoded_in_software(stderr_lines, hwaccel)
-        and not _detect_hwaccel_runtime_error(stderr_lines_all)
-    )
+    if rc == 0 or hwaccel is None or not any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines):
+        return False
+    stderr_text = " ".join(stderr_lines).lower()
+    if any(verdict in stderr_text for verdict in _GPU_LACKS_CODEC_VERDICTS):
+        return not _detect_hwaccel_runtime_error(
+            [line for line in stderr_lines_all if _HWACCEL_INIT_FAILED not in line.lower()]
+        )
+    return _decoded_in_software(stderr_lines, hwaccel) and not _detect_hwaccel_runtime_error(stderr_lines_all)
 
 
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
@@ -1248,19 +1265,14 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
         "unknown decoder",
         "decoder not found",
         "could not find codec",
-        "unsupported codec id",
         # Hardware decoder specific errors (clearly indicate hardware decoder limitations)
         "hardware decoder not found",
         "hardware decoder unavailable",
         "hwaccel decoder not found",
         "hwaccel decoder unavailable",
-        # NVDEC's verdict that the GPU has no decoder for this profile (H.264 High 10 or 4:4:4). FFmpeg prints the
-        # generic "hwaccel initialisation returned error" right after it, so it has to win over that driver error.
-        "hardware is lacking required capabilities",
-        # VAAPI's verdicts: the driver has no profile for the codec (MPEG-4 part 2), or not this one (H.264 High 10,
-        # printed only at -loglevel debug).
-        "no support for codec",
-        "not supported for hardware decode",
+        # The GPU decoder's own verdicts. FFmpeg prints the generic "hwaccel initialisation returned error" right after
+        # them, so they have to win over that driver error.
+        *_GPU_LACKS_CODEC_VERDICTS,
         # Generic codec errors (check these carefully - only in GPU context after failure)
         "unsupported codec",
         "codec not supported",

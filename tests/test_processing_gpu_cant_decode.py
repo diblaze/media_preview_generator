@@ -601,12 +601,113 @@ PRORES_ON_NVDEC = [
 ]
 
 
+def _verdict_then_frames_refused(stream: str, codec: str, verdict: str, hwaccel: str) -> list[str]:
+    """A run whose GPU decoder said it lacks the codec or profile, then FFmpeg's generic set-up failure line, then
+    the GPU scaler refusing the software-decoded frames (jellyfin-ffmpeg 8.1.3: a Quadro P5000, a UHD 770)."""
+    return [
+        f"Stream #0:0: Video: {stream}",
+        f"Stream #0:0 -> #0:0 ({codec} (native) -> mjpeg (native))",
+        f"[{codec} @ 0x61d830a57080] {verdict}",
+        f"[{codec} @ 0x61d830a57080] Failed setup for format {hwaccel}: hwaccel initialisation returned error.",
+        *_frames_refused("scale_cuda" if hwaccel == "cuda" else "scale_vaapi"),
+    ]
+
+
+NVDEC_LACKS = "Hardware is lacking required capabilities"
+# Every NVIDIA cell where the GPU has the codec's decoder but not the profile, NVDEC's own word for H.263, and VAAPI's
+# for a codec or profile the driver lacks.
+VERDICT_THEN_FRAMES_REFUSED = [
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused(
+            "h263 (s263 / 0x33363273), yuv420p(progressive), 352x288 [SAR 12:11 DAR 4:3], 613 kb/s, 25 fps",
+            "h263",
+            "Unsupported codec ID",
+            "cuda",
+        ),
+        id="h263-on-nvdec",
+    ),
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused("vp8, yuv420p(tv, progressive), 640x360, 24 fps", "vp8", NVDEC_LACKS, "cuda"),
+        id="vp8-on-pascal",
+    ),
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused(
+            "h264 (High 10), yuv420p10le(tv, progressive), 640x360, 24 fps", "h264", NVDEC_LACKS, "cuda"
+        ),
+        id="h264-high10-on-nvdec",
+    ),
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused(
+            "h264 (High 4:2:2), yuv422p(tv, progressive), 640x360, 24 fps", "h264", NVDEC_LACKS, "cuda"
+        ),
+        id="h264-422-on-nvdec",
+    ),
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused(
+            "h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), 640x360, 24 fps", "h264", NVDEC_LACKS, "cuda"
+        ),
+        id="h264-444-on-nvdec",
+    ),
+    pytest.param(
+        "NVIDIA",
+        _verdict_then_frames_refused(
+            "hevc (Rext), yuv422p10le(tv, progressive), 640x360, 24 fps", "hevc", NVDEC_LACKS, "cuda"
+        ),
+        id="hevc-422-on-nvdec",
+    ),
+    pytest.param(
+        "INTEL",
+        _verdict_then_frames_refused(
+            "mpeg4 (Simple Profile) (XVID / 0x44495658), yuv420p, 640x360, 1112 kb/s, 24 fps",
+            "mpeg4",
+            "No support for codec mpeg4 profile 0.",
+            "vaapi",
+        ),
+        id="xvid-on-vaapi",
+    ),
+    pytest.param(
+        "INTEL",
+        _verdict_then_frames_refused(
+            "mpeg4 (Advanced Simple Profile) (DX50 / 0x30355844), yuv420p, 640x352, 1180 kb/s, 25 fps",
+            "mpeg4",
+            "No support for codec mpeg4 profile 15.",
+            "vaapi",
+        ),
+        id="divx-on-vaapi",
+    ),
+    pytest.param(
+        "INTEL",
+        _verdict_then_frames_refused(
+            "h263 (s263 / 0x33363273), yuv420p(progressive), 352x288, 613 kb/s, 25 fps",
+            "h263",
+            "No support for codec h263 profile -99.",
+            "vaapi",
+        ),
+        id="h263-on-vaapi",
+    ),
+    pytest.param(
+        "INTEL",
+        _verdict_then_frames_refused(
+            "vp8, yuv420p(tv, progressive), 640x360, 24 fps", "vp8", "No support for codec vp8 profile 0.", "vaapi"
+        ),
+        id="vp8-on-vaapi",
+    ),
+]
+
+
 class TestAGpuWithoutTheDecoderIsAQuietHandOff:
     """A ProRes, WMV, DivX 3, H.263 or VP8 file on a GPU worker is a normal CPU fallback ("No action needed").
 
     It used to log two ERROR "FFmpeg failed …" lines, two "unusual exit code … broken hardware acceleration driver"
     warnings and two stderr dumps, around a full-frame rerun that decodes in software the same way and fails the
-    same way (jellyfin-ffmpeg 8.1.3 on a Quadro P5000).
+    same way (jellyfin-ffmpeg 8.1.3 on a Quadro P5000). So did a file whose GPU decoder says it lacks the codec or
+    profile (NVDEC on VP8, H.264 High 10 / 4:2:2 / 4:4:4, HEVC 4:2:2, H.263; VAAPI on MPEG-4 part 2, H.263, VP8): FFmpeg
+    follows that verdict with its generic "hwaccel initialisation returned error", which read as a driver error.
     """
 
     @staticmethod
@@ -636,6 +737,7 @@ class TestAGpuWithoutTheDecoderIsAQuietHandOff:
                 ],
                 id="wmv8-on-vaapi",
             ),
+            *VERDICT_THEN_FRAMES_REFUSED,
         ],
     )
     def test_one_gpu_run_and_no_error_before_the_cpu_takes_it(self, run, gpu, stderr):  # noqa: F811
@@ -668,6 +770,14 @@ class TestAGpuWithoutTheDecoderIsAQuietHandOff:
                 ],
                 id="a-driver-error-first",
             ),
+            pytest.param(
+                [
+                    "Stream #0:0: Video: hevc (Main), yuv420p(tv, progressive), 1920x1080, 23.98 fps",
+                    *HEVC_HWACCEL_INIT_ONLY,
+                    *_frames_refused("scale_cuda"),
+                ],
+                id="a-decode-context-the-driver-failed-to-create",
+            ),
         ],
     )
     def test_a_gpu_failure_still_says_so_and_gets_its_full_frame_rerun(self, run, stderr):  # noqa: F811
@@ -675,6 +785,22 @@ class TestAGpuWithoutTheDecoderIsAQuietHandOff:
 
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "hwaccel"
+        assert len(procs) == 2
+        assert any(line.startswith("ERROR|FFmpeg failed while extracting frames") for line in records), records
+        assert not any("The GPU can't decode the video of" in line for line in records), records
+
+    def test_a_driver_error_besides_the_decoders_verdict_still_says_so(self, run):  # noqa: F811
+        # Only FFmpeg's generic set-up line gives way to the verdict; a driver error of its own keeps the run noisy.
+        verdict_run = VERDICT_THEN_FRAMES_REFUSED[1].values[1]
+        stderr = [
+            *verdict_run[:3],
+            "[AVHWFramesContext @ 0x6470e4f1a2c0] Failed to create surface: 2 (resource allocation failed).",
+            *verdict_run[3:],
+        ]
+
+        outcome, procs, records = self._run_real(run, stderr)
+
+        assert_handed_to_cpu(outcome)
         assert len(procs) == 2
         assert any(line.startswith("ERROR|FFmpeg failed while extracting frames") for line in records), records
         assert not any("The GPU can't decode the video of" in line for line in records), records
