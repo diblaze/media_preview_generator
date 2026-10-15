@@ -115,7 +115,10 @@ def normalise_key(raw: object, stored: str) -> tuple[str | None, str]:
         return None, "The node's key must be text"
     key = stored if raw is None or raw == KEY_MASK else raw.strip()
     if not key:
-        return None, "Enter the node's key (shown in the node's log the first time it starts)"
+        return None, (
+            "Enter the node's key (in the node's log the first time it starts; on Windows, printed by the installer "
+            "and kept in node.json)"
+        )
     if key != stored and not (len(key) <= KEY_MAX_LEN and sendable_key(key)):
         return None, f"The node's key must be up to {KEY_MAX_LEN} printable ASCII characters with no spaces"
     return key, ""

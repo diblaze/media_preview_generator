@@ -69,12 +69,12 @@
                         </div>
                         <div class="sm-fld">
                             <label class="sm-lab" for="addNodeKey">Key
-                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Printed in the node's log on first start, or the NODE_KEY you set."><i class="bi bi-info-circle"></i></button>
+                                <button type="button" class="info-icon" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="In the node's log on first start (Docker), printed by install.ps1 and kept in node.json (Windows), or the NODE_KEY you set."><i class="bi bi-info-circle"></i></button>
                             </label>
                             <input type="password" class="form-control" id="addNodeKey" autocomplete="new-password">
                         </div>
                     </div>
-                    <div class="sm-hint">The key is printed in the node's log on first start. It is never written to this app's logs.</div>
+                    <div class="sm-hint">The key is printed in the node's log on first start, or by the installer on Windows (it is also in node.json). It is never written to this app's logs.</div>
                     <div class="sm-warnline bad d-none" id="addNodeError" role="alert"></div>
                     <div class="sm-card d-none" id="addNodeProbe" role="status"></div>
                 </section>
