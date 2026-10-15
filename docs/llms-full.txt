@@ -2282,7 +2282,8 @@ docker run -d --name media-preview-node -p 9494:9494 \
 ```
 
 - `NODE_NAME` is the name the app shows for it.
-- Mount your media read-only, at any path.
+- Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
+  they are.
 - Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").

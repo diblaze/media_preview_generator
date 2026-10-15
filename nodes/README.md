@@ -15,8 +15,9 @@ A node has one or both roles:
 The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`](worker/docker-compose.yml).
 
 * Run the **same image tag** as the app: a worker node must be on the app's exact version.
-* Mount your media **read-only**, at any path. The app maps its paths to the node's (Settings → Nodes → path
-  mappings) and checks each file is the same one (size and modification time) before using it.
+* Mount your media **read-only**. At the same path as in the app's container, the mappings Add node fills in work
+  as they are; at any other path, set them on the node's **Media** tab. The app checks each file is the same one
+  (size and modification time) before using it.
 * Pass the GPU exactly as you would to the app: `--device /dev/dri:/dev/dri` for Intel/AMD, or
   `--gpus all` / `runtime: nvidia` with `NVIDIA_DRIVER_CAPABILITIES=all` for NVIDIA. Leave `/dev/dri` out on a machine
   without an Intel or AMD GPU: the container doesn't start without it ("error gathering device information").
