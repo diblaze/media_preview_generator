@@ -702,6 +702,38 @@ class TestNodeSentValues:
         assert json.loads(text, parse_constant=refuse)["info"]["worker"]["cpu"]["load1"] is None
 
 
+class TestATestOfRowsSavedLater:
+    """Add node and the Media tab test the rows in the editor before saving them: a pass is kept once they are."""
+
+    def _library(self, tmp_path):
+        return TestTestAccess._library(self, tmp_path)
+
+    def test_a_pass_in_the_add_node_wizard_is_kept_once_its_rows_are_saved(self, client, nodes, tmp_path):
+        self._library(tmp_path)
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        node_id = _add(client).get_json()["id"]
+
+        tested = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": rows}).get_json()
+        assert tested["libraries"][0]["ok"] is True
+        assert reg.get_registry().details(node_id).access_result is None
+        assert client.put(f"/api/nodes/{node_id}", json={"path_mappings": rows}).status_code == 200
+
+        assert reg.get_registry().details(node_id).access_result == tested
+        ids = [c["id"] for s in client.get(f"/api/nodes/{node_id}/health").get_json()["sections"] for c in s["checks"]]
+        assert "node_access_untested" not in ids
+
+    def test_a_pass_of_other_rows_is_not_kept(self, client, nodes, tmp_path):
+        self._library(tmp_path)
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        node_id = _add(client).get_json()["id"]
+        client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": rows})
+
+        saved = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/volume1"}]
+        assert client.put(f"/api/nodes/{node_id}", json={"path_mappings": saved}).status_code == 200
+
+        assert reg.get_registry().details(node_id).access_result is None
+
+
 class TestRemovedDuringAGroupSave:
     def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
         """The group save checks its members against the nodes list under the settings lock, so a Remove that comes

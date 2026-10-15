@@ -149,6 +149,9 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
+    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save): kept as
+    # ``(rows, result, checked_at)`` and adopted when exactly those rows are saved.
+    pending_access: tuple[list, dict, float] | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -435,8 +438,9 @@ class NodeRegistry:
     def record_access_result(self, node_id: str, result: dict, *, tested_mappings: list[dict]) -> None:
         """Remember a Test access result; a passing one clears an access problem.
 
-        A test takes seconds; when the node's saved mappings changed meanwhile, the result says nothing about the
-        new ones and is dropped.
+        A result for rows other than the saved ones (rows still being edited, or mappings that changed during the
+        test) says nothing about how the node runs work now. It is held aside and adopted only if exactly those
+        rows are saved next.
 
         Args:
             node_id: The node.
@@ -448,18 +452,24 @@ class NodeRegistry:
             live = self._nodes.get(node_id)
             if live is None:
                 return
+            checked_at = self._wall_clock()
             if tested_mappings != (live.record.get("path_mappings") or []):
-                logger.info("Test access of node {}: its mappings changed during the test; result not kept", node_id)
+                live.pending_access = (copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at)
                 return
-            live.access_result = copy.deepcopy(result)
-            live.access_checked_at = checked_at = self._wall_clock()
-            mappings, keep = copy.deepcopy(live.record.get("path_mappings")), set(self._nodes)
-            if access_passed(result):
-                live.access_problem = ""
-                live.not_visible.clear()
+            live.pending_access = None
+            mappings, keep = self._adopt_access(live, result, checked_at), set(self._nodes)
             self._touch()
         if self._access_store is not None:
             self._access_store.save(node_id, mappings, result, checked_at, keep=keep)
+
+    def _adopt_access(self, live: _Live, result: dict, checked_at: float) -> list:
+        """Make ``result`` the node's Test access result (the caller holds the lock); answers the saved rows."""
+        live.access_result = copy.deepcopy(result)
+        live.access_checked_at = checked_at
+        if access_passed(result):
+            live.access_problem = ""
+            live.not_visible.clear()
+        return copy.deepcopy(live.record.get("path_mappings"))
 
     # ------------------------------------------------------------------ checks on demand
 
@@ -593,10 +603,17 @@ class NodeRegistry:
         store = self._access_store
         if store is None:
             return
-        for action, node_id, mappings in work:
+        for action, node_id, payload in work:
             if action == "forget":
-                store.forget(node_id, keep_mappings=mappings)
+                store.forget(node_id, keep_mappings=payload)
                 continue
+            if action == "save":
+                rows, result, checked_at = payload
+                with self._lock:
+                    keep = set(self._nodes)
+                store.save(node_id, rows, result, checked_at, keep=keep)
+                continue
+            mappings = payload
             stored = store.load(node_id, mappings)
             if stored is None:
                 continue
@@ -612,7 +629,8 @@ class NodeRegistry:
         Args:
             live: The node's live record, or None for a new node.
             record: Its stored record.
-            store_work: Collects ``("load" | "forget", node id, mappings)`` for :meth:`_run_store_work`.
+            store_work: Collects ``("load" | "forget", node id, mappings)`` and ``("save", node id, (mappings,
+                result, checked_at))`` for :meth:`_run_store_work`.
         """
         if live is None:
             live = _Live(record=copy.deepcopy(record), client=self._client_factory(record))
@@ -639,10 +657,16 @@ class NodeRegistry:
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
         if old.get("path_mappings") != record.get("path_mappings"):
-            # A test of other mappings says nothing about these.
-            live.access_result = live.access_checked_at = None
-            if self._access_store is not None:
-                store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
+            # A test of other mappings says nothing about these, unless it tested exactly the rows just saved.
+            pending, live.pending_access = live.pending_access, None
+            if pending is not None and pending[0] == (record.get("path_mappings") or []):
+                rows = self._adopt_access(live, pending[1], pending[2])
+                if self._access_store is not None:
+                    store_work.append(("save", str(record.get("id")), (rows, pending[1], pending[2])))
+            else:
+                live.access_result = live.access_checked_at = None
+                if self._access_store is not None:
+                    store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
         return live
 
     # ------------------------------------------------------------------ state

@@ -426,9 +426,8 @@ def test_node_access(node_id: str):
         result = run_test_access(_make_client(record["url"], record["key"]), mappings, sm.get("media_servers") or [])
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
-    # Only a test of the saved mappings says anything about how the node runs work now.
-    if rows == stored:
-        get_registry().record_access_result(node_id, result, tested_mappings=rows)
+    # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.
+    get_registry().record_access_result(node_id, result, tested_mappings=rows)
     return jsonify(result)
 
 
