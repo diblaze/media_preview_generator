@@ -429,17 +429,24 @@ class NodeRegistry:
                 return
         self._submit(self._gpu_check, node_id, device)
 
-    def record_access_result(self, node_id: str, result: dict) -> None:
+    def record_access_result(self, node_id: str, result: dict, *, tested_mappings: list[dict]) -> None:
         """Remember a Test access result; a passing one clears an access problem.
+
+        A test takes seconds; when the node's saved mappings changed meanwhile, the result says nothing about the
+        new ones and is dropped.
 
         Args:
             node_id: The node.
             result: ``{"libraries": [...]}`` as ``mappings.run_test_access`` returns it.
+            tested_mappings: The ``path_mappings`` rows the test ran with.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
+                return
+            if tested_mappings != (live.record.get("path_mappings") or []):
+                logger.info("Test access of node {}: its mappings changed during the test; result not kept", node_id)
                 return
             live.access_result = copy.deepcopy(result)
             live.access_checked_at = checked_at = self._wall_clock()

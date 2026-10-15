@@ -472,6 +472,23 @@ class TestTestAccess:
         assert nodes("http://nuc:9494").access_requests[0][0][0].node_prefix == "/elsewhere"
         assert reg.get_registry().details(node_id).access_result is None
 
+    def test_a_pass_of_mappings_replaced_during_the_test_is_not_remembered(self, client, nodes, tmp_path, monkeypatch):
+        self._library(tmp_path)
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        node_id = _add(client, path_mappings=rows).get_json()["id"]
+        node = nodes("http://nuc:9494")
+        ask = node.access_check
+        replaced = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/volume1"}]
+
+        def saved_while_the_node_checks(mappings, files):
+            _sm().update_nodes([{**n, "path_mappings": replaced} for n in _sm().nodes])
+            return ask(mappings, files)
+
+        monkeypatch.setattr(node, "access_check", saved_while_the_node_checks)
+        resp = client.post(f"/api/nodes/{node_id}/test-access", json={})
+        assert resp.status_code == 200 and resp.get_json()["libraries"][0]["ok"] is True
+        assert reg.get_registry().details(node_id).access_result is None
+
     def test_bad_mappings_are_refused(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         resp = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": [{"app_prefix": "x"}]})

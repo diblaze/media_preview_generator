@@ -395,7 +395,7 @@ def test_node_access(node_id: str):
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
     # Only a test of the saved mappings says anything about how the node runs work now.
     if rows == stored:
-        get_registry().record_access_result(node_id, result)
+        get_registry().record_access_result(node_id, result, tested_mappings=rows)
     return jsonify(result)
 
 

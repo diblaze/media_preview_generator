@@ -104,6 +104,9 @@ class Harness:
         self.revision += 1
 
 
+MAPPINGS = [{"app_prefix": "/data", "node_prefix": "/mnt"}]
+
+
 def _record(**fields):
     return {
         "id": "n1",
@@ -112,7 +115,7 @@ def _record(**fields):
         "url": "http://nuc:9494",
         "key": "k",
         "enabled": True,
-        "path_mappings": [{"app_prefix": "/data", "node_prefix": "/mnt"}],
+        "path_mappings": list(MAPPINGS),
         **fields,
     }
 
@@ -309,11 +312,24 @@ class TestAccessProblem:
     def test_a_passing_test_access_clears_it(self, h):
         self.test_three_different_files_in_ten_minutes_is_an_access_problem(h)
         failing = {"libraries": [{"checked": 3, "ok": False}]}
-        h.registry.record_access_result("n1", failing)
+        h.registry.record_access_result("n1", failing, tested_mappings=MAPPINGS)
         assert h.registry.view("n1").state == reg.STATE_ACCESS_PROBLEM
-        h.registry.record_access_result("n1", {"libraries": [{"checked": 3, "ok": True}, {"checked": 0}]})
+        h.registry.record_access_result(
+            "n1", {"libraries": [{"checked": 3, "ok": True}, {"checked": 0}]}, tested_mappings=MAPPINGS
+        )
         assert h.registry.view("n1").state == reg.STATE_READY
         assert h.registry.details("n1").access_result["libraries"][0]["ok"] is True
+
+    def test_a_pass_of_mappings_replaced_since_the_test_began_changes_nothing(self, h):
+        tested = list(h.nodes[0]["path_mappings"])
+        h.change(path_mappings=[{"app_prefix": "/data", "node_prefix": "/volume1"}])
+        # The new mappings fail on three files while the test of the old ones is still running.
+        self.test_three_different_files_in_ten_minutes_is_an_access_problem(h)
+
+        h.registry.record_access_result("n1", {"libraries": [{"checked": 3, "ok": True}]}, tested_mappings=tested)
+
+        assert h.registry.view("n1").state == reg.STATE_ACCESS_PROBLEM
+        assert h.registry.details("n1").access_result is None
 
     def test_check_now_clears_it_only_when_the_quick_access_check_passes(self, h):
         self.test_three_different_files_in_ten_minutes_is_an_access_problem(h)
@@ -451,7 +467,7 @@ class TestLoop:
         h.registry.report_unavailable("nope")
         h.registry.report_not_visible("nope", "/x", "missing")
         h.registry.report_gpu_error("nope", "cuda:0")
-        h.registry.record_access_result("nope", {})
+        h.registry.record_access_result("nope", {}, tested_mappings=MAPPINGS)
         assert h.registry.check_now("nope") is None
         assert h.registry.rescan_gpus("nope") is None
 
@@ -496,7 +512,7 @@ class TestAccessResultSurvivesRestart:
 
     def test_a_restarted_app_still_has_the_last_test_of_the_saved_mappings(self, store, tmp_path):
         before = Harness(access_store=store)
-        before.registry.record_access_result("n1", self.RESULT)
+        before.registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
 
         after = Harness(access_store=store)  # a new process: nothing in memory
 
@@ -508,7 +524,7 @@ class TestAccessResultSurvivesRestart:
 
     def test_changing_the_nodes_mappings_forgets_its_result(self, store):
         h = Harness(access_store=store)
-        h.registry.record_access_result("n1", self.RESULT)
+        h.registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
 
         h.change(path_mappings=[{"app_prefix": "/data", "node_prefix": "/volume1"}])
 
@@ -519,9 +535,19 @@ class TestAccessResultSurvivesRestart:
         store.save("n1", [{"app_prefix": "/data", "node_prefix": "/old"}], self.RESULT, 1.0)
         assert Harness(access_store=store).registry.details("n1").access_result is None
 
+    def test_a_result_for_mappings_replaced_during_the_test_is_not_saved(self, store, tmp_path):
+        h = Harness(access_store=store)
+        tested = list(h.nodes[0]["path_mappings"])
+        h.change(path_mappings=[{"app_prefix": "/data", "node_prefix": "/volume1"}])
+
+        h.registry.record_access_result("n1", self.RESULT, tested_mappings=tested)
+
+        assert not (tmp_path / "node_access_results.json").exists()
+        assert Harness(nodes=list(h.nodes), access_store=store).registry.details("n1").access_result is None
+
     def test_removed_nodes_are_dropped_from_the_file_on_the_next_save(self, store, tmp_path):
         store.save("gone", [], self.RESULT, 1.0)
-        Harness(access_store=store).registry.record_access_result("n1", self.RESULT)
+        Harness(access_store=store).registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
         assert set(json.loads((tmp_path / "node_access_results.json").read_text())) == {"n1"}
 
     def test_an_unreadable_file_reads_as_untested(self, store, tmp_path):
