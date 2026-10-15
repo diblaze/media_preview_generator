@@ -10,12 +10,15 @@ application-level configuration.
 """
 
 import copy
+import filecmp
+import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -362,11 +365,45 @@ def _migrate_env_vars(sm) -> None:
 # =========================================================================
 
 
+_PRE_UPGRADE_SUFFIX_RE = re.compile(r"\.pre-v([0-9]+)(?:\.[0-9]{8}-[0-9]{6})?\.bak")
+
+
+def _pre_upgrade_copies(settings_file: str, from_schema: int | None = None) -> list[str]:
+    """Return the copies :func:`_backup_settings_before_migrating` took of ``settings_file``.
+
+    Args:
+        settings_file: The live settings.json path.
+        from_schema: Only the copies taken before migrating from this schema version; None for every version.
+
+    Returns:
+        Paths of ``{settings_file}.pre-v<N>.bak`` and ``{settings_file}.pre-v<N>.<YYYYMMDD-HHMMSS>.bak``.
+    """
+    copies = []
+    for path in glob.glob(glob.escape(settings_file) + ".pre-v*.bak"):
+        match = _PRE_UPGRADE_SUFFIX_RE.fullmatch(path[len(settings_file) :])
+        if match and (from_schema is None or int(match.group(1)) == from_schema):
+            copies.append(path)
+    return sorted(copies)
+
+
+def _newest_pre_upgrade_copy(settings_file: str) -> str:
+    """Return the most recently written pre-upgrade copy of ``settings_file``, or "" when there is none."""
+    copies = []
+    for path in _pre_upgrade_copies(settings_file):
+        try:
+            copies.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    return max(copies)[1] if copies else ""
+
+
 def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     """Copy settings.json to ``{settings_file}.pre-v{from_schema}.bak`` before any migration step saves over it.
 
     The name is not a timestamped one, so the save-time pruner never deletes it; ordinary saves would otherwise
-    rotate the pre-upgrade copy out within minutes.
+    rotate the pre-upgrade copy out within minutes. When that name is taken by a copy holding other settings (the
+    user rolled back, changed things on the older build and upgraded again), the copy is
+    ``{settings_file}.pre-v{from_schema}.<YYYYMMDD-HHMMSS>.bak`` instead, which the pruner doesn't touch either.
 
     Args:
         sm: The settings manager about to be migrated.
@@ -378,12 +415,20 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
     settings_file = getattr(sm, "settings_file", None)
     if not settings_file or not os.path.isfile(str(settings_file)):
         return ""
+    settings_file = str(settings_file)
     bak_path = f"{settings_file}.pre-v{from_schema}.bak"
-    # The earliest copy is the one that matches the version the user came from; a retry boot must not replace it.
+    # A retry boot finds the copy it took last time still matching the file, so it keeps naming that one. Any
+    # existing copy is left alone: an earlier upgrade's copy is still the way back to before that upgrade.
+    for existing in _pre_upgrade_copies(settings_file, from_schema):
+        try:
+            if filecmp.cmp(settings_file, existing, shallow=False):
+                return existing
+        except OSError:
+            continue
     if os.path.isfile(bak_path):
-        return bak_path
+        bak_path = f"{settings_file}.pre-v{from_schema}.{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.bak"
     try:
-        shutil.copy2(str(settings_file), bak_path)
+        shutil.copy2(settings_file, bak_path)
         return bak_path
     except OSError as exc:
         logger.warning(
@@ -478,12 +523,19 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         # Silent acceptance would drop unknown fields on the next save —
         # the exact failure mode that wiped jobs.json on tag-drift.
         settings_path = getattr(sm, "settings_file", None) or "settings.json"
+        newest_copy = _newest_pre_upgrade_copy(str(settings_path))
+        if newest_copy:
+            upgrade_copy = f"the copy taken just before the latest upgrade is {newest_copy}"
+        else:
+            upgrade_copy = (
+                f"the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
+                f"version you upgraded from"
+            )
         raise SchemaDowngradeError(
             f"settings.json was written by schema v{current} but this binary supports up to "
             f"v{_CURRENT_SCHEMA_VERSION}. Refusing to start (would silently drop fields on next save). "
             f"Either run a newer build of the app, or restore a settings.json from before the upgrade "
-            f"(the copy taken just before the upgrade is {settings_path}.pre-v<N>.bak, where N is the schema "
-            f"version you upgraded from; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
+            f"({upgrade_copy}; the app's other backups sit next to it as {settings_path}.<timestamp>.bak) "
             f"and start the older app version that wrote it."
         )
     # A pending v14 retry has to get past the version gate: the failure that
@@ -560,7 +612,9 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
 
     if log_notes:
         logger.info("Settings schema migrated to v{}: {}", _CURRENT_SCHEMA_VERSION, ", ".join(log_notes))
-    if log_notes and announce:
+    # A version move with no notes still has to reach an unread card: left alone, it keeps naming the older
+    # upgrade's copy as the way back (a fresh install's first-boot copy holds nothing) and the older "to".
+    if announce and (log_notes or current < _CURRENT_SCHEMA_VERSION):
         # J5: drop a one-shot flag the dashboard's notification bell reads
         # so the user sees a single "we migrated your config" card on next
         # login. Dismissal removes the flag (see notifications.py).
@@ -572,9 +626,13 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         # Older versions stored a permanent dismissal of this card, which would hide this new notice as well. They
         # also left the dismissed notice in place: the user has read it, so its notes don't go into the new card.
         dismissed = sm.get("dismissed_notifications")
-        if isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed:
-            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
+        stale_dismissal = isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed
+        if stale_dismissal:
             existing = {}
+        if not log_notes and not existing:
+            return
+        if stale_dismissal:
+            sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
         # The card always names this boot's snapshot, never an unread notice's older one: rolling back means
         # restoring the settings as this build found them (an older notice's copy can be from a fresh install's
         # first boot, holding nothing), and only the build that wrote them reads them as they are.
@@ -705,6 +763,32 @@ def _migrate_to_v3(sm) -> list:
     return []
 
 
+def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bool:
+    """Whether a Recently Added schedule already scans what v4 would make one for.
+
+    A settings file from before v4 restored over an install that already ran it (Settings -> Backups, or copied back
+    by hand) runs v4 again; the schedules it made the first time are still in schedules.json, maybe renamed or
+    retimed since.
+
+    Args:
+        schedules: Every stored schedule.
+        entry: A ``recently_added_libraries`` entry (a library id, or a name), or None for every library.
+    """
+    for schedule in schedules:
+        if (schedule.get("config") or {}).get("job_type") != "recently_added":
+            continue
+        ids = {str(x.get("library_id") if isinstance(x, dict) else x) for x in schedule.get("library_ids") or []}
+        if schedule.get("library_id"):
+            ids.add(str(schedule["library_id"]))
+        name = str(schedule.get("library_name") or "")
+        if entry is None:
+            if not ids and not name:
+                return True
+        elif (entry in ids) if entry.isdigit() else (name == entry):
+            return True
+    return False
+
+
 def _migrate_to_v4(sm) -> list:
     """Convert legacy ``recently_added_*`` settings into schedule entries.
 
@@ -721,6 +805,8 @@ def _migrate_to_v4(sm) -> list:
       3. Deletes all four legacy keys from settings.
       4. Best-effort removes the obsolete ``system_recently_added_scan``
          APScheduler job if it exists in the persistent jobstore.
+
+    A schedule it would make that is already there (a restored settings file from before v4) is not made twice.
     """
     notes: list[str] = []
     legacy_keys = [
@@ -751,7 +837,10 @@ def _migrate_to_v4(sm) -> list:
             # (and any caller using a non-default CONFIG_DIR) end up with
             # a ScheduleManager writing to the right jobstore location.
             manager = get_schedule_manager(config_dir=str(sm.config_dir))
-            if not library_entries:
+            existing = manager.get_all_schedules()
+            if not library_entries and _has_recently_added_schedule(existing, None):
+                notes.append("v4: the recently-added schedule is already there")
+            elif not library_entries:
                 schedule = manager.create_schedule(
                     name="Recently Added Scanner",
                     interval_minutes=interval,
@@ -765,7 +854,8 @@ def _migrate_to_v4(sm) -> list:
                 )
                 notes.append(f"v4: created 1 recently-added schedule ({schedule['id']})")
             else:
-                for entry in library_entries:
+                missing = [entry for entry in library_entries if not _has_recently_added_schedule(existing, entry)]
+                for entry in missing:
                     schedule = manager.create_schedule(
                         name=f"Recently Added Scanner — {entry}",
                         interval_minutes=interval,
@@ -777,9 +867,10 @@ def _migrate_to_v4(sm) -> list:
                         },
                         enabled=True,
                     )
-                notes.append(
-                    f"v4: created {len(library_entries)} recently-added schedule(s) from legacy library override"
-                )
+                if missing:
+                    notes.append(f"v4: created {len(missing)} recently-added schedule(s) from legacy library override")
+                if len(missing) < len(library_entries):
+                    notes.append(f"v4: {len(library_entries) - len(missing)} recently-added schedule(s) already there")
 
             # Best-effort: remove the stale system job if it's still in
             # the persistent APScheduler jobstore.

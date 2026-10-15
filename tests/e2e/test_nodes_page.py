@@ -27,6 +27,7 @@ from .test_intro_credits_server_tab import (
 )
 
 APP_VERSION = "5.2.0"
+CHANGED_ELSEWHERE = "This node was changed in another tab. Reload the page, then make your change again."
 PHONE = {"width": 390, "height": 844}
 
 
@@ -63,9 +64,16 @@ def _node(node_id: str, name: str, state: str = "ready", **overrides) -> dict:
         "last_seen": time.time() - 3,
         "path_mappings": [],
         "used_by": {"groups": [], "servers": []},
+        "edit_tag": f"{node_id}-1",
     }
     node.update(overrides)
     return node
+
+
+def _next_tag(tag: str) -> str:
+    """The tag the app gives a node after a save changed it (``n-storage-1`` -> ``n-storage-2``)."""
+    stem, _, n = tag.rpartition("-")
+    return f"{stem}-{int(n) + 1}"
 
 
 def _four_nodes() -> list[dict]:
@@ -164,7 +172,11 @@ class NodesApi:
             return _fulfill(route, row)
         node = self._find(parts[1])
         if len(parts) == 2 and request.method == "PUT":
-            node.update({k: v for k, v in body.items() if k != "key"})
+            # As the app does: a save from a dialog opened before the node last changed is refused.
+            if "edit_tag" in body and body["edit_tag"] != node["edit_tag"]:
+                return _fulfill(route, {"error": CHANGED_ELSEWHERE}, 409)
+            node.update({k: v for k, v in body.items() if k not in ("key", "edit_tag")})
+            node["edit_tag"] = _next_tag(node["edit_tag"])
             return _fulfill(route, node)
         if len(parts) == 2 and request.method == "DELETE":
             status, answer = self.delete_answer
@@ -591,7 +603,8 @@ class TestAddNode:
                 "path_mappings": [
                     {"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/TV Shows"},
                     {"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"},
-                ]
+                ],
+                "edit_tag": "n-new-1",
             }
         ]
         expect(page.locator("#node-n-new")).to_be_visible()
@@ -616,7 +629,7 @@ class TestAddNode:
 
         expect(page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
         assert api.bodies("PUT", "/nodes/n-new") == [
-            {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}]}
+            {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}], "edit_tag": "n-new-1"}
         ]
 
     def test_step_2_with_servers_but_no_libraries_says_to_refresh_them(self, authed_page: Page, app_url: str) -> None:
@@ -817,7 +830,10 @@ class TestNodeDialog:
         authed_page.locator("#nodeSaveMappings").click()
         expect(authed_page.locator("#nodeMediaResult")).to_have_text("Saved")
         assert api.bodies("PUT", "/nodes/n-storage") == [
-            {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
+            {
+                "path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}],
+                "edit_tag": "n-storage-1",
+            }
         ]
 
     def test_a_node_with_no_rows_gets_the_library_folders_suggested(self, authed_page: Page, app_url: str) -> None:
@@ -1183,10 +1199,54 @@ class TestNodeDialog:
         authed_page.locator("#nodeSettingsSave").click()
         expect(authed_page.locator("#nodeSettingsResult")).to_have_text("Saved")
         assert api.bodies("PUT", "/nodes/n-storage") == [
-            {"name": "storage-2", "url": "http://storage.lan:9494", "key": "****", "enabled": False}
+            {
+                "name": "storage-2",
+                "url": "http://storage.lan:9494",
+                "key": "****",
+                "enabled": False,
+                "edit_tag": "n-storage-1",
+            }
         ]
         expect(authed_page.locator("#nodeModalName")).to_have_text("storage-2")
         expect(authed_page.locator("#node-n-storage .nd-name")).to_have_text("storage-2")
+
+    def test_a_save_over_a_change_made_in_another_tab_is_refused_and_says_so(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        page = authed_page
+        page.clock.install()
+        api = _open_nodes(page, app_url, _four_nodes())
+        _open_node(page, "n-storage")
+        _node_tab(page, "settings")
+        # Another tab renames the node; this tab's next poll reads the new row while the dialog is still open.
+        api._find("n-storage").update({"name": "storage-renamed", "edit_tag": "n-storage-2"})
+        page.clock.run_for(10_500)
+        expect(page.locator("#node-n-storage .nd-name")).to_have_text("storage-renamed")
+
+        page.locator("label[for='nodeSetEnabled']").click()
+        page.locator("#nodeSettingsSave").click()
+
+        expect(page.locator("#nodeSettingsResult")).to_have_text(CHANGED_ELSEWHERE)
+        assert [body["edit_tag"] for body in api.bodies("PUT", "/nodes/n-storage")] == ["n-storage-1"]
+        assert (api._find("n-storage")["name"], api._find("n-storage")["enabled"]) == ("storage-renamed", True)
+
+    def test_a_settings_save_then_a_mappings_save_in_one_dialog_both_go_through(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        page = authed_page
+        api = _open_nodes(page, app_url, _four_nodes())
+        _open_node(page, "n-storage")
+        _node_tab(page, "settings")
+        page.locator("#nodeSetName").fill("storage-2")
+        page.locator("#nodeSettingsSave").click()
+        expect(page.locator("#nodeSettingsResult")).to_have_text("Saved")
+
+        pane = _node_tab(page, "media")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        page.locator("#nodeSaveMappings").click()
+
+        expect(page.locator("#nodeMediaResult")).to_have_text("Saved")
+        assert [body["edit_tag"] for body in api.bodies("PUT", "/nodes/n-storage")] == ["n-storage-1", "n-storage-2"]
 
     def test_a_new_key_the_node_refuses_is_not_saved(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())

@@ -107,6 +107,44 @@ class TestValidateNode:
         assert record is None and "already called" in err
 
     @pytest.mark.parametrize(
+        "name",
+        [
+            "nuc\n2026-10-15 01:00:00 | ERROR | forged line",
+            "nuc\rforged",
+            "a\x00b",
+            "a\tb",
+            "nuc forged",
+            "nuc\x85forged",
+            "‮edon",
+            "nuc​",
+        ],
+        ids=["newline", "carriage-return", "nul", "tab", "line-separator", "next-line", "rtl-override", "zero-width"],
+    )
+    def test_a_name_with_a_line_break_or_hidden_character_is_refused(self, name):
+        """Every job-log line of the node starts with its name: a line break there forges a second line."""
+        record, err = ns.validate_node(_post(name=name), existing=None, others=[])
+        assert record is None and err == "The node's name can't have line breaks, tabs or hidden characters"
+
+    @pytest.mark.parametrize("name", ["́", "　́"], ids=["combining-mark", "wide-space-and-mark"])
+    def test_a_name_with_nothing_to_see_is_refused(self, name):
+        record, err = ns.validate_node(_post(name=name), existing=None, others=[])
+        assert record is None and err == "Give the node a name"
+
+    @pytest.mark.parametrize("name", ["Café", "日本のNAS", "nuc-01 (GPU) #2", "Ünïcødé ✓"])
+    def test_ordinary_names_in_any_script_are_kept_as_typed(self, name):
+        record, err = ns.validate_node(_post(name=f" {name} "), existing=None, others=[])
+        assert err == "" and record["name"] == name
+
+    @pytest.mark.parametrize(
+        ("taken", "typed"),
+        [("Café", "Café"), ("nuc", "ＮＵＣ"), ("Straße", "STRASSE")],
+        ids=["combining-accent", "full-width", "sharp-s"],
+    )
+    def test_names_that_look_the_same_count_as_the_same_name(self, taken, typed):
+        record, err = ns.validate_node(_post(name=typed), existing=None, others=[{"name": taken}])
+        assert record is None and err == f"Another node is already called {typed}"
+
+    @pytest.mark.parametrize(
         "key", ["", "has space", "curly\u2019quote", "k" * 201], ids=["empty", "space", "non-ascii", "long"]
     )
     def test_keys_it_refuses(self, key):
@@ -241,6 +279,48 @@ class TestSettingsManagerNodes:
         with pytest.raises(NodesConflict):
             sm.update_nodes([record], expected_revision=0)
         assert sm.update_nodes([record], expected_revision=1) == 2
+
+    @pytest.mark.parametrize("hand_edited", [None, "3", 2.5, True, []])
+    def test_a_hand_edited_revision_that_isnt_a_whole_number_counts_as_zero(self, tmp_path, hand_edited):
+        import json
+
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes_revision": hand_edited}))
+        sm = SettingsManager(str(tmp_path))
+        record, _ = ns.validate_node(_post(), existing=None, others=[])
+
+        assert sm.nodes_revision == 0
+        assert sm.update_nodes([record]) == 1
+        assert sm.update_nodes([record], expected_revision=1) == 2
+
+    def test_a_node_written_by_hand_without_an_id_is_given_one_that_is_saved(self, tmp_path):
+        import json
+
+        hand_written = {"name": "nuc", "url": "http://nuc.lan:9494", "key": "k" * 24, "enabled": True}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [hand_written], "nodes_revision": 4}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        (node,) = sm.nodes
+        assert len(node["id"]) == 32 and node["name"] == "nuc"
+        assert sm.nodes_revision == 5
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["id"] == node["id"]
+        assert SettingsManager(str(tmp_path)).nodes[0]["id"] == node["id"]  # the same id after a restart
+        other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
+        assert sm.update_nodes([*sm.nodes, other]) == 6
+
+    def test_a_bad_record_written_by_hand_holds_up_only_a_change_to_itself(self, tmp_path):
+        import json
+
+        bad = {"id": "bad1", "name": "nas", "url": "not an address", "key": "k" * 24, "enabled": True}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [bad]}))
+        sm = SettingsManager(str(tmp_path))
+        other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
+
+        assert sm.update_nodes([*sm.nodes, other]) == 1
+        assert sm.nodes == [bad, other]
+        with pytest.raises(ValueError, match=r"^nas: "):
+            sm.update_nodes([{**bad, "enabled": False}, other])
+        assert sm.nodes == [bad, other]
 
     def test_an_invalid_list_is_refused_and_nothing_is_saved(self, tmp_path):
         sm = SettingsManager(str(tmp_path))

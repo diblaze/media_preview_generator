@@ -39,9 +39,16 @@ def _group_on(*node_ids):
     return [{"id": "g1", "name": "Nodes", "enabled": True, "members": members}]
 
 
-def _plex_on(node_id, *, enabled):
+def _plex_on(node_id, *, enabled, server_enabled=None):
     agent = {"enabled": enabled, "node_id": node_id}
-    return [{"id": "p1", "type": "plex", "name": "Home", "markers": {"enabled": False, "plex": {"agent": agent}}}]
+    server = {"id": "p1", "type": "plex", "name": "Home", "markers": {"enabled": False, "plex": {"agent": agent}}}
+    if server_enabled is not None:
+        server["enabled"] = server_enabled
+    return [server]
+
+
+def _group_off(*node_ids):
+    return [{**group, "enabled": False} for group in _group_on(*node_ids)]
 
 
 @pytest.fixture(autouse=True)
@@ -170,15 +177,40 @@ def test_the_dismiss_routes_know_node_card_ids(notification_id, known):
         ([], [], False),
         ([], _plex_on("abc123", enabled=False), False),
         ([], _plex_on("abc123", enabled=True), True),
+        ([], _plex_on("abc123", enabled=True, server_enabled=True), True),
+        ([], _plex_on("abc123", enabled=True, server_enabled=False), False),
         (_group_on("abc123"), [], True),
+        (_group_off("abc123"), [], False),
     ],
-    ids=["nothing", "plex-database-node-switched-off", "plex-database-node-on", "group-member"],
+    ids=[
+        "nothing",
+        "plex-database-node-switched-off",
+        "plex-database-node-on",
+        "plex-database-node-on-server-on",
+        "plex-database-node-on-server-switched-off",
+        "group-member",
+        "member-of-a-switched-off-group",
+    ],
 )
-def test_only_a_node_something_uses_gets_a_card(groups, servers, carded):
+def test_only_a_node_something_switched_on_uses_gets_a_card(groups, servers, carded):
+    """A switched-off server or group runs nothing, so a node only it uses keeps no offline card up (5.1.0 never
+    contacted a switched-off server's helper)."""
     from media_preview_generator.web.settings_manager import get_settings_manager
 
     get_settings_manager().apply_changes(updates={"worker_groups": groups, "media_servers": servers})
     assert bool(_cards(_view(reg.STATE_OFFLINE))) is carded
+
+
+def test_a_switched_off_group_or_server_still_counts_as_using_the_node_for_used_by_and_remove():
+    from media_preview_generator.nodes.settings import node_users
+
+    groups, servers = _group_off("abc123"), _plex_on("abc123", enabled=True, server_enabled=False)
+
+    assert node_users("abc123", groups, servers) == {
+        "groups": [{"id": "g1", "name": "Nodes"}],
+        "servers": [{"id": "p1", "name": "Home"}],
+    }
+    assert node_users("abc123", groups, servers, switched_on_only=True) == {"groups": [], "servers": []}
 
 
 def test_the_builder_survives_a_registry_that_fails():

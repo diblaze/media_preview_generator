@@ -37,6 +37,7 @@ NODE_ROW_KEYS = {
     "path_mappings",
     "used_by",
     "to_fix",
+    "edit_tag",
 }
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok", "error": None}
 GPU_ON_CPU_TEXT = {**GPU, "credit_text": {"on_gpu": False, "reason": "Vulkan reports no hardware GPU"}}
@@ -582,6 +583,46 @@ class TestUpdate:
         resp = client.put(f"/api/nodes/{node_id}", json={"url": "nope"})
         assert resp.status_code == 400
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
+
+    def test_a_save_from_a_dialog_opened_before_another_save_is_refused(self, client, nodes):
+        """Tab B opened the node, tab A renamed it; B switching it off must not put the old name back."""
+        row = _add(client).get_json()
+        node_id, opened_with = row["id"], row["edit_tag"]
+        tab_a = client.put(f"/api/nodes/{node_id}", json={"name": "nuc-gpu", "key": "****", "edit_tag": opened_with})
+        assert tab_a.status_code == 200 and tab_a.get_json()["edit_tag"] != opened_with
+
+        tab_b = client.put(
+            f"/api/nodes/{node_id}", json={"name": "nuc", "key": "****", "enabled": False, "edit_tag": opened_with}
+        )
+
+        assert tab_b.status_code == 409
+        assert tab_b.get_json() == {"error": api_nodes.CHANGED_ELSEWHERE}
+        assert (_sm().nodes[0]["name"], _sm().nodes[0]["enabled"]) == ("nuc-gpu", True)
+
+    def test_a_save_after_the_app_recorded_the_nodes_id_or_another_node_changed_goes_through(self, client, nodes):
+        """Only an edit of this node's own fields makes a dialog stale; the app's own records don't."""
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("down")
+        row = _add(client).get_json()
+        nodes("http://other:9494").info_answer = _info(uid="uid-2")
+        other = _add(client, name="other", url="http://other:9494").get_json()
+        nodes("http://nuc:9494").info_answer = _info()
+        assert _checked(client, row["id"])["state"] == "ready"
+        assert _sm().nodes[0]["node_uid"] == "uid-1"
+        assert client.put(f"/api/nodes/{other['id']}", json={"name": "other-2", "key": "****"}).status_code == 200
+
+        resp = client.put(f"/api/nodes/{row['id']}", json={"enabled": False, "edit_tag": row["edit_tag"]})
+
+        assert resp.status_code == 200 and resp.get_json()["enabled"] is False
+
+    def test_a_save_without_a_tag_is_not_checked(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        client.put(f"/api/nodes/{node_id}", json={"name": "nuc-gpu", "key": "****"})
+        assert client.put(f"/api/nodes/{node_id}", json={"enabled": False}).status_code == 200
+
+    def test_the_tag_never_carries_the_key(self, client, nodes):
+        row = _add(client).get_json()
+        client.put(f"/api/nodes/{row['id']}", json={"key": "another-key"})
+        assert _row(client, row["id"])["edit_tag"] == row["edit_tag"]
 
 
 class TestDelete:

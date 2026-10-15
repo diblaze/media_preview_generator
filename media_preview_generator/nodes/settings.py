@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import re
+import unicodedata
 import urllib.parse
 import uuid
 from datetime import UTC, datetime
@@ -158,6 +159,12 @@ def normalise_mappings(raw: object) -> tuple[list[dict[str, str]] | None, str]:
     return rows, ""
 
 
+def _name_key(name: str) -> str:
+    """A name as the unique-name rule compares it: names that look the same ("Café" typed two ways, "ＮＵＣ" and
+    "nuc") compare equal."""
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+
+
 def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> tuple[dict | None, str]:
     """Validate one posted node against the record it updates and the other nodes.
 
@@ -184,7 +191,13 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
         return None, "Give the node a name"
     if len(name) > NAME_MAX_LEN:
         return None, f"The node's name must be at most {NAME_MAX_LEN} characters"
-    if any(str(o.get("name") or "").strip().casefold() == name.casefold() for o in others):
+    # The name starts every job-log line of the node: a line break would forge a second line, and a hidden or
+    # right-to-left character would make it read as something else.
+    if any(unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in ("Zl", "Zp") for ch in name):
+        return None, "The node's name can't have line breaks, tabs or hidden characters"
+    if not any(unicodedata.category(ch)[0] in "LNPS" for ch in name):
+        return None, "Give the node a name"
+    if any(_name_key(str(o.get("name") or "").strip()) == _name_key(name) for o in others):
         return None, f"Another node is already called {name}"
     url, err = normalise_url(raw.get("url", base.get("url")))
     if url is None:
@@ -216,22 +229,35 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     }, ""
 
 
-def validate_nodes(raw: object) -> tuple[list[dict] | None, str]:
+def _record_label(entry: dict, fallback: str) -> str:
+    """How an error names a stored record: its name, else ``fallback``."""
+    name = entry.get("name")
+    return name.strip() if isinstance(name, str) and name.strip() else fallback
+
+
+def validate_nodes(raw: object, saved: list[dict] | None = None) -> tuple[list[dict] | None, str]:
     """Validate a whole ``nodes`` list as stored (each record keeps its id, uid and key).
+
+    A record that isn't valid but is exactly as saved (written into settings.json by hand) is kept as it is: it holds
+    up only a change to itself, never a save of the other nodes.
 
     Args:
         raw: The list to store.
+        saved: The list as it is saved now.
 
     Returns:
-        ``(nodes, "")`` or ``(None, message)``.
+        ``(nodes, "")`` or ``(None, message)``; a message about one record names it.
     """
     if not isinstance(raw, list):
         return None, "nodes must be a list"
+    as_saved = {str(n.get("id")): n for n in saved or [] if isinstance(n, dict) and n.get("id")}
     out: list[dict] = []
     seen_ids: set[str] = set()
     for entry in raw:
-        if not isinstance(entry, dict) or not str(entry.get("id") or ""):
-            return None, "Each node needs an id"
+        if not isinstance(entry, dict):
+            return None, "Each node must be an object"
+        if not str(entry.get("id") or ""):
+            return None, f"{_record_label(entry, 'A node')} needs an id"
         node_id = str(entry["id"])
         if node_id in seen_ids:
             return None, f"Node id {node_id} is used twice"
@@ -245,7 +271,10 @@ def validate_nodes(raw: object) -> tuple[list[dict] | None, str]:
         }
         record, err = validate_node({**entry, "key": None}, existing=stored, others=out)
         if record is None:
-            return None, err
+            if as_saved.get(node_id) == entry:
+                out.append(copy.deepcopy(entry))
+                continue
+            return None, f"{_record_label(entry, node_id)}: {err}"
         out.append(record)
     return out, ""
 
@@ -274,7 +303,9 @@ def server_agent(entry: object) -> dict | None:
     return agent if isinstance(agent, dict) else None
 
 
-def node_users(node_id: str, worker_groups: object, media_servers: object) -> dict[str, list[dict[str, str]]]:
+def node_users(
+    node_id: str, worker_groups: object, media_servers: object, *, switched_on_only: bool = False
+) -> dict[str, list[dict[str, str]]]:
     """The worker groups with a member on the node, and the Plex servers whose database it opens.
 
     A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
@@ -285,13 +316,15 @@ def node_users(node_id: str, worker_groups: object, media_servers: object) -> di
         node_id: The node.
         worker_groups: settings.json's ``worker_groups``.
         media_servers: settings.json's ``media_servers``.
+        switched_on_only: Leave out a worker group or Plex server that is switched off: nothing of theirs runs, so
+            nothing waits on the node (the bell's rule). "Used by" and Remove count them, as they still point at it.
 
     Returns:
         ``{"groups": [{"id", "name"}], "servers": [{"id", "name"}]}``.
     """
     groups = []
     for group in worker_groups if isinstance(worker_groups, list) else []:
-        if not isinstance(group, dict):
+        if not isinstance(group, dict) or (switched_on_only and not group.get("enabled", True)):
             continue
         members = group.get("members") or []
         if any(isinstance(m, dict) and m.get("node") == node_id for m in members):
@@ -299,8 +332,11 @@ def node_users(node_id: str, worker_groups: object, media_servers: object) -> di
     servers = []
     for entry in media_servers if isinstance(media_servers, list) else []:
         agent = server_agent(entry)
-        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
-            servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
+        if agent is None or not agent.get("enabled") or agent.get("node_id") != node_id:
+            continue
+        if switched_on_only and not entry.get("enabled", True):
+            continue
+        servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
     return {"groups": groups, "servers": servers}
 
 

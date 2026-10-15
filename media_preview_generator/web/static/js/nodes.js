@@ -878,7 +878,7 @@
         if (mappings === null) return;
         const btn = $('#addNodeFinish');
         btn.disabled = true;
-        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: mappings });
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: mappings, edit_tag: add.node.edit_tag });
         enable(btn);
         const errorEl = $('#addNodeSaveError');
         if (!r.ok) {
@@ -898,15 +898,18 @@
         if (add.finished || $('#addNodeStep2').classList.contains('d-none')) return;
         const rows = add.editor.read();
         if (!rows || !rows.length) return;
-        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: rows });
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: rows, edit_tag: add.node.edit_tag });
         if (r.ok) replaceNode(r.data);
     }
 
     // ---------- node dialog --------------------------------------------------------------------------------------
 
     // mapDirty / setDirty: the Media rows / the Settings fields were edited and not saved; discardOk lets one close
-    // through after the user said Discard.
-    const detail = { editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false };
+    // through after the user said Discard. editTag: the node's edit_tag as the dialog opened it (or as its own last
+    // save left it); polls don't move it, so a save over another tab's change is refused, not applied on top.
+    const detail = {
+        editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false, editTag: undefined,
+    };
 
     function setMapDirty(dirty) {
         detail.mapDirty = dirty;
@@ -1021,6 +1024,7 @@
         const node = nodeById(id);
         if (!node) return;
         page.openId = String(node.id);
+        detail.editTag = node.edit_tag;
         detail.mapDirty = detail.setDirty = detail.discardOk = false;
         hideDiscard();
         renderHeader(node);
@@ -1101,13 +1105,14 @@
         const result = $('#nodeMediaResult');
         const btn = $('#nodeSaveMappings');
         btn.disabled = true;
-        const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { path_mappings: mappings });
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { path_mappings: mappings, edit_tag: detail.editTag });
         enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
             return;
         }
+        detail.editTag = r.data.edit_tag;
         replaceNode(r.data);
         refreshOpenNode();
         setMapDirty(false);
@@ -1163,13 +1168,14 @@
             }
             if (probe.data && probe.data.ok === false) unanswered = probeErrorText(error || {}, body.url);
         }
-        const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, body);
+        const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { ...body, edit_tag: detail.editTag });
         enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
             return;
         }
+        detail.editTag = r.data.edit_tag;
         replaceNode(r.data);
         refreshOpenNode();
         detail.editor.setName(r.data.name || r.data.id);
