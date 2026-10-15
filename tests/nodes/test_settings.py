@@ -137,10 +137,18 @@ class TestValidateNode:
 
     @pytest.mark.parametrize(
         ("taken", "typed"),
-        [("Café", "Café"), ("nuc", "ＮＵＣ"), ("Straße", "STRASSE")],
-        ids=["combining-accent", "full-width", "sharp-s"],
+        [
+            ("Café", "Café"),
+            ("nuc", "ＮＵＣ"),
+            ("Straße", "STRASSE"),
+            ("nuc 1", "nuc  1"),
+            ("nuc  1", "nuc 1"),
+            ("nuc 1", "nuc\u3000 1"),
+        ],
+        ids=["combining-accent", "full-width", "sharp-s", "double-space", "taken-with-double-space", "wide-space"],
     )
     def test_names_that_look_the_same_count_as_the_same_name(self, taken, typed):
+        """A page shows a run of spaces as one, so "nuc  1" and "nuc 1" read as the same node."""
         record, err = ns.validate_node(_post(name=typed), existing=None, others=[{"name": taken}])
         assert record is None and err == f"Another node is already called {typed}"
 
