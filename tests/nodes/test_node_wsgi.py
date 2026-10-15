@@ -244,6 +244,67 @@ def test_connections_are_counted_per_caller_network_not_per_address(served, monk
             conn.close()
 
 
+def _keep_alive(port: int, source: str) -> socket.socket:
+    """A connection that had its answer and stays open, as each of the app's worker threads keeps one."""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0))
+    conn.sendall(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert b" 200 " in conn.recv(4096)
+    return conn
+
+
+def _closed_by_the_node(conn: socket.socket) -> bool:
+    conn.settimeout(1.0)
+    try:
+        while conn.recv(4096):
+            pass  # the rest of the last answer
+    except TimeoutError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def _answer_from(port: int, source: str) -> bytes:
+    try:
+        return _health_from(port, source)
+    except OSError:
+        return b""
+
+
+def test_an_address_at_its_limit_gives_up_an_idle_keep_alive_rather_than_refuse(served):
+    # One keep-alive per worker thread running a file here: 110 workers against a 100-connection limit left 10 polls
+    # refused every second, and each refused poll handed a file back.
+    port = served(CONNECTIONS_PER_ADDRESS=5)
+    idle = [_keep_alive(port, "127.0.0.1") for _ in range(5)]
+    try:
+        assert b" 200 " in _answer_from(port, "127.0.0.1")
+        assert sum(_closed_by_the_node(conn) for conn in idle) == 1
+    finally:
+        for conn in idle:
+            conn.close()
+
+
+def test_an_address_whose_every_connection_is_busy_is_still_refused(served):
+    port = served(CONNECTIONS_PER_ADDRESS=5)
+    held = [_half_sent(port, "127.0.0.2") for _ in range(5)]
+    try:
+        time.sleep(0.5)
+        assert _answer_from(port, "127.0.0.2") == b""
+        assert not any(_closed_by_the_node(conn) for conn in held)
+    finally:
+        for conn in held:
+            conn.close()
+
+
+def test_one_address_may_hold_a_connection_for_every_worker_one_app_can_give_a_node():
+    from media_preview_generator.nodes.server import wsgi
+    from media_preview_generator.worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
+
+    assert wsgi.CONNECTIONS_PER_ADDRESS > MAX_CPU_WORKERS + MAX_GPU_WORKERS
+    # And still no single machine takes every connection the node has, Windows' smaller limit included.
+    assert wsgi.CONNECTIONS_PER_ADDRESS < wsgi.SELECT_CONNECTION_LIMIT <= wsgi.CONNECTION_LIMIT
+
+
 def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):
     port = served(REQUEST_READ_S=1)
     started = time.monotonic()

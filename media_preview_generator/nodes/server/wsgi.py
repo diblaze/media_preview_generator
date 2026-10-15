@@ -6,8 +6,8 @@ and the Plex database role's "one writer at a time" is a lock inside it. waitres
 event loop before a thread takes it, so connections that send a request slowly, or never finish one, hold no thread:
 ``/v1/health`` and the app's polls keep answering. Nothing here needs the key, so anyone who can reach the port could
 otherwise freeze the node with a few half-sent requests. Nor can they hold every connection the node takes: one
-address gets :data:`CONNECTIONS_PER_ADDRESS` at once, and each request must arrive whole within
-:data:`REQUEST_READ_S`.
+address gets :data:`CONNECTIONS_PER_ADDRESS` at once (past that, one of its idle keep-alives makes room), and each
+request must arrive whole within :data:`REQUEST_READ_S`.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import argparse
 import os
 import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
 from .app import EXTENSION, MAX_BODY_BYTES, create_node_app
 from .identity import caller_key
 
@@ -38,10 +40,12 @@ CHANNEL_TIMEOUT_S = 60
 CONNECTION_LIMIT = 1000
 # Windows has no poll(), and its select() takes at most 512 sockets: room is left for the listener and waitress's own.
 SELECT_CONNECTION_LIMIT = 500
-# Connections one address (an IPv6 caller's whole /64: ``identity.caller_key``) may hold at once. The app keeps a few
-# per running task on the node, far under this, and no single machine can take every connection the node has (waitress
-# has no per-address limit of its own).
-CONNECTIONS_PER_ADDRESS = 100
+# Connections one address (an IPv6 caller's whole /64: ``identity.caller_key``) may hold at once. Each of the app's
+# workers running a file here keeps one open (a keep-alive per worker thread), and one app can give a node up to
+# MAX_CPU_WORKERS + MAX_GPU_WORKERS of them, plus a few for its checks and clean-ups. Twice that leaves room for both
+# and for a second app on the same machine, and stays under SELECT_CONNECTION_LIMIT, so no single machine can take
+# every connection the node has (waitress has no per-address limit of its own).
+CONNECTIONS_PER_ADDRESS = 2 * (MAX_CPU_WORKERS + MAX_GPU_WORKERS)
 # A request (headers and body) must arrive whole within this long of its first byte. CHANNEL_TIMEOUT_S only closes a
 # connection that went quiet, so one header line every few seconds would otherwise hold a connection forever.
 REQUEST_READ_S = 30
@@ -67,9 +71,37 @@ def _setup_logging() -> None:
     setup_logging(log_level=level)
 
 
+def _quiet(channel: Any) -> bool:
+    """Whether a connection sits open with nothing on it: no request being read, run or answered, and none arriving.
+
+    Args:
+        channel: A waitress ``HTTPChannel``.
+
+    Returns:
+        True when closing it loses nothing (a client's keep-alive between requests, or one its peer closed).
+    """
+    if channel.requests or channel.request is not None or channel.total_outbufs_len:
+        return False
+    if channel.will_close or channel.close_when_flushed:
+        return False
+    try:
+        # A request already on its way, not yet read: closing now would drop it.
+        waiting = channel.socket.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return True  # a broken connection: nothing to lose either
+    return not waiting
+
+
 def _limited_channels(listen_map: dict) -> Any:
-    """A waitress ``channel_class`` that refuses an address's connection past :data:`CONNECTIONS_PER_ADDRESS` and
-    closes one whose request hasn't arrived whole within :data:`REQUEST_READ_S`.
+    """A waitress ``channel_class`` that holds an address to :data:`CONNECTIONS_PER_ADDRESS` connections and closes one
+    whose request hasn't arrived whole within :data:`REQUEST_READ_S`.
+
+    At the limit, one of the address's idle keep-alives is closed to make room, and only an address whose every
+    connection is busy (reading, running or answering a request) is refused: a client keeping more keep-alives than
+    the limit then only loses idle ones, which it opens again. The one closed is the one most recently busy: the
+    app's workers poll on a timer, so its owner is the furthest from sending on it again.
 
     Args:
         listen_map: The server's socket map: every open connection is in it.
@@ -101,8 +133,14 @@ def _limited_channels(listen_map: dict) -> Any:
 
     def accept(server: Any, sock: Any, addr: Any, adj: Any, map: dict | None = None) -> NodeChannel | None:
         peer = caller_key(addr[0] if isinstance(addr, tuple) else str(addr))
-        held = sum(1 for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.caller == peer)
-        if held < CONNECTIONS_PER_ADDRESS:
+        held = [d for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.caller == peer]
+        if len(held) >= CONNECTIONS_PER_ADDRESS:
+            quiet = next((d for d in sorted(held, key=lambda d: -d.last_activity) if _quiet(d)), None)
+            if quiet is not None:
+                # waitress's loop calls this, so the channel is closed here and now (it leaves the map at once).
+                quiet.handle_close()
+                held.remove(quiet)
+        if len(held) < CONNECTIONS_PER_ADDRESS:
             channel = NodeChannel(server, sock, addr, adj, map=map)
             channel.caller = peer
             return channel
