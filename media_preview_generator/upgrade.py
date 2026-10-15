@@ -222,6 +222,10 @@ def run_migrations(settings_manager, *, plex_server_id: str | None = None) -> No
             new one: a restored legacy file's Plex server keeps the id it got at the first upgrade.
 
     """
+    if getattr(settings_manager, "load_failed", False) is True:
+        # Migrating empty defaults would overwrite the unreadable file the owner still needs to fix or restore.
+        logger.error("Skipping start-up migrations: settings.json could not be read and is left untouched.")
+        return
     # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
     # the user set, so no "Settings migrated" card is shown for them. An install set up with environment variables
     # alone has no file either, but the steps rewrite the setup seeded from them, so that one still gets the card.

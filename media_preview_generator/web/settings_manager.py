@@ -78,12 +78,14 @@ class SettingsManager:
         self._lock = threading.RLock()
         # Set when settings.json exists but could not be read; setup then counts as complete so auth stays closed.
         self._load_failed = False
+        self._refused_write_logged = False
         self._load()
         self._load_setup_state()
 
     def _load(self) -> None:
         """Load settings from file."""
         self._load_failed = False
+        self._refused_write_logged = False
         if self.settings_file.exists():
             try:
                 with open(self.settings_file) as f:
@@ -248,7 +250,17 @@ class SettingsManager:
         self._settings.pop("plex_webhook_enabled", None)
 
     def _save(self) -> None:
-        """Save settings to file atomically."""
+        """Save settings to file atomically, unless the file couldn't be read (see ``load_failed``)."""
+        if self._load_failed:
+            # The memory copy is empty defaults: writing it would replace the owner's real file and open setup.
+            if not self._refused_write_logged:
+                self._refused_write_logged = True
+                logger.error(
+                    "Not writing {}: it could not be read, so the app is keeping it untouched. Fix the file or "
+                    "restore a backup (Settings > Backup & Restore), then restart; changes made meanwhile are not saved.",
+                    self.settings_file,
+                )
+            return
         try:
             from ..utils import atomic_json_save_with_backup
 
