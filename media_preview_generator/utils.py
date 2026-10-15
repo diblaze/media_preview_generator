@@ -180,6 +180,10 @@ def is_node_mode() -> bool:
     return os.environ.get("MODE", "").strip().lower() == "node"
 
 
+# What each FFmpeg run's log in scratch_dir() is named from; a node removes the ones a killed process left, at its start.
+FFMPEG_LOG_PREFIX = "ffmpeg_output_"
+
+
 def scratch_dir() -> str:
     """The folder for this process's short-lived files (FFmpeg's log, a helper's stderr).
 

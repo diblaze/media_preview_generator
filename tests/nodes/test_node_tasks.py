@@ -739,6 +739,23 @@ class TestExpiry:
 
         assert sorted(os.listdir(root)) == ["someone-elses"]
 
+    def test_the_ffmpeg_logs_a_killed_node_left_in_its_temp_folder_are_removed_at_start(self, tmp_path, monkeypatch):
+        """A preview's FFmpeg writes its log to the node's temp folder, outside the task's own dir; a node killed
+        mid-preview (kill -9, the OOM killer, a stop past its grace) never removes it."""
+        from media_preview_generator.utils import scratch_dir
+
+        root = tmp_path / "node-tmp"
+        root.mkdir()
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(root))
+        assert scratch_dir() == str(root)
+        (root / "ffmpeg_output_4150646_128408868542144_1792054993907846558.log").write_text("frame=  120 fps= 60\n")
+        (root / "ffmpeg_output_notes.txt").write_text("not one of FFmpeg's logs\n")
+
+        tasks.TaskTable({}, temp_root=str(root)).close()
+
+        assert sorted(os.listdir(root)) == ["ffmpeg_output_notes.txt"]
+
 
 class TestStopping:
     """SIGTERM closes the table first; the server answers until the cancelled tasks' FFmpeg has stopped."""

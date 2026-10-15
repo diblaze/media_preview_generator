@@ -26,6 +26,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...utils import FFMPEG_LOG_PREFIX
 from ..protocol import (
     CLIENT_TASK_ID_FIELD,
     CLIENT_TASK_ID_PATTERN,
@@ -395,15 +396,23 @@ class TaskTable:
         return sorted(self._ops)
 
     def _remove_leftovers(self) -> None:
-        # Tasks live in memory only, so a task dir found at start belongs to a process that died mid-task.
+        # Tasks live in memory only, so a task dir found at start belongs to a process that died mid-task, and so does
+        # an FFmpeg log: a preview's FFmpeg writes it here (utils.scratch_dir), outside the task's own dir.
         try:
             names = os.listdir(self.temp_root)
         except OSError:
             return
         for name in names:
             path = os.path.join(self.temp_root, name)
-            if name.startswith(TASK_DIR_PREFIX) and os.path.isdir(path) and not os.path.islink(path):
+            if os.path.islink(path):
+                continue
+            if name.startswith(TASK_DIR_PREFIX) and os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
+            elif name.startswith(FFMPEG_LOG_PREFIX) and name.endswith(".log") and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    logger.debug("Couldn't remove {} left by an earlier run: {}", name, exc)
 
     def start(self, spec: object) -> str:
         """Validate a TASK_SPEC and start its op in a thread.

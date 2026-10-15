@@ -37,7 +37,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import dies_with_node, gpu_settings_hint, scratch_dir, working_folder_hint
+from ..utils import FFMPEG_LOG_PREFIX, dies_with_node, gpu_settings_hint, scratch_dir, working_folder_hint
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -476,7 +476,7 @@ def create_ffmpeg_runner(
         thread_id = threading.get_ident()
         output_file = os.path.join(
             scratch_dir(),
-            f"ffmpeg_output_{os.getpid()}_{thread_id}_{time.time_ns()}.log",
+            f"{FFMPEG_LOG_PREFIX}{os.getpid()}_{thread_id}_{time.time_ns()}.log",
         )
         stderr_fh = open(output_file, "w", encoding="utf-8")
         proc = None
