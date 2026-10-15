@@ -268,3 +268,19 @@ def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_row
     assert (legacy["ok"], legacy["severity"], legacy["fix_where"]) == (False, "recommended", "node")
     assert [s["id"] for s in envelope["sections"]] == ["node_connection", "node_plex_db"]
     assert envelope["overall_ok"] is True
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["plex-db-node", "old-plex-helper"])
+def test_a_plex_database_nodes_version_row_says_new_enough_not_matching(legacy):
+    envelope = _envelope(
+        _details(roles=(ROLE_PLEX_DB,), gpus=(), legacy=legacy),
+        file_checks=_report(Capability.READY, "", db_path="/d", lock_holder=True),
+    )
+    row = _check(envelope, "node_version")
+    assert (row["ok"], row["label"]) == (True, "The node's version is new enough")
+    assert "1.0.0 or newer" in row["explanation"]
+
+
+def test_a_worker_nodes_version_row_says_it_matches():
+    row = _check(_envelope(_details()), "node_version")
+    assert (row["ok"], row["label"]) == (True, "The node's version matches this app")

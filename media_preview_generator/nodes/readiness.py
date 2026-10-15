@@ -121,14 +121,27 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
     )
     if not key_ok:
         return rows
+    from ..markers.publishers.plex_remote import MIN_AGENT_VERSION
+
     version_ok = view.state != STATE_UPDATE_NEEDED
+    # The registry holds a worker to this app's exact version, a Plex database node only to a minimum one.
+    worker = protocol.ROLE_WORKER in view.roles or not view.roles
+    if worker:
+        passing = "The node's version matches this app"
+        explanation = "A worker node runs this app's own code, so it must be the same version."
+    else:
+        passing = "The node's version is new enough"
+        explanation = (
+            f"A Plex database node needs version {MIN_AGENT_VERSION} or newer of its Plex database role. It doesn't "
+            "have to match this app's version."
+        )
     rows.append(
         _row(
             "node_version",
-            "The node's version matches this app" if version_ok else "The node needs an update",
+            passing if version_ok else "The node needs an update",
             severity=CRITICAL,
             ok=version_ok,
-            explanation="A worker node runs this app's own code, so it must be the same version.",
+            explanation=explanation,
             current=view.version or "unknown",
             recommended=app_version if protocol.ROLE_WORKER in view.roles else None,
             reason=None if version_ok else view.reason,
