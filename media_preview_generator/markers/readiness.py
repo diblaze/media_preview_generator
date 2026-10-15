@@ -107,7 +107,7 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
     "disabled": (
         "The Plex database node is turned off",
         "turned off",
-        "Turn it on on the Nodes page. Markers wait here until then; nothing is lost.",
+        "Turn it on on the Nodes page, then run Intro & Credits again: nothing is written to Plex while it is off.",
     ),
     "different_node": (
         "A different node answers at the Plex database node's address",
