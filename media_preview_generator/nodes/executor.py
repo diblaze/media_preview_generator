@@ -26,7 +26,14 @@ from loguru import logger
 
 from ..processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, CodecNotSupportedError
 from . import protocol
-from .client import NodeClient, NodeError, NodeRequestError, NodeTimeoutError, NodeUnknownTaskError
+from .client import (
+    MAX_ARTIFACT_BYTES,
+    NodeClient,
+    NodeError,
+    NodeRequestError,
+    NodeTimeoutError,
+    NodeUnknownTaskError,
+)
 from .registry import NodeRegistry, get_registry
 
 # How often a running task is polled; a cancel or a pause flip is forwarded within one slice of it.
@@ -39,6 +46,10 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
+# A preview frame is a 320x240 JPEG (tens of KB; raw RGB would be 225 KB), and a 4-hour film at the 1 s interval
+# is 14,400 of them: anything past these is not a preview's frames.
+MAX_FRAME_BYTES = 16 * 1024 * 1024
+MAX_FRAMES = 100_000
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
 
 REQUEUE_NODE_UNAVAILABLE = "node_unavailable"
@@ -169,15 +180,19 @@ def extract_artifact(data: bytes, dest: str) -> list[str]:
         The names unpacked, sorted.
 
     Raises:
-        NodeTaskError: The tar is unreadable or holds anything but plain files with bare names.
+        NodeTaskError: The tar is unreadable, holds anything but plain files with bare names, or is far bigger
+            than any preview's frames.
     """
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
-            members = tar.getmembers()
-            for member in members:
+            members = []
+            total = 0
+            # A sparse member passes isfile() yet unpacks to any size it declares from a few bytes of tar.
+            for member in tar:
                 name = member.name
                 if (
                     not member.isfile()
+                    or member.issparse()
                     or not name
                     or name in (".", "..")
                     or "/" in name
@@ -185,6 +200,10 @@ def extract_artifact(data: bytes, dest: str) -> list[str]:
                     or name != os.path.basename(name)
                 ):
                     raise NodeTaskError(protocol.KIND_FAILED, f"The node's frames hold an unexpected entry {name!r}")
+                total += member.size
+                if member.size > MAX_FRAME_BYTES or total > MAX_ARTIFACT_BYTES or len(members) >= MAX_FRAMES:
+                    raise NodeTaskError(protocol.KIND_FAILED, "The node's frames are far bigger than a preview's")
+                members.append(member)
             tar.extractall(dest, members=members, filter="data")
     except tarfile.TarError as exc:
         raise NodeTaskError(protocol.KIND_FAILED, f"The node's frames couldn't be unpacked: {exc}") from exc

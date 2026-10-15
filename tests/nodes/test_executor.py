@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
 import io
 import os
 import re
@@ -27,6 +29,7 @@ from media_preview_generator.nodes.executor import (
     NodeUnavailableError,
     Placement,
     current_placement,
+    extract_artifact,
     placed_on,
     run_on_node,
 )
@@ -36,6 +39,12 @@ from media_preview_generator.processing.generator import FALLBACK_HWACCEL, FALLB
 from .executor_fakes import NODE_ID, NODE_NAME, FakeRegistry, ScriptedClient, finished, running, unreachable
 
 PLACEMENT = Placement(NODE_ID, NODE_NAME)
+
+# `truncate -s 4000000000 00001.jpg && tar --sparse --format=gnu -cf bomb.tar 00001.jpg` (10,240 bytes), gzipped.
+SPARSE_BOMB_GZ_B64 = (
+    "H4sIAAAAAAAC/+3QQQrDMAxEUR3FJyhjW7YP0hMYCoWsQpvcP8mikFUChXRR/tuMQALBSFK8DePTrrO+UHXfMraifX5YLKm6sppnU1ynZuFuPzC/"
+    "p/4KwR596kd3Z/uv5VJzqsm3FvaNXPIAAAAAAAAAAAAAAAAAAPAnFj+Ygq8AKAAA"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -198,6 +207,33 @@ class TestArtifact:
         _install(client)
         with pytest.raises(NodeTaskError, match="couldn't be unpacked"):
             _run(media, artifact_to=str(tmp_path))
+
+    def test_a_sparse_member_declaring_gigabytes_is_refused_and_nothing_is_written(self, tmp_path):
+        # 10 KB of tar that unpacks into a 4,000,000,000-byte "JPEG" (see SPARSE_BOMB_GZ_B64).
+        data = gzip.decompress(base64.b64decode(SPARSE_BOMB_GZ_B64))
+        assert len(data) == 10240
+        with pytest.raises(NodeTaskError, match="unexpected entry"):
+            extract_artifact(data, str(tmp_path))
+        assert os.listdir(tmp_path) == []
+
+    def test_a_frame_bigger_than_any_preview_frame_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_FRAME_BYTES", 4)
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("1.jpg", b"1234"), ("2.jpg", b"12345")]), str(tmp_path))
+        assert os.listdir(tmp_path) == []
+
+    def test_more_frames_than_any_preview_has_are_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_FRAMES", 2)
+        assert extract_artifact(_tar([("1.jpg", b"a"), ("2.jpg", b"b")]), str(tmp_path)) == ["1.jpg", "2.jpg"]
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("3.jpg", b"a"), ("4.jpg", b"b"), ("5.jpg", b"c")]), str(tmp_path))
+        assert sorted(os.listdir(tmp_path)) == ["1.jpg", "2.jpg"]
+
+    def test_frames_adding_up_past_the_artifact_cap_are_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_ARTIFACT_BYTES", 8)
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("1.jpg", b"12345"), ("2.jpg", b"12345")]), str(tmp_path))
+        assert os.listdir(tmp_path) == []
 
     def test_artifact_download_failure_is_node_unavailable(self, media, tmp_path):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])

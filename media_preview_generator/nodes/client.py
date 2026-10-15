@@ -22,6 +22,9 @@ READ_TIMEOUT_S = 10.0
 INFO_TIMEOUT_S = 60.0
 # A preview's frames are a few MB; the artifact download gets its own, longer read timeout.
 ARTIFACT_TIMEOUT_S = 300.0
+# The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
+# this; a node sending more is refused rather than held in memory.
+MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
 
 
 class NodeError(Exception):
