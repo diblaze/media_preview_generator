@@ -22,7 +22,7 @@ from loguru import logger
 
 from . import protocol
 from .access_results import AccessResultStore
-from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError
+from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError, NodeTimeoutError
 from .protocol import PathMapping
 from .settings import find_node, node_mappings
 
@@ -153,6 +153,11 @@ class _Live:
     # ``(rows, result, checked_at)`` and adopted when exactly those rows are saved.
     pending_access: tuple[list, dict, float] | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Health checks begun so far, the number of the last one that came back ready, and how many had begun when job
+    # code last reported the node unavailable: only a check begun after that report vouches for the node again.
+    checks_begun: int = 0
+    ready_check: int = 0
+    reported_at_check: int = 0
 
 
 def _app_version() -> str:
@@ -392,17 +397,30 @@ class NodeRegistry:
     # ------------------------------------------------------------------ reports from job code
 
     def report_unavailable(self, node_id: str) -> None:
-        """A node stopped answering mid-task: check it now rather than at its next turn."""
+        """A node stopped answering mid-task: check it now rather than at its next turn.
+
+        A check already running began before the report, so another one follows it straight away.
+        """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return
             live.next_check = 0.0
+            live.reported_at_check = live.checks_begun
         if self._running():
             self._wake.set()
         else:
             self._submit(self._run_check, node_id)
+
+    def checked_ready_since_unavailable(self, node_id: str) -> bool:
+        """Whether the node is ready and a health check begun after it was last reported unavailable said so."""
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None or self._state(live)[0] != STATE_READY:
+                return False
+            return live.ready_check > live.reported_at_check
 
     def report_not_visible(self, node_id: str, app_path: str, reason: str) -> None:
         """A node couldn't see a file; three different files within 10 minutes is an access problem."""
@@ -745,11 +763,14 @@ class NodeRegistry:
             record, client = copy.deepcopy(live.record), live.client
         try:
             with live.check_lock:
+                with self._lock:
+                    live.checks_begun += 1
+                    number = live.checks_begun
                 outcome = self._probe(record, client)
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.
-                    self._apply(live, outcome)
+                    self._apply(live, outcome, number)
                     has_access_problem = bool(live.access_problem)
                 if outcome.uid and outcome.uid != record.get("node_uid"):
                     self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
@@ -761,7 +782,7 @@ class NodeRegistry:
             with self._lock:
                 live.checking = False
 
-    def _apply(self, live: _Live, outcome: _Outcome) -> None:
+    def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason
         if outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
@@ -770,7 +791,9 @@ class NodeRegistry:
             live.offline_streak = 0
             delay = HEALTH_INTERVAL_S
             live.last_seen = self._wall_clock()
-        live.next_check = self._clock() + delay
+        if outcome.state == STATE_READY:
+            live.ready_check = number
+        live.next_check = 0.0 if number <= live.reported_at_check else self._clock() + delay
         if outcome.info is not None or outcome.legacy:
             live.info = outcome.info
             live.legacy = outcome.legacy
@@ -784,6 +807,7 @@ class NodeRegistry:
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
         info: dict | None = None
+        timeouts = 0
         for attempt in range(CHECK_ATTEMPTS):
             try:
                 info = client.info()
@@ -799,8 +823,14 @@ class NodeRegistry:
                 return self._probe_legacy(record)
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
+                timeouts += isinstance(exc, NodeTimeoutError)
                 if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
                     break
+        if info is None and timeouts == CHECK_ATTEMPTS:
+            return _Outcome(
+                STATE_OFFLINE,
+                f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it.",
+            )
         if info is None:
             return _Outcome(
                 STATE_OFFLINE,

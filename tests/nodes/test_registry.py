@@ -10,7 +10,12 @@ import pytest
 
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.access_results import AccessResultStore
-from media_preview_generator.nodes.client import NodeAuthError, NodeProtocolError, NodeUnreachableError
+from media_preview_generator.nodes.client import (
+    NodeAuthError,
+    NodeProtocolError,
+    NodeTimeoutError,
+    NodeUnreachableError,
+)
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
 
 APP_VERSION = "9.9.9"
@@ -164,6 +169,13 @@ class TestStates:
         assert view.state == reg.STATE_OFFLINE and "didn't answer" in view.reason
         assert "http://" not in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+
+    def test_a_node_that_takes_connections_but_never_answers_says_so(self, h):
+        client = h.client()
+        client.infos = [NodeTimeoutError("x")] * 3
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_OFFLINE
+        assert view.reason.startswith("nuc accepts connections but doesn't answer.")
 
     def test_one_failed_attempt_is_not_offline(self, h):
         client = h.client()
@@ -490,6 +502,44 @@ class TestLoop:
         h.client().default_info = NodeUnreachableError("gone")
         h.registry.report_unavailable("n1")
         assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_OFFLINE)
+
+    def test_only_a_check_begun_after_a_drop_vouches_for_the_node(self, h):
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is True
+        client = h.client()
+        started, release = threading.Event(), threading.Event()
+
+        def slow_info():
+            started.set()
+            release.wait(5)
+            return _info()
+
+        client.info = slow_info
+        checking = threading.Thread(target=h.registry.check_now, args=("n1",))
+        checking.start()
+        assert started.wait(5)
+        h.registry._run_check = lambda *args, **kwargs: None  # keep the report's own check out of it
+        h.registry.report_unavailable("n1")
+        release.set()
+        checking.join(5)
+
+        # Ready, but that check began before the node dropped its file; the next one is due at once.
+        assert h.registry.view("n1").state == reg.STATE_READY
+        assert h.registry.checked_ready_since_unavailable("n1") is False
+        assert h.registry._nodes["n1"].next_check == 0.0
+        del h.registry._run_check
+        client.info = lambda: _info()
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is True
+
+    def test_a_check_begun_after_a_drop_that_finds_the_node_down_vouches_for_nothing(self, h):
+        h.registry.check_now("n1")
+        h.registry._run_check = lambda *args, **kwargs: None
+        h.registry.report_unavailable("n1")
+        del h.registry._run_check
+        h.client().infos = [NodeUnreachableError("x")] * 3
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is False
 
     def test_unknown_nodes_are_ignored_by_every_report(self, h):
         h.registry.report_unavailable("nope")

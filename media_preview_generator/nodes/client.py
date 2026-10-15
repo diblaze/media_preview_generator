@@ -19,8 +19,11 @@ from . import protocol
 # Connect fast (a LAN node either answers or it doesn't); read long enough for a busy node to answer a poll.
 CONNECT_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 10.0
-# /v1/info runs GPU detection on a cold node (measured 0.7-1.3 s; a slow Vulkan probe can take longer).
-INFO_TIMEOUT_S = 60.0
+# /v1/info never waits on GPU detection, so a node that doesn't answer it this fast is stuck; three tries of it then
+# call a hung node offline within a minute, while the files it dropped are held back from it.
+INFO_TIMEOUT_S = 10.0
+# A rescan runs GPU detection while the request waits (measured 0.7-1.3 s; a slow Vulkan probe can take longer).
+GPU_RESCAN_TIMEOUT_S = 60.0
 # A preview's frames are a few MB; the artifact download gets its own, longer read timeout.
 ARTIFACT_TIMEOUT_S = 300.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
@@ -216,7 +219,7 @@ class NodeClient:
 
     def rescan_gpus(self) -> dict:
         """``POST /v1/gpus/rescan``: run GPU detection again and answer with the fresh list."""
-        return self._call("POST", protocol.ROUTE_GPUS_RESCAN, json={}, read_timeout=INFO_TIMEOUT_S)
+        return self._call("POST", protocol.ROUTE_GPUS_RESCAN, json={}, read_timeout=GPU_RESCAN_TIMEOUT_S)
 
     def access_check(self, mappings: list[protocol.PathMapping], files: list[dict]) -> dict:
         """``POST /v1/access-check`` for up to a few dozen ``{"path", "size", "mtime_ns"}`` files."""

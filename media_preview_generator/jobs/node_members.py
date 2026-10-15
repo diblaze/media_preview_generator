@@ -178,18 +178,15 @@ def member_detected(policy: dict, local_devices: set[str] | dict, nodes: NodeHar
     return policy["resource"] == "cpu" or policy.get("device") in local_devices
 
 
-def ready_seen_at(node_id: str) -> float | None:
-    """When the registry last heard from ``node_id`` while it is ready; None while it isn't ready or can't be read."""
-    from ..nodes.registry import STATE_READY, get_registry
+def checked_ready_since_drop(node_id: str) -> bool:
+    """Whether a registry check of ``node_id`` begun after it last dropped a file found it ready (False on errors)."""
+    from ..nodes.registry import get_registry
 
     try:
-        view = get_registry().view(node_id)
+        return get_registry().checked_ready_since_unavailable(node_id)
     except Exception as exc:
         logger.debug("Could not read node {} from the node registry: {}", node_id, exc)
-        return None
-    if view is None or view.state != STATE_READY:
-        return None
-    return view.last_seen
+        return False
 
 
 def worker_node_id(worker: object) -> str | None:

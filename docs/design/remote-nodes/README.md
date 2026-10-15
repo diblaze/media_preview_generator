@@ -32,8 +32,8 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
   database tests on `windows-latest`, PyInstaller build started and called), and a real lab run with GPU, CPU and
   Plex database nodes (all scenarios passed: [`evidence/lab-final/`](evidence/lab-final/README.md)).
 * **Changes from the design as written:**
-  - A node that drops a file is held back until it checks ready again (or 60 s); starts the node never took don't
-    count toward the two-drop limit (max 5 per file). Retries prefer another worker.
+  - A node that drops a file is held back until a check begun after the drop finds it ready (or 5 min); starts
+    the node never took don't count toward the two-drop limit (max 5 per file). Retries prefer another worker.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
   - Test access results persist in `node_access_results.json` until that node's mappings change. A test of rows
@@ -222,8 +222,10 @@ retry runs (on the **node's** CPU, see §6).
   that comes back stops it); a second drop on the same item fails it ("node <name> unavailable (it dropped the
   file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
-  then it fails). After either, the node gets no new file until the registry's next check of it comes back
-  ready (60 s at most), and the item's retry goes to another node or this app when one is free.
+  then it fails). After either, the node gets no new file until a registry check begun after the drop comes back
+  ready (5 min at most), and the item's retry goes to another node or this app when one is free. Health checks
+  read `/v1/info` with a 10 s timeout, so a node that takes connections but never answers reads offline ("accepts
+  connections but doesn't answer") within a minute.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the
   item goes to the next eligible worker on a different node (or this app); when every eligible worker has failed it,
   the item fails "not visible on X, Y". Members on a node that is offline or connecting (or rechecking a lost GPU)
