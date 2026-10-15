@@ -71,10 +71,13 @@ READ_BACK_BUDGET_S = 60.0
 NODE_FULL_RETRY_S = 0.5
 # The body fields that say how long the node may wait for the database; a request asked again sends what is left.
 _WAIT_FIELDS = ("deadline_s", "budget_s")
-# The most of one answer this app reads. Library Health's rows for a whole large library are the largest answer (each
-# media part's extra_data, a few KB): hundreds of MB at most. Answers are never compressed, so a small reply can't
+# The most of one answer this app reads: Library Health's rows, the largest answer (~2 KB per media part measured on
+# a lab library of 778 parts), so 512 MB fits ~250,000 parts. Answers are never compressed, so a small reply can't
 # expand into gigabytes here.
 MAX_ANSWER_BYTES = 512 * 1024 * 1024
+# Every other answer: JSON parses into ~25x its size here (each 3-byte ``[],`` is a 64-byte list), and each is about
+# one item, a check or 50 read-back items (the largest item of that lab library: 13 KB).
+MAX_SMALL_ANSWER_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 # Agent states the Edit tab badges (``capability().details["agent"]["state"]``).
 AGENT_CONNECTED = "connected"
@@ -727,7 +730,15 @@ class AgentClient:
         """The address, for messages the user reads."""
         return self.url or "(no address)"
 
-    def post(self, path: str, body: dict, *, timeout: float, unreachable: str = MARKERS_WAIT_FOR_THE_NODE) -> dict:
+    def post(
+        self,
+        path: str,
+        body: dict,
+        *,
+        timeout: float,
+        unreachable: str = MARKERS_WAIT_FOR_THE_NODE,
+        limit: int = MAX_SMALL_ANSWER_BYTES,
+    ) -> dict:
         """Send one request and return its ``result``.
 
         Args:
@@ -735,6 +746,7 @@ class AgentClient:
             body: The request body.
             timeout: Seconds allowed for the answer, on top of the connect timeout.
             unreachable: What happens to the feature's work while the node doesn't answer, for that message.
+            limit: The most bytes of the answer read; a larger one is refused unparsed.
 
         Returns:
             The answer's ``result`` object.
@@ -750,7 +762,9 @@ class AgentClient:
         give_up = time.monotonic() + _time_left(body)
         while True:
             try:
-                return self._send(self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable)
+                return self._send(
+                    self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable, limit=limit
+                )
             except NodeFullError:
                 if give_up - time.monotonic() <= NODE_FULL_RETRY_S or wait_cancelled():
                     raise
@@ -764,9 +778,16 @@ class AgentClient:
         return self._send(self._session.get, "/v1/ping", {}, timeout=timeout)
 
     def _send(
-        self, method: Callable[..., Any], path: str, extra: dict, *, timeout: float, unreachable: str = ""
+        self,
+        method: Callable[..., Any],
+        path: str,
+        extra: dict,
+        *,
+        timeout: float,
+        unreachable: str = "",
+        limit: int = MAX_SMALL_ANSWER_BYTES,
     ) -> dict:
-        """Send one request and read its answer: never a redirect followed, never more than ``MAX_ANSWER_BYTES``."""
+        """Send one request and read its answer: never a redirect followed, never more than ``limit`` bytes."""
         self._refuse_early()
         uid = self._node_uid() if self._node_uid is not None else ""
         if self._address is not None:
@@ -788,7 +809,7 @@ class AgentClient:
                 **extra,
             )
             try:
-                payload = self._payload(response)
+                payload = self._payload(response, limit)
             finally:
                 response.close()
         except requests.RequestException as exc:
@@ -809,8 +830,8 @@ class AgentClient:
             )
         return self._read(response.status_code, payload, sent=sent, unreachable=unreachable)
 
-    def _payload(self, response: Any) -> Any:
-        """The answer's JSON body, read up to ``MAX_ANSWER_BYTES``; None when it isn't JSON.
+    def _payload(self, response: Any, limit: int = MAX_SMALL_ANSWER_BYTES) -> Any:
+        """The answer's JSON body, read up to ``limit`` bytes; None when it isn't JSON.
 
         Raises:
             AgentError: A redirect, a compressed body, or a body larger than any answer.
@@ -827,9 +848,9 @@ class AgentClient:
         if encoding == "identity":
             for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
                 body += chunk
-                if len(body) > MAX_ANSWER_BYTES:
+                if len(body) > limit:
                     break
-        if encoding != "identity" or len(body) > MAX_ANSWER_BYTES:
+        if encoding != "identity" or len(body) > limit:
             self.state = AGENT_UNREACHABLE
             raise AgentError(
                 f"The Plex database node at {self.describe()} sent an answer this app doesn't read "
@@ -1296,6 +1317,7 @@ class RemotePlexDb(PlexDatabase):
             body,
             timeout=remaining + ANSWER_GRACE_S,
             unreachable=LIBRARY_HEALTH_WAITS_FOR_THE_NODE,
+            limit=MAX_ANSWER_BYTES,
         )
         if isinstance(result.get("error"), dict):
             # The node's read failed after its answer's status went out: the refusal comes in the answer instead.
