@@ -105,7 +105,7 @@ See [Plex chapter thumbnails](../guides.md#plex-chapter-thumbnails) for job beha
 ## Plex loudness  <a id="plex-loudness"></a>
 *Plex only — shown when this app's loudness analysis is on*
 
-**Writer readiness:** checks that this app can safely store loudness measurements in the local Plex database.
+**Writer readiness:** checks that this app can safely store loudness measurements in Plex's database.
 Select the movie and TV libraries this app should analyse in the server's loudness settings.
 
 **Plex's own analysis:** recommends setting the server-wide **Analyze audio tracks for loudness** schedule to

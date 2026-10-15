@@ -37,8 +37,8 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 - GPUs: NVIDIA (CUDA), Intel and AMD (VAAPI) on Linux; only NVIDIA on Windows (WSL2); none on macOS. Without a GPU it runs on CPU workers.
 - HDR10, HLG and HDR10+ are tone-mapped; Dolby Vision 7 and 8 use their HDR10 layer; Dolby Vision 5 needs a hardware Vulkan driver in the container.
 - Frame interval 1-60 s (default 10; Plex's own default is 2); thumbnail quality 1-10 (default 4; lower = sharper).
-- Intro & Credits: finds intros and end credits and writes Skip Intro / Skip Credits markers to Plex (needs Plex Pass on the server and for viewers; the app runs on the Plex machine or uses the Plex marker agent), Jellyfin 10.11/12.0 and Emby 4.9/4.10 (via the app's plugins; Skip Intro on Emby needs Premiere). Off until turned on per server.
-- Remote processing: previews can run on another machine with access to shared media and the required writable output mounts. The Plex helper supports marker, chapter and loudness operations and Library Health counts beside Plex; network-mounted databases are unsupported.
+- Intro & Credits: finds intros and end credits and writes Skip Intro / Skip Credits markers to Plex (needs Plex Pass on the server and for viewers; the app runs on the Plex machine or uses a Plex database node), Jellyfin 10.11/12.0 and Emby 4.9/4.10 (via the app's plugins; Skip Intro on Emby needs Premiere). Off until turned on per server.
+- Remote processing: previews can run on another machine with access to shared media and the required writable output mounts. A Plex database node beside Plex handles markers, chapter thumbnails, loudness and Library Health counts; network-mounted databases are unsupported.
 
 ## Docs
 
@@ -54,7 +54,7 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 - [Previews on Sonarr or Radarr import](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/): webhooks, the 60 s quiet period, retries
 - [HDR and Dolby Vision previews](https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/): tone mapping and the Profile 5 caveat
 - [Skip Intro and Skip Credits](https://mediapreviewgenerator.dev/skip-intro-credits/): what each server needs, how intros and credits are found, Needs review, limits
-- [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/): Audio loudness analysis on this app's workers for local Plex 1.43.4.x or 1.43.5.x; independent opt-in and scoped undo
+- [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/): Audio loudness analysis on this app's workers for Plex 1.43.4.x or 1.43.5.x; independent opt-in and scoped undo
 - [Guides and troubleshooting](https://mediapreviewgenerator.dev/guides/): web UI, webhooks, schedules, HDR, CPU fallback
 - [Setup Health](https://mediapreviewgenerator.dev/guides/previews-readiness/): every server setting that decides whether previews show up
 - [Multi-server](https://mediapreviewgenerator.dev/multi-server/): output formats, webhook routing, retries, the Jellyfin plugin

@@ -1414,7 +1414,8 @@ schedule or global holds. Ordinary interrupted running jobs continue to follow t
 
 API token or session, like every other route. A `NODE_ROW` is a node's `id`, `name`, `url`, `enabled`, `state` and
 plain `reason`, `version`, `roles`, `legacy` (an older Plex database node that only answers `/v1/ping`), `platform`,
-`gpus`, `cpu`, `busy`, `last_seen`, `path_mappings`, `used_by` (`{"groups": [...], "servers": [...]}`) and
+`gpus`, `cpu`, `busy`, `last_seen`, `checking` (a check is running or queued), `path_mappings`, `used_by`
+(`{"groups": [...], "servers": [...]}`), `to_fix` (`{"must_fix": n, "recommended": n}`, its Setup Health counts) and
 `edit_tag`. It never holds the key.
 
 | Method | Endpoint | Description |
@@ -2128,7 +2129,7 @@ unless noted.
 | POST | `/api/jobs/cancel-bulk` | Cancel several waiting, paused or running jobs. Body `{"job_ids": ["..."]}` (1 to 500 ids, otherwise `400`). Finished and unknown jobs are skipped. Returns `{"cancelled": [ids], "skipped": [{"id": "...", "reason": "not_found" \| "not_active (<status>)"}]}`. |
 | POST | `/api/jobs/clear` | Delete finished jobs. Optional body `{"statuses": ["completed", "failed", "cancelled"]}` (default: all three), or `{"job_ids": ["..."]}` to delete only those jobs (not both). With `job_ids`, only finished jobs are removed; others come back in `skipped`. Returns `{"success": true, "cleared": N}`; the `job_ids` form also returns `removed` (ids deleted, including finished retry rows of a cleared chain head) and `skipped` (`[{"id": "...", "reason": "not_found" \| "not_finished (<status>)" \| "retry_in_progress"}]`). |
 | GET | `/api/jobs/stats` | Counts of visible jobs: `total`, `pending`, `running`, `completed`, `failed`, `cancelled` (retry attempts are not counted separately) |
-| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
+| GET | `/api/jobs/workers` | Current worker-pool snapshot (type, state, current item, `group_id`, `group_name`, `group_resource`, `retiring`, and `node` (`{"id", "name"}`) and `node_state` for a node's worker, `null` for this app's). Busy workers include their actual `job_id` and `current_file`; `job_kind` and `paused` reflect that job's current state. Idle workers have no current job or file. Global processing pause is separate. |
 | POST | `/api/workers/add` · `/api/workers/remove` | Scaling by type: `{"worker_type":"CPU"\|"GPU","count":N,"group_id":"..."}`. Changes a saved group; omit `group_id` only when exactly one group matches the resource. Ambiguous selection returns `409`. Busy removed workers finish their current file. |
 | POST | `/api/jobs/{id}/workers/add` · `/api/jobs/{id}/workers/remove` | Aliases of the above for a running job; select the group as above. Changes the shared saved group, not a temporary allocation exclusive to that job. |
 

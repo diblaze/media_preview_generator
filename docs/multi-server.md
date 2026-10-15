@@ -14,7 +14,7 @@ server that owns it, in the format that server expects.
 
 1. [Install the container](getting-started.md) where you want the processing to run. Its media paths and output mounts must reach the same files your servers use.
 2. Open **Servers → Add Server**, choose Plex, Emby or Jellyfin, and complete the connection flow. Click **Test connection**, then **Save server**. Repeat for each server. The **Connection** tab of **Edit** holds authentication and the Plex database choice.
-3. Click **Edit** on a server card, then open **Libraries** to choose which libraries get previews. Use the **Processing** tab for that server's chapter thumbnails, Intro & Credits and, on a supported local Plex server, loudness.
+3. Click **Edit** on a server card, then open **Libraries** to choose which libraries get previews. Use the **Processing** tab for that server's chapter thumbnails, Intro & Credits and, on a supported Plex server, loudness.
 4. Check the **Path mappings** tab when the server and container use different paths. Open **Setup Health** for each server and resolve the relevant output and library checks.
 5. Process one shared movie or episode with **Process a file or folder** on the Dashboard. Expand **All jobs → Job details** to check results for each server, then inspect the output in its player. **Open logs and files** preserves the per-file result when one server is waiting or failed.
 

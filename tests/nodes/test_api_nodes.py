@@ -1516,6 +1516,17 @@ class TestTheReference:
         row = next(line for line in text.splitlines() if "| GET | `/api/worker-groups` |" in line)
         assert "`nodes`" in row
 
+    def test_the_workers_snapshot_documents_which_node_a_worker_runs_on(self):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        row = next(line for line in text.splitlines() if "| GET | `/api/jobs/workers` |" in line)
+        assert "`node`" in row and "`node_state`" in row
+
+    def test_every_field_of_a_node_row_is_in_the_reference(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        paragraph = text.split("A `NODE_ROW` is", 1)[1].split("\n\n", 1)[0]
+        assert sorted(key for key in _row(client, node_id) if f"`{key}`" not in paragraph) == []
+
     def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
         text = self.REFERENCE.read_text(encoding="utf-8")
         missing = []

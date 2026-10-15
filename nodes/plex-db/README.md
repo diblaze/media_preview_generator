@@ -1,4 +1,4 @@
-# Plex database node (the Plex helper)
+# Plex database node
 
 A small container you run **next to Plex**, so Media Preview Generator can write into the database of a Plex that runs
 on a different machine: intro and credits markers, chapter thumbnails (1.1.0 and newer), loudness measurements and
@@ -7,7 +7,7 @@ Library Health's database counts (1.2.0 and newer).
 This is the container that used to be called the **Plex marker agent**. It is now the Plex database role of a
 Media Preview Generator *node* (the app's code in `media_preview_generator/nodes/server/`), but nothing you set up
 changes: the same image, the same key (an existing install's `AGENT_TOKEN` keeps working), the same port and the
-same address in the app. An existing helper keeps working with this app, and a 1.2.0 helper keeps working with an
+same address in the app. An existing install keeps working with this app, and a 1.2.0 node keeps working with an
 older app.
 
 You only need it in that one case. If the app and Plex already run on the same machine, don't run this — the app
@@ -38,7 +38,7 @@ and mark an item analysed in `metadata_items.extra_data`, only after checking, i
 the streams are still the ones the app measured. Library Health requests run fixed, read-only counting queries.
 
 It also reads `Preferences.xml` in that folder, for one string: Plex's own machine identifier. The app compares
-it with the identifier its Plex reports, so a helper set up beside the *wrong* Plex is refused before anything is
+it with the identifier its Plex reports, so a node set up beside the *wrong* Plex is refused before anything is
 written.
 
 The one file it writes outside Plex's folder is `/config/loudness-writes.jsonl` in its own volume: the undo record of
@@ -48,7 +48,7 @@ must be a named volume** (the compose file names one, `plex-db-node-config`) or 
 only the container's own layer or a volume with no name, which an update throws away together with the undo record
 and the node's id, so the node writes no loudness until it has one.
 
-**Updating a helper from before nodes?** Its old compose file or `docker run` had no `/config` volume. Add
+**Updating an install from before nodes?** Its old compose file or `docker run` had no `/config` volume. Add
 `-v plex-db-node-config:/config` (or the compose file's `volumes:` line) when you update, or loudness reports
 "Mount a volume at /config".
 
@@ -66,9 +66,9 @@ It refuses exactly what the in-process writer refuses, because it *is* the in-pr
 ## Running it
 
 `docker-compose.yml` is in this folder; everything that has to match your machine lives in `.env` beside it.
-`PLEX_CONFIG` has no default — leave it out and compose stops with a message naming it, instead of starting an
-agent with nothing mounted. Without `NODE_KEY` the node makes a key of its own and prints it once in `docker logs`.
-`PUID`/`PGID` do fall back to `1000`, so set them if Plex runs as anyone else: an agent running as the wrong user
+`PLEX_CONFIG` has no default — leave it out and compose stops with a message naming it, instead of starting a
+node with nothing mounted. Without `NODE_KEY` the node makes a key of its own and prints it once in `docker logs`.
+`PUID`/`PGID` do fall back to `1000`, so set them if Plex runs as anyone else: a node running as the wrong user
 starts and reports healthy, then writes no markers at all.
 
 ```bash
@@ -108,15 +108,15 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 | `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (up to 200 characters, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
-| `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
+| `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the node binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
 | `NODE_NAME` | The name the app shows for it (compose default `plex-database`). |
 | `NODE_ROLES` | Set to `plex_db` by the image. Leave it. |
 | `AGENT_BIND` | Host address compose publishes on (default `0.0.0.0`, all interfaces). Set it to the one LAN address the app reaches this machine on if this host has several. |
-| `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. Compose runs the node as them (`user:`); with `docker run`, use `--user <uid>:<gid>` instead. The agent is non-root and can't write the database as anyone else. |
+| `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. Compose runs the node as them (`user:`); with `docker run`, use `--user <uid>:<gid>` instead. The node is non-root and can't write the database as anyone else. |
 
 Three things to keep in mind:
 
-- **Same machine as Plex, and the same path.** The agent proves Plex has the database open through the very file it
+- **Same machine as Plex, and the same path.** The node proves Plex has the database open through the very file it
   sees; a copy, a snapshot or a different mount of the same folder is refused, not written.
 - **One container per Plex**, and one worker inside it (the image is built that way). Two writers would break the
   "one writer at a time" guarantee the app relies on.
@@ -160,27 +160,27 @@ being published alongside.
 
 ## Versions
 
-The agent has its own version (`AGENT_VERSION`, the image tag) and implements one or more numbered **protocols** —
-the shape of the requests and answers. The app sends the protocol it speaks on every request and reads the agent's
+The node has its own version (`AGENT_VERSION`, the image tag) and implements one or more numbered **protocols** —
+the shape of the requests and answers. The app sends the protocol it speaks on every request and reads the node's
 version and protocols off every answer, so a mismatch is caught on the first call, in either direction:
 
-- the agent is older than the app's `MIN_AGENT_VERSION` → refused, naming both versions and saying to update the
-  agent ("the agent is 0.3.0, this app needs 1.0.0 or newer");
-- the agent has moved past the protocol the app speaks → refused, naming both protocols and saying to update the
-  **app** (updating the agent again would send you in a circle);
+- the node is older than the app's `MIN_AGENT_VERSION` → refused, naming both versions and saying to update the
+  node;
+- the node has moved past the protocol the app speaks → refused, naming both protocols and saying to update the
+  **app** (updating the node again would send you in a circle);
 - either way the app shows **Update needed** on the Edit tab and **writes nothing**. Markers wait for the next run.
 
-A new protocol number is only ever *added* to the agent, never swapped, so an agent can serve an older app while you
-update them one at a time. Update the agent first: a newer agent still speaks the older app's protocol.
+A new protocol number is only ever *added* to the node, never swapped, so a node can serve an older app while you
+update them one at a time. Update the node first: a newer node still speaks the older app's protocol.
 
-An optional field added to a request doesn't change the protocol: an older agent ignores it and behaves as before.
-The agent supports the file limits carried by a write (`limits`, the file's duration). With them
+An optional field added to a request doesn't change the protocol: an older node ignores it and behaves as before.
+The node supports the file limits carried by a write (`limits`, the file's duration). With them
 "Keep Plex's" drops a Plex marker that can't be right for the file, such as credits that start after it ends, and
 writes ours.
 
 Item reads include `stale_types` (the types whose markers Plex made for
 an earlier file at the path, from `taggings.created_at`, `media_parts.updated_at` and the parts' `pv:` records) and
-each part's `updated_at`. If an agent omits these fields, the app reads that as "can't tell": every Plex marker counts
+each part's `updated_at`. If a node omits these fields, the app reads that as "can't tell": every Plex marker counts
 as before, and its "Keep Plex's" keeps stale markers even where the app has an answer of its own.
 
 `AGENT_VERSION` in `media_preview_generator/nodes/server/plex_db.py` is the one place that version is decided. The image tag in
@@ -200,7 +200,7 @@ into its Plex what was meant for that node's.
 | Endpoint | What it does | Answers |
 |---|---|---|
 | `GET /v1/health` | Liveness for the container's health check. No key, nothing about your library. | `{"ok": true, "agent": …}` |
-| `GET /v1/ping` | The version, advertised capabilities, which Plex this agent serves, and whether the database file is there. Needs the key but no protocol header, so it still answers when the two sides disagree. The app checks it before chapter operations; marker "Check again" runs the two checks below. | `agent.capabilities`, `result.db_present`, `result.machine_identifier` |
+| `GET /v1/ping` | The version, advertised capabilities, which Plex this node serves, and whether the database file is there. Needs the key but no protocol header, so it still answers when the two sides disagree. The app checks it before chapter operations; marker "Check again" runs the two checks below. | `agent.capabilities`, `result.db_present`, `result.machine_identifier` |
 | `POST /v1/checks/file` | Is the database found, on a local disk, writable, and open in Plex's process? Also which Plex this is. | `result.report` (a capability report), `result.machine_identifier` |
 | `POST /v1/checks/db` | Is it the tested schema, is its marker data readable, is Plex's marker tag row there? | `result.report` |
 | `POST /v1/item/read` | One item's live parts (schema and tag row checked first). | `result.item` |
@@ -211,7 +211,7 @@ into its Plex what was meant for that node's.
 | `POST /v1/loudness/{file_checks,check,streams,snapshot,write,mark}` | Loudness (capability `loudness_v1`): the database's checks, a file's audio streams, an item's snapshot before analysis, one stream's write, the item's mark. Every one but `file_checks` carries the identity the app read from Plex (`machine_identifier`, `pms_version`), which must match `Preferences.xml` and a tested Plex version. | `result.report` / `result.streams`, `result.in_plex` / `result.snapshot` / `result.written` / `result.marked` |
 | `POST /v1/library-health/rows` | Library Health's fixed counting queries for the named sections (capability `library_health_v1`). | `result.rows` |
 
-Status codes: `200` a result, `400` a body the agent can't read, `401` no key or the wrong key (and nothing else —
+Status codes: `200` a result, `400` a body the node can't read, `401` no key or the wrong key (and nothing else —
 an unauthenticated caller learns nothing about this Plex), `409` a refusal the app re-raises as its own error (a
 network filesystem, an unknown schema, a missing marker tag row, Plex busy), a protocol it doesn't speak, or
 `wrong_node`, `413` (plain text) a body over 512 KB, `429` `rate_limited` with `Retry-After`: too many wrong keys
@@ -224,13 +224,13 @@ sides, so they can't disagree about a field.
 
 | What you see | What it means |
 |---|---|
-| **Can't reach it** | The agent isn't running, or the address or port is wrong. Markers wait; nothing is lost. |
+| **Can't reach it** | The node isn't running, or the address or port is wrong. Markers wait; nothing is lost. |
 | **Key refused** | The keys don't match. Paste the node's key (its `NODE_KEY` or `AGENT_TOKEN`, or the one it printed in `docker logs`) into the app's node. |
-| **Update needed** | The app and the agent are different versions. The message says which side to update. |
-| "is next to a different Plex server" | The address points at the agent of another Plex. Both sides compare Plex's own machine identifier, so markers never go into the wrong database. |
-| "Plex's database is on a network share" | The *agent's* mount is a network share. It has to be a local disk on the Plex machine. |
-| "Plex doesn't have its database open through this folder right now" | Plex is stopped, or the agent has a different path to the file than Plex does. |
-| "Plex hasn't created its marker tag yet" | Run Plex's own intro or credits detection once on any item. The agent never creates that row. |
+| **Update needed** | The app and the node are different versions. The message says which side to update. |
+| "is next to a different Plex server" | The address points at the node of another Plex. Both sides compare Plex's own machine identifier, so markers never go into the wrong database. |
+| "Plex's database is on a network share" | The *node's* mount is a network share. It has to be a local disk on the Plex machine. |
+| "Plex doesn't have its database open through this folder right now" | Plex is stopped, or the node has a different path to the file than Plex does. |
+| "Plex hasn't created its marker tag yet" | Run Plex's own intro or credits detection once on any item. The node never creates that row. |
 
 `docker logs plex-marker-agent` shows what it did — one line per item or stream written. It never logs the key.
 
@@ -238,7 +238,7 @@ sides, so they can't disagree about a field.
 
 An answer's `agent.capabilities` lists what this build can do beyond markers: `chapters_v1`, `loudness_v1`,
 `library_health_v1`. The app checks for a capability (asking `/v1/ping` when it isn't sure) before it sends one of
-those requests, so an older helper gets "update the helper to 1.2.0 or newer" from the app instead of a request it
+those requests, so an older node gets an "update the node" message from the app instead of a request it
 can't answer, and nothing is written.
 
 ### Chapter capability
@@ -250,8 +250,8 @@ Other versions are refused until verified. Readiness does not require any chapte
 Each request requires a positive match between the connected Plex identity and this folder's
 `ProcessedMachineIdentifier`. Registration rechecks the exact item, media part, source hash, size, modification
 timestamp, chapter rows, and previous thumbnail references inside the same SQLite transaction. All expected
-JPEGs must exist and match their submitted SHA-256 digests. The helper derives every output path itself.
-The helper adds content revisions to image URLs, but Plex's normal file checks can remove them.
+JPEGs must exist and match their submitted SHA-256 digests. The node derives every output path itself.
+The node adds content revisions to image URLs, but Plex's normal file checks can remove them.
 Plex may continue serving older cached thumbnails after replacement, including after its own native generation;
 these revisions do not guarantee cache invalidation. See the [chapter thumbnail cache limitation](../../docs/guides.md#plex-chapter-thumbnails).
 Multipart and multiple-version items are refused until their chapter ownership has been verified.
