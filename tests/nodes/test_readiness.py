@@ -466,7 +466,7 @@ def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_row
 def test_an_older_helper_at_a_node_that_saved_an_id_fails_its_version_row_and_isnt_said_to_keep_working():
     # A rollback to the released helper: every Plex database request is refused, so Setup Health can't say it's fine.
     envelope = node_readiness(
-        _details(roles=(ROLE_PLEX_DB,), gpus=(), legacy=True),
+        _details(reg.STATE_UPDATE_NEEDED, roles=(ROLE_PLEX_DB,), gpus=(), legacy=True, reason=reg.no_id_reason("nuc")),
         key="k",
         worker_groups=[],
         app_version="9.9.9",
@@ -477,9 +477,23 @@ def test_an_older_helper_at_a_node_that_saved_an_id_fails_its_version_row_and_is
     )
     row = _check(envelope, "node_version")
     assert (row["ok"], row["severity"], row["label"]) == (False, "critical", "The node needs an update")
-    assert "Update the node, or type its key again" in row["reason"]
+    # Both rows give the same advice, naming the node: the protocol numbers the node refused with said only half.
+    assert row["reason"] == reg.no_id_reason("nuc")
+    assert _check(envelope, "plex_db_reachable")["reason"] == reg.no_id_reason("nuc")
     assert not any(c["id"] == "node_legacy_helper" for s in envelope["sections"] for c in s["checks"])
     assert envelope["overall_ok"] is False
+
+
+def test_a_refusal_of_the_plex_database_check_is_the_nodes_own_words_when_no_id_was_saved():
+    envelope = node_readiness(
+        _details(roles=(ROLE_PLEX_DB,), gpus=(), legacy=True),
+        key="k",
+        worker_groups=[],
+        app_version="9.9.9",
+        file_checks=_report(Capability.AGENT_UNAVAILABLE, "The node refused this app's key."),
+    )
+
+    assert _check(envelope, "plex_db_reachable")["reason"] == "The node refused this app's key."
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["plex-db-node", "old-plex-helper"])

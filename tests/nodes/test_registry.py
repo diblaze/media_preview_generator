@@ -1608,10 +1608,13 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
         hold = h.registry.plex_db_hold("n1")
 
         assert hold is not None and not hold.waits
-        assert "older release that gives no id" in hold.message
-        assert h.registry.view("n1").state == reg.STATE_READY
+        assert hold.message == f"{reg.no_id_reason('nuc')} Until then this app doesn't use it for Plex's database."
+        # Every Plex database request is refused, so its card, list and bell say it needs an update, not Ready.
+        view = h.registry.view("n1")
+        assert (view.state, view.reason, view.legacy) == (reg.STATE_UPDATE_NEEDED, reg.no_id_reason("nuc"), True)
         h.change(node_uid=None)  # its key typed again
         assert h.registry.plex_db_hold("n1") is None
+        assert h.registry.check_now("n1").state == reg.STATE_READY
 
     def test_a_node_that_refuses_the_key_without_an_id_is_held_with_its_own_reason(self, h):
         h.client().default_info = NodeAuthError("401")

@@ -378,6 +378,14 @@ def _restarting_reason(name: object) -> str:
     return f"{name or 'The node'} is restarting; it gets no files until it is back."
 
 
+def no_id_reason(name: object) -> str:
+    """Why a node with a saved id that answers as an older release, which gives none, gets no Plex database work."""
+    return (
+        f"{name or 'The node'} answers as an older release that gives no id, so this app can't confirm it is the same "
+        "Plex. Update the node, or type its key again on its Settings tab if it is the same Plex."
+    )
+
+
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
     from ..web.settings_manager import get_settings_manager
     from .mappings import quick_access_check
@@ -671,11 +679,7 @@ class NodeRegistry:
                     return None
                 if live.heard_uid == "":
                     if live.probe_state == STATE_READY:
-                        return PlexDbHold(
-                            f"{name} answers as an older release that gives no id, so this app can't confirm it is "
-                            "the same Plex. Update the node, or type its key again on its Settings tab if it is the "
-                            "same Plex."
-                        )
+                        return PlexDbHold(no_id_reason(name))
                     return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
                 if not live.checking and not waited and live.record.get("enabled", True):
                     now = self._clock()
@@ -1560,7 +1564,8 @@ class NodeRegistry:
         return _Outcome(STATE_READY, **outcome)
 
     def _probe_legacy(self, record: dict) -> _Outcome:
-        """A node that doesn't know ``/v1/info``: an old Plex helper keeps working as a Plex database node."""
+        """A node that doesn't know ``/v1/info``: an old Plex helper keeps working as a Plex database node, unless an id
+        was saved for the node (``no_id_reason``)."""
         from ..markers.publishers.plex_remote import (
             AGENT_CONNECTED,
             AGENT_INCOMPATIBLE,
@@ -1573,6 +1578,10 @@ class NodeRegistry:
         state, version = self._legacy_ping(str(record.get("url") or ""), str(record.get("key") or ""))
         legacy = {"legacy": True, "version": version, "roles": (protocol.ROLE_PLEX_DB,), "info": None}
         if state == AGENT_CONNECTED:
+            if record.get("node_uid"):
+                # A node that gave an id answered here before: every Plex database request names it, which this
+                # release refuses, so it reads as needing an update rather than ready.
+                return _Outcome(STATE_UPDATE_NEEDED, no_id_reason(record.get("name")), **legacy)
             return _Outcome(STATE_READY, **legacy)
         if state == AGENT_REJECTED:
             return _Outcome(STATE_KEY_REFUSED, f"{name} refused the key. Set the same key on both sides.", **legacy)

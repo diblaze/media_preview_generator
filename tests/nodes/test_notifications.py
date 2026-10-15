@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from markupsafe import escape
 
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.web import notifications as notif
@@ -248,6 +249,34 @@ def test_a_plex_database_node_with_a_new_id_gets_a_card_that_opens_its_key():
     assert "Type the node's key again on its Settings tab" in card["body_html"]
     assert card["action"] == {"href": "/nodes#node-abc123/settings", "label": "Type the key again"}
     assert notif.is_session_only_dismissal(card["id"])
+
+
+@pytest.mark.parametrize("saved_uid", ["uid-1", None], ids=["rolled-back", "never-gave-an-id"])
+def test_a_plex_database_node_rolled_back_to_an_older_release_gets_a_card(saved_uid):
+    """Lab: a node rolled back to the released helper had every Plex database request refused and markers jobs
+    skipping every file, while its card read Ready and the bell stayed quiet. One that never gave an id keeps working."""
+    from media_preview_generator.nodes.client import NodeProtocolError
+    from media_preview_generator.web.settings_manager import get_settings_manager
+    from tests.nodes.test_registry import Harness, _record
+
+    get_settings_manager().apply_changes(updates={"worker_groups": [], "media_servers": _plex_on("n1", enabled=True)})
+    h = Harness(nodes=[_record(node_uid=saved_uid)])
+    try:
+        h.client().default_info = NodeProtocolError("404")  # an older Plex helper doesn't know /v1/info
+        h.registry.check_now("n1")
+        reg.set_registry(h.registry)
+        cards = notif._build_node_notifications()
+    finally:
+        h.registry.stop()
+
+    if saved_uid is None:
+        assert cards == []
+        return
+    (card,) = cards
+    assert card["id"] == "node:n1:update_needed"
+    assert card["title"] == "nuc needs an update"
+    assert card["body_html"] == f"<p class='mb-0'>{escape(reg.no_id_reason('nuc'))}</p>"
+    assert card["action"] == {"href": "/nodes#node-n1/health", "label": "Open Nodes"}
 
 
 def test_a_new_id_raises_no_card_when_no_switched_on_server_uses_the_node():

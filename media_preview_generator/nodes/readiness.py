@@ -36,6 +36,8 @@ from .registry import (
     STATE_TEMP_PROBLEM,
     STATE_UPDATE_NEEDED,
     NodeDetails,
+    NodeView,
+    no_id_reason,
 )
 
 DOCS_ANCHOR = "nodes"
@@ -223,14 +225,7 @@ def _connection(
             explanation=explanation,
             current=current,
             recommended=recommended,
-            reason=None
-            if version_ok
-            else (
-                "It answers as an older release that gives no id, so this app can't confirm it is the same Plex. "
-                "Update the node, or type its key again on its Settings tab if it is the same Plex."
-                if rolled_back
-                else view.reason
-            ),
+            reason=None if version_ok else no_id_reason(view.name) if rolled_back else view.reason,
             fix_where=None if app_behind else FIX_ON_NODE,
             docs_url=None if app_behind else UPDATE_DOCS_URL,
             help_label=None if app_behind else "How to update a node",
@@ -499,11 +494,13 @@ def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
     ]
 
 
-def _plex_db(url: str, key: str, node_uid: str, file_checks: Callable[[str, str, str], Any]) -> list[dict[str, Any]]:
+def _plex_db(
+    view: NodeView, key: str, node_uid: str, file_checks: Callable[[str, str, str], Any]
+) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
     from ..markers.publishers.plex_db import node_wording
 
-    checked = file_checks(url, key, node_uid)
+    checked = file_checks(view.url, key, node_uid)
     if checked is None:
         return []  # Not checked yet (cached_file_checks): no rows rather than a guess.
     # The check ran on the node: its refusals are about the node, not this app.
@@ -517,7 +514,9 @@ def _plex_db(url: str, key: str, node_uid: str, file_checks: Callable[[str, str,
                 severity=CRITICAL,
                 ok=False,
                 explanation="The node opens Plex's database on Plex's own machine.",
-                reason=report.message,
+                # An older release refuses the saved id every request names: the version row's advice, not its
+                # protocol number.
+                reason=no_id_reason(view.name) if view.legacy and node_uid else report.message,
                 fix_where=FIX_ON_NODE,
             )
         ]
@@ -616,7 +615,7 @@ def node_readiness(
     if usable and protocol.ROLE_PLEX_DB in view.roles:
         rows = _plex_db_confirmed(details)
         if file_checks is not None:
-            rows += _plex_db(view.url, key, node_uid, file_checks)
+            rows += _plex_db(view, key, node_uid, file_checks)
         sections.append(_section("node_plex_db", "Plex database", rows))
     kept = [s for s in sections if s is not None]
     overall_ok = not any(c["severity"] == CRITICAL and c["ok"] is False for s in kept for c in s["checks"])
