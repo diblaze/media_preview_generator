@@ -59,13 +59,17 @@ def main(argv: list[str] | None = None) -> int:
         print("Plex has the database open; stop Plex first.", file=sys.stderr)
         return 2
     records, unreadable = [], 0
-    with open(args.log, encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                # A line cut short (the app stopped mid-write) or blank: the rest still undoes.
-                unreadable += line.strip() != ""
+    try:
+        with open(args.log, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    # A line cut short (the app stopped mid-write) or blank: the rest still undoes.
+                    unreadable += line.strip() != ""
+    except OSError as exc:
+        print(f"Can't read the undo record {args.log} ({exc.strerror or exc}); nothing changed.", file=sys.stderr)
+        return 2
     # mode=rw: a mistyped path fails instead of creating an empty database next to Plex's.
     uri = f"file:{urllib.parse.quote(args.db)}?mode=rw"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)

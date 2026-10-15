@@ -73,6 +73,17 @@ def test_a_mistyped_db_path_fails_and_creates_nothing(tmp_path):
     assert not missing.exists()
 
 
+def test_a_missing_undo_record_is_one_plain_line_and_changes_nothing(db, tmp_path, capsys):  # noqa: F811
+    # It was a FileNotFoundError traceback.
+    plex_db.write_stream(db, 11, FIELDS, deadline=1e12)
+    missing = tmp_path / "no-such.jsonl"
+
+    assert undo(["--db", db._path(), "--log", str(missing)]) == 2
+    said = capsys.readouterr().err.strip()
+    assert said == f"Can't read the undo record {missing} (No such file or directory); nothing changed."
+    assert _extra(db._path(), 11) == PLEX_ANALYSED
+
+
 def test_a_row_plex_changed_since_loses_only_the_fields_the_job_added(db, tmp_path):  # noqa: F811
     for stream_id in (11, 12):
         plex_db.write_stream(db, stream_id, FIELDS, deadline=1e12)
