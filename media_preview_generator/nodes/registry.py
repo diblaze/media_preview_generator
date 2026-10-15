@@ -661,6 +661,7 @@ class NodeRegistry:
         tie_decided = self._tie_new_uid(node_id)
         deadline = time.monotonic() + FIRST_CHECK_WAIT_S
         waited = False
+        started = False
         with self._check_done:
             while True:
                 live = self._nodes.get(node_id)
@@ -696,15 +697,19 @@ class NodeRegistry:
                     now = self._clock()
                     if live.next_check <= now:
                         live.checking = True
+                        started = True
                         self._submit(self._run_check, node_id, False, True)
                     else:
                         # One that didn't answer keeps its back-off (a check per request ran them back to back),
                         # brought forward as for a job waiting on it.
                         live.next_check = min(live.next_check, now + WAITING_RECHECK_S)
-                if hold is not None:
-                    return hold
                 left = deadline - time.monotonic()
-                if not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
+                if hold is not None:
+                    # The check just started is the one that lifts it (the saved machine answering again): wait for it
+                    # as a first check does, or one file is skipped after the impostor has already left.
+                    if not (started and live.checking and left > 0):
+                        return hold
+                elif not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
                     return checking
                 waited = True
                 self._check_done.wait(left)

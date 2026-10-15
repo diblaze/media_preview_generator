@@ -1459,6 +1459,19 @@ class TestNewPlexDatabaseNodeId:
         assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
         h.registry.stop()
 
+    def test_a_hold_is_lifted_by_the_check_it_just_started(self):
+        # The hold was returned the moment its lifting check began, so one more file was skipped after the impostor
+        # had left the address.
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "")
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
+        self._answer(h, "uid-1", "plex-a")  # the saved machine is back; the registry hasn't yet checked
+        h.registry._nodes["n1"].unconfirmed_uid = "uid-2"
+        h.registry._nodes["n1"].next_check = 0.0
+
+        assert h.registry.plex_db_hold("n1") is None
+        h.registry.stop()
+
     def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):
         h = self._harness(["plex-a"])
         self._answer(h, "uid-2", "")
