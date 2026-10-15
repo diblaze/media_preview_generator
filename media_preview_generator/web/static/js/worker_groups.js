@@ -91,18 +91,26 @@
         return nodeFor(member)?.name || member.node_name || member.node;
     }
 
-    // Why a node member has no workers now, judged from the node list; the server's member row says the same once saved.
+    // Why a node member has no workers now, in the few words its chip has room for, judged from the node list; the
+    // server's member row says the same once saved.
     function nodeIssue(member) {
         if (!member.node) return '';
         const node = nodeFor(member);
         if (!node) return 'node removed';
         if (!runsWorkers(node)) return "node doesn't run workers";
-        const reason = node.reason || `node ${nodeStateLabel(node).toLowerCase()}`;
+        const reason = nodeState(node.state)?.short || node.reason || `node ${nodeStateLabel(node).toLowerCase()}`;
         if (member.resource === 'cpu') return ['ready', 'gpu_lost'].includes(node.state) ? '' : reason;
         if (node.state !== 'ready') return reason;
         const gpu = (node.devices || []).find(item => item.device === member.device);
         if (!gpu) return 'GPU not found on this node';
         return gpu.status === 'failed' ? 'GPU failed its test on this node' : '';
+    }
+
+    // The node's own sentence for it (a chip's tooltip), or the short reason when the node gave none.
+    function nodeIssueDetail(member) {
+        const issue = nodeIssue(member);
+        const node = nodeFor(member);
+        return issue && node && runsWorkers(node) && node.state !== 'ready' && node.reason ? node.reason : issue;
     }
 
     // The dashboard page does not load week_graph.js, so it keeps a copy of the same palette (see week_graph.js).
@@ -237,7 +245,7 @@
     }));
 
     function memberChip(member) {
-        const issue = nodeIssue(member);
+        const issue = nodeIssueDetail(member);
         const missing = deviceMissing(member) || !!issue;
         const note = deviceMissing(member) ? ' (not detected)' : issue ? ` (${issue} · 0 now)` : '';
         const name = (member.node ? nodeName(member) + ' · ' : '') + shortDeviceName(member);
@@ -645,7 +653,10 @@
         const occupancy = `${state.busy} of ${member.count} configured ${member.count === 1 ? 'worker' : 'workers'} busy on ${title}.`;
         let chip = `<span class="occ-chip" data-member-indicator role="img" aria-label="${escapeHtml(occupancy)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(occupancy)}">${state.busy}<small>/ ${member.count}</small></span>`;
         if (missing) chip = `<span class="chip warn" tabindex="0" role="img" aria-label="${escapeHtml(name)} not detected" data-bs-toggle="tooltip" data-bs-title="Its jobs wait; the other devices keep working."><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>Not detected</span>`;
-        if (nodeDown) chip = `<span class="chip ${tone}" data-node-zero tabindex="0" role="img" aria-label="${escapeHtml(`${title}: ${reason}, no workers now`)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(`Its jobs wait for ${nodeName(member)}; the other devices keep working.`)}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>${escapeHtml(reason)} · 0 now</span>`;
+        // The chip has room for a few words; the node's own sentence, when it says more, leads its tooltip.
+        const detail = nodeDown ? nodeIssueDetail(member) : '';
+        const why = detail && detail !== reason ? `${detail.replace(/\.$/, '')}. ` : '';
+        if (nodeDown) chip = `<span class="chip ${tone}" data-node-zero tabindex="0" role="img" aria-label="${escapeHtml(`${title}: ${reason}, no workers now`)}" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(`${why}Its jobs wait for ${nodeName(member)}; the other devices keep working.`)}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>${escapeHtml(reason)} · 0 now</span>`;
         const problem = missing || nodeDown;
         const stepper = group.enabled ? memberStepper(group, member, member.count) : '';
         const note = missing ? `${name}: GPU not detected. Its jobs wait; other devices keep working.`
@@ -966,7 +977,8 @@
     function memberNodeChips(member) {
         if (!member.node) return '';
         const issue = nodeIssue(member);
-        const zero = issue ? `<span class="node-zero ${nodeTone(nodeFor(member)?.state)}" data-node-zero>${escapeHtml(issue)} · 0 now</span>` : '';
+        const detail = nodeIssueDetail(member);
+        const zero = issue ? `<span class="node-zero ${nodeTone(nodeFor(member)?.state)}" data-node-zero tabindex="0" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(detail)}">${escapeHtml(issue)} · 0 now</span>` : '';
         return `<span class="node-chips" data-node-chips>${nodeChip(member)}${zero}</span>`;
     }
 

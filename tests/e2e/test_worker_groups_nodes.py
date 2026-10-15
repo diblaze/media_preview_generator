@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -115,10 +117,12 @@ def test_member_on_a_node_that_cannot_work_shows_why_it_has_zero(
     page.locator('[data-member="m-cpu"] [data-pick]').select_option("node:nuc:cpu")
     row = page.locator('[data-member="m-cpu"]')
     expect(row.locator(".node-chip")).to_have_text("nuc")
-    expect(row.locator("[data-node-zero]")).to_have_text("fix access first · 0 now")
+    # A few words on the chip (the same the server gives the member), the node's own reason as its tooltip.
+    expect(row.locator("[data-node-zero]")).to_have_text("fix media access first · 0 now")
+    expect(row.locator("[data-node-zero]")).to_have_attribute("data-bs-title", "fix access first")
     # Red, as on the Nodes page: a node with an access problem gets no work at all.
     expect(row.locator("[data-node-zero]")).to_have_class("node-zero bad")
-    expect(row).to_contain_text("nuc: fix access first · 0 workers now.")
+    expect(row).to_contain_text("nuc: fix media access first · 0 workers now.")
     page.locator('[data-member="m-cpu"] [data-pick]').select_option("cpu")
     expect(row.locator(".node-chip")).to_have_count(0)
     page.locator("#workerGroupEditorApply").click()
@@ -224,6 +228,69 @@ def test_a_worker_cards_node_state_has_the_nodes_pages_name_and_colour(
     badge = authed_page.locator('[data-worker-key="GPU_4"] [data-status-badge]')
     expect(badge).to_have_text(text)
     expect(badge).to_have_class(f"pill {tone}")
+
+
+LONG_REASON = (
+    "old-laptop's temp folder can't be used, so it gets no files: no space left on device: /ntmp. Free up space "
+    "there, or set NODE_TEMP_DIR on the node to a folder it can write to."
+)
+
+
+def _temp_problem_node(api: dict) -> None:
+    offline_node_group(api)
+    laptop = next(node for node in api["state"]["nodes"] if node["id"] == "laptop")
+    laptop.update(state="temp_problem", reason=LONG_REASON)
+    row = next(m for m in api["state"]["capacity"]["groups"][1]["members"] if m["id"] == "m-laptop")
+    row["reason"] = "node's temp folder can't be used"
+
+
+@pytest.mark.parametrize("width", [390, 1440])
+def test_the_editors_zero_chip_is_short_stays_in_its_row_and_has_the_full_reason_as_its_tooltip(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+    width: int,
+) -> None:
+    """The chip carried the node's whole sentence on one line and ran up to 774 px past its card."""
+    _temp_problem_node(group_api)
+    authed_page.set_viewport_size({"width": width, "height": 844})
+    settings_page(authed_page, app_url)
+    authed_page.locator('[data-edit="gpu-video"]').click()
+    row = authed_page.locator('[data-member="m-laptop"]')
+    zero = row.locator("[data-node-zero]")
+    expect(zero).to_have_text("node's temp folder can't be used · 0 now")
+    expect(zero).to_have_attribute("data-bs-title", LONG_REASON)
+    chip, card = zero.bounding_box(), row.bounding_box()
+    assert chip["x"] + chip["width"] <= card["x"] + card["width"] + 1, (chip, card)
+    assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_on_a_phone_the_dashboards_zero_chip_doesnt_cover_the_device_name(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    """At 390 px "node's temp folder can't be used · 0 now" sat on top of the node chip and the GPU's name."""
+    _temp_problem_node(group_api)
+    mock_dashboard_defaults(authed_page)
+    authed_page.set_viewport_size({"width": 390, "height": 844})
+    authed_page.goto(app_url + "/")
+    head = authed_page.locator('[data-member-block="gpu-video:m-laptop"] .mem-h')
+    chip = head.locator("[data-node-zero]")
+    expect(chip).to_have_text("node's temp folder can't be used · 0 now")
+    expect(chip).to_have_attribute(
+        "data-bs-title", re.compile(r"^old-laptop's temp folder can't be used.*Its jobs wait")
+    )
+    overlaps = head.evaluate(
+        """head => {
+            const chip = head.querySelector('[data-node-zero]').getBoundingClientRect();
+            return Array.from(head.querySelector('.devname').children).map(c => c.getBoundingClientRect())
+                .filter(p => p.width && p.right > chip.left + 1 && p.left < chip.right && p.bottom > chip.top
+                    && p.top < chip.bottom).length;
+        }"""
+    )
+    assert overlaps == 0
+    assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
 def test_week_legend_names_a_node_device_apart_from_this_apps(

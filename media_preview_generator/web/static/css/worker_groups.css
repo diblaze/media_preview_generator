@@ -291,17 +291,17 @@
 .wg-mem-head { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .mem-h { display:grid; grid-template-columns:minmax(0, 1fr) auto auto auto; align-items:center; gap:8px; }
 .mem-h.miss, .mem-h.gone { grid-template-columns:minmax(0, 1fr) auto auto; }
-.devname { display:inline-flex; align-items:center; gap:6px; min-width:0; font-weight:600; }
+.devname { display:inline-flex; align-items:center; gap:6px; min-width:0; overflow:hidden; font-weight:600; }
 .devname .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
 .wg-mem .chip { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 9px; border-radius:99px; background:var(--inset); font-size:12.5px; font-weight:600; white-space:nowrap; }
 .wg-mem .chip.warn { background:var(--warn-soft); color:var(--warn); }
 .wg-mem .chip.bad { background:var(--bad-soft); color:var(--bad); }
 
 /* Remote nodes: the node's name in front of its device, and why it has no workers right now. */
-.node-chip { display:inline-flex; align-items:center; gap:4px; flex:none; max-width:12rem; height:20px; padding:0 7px; overflow:hidden; border:1px solid var(--line-strong); border-radius:99px; background:var(--inset); font-size:11.5px; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
+.node-chip { display:inline-flex; align-items:center; gap:4px; flex:0 1 auto; min-width:2.5rem; max-width:12rem; height:20px; padding:0 7px; overflow:hidden; border:1px solid var(--line-strong); border-radius:99px; background:var(--inset); font-size:11.5px; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
 .node-chip[hidden] { display:none; }
-.node-chips { display:inline-flex; flex-wrap:wrap; align-items:center; gap:6px; margin-left:8px; }
-.node-zero { display:inline-flex; align-items:center; height:20px; padding:0 8px; border-radius:99px; font-size:11.5px; font-weight:600; white-space:nowrap; }
+.node-chips { display:inline-flex; flex-wrap:wrap; align-items:center; gap:6px; min-width:0; max-width:100%; margin-left:8px; }
+.node-zero { display:inline-flex; align-items:center; min-height:20px; padding:1px 8px; border-radius:99px; font-size:11.5px; font-weight:600; line-height:1.3; }
 .node-zero.bad { background:var(--bad-soft); color:var(--bad); }
 .node-zero.warn { background:var(--warn-soft); color:var(--warn); }
 .wg-mem .caps .cap { width:24px; height:24px; font-size:12px; }
@@ -321,6 +321,9 @@
  .mem-h .caps { grid-column:1; grid-row:2; }
  .mem-h .occ-chip, .mem-h .chip.warn, .mem-h .chip.bad { grid-column:2; grid-row:1; justify-self:end; }
  .mem-h .stepper { grid-column:2; grid-row:2; justify-self:end; }
+ /* A node's "0 now" reason gets its own line under the name rather than covering it. */
+ .mem-h .chip[data-node-zero] { grid-column:1 / -1; grid-row:2; justify-self:start; height:auto; min-height:26px; white-space:normal; }
+ .mem-h.miss .stepper { grid-row:1; }
 }
 @media (pointer: coarse) {
  .dashboard-layout .stepper button { min-width:44px; min-height:44px; }
@@ -343,7 +346,7 @@
 .mrow.has-err { border-color:var(--bad); border-left-color:var(--bad); }
 .mrow.has-warn { border-color:color-mix(in srgb, var(--warn) 60%, var(--line)); border-left-color:var(--warn); }
 .mrow-top { display:grid; grid-template-columns:minmax(0, 1fr) auto auto; align-items:end; gap:12px; }
-.mrow .lbl { display:flex; align-items:center; margin-bottom:4px; font-size:12px; font-weight:600; color:var(--muted); }
+.mrow .lbl { display:flex; flex-wrap:wrap; align-items:center; row-gap:4px; margin-bottom:4px; font-size:12px; font-weight:600; color:var(--muted); }
 .mrow .form-select { min-height:44px; }
 .mrow-jobs { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; }
 .mrow-jobs .lbl { margin:0 4px 0 0; }
