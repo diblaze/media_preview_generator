@@ -41,7 +41,7 @@ def _envelope(details, *, groups=None, file_checks=None):
         key="k",
         worker_groups=groups or [],
         app_version="9.9.9",
-        file_checks=file_checks or (lambda url, key: pytest.fail("the Plex database must not be checked")),
+        file_checks=file_checks or (lambda url, key, node_uid: pytest.fail("the Plex database must not be checked")),
     )
 
 
@@ -320,18 +320,18 @@ def test_a_node_used_by_a_group_member_passes_and_a_failed_gpu_is_must_fix():
 
 
 def _report(state, message="", **details):
-    return lambda url, key: CapabilityReport(state, message, details)
+    return lambda url, key, node_uid: CapabilityReport(state, message, details)
 
 
 def test_a_plex_database_node_checks_the_database_on_its_machine():
     seen = []
 
-    def checks(url, key):
-        seen.append((url, key))
+    def checks(url, key, node_uid):
+        seen.append((url, key, node_uid))
         return CapabilityReport(Capability.READY, "", {"db_path": "/plex/db", "fs_type": "ext4", "lock_holder": True})
 
     envelope = _envelope(_details(roles=(ROLE_PLEX_DB,), gpus=()), file_checks=checks)
-    assert seen == [("http://nuc:9494", "k")]
+    assert seen == [("http://nuc:9494", "k", "")]
     rows = _section(envelope, "node_plex_db")["checks"]
     assert [(r["id"], r["ok"]) for r in rows] == [
         ("plex_db_present", True),
@@ -475,7 +475,7 @@ def test_a_worker_on_another_build_of_the_same_version_shows_both_short_commits(
         worker_groups=[],
         app_version="9.9.9",
         app_build="a" * 40,
-        file_checks=lambda url, key: pytest.fail("the Plex database must not be checked"),
+        file_checks=lambda url, key, node_uid: pytest.fail("the Plex database must not be checked"),
     )
     row = _check(envelope, "node_version")
     assert (row["ok"], row["current"], row["recommended"]) == (False, "9.9.9 (bbbbbbb)", "9.9.9 (aaaaaaa)")
@@ -491,7 +491,7 @@ def test_a_worker_on_another_version_shows_the_versions_only():
         worker_groups=[],
         app_version="9.9.9",
         app_build="a" * 40,
-        file_checks=lambda url, key: pytest.fail("the Plex database must not be checked"),
+        file_checks=lambda url, key, node_uid: pytest.fail("the Plex database must not be checked"),
     )
     row = _check(envelope, "node_version")
     assert (row["current"], row["recommended"]) == ("9.9.8", "9.9.9")
@@ -536,7 +536,7 @@ def test_the_count_to_fix_uses_the_last_plex_database_check_without_asking_the_n
     assert count() == {"must_fix": 0, "recommended": 0}
 
     class FakeRemote:
-        def __init__(self, url, key):
+        def __init__(self, url, key, **kwargs):
             pass
 
         def file_checks(self, *, deadline):

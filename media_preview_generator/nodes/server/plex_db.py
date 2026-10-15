@@ -60,7 +60,7 @@ from ...markers.publishers.plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from ..protocol import KIND_RATE_LIMITED, KIND_WRONG_NODE, NODE_UID_HEADER, sendable_key, whole_number
+from ..protocol import KIND_PROTOCOL, KIND_RATE_LIMITED, KIND_WRONG_NODE, NODE_UID_HEADER, sendable_key, whole_number
 from .identity import wrong_key_limit
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
@@ -416,6 +416,18 @@ def register_plex_db(
                 }
             ), 409
         named = request.headers.get(NODE_UID_HEADER, "").strip()
+        if not named and whole_number(request.headers.get(plex_remote.PROTOCOL_HEADER, "")) == (
+            plex_remote.AGENT_PROTOCOL_NODE_UID
+        ):
+            # The app sends this protocol only with the id it saved (first contact is protocol 1), so the id was
+            # dropped on the way, by a proxy: running the request would skip the check that it is meant for this
+            # machine.
+            message = (
+                f"The node's id ({NODE_UID_HEADER}) didn't arrive with this request, so this node ran nothing. If a "
+                "proxy sits between the app and this node, let it pass that header."
+            )
+            error = {"kind": KIND_PROTOCOL, "message": message, "state": Capability.AGENT_UNAVAILABLE.value}
+            return jsonify({"ok": False, "agent": agent_block(), "error": error}), 409
         if named and named != own_uid:
             # The app saved another machine at this address (this one was given the same key and address): whatever
             # it asks was meant for that one's Plex. The app checks which machine answers here before it asks again.

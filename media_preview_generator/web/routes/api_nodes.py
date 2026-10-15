@@ -166,6 +166,7 @@ def _to_fix(record: dict, details: NodeDetails | None) -> dict[str, int]:
         key=str(record.get("key") or ""),
         worker_groups=sm.get("worker_groups"),
         app_version=_app_version(),
+        node_uid=str(record.get("node_uid") or ""),
         file_checks=cached_file_checks,
     )
     return to_fix(envelope)
@@ -637,6 +638,7 @@ def node_health(node_id: str):
         worker_groups=sm.get("worker_groups"),
         app_version=_app_version(),
         app_build=protocol.build_sha(),
+        node_uid=str(record.get("node_uid") or ""),
     )
     return jsonify(envelope)
 

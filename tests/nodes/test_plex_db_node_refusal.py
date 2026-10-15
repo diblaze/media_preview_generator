@@ -279,6 +279,55 @@ class TestTurnedOffAfterTheDatabaseWasOpened:
         assert db._client.refusal() is None
 
 
+def _ok_answer() -> MagicMock:
+    answer = MagicMock(status_code=200, headers={})
+    body = {"ok": True, "agent": {"version": "1.2.0", "protocols": [1, 2]}, "result": {}}
+    answer.iter_content.return_value = [json.dumps(body).encode()]
+    return answer
+
+
+class TestNodeEditedAfterTheDatabaseWasOpened:
+    """Editing a node's address or key clears its saved id. A job that opened the database before the edit sends its
+    next request to the new address with the new key: one without the id at the old address would run on any machine
+    there that has the key."""
+
+    EDITED = {"url": "http://new-host.lan:9494", "key": "new-key", "node_uid": None}
+
+    def _edit(self) -> None:
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        get_settings_manager().set("nodes", [{**NODE, **self.EDITED}])
+
+    def _assert_sent_to_the_edited_node(self, session: MagicMock) -> None:
+        assert [c.args[0] for c in session.post.call_args_list if c.args[0].startswith(NODE["url"])] == []
+        sent = session.post.call_args
+        assert sent.args[0].startswith(self.EDITED["url"])
+        assert sent.kwargs["headers"]["Authorization"] == f"Bearer {self.EDITED['key']}"
+        assert NODE_UID_HEADER not in sent.kwargs["headers"]
+
+    def test_markers(self, node):
+        node(enabled=True)
+        session = MagicMock()
+        session.post.return_value = _ok_answer()
+        db = plex_database(
+            load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session
+        )
+        self._edit()
+        db._client.post("/v1/item/read", {}, timeout=1)
+        self._assert_sent_to_the_edited_node(session)
+
+    def test_chapters(self, node, monkeypatch):
+        node(enabled=True)
+        monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
+        backend, *_ = plex_chapters._context(MagicMock(), SimpleNamespace(markers=MARKERS, output={}))
+        session = MagicMock()
+        session.post.return_value = _ok_answer()
+        backend._session = session
+        self._edit()
+        backend.post("/v1/chapters/check", {}, timeout=1)
+        self._assert_sent_to_the_edited_node(session)
+
+
 def test_a_node_still_to_be_checked_is_refused_as_not_answering_so_the_work_waits(node):
     """Each feature waits for a node that doesn't answer (loudness waits, chapters retry); a refusal fails the file."""
     node(enabled=True, held=AGENT_UNREACHABLE)

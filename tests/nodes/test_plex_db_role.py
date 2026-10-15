@@ -332,6 +332,26 @@ class TestARequestMeantForAnotherNode:
         assert agent.post("/v1/item/write", json=write, headers=self._naming(self.UID)).status_code == 200
         assert _served(plex_config) == [("intro", 11_000, 37_000)]
 
+    @pytest.mark.parametrize(("method", "path", "body"), TestTheGuards.ENDPOINTS)
+    @pytest.mark.parametrize("named", ["", "  "], ids=["missing", "blank"])
+    def test_every_endpoint_refuses_the_protocol_that_names_an_id_without_one(self, agent, method, path, body, named):
+        # The app sends protocol 2 only with the id it saved: without it, the header was lost on the way (a proxy
+        # that drops it), and running the request would skip the check that it is meant for this machine.
+        headers = self._naming(named)
+        if not named:
+            del headers[protocol.NODE_UID_HEADER]
+        response = getattr(agent, method)(path, json=body, headers=headers)
+        assert response.status_code == 409
+        error = plex_remote.error_from_json(response.get_json()["error"])
+        assert "didn't arrive" in str(error)
+        assert error.state is Capability.AGENT_UNAVAILABLE
+
+    def test_a_write_in_the_protocol_that_names_an_id_without_one_writes_nothing(self, agent, plex_config):
+        headers = {**AUTH, plex_remote.PROTOCOL_HEADER: str(plex_remote.AGENT_PROTOCOL_NODE_UID)}
+        write = _write_body(rating_key=7, wanted=[INTRO])
+        assert agent.post("/v1/item/write", json=write, headers=headers).status_code == 409
+        assert _served(plex_config) == []
+
     def test_a_request_naming_no_node_goes_through_as_before(self, agent, plex_config):
         # An app that hasn't saved the id yet (first contact), or one from before the check, speaking protocol 1.
         write = _write_body(rating_key=7, wanted=[INTRO])

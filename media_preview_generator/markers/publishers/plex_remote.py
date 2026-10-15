@@ -561,6 +561,24 @@ def saved_node_uid(settings: Any) -> str:
     return str((record or {}).get("node_uid") or "")
 
 
+def saved_node_address(settings: Any) -> tuple[str, str]:
+    """The address and key saved for the server's Plex database node, read now.
+
+    Args:
+        settings: That server's ``ServerMarkersSettings``.
+
+    Returns:
+        ``(url, key)`` from the node's record; the settings' own copy for a server with no node id.
+    """
+    node_id = getattr(settings, "agent_node_id", None)
+    if not node_id:
+        return str(getattr(settings, "agent_url", "") or ""), str(getattr(settings, "agent_token", "") or "")
+    from ...nodes.settings import node_address
+
+    url, key, _name = node_address(str(node_id))
+    return url, key
+
+
 def report_wrong_node(settings: Any) -> None:
     """Hold the server's Plex database node's work until a check hears which machine answers at its address now.
 
@@ -586,6 +604,7 @@ class AgentClient:
         refusal: Callable[[], NodeRefusal | None] | None = None,
         node_uid: Callable[[], str] | None = None,
         wrong_node: Callable[[], None] | None = None,
+        address: Callable[[], tuple[str, str]] | None = None,
     ) -> None:
         """Create the client.
 
@@ -599,19 +618,25 @@ class AgentClient:
                 before first contact). Each request names it, so another machine at the address runs nothing.
             wrong_node: Told when the node refused a request as another machine than that id
                 (``report_wrong_node``).
+            address: Asked before every request for the node's address and key (``saved_node_address``), which then
+                replace ``url`` and ``token``: a node edited while a job runs gets that job's next request.
         """
-        self.url = str(url or "").strip().rstrip("/")
-        self._token = str(token or "")
+        self._set_address(url, token)
         self._session = session or requests.Session()
         self._refusal_check = refusal
         self._node_uid = node_uid
         self._wrong_node = wrong_node
+        self._address = address
         self.version = ""
         refused = refusal() if refusal is not None else None
         self.state = refused.agent_state if refused is not None else AGENT_UNREACHABLE
         # Plex's own machine identifier, as the agent reads it beside the database it would write.
         self.machine_identifier = ""
         self.capabilities: list[str] = []
+
+    def _set_address(self, url: str, token: str) -> None:
+        self.url = str(url or "").strip().rstrip("/")
+        self._token = str(token or "")
 
     def describe(self) -> str:
         """The address, for messages the user reads."""
@@ -646,6 +671,10 @@ class AgentClient:
         """Send one request and read its answer: never a redirect followed, never more than ``MAX_ANSWER_BYTES``."""
         self._refuse_early()
         uid = self._node_uid() if self._node_uid is not None else ""
+        if self._address is not None:
+            # Read after the id: an edit of the address clears the id, so the other order could send a request with
+            # no id to the old address.
+            self._set_address(*self._address())
         sent = AGENT_PROTOCOL_NODE_UID if uid else AGENT_PROTOCOL
         headers = {"Authorization": f"Bearer {self._token}", PROTOCOL_HEADER: str(sent), "Accept-Encoding": "identity"}
         if uid:
@@ -873,6 +902,7 @@ class RemotePlexDb(PlexDatabase):
         refusal: Callable[[], NodeRefusal | None] | None = None,
         node_uid: Callable[[], str] | None = None,
         wrong_node: Callable[[], None] | None = None,
+        address: Callable[[], tuple[str, str]] | None = None,
     ) -> None:
         """Create the transport.
 
@@ -883,9 +913,10 @@ class RemotePlexDb(PlexDatabase):
             refusal: Asked before every call why nothing may be sent to the node now (``node_refusal``).
             node_uid: The id this app saved for the node, named on every call (``AgentClient``).
             wrong_node: Told when the node refused a call as another machine than that id.
+            address: The node's address and key as saved now, read before every call (``AgentClient``).
         """
         self._client = AgentClient(
-            url, token, session=session, refusal=refusal, node_uid=node_uid, wrong_node=wrong_node
+            url, token, session=session, refusal=refusal, node_uid=node_uid, wrong_node=wrong_node, address=address
         )
 
     def agent_details(self) -> dict:
@@ -1185,5 +1216,6 @@ def plex_database(
             refusal=lambda: node_refusal(settings),
             node_uid=lambda: saved_node_uid(settings),
             wrong_node=lambda: report_wrong_node(settings),
+            address=lambda: saved_node_address(settings),
         )
     return LocalPlexDb(path_provider, label=label, mountinfo_path=mountinfo_path)
