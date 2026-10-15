@@ -524,6 +524,22 @@ def test_a_worker_on_another_version_shows_the_versions_only():
     assert (row["current"], row["recommended"]) == ("9.9.8", "9.9.9")
 
 
+def test_a_worker_newer_than_this_app_says_to_update_this_app_not_the_node():
+    # It said "The node needs an update", "Fix on the node" and recommended the node go back to this app's version.
+    reason = "nuc runs version 9.9.10 and this app runs 9.9.9. Update this app to 9.9.10."
+    details = _details(reg.STATE_UPDATE_NEEDED, reason=reason)
+    details = dataclasses.replace(details, view=dataclasses.replace(details.view, version="9.9.10"))
+    row = _check(_envelope(details), "node_version")
+    assert (row["ok"], row["label"], row["reason"], row["current"]) == (
+        False,
+        "This app needs an update",
+        reason,
+        "9.9.10",
+    )
+    assert not row.get("recommended")
+    assert not {"fix_where", "docs_url", "help_label"} & row.keys()
+
+
 def test_a_worker_nodes_version_row_says_it_matches():
     row = _check(_envelope(_details()), "node_version")
     assert (row["ok"], row["label"]) == (True, "The node's version matches this app")

@@ -188,11 +188,13 @@ def _connection(
             )
         )
         return rows
-    from ..markers.publishers.plex_remote import MIN_AGENT_VERSION
+    from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_older_than
 
     # A saved id means a node that gives one answered here before: an older release that gives none is refused.
     rolled_back = view.legacy and bool(node_uid)
     version_ok = view.state != STATE_UPDATE_NEEDED and not rolled_back
+    # A worker node ahead of this app is matched by updating this app, so nothing points at the node's machine.
+    app_behind = not version_ok and protocol.ROLE_WORKER in view.roles and agent_older_than(app_version, view.version)
     # The registry holds a worker to this app's exact version, a Plex database node only to a minimum one.
     worker = protocol.ROLE_WORKER in view.roles or not view.roles
     if worker:
@@ -206,7 +208,7 @@ def _connection(
         )
     shown = protocol.node_version(details.info) if details.info else ""
     current = shown or view.version or "unknown"
-    recommended = app_version if protocol.ROLE_WORKER in view.roles else None
+    recommended = app_version if protocol.ROLE_WORKER in view.roles and not app_behind else None
     node_block = (details.info or {}).get("node")
     node_build = str(node_block.get("build") or "") if isinstance(node_block, dict) else ""
     if recommended and view.version == app_version and not protocol.same_build(node_build, app_build):
@@ -215,7 +217,7 @@ def _connection(
     rows.append(
         _row(
             "node_version",
-            passing if version_ok else "The node needs an update",
+            passing if version_ok else "This app needs an update" if app_behind else "The node needs an update",
             severity=CRITICAL,
             ok=version_ok,
             explanation=explanation,
@@ -229,9 +231,9 @@ def _connection(
                 if rolled_back
                 else view.reason
             ),
-            fix_where=FIX_ON_NODE,
-            docs_url=UPDATE_DOCS_URL,
-            help_label="How to update a node",
+            fix_where=None if app_behind else FIX_ON_NODE,
+            docs_url=None if app_behind else UPDATE_DOCS_URL,
+            help_label=None if app_behind else "How to update a node",
         )
     )
     if version_ok and protocol.ROLE_WORKER in view.roles:

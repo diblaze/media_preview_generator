@@ -754,7 +754,7 @@
         rows.push(`<div class="nd-found-row">${pill('ok', '✓ Connected')}`
             + (same
                 ? `<span class="nd-faint">version ${esc(version || 'unknown')}${info.version_match === true ? ' · same as this app' : ''}</span>`
-                : `${pill('warn', 'Update needed')}<span class="nd-faint">version ${esc(version || 'unknown')}; this app is ${esc(page.appVersion || 'newer')}. Update the node so they match before it gets work.</span>`)
+                : `${pill('warn', 'Update needed')}<span class="nd-faint">version ${esc(version || 'unknown')}; this app is ${esc(page.appVersion || 'another version')}. Run the same version on both before it gets work.</span>`)
             + '</div>');
         let found = infoRoles(info).map((role) => pill('role', role === ROLE_PLEX_DB ? 'Plex database' : 'Worker')).join('');
         if (String((info.platform || {}).os || '').toLowerCase().startsWith('win')) found += pill('off', 'Windows');

@@ -1446,7 +1446,12 @@ class NodeRegistry:
         )
 
     def _read_info(self, record: dict, info: dict) -> _Outcome:
-        from ..markers.publishers.plex_remote import AGENT_PROTOCOL_NODE_UID, MIN_AGENT_VERSION, agent_too_old
+        from ..markers.publishers.plex_remote import (
+            AGENT_PROTOCOL_NODE_UID,
+            MIN_AGENT_VERSION,
+            agent_older_than,
+            agent_too_old,
+        )
 
         name = str(record.get("name") or "The node")
         block = info.get("node") if isinstance(info.get("node"), dict) else {}
@@ -1465,10 +1470,15 @@ class NodeRegistry:
             )
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
+            # A node that is ahead is matched by updating this app; one whose version can't be read is updated.
+            update = (
+                f"Update this app to {version}."
+                if agent_older_than(app_version, version)
+                else f"Update the node to {app_version}."
+            )
             return _Outcome(
                 STATE_UPDATE_NEEDED,
-                f"{name} runs version {version or 'unknown'} and this app runs {app_version}. Update the node to "
-                f"{app_version}.",
+                f"{name} runs version {version or 'unknown'} and this app runs {app_version}. {update}",
                 **outcome,
             )
         build, app_build = str(block.get("build") or ""), self._app_build()

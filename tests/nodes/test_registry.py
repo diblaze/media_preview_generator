@@ -289,7 +289,18 @@ class TestStates:
         view = h.registry.check_now("n1")
         assert view.state == reg.STATE_UPDATE_NEEDED
         assert "9.9.8" in view.reason and APP_VERSION in view.reason
+        assert view.reason.endswith(f"Update the node to {APP_VERSION}.")
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node needs an update")
+
+    @pytest.mark.parametrize("version", ["9.9.10", "10.0.0"])
+    def test_a_worker_newer_than_this_app_says_to_update_this_app(self, h, version):
+        # "Update the node to 9.9.9" sent the user to downgrade a node that was already ahead.
+        h.client().default_info = _info(version=version)
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_UPDATE_NEEDED
+        assert (
+            view.reason == f"nuc runs version {version} and this app runs {APP_VERSION}. Update this app to {version}."
+        )
 
     def test_a_worker_on_another_build_of_the_same_version_needs_an_update(self, h):
         # Pull request images and local builds all report one version: their commit tells them apart.
