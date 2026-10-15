@@ -694,11 +694,14 @@ class NodeRegistry:
                     live.next_check = soon
 
     def checked_ready_since_unavailable(self, node_id: str) -> bool:
-        """Whether the node is ready and a health check begun after it was last reported unavailable said so."""
+        """Whether the node has capacity and a health check begun after it was last reported unavailable found it so.
+
+        A node that lost its GPU counts: its CPU members keep their capacity, and its GPU members get none anyway.
+        """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
-            if live is None or self._state(live)[0] != STATE_READY:
+            if live is None or self._state(live)[0] not in (STATE_READY, STATE_GPU_LOST):
                 return False
             return live.ready_check > live.reported_at_check
 

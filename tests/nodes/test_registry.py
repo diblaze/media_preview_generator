@@ -779,6 +779,51 @@ class TestGpuLost:
 
         assert h.registry.rescan_gpus("n1").state == reg.STATE_GPU_LOST
 
+    @staticmethod
+    def _gpu_detection_broken(h):
+        broken = _info()
+        broken["worker"]["gpu_error"] = "Failed to initialize NVML: Driver/library version mismatch"
+        h.client().default_info = broken
+        assert h.registry.check_now("n1").state == reg.STATE_GPU_LOST
+
+    @staticmethod
+    def _drop(h):
+        h.registry._run_check = lambda *args, **kwargs: None  # keep the report's own check out of it
+        h.registry.report_unavailable("n1")
+        del h.registry._run_check
+
+    def test_a_check_after_a_drop_that_finds_it_answering_vouches_for_its_cpu_members(self, h):
+        self._gpu_detection_broken(h)
+        self._drop(h)
+        assert h.registry.checked_ready_since_unavailable("n1") is False
+
+        h.registry.check_now("n1")
+
+        assert h.registry.view("n1").state == reg.STATE_GPU_LOST
+        assert h.registry.capacity("n1").cpu is True
+        assert h.registry.checked_ready_since_unavailable("n1") is True
+
+    def test_its_cpu_workers_take_files_again_once_a_check_after_a_drop_finds_it_answering(self, h):
+        from media_preview_generator.jobs.worker import Worker, WorkerPool
+
+        self._gpu_detection_broken(h)
+        reg.set_registry(h.registry)
+        try:
+            pool = WorkerPool(cpu_workers=0, gpu_workers=0, selected_gpus=[])
+            worker = Worker(0, "CPU", node_id="n1", node_name="nuc")
+            worker._done_event = pool._worker_done_event
+            pool.workers.append(worker)
+            pool.mark_node_suspect("n1")
+            self._drop(h)
+            assert pool._find_available_worker(kind="intro_credits") is None
+
+            h.registry.check_now("n1")
+            pool.refresh_suspect_nodes()
+
+            assert pool._find_available_worker(kind="intro_credits") is worker
+        finally:
+            reg.set_registry(None)
+
     def test_a_plex_database_only_node_with_a_detection_error_stays_ready(self, h):
         failing = _info(roles=(ROLE_PLEX_DB,))
         failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"

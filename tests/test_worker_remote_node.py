@@ -247,7 +247,8 @@ class _Registry(NodeRegistry):
         return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), gpus, 4, False, seen)
 
     def checked_ready_since_unavailable(self, node_id: str) -> bool:
-        return node_id in self.checked_since_drop and self.states.get(node_id, (STATE_OFFLINE,))[0] == STATE_READY
+        state = self.states.get(node_id, (STATE_OFFLINE,))[0]
+        return node_id in self.checked_since_drop and state in (STATE_READY, STATE_GPU_LOST)
 
     def capacity(self, node_id: str) -> NodeCapacity:
         if node_id in self.capacities:
