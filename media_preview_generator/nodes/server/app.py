@@ -143,7 +143,7 @@ def create_node_app(
     )
     app.extensions[EXTENSION] = state
 
-    app.register_blueprint(_node_blueprint(state))
+    app.register_blueprint(_node_blueprint(state, identity.wrong_key_limit(app)))
 
     if protocol.ROLE_PLEX_DB in chosen_roles:
         plex_config_dir = os.environ.get("PLEX_CONFIG_DIR", "").strip()
@@ -165,7 +165,7 @@ def create_node_app(
     return app
 
 
-def _node_blueprint(state: NodeServerState) -> Blueprint:
+def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) -> Blueprint:
     """The node routes. Their auth and protocol checks live on the blueprint, not the app, so the Plex database
     role's routes keep the agent's own header check."""
     bp = Blueprint("node", __name__)
@@ -183,11 +183,17 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
         return answer({"error": error}, status, ok=False)
 
     def authorised() -> bool:
+        caller = request.remote_addr or ""
+        if wrong_keys.blocked(caller):
+            return False
         header = request.headers.get("Authorization", "")
         offered = header[7:].strip() if header.startswith("Bearer ") else ""
         # Compared as BYTES: werkzeug decodes headers as latin-1, and compare_digest raises TypeError on a str
         # holding anything above U+007F, so a stray non-ASCII byte would 500 on the auth path instead of 401.
-        return bool(offered) and secrets.compare_digest(offered.encode("utf-8", "surrogateescape"), key_bytes)
+        ok = bool(offered) and secrets.compare_digest(offered.encode("utf-8", "surrogateescape"), key_bytes)
+        if not ok:
+            wrong_keys.note_wrong(caller)
+        return ok
 
     @bp.before_request
     def _guard() -> Any:

@@ -12,7 +12,10 @@ import json
 import os
 import secrets
 import socket
+import threading
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +31,59 @@ PLACEHOLDER_MARK = "change-me"
 # rule: it keeps working whatever its length (with a warning), so an upgrade never locks the app out.
 MIN_KEY_LENGTH = 16
 MAKE_A_KEY = "openssl rand -hex 24"
+# Wrong keys one caller address may send at once, then one more every WRONG_KEY_REFILL_S: guessing even a short
+# AGENT_TOKEN runs at 20 keys a minute instead of hundreds a second. The app sends the right key and spends none.
+WRONG_KEY_BURST = 20
+WRONG_KEY_REFILL_S = 3.0
+# Addresses remembered at most; past it, those owing nothing are forgotten, then the longest quiet.
+WRONG_KEY_ADDRESSES_MAX = 4096
+_WRONG_KEYS_EXTENSION = "mpg_node_wrong_keys"
+
+
+class WrongKeyLimit:
+    """The wrong keys each caller address sent lately, so a node's guards stop comparing keys from one that sends
+    too many (thread-safe).
+
+    Args:
+        burst: Wrong keys an address may send at once.
+        refill_s: How long until it may send one more.
+        clock: For tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        burst: int = WRONG_KEY_BURST,
+        refill_s: float = WRONG_KEY_REFILL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._burst, self._refill_s, self._clock = burst, refill_s, clock
+        self._owed: dict[str, tuple[float, float]] = {}  # address -> (wrong keys not yet refilled, as of when)
+        self._lock = threading.Lock()
+
+    def _owing(self, address: str, now: float) -> float:
+        owed, since = self._owed.get(address, (0.0, now))
+        return max(0.0, owed - (now - since) / self._refill_s)
+
+    def blocked(self, address: str) -> bool:
+        """Whether ``address`` has used up its wrong keys: answer it as a wrong key without comparing."""
+        with self._lock:
+            return self._owing(address, self._clock()) > self._burst - 1
+
+    def note_wrong(self, address: str) -> None:
+        """Count one wrong (or missing) key from ``address``."""
+        with self._lock:
+            now = self._clock()
+            self._owed[address] = (self._owing(address, now) + 1, now)
+            if len(self._owed) > WRONG_KEY_ADDRESSES_MAX:
+                owing = {a: v for a, v in self._owed.items() if self._owing(a, now) > 0}
+                newest = sorted(owing.items(), key=lambda item: item[1][1])[-WRONG_KEY_ADDRESSES_MAX // 2 :]
+                self._owed = dict(newest)
+
+
+def wrong_key_limit(app: Any) -> WrongKeyLimit:
+    """The node app's one :class:`WrongKeyLimit`, shared by the node routes' guard and the Plex database role's."""
+    return app.extensions.setdefault(_WRONG_KEYS_EXTENSION, WrongKeyLimit())
 
 
 @dataclass(frozen=True)

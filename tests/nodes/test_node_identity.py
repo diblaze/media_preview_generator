@@ -262,3 +262,35 @@ class TestName:
         monkeypatch.setattr(identity.socket, "gethostname", lambda: "host-1")
 
         assert identity.load_identity(str(tmp_path)).name == "host-1"
+
+
+class TestWrongKeyLimit:
+    def _limit(self):
+        now = [0.0]
+        return identity.WrongKeyLimit(burst=3, refill_s=10.0, clock=lambda: now[0]), now
+
+    def test_an_address_is_blocked_after_its_burst_and_gets_one_more_try_per_refill(self):
+        limit, now = self._limit()
+        for _ in range(3):
+            assert not limit.blocked("10.0.0.66")
+            limit.note_wrong("10.0.0.66")
+        assert limit.blocked("10.0.0.66")
+        now[0] = 10.0
+        assert not limit.blocked("10.0.0.66")
+        limit.note_wrong("10.0.0.66")
+        assert limit.blocked("10.0.0.66")
+
+    def test_other_addresses_and_an_address_that_stopped_guessing_are_not_blocked(self):
+        limit, now = self._limit()
+        for _ in range(3):
+            limit.note_wrong("10.0.0.66")
+        assert not limit.blocked("10.0.0.5")
+        now[0] = 30.0
+        assert not limit.blocked("10.0.0.66")
+
+    def test_it_remembers_a_bounded_number_of_addresses(self, monkeypatch):
+        monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)
+        limit, _now = self._limit()
+        for n in range(50):
+            limit.note_wrong(f"10.0.1.{n}")
+        assert len(limit._owed) <= 10

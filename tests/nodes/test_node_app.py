@@ -118,6 +118,20 @@ class TestAuth:
     def test_delete_needs_the_key(self, make_app):
         assert make_app().test_client().delete("/v1/tasks/x").status_code == 401
 
+    def test_an_address_that_sent_too_many_wrong_keys_is_refused_even_with_the_right_one(self, make_app):
+        from media_preview_generator.nodes.server import identity
+
+        client = make_app().test_client()
+        guesser, app_address = {"REMOTE_ADDR": "10.0.0.66"}, {"REMOTE_ADDR": "10.0.0.5"}
+        wrong = {"Authorization": "Bearer wrong", protocol.PROTOCOL_HEADER: "1"}
+        for _ in range(identity.WRONG_KEY_BURST):
+            assert client.get("/v1/info", headers=wrong, environ_base=guesser).status_code == 401
+
+        # Its key isn't compared any more, so the right one can't be told from a wrong one...
+        assert client.get("/v1/info", headers=HEADERS, environ_base=guesser).status_code == 401
+        # ...while the app, at another address, is answered as always.
+        assert client.get("/v1/info", headers=HEADERS, environ_base=app_address).status_code == 200
+
 
 class TestProtocolHeader:
     @pytest.mark.parametrize("value", [None, "2", "one", "", "¹", "1" * 5000], ids=lambda v: repr(v)[:12])

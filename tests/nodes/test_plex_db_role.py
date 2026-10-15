@@ -205,6 +205,17 @@ class TestTheGuards:
         app = create_node_app(config_dir=str(tmp_path / "node"), roles=["plex_db"])
         assert "/v1/ping" in {rule.rule for rule in app.url_map.iter_rules()}
 
+    def test_an_address_that_sent_too_many_wrong_keys_is_refused_even_with_the_right_one(self, agent):
+        from media_preview_generator.nodes.server import identity
+
+        wrong = {"Authorization": "Bearer nope", plex_remote.PROTOCOL_HEADER: "1"}
+        right = {"Authorization": f"Bearer {TOKEN}", plex_remote.PROTOCOL_HEADER: "1"}
+        guesser = {"REMOTE_ADDR": "10.0.0.66"}
+        for _ in range(identity.WRONG_KEY_BURST):
+            assert agent.get("/v1/ping", headers=wrong, environ_base=guesser).status_code == 401
+        assert agent.get("/v1/ping", headers=right, environ_base=guesser).status_code == 401
+        assert agent.get("/v1/ping", headers=right, environ_base={"REMOTE_ADDR": "10.0.0.5"}).status_code == 200
+
     def test_a_wrong_key_says_nothing_about_this_plex(self, agent):
         body = agent.post("/v1/checks/file", json={}, headers={"Authorization": "Bearer nope"}).get_data(as_text=True)
         assert "Plex Media Server" not in body and "db_path" not in body
@@ -582,6 +593,14 @@ class TestTheImageStaysInStepWithTheApp:
         tags = set(re.findall(r"ghcr\.io/[\w.-]+/plex-marker-agent:(\S+)", text))
         assert tags, f"{document} should name the image tag the user is told to pull"
         assert tags == {plex_db_role.AGENT_VERSION}
+
+    def test_a_new_install_is_told_to_set_node_key_and_an_old_agent_token_still_works(self):
+        # NODE_KEY must be 16 characters or more; AGENT_TOKEN predates the rule and works at any length.
+        compose = (AGENT_DIR / "docker-compose.yml").read_text()
+        readme = (AGENT_DIR / "README.md").read_text()
+        assert "#   NODE_KEY=<paste the output of: openssl rand -hex 24>" in compose
+        assert "NODE_KEY: ${NODE_KEY:-}" in compose and "AGENT_TOKEN: ${AGENT_TOKEN:-}" in compose
+        assert "printf 'NODE_KEY=%s\\n'" in readme and "printf 'AGENT_TOKEN" not in readme
 
 
 class TestWhichPlexTheAgentServes:

@@ -2,7 +2,7 @@
 # is the whole point of it.
 #
 #   cat > .env <<'EOF'
-#   AGENT_TOKEN=<paste the output of: openssl rand -hex 24>
+#   NODE_KEY=<paste the output of: openssl rand -hex 24>
 #   PLEX_CONFIG=/path/to/plex/config
 #   PUID=1000
 #   PGID=1000
@@ -10,15 +10,17 @@
 #   chmod 600 .env
 #   docker compose up -d
 #
-# AGENT_TOKEN and PLEX_CONFIG have no default at all: leave either out and compose stops with a message naming it,
-# rather than starting a node with nothing mounted. PUID/PGID do fall back to 1000:1000 — set them if Plex runs
-# as anyone else, because a node running as the wrong user starts and looks healthy but can write nothing.
+# PLEX_CONFIG has no default at all: leave it out and compose stops with a message naming it, rather than starting a
+# node with nothing mounted. Without NODE_KEY the node makes a key of its own and prints it once in `docker logs`.
+# PUID/PGID do fall back to 1000:1000 — set them if Plex runs as anyone else, because a node running as the wrong
+# user starts and looks healthy but can write nothing.
 #
 # Then add this machine's address (http://<this-host>:9494) and the same key in the app (Nodes → Add node), and choose
 # the node in Servers → your Plex → Edit → Connection → Plex database.
 #
-# Upgrading from the Plex marker agent: the service, container name, image and settings are the same, so replacing
-# the old compose file with this one and running `docker compose up -d` updates it in place.
+# Upgrading from the Plex marker agent: the service, container name, image and settings are the same (its .env's
+# AGENT_TOKEN keeps working), so replacing the old compose file with this one and running `docker compose up -d`
+# updates it in place.
 services:
   plex-marker-agent:
     image: ghcr.io/stevezau/plex-marker-agent:1.2.0
@@ -28,8 +30,10 @@ services:
     # the database as anyone else, and refuses to try. 1000:1000 is only the common case, not a promise about yours.
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
-      # The shared key. Keep it in .env (never in this file, never in the image).
-      AGENT_TOKEN: ${AGENT_TOKEN:?set AGENT_TOKEN in .env}
+      # The shared key. Keep it in .env (never in this file, never in the image). AGENT_TOKEN is its name from the
+      # Plex marker agent: an older install's .env keeps working, and NODE_KEY wins when both are set.
+      NODE_KEY: ${NODE_KEY:-}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
       # Plex's config folder as THIS container sees it. The node derives the database path from it and never takes
       # a path from the app.
       PLEX_CONFIG_DIR: /plex/Library/Application Support/Plex Media Server
