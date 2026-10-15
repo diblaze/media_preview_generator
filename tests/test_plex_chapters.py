@@ -626,6 +626,36 @@ def test_agent_typed_requests_and_auth(backend, monkeypatch):
     assert client.post("/v1/chapters/register", json=body, headers=headers).status_code == 400
 
 
+def test_a_snapshot_from_an_app_without_the_analysed_field_registers_through_the_role(backend, monkeypatch):
+    """5.1.0's snapshot has no ``analysed``: a node beside an analysed part must not read that as a changed source."""
+    mutate(backend, "UPDATE media_items SET duration=5000 WHERE id=10")
+    mutate(backend, "INSERT INTO media_streams VALUES(1,20,2)")
+    target = read(backend)
+    assert target.analysed is True
+    client = _role_client(backend, monkeypatch)
+    headers = {"Authorization": "Bearer synthetic-key", "X-Marker-Agent-Protocol": "1"}
+    snapshot = target_to_json(target)
+    del snapshot["analysed"]
+    _, revisions = images(backend)
+    before = rows(backend)
+
+    response = client.post(
+        "/v1/chapters/register",
+        json={
+            "machine_identifier": MACHINE,
+            "pms_version": VERSION,
+            "deadline_s": 3,
+            "target": snapshot,
+            "revisions": [{"index": i, "sha256": sha} for i, sha in revisions.items()],
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.json
+    assert response.json["result"]["registered"] is True
+    assert rows(backend) != before
+
+
 def test_register_subset_updates_only_revised_chapters(backend):
     target = read(backend)
     _, revisions = images(backend)

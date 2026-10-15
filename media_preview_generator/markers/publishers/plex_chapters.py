@@ -18,7 +18,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -101,8 +101,10 @@ class ChapterTarget:
     chapters: tuple[Chapter, ...]
     machine_identifier: str
     # Plex has analysed this part (duration and audio/video streams recorded); chapters are written at that step, so
-    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False.
-    analysed: bool = False
+    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False. Derived, so
+    # not part of the snapshot's identity: an app older than this field sends none, and register's whole-snapshot
+    # comparison must not read that as Plex having changed the source.
+    analysed: bool = field(default=False, compare=False)
 
 
 def _target_changes(before: ChapterTarget, after: ChapterTarget) -> tuple[str, ...]:
