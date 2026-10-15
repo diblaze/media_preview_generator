@@ -107,6 +107,7 @@ def _is_known_notification_id(notification_id: str) -> bool:
         LIBRARY_HEALTH_CHECK_FAILED_ID,
         LIBRARY_HEALTH_NOT_SHOWING_ID,
         MEDIA_MOUNT_UNHEALTHY_ID,
+        NODE_UNCONFIRMED,
         SCHEMA_MIGRATION_ID,
         TIMEZONE_MISCONFIGURED_ID,
         VULKAN_SOFTWARE_FALLBACK_ID,
@@ -124,7 +125,7 @@ def _is_known_notification_id(notification_id: str) -> bool:
     if notification_id in fixed:
         return True
     if _NODE_NOTIFICATION_ID_RE.fullmatch(notification_id):
-        return notification_id.rsplit(":", 1)[1] in ALERT_STATES
+        return notification_id.rsplit(":", 1)[1] in {*ALERT_STATES, NODE_UNCONFIRMED}
     return is_gpu_notification_id(notification_id) and _GPU_NOTIFICATION_ID_RE.fullmatch(notification_id) is not None
 
 

@@ -28,7 +28,7 @@ from ...nodes.client import (
     NodeRequestError,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
-from ...nodes.readiness import node_readiness, to_fix
+from ...nodes.readiness import cached_file_checks, node_readiness, to_fix
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
 from ...nodes.settings import (
     KEY_MASK,
@@ -148,7 +148,7 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
 def _to_fix(record: dict, details: NodeDetails | None) -> dict[str, int]:
     """The Setup Health counts the card shows, so a "Ready" card still says when its Setup Health has rows to fix.
 
-    The Plex database checks ask the node, so they are left out here; its Setup Health tab runs them.
+    The Plex database checks ask the node, so the count uses the last ones its Setup Health tab ran.
     """
     if details is None:
         return {"must_fix": 0, "recommended": 0}
@@ -158,7 +158,7 @@ def _to_fix(record: dict, details: NodeDetails | None) -> dict[str, int]:
         key=str(record.get("key") or ""),
         worker_groups=sm.get("worker_groups"),
         app_version=_app_version(),
-        file_checks=None,
+        file_checks=cached_file_checks,
     )
     return to_fix(envelope)
 

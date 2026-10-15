@@ -122,6 +122,8 @@ class NodeView:
     checking: bool = False
     # Why an offline node is offline (``OFFLINE_*``); "" in every other state.
     cause: str = ""
+    # A Plex database node reported a new id this app couldn't tie to its Plex: its key must be typed again.
+    plex_db_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -948,6 +950,7 @@ class NodeRegistry:
             last_seen=live.last_seen,
             checking=live.checking,
             cause=live.probe_cause if state == STATE_OFFLINE else "",
+            plex_db_unconfirmed=bool(live.unconfirmed_uid),
         )
 
     def _touch(self) -> None:

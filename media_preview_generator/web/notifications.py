@@ -45,6 +45,8 @@ LIBRARY_HEALTH_CHECK_FAILED_ID = "library_health_check_failed"
 CREDITS_ON_CPU_ID_PREFIX = "credits_on_cpu_"
 # ``node:<node id>:<state>``, one per node in an alert state.
 NODE_ID_PREFIX = "node:"
+# The ``<state>`` of a Plex database node's card when it reports a new id its key must confirm.
+NODE_UNCONFIRMED = "unconfirmed"
 
 # Cards that can be hidden until the next restart but never for good: the problem they report comes and goes, and a
 # permanent dismissal would hide the next occurrence too. An id stored by an older version is ignored.
@@ -583,7 +585,8 @@ def node_notification_id(node_id: str, state: str) -> str:
 
 def _build_node_notifications() -> list[dict[str, Any]]:
     """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU,
-    has no FFmpeg, is added twice or can't use its temp folder.
+    has no FFmpeg, is added twice or can't use its temp folder, plus one for a Plex database node whose new id waits
+    for its key to be typed again.
 
     A node nothing uses (no switched-on worker group with a member on it, no switched-on Plex server with its Plex
     database node switched on pointing at it) raises no card: whatever its state, no work waits on it.
@@ -609,8 +612,13 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         for state in ALERT_STATES:
             if state != view.state:
                 undismiss_session(node_notification_id(view.id, state))
+        users = node_users(view.id, groups, servers, switched_on_only=True)
+        if not view.plex_db_unconfirmed:
+            undismiss_session(node_notification_id(view.id, NODE_UNCONFIRMED))
+        elif users["servers"]:
+            cards.append(_unconfirmed_node_card(view.id, view.name or "A node"))
         text = _NODE_CARD_TEXT.get(view.state)
-        if text is None or not any(node_users(view.id, groups, servers, switched_on_only=True).values()):
+        if text is None or not any(users.values()):
             continue
         title, todo, label, target = text
         if view.state == STATE_OFFLINE and view.cause == OFFLINE_RESTARTING:
@@ -633,6 +641,21 @@ def _build_node_notifications() -> list[dict[str, Any]]:
             }
         )
     return cards
+
+
+def _unconfirmed_node_card(node_id: str, name: str) -> dict[str, Any]:
+    """The card for a Plex database node that reports a new id (``NodeRegistry.plex_db_refusal``)."""
+    return {
+        "id": node_notification_id(node_id, NODE_UNCONFIRMED),
+        "severity": "warning",
+        "title": f"{name} reports a new id",
+        "body_html": "<p class='mb-0'>This app sends it no Plex database work until you confirm it is the same Plex. "
+        "Type the node's key again on its Settings tab.</p>",
+        "dismissable": True,
+        "permanent_dismissable": False,
+        "source": "nodes",
+        "action": {"href": f"/nodes#node-{node_id}/settings", "label": "Type the key again"},
+    }
 
 
 def _notification_sources() -> list[dict[str, Any] | None]:

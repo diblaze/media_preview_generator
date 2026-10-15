@@ -504,6 +504,51 @@ def test_a_node_that_needs_an_update_links_the_steps():
     assert "docs_url" not in _check(_envelope(_details()), "node_version")
 
 
+def test_the_count_to_fix_uses_the_last_plex_database_check_without_asking_the_node(monkeypatch):
+    """A node that can't write Plex's database showed Ready on its card: the count left the database rows out."""
+    from media_preview_generator.markers.publishers import plex_remote
+    from media_preview_generator.nodes import readiness
+
+    monkeypatch.setattr(readiness, "_last_reports", {})
+    details = _details(roles=(ROLE_PLEX_DB,), gpus=())
+
+    def count() -> dict:
+        envelope = node_readiness(
+            details, key="k", worker_groups=[], app_version="9.9.9", file_checks=readiness.cached_file_checks
+        )
+        return to_fix(envelope)
+
+    assert count() == {"must_fix": 0, "recommended": 0}
+
+    class FakeRemote:
+        def __init__(self, url, key):
+            pass
+
+        def file_checks(self, *, deadline):
+            return CapabilityReport(Capability.MISCONFIGURED, "can't write", {"db_path": "/d", "unwritable": ["/d"]})
+
+    monkeypatch.setattr(plex_remote, "RemotePlexDb", FakeRemote)
+    node_readiness(details, key="k", worker_groups=[], app_version="9.9.9", file_checks=readiness._default_file_checks)
+
+    assert count() == {"must_fix": 1, "recommended": 0}
+    # Another key is another check: its answer isn't this one's.
+    assert readiness.cached_file_checks("http://nuc:9494", "other") is None
+
+
+def test_a_plex_database_node_with_a_new_id_has_a_must_fix_that_opens_its_key():
+    details = _details(roles=(ROLE_PLEX_DB,), gpus=())
+    details = dataclasses.replace(details, view=dataclasses.replace(details.view, plex_db_unconfirmed=True))
+
+    envelope = _envelope(details, file_checks=_report(Capability.READY, "", db_path="/d", lock_holder=True))
+
+    row = _check(envelope, "plex_db_confirmed")
+    assert (row["ok"], row["severity"], row["label"]) == (False, "critical", "nuc reports a new id")
+    assert (row["fix_tab"], row["fix_label"]) == ("settings", "Type the key again")
+    assert envelope["overall_ok"] is False
+    counted = node_readiness(details, key="k", worker_groups=[], app_version="9.9.9", file_checks=None)
+    assert to_fix(counted) == {"must_fix": 1, "recommended": 0}
+
+
 def test_the_count_to_fix_matches_the_buckets_and_skips_the_plex_database_checks():
     failed = _details(roles=(ROLE_WORKER, ROLE_PLEX_DB), gpus=({**GPU, "status": "failed"},))
     envelope = node_readiness(failed, key="k", worker_groups=[], app_version="9.9.9", file_checks=None)

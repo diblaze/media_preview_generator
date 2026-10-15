@@ -11,6 +11,8 @@ A failing row says where its fix is: ``fix_tab`` (``media`` / ``settings`` / ``o
 
 from __future__ import annotations
 
+import hashlib
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -46,6 +48,9 @@ WORKERS_URL = "/settings#section-workers"
 SERVERS_URL = "/servers"
 # The docs section with the steps to update a node to this app's version.
 UPDATE_DOCS_URL = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
+# The last Plex database check of each (address, key hash), for the node list (cached_file_checks).
+_last_reports: dict[tuple[str, str], Any] = {}
+_last_reports_lock = threading.Lock()
 # Node-only row keys; the shared row builder doesn't know them.
 _NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label", "docs_url")
 # An offline node that answered at its address: (row label, where the fix is). A restart ends by itself, and a node
@@ -402,18 +407,57 @@ def _gpu_reason(error: object) -> str:
     return f"{found}Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
 
 
+def _report_key(url: str, key: str) -> tuple[str, str]:
+    return url, hashlib.sha256(key.encode()).hexdigest()
+
+
 def _default_file_checks(url: str, key: str) -> Any:
     from ..markers.publishers.plex_remote import RemotePlexDb
 
-    return RemotePlexDb(url, key).file_checks(deadline=time.monotonic() + PLEX_DB_CHECK_S)
+    report = RemotePlexDb(url, key).file_checks(deadline=time.monotonic() + PLEX_DB_CHECK_S)
+    with _last_reports_lock:
+        _last_reports[_report_key(url, key)] = report
+    return report
+
+
+def cached_file_checks(url: str, key: str) -> Any:
+    """The last Plex database check Setup Health ran on the node at ``url`` with ``key``, or None (never asks it).
+
+    The node list counts its rows from this, so a card stops saying Ready while its Setup Health has a must fix,
+    without a call to every node on every poll.
+    """
+    with _last_reports_lock:
+        return _last_reports.get(_report_key(url, key))
+
+
+def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
+    view = details.view
+    if not view.plex_db_unconfirmed:
+        return []
+    return [
+        _row(
+            "plex_db_confirmed",
+            f"{view.name} reports a new id",
+            severity=CRITICAL,
+            ok=False,
+            explanation="Another machine given the same address and key would report a new id too, so this app sends "
+            "it no Plex database work until you confirm it is the same Plex.",
+            reason="Type the node's key again on its Settings tab to confirm it is the same Plex.",
+            fix_tab=TAB_SETTINGS,
+            fix_label="Type the key again",
+        )
+    ]
 
 
 def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
     from ..markers.publishers.plex_db import node_wording
 
+    checked = file_checks(url, key)
+    if checked is None:
+        return []  # Not checked yet (cached_file_checks): no rows rather than a guess.
     # The check ran on the node: its refusals are about the node, not this app.
-    report = node_wording(file_checks(url, key))
+    report = node_wording(checked)
     details = report.details or {}
     if report.state is Capability.AGENT_UNAVAILABLE:
         return [
@@ -503,8 +547,9 @@ def node_readiness(
         worker_groups: The stored ``worker_groups`` list.
         app_version: This app's version.
         app_build: This app's commit ("" when unknown); shown when only the node's commit differs.
-        file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own). None
-            leaves the Plex database section out: it asks the node, too slow for the node list's count.
+        file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own); an answer
+            of None (not checked yet) adds no rows. None leaves the database checks out. The node list's count passes
+            :func:`cached_file_checks`: asking the node is too slow for it.
 
     Returns:
         ``{"overall_ok", "sections"}``.
@@ -516,8 +561,11 @@ def node_readiness(
     if usable and worker and not view.legacy:
         sections.append(_section("node_media_access", "Media access", _media_access(details)))
         sections.append(_section("node_workers", "Workers", _workers(details, worker_groups)))
-    if usable and protocol.ROLE_PLEX_DB in view.roles and file_checks is not None:
-        sections.append(_section("node_plex_db", "Plex database", _plex_db(view.url, key, file_checks)))
+    if usable and protocol.ROLE_PLEX_DB in view.roles:
+        rows = _plex_db_confirmed(details)
+        if file_checks is not None:
+            rows += _plex_db(view.url, key, file_checks)
+        sections.append(_section("node_plex_db", "Plex database", rows))
     kept = [s for s in sections if s is not None]
     overall_ok = not any(c["severity"] == CRITICAL and c["ok"] is False for s in kept for c in s["checks"])
     return {"overall_ok": overall_ok, "sections": kept}

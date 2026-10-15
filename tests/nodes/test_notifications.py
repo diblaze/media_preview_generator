@@ -177,6 +177,7 @@ def test_a_permanent_dismissal_never_hides_a_node_card():
     [
         ("node:abc123:offline", True),
         ("node:abc123:gpu_lost", True),
+        ("node:abc123:unconfirmed", True),
         ("node:abc123:ready", False),
         ("node:../../x:offline", False),
         ("node:abc123", False),
@@ -214,6 +215,46 @@ def test_only_a_node_something_switched_on_uses_gets_a_card(groups, servers, car
 
     get_settings_manager().apply_changes(updates={"worker_groups": groups, "media_servers": servers})
     assert bool(_cards(_view(reg.STATE_OFFLINE))) is carded
+
+
+def _unconfirmed(state=reg.STATE_READY):
+    return dataclasses.replace(_view(state, name="plex-box", reason=""), roles=("plex_db",), plex_db_unconfirmed=True)
+
+
+def test_a_plex_database_node_with_a_new_id_gets_a_card_that_opens_its_key():
+    """Until now only the Servers page said it; the node's card showed Ready and the bell stayed quiet."""
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    get_settings_manager().apply_changes(
+        updates={"worker_groups": [], "media_servers": _plex_on("abc123", enabled=True)}
+    )
+
+    (card,) = _cards(_unconfirmed())
+
+    assert card["id"] == "node:abc123:unconfirmed"
+    assert card["title"] == "plex-box reports a new id"
+    assert "Type the node's key again on its Settings tab" in card["body_html"]
+    assert card["action"] == {"href": "/nodes#node-abc123/settings", "label": "Type the key again"}
+    assert notif.is_session_only_dismissal(card["id"])
+
+
+def test_a_new_id_raises_no_card_when_no_switched_on_server_uses_the_node():
+    """A worker group member doesn't send Plex database work, so it doesn't make the new id matter."""
+    assert _cards(_unconfirmed()) == []
+
+
+def test_a_new_id_card_comes_back_after_the_key_is_confirmed_and_it_happens_again():
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    get_settings_manager().apply_changes(
+        updates={"worker_groups": [], "media_servers": _plex_on("abc123", enabled=True)}
+    )
+    card_id = notif.node_notification_id("abc123", notif.NODE_UNCONFIRMED)
+    notif.dismiss_session(card_id)
+
+    _cards(dataclasses.replace(_unconfirmed(), plex_db_unconfirmed=False))
+
+    assert not notif._session_is_dismissed(card_id)
 
 
 def test_a_switched_off_group_or_server_still_counts_as_using_the_node_for_used_by_and_remove():

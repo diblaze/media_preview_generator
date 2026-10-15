@@ -826,6 +826,34 @@ class TestHealthAndLog:
         assert set(body) == {"overall_ok", "sections"}
         assert body["sections"][0]["id"] == "node_connection"
 
+    def test_a_plex_database_must_fix_its_setup_health_found_is_counted_on_its_card(self, client, nodes, monkeypatch):
+        """The card said Ready with nothing to fix while Setup Health said the node can't write Plex's database."""
+        from media_preview_generator.markers.publishers import plex_remote
+        from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
+        from media_preview_generator.nodes import readiness
+
+        class CantWrite:
+            def __init__(self, url, key):
+                pass
+
+            def file_checks(self, *, deadline):
+                return CapabilityReport(
+                    Capability.MISCONFIGURED, "can't write", {"db_path": "/d", "unwritable": ["/d"]}
+                )
+
+        monkeypatch.setattr(readiness, "_last_reports", {})
+        monkeypatch.setattr(plex_remote, "RemotePlexDb", CantWrite)
+        nodes("http://nuc:9494").info_answer["node"]["roles"] = ["plex_db"]
+        node_id = _add(client).get_json()["id"]
+        _checked(client, node_id)
+
+        def card() -> dict:
+            return next(n for n in client.get("/api/nodes").get_json()["nodes"] if n["id"] == node_id)
+
+        assert card()["to_fix"] == {"must_fix": 0, "recommended": 0}
+        assert client.get(f"/api/nodes/{node_id}/health").get_json()["overall_ok"] is False
+        assert card()["to_fix"] == {"must_fix": 1, "recommended": 0}
+
     @pytest.fixture
     def app_in_sydney(self, monkeypatch):
         monkeypatch.setenv("TZ", "Australia/Sydney")
