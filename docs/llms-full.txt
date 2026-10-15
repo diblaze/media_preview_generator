@@ -1481,7 +1481,8 @@ CPU worker groups, alongside previews and Intro & Credits, and stores the measur
 the completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
-supported: Plex's music analysis includes album gain and fades that this video feature does not produce.
+supported: Plex's music analysis includes album gain and fades that this video feature does not produce. Trailers and
+other extras are skipped, because Plex doesn't take loudness for them.
 
 Loudness is off by default for each Plex server. When you enable it, all supported movie and TV libraries are selected
 by default; you can narrow that selection on the **Libraries** tab.
@@ -5489,7 +5490,9 @@ loudness worker is free. File outcomes:
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
 | `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
+| `loudness_skipped` | The file is a trailer or other extra (the same rule as Intro & Credits). Plex doesn't take loudness for extras. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
+| `skipped_source_gone` | The file isn't on disk because a newer file replaced it, or an import webhook said it was deleted. No retry. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |
 
 ### Plex loudness Endpoints

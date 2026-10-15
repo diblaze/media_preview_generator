@@ -109,6 +109,14 @@ def test_a_trailer_or_other_extra_is_skipped_not_a_failed_music_file(ctx, db, me
     assert job._completion({job.SKIPPED: 2}, []) == (0, None)
 
 
+def test_every_outcome_a_job_records_is_in_the_references_table():
+    # A script keyed on docs/reference.md's "File outcomes" table needs a meaning for every value a job can record.
+    reference = Path(job.__file__).resolve().parents[2] / "docs" / "reference.md"
+    text = reference.read_text(encoding="utf-8")
+    table = text.split("loudness worker is free. File outcomes:", 1)[1].split("### Plex loudness Endpoints", 1)[0]
+    assert [key for key in job.OUTCOME_KEYS if f"| `{key}` |" not in table] == []
+
+
 def test_check_settles_a_missing_file_and_a_file_nobody_owns(ctx, tmp_path):
     assert job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx).outcome_key == job.FILE_NOT_FOUND
     with patch.object(job, "owners", return_value=[]):

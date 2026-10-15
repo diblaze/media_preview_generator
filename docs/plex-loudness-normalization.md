@@ -17,7 +17,8 @@ CPU worker groups, alongside previews and Intro & Credits, and stores the measur
 the completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
-supported: Plex's music analysis includes album gain and fades that this video feature does not produce.
+supported: Plex's music analysis includes album gain and fades that this video feature does not produce. Trailers and
+other extras are skipped, because Plex doesn't take loudness for them.
 
 Loudness is off by default for each Plex server. When you enable it, all supported movie and TV libraries are selected
 by default; you can narrow that selection on the **Libraries** tab.
