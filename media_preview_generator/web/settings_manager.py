@@ -127,13 +127,19 @@ class SettingsManager:
         the right per-server token. Multi-server is brand-new on this branch
         so any settings.json hitting this code holds at most one Plex server;
         the migration is a straight copy.
+
+        A file from before the v7 upgrade has no server list yet: the keys stay for that step, which moves them onto
+        the Plex server it makes. The move is made in memory only, so the upgrade's pre-upgrade copy of settings.json
+        is the file as the old build wrote it; the next save stores it.
         """
         legacy_url = (self._settings.get("plex_webhook_public_url") or "").strip()
         legacy_enabled = self._settings.get("plex_webhook_enabled")
         if not legacy_url and legacy_enabled is None:
             return  # nothing to migrate
 
-        media_servers = self._settings.get("media_servers") or []
+        media_servers = self._settings.get("media_servers")
+        if media_servers is None:
+            return
         plex_entry = next(
             (s for s in media_servers if isinstance(s, dict) and s.get("type") == "plex"),
             None,
@@ -151,7 +157,6 @@ class SettingsManager:
 
         self._settings.pop("plex_webhook_public_url", None)
         self._settings.pop("plex_webhook_enabled", None)
-        self._save()
 
     def _save(self) -> None:
         """Save settings to file atomically."""

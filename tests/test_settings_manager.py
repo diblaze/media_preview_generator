@@ -847,7 +847,10 @@ class TestSingletonInitDeadlockRegression:
         result: dict = {}
 
         def init_in_thread() -> None:
+            from media_preview_generator.upgrade import run_migrations
+
             sm = get_settings_manager(str(tmp_path))
+            run_migrations(sm)
             result["settings"] = sm.get_all()
 
         t = threading.Thread(target=init_in_thread, daemon=True)
@@ -864,12 +867,8 @@ class TestSingletonInitDeadlockRegression:
                 )
 
             settings = result["settings"]
-            assert "plex_webhook_enabled" not in settings, (
-                "Legacy plex_webhook_enabled key was not migrated away during _load"
-            )
-            assert "plex_webhook_public_url" not in settings, (
-                "Legacy plex_webhook_public_url key was not migrated away during _load"
-            )
+            assert "plex_webhook_enabled" not in settings and "plex_webhook_public_url" not in settings
+            assert settings["media_servers"][0]["output"]["webhook_public_url"] == "https://example.com/webhook"
         finally:
             reset_settings_manager()
 

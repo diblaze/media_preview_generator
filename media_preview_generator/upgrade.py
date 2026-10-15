@@ -930,21 +930,29 @@ def _migrate_to_v7(sm) -> list:
     are *not* removed yet — the read path continues to honour them so
     Phase 1 ships the schema change without breaking existing single-Plex
     deployments. A later migration removes them once all callers have
-    been routed through the server registry.
+    been routed through the server registry. The Plex Direct webhook keys
+    (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto the
+    synthesised server's ``output``.
     """
     notes: list[str] = []
     if sm.get("media_servers") is not None:
         return notes
 
+    webhook_keys = [key for key in ("plex_webhook_public_url", "plex_webhook_enabled") if sm.get(key) is not None]
     entry = _legacy_plex_to_media_server(sm)
     if entry is None:
         # Fresh install: write an empty list so callers can rely on the key
         # always being present.
-        sm.apply_changes(updates={"media_servers": []})
+        sm.apply_changes(updates={"media_servers": []}, deletes=webhook_keys)
         notes.append("v7: initialised empty media_servers array")
         return notes
 
-    sm.apply_changes(updates={"media_servers": [entry]})
+    webhook_url = (sm.get("plex_webhook_public_url") or "").strip()
+    if webhook_url:
+        entry["output"]["webhook_public_url"] = webhook_url
+    if sm.get("plex_webhook_enabled") is not None:
+        entry["output"]["webhook_enabled"] = bool(sm.get("plex_webhook_enabled"))
+    sm.apply_changes(updates={"media_servers": [entry]}, deletes=webhook_keys)
     notes.append("v7: synthesised media_servers[0] from legacy plex_* settings")
     return notes
 
