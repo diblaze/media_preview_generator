@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -31,6 +32,7 @@ NODE_ROW_KEYS = {
     "cpu",
     "busy",
     "last_seen",
+    "checking",
     "path_mappings",
     "used_by",
     "to_fix",
@@ -125,6 +127,36 @@ def _sm():
 def _add(client, **fields):
     body = {"name": "nuc", "url": "http://nuc:9494", "key": "node-key", "path_mappings": [], **fields}
     return client.post("/api/nodes", json=body)
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _rows(client):
+    return client.get("/api/nodes").get_json()["nodes"]
+
+
+def _row(client, node_id):
+    return next(row for row in _rows(client) if row["id"] == node_id)
+
+
+def _checked(client, node_id):
+    """Check now, then the node's row once that check is done: it runs in the background.
+
+    A check still running when it is asked (the one adding the node starts) would answer it instead, so that one
+    finishes first.
+    """
+    assert _wait_for(lambda: not _row(client, node_id)["checking"])
+    resp = client.post(f"/api/nodes/{node_id}/check")
+    assert resp.status_code == 202, resp.get_json()
+    assert _wait_for(lambda: not _row(client, node_id)["checking"])
+    return _row(client, node_id)
 
 
 class TestListAndProbe:
@@ -358,12 +390,78 @@ class TestCreate:
         assert resp.status_code == 400 and "already called" in resp.get_json()["error"]
 
 
-class TestRowState:
-    def test_check_now_answers_with_the_live_state_and_last_info(self, client, nodes):
+class TestCheckNow:
+    """Check now answers at once: the checks run in the background and the page reads the list until they're done."""
+
+    @pytest.fixture
+    def real_gaps(self, nodes):
+        """The registry with the real wait between a check's attempts (the shared fixture's has none)."""
+        registry = reg.NodeRegistry(
+            client_factory=lambda record: nodes(record["url"]),
+            legacy_ping=lambda url, key: ("unreachable", ""),
+            quick_access=lambda client, mappings: True,
+            app_version=lambda: APP_VERSION,
+        )
+        reg.set_registry(registry)
+        yield nodes
+        registry.stop()  # ends a wait before the next attempt
+
+    def test_check_now_of_a_node_that_does_not_answer_answers_at_once(self, client, real_gaps):
         node_id = _add(client).get_json()["id"]
+        assert _wait_for(lambda: not _row(client, node_id)["checking"])
+        real_gaps("http://nuc:9494").info_answer = NodeUnreachableError("http://nuc:9494 didn't answer: ConnectTimeout")
+
+        started = time.monotonic()
         resp = client.post(f"/api/nodes/{node_id}/check")
-        row = resp.get_json()
-        assert resp.status_code == 200 and row["state"] == "ready"
+        took = time.monotonic() - started
+
+        # Its three attempts 4 s apart held this web server thread 8 s (17-38 s with real timeouts).
+        assert took < 1.0, f"POST /check held the request for {took:.1f} s"
+        assert resp.status_code == 202 and resp.get_json()["checking"] is True
+        assert _row(client, node_id)["checking"] is True
+        reg.get_registry().stop()
+        assert _wait_for(lambda: not _row(client, node_id)["checking"])
+        assert _row(client, node_id)["state"] == "offline"
+
+    def test_check_all_checks_every_turned_on_node_once_in_the_background(self, client, nodes):
+        ids = {}
+        for name, uid in (("nuc", "uid-1"), ("pc", "uid-2"), ("old", "uid-3")):
+            nodes(f"http://{name}:9494").info_answer = _info(uid=uid)
+            ids[name] = _add(client, name=name, url=f"http://{name}:9494").get_json()["id"]
+        assert client.put(f"/api/nodes/{ids['old']}", json={"enabled": False}).status_code == 200
+        assert _wait_for(lambda: not any(row["checking"] for row in _rows(client)))
+        release, asked = threading.Event(), []
+        for name in ids:
+            fake = nodes(f"http://{name}:9494")
+
+            def slow(name=name, answer=fake.info_answer):
+                asked.append(name)
+                release.wait(5)
+                return answer
+
+            fake.info = slow
+
+        resp = client.post("/api/nodes/check")
+        again = client.post("/api/nodes/check")  # while those checks still run
+
+        body = resp.get_json()
+        assert (resp.status_code, again.status_code, body["app_version"]) == (202, 202, APP_VERSION)
+        assert {row["name"]: row["checking"] for row in body["nodes"]} == {"nuc": True, "pc": True, "old": False}
+        release.set()
+        assert _wait_for(lambda: not any(row["checking"] for row in _rows(client)))
+        assert sorted(asked) == ["nuc", "pc"]
+        assert {row["name"]: row["state"] for row in _rows(client)} == {
+            "nuc": "ready",
+            "pc": "ready",
+            "old": "disabled",
+        }
+
+
+class TestRowState:
+    def test_check_now_leaves_the_live_state_and_last_info_in_the_row(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        row = _checked(client, node_id)
+        assert row["state"] == "ready" and row["checking"] is False
         assert (row["version"], row["roles"], row["legacy"], row["busy"]) == (APP_VERSION, ["worker"], False, 2)
         assert row["cpu"] == {"cores": 8, "load1": 0.25, "ram_total": 16, "ram_available": 9}
         assert row["platform"] == {"os": "Linux", "arch": "x86_64", "python": "3.12"}
@@ -379,7 +477,7 @@ class TestRowState:
 
     def test_rescan_gpus_on_a_node_that_does_not_answer_is_a_502_not_the_old_gpus(self, client, nodes):
         node_id = _add(client).get_json()["id"]
-        assert client.post(f"/api/nodes/{node_id}/check").get_json()["state"] == "ready"
+        assert _checked(client, node_id)["state"] == "ready"
         fake = nodes("http://nuc:9494")
 
         def down():
@@ -418,7 +516,7 @@ class TestUpdate:
 
     def test_a_new_address_goes_back_to_connecting(self, client, nodes):
         node_id = _add(client).get_json()["id"]
-        client.post(f"/api/nodes/{node_id}/check")
+        _checked(client, node_id)
         nodes("http://moved:9494").info_answer = NodeUnreachableError("slow")
         row = client.put(f"/api/nodes/{node_id}", json={"url": "http://moved:9494", "key": "node-key"}).get_json()
         assert row["url"] == "http://moved:9494"
@@ -608,7 +706,7 @@ class TestTestAccess:
 class TestHealthAndLog:
     def test_health_is_the_setup_health_envelope(self, client, nodes):
         node_id = _add(client).get_json()["id"]
-        client.post(f"/api/nodes/{node_id}/check")
+        _checked(client, node_id)
         body = client.get(f"/api/nodes/{node_id}/health").get_json()
         assert set(body) == {"overall_ok", "sections"}
         assert body["sections"][0]["id"] == "node_connection"
@@ -662,6 +760,7 @@ class TestAuth:
         ("put", "/api/nodes/n1"),
         ("delete", "/api/nodes/n1"),
         ("post", "/api/nodes/n1/check"),
+        ("post", "/api/nodes/check"),
         ("post", "/api/nodes/n1/test-access"),
         ("get", "/api/nodes/n1/health"),
         ("get", "/api/nodes/n1/log"),
@@ -744,7 +843,7 @@ class TestReinstalledNode:
 
         # docker pull + rm + run without a kept /config: a fresh node.json, so a new id.
         helper.info_answer = self._plex_db_info("second-container", machine_identifier)
-        row = client.post(f"/api/nodes/{node_id}/check").get_json()
+        row = _checked(client, node_id)
         assert row["state"] == "ready", row["reason"]
         return node_id
 
@@ -788,7 +887,7 @@ class TestReinstalledNode:
 
         assert resp.status_code == 200, resp.get_json()
         assert self._refusal() is None
-        client.post(f"/api/nodes/{node_id}/check")
+        _checked(client, node_id)
         assert _sm().nodes[0]["node_uid"] == "second-container"
         assert self._refusal() is None
 
@@ -808,8 +907,8 @@ class TestReinstalledNode:
         lines: list[str] = []
         sink = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
         try:
-            client.post(f"/api/nodes/{node_id}/check")
-            client.post(f"/api/nodes/{node_id}/check")
+            _checked(client, node_id)
+            _checked(client, node_id)
         finally:
             logger.remove(sink)
         assert [line for line in lines if "new id" in line] == ["nuc reports a new id; it was probably reinstalled"]
@@ -845,7 +944,7 @@ class TestNodeSentValues:
         answer["platform"] = {"os": "L" * 5000, "arch": float("nan")}
         nodes("http://nuc:9494").info_answer = answer
         node_id = _add(client).get_json()["id"]
-        client.post(f"/api/nodes/{node_id}/check")
+        _checked(client, node_id)
 
         def refuse(constant):
             raise ValueError(f"not JSON a browser can parse: {constant}")

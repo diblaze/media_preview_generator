@@ -140,6 +140,7 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "cpu": {key: _finite(cpu.get(key)) for key in ("cores", "load1", "ram_total", "ram_available")},
         "busy": details.busy if details else 0,
         "last_seen": view.last_seen if view else None,
+        "checking": bool(view.checking) if view else False,
         "path_mappings": list(record.get("path_mappings") or []),
         "used_by": _used_by(record["id"]),
         "to_fix": _to_fix(record, details),
@@ -334,14 +335,34 @@ def _json_body() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _list_body() -> dict[str, Any]:
+    registry = get_registry()
+    rows = [
+        _node_row(record, registry.details(record["id"])) for record in get_settings_manager().nodes if record.get("id")
+    ]
+    return {"nodes": rows, "app_version": _app_version()}
+
+
 @api.route("/nodes", methods=["GET"])
 @api_token_required
 def list_nodes():
     """Every node as ``NODE_ROW`` and this app's version."""
-    sm = get_settings_manager()
+    return jsonify(_list_body())
+
+
+@api.route("/nodes/check", methods=["POST"])
+@api_token_required
+def check_all_nodes():
+    """Start a health check of every node and answer 202 at once with ``GET /nodes``'s answer.
+
+    The checks run in the background (one of a node that doesn't answer takes up to ~40 s): the page reads the list
+    again until no row is ``checking``.
+    """
     registry = get_registry()
-    rows = [_node_row(record, registry.details(record["id"])) for record in sm.nodes if record.get("id")]
-    return jsonify({"nodes": rows, "app_version": _app_version()})
+    for record in get_settings_manager().nodes:
+        if record.get("id"):
+            registry.request_check(record["id"])
+    return jsonify(_list_body()), 202
 
 
 @api.route("/nodes/probe", methods=["POST"])
@@ -518,10 +539,10 @@ def delete_node(node_id: str):
 @api.route("/nodes/<node_id>/check", methods=["POST"])
 @api_token_required
 def check_node(node_id: str):
-    """Run a health check now and answer with the fresh ``NODE_ROW``."""
-    if get_registry().check_now(node_id) is None:
+    """Start a health check in the background and answer 202 at once with the ``NODE_ROW`` (``checking`` meanwhile)."""
+    if get_registry().request_check(node_id) is None:
         return _not_found(node_id)
-    return jsonify(_row_for(node_id))
+    return jsonify(_row_for(node_id)), 202
 
 
 @api.route("/nodes/<node_id>/test-access", methods=["POST"])

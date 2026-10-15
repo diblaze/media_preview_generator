@@ -117,10 +117,17 @@ class NodesApi:
         self.delete_answer: tuple[int, dict] = (200, {"ok": True})
         self.rescan_answer: tuple[int, dict] | None = None
         self.suggest_answer: dict = {"path_mappings": [], "media_setup": {"servers": 1, "libraries": 1}}
+        # Check now: how many list reads after it still say the nodes are being checked; the next shows what changed.
+        self.check_reads = 0
+        self.after_check: dict[str, dict] = {}
+        self._checking = 0
         page.route("**/api/nodes**", self._handle)
 
     def bodies(self, method: str, suffix: str) -> list:
         return [body for m, path, body in self.calls if m == method and path.endswith(suffix)]
+
+    def _list(self, *, checking: bool) -> dict:
+        return {"nodes": [{**node, "checking": checking} for node in self.nodes], "app_version": APP_VERSION}
 
     def _find(self, node_id: str) -> dict:
         return next(n for n in self.nodes if n["id"] == node_id)
@@ -133,7 +140,16 @@ class NodesApi:
         self.calls.append((request.method, path, body))
         parts = path.strip("/").split("/")
         if parts == ["nodes"] and request.method == "GET":
-            return _fulfill(route, {"nodes": self.nodes, "app_version": APP_VERSION})
+            if self._checking:
+                self._checking -= 1
+                if not self._checking:
+                    for node in self.nodes:
+                        node.update(self.after_check.get(node["id"], {}))
+                return _fulfill(route, self._list(checking=bool(self._checking)))
+            return _fulfill(route, self._list(checking=False))
+        if parts == ["nodes", "check"]:
+            self._checking = self.check_reads + 1
+            return _fulfill(route, self._list(checking=True), 202)
         if parts == ["nodes", "probe"]:
             return _fulfill(route, self.probe_answer)
         if parts == ["nodes"] and request.method == "POST":
@@ -368,13 +384,23 @@ class TestNodeList:
         empty.locator(".nd-add").click()
         expect_modal_shown(authed_page, "addNodeModal")
 
-    def test_check_now_checks_every_node(self, authed_page: Page, app_url: str) -> None:
+    def test_check_now_checks_every_node_in_one_request_and_says_checking_until_done(
+        self, authed_page: Page, app_url: str
+    ) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
-        with authed_page.expect_response(lambda r: r.url.endswith("/api/nodes") and r.request.method == "GET"):
-            authed_page.locator("#nodesCheckNow").click()
-        checked = sorted(path for method, path, _ in api.calls if method == "POST" and path.endswith("/check"))
-        assert checked == [f"/nodes/{n}/check" for n in ("n-nuc", "n-old", "n-pc", "n-storage")]
-        expect(authed_page.locator("#nodesCheckNow")).to_have_text("Check now")
+        api.check_reads = 2
+        api.after_check = {"n-old": {"state": "ready", "reason": ""}}
+        button = authed_page.locator("#nodesCheckNow")
+
+        button.click()
+
+        expect(button).to_have_text("Checking…")
+        expect(button).to_be_disabled()
+        expect(authed_page.locator("#node-n-old .nd-status .pill")).not_to_have_text("✓ Ready")
+        expect(button).to_have_text("Check now", timeout=10000)
+        expect(button).to_be_enabled()
+        expect(authed_page.locator("#node-n-old .nd-status .pill")).to_have_text("✓ Ready")
+        assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/check"]
 
     def test_list_is_polled(self, authed_page: Page, app_url: str) -> None:
         authed_page.clock.install()
