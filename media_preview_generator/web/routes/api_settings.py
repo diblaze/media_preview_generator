@@ -1849,6 +1849,28 @@ def _settings_replaced(settings: Any) -> str | None:
     return reconcile_group_settings(settings)
 
 
+def _restored_pause_applied(settings: Any, paused_before: bool) -> None:
+    """Do what Pause or Resume does when the restored settings.json pauses processing, or stops pausing it.
+
+    The pause is read from the settings, so the restore alone changes it, but nothing else: the jobs the old pause
+    held would stay pending until the next Resume, and the dashboard would go on showing the old state.
+
+    Args:
+        settings: The settings manager, holding the restored file.
+        paused_before: Whether processing was paused before the restore.
+    """
+    from ..jobs import get_job_manager
+    from .job_runner import resume_running_and_drain_pending
+
+    paused = settings.processing_paused
+    if paused == paused_before:
+        return
+    logger.info("Processing {} by the restored settings", "paused" if paused else "resumed")
+    get_job_manager().emit_processing_paused_changed(paused)
+    if not paused:
+        resume_running_and_drain_pending()
+
+
 def _restore_refusal(name: str, path: str, settings: Any) -> str:
     """Why a backup can't be put back by this build ("" when it can).
 
@@ -1956,12 +1978,14 @@ def restore_backup():
     schedules = get_schedule_manager() if name in ("schedules.json", "settings.json") else None
     tmp_path = f"{live}.restore.tmp"
     replaced = False
+    paused_before = False
     failure = None
     try:
         # The schedules lock first: a schedule save takes it, then the settings lock.
         with schedules.locked() if schedules is not None else nullcontext(), settings.locked():
             live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
             setup_finished = settings.is_setup_complete()
+            paused_before = settings.processing_paused
             # Copied before the snapshot: trimming the backups to the number kept (or by age) can delete this one.
             shutil.copy2(bak_path, tmp_path)
             _snapshot_before_restore(live)
@@ -1988,6 +2012,9 @@ def restore_backup():
             os.unlink(tmp_path)
     # Whenever the file was replaced, even with its update failed: what read the old file must read this one.
     warning = _settings_replaced(settings) if replaced and name == "settings.json" else None
+    if replaced and name == "settings.json" and not settings.load_failed:
+        # Outside the locks: a resume starts the waiting jobs.
+        _restored_pause_applied(settings, paused_before)
     if failure:
         return jsonify({"success": False, "error": failure}), 500
 

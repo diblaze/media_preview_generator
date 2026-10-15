@@ -7517,6 +7517,42 @@ class TestBackupRestore:
         assert "can't be read" in resp.get_json()["error"]
         assert client.get("/api/setup/status").status_code == 200
 
+    @pytest.mark.parametrize(
+        ("paused_live", "paused_backup"),
+        [(True, False), (False, True), (True, True), (False, False)],
+        ids=["resumed-by-the-restore", "paused-by-the-restore", "stays-paused", "stays-running"],
+    )
+    def test_a_restore_that_changes_the_pause_does_what_pause_or_resume_does(
+        self, client, monkeypatch, paused_live, paused_backup
+    ):
+        """A pause saves settings.json, so the newest backup is the file from just before it. Restored, processing read
+        "not paused", but the jobs the pause held stayed pending until the next Resume, and the dashboard wasn't told."""
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes import job_runner
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        backup = "settings.json.20260101-100000.bak"
+        reasons = ["manual"] if paused_backup else []
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(dict(sm.get_all(), processing_pause_reasons=reasons, processing_paused=paused_backup), f)
+        sm.processing_paused = paused_live
+        jm = get_job_manager()
+        job = jm.create_job(library_name="Movies", config={})
+        started: list[str] = []
+        told: list[bool] = []
+        monkeypatch.setattr(job_runner, "_start_job_async", lambda job_id, cfg=None: started.append(job_id))
+        monkeypatch.setattr(jm, "emit_processing_paused_changed", told.append)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.processing_paused is paused_backup
+        assert told == ([paused_backup] if paused_live != paused_backup else [])
+        assert started == ([job.id] if paused_live and not paused_backup else [])
+
     def test_the_backups_list_marks_a_backup_that_cant_be_read(self, client):
         """A backup cut short is newer than the live file, so it was marked "backup is newer", inviting the restore."""
         from media_preview_generator.utils import timestamped_backups
