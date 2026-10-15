@@ -2596,6 +2596,22 @@ def test_forget_capability_drops_one_servers_answers():
     assert cache.get(plex, "inspector", lambda: "unused") == "ready"
 
 
+@pytest.mark.parametrize("how", ["forget", "clear"])
+def test_a_check_running_when_its_server_is_forgotten_doesnt_store_its_answer(how):
+    # A check against a node's old address came back after its address changed (``forget_node_capability``): its
+    # answer was served for up to a minute.
+    cache = inspect.CapabilityCache(ttl_s=60.0, clock=lambda: 0.0)
+    cfg = server_config("plex", ServerType.PLEX)
+
+    def old_address_check():
+        cache.forget("plex") if how == "forget" else cache.clear()
+        return "ready"
+
+    assert cache.get(cfg, "status", old_address_check) == "ready"
+    assert cache.get(cfg, "status", lambda: "agent_unavailable") == "agent_unavailable"
+    assert cache.get(cfg, "status", lambda: "unused") == "agent_unavailable"
+
+
 def test_forget_capability_uses_the_shared_cache(factory):
     cfg = server_config("jf", ServerType.JELLYFIN)
     inspect.server_status_payload(MagicMock(), cfg)

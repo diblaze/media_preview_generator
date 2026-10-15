@@ -472,6 +472,12 @@ class _TaskRun:
             except NodeStoppingError as exc:
                 # A routine stop (a restart, an update) cancelled it: not the file's doing, so no drop is counted.
                 raise self._unavailable(f"{name} is restarting", started=False) from exc
+            except NodeRateLimitedError as exc:
+                # The node answered: it holds back this app's address (wrong keys from something else there), not
+                # the task, which keeps running. One no poll reaches for the node's unpolled-task expiry is dropped
+                # there, and then reads here as a task the node no longer knows.
+                logger.debug("{}poll held back: {}", self._prefix, exc)
+                failed_polls = 0
             except NodeError as exc:
                 if failed_polls == 0:
                     failing_since = asked_at
@@ -480,10 +486,11 @@ class _TaskRun:
                     raise self._unavailable(f"{name} stopped answering: {exc}") from exc
                 self._sleep()
                 continue
-            failed_polls = 0
-            self._relay(state)
-            if state.get("status") in protocol.FINISHED_STATUSES:
-                return state
+            else:
+                failed_polls = 0
+                self._relay(state)
+                if state.get("status") in protocol.FINISHED_STATUSES:
+                    return state
             if self._cancel_seen_at is not None and time.monotonic() - self._cancel_seen_at > CANCEL_WAIT_S:
                 raise NodeTaskCancelledError(protocol.KIND_CANCELLED, f"{name} didn't stop the cancelled task")
             self._sleep()

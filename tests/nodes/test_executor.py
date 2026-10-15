@@ -354,6 +354,24 @@ class TestNodeDrops:
             _run(media)
         assert client.named("delete") == []
 
+    def test_polls_held_back_by_the_wrong_key_limit_keep_waiting_for_a_task_the_node_runs(self, media):
+        # Something else at this app's address with an old key: the node answers 429 to every request from here for
+        # a while, and the task keeps running. Read as the node going away, two of those failed the file.
+        waits = [NodeRateLimitedError("http://n asks this app to wait")] * (executor.MAX_FAILED_POLLS + 3)
+        client = ScriptedClient([running(), unreachable(), *waits, finished(protocol.STATUS_DONE, result={"ok": 1})])
+        registry = _install(client)
+
+        assert _run(media) == {"ok": 1}
+        assert registry.reports == []
+
+    def test_a_cancelled_task_held_back_by_the_wrong_key_limit_is_still_given_up_on(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "CANCEL_WAIT_S", 0.0)
+        client = ScriptedClient([running(), NodeRateLimitedError("http://n asks this app to wait")])
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError, match="didn't stop the cancelled task"):
+            _run(media, cancel_check=lambda: bool(client.named("poll")))  # cancelled once the task runs
+
     def test_two_failed_polls_then_an_answer_carry_on(self, media):
         client = ScriptedClient(
             [unreachable(), unreachable(), running(), unreachable(), finished(protocol.STATUS_DONE, result={"ok": 1})]

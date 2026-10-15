@@ -6998,6 +6998,26 @@ class TestBackupRestore:
         finally:
             reg.set_registry(None)
 
+    def test_a_restore_forgets_the_cached_intro_and_credits_checks(self, client):
+        """A server's cached check names only its Plex database node, which the restored file can move elsewhere."""
+        from media_preview_generator.markers import inspect
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        backup = "settings.json.20261015-040000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(sm.get_all(), f)
+        inspect._CAPABILITY_CACHE._entries[("s1", "status")] = (0.0, "fingerprint", {"state": "ready"})
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": backup},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert inspect._CAPABILITY_CACHE._entries == {}
+
     def test_a_nodes_editor_opened_before_a_restore_is_told_the_nodes_changed(self, client):
         """The backup can hold other nodes at the revision the open editor loaded: its save must not land on them."""
         from media_preview_generator.web.settings_manager import NodesConflict, get_settings_manager

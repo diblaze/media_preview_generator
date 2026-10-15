@@ -115,6 +115,10 @@ class CapabilityCache:
         self._guard = threading.Lock()
         self._entries: dict[tuple[str, str], tuple[float, str, Any]] = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
+        # How often each server's answers were forgotten, and every answer cleared: a check that began before one of
+        # those (against a node's old address, say) answers for what was forgotten, so it isn't stored.
+        self._forgets: dict[str, int] = {}
+        self._clears = 0
 
     def get(self, config: ServerConfig, variant: str, compute: Callable[[], Any]) -> Any:
         """The cached answer for ``config``'s server, computing it at most once at a time per server.
@@ -146,9 +150,12 @@ class CapabilityCache:
             if entry is not None and not saved_since and self._clock() - entry[0] < self._ttl_for(entry[2]):
                 return copy.deepcopy(entry[2])
             try:
+                with self._guard:
+                    began = (self._clears, self._forgets.get(config.id, 0))
                 value = compute()
                 with self._guard:
-                    self._entries[key] = (self._clock(), fingerprint, value)
+                    if began == (self._clears, self._forgets.get(config.id, 0)):
+                        self._entries[key] = (self._clock(), fingerprint, value)
             finally:
                 if saved_since:
                     # The lock goes with the evicted answer; a thread already waiting on it still finds the new one.
@@ -180,7 +187,8 @@ class CapabilityCache:
         return self.ttl_s if ready else self.not_ready_ttl_s
 
     def forget(self, server_id: str) -> None:
-        """Forget one server's answers (both variants), so its next load checks it again.
+        """Forget one server's answers (both variants), and what a check of it still running finds, so its next load
+        checks it again.
 
         Args:
             server_id: The server's id.
@@ -188,12 +196,15 @@ class CapabilityCache:
         with self._guard:
             for key in [k for k in self._entries if k[0] == server_id]:
                 del self._entries[key]
+            self._forgets[server_id] = self._forgets.get(server_id, 0) + 1
 
     def clear(self) -> None:
         """Forget every answer and its lock."""
         with self._guard:
             self._entries.clear()
             self._locks.clear()
+            self._forgets.clear()
+            self._clears += 1
 
 
 def _config_fingerprint(config: ServerConfig) -> str:

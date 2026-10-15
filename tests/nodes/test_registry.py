@@ -1243,7 +1243,7 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
         assert h.registry.plex_db_hold("n1") is None
         assert h.client().info_calls == 1
 
-    def test_after_a_check_found_it_down_its_work_waits_and_a_check_starts_at_once(self, h):
+    def test_after_a_check_found_it_down_its_work_waits_and_its_next_check_comes_sooner(self, h):
         client = h.client()
         client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
         client.default_info = self._answer("uid-2")
@@ -1257,7 +1257,23 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
             "lost.",
             waits=True,
         )
+        assert h.registry._nodes["n1"].next_check == h.clock.now + reg.WAITING_RECHECK_S
+        h.clock.now += reg.WAITING_RECHECK_S
+        h.registry.plex_db_hold("n1")
         assert _wait_for(lambda: "reports a new id" in h.registry.plex_db_refusal("n1"))
+
+    def test_work_asked_for_while_it_is_down_keeps_its_check_back_off(self, h):
+        # Each request for Plex database work started a check of a node that was down: 8 s checks back to back.
+        client = h.client()
+        client.default_info = NodeUnreachableError("down")
+        h.registry.check_now("n1")
+        live = h.registry._nodes["n1"]
+
+        for _ in range(3):
+            assert h.registry.plex_db_hold("n1").waits
+            assert _wait_for(lambda: not live.checking)
+
+        assert client.info_calls == reg.CHECK_ATTEMPTS
 
     def test_a_node_heard_with_its_saved_id_that_goes_down_is_held_again(self, h):
         client = h.client()
@@ -1284,6 +1300,54 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
             h.client().default_info = NodeUnreachableError("down")  # the new client: nothing answers there yet
 
         assert h.registry.plex_db_hold("n1").waits
+
+    @pytest.mark.parametrize("after", ["app-start", "node-down"])
+    def test_an_older_release_that_gives_no_id_is_held_until_updated_or_confirmed(self, h, after):
+        # An answer without an id used to count as hearing the node: an older Plex helper beside another Plex, with
+        # the saved key at the saved address, got this server's markers.
+        client = h.client()
+        if after == "node-down":
+            client.default_info = self._answer("uid-1")
+            h.registry.check_now("n1")
+            client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
+            h.registry.check_now("n1")
+        client.default_info = NodeProtocolError("404")  # an older Plex helper doesn't know /v1/info
+        h.legacy = ("connected", "1.2.0")
+        if after == "node-down":
+            h.registry.check_now("n1")
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold is not None and not hold.waits
+        assert "older release that gives no id" in hold.message
+        assert h.registry.view("n1").state == reg.STATE_READY
+        h.change(node_uid=None)  # its key typed again
+        assert h.registry.plex_db_hold("n1") is None
+
+    def test_a_node_that_refuses_the_key_without_an_id_is_held_with_its_own_reason(self, h):
+        h.client().default_info = NodeAuthError("401")
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold is not None and not hold.waits
+        assert hold.message.startswith("nuc refused the key.")
+
+    def test_a_new_id_isnt_taken_for_the_saved_one_while_it_is_being_settled(self, h):
+        client = h.client()
+        client.default_info = self._answer("uid-1")
+        h.registry.check_now("n1")
+        seen = []
+        confirmed = h.registry._new_uid_confirmed
+
+        def spy(node_id, record, outcome):
+            seen.append(h.registry._nodes["n1"].heard_uid)
+            return confirmed(node_id, record, outcome)
+
+        h.registry._new_uid_confirmed = spy
+        client.default_info = self._answer("uid-2")
+        h.registry.check_now("n1")
+
+        assert seen == [None]
 
     def test_a_node_without_a_saved_id_is_never_held(self, h):
         h.change(node_uid=None)
@@ -1335,6 +1399,24 @@ def test_a_node_asking_to_wait_and_something_that_isnt_a_node_say_why_they_are_o
     h.client().default_info = NodeProtocolError("not a node")
     h.legacy = ("unreachable", "")
     assert h.registry.check_now("n1").cause == reg.OFFLINE_NOT_A_NODE
+
+
+@pytest.mark.parametrize(
+    ("last", "cause"),
+    [("wait", reg.OFFLINE_RATE_LIMITED), ("refused", reg.OFFLINE_UNREACHABLE)],
+    ids=["wait", "refused"],
+)
+def test_an_offline_node_is_read_by_its_last_attempt_not_by_one_wait_among_them(h, last, cause):
+    # One 429 among the attempts was reported as the cause though the node then refused connections: "something at
+    # this app's address has an old key" sent the user after the wrong fix.
+    from media_preview_generator.nodes.client import NodeRateLimitedError
+
+    wait = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+    refused = NodeUnreachableError("http://nuc:9494 didn't answer")
+    attempts = [wait, refused] * reg.CHECK_ATTEMPTS
+    h.client().infos = attempts[: reg.CHECK_ATTEMPTS - 1] + [wait if last == "wait" else refused]
+
+    assert h.registry.check_now("n1").cause == cause
 
 
 def test_one_wait_then_an_answer_is_ready_not_offline(h):

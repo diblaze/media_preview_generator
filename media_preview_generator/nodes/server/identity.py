@@ -39,6 +39,11 @@ MAKE_A_KEY = "openssl rand -hex 24"
 # held back its key isn't compared at all, so the answer is 429 with Retry-After -- a wait, never "wrong key".
 WRONG_KEY_BURST = 20
 WRONG_KEY_REFILL_S = 3.0
+# An IPv6 machine is usually handed a whole /64 and can use a new address in it for every request, and the other
+# machines of its network share that /64 (or its ULA or link-local one). So each address has its own limit, and its /64
+# as a whole one this many times looser (burst and refill): a device with an old key holds back only itself, and one
+# taking a new address for every key guesses this many times faster than one address, no more.
+WRONG_KEY_NETWORK_FACTOR = 10
 # Addresses remembered at most; past it, those owing nothing are forgotten, then the longest quiet of those not held
 # back. One held back is never forgotten: wrong keys from other addresses would otherwise give it its whole burst again.
 WRONG_KEY_ADDRESSES_MAX = 4096
@@ -46,32 +51,45 @@ _WRONG_KEYS_EXTENSION = "mpg_node_wrong_keys"
 
 
 def caller_key(address: str) -> str:
-    """What one caller's wrong keys and connections are counted by: its IPv4 address, or its IPv6 address's /64.
-
-    An IPv6 machine is usually handed a whole /64 and can use a new address in it for every request, so counting
-    each IPv6 address would let it guess keys, or take connections, without limit.
+    """What one caller's wrong keys and connections are counted by: its address.
 
     Args:
         address: The caller's address as the server saw it.
 
     Returns:
-        The address (an IPv4-mapped IPv6 address as plain IPv4), the /64 network for IPv6, or ``address`` unchanged
-        when it isn't an IP address.
+        The address (an IPv4-mapped IPv6 address as plain IPv4, IPv6 in its short form), or ``address`` unchanged when
+        it isn't an IP address.
     """
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return address
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None:
-            return str(ip.ipv4_mapped)
-        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
     return str(ip)
 
 
+def caller_network(address: str) -> str | None:
+    """The /64 an IPv6 caller's address is in, counted as a whole too (:data:`WRONG_KEY_NETWORK_FACTOR`).
+
+    Args:
+        address: The caller's address as the server saw it.
+
+    Returns:
+        The /64 network, or None for an IPv4 (or IPv4-mapped) address and anything that isn't an IP address.
+    """
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    if not isinstance(ip, ipaddress.IPv6Address) or ip.ipv4_mapped is not None:
+        return None
+    return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+
+
 class WrongKeyLimit:
-    """The wrong keys each caller sent lately (by :func:`caller_key`), so a node's guards stop comparing keys from
-    one that sends too many and tell it to wait (thread-safe).
+    """The wrong keys each caller address (:func:`caller_key`) and IPv6 /64 (:func:`caller_network`) sent lately, so a
+    node's guards stop comparing keys from one that sends too many and tell it to wait (thread-safe).
 
     Args:
         burst: Wrong keys an address may send at once.
@@ -87,14 +105,30 @@ class WrongKeyLimit:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._burst, self._refill_s, self._clock = burst, refill_s, clock
-        self._owed: dict[str, tuple[float, float]] = {}  # address -> (wrong keys not yet refilled, as of when)
-        # Addresses already named in the log for this run of wrong keys, so one that keeps sending them is named once.
+        # Address or /64 -> (wrong keys not yet refilled, as of when).
+        self._owed: dict[str, tuple[float, float]] = {}
+        # Those already named in the log for this run of wrong keys, so one that keeps sending them is named once.
         self._logged: set[str] = set()
         self._lock = threading.Lock()
 
-    def _owing(self, address: str, now: float) -> float:
-        owed, since = self._owed.get(address, (0.0, now))
-        return max(0.0, owed - (now - since) / self._refill_s)
+    def _limits(self, counted: str) -> tuple[float, float]:
+        """``(burst, refill_s)`` for an address, or the looser ones of a /64 (its key holds the "/")."""
+        if "/" in counted:
+            return self._burst * WRONG_KEY_NETWORK_FACTOR, self._refill_s / WRONG_KEY_NETWORK_FACTOR
+        return self._burst, self._refill_s
+
+    def _owing(self, counted: str, now: float) -> float:
+        owed, since = self._owed.get(counted, (0.0, now))
+        return max(0.0, owed - (now - since) / self._limits(counted)[1])
+
+    def _wait_s(self, counted: str, now: float) -> float:
+        burst, refill_s = self._limits(counted)
+        return max(0.0, self._owing(counted, now) - (burst - 1)) * refill_s
+
+    @staticmethod
+    def _counted(address: str) -> list[str]:
+        network = caller_network(address)
+        return [caller_key(address), *([network] if network else [])]
 
     def blocked_for(self, address: str) -> int:
         """Whole seconds until ``address`` may send a key again; 0 when it may now.
@@ -102,36 +136,38 @@ class WrongKeyLimit:
         While it is above 0 the guards answer 429 without comparing the key, so a guesser learns nothing.
         """
         with self._lock:
-            over = self._owing(caller_key(address), self._clock()) - (self._burst - 1)
-        return max(1, math.ceil(over * self._refill_s)) if over > 0 else 0
+            now = self._clock()
+            wait_s = max(self._wait_s(counted, now) for counted in self._counted(address))
+        return max(1, math.ceil(wait_s)) if wait_s > 0 else 0
 
     def note_wrong(self, address: str) -> None:
         """Count one wrong (or missing) key from ``address``; the first time it is held back, say so in the log."""
-        address = caller_key(address)
+        named: list[str] = []
         with self._lock:
             now = self._clock()
-            before = self._owing(address, now)
-            if not before:
-                self._logged.discard(address)
-            self._owed[address] = (before + 1, now)
-            held_back = before + 1 > self._burst - 1 and address not in self._logged
-            if held_back:
-                self._logged.add(address)
+            for counted in self._counted(address):
+                before = self._owing(counted, now)
+                if not before:
+                    self._logged.discard(counted)
+                self._owed[counted] = (before + 1, now)
+                if before + 1 > self._limits(counted)[0] - 1 and counted not in self._logged:
+                    self._logged.add(counted)
+                    named.append(counted)
             if len(self._owed) > WRONG_KEY_ADDRESSES_MAX:
-                owing = {a: self._owing(a, now) for a in self._owed}
-                held = {a: v for a, v in self._owed.items() if owing[a] > self._burst - 1}
+                owing = {c: self._owing(c, now) for c in self._owed}
+                held = {c: v for c, v in self._owed.items() if owing[c] > self._limits(c)[0] - 1}
                 room = max(0, WRONG_KEY_ADDRESSES_MAX // 2 - len(held))
                 rest = sorted(
-                    ((a, v) for a, v in self._owed.items() if 0 < owing[a] <= self._burst - 1),
+                    ((c, v) for c, v in self._owed.items() if 0 < owing[c] <= self._limits(c)[0] - 1),
                     key=lambda item: item[1][1],
                 )
                 self._owed = {**dict(rest[-room:] if room else []), **held}
                 self._logged &= set(self._owed)
-        if held_back:
+        for counted in named:
             logger.warning(
                 "Too many wrong keys came from {}, so this node asks everything there to wait, even with the right "
-                "key. Something at that address has an old key: give it the right one, or stop it.",
-                address,
+                "key. Something there has an old key: give it the right one, or stop it.",
+                f"addresses in {counted}" if "/" in counted else counted,
             )
 
 

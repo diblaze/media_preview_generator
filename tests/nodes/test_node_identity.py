@@ -287,21 +287,23 @@ class TestName:
 
 class TestCallerKey:
     @pytest.mark.parametrize(
-        ("address", "key"),
+        ("address", "key", "network"),
         [
-            ("10.0.0.66", "10.0.0.66"),
-            ("2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"),
-            ("2001:db8:1:2::1", "2001:db8:1:2::/64"),
-            ("2001:db8:1:3::1", "2001:db8:1:3::/64"),
-            ("::ffff:10.0.0.66", "10.0.0.66"),
-            ("::1", "::/64"),
-            ("", ""),
-            ("not-an-address", "not-an-address"),
+            ("10.0.0.66", "10.0.0.66", None),
+            ("2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"),
+            ("2001:0db8:0001:0002::0001", "2001:db8:1:2::1", "2001:db8:1:2::/64"),
+            ("fd12:3456:789a:1::5", "fd12:3456:789a:1::5", "fd12:3456:789a:1::/64"),
+            ("fe80::1", "fe80::1", "fe80::/64"),
+            ("::ffff:10.0.0.66", "10.0.0.66", None),
+            ("::1", "::1", "::/64"),
+            ("", "", None),
+            ("not-an-address", "not-an-address", None),
         ],
-        ids=["ipv4", "ipv6", "ipv6-same-64", "ipv6-other-64", "ipv4-mapped", "loopback", "empty", "not-ip"],
+        ids=["ipv4", "ipv6", "ipv6-long-form", "ula", "link-local", "ipv4-mapped", "loopback", "empty", "not-ip"],
     )
-    def test_ipv4_is_counted_per_address_and_ipv6_per_64(self, address, key):
+    def test_each_address_is_a_caller_and_an_ipv6_ones_64_is_counted_too(self, address, key, network):
         assert identity.caller_key(address) == key
+        assert identity.caller_network(address) == network
 
 
 class TestWrongKeyLimit:
@@ -346,12 +348,30 @@ class TestWrongKeyLimit:
         named = [line for line in lines if "10.0.0.66" in line]
         assert len(named) == 2 and "wait, even with the right key" in named[0]
 
-    def test_wrong_keys_from_one_ipv6_64_add_up_while_ipv4_neighbours_dont(self):
+    @pytest.mark.parametrize(
+        "prefix", ["2001:db8:1:2::", "fd12:3456:789a:1::", "fe80::"], ids=["isp", "ula", "link-local"]
+    )
+    def test_a_device_with_an_old_key_holds_back_only_itself_not_the_rest_of_its_64(self, prefix):
+        # Every machine of a home network shares its /64: one old copy with an old key held back the app beside it.
         limit, _now = self._limit()
-        for n in range(3):  # a new address in its /64 for every guess
-            limit.note_wrong(f"2001:db8:1:2::{n + 1:x}")
+        for _ in range(3):
+            limit.note_wrong(f"{prefix}66")
+        assert limit.blocked_for(f"{prefix}66") > 0
+        assert limit.blocked_for(f"{prefix}5") == 0
+
+    def test_a_new_ipv6_address_for_every_guess_is_held_back_after_ten_addresses_worth(self):
+        limit, _now = self._limit()
+        lines: list[str] = []
+        sink = identity.logger.add(lambda message: lines.append(str(message)), level="WARNING")
+        try:
+            for n in range(3 * identity.WRONG_KEY_NETWORK_FACTOR):
+                assert limit.blocked_for("2001:db8:1:2:ffff::9") == 0
+                limit.note_wrong(f"2001:db8:1:2::{n + 1:x}")
+        finally:
+            identity.logger.remove(sink)
         assert limit.blocked_for("2001:db8:1:2:ffff::9") > 0
         assert limit.blocked_for("2001:db8:1:3::1") == 0
+        assert [line for line in lines if "addresses in 2001:db8:1:2::/64" in line]
 
         for n in range(3):
             limit.note_wrong(f"10.0.0.{n + 1}")
