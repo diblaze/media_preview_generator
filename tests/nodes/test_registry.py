@@ -1608,6 +1608,56 @@ class TestTwinOfAPlexDatabaseNode:
         h.registry.stop()
 
 
+def _plex_using(server_id: str, identity: str, *, enabled: bool = True, node_on: bool = True) -> dict:
+    return {
+        "id": server_id,
+        "type": "plex",
+        "name": server_id,
+        "enabled": enabled,
+        "server_identity": identity,
+        "markers": {"enabled": True, "plex": {"agent": {"enabled": node_on, "node_id": "n1"}}},
+    }
+
+
+class TestServersThatWriteThroughANode:
+    """Which Plex servers ``_default_served_plex_ids`` says write through a node (their new-id check)."""
+
+    @pytest.fixture
+    def sm(self, tmp_path):
+        from media_preview_generator.web import settings_manager as sm_mod
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        manager = SettingsManager(config_dir=str(tmp_path))
+        sm_mod._settings_manager = manager
+        yield manager
+        sm_mod.reset_settings_manager()
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            _plex_using("old", "plex-b", enabled=False),
+            _plex_using("old", "", enabled=False),
+            _plex_using("old", "plex-b", node_on=False),
+        ],
+        ids=["server-switched-off", "server-switched-off-never-connected", "its-node-switched-off"],
+    )
+    def test_a_server_that_writes_nothing_through_the_node_doesnt_count(self, sm, other):
+        """Counted, it turned a clean "same Plex" answer into "two Plexes": the node's new id was held and its Plex
+        database work refused until the key was typed again."""
+        sm.apply_changes(updates={"media_servers": [_plex_using("home", "plex-a"), other]})
+
+        assert reg._default_served_plex_ids("n1") == ["plex-a"]
+
+        h = Harness(nodes=[_record(node_uid="uid-1")])
+        h.registry._served_plex_ids = reg._default_served_plex_ids
+        info = _info(uid="uid-2", roles=(ROLE_PLEX_DB,))
+        info["plex_db"] = {"machine_identifier": "plex-a"}
+        h.client().default_info = info
+        h.registry.check_now("n1")
+        assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+
 class TestRecordedNodeId:
     """What ``_default_record_uid`` writes to settings.json."""
 

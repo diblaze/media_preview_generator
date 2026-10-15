@@ -33,7 +33,7 @@ from .client import (
     NodeTimeoutError,
 )
 from .protocol import PathMapping
-from .settings import find_node, node_mappings
+from .settings import find_node, node_mappings, server_agent
 
 STATE_CONNECTING = "connecting"
 STATE_READY = "ready"
@@ -279,17 +279,19 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
 
 
 def _default_served_plex_ids(node_id: str) -> list[str]:
-    """The machine identifier of every Plex server whose Plex database node is ``node_id`` ("" where unknown)."""
+    """The machine identifier of every Plex server that writes through ``node_id`` ("" where unknown).
+
+    A server switched off, or with its Plex database node switched off, writes nothing through the node though it
+    remembers it, so it doesn't hold back the node's new id.
+    """
     from ..web.settings_manager import get_settings_manager
 
     out = []
     for entry in get_settings_manager().get("media_servers") or []:
-        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        agent = server_agent(entry)
+        if agent is None or not agent.get("enabled") or agent.get("node_id") != node_id:
             continue
-        markers = entry.get("markers")
-        plex = markers.get("plex") if isinstance(markers, dict) else None
-        agent = plex.get("agent") if isinstance(plex, dict) else None
-        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+        if entry.get("enabled", True):
             out.append(str(entry.get("server_identity") or ""))
     return out
 
