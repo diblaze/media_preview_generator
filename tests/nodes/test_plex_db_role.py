@@ -971,6 +971,7 @@ class TestChapterFileCheckRefusalsAreSaidAboutTheNode:
             "machine. Give the node Plex's own config folder.",
         )
 
+    @linux_mount_table
     def test_a_database_on_a_network_share_where_the_node_runs(self, plex_config, tmp_path, monkeypatch):
         report = self._chapter_check(plex_config, tmp_path, monkeypatch, fs="nfs4")
         assert (report.state, report.message) == (
