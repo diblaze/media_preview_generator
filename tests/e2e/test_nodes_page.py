@@ -440,6 +440,14 @@ class TestNodeList:
         expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready")
         assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/check"]
 
+    def test_check_now_says_how_often_nodes_are_checked_without_it(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        button = authed_page.locator("#nodesCheckNow")
+        button.hover()
+        tip = authed_page.locator(".tooltip.show")
+        expect(tip).to_contain_text("checked every 30 seconds")
+        expect(tip).to_contain_text("every 15 seconds while a job waits for it")
+
     def test_list_is_polled(self, authed_page: Page, app_url: str) -> None:
         authed_page.clock.install()
         nodes = _four_nodes()

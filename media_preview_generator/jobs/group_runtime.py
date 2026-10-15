@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from loguru import logger
+
 if TYPE_CHECKING:
     from .node_members import NodeHardware
 
@@ -78,6 +80,13 @@ def capacity_for_groups(
                 f"{hardware.node_name}: {hardware.reason}" for hardware in (nodes.member(g) for g in compatible)
             )
         )
+        # Only jobs ask for capacity, so a job waits on these nodes alone: check them soon, not after a back-off.
+        from ..nodes.registry import note_work_waiting
+
+        try:
+            note_work_waiting({g["node"] for g in compatible})
+        except Exception as exc:  # noqa: BLE001 - only brings a check forward; the capacity answer stands
+            logger.debug("Couldn't bring the next check of nodes forward: {}", exc)
     return {
         "configured": sum(g["count"] for g in compatible),
         "open": sum(g["count"] for g in opened),

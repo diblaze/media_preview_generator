@@ -51,6 +51,7 @@ class FakeRegistry(NodeRegistry):
         self._views: dict[str, NodeView] = {}
         self._capacity: dict[str, NodeCapacity] = {}
         self.reads = 0
+        self.waiting: list[list[str]] = []
 
     def put(
         self,
@@ -94,6 +95,9 @@ class FakeRegistry(NodeRegistry):
 
     def capacity(self, node_id: str) -> NodeCapacity:
         return self._capacity.get(node_id, NodeCapacity(False, False, "node removed"))
+
+    def work_waiting(self, node_ids) -> None:
+        self.waiting.append(sorted(node_ids))
 
 
 @pytest.fixture
@@ -424,12 +428,24 @@ class TestCapacityAndParking:
         assert capacity["detail"] == "storage: node offline"
         assert capacity_wait_message(capacity) == "Waiting for a node — storage: node offline"
 
+    def test_a_job_waiting_only_for_nodes_asks_for_them_to_be_checked_soon(self, registry):
+        """Its back-off kept a node that was back reading offline for minutes while the job waited."""
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups([group("g", member("a", node="storage"), member("b", node="nuc"))], [])
+
+        assert pool.capacity_for("previews")["reason"] == "node_unavailable"
+
+        assert registry.waiting == [["nuc", "storage"]]
+
     def test_mixed_local_and_offline_node_keeps_the_hardware_reason(self, registry):
         registry.put("storage", state=STATE_OFFLINE, reason="node offline")
         pool = WorkerPool(0, 0, [])
         pool.reconcile_groups(node_groups(), [])
         capacity = pool.capacity_for("previews")
         assert (capacity["open"], capacity["reason"], capacity["detail"]) == (0, "hardware", "")
+        assert registry.waiting == []
 
     def test_ready_node_capacity_is_open(self, registry):
         registry.put("storage")

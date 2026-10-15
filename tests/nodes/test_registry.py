@@ -197,6 +197,29 @@ class TestStates:
         h.registry.check_now("n1")
         assert h.registry._nodes["n1"].next_check - h.clock.now == reg.HEALTH_INTERVAL_S
 
+    def test_an_offline_node_a_job_waits_for_is_checked_soon_not_after_its_back_off(self, h):
+        """Back after a few misses, a node read "offline" for up to five minutes while its job kept waiting."""
+        h.client().default_info = NodeUnreachableError("down")
+        for _ in range(4):
+            h.registry.check_now("n1")
+        assert h.registry._nodes["n1"].next_check - h.clock.now == 300.0
+
+        h.registry.work_waiting(["n1", "gone"])
+
+        assert h.registry._nodes["n1"].next_check - h.clock.now == reg.WAITING_RECHECK_S
+
+    def test_a_job_waiting_never_delays_a_check_or_hurries_a_node_that_is_up(self, h):
+        h.client().default_info = NodeUnreachableError("down")
+        h.registry.check_now("n1")
+        h.registry._nodes["n1"].next_check = h.clock.now + 5.0
+        h.registry.work_waiting(["n1"])
+        assert h.registry._nodes["n1"].next_check - h.clock.now == 5.0
+
+        h.client().default_info = _info()
+        h.registry.check_now("n1")
+        h.registry.work_waiting(["n1"])
+        assert h.registry._nodes["n1"].next_check - h.clock.now == reg.HEALTH_INTERVAL_S
+
     def test_a_refused_key_is_key_refused_after_one_attempt(self, h):
         client = h.client()
         client.default_info = NodeAuthError("no")

@@ -14,7 +14,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
@@ -70,6 +70,8 @@ ALERT_STATES = (
 HEALTH_INTERVAL_S = 30.0
 # Delay before the next check after the 1st, 2nd, 3rd and later offline checks in a row.
 OFFLINE_BACKOFF_S = (30.0, 60.0, 120.0, 300.0)
+# How soon an offline node is checked again while a job waits for it alone (``work_waiting``) instead of its back-off.
+WAITING_RECHECK_S = 15.0
 CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
@@ -574,6 +576,19 @@ class NodeRegistry:
             self._wake.set()
         else:
             self._submit(self._run_check, node_id)
+
+    def work_waiting(self, node_ids: Iterable[str]) -> None:
+        """A job waits for these nodes alone: an offline one is checked within ``WAITING_RECHECK_S``.
+
+        Its back-off reaches five minutes, so the job went on "waiting for a node" for minutes after the node was
+        back. Cheap enough to call on every look at the job's capacity: nothing but the next check's time moves.
+        """
+        soon = self._clock() + WAITING_RECHECK_S
+        with self._lock:
+            for node_id in node_ids:
+                live = self._nodes.get(str(node_id))
+                if live is not None and live.probe_state == STATE_OFFLINE and live.next_check > soon:
+                    live.next_check = soon
 
     def checked_ready_since_unavailable(self, node_id: str) -> bool:
         """Whether the node is ready and a health check begun after it was last reported unavailable said so."""
@@ -1364,6 +1379,14 @@ def get_registry() -> NodeRegistry:
         if _registry is None:
             _registry = NodeRegistry(access_store=AccessResultStore())
         return _registry
+
+
+def note_work_waiting(node_ids: Iterable[str]) -> None:
+    """:meth:`NodeRegistry.work_waiting` on the process-wide registry; nothing before one exists (no node checked)."""
+    with _registry_lock:
+        registry = _registry
+    if registry is not None:
+        registry.work_waiting(node_ids)
 
 
 def set_registry(registry: NodeRegistry | None) -> None:
