@@ -638,6 +638,60 @@ class TestNodeDialog:
             {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
         ]
 
+    def test_closing_with_unsaved_mappings_asks_first(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        _node_tab(authed_page, "overview")
+
+        authed_page.keyboard.press("Escape")
+        foot = authed_page.locator("#nodeDiscardFoot")
+        expect(foot).to_be_visible()
+        expect(foot).to_contain_text("Discard the unsaved mappings?")
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+
+        authed_page.locator("#nodeKeepEditing").click()
+        expect(foot).to_be_hidden()
+        expect(pane.locator(".nd-node").first).to_have_value("/mnt/media/Movies")
+
+        authed_page.locator("#nodeModal .btn-close").click()
+        authed_page.locator("#nodeDiscardConfirm").click()
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    def test_focus_stays_in_the_dialog_after_a_button_finishes(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 working GPU")
+        assert authed_page.evaluate("() => !!document.activeElement.closest('#nodeModal')")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    def test_closing_with_unsaved_settings_asks_first(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetName").fill("storage-2")
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeDiscardFoot")).to_contain_text("Discard the unsaved settings?")
+        expect(authed_page.locator("#nodeModal")).to_be_visible()
+
+    def test_saved_mappings_close_without_asking_and_are_tested(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-node").first.fill("/mnt/media/Movies")
+        with authed_page.expect_response(lambda r: r.url.endswith("/test-access")):
+            authed_page.locator("#nodeSaveMappings").click()
+        assert api.bodies("POST", "/nodes/n-storage/test-access") == [
+            {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
+        ]
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#nodeDiscardFoot")).to_be_hidden()
+
     def test_use_this_edits_the_row_of_the_library_it_was_suggested_for(self, authed_page: Page, app_url: str) -> None:
         # Both libraries pointed at the node's media root: the natural mistake, and the one a real node can list.
         node = _node(

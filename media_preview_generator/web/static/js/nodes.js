@@ -38,6 +38,13 @@
         return r.status ? `${fallback} (HTTP ${r.status})` : `${fallback} (no answer from this app)`;
     }
 
+    // Disabling the focused button drops focus to <body>, outside the dialog, where Esc and Tab no longer reach it;
+    // focus goes back to the button once it works again.
+    function enable(btn) {
+        btn.disabled = false;
+        if (!document.activeElement || document.activeElement === document.body) btn.focus();
+    }
+
     function initTooltips(scope) {
         if (typeof window._initBootstrapTooltips === 'function') window._initBootstrapTooltips(scope);
     }
@@ -523,7 +530,7 @@
                 showError('');
                 renderResults(Array.isArray(r.data && r.data.libraries) ? r.data.libraries : []);
             } finally {
-                btn.disabled = false;
+                enable(btn);
                 btn.innerHTML = '<i class="bi bi-play-fill me-1"></i>Test access';
             }
         }
@@ -682,7 +689,7 @@
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Connecting…';
         const r = await api('POST', '/api/nodes/probe', { url, key });
-        btn.disabled = false;
+        enable(btn);
         btn.innerHTML = '<i class="bi bi-plug me-1"></i>Connect';
         if (!r.ok || !r.data || r.data.ok === false || !r.data.info) {
             add.probe = null;
@@ -723,7 +730,7 @@
         const btn = $('#addNodeNext');
         btn.disabled = true;
         const r = await api('POST', '/api/nodes', body);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             if (r.status === 409) {
                 addError(alreadyAddedText(r.data && r.data.name));
@@ -753,7 +760,7 @@
         const btn = $('#addNodeFinish');
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(add.node.id)}`, { path_mappings: mappings });
-        btn.disabled = false;
+        enable(btn);
         const errorEl = $('#addNodeSaveError');
         if (!r.ok) {
             errorEl.textContent = errorText(r, "Couldn't save the mappings");
@@ -768,7 +775,35 @@
 
     // ---------- node dialog --------------------------------------------------------------------------------------
 
-    const detail = { editor: null, healthSeq: 0, healthStartedAt: 0 };
+    // mapDirty / setDirty: the Media rows / the Settings fields were edited and not saved; discardOk lets one close
+    // through after the user said Discard.
+    const detail = { editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false };
+
+    function setMapDirty(dirty) {
+        detail.mapDirty = dirty;
+        if (!dirty && !detail.setDirty) hideDiscard();
+    }
+
+    function setSettingsDirty(dirty) {
+        detail.setDirty = dirty;
+        if (!dirty && !detail.mapDirty) hideDiscard();
+    }
+
+    function hideDiscard() {
+        $('#nodeDiscardFoot').classList.add('d-none');
+    }
+
+    // Close, Esc and the backdrop all end in hide(): while there are edits, ask first, on the tab that holds them.
+    function guardClose(event) {
+        if (event.target !== $('#nodeModal') || detail.discardOk || !(detail.mapDirty || detail.setDirty)) return;
+        event.preventDefault();
+        showTab(detail.mapDirty ? 'media' : 'settings');
+        $('#nodeDiscardText').textContent = detail.mapDirty && detail.setDirty
+            ? 'Discard the unsaved mappings and settings?'
+            : `Discard the unsaved ${detail.mapDirty ? 'mappings' : 'settings'}?`;
+        $('#nodeDiscardFoot').classList.remove('d-none');
+        $('#nodeKeepEditing').focus();
+    }
 
     function openNodeObj() {
         return page.openId ? nodeById(page.openId) : null;
@@ -855,6 +890,8 @@
         const node = nodeById(id);
         if (!node) return;
         page.openId = String(node.id);
+        detail.mapDirty = detail.setDirty = detail.discardOk = false;
+        hideDiscard();
         renderHeader(node);
         renderOverview(node);
         renderSettings(node);
@@ -892,7 +929,7 @@
         result.className = 'sm-tres';
         result.innerHTML = '<span class="sm-spin"></span>Checking the GPUs…';
         const r = await api('POST', `/api/nodes/${encodeURIComponent(node.id)}/rescan-gpus`);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't rescan");
@@ -918,7 +955,7 @@
         const btn = $('#nodeSaveMappings');
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { path_mappings: mappings });
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -926,8 +963,11 @@
         }
         replaceNode(r.data);
         refreshOpenNode();
+        setMapDirty(false);
         result.className = 'sm-tres ok';
         result.textContent = 'Saved';
+        // What was just saved is what the node runs with now: check it sees the files there.
+        detail.editor.test();
     }
 
     async function saveSettings() {
@@ -954,7 +994,7 @@
         const btn = $('#nodeSettingsSave');
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, body);
-        btn.disabled = false;
+        enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -964,6 +1004,7 @@
         refreshOpenNode();
         detail.editor.setName(r.data.name || r.data.id);
         keyEl.value = '****';
+        setSettingsDirty(false);
         result.className = 'sm-tres ok';
         result.textContent = 'Saved';
     }
@@ -1202,6 +1243,7 @@
         detail.editor = createMappingEditor($('#nodeMediaEditor'), {
             getNodeId: async () => page.openId,
             onChange: () => {
+                setMapDirty(true);
                 const result = $('#nodeMediaResult');
                 result.className = 'sm-tres warn';
                 result.textContent = 'Not saved yet';
@@ -1238,7 +1280,18 @@
             if (add.node) loadNodes();
         });
 
+        $('#nodeModal').addEventListener('hide.bs.modal', guardClose);
+        $('#nodeKeepEditing').addEventListener('click', hideDiscard);
+        $('#nodeDiscardConfirm').addEventListener('click', () => {
+            detail.discardOk = true;
+            bootstrap.Modal.getOrCreateInstance($('#nodeModal')).hide();
+        });
+        ['input', 'change'].forEach((type) => $('#node-tab-settings').addEventListener(type, (event) => {
+            if (event.target.matches('#nodeSetName, #nodeSetUrl, #nodeSetKey, #nodeSetEnabled')) setSettingsDirty(true);
+        }));
         $('#nodeModal').addEventListener('hidden.bs.modal', () => {
+            detail.mapDirty = detail.setDirty = detail.discardOk = false;
+            hideDiscard();
             page.openId = null;
             if (window.location.hash.startsWith('#node-')) history.replaceState(null, '', window.location.pathname);
         });
