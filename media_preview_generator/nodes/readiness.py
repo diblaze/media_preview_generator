@@ -329,8 +329,10 @@ def _default_file_checks(url: str, key: str) -> Any:
 
 def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
+    from ..markers.publishers.plex_db import node_wording
 
-    report = file_checks(url, key)
+    # The check ran on the node: its refusals are about the node, not this app.
+    report = node_wording(file_checks(url, key))
     details = report.details or {}
     if report.state is Capability.AGENT_UNAVAILABLE:
         return [

@@ -1664,7 +1664,8 @@ table covers every state the check can report, using its exact wording:
 | *(Jellyfin)* "Can't reach this Jellyfin server" / "Can't reach the Media Preview Bridge markers endpoint on this Jellyfin server" | A transient connection problem | Confirm the server is up and reachable; recheck |
 | *(Jellyfin)* "Jellyfin rejected this server's credentials; reconnect it" | The stored token/login no longer works | Reconnect the server from the Servers page |
 | *(Jellyfin)* "Jellyfin refused the Media Preview Bridge markers endpoint; this server's API key or user needs administrator rights" | The connected account isn't an administrator | Reconnect with an admin account or API key |
-| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." | A `PUID`/`PGID` mismatch between the two containers | Set this container's `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "This app (user N) can't write …. Run it with the user that owns Plex's database (user M)." (or "The Plex database node (user N) can't write …. Run the node as …") | A `PUID`/`PGID` mismatch between the two containers | Set this container's (or the node's) `PUID`/`PGID` to the user that owns Plex's files |
+| *(Plex)* "… can't write …, though it runs as the user that owns Plex's database: the folder is read-only." | Plex's config folder is mounted read-only (`:ro`) or its folder doesn't allow writes | Mount it read-write |
 | *(Plex)* "Disk full: Plex's database can't take any writes (…)." | The disk holding Plex's database is full | Free up space on that disk |
 | Status block fails to load: "Couldn't check this server's Intro & Credits status" (Processing tab) or "Couldn't read this server's Intro & Credits state (…)" (Inspector row) | An unexpected error while checking (e.g. `markers.db` unreadable) — one server's failure never blocks the rest of the page | Reload; check the logs for the exception type named in the message |
 

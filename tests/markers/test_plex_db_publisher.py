@@ -2407,6 +2407,33 @@ class TestSqliteErrors:
         assert ei.value.state is Capability.UNREACHABLE
         assert _rows(db, "SELECT COUNT(*) FROM taggings")[0][0] == 0
 
+    @pytest.mark.parametrize(
+        ("owner", "says", "never_says"),
+        [
+            (
+                "998",
+                "This app (user 1000) can't write /plex/db. Run it with the user that owns Plex's database (user 998).",
+                "read-only",
+            ),
+            (
+                "1000",
+                "This app (user 1000) can't write /plex/db, though it runs as the user that owns Plex's database: the "
+                "folder is read-only. Make it writable (in Docker, mount Plex's config folder without :ro).",
+                "(user 1000).",
+            ),
+        ],
+        ids=["another-user", "read-only-folder"],
+    )
+    def test_an_unwritable_database_names_the_fix_that_is_still_missing(self, owner, says, never_says):
+        """A writer that already is the database's owner can't be fixed by running it as that user: the folder is
+        read-only (a ``:ro`` mount)."""
+        from media_preview_generator.markers.publishers.plex_db import unwritable_message
+
+        details = {"unwritable": ["/plex/db"], "writer_uid": "1000", "db_owner_uid": owner}
+        message = unwritable_message(details)
+        assert message == says
+        assert never_says not in message
+
     @pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root bypasses file permissions")
     @pytest.mark.parametrize("target", ["db", "folder", "shm"])
     def test_files_this_app_cannot_write_are_misconfigured(self, tmp_path, target):

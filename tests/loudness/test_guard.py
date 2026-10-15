@@ -408,3 +408,23 @@ def test_the_node_not_answering_a_loudness_request_says_loudness_waits():
     db = _remote_loudness_db(capability_known=True)
     with pytest.raises(PublishError, match="Loudness waits until it answers again; nothing is lost"):
         db.read_item_snapshot(1, deadline=time.monotonic() + 5)
+
+
+@pytest.mark.parametrize("owner", ["998", "1000"], ids=["another-user", "read-only-folder"])
+def test_loudness_through_a_node_that_cant_write_plexs_database_talks_about_the_node(owner):
+    from media_preview_generator.markers.publishers.plex_remote import report_to_json
+
+    details = {"db_path": "/plex/db", "fs_type": "ext4", "unwritable": ["/plex/db"], "writer_uid": "1000"}
+    refused = CapabilityReport(Capability.MISCONFIGURED, "This app (user 1000) can't write /plex/db.", details)
+    remote = MagicMock()
+    refused = CapabilityReport(refused.state, refused.message, {**details, "db_owner_uid": owner})
+    remote.loudness.return_value = {"report": report_to_json(refused)}
+    remote.agent_details.return_value = {"url": "http://plex-host:9494", "state": "connected"}
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+    report = guard.RemoteLoudnessDb(server, remote).capability(deadline=time.monotonic() + 5)
+    assert report.state is Capability.MISCONFIGURED
+    assert report.message.startswith("The Plex database node (user 1000) can't write /plex/db")
+    assert ("read-only" in report.message) is (owner == "1000")

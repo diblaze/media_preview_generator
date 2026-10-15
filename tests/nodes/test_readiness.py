@@ -270,6 +270,69 @@ def test_each_plex_database_problem_stops_at_its_own_row(report, failing, rows):
     assert envelope["overall_ok"] is False
 
 
+UNWRITABLE = {"db_path": "/plex/db", "fs_type": "ext4", "unwritable": ["/plex/db"], "writer_uid": "1000"}
+
+
+@pytest.mark.parametrize(
+    ("report", "row_id", "says"),
+    [
+        (
+            _report(
+                Capability.MISCONFIGURED,
+                "This app (user 1000) can't write /plex/db. Run it with the user that owns Plex's database (user 998).",
+                **UNWRITABLE,
+                db_owner_uid="998",
+            ),
+            "plex_db_writable",
+            "The Plex database node (user 1000) can't write /plex/db. Run the node as the user that owns Plex's "
+            "database (user 998).",
+        ),
+        (
+            _report(
+                Capability.MISCONFIGURED,
+                "This app (user 1000) can't write /plex/db. Run it with the user that owns Plex's database (user 1000).",
+                **UNWRITABLE,
+                db_owner_uid="1000",
+            ),
+            "plex_db_writable",
+            "The Plex database node (user 1000) can't write /plex/db, though it runs as the user that owns Plex's "
+            "database: the folder is read-only.",
+        ),
+        (
+            _report(
+                Capability.NEEDS_LOCAL_DB,
+                "Plex's database is on a network share (nfs4). The app must run on the same machine as Plex to write "
+                "markers; Plex stays read-only.",
+                db_path="/plex/db",
+                fs_type="nfs4",
+            ),
+            "plex_db_local",
+            "Plex's database is on a network share (nfs4) where the Plex database node runs.",
+        ),
+        (
+            _report(
+                Capability.UNREACHABLE,
+                "Plex doesn't have its database open through this folder right now (Plex is stopped, or this app "
+                "sees a different path to the file).",
+                db_path="/plex/db",
+                fs_type="ext4",
+                lock_holder=False,
+            ),
+            "plex_db_held",
+            "the node sees a different path to the file",
+        ),
+    ],
+    ids=["another-user", "read-only-folder", "network-share", "not-held-open"],
+)
+def test_a_plex_database_refusal_talks_about_the_node_not_this_app(report, row_id, says):
+    """The check ran on the node: "This app ..." would send the user to change the app the node exists to leave be."""
+    envelope = _envelope(_details(roles=(ROLE_PLEX_DB,), gpus=()), file_checks=report)
+    row = next(r for r in _section(envelope, "node_plex_db")["checks"] if r["id"] == row_id)
+    assert row["ok"] is False
+    assert says in row["reason"]
+    assert "this app" not in row["reason"].lower() and "The app must" not in row["reason"]
+
+
 def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_rows():
     envelope = _envelope(
         _details(roles=(ROLE_PLEX_DB,), gpus=(), legacy=True),

@@ -24,6 +24,7 @@ from ..markers.publishers.plex_db import (
     LocalPlexDb,
     decode_extra_data,
     is_tested_pms_version,
+    node_wording,
     plex_busy_error,
     plex_db_path,
     plex_machine_identifier,
@@ -322,6 +323,8 @@ class RemoteLoudnessDb:
             report = CapabilityReport(
                 Capability.AGENT_UNAVAILABLE, "The Plex database node sent a loudness answer this app can't read"
             )
+        # The file checks ran on the node: a refusal of theirs is about the node, not this app.
+        report = node_wording(report)
         return CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
 
     def file_checks(self, *, deadline: float) -> CapabilityReport:
