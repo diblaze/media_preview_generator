@@ -485,6 +485,19 @@ class TestNodeList:
         expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready")
         assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/check"]
 
+    def test_check_now_gives_focus_back_to_its_button_when_done(self, authed_page: Page, app_url: str) -> None:
+        """Disabled while checking, the button dropped the focus to the page and never took it back."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.check_reads = 1
+        button = authed_page.locator("#nodesCheckNow")
+        button.focus()
+
+        authed_page.keyboard.press("Enter")
+
+        expect(button).to_have_text("Checking…")
+        expect(button).to_have_text("Check now", timeout=10000)
+        expect(button).to_be_focused()
+
     def test_check_now_says_how_often_nodes_are_checked_without_it(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         button = authed_page.locator("#nodesCheckNow")
@@ -587,6 +600,14 @@ class TestAddNode:
         _open_nodes(authed_page, app_url, _four_nodes()[:1])
         _open_add(authed_page)
         expect(authed_page.locator("#addNodeUrl")).to_be_focused()
+
+    def test_closing_the_dialog_gives_focus_back_to_add_node(self, authed_page: Page, app_url: str) -> None:
+        """Opened from code, it gave focus back to the page itself: Tab started again from the top."""
+        _open_nodes(authed_page, app_url, _four_nodes()[:1])
+        _open_add(authed_page)
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#nodesAddBtn")).to_be_focused()
 
     def test_connect_save_test_access_use_suggestion_and_save(
         self, authed_page: Page, app_url: str, tmp_path: Path
@@ -922,6 +943,47 @@ class TestNodeDialog:
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("RTX 4070")
         assert api.bodies("POST", "/nodes/n-storage/rescan-gpus") == [None]
 
+    @pytest.mark.parametrize("state", ["offline", "duplicate"])
+    def test_a_node_not_answering_as_itself_shows_its_gpus_without_saying_they_work(
+        self, authed_page: Page, app_url: str, state: str
+    ) -> None:
+        """An offline node's Overview said its last answer's GPU was "✓ Working", with Rescan GPUs ready to press."""
+        nodes = _four_nodes()
+        nodes[3]["state"] = state
+        _open_nodes(authed_page, app_url, nodes)
+        _open_node(authed_page, "n-old")
+        gpus = authed_page.locator("#nodeGpuList")
+        expect(gpus).to_contain_text("GTX 1650")
+        expect(gpus).not_to_contain_text("Working")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_disabled()
+
+    def test_rescan_is_ready_again_once_the_node_answers(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-old")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_disabled()
+        api.nodes[3] = {**api.nodes[3], "state": "ready", "reason": "", "last_seen": time.time() - 2}
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        expect(authed_page.locator("#nodeGpuList")).to_contain_text("✓ Working")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_enabled()
+
+    def test_a_poll_keeps_the_focus_on_the_overview_so_esc_still_closes_the_dialog(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """Every poll rewrote the Overview under the focused link: focus fell to the page and Esc did nothing."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-nuc")
+        _node_tab(authed_page, "overview")
+        link = authed_page.locator("#nodeOverview a", has_text="Add it to a worker group")
+        link.focus()
+        api.nodes[2] = {**api.nodes[2], "cpu": {**api.nodes[2]["cpu"], "load1": 2.5}}
+
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        expect(authed_page.locator("#nodeOverview")).to_contain_text("load 2.5")
+        expect(link).to_be_focused()
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
     def test_rescan_of_a_node_that_does_not_answer_says_so_in_red(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
         api.rescan_answer = (502, {"error": "Couldn't ask storage: http://storage.lan:9494 didn't answer"})
@@ -1062,6 +1124,33 @@ class TestNodeDialog:
         assert authed_page.evaluate("() => !!document.activeElement.closest('#nodeModal')")
         authed_page.keyboard.press("Escape")
         expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    def test_saving_mappings_that_fix_access_updates_the_setup_health_badge(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """The header turned Ready after the save and its Test access, while the Setup Health badge kept its 1."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        problem = {"id": "node_access_problem", "label": "nuc couldn't see files it was sent", "ok": False}
+        api.health_answer = {
+            "overall_ok": False,
+            "sections": [
+                {"id": "node_media_access", "title": "Media access", "checks": [{**problem, "severity": "critical"}]}
+            ],
+        }
+        _open_node(authed_page, "n-nuc")
+        badge = authed_page.locator("#nodeHealthTabBadge")
+        expect(badge).to_have_text("1")
+        pane = _node_tab(authed_page, "media")
+        pane.locator(".nd-add-row").click()
+        pane.locator(".nd-app").last.fill("/data/TV Shows")
+        pane.locator(".nd-node").last.fill("/media/tv")
+        api.test_answers = [{"libraries": [_library("TV Shows", "/data/TV Shows", True, "/media/tv")]}]
+        api.health_answer = {"overall_ok": True, "sections": []}
+
+        authed_page.locator("#nodeSaveMappings").click()
+
+        expect(pane).to_contain_text("The node sees every library, same files.")
+        expect(badge).to_be_hidden()
 
     def test_closing_with_unsaved_settings_asks_first(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())

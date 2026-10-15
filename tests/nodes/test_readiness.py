@@ -137,10 +137,18 @@ def test_a_node_that_answered_at_its_address_isnt_sent_to_check_it(cause, label,
     assert not {"fix_tab", "fix_label"} & set(row)
 
 
-@pytest.mark.parametrize("cause", [reg.OFFLINE_UNREACHABLE, reg.OFFLINE_NOT_A_NODE, ""])
-def test_a_node_that_didnt_answer_as_a_node_is_sent_to_check_its_address(cause):
+@pytest.mark.parametrize(
+    ("cause", "label"),
+    [
+        (reg.OFFLINE_UNREACHABLE, "nuc isn't answering"),
+        # Its reason says something answered there: "isn't answering" above it contradicted it.
+        (reg.OFFLINE_NOT_A_NODE, "Something else answers at nuc's address"),
+        ("", "nuc isn't answering"),
+    ],
+)
+def test_a_node_that_didnt_answer_as_a_node_is_sent_to_check_its_address(cause, label):
     row = _check(_envelope(_offline(cause)), "node_reachable")
-    assert (row["label"], row["fix_tab"], row["fix_label"]) == ("nuc isn't answering", "settings", "Check the address")
+    assert (row["label"], row["fix_tab"], row["fix_label"]) == (label, "settings", "Check the address")
 
 
 def test_a_node_added_twice_is_one_must_fix_row_pointing_at_its_remove_button():
@@ -510,6 +518,38 @@ def test_a_failed_gpu_says_what_its_test_found_and_what_to_do():
     assert row["reason"] == (
         "CUDA acceleration test failed. Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
     )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "nuc lost its GPU cuda:0 (the node no longer finds it). Its CPU workers keep running. Check the GPU driver on "
+        "the node.",
+        "nuc couldn't check its GPUs yet (nvidia-smi failed). It tries again in a few minutes; its CPU workers keep "
+        "running.",
+    ],
+    ids=["gpu_vanished", "detection_pending"],
+)
+def test_a_node_whose_gpu_is_gone_from_its_list_has_a_must_fix_row_saying_so(reason):
+    """The card said "GPU lost" and its Fix opened Setup Health, which listed only the GPUs the node still reports:
+    none, so nothing there said its GPU workers were paused, and the card's count left it out."""
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=(), reason=reason))
+    row = _check(envelope, "node_gpu_lost")
+    assert (row["ok"], row["severity"], row["label"], row["reason"], row["fix_where"]) == (
+        False,
+        "critical",
+        "nuc's GPU workers are paused",
+        reason,
+        "node",
+    )
+    assert to_fix(envelope)["must_fix"] == 1
+
+
+def test_a_lost_gpu_the_node_still_lists_as_failed_is_one_row_not_two():
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=({**GPU, "status": "failed"},), reason="why"))
+    assert all(c["id"] != "node_gpu_lost" for s in envelope["sections"] for c in s["checks"])
+    assert to_fix(envelope)["must_fix"] == 1
+    assert all(c["id"] != "node_gpu_lost" for s in _envelope(_details())["sections"] for c in s["checks"])
 
 
 def test_a_node_that_needs_an_update_links_the_steps():

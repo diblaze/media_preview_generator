@@ -155,8 +155,9 @@ def _group_row(group_id: str, name: str, enabled: bool, members: list[dict]) -> 
 
 
 def node_rows() -> list[dict]:
-    """The device picker's view of each added node: state, reason, roles, its GPUs and CPU cores (never its url or
-    key). The picker leaves out a node whose roles don't include running workers (a Plex database node)."""
+    """The device picker's view of each added node: state, reason, cause (why it is offline), roles, its GPUs and CPU
+    cores (never its url or key). The picker leaves out a node whose roles don't include running workers (a Plex
+    database node)."""
     from ...nodes.registry import get_registry
 
     try:
@@ -170,6 +171,7 @@ def node_rows() -> list[dict]:
             "name": view.name,
             "state": view.state,
             "reason": view.reason,
+            "cause": view.cause,
             "roles": list(view.roles),
             "devices": [
                 {key: gpu.get(key) for key in ("device", "name", "type", "status")}

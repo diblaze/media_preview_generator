@@ -21,6 +21,7 @@ from ..markers.readiness import CRITICAL, RECOMMENDED
 from ..markers.readiness import _row as readiness_row
 from . import protocol
 from .registry import (
+    OFFLINE_NOT_A_NODE,
     OFFLINE_RATE_LIMITED,
     OFFLINE_RESTARTING,
     OFFLINE_STUCK,
@@ -28,6 +29,7 @@ from .registry import (
     STATE_CONNECTING,
     STATE_DISABLED,
     STATE_DUPLICATE,
+    STATE_GPU_LOST,
     STATE_KEY_REFUSED,
     STATE_NO_FFMPEG,
     STATE_OFFLINE,
@@ -133,10 +135,16 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
                 fix_where=fix_where,
             )
         ]
+    if reachable:
+        label = f"{view.name} answers"
+    elif view.cause == OFFLINE_NOT_A_NODE:
+        label = f"Something else answers at {view.name}'s address"
+    else:
+        label = f"{view.name} isn't answering"
     rows = [
         _row(
             "node_reachable",
-            f"{view.name} answers" if reachable else f"{view.name} isn't answering",
+            label,
             severity=CRITICAL,
             ok=reachable,
             explanation="The app checks every node every 30 seconds.",
@@ -403,6 +411,21 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
                 current=gpu.get("status") or "unknown",
                 recommended="ok",
                 reason=None if ok else _gpu_reason(errors.get(gpu.get("device"))),
+                fix_where=FIX_ON_NODE,
+            )
+        )
+    explained = any(gpu.get("status") != "ok" for gpu in view.gpus)
+    if view.state == STATE_GPU_LOST and not explained:
+        # The GPU is gone from the node's list, or no detection has worked yet: no GPU row above says why its GPU
+        # workers are paused.
+        rows.append(
+            _row(
+                "node_gpu_lost",
+                f"{view.name}'s GPU workers are paused",
+                severity=CRITICAL,
+                ok=False,
+                explanation="The node tests each GPU when it starts, every 5 minutes, and after a GPU error.",
+                reason=view.reason,
                 fix_where=FIX_ON_NODE,
             )
         )

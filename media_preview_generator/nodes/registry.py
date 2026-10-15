@@ -110,6 +110,12 @@ _CAPACITY_REASONS = {
     STATE_DISABLED: "node turned off",
     STATE_DUPLICATE: "node added twice",
 }
+# An offline node that answered it is restarting, or asked this app to wait, has nothing to fix on it: "node offline"
+# beside it contradicted its Setup Health and bell, which say so.
+_OFFLINE_CAPACITY_REASONS = {
+    OFFLINE_RESTARTING: "node restarting",
+    OFFLINE_RATE_LIMITED: "node asks to wait",
+}
 
 
 @dataclass(frozen=True)
@@ -594,6 +600,8 @@ class NodeRegistry:
                 return NodeCapacity(True, True, "")
             if state == STATE_GPU_LOST:
                 return NodeCapacity(True, False, reason)
+            if state == STATE_OFFLINE and live.probe_cause in _OFFLINE_CAPACITY_REASONS:
+                return NodeCapacity(False, False, _OFFLINE_CAPACITY_REASONS[live.probe_cause])
             return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
 
     def plex_db_refusal(self, node_id: str) -> str:
