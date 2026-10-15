@@ -155,7 +155,8 @@ def _group_row(group_id: str, name: str, enabled: bool, members: list[dict]) -> 
 
 
 def node_rows() -> list[dict]:
-    """The device picker's view of each added node: state, reason, its GPUs and CPU cores (never its url or key)."""
+    """The device picker's view of each added node: state, reason, roles, its GPUs and CPU cores (never its url or
+    key). The picker leaves out a node whose roles don't include running workers (a Plex database node)."""
     from ...nodes.registry import get_registry
 
     try:
@@ -169,6 +170,7 @@ def node_rows() -> list[dict]:
             "name": view.name,
             "state": view.state,
             "reason": view.reason,
+            "roles": list(view.roles),
             "devices": [
                 {key: gpu.get(key) for key in ("device", "name", "type", "status")}
                 for gpu in view.gpus
@@ -325,6 +327,41 @@ def get_worker_groups():
     return jsonify(worker_group_payload())
 
 
+def _member_on_non_worker_node(groups: object, saved: list[dict]) -> str | None:
+    """Why a submitted member can't go on its node: the node answered that it doesn't run workers.
+
+    Roles are known only once a node has answered, so a node not checked yet is let through (its row then says it has
+    no workers). A member already saved on such a node keeps saving, so it doesn't block an edit of another group.
+
+    Args:
+        groups: The submitted groups, not validated yet.
+        saved: The stored groups.
+
+    Returns:
+        The refusal, or None when every member may be saved.
+    """
+    from ...nodes.protocol import ROLE_WORKER
+    from ...nodes.registry import get_registry
+
+    def device_key(member: dict) -> tuple:
+        return member.get("node"), member.get("resource"), member.get("device")
+
+    kept = {device_key(policy) for policy in member_policies(saved) if policy.get("node")}
+    for group in groups if isinstance(groups, list) else []:
+        for member in (group.get("members") if isinstance(group, dict) else None) or []:
+            node_id = member.get("node") if isinstance(member, dict) else None
+            if not isinstance(node_id, str) or not node_id or device_key(member) in kept:
+                continue
+            try:
+                view = get_registry().view(node_id)
+            except Exception as exc:  # noqa: BLE001 - an unreadable registry proves nothing; the save itself decides
+                logger.debug("Could not read node {} for a worker group save ({})", node_id, exc)
+                continue
+            if view is not None and view.roles and ROLE_WORKER not in view.roles:
+                return f"{view.name or node_id} doesn't run workers: it is a Plex database node. Pick another device."
+    return None
+
+
 @api.route("/worker-groups", methods=["PUT"])
 @setup_or_auth_required
 def save_worker_groups():
@@ -333,6 +370,9 @@ def save_worker_groups():
     if not isinstance(data, dict) or type(data.get("revision")) is not int or "groups" not in data:
         return jsonify({"error": "Provide groups and the revision you loaded"}), 400
     settings = get_settings_manager()
+    refusal = _member_on_non_worker_node(data["groups"], settings.worker_groups)
+    if refusal:
+        return jsonify({"error": refusal}), 400
     try:
         settings.update_worker_groups(data["groups"], expected_revision=data["revision"])
     except WorkerGroupsConflict as exc:

@@ -59,6 +59,27 @@ class TestSave:
         assert response.status_code == 400
         assert "node laptop is not added" in response.get_json()["error"]
 
+    def test_member_on_a_plex_database_node_is_refused(self, client, registry):
+        """Applying "plex-db · CPU" used to say "Worker groups saved", then the row turned "doesn't run workers"."""
+        registry.put("storage", name="plex-db", roles=("plex_db",), gpus=())
+        response = put(client, [group("g", member("a", node="storage"))])
+        assert response.status_code == 400
+        assert response.get_json()["error"] == (
+            "plex-db doesn't run workers: it is a Plex database node. Pick another device."
+        )
+        assert not any(saved["id"] == "g" for saved in get_settings_manager().worker_groups)
+
+    def test_member_already_saved_on_a_node_that_turned_out_not_to_run_workers_keeps_saving(self, client, registry):
+        registry.put("storage")
+        assert put(client, [group("g", member("a", node="storage"))]).status_code == 200
+        registry.put("storage", roles=("plex_db",), gpus=())
+        response = put(client, [group("g", member("a", node="storage")), group("h", member("b"))])
+        assert response.status_code == 200, response.get_json()
+
+    def test_member_on_a_node_not_checked_yet_is_saved(self, client, registry):
+        registry.put("storage", state=STATE_OFFLINE, reason="node offline", roles=())
+        assert put(client, [group("g", member("a", node="storage"))]).status_code == 200
+
     def test_legacy_cpu_count_control_ignores_node_cpu_members(self, client, registry):
         registry.put("storage")
         assert put(client, [group("g", member("ncpu", count=3, node="storage"))]).status_code == 200
@@ -79,11 +100,26 @@ class TestPayload:
                 "name": "Storage box",
                 "state": "ready",
                 "reason": "",
+                "roles": ["worker"],
                 "devices": [NODE_GPU],
                 "cpu_cores": 24,
             },
-            {"id": "nuc", "name": "nuc", "state": "offline", "reason": "node offline", "devices": [], "cpu_cores": 24},
+            {
+                "id": "nuc",
+                "name": "nuc",
+                "state": "offline",
+                "reason": "node offline",
+                "roles": ["worker"],
+                "devices": [],
+                "cpu_cores": 24,
+            },
         ]
+
+    def test_nodes_list_says_which_node_doesnt_run_workers(self, client, registry):
+        """The picker offered a Plex database node's "CPU": the rows didn't say what the node does."""
+        registry.put("storage", roles=("plex_db",), gpus=())
+        nodes = client.get("/api/worker-groups").get_json()["nodes"]
+        assert [(n["id"], n["roles"]) for n in nodes] == [("storage", ["plex_db"])]
 
     def test_node_members_show_node_name_state_and_reason(self, client, registry):
         registry.put("storage")

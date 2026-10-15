@@ -53,7 +53,14 @@ class FakeRegistry(NodeRegistry):
         self.reads = 0
 
     def put(
-        self, node_id: str, *, state: str = STATE_READY, gpus: tuple = (NODE_GPU,), reason: str = "", name=None
+        self,
+        node_id: str,
+        *,
+        state: str = STATE_READY,
+        gpus: tuple = (NODE_GPU,),
+        reason: str = "",
+        name=None,
+        roles: tuple = ("worker",),
     ) -> None:
         self._views[node_id] = NodeView(
             id=node_id,
@@ -63,7 +70,7 @@ class FakeRegistry(NodeRegistry):
             state=state,
             reason=reason,
             version="1",
-            roles=("worker",),
+            roles=tuple(roles),
             gpus=tuple(gpus),
             cpu_cores=24,
             legacy=False,

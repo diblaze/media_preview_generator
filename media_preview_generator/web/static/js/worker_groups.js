@@ -78,6 +78,8 @@
     // Red when the node is down or refuses us; amber when it needs attention but is reachable.
     const nodeTone = state => (!state || ['offline', 'key_refused'].includes(state) ? 'bad' : 'warn');
     const nodesList = () => snapshot.nodes || [];
+    // A node's roles are known once it has answered; until then it may still turn out to run workers.
+    const runsWorkers = node => !(node.roles || []).length || node.roles.includes('worker');
     const nodeFor = member => (member.node ? nodesList().find(node => node.id === member.node) || null : null);
     const nodeStateLabel = node => (node ? NODE_STATES[node.state] || node.state || '' : 'Removed');
     const hardwareFor = member => (member.node
@@ -96,6 +98,7 @@
         if (!member.node) return '';
         const node = nodeFor(member);
         if (!node) return 'node removed';
+        if (!runsWorkers(node)) return "node doesn't run workers";
         const reason = node.reason || `node ${nodeStateLabel(node).toLowerCase()}`;
         if (member.resource === 'cpu') return ['ready', 'gpu_lost'].includes(node.state) ? '' : reason;
         if (node.state !== 'ready') return reason;
@@ -881,7 +884,7 @@
         const gpu = (snapshot.hardware || []).find(item => item.device && item.status !== 'failed' && !used.has(item.device));
         if (gpu) return { resource: 'gpu', device: gpu.device, job_types: GPU_JOBS.slice() };
         if (!used.has('cpu')) return { resource: 'cpu', device: null, job_types: CPU_JOBS.slice() };
-        for (const node of nodesList().filter(item => item.state === 'ready')) {
+        for (const node of nodesList().filter(item => item.state === 'ready' && runsWorkers(item))) {
             const nodeGpu = (node.devices || []).find(item => item.status !== 'failed' && !used.has(`node:${node.id}:gpu:${item.device}`));
             if (nodeGpu) return { resource: 'gpu', device: nodeGpu.device, node: node.id, job_types: GPU_JOBS.slice() };
             if (!used.has(`node:${node.id}:cpu`)) return { resource: 'cpu', device: null, node: node.id, job_types: CPU_JOBS.slice() };
@@ -902,7 +905,8 @@
         if (!member.node && member.resource === 'gpu' && !gpus.some(gpu => gpu.device === member.device)) {
             sections[0].options.push({ value: member.device, label: `${member.device} — not detected`, resource: 'gpu', device: member.device, node: null });
         }
-        for (const node of nodesList()) {
+        // A Plex database node has no CPU or GPU to lend, so it isn't offered.
+        for (const node of nodesList().filter(runsWorkers)) {
             const state = nodeStateLabel(node);
             const devices = (node.devices || []).map(gpu => ({
                 value: `node:${node.id}:gpu:${gpu.device}`, label: `${node.name} · ${gpu.name || gpu.device}${gpu.status === 'failed' ? ' (unavailable)' : ''}`,
@@ -920,7 +924,7 @@
             const known = sections.find(section => section.node === member.node);
             const option = { value: selected, label: `${nodeName(member)} · ${deviceName(member)} — ${nodeIssue(member) || 'not found'}`, resource: member.resource, device: member.device, node: member.node };
             if (known) known.options.push(option);
-            else sections.push({ label: `${nodeName(member)} · Removed`, node: member.node, options: [option] });
+            else sections.push({ label: `${nodeName(member)} · ${nodeFor(member) ? "Doesn't run workers" : 'Removed'}`, node: member.node, options: [option] });
         }
         return sections;
     }

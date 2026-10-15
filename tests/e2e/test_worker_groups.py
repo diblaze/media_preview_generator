@@ -916,6 +916,44 @@ def _with_nas_node(group_api: dict, gpu_status: str = "ok") -> None:
     ]
 
 
+def test_the_device_picker_leaves_out_a_plex_database_node(authed_page: Page, app_url: str, group_api: dict) -> None:
+    """The picker offered "plex-db · CPU" next to the worker nodes, and Add device could pick it."""
+    group_api["state"]["nodes"] = [
+        {
+            "id": "nas",
+            "name": "nas-node",
+            "state": "ready",
+            "reason": "",
+            "roles": ["worker"],
+            "devices": [],
+            "cpu_cores": 8,
+        },
+        {
+            "id": "pdb",
+            "name": "plex-db",
+            "state": "ready",
+            "reason": "",
+            "roles": ["plex_db"],
+            "devices": [],
+            "cpu_cores": 4,
+        },
+    ]
+    settings_page(authed_page, app_url)
+    page = authed_page
+    page.locator('[data-edit="cpu-night"]').click()
+    picker = page.locator('[data-member="m-cpu"] [data-pick]')
+    expect(picker.locator('option[value="node:nas:cpu"]')).to_have_count(1)
+    expect(picker.locator('option[value^="node:pdb:"]')).to_have_count(0)
+    expect(picker.locator("optgroup", has_text="plex-db")).to_have_count(0)
+    # This app's GPU, then the worker node's CPU; nothing is left after that.
+    page.locator("#workerGroupAddDevice").click()
+    page.locator("#workerGroupAddDevice").click()
+    expect(page.locator("#workerGroupMembers .mrow")).to_have_count(3)
+    expect(page.locator("#workerGroupAddDevice")).to_be_disabled()
+    picked = page.locator("#workerGroupMembers [data-pick]").evaluate_all("els => els.map(e => e.value)")
+    assert picked == ["cpu", "nvidia0", "node:nas:cpu"], picked
+
+
 def test_each_machines_cpu_and_gpu_get_their_own_colour(authed_page: Page, app_url: str, group_api: dict) -> None:
     _with_nas_node(group_api)
     _add_gpu_member(group_api)
