@@ -41,6 +41,7 @@ from ..utils import (
     dies_with_node,
     gpu_settings_hint,
     is_node_mode,
+    node_temp_root,
     scratch_dir,
     working_folder_hint,
 )
@@ -810,9 +811,13 @@ def create_ffmpeg_runner(
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines, output_folder)
             no_decoder = exit_diagnosis == "no_decoder"
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
-            # A node hands such a file back to the queue (nodes/server/tasks.py): its temp folder is the node's state,
-            # which its card and bell say, not a failed file, so one warning and no stderr lines.
-            handed_back = refused is not None and is_node_mode()
+            # A node hands such a file back to the queue: its temp folder is the node's state, which its card and bell
+            # say, not a failed file, so one warning and no stderr lines. Its own rule, so the two can't disagree.
+            handed_back = False
+            if refused is not None and is_node_mode():
+                from ..nodes.server.tasks import blames_temp_folder
+
+                handed_back = blames_temp_folder(node_temp_root(), refused, output_folder)
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
                 folder, move = working_folder_hint(getattr(config, "tmp_folder", None))

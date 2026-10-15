@@ -25,6 +25,7 @@ or fails (CPU).
 Only the FFmpeg boundary is mocked; counting, cleanup, renaming and the cascade run for real against ``tmp_path``.
 """
 
+import contextlib
 import errno
 import itertools
 import os
@@ -804,30 +805,60 @@ class TestTheRunnersFailureLines:
 
     @pytest.mark.parametrize("node", [True, False], ids=["node", "app"])
     @pytest.mark.parametrize(
-        ("rc", "stderr"),
-        [(FOLDER_FULL, "\n".join(FOLDER_FULL_STDERR)), (FOLDER_READ_ONLY, "\n".join(FOLDER_READ_ONLY_STDERR))],
-        ids=["full", "read-only"],
+        ("rc", "stderr", "refuses_files", "temp_root_refuses", "handed_back"),
+        [
+            (FOLDER_FULL, FOLDER_FULL_STDERR, None, False, True),
+            (SHELL_SIGABRT, [OVER_QUOTA_LINE], None, False, True),
+            (FOLDER_READ_ONLY, FOLDER_READ_ONLY_STDERR, None, False, True),
+            (PERMISSION_DENIED, FOLDER_PERMISSION_DENIED_STDERR, errno.EACCES, True, True),
+            (PERMISSION_DENIED, FOLDER_PERMISSION_DENIED_STDERR, errno.EACCES, False, False),
+            (NOT_PERMITTED, FOLDER_NOT_PERMITTED_STDERR, errno.EPERM, True, True),
+            (NOT_PERMITTED, FOLDER_NOT_PERMITTED_STDERR, errno.EPERM, False, False),
+        ],
+        ids=[
+            "full",
+            "over-quota",
+            "read-only",
+            "no-permission-temp-folder-refuses",
+            "no-permission-temp-folder-takes-folders",
+            "not-permitted-temp-folder-refuses",
+            "not-permitted-temp-folder-takes-folders",
+        ],
     )
-    def test_a_refused_write_on_a_node_is_one_warning_for_the_file_it_hands_back(
-        self, run, tmp_path, monkeypatch, rc, stderr, node
+    def test_a_refused_write_on_a_node_is_one_warning_only_for_a_file_it_hands_back(
+        self, run, tmp_path, monkeypatch, rc, stderr, refuses_files, temp_root_refuses, handed_back, node
     ):
         """Lab: a node whose temp folder filled up logged an ERROR and five stderr WARNING lines for a file it only
-        handed back to the queue, so a job that completed with every preview made read as having a failed file."""
+        handed back to the queue, so a job that completed with every preview made read as having a failed file. A
+        permission error the node fails the file for (its temp folder still takes new folders: nodes/server/tasks.py)
+        keeps the ERROR and stderr lines that say why."""
         if node:
             monkeypatch.setenv("MODE", "node")
+            # A node's thumbnails go to its task's folder inside its temp folder.
+            monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path))
             # Its setpriv lookup would run through the stand-in Popen.
             monkeypatch.setattr(
                 "media_preview_generator.processing.ffmpeg_runner.dies_with_node", lambda args: (args, None)
             )
         else:
             monkeypatch.delenv("MODE", raising=False)
+        if temp_root_refuses:
+            monkeypatch.setattr(
+                "media_preview_generator.nodes.server.tasks.probe_temp_folder",
+                lambda temp_root: f"The node can't write to its temp folder {temp_root} (Permission denied)",
+            )
 
-        outcome = self._run_real(run, tmp_path, rc, stderr)
+        with (
+            TestAFolderThatRefusesTheThumbnails._refusing_new_files(tmp_path / "frames", refuses_files)
+            if refuses_files
+            else contextlib.nullcontext()
+        ):
+            outcome = self._run_real(run, tmp_path, rc, "\n".join(stderr))
 
         assert isinstance(outcome.result, WorkingFolderError)
         said = [line.split("|", 1)[0] for line in outcome.warnings if "couldn't write thumbnails" in line]
         stderr_dumps = [line for line in outcome.warnings if "stderr lines" in line]
-        if node:
+        if node and handed_back:
             assert (said, stderr_dumps) == (["WARNING"], []), outcome.warnings
             assert not any(line.startswith("ERROR|") for line in outcome.warnings), outcome.warnings
         else:

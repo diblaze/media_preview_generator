@@ -159,6 +159,29 @@ def _inside(path: str, folder: str) -> bool:
     return os.path.commonpath([real, root]) == root
 
 
+def blames_temp_folder(temp_root: str, code: int | None, written: str | None) -> bool:
+    """Whether a failed write is the temp folder's problem, so the node hands the file back instead of failing it.
+
+    Shared with the FFmpeg runner, which words its log line by it (``processing/ffmpeg_runner.py``).
+
+    Args:
+        temp_root: The node's temp folder.
+        code: The write's errno.
+        written: The path the write named, when it named one.
+
+    Returns:
+        True when the folder filled up, went read-only, or can't be written by the node's user.
+    """
+    if code not in _TEMP_WRITE_ERRNOS | _TEMP_PERMISSION_ERRNOS:
+        return False
+    blamed = code in _TEMP_WRITE_ERRNOS if written is None else _inside(written, temp_root)
+    # The node's user made the task's folder, so a refusal there is a security policy on one file or FFmpeg's
+    # catch-all error (-1) read as EPERM, unless the folder refuses a new folder now too.
+    if blamed and code in _TEMP_PERMISSION_ERRNOS:
+        blamed = probe_temp_folder(temp_root) is not None
+    return blamed
+
+
 def _is_cancellation(exc: BaseException) -> bool:
     for module_name, class_name in _CANCELLATION_CLASSES:
         module = sys.modules.get(module_name)
@@ -502,17 +525,9 @@ class TaskTable:
         whether it filled up; else None."""
         seen: BaseException | None = exc
         while seen is not None and self.temp_root is not None:
-            if isinstance(seen, OSError) and seen.errno in _TEMP_WRITE_ERRNOS | _TEMP_PERMISSION_ERRNOS:
+            if isinstance(seen, OSError):
                 written = seen.filename if isinstance(seen.filename, str) else None
-                if written is None:
-                    blamed = seen.errno in _TEMP_WRITE_ERRNOS
-                else:
-                    blamed = _inside(written, self.temp_root)
-                # The node's user made the task's folder, so a refusal there is a security policy on one file or
-                # FFmpeg's catch-all error (-1) read as EPERM, unless the folder refuses a new folder now too.
-                if blamed and seen.errno in _TEMP_PERMISSION_ERRNOS:
-                    blamed = probe_temp_folder(self.temp_root) is not None
-                if blamed:
+                if blames_temp_folder(self.temp_root, seen.errno, written):
                     message = temp_folder_problem(self.temp_root, seen)
                     filled = seen.errno in _TEMP_FULL_ERRNOS
                     if filled:
