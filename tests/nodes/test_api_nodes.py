@@ -583,3 +583,38 @@ class TestAuth:
         monkeypatch.setattr(type(_sm()), "is_setup_complete", lambda self: False)
         fresh = client.application.test_client()
         assert fresh.get("/api/nodes", headers=auth_headers).status_code == 200
+
+
+class TestRemovedDuringAGroupSave:
+    def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
+        """The group save checks its members against the nodes list under the settings lock, so a Remove that comes
+        in meanwhile waits, sees the new member and is refused."""
+        import threading
+
+        from media_preview_generator import worker_groups as wg
+
+        node_id = _add(client).get_json()["id"]
+        real_validate = wg.validate_worker_groups
+        checking, deleted = threading.Event(), []
+
+        def slow_validate(value, **kwargs):
+            clean = real_validate(value, **kwargs)
+            checking.set()
+            time.sleep(0.3)  # the other request's Remove arrives now
+            return clean
+
+        def remove():
+            checking.wait(5)
+            deleted.append(client.delete(f"/api/nodes/{node_id}").status_code)
+
+        monkeypatch.setattr(wg, "validate_worker_groups", slow_validate)
+        remover = threading.Thread(target=remove)
+        remover.start()
+        member = {"id": "m1", "resource": "cpu", "device": None, "count": 1, "job_types": ["previews"], "node": node_id}
+        group = {"id": "g1", "name": "NUC", "enabled": True, "availability": {"mode": "always", "windows": []},
+                 "members": [member]}  # fmt: skip
+        _sm().update_worker_groups([group])
+        remover.join(5)
+
+        assert deleted == [409]
+        assert [n["id"] for n in _sm().nodes] == [node_id]
