@@ -154,8 +154,10 @@ def refresh_worker_groups(pool, config=None, selected_gpus: list | None = None, 
     now = time.monotonic()
     if not force and config is None and selected_gpus is None and pool._policies is None:
         return False
-    node_revision = registry_revision()
     uses_nodes = any(policy.get("node") for policy in (getattr(pool, "_policies", None) or {}).values())
+    # Only read the registry when a member uses a node: its revision syncs from settings, and this runs on every
+    # dispatch pass.
+    node_revision = registry_revision() if uses_nodes else None
     nodes_changed = uses_nodes and node_revision != getattr(pool, "_node_revision", None)
     if (
         not force
@@ -169,6 +171,9 @@ def refresh_worker_groups(pool, config=None, selected_gpus: list | None = None, 
         return False
     pool.reconcile_groups(groups, selected_gpus, revision=revision)
     pool._group_refresh_at = now
+    if node_revision is None:
+        # Policies that just gained a node member: the revision the reconcile read the registry at.
+        node_revision = getattr(getattr(pool, "_node_hardware", None), "revision", None)
     pool._node_revision = node_revision
     return True
 

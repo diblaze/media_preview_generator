@@ -386,6 +386,19 @@ class TestRevisionRefresh:
         refresh_worker_groups(pool)
         assert calls == []
 
+    def test_no_member_on_a_node_never_creates_or_reads_the_registry(self, saved):
+        # Every dispatch pass refreshes: with no node configured it must not build the registry (whose revision
+        # syncs from settings under the settings lock) or read it, as before nodes existed.
+        from media_preview_generator.nodes import registry as registry_mod
+
+        set_registry(None)
+        saved["groups"] = [group("g", member("a"))]
+        pool = WorkerPool(0, 0, [])
+        refresh_worker_groups(pool, force=True)
+        for _ in range(5):
+            refresh_worker_groups(pool)
+        assert registry_mod._registry is None
+
 
 class TestCapacityAndParking:
     def test_all_capacity_on_an_offline_node_reads_node_unavailable(self, registry):
