@@ -579,7 +579,7 @@ def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
         )
     if damaged:
         return PublishError(
-            f"Database damaged: Plex's database needs repairing before markers can be written ({text})",
+            f"Database damaged: Plex's database needs repairing before this app can use it ({text})",
             state=Capability.MISCONFIGURED,
         )
     if access:

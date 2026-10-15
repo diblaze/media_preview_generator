@@ -193,7 +193,8 @@ class TestADatabaseThatCantBeReadIsRefusedAsItIs:
             ("not-a-database", "This app can't use Plex's database file (file is not a database)"),
             (
                 "malformed",
-                "Database damaged: Plex's database needs repairing before markers can be written (database disk image "
+                # Library Health counts, it writes no markers: the words name none.
+                "Database damaged: Plex's database needs repairing before this app can use it (database disk image "
                 "is malformed)",
             ),
         ],
