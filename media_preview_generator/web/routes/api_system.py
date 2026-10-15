@@ -482,6 +482,7 @@ def get_config():
     """Get current configuration."""
     try:
         from ...config import MAX_CPU_THREADS, get_cached_config
+        from ...config.validation import node_worker_total
         from ..settings_manager import get_settings_manager
 
         config = get_cached_config()
@@ -519,7 +520,7 @@ def get_config():
             "ffmpeg_threads": config.ffmpeg_threads,
             "log_level": config.log_level,
         }
-        if config.gpu_threads == 0 and config.cpu_threads == 0:
+        if config.gpu_threads == 0 and config.cpu_threads == 0 and not node_worker_total(settings.get_all()):
             resp["config_warning"] = (
                 "No workers configured — jobs will remain pending until GPU or CPU workers are added."
             )
