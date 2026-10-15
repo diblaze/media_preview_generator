@@ -22,6 +22,7 @@ from media_preview_generator.utils import (
     redact_secrets,
     redacted_traceback,
     sanitize_path,
+    scratch_dir,
     setup_working_directory,
 )
 
@@ -920,3 +921,21 @@ class TestAtomicJsonSaveWithBackup:
         # This should NOT raise — backup is best-effort.
         utils.atomic_json_save_with_backup(str(target), {"v": 2})
         assert _json.loads(target.read_text())["v"] == 2
+
+
+class TestScratchDir:
+    def test_a_node_uses_its_own_temp_folder(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", f"  {tmp_path}  ")
+        assert scratch_dir() == str(tmp_path)
+
+    def test_a_node_without_one_and_the_app_use_the_system_temp_folder(self, monkeypatch, tmp_path):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", "")
+        assert scratch_dir() == str(tmp_path)
+        monkeypatch.delenv("MODE")
+        monkeypatch.setenv("NODE_TEMP_DIR", "/elsewhere")  # a node's setting: the app has no use for it
+        assert scratch_dir() == str(tmp_path)

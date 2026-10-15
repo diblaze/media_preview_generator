@@ -53,7 +53,7 @@ from typing import Any, BinaryIO
 import numpy as np
 from loguru import logger
 
-from ...utils import redact_secrets
+from ...utils import redact_secrets, scratch_dir
 from ..locks import KeyedLocks
 from .cards import READ_SCALE
 from .devices import choose_ep_device, pin_env_to_gpu, worker_pci_bus_id
@@ -717,7 +717,7 @@ def _start(spec: HelperSpec, *, command: Callable[[HelperSpec], list[str]], pope
     Raises:
         HelperError: It couldn't be started, or its first line wasn't a ready line.
     """
-    stderr_file = tempfile.TemporaryFile()
+    stderr_file = tempfile.TemporaryFile(dir=scratch_dir())
     try:
         proc = popen(command(spec), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, env=spec.env,
                      start_new_session=True)  # fmt: skip

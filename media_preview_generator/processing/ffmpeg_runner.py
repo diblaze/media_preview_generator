@@ -28,7 +28,6 @@ import os
 import re
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -37,7 +36,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import dies_with_node, gpu_settings_hint, working_folder_hint
+from ..utils import dies_with_node, gpu_settings_hint, scratch_dir, working_folder_hint
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -474,7 +473,7 @@ def create_ffmpeg_runner(
         # Use file polling approach for non-blocking, high-frequency progress monitoring
         thread_id = threading.get_ident()
         output_file = os.path.join(
-            tempfile.gettempdir(),
+            scratch_dir(),
             f"ffmpeg_output_{os.getpid()}_{thread_id}_{time.time_ns()}.log",
         )
         stderr_fh = open(output_file, "w", encoding="utf-8")

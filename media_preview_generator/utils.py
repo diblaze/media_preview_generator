@@ -180,6 +180,16 @@ def is_node_mode() -> bool:
     return os.environ.get("MODE", "").strip().lower() == "node"
 
 
+def scratch_dir() -> str:
+    """The folder for this process's short-lived files (FFmpeg's log, a helper's stderr).
+
+    On a node, its temp folder (``NODE_TEMP_DIR``), the one it checks at start: a node run read-only may have no
+    writable system temp at all, and every file sent to it would fail. Else the system's temp folder.
+    """
+    chosen = os.environ.get("NODE_TEMP_DIR", "").strip() if is_node_mode() else ""
+    return chosen or tempfile.gettempdir()
+
+
 def gpu_settings_hint() -> str:
     """Where a GPU is turned off: the app's GPU settings, or for a node's GPUs, the app's worker groups."""
     return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU Configuration"

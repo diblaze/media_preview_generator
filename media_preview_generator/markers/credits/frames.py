@@ -28,7 +28,7 @@ from loguru import logger
 
 from ...processing.ffmpeg_runner import GPU_CANT_DECODE_VERDICT
 from ...processing.hwaccel import hwaccel_decode_args
-from ...utils import dies_with_node
+from ...utils import dies_with_node, scratch_dir
 from ..freeze import Freeze
 from ..probe import (
     ProbeError,
@@ -702,7 +702,7 @@ def run_decode(
         luma.extend(round(float(plane.mean()), 1) for plane in planes)
         pending.clear()
 
-    with tempfile.TemporaryFile() as stderr_file:
+    with tempfile.TemporaryFile(dir=scratch_dir()) as stderr_file:
         try:
             run_args, preexec = dies_with_node(command)  # a node's FFmpeg dies with the node
             # Its own session, so a kill reaches everything ffmpeg started; the app's process group is never signalled.

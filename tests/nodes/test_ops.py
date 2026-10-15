@@ -496,3 +496,84 @@ class TestCredits:
             ops.credits_find(ctx, NODE_PATH, {**self.PARAMS, "tail_s": "30,drawtext=text=x"})
 
         assert ran == []
+
+
+class TestANodeWithoutASystemTempFolder:
+    """A node run read-only, with only NODE_TEMP_DIR writable: FFmpeg's log and the helpers' stderr files go there.
+
+    They went to the system temp folder, so every preview on such a node failed with "No usable temporary directory
+    found" while the node itself checked NODE_TEMP_DIR at start and reported itself ready.
+    """
+
+    @pytest.fixture(autouse=True)
+    def read_only_node(self, tmp_path, monkeypatch):
+        import tempfile
+
+        node_temp = tmp_path / "node-tmp"
+        node_temp.mkdir()
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(node_temp))
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-system-temp"))  # what gettempdir() answers
+        return node_temp
+
+    def test_ffmpegs_log_is_written_to_the_nodes_temp_folder(self, read_only_node, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from media_preview_generator.processing import ffmpeg_runner
+
+        config = SimpleNamespace(ffmpeg_path="/usr/bin/ffmpeg", thumbnail_quality=4, log_level="INFO", ffmpeg_threads=2)
+        runner = ffmpeg_runner.create_ffmpeg_runner(
+            video_file="/media/Movie (2020)/Movie.mkv",
+            output_folder=str(read_only_node / "frames"),
+            gpu=None,
+            gpu_device_path=None,
+            config=config,
+            progress_callback=None,
+            ffmpeg_threads_override=None,
+            cancel_check=None,
+            path_kind="sdr",
+            libplacebo_vf="",
+            use_libplacebo=False,
+            dv5_software_fallback=False,
+            base_scale="scale=w=320:h=240",
+            fps_filter="fps=fps=0.1:round=up",
+            hdr10_zscale_chain="",
+        )
+        logs = []
+        proc = MagicMock(returncode=0, pid=4242)
+        proc.poll.return_value = 0
+
+        def popen(args, **kwargs):
+            logs.append(kwargs["stderr"].name)
+            return proc
+
+        monkeypatch.setattr(ffmpeg_runner.subprocess, "Popen", popen)
+        monkeypatch.setattr(ffmpeg_runner.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(ffmpeg_runner, "dies_with_node", lambda args: (args, None))  # no setpriv lookup
+
+        runner(use_skip=False)
+
+        assert len(logs) == 1 and os.path.dirname(logs[0]) == str(read_only_node)
+
+    def test_a_credit_decode_keeps_ffmpegs_stderr_in_the_nodes_temp_folder(self, monkeypatch):
+        def no_ffmpeg(*args, **kwargs):
+            raise OSError("no ffmpeg here")
+
+        monkeypatch.setattr(frames.subprocess, "Popen", no_ffmpeg)
+
+        # The decode gets as far as starting FFmpeg: its stderr file was made.
+        with pytest.raises(frames.FrameDecodeError, match="could not run"):
+            frames.run_decode(["ffmpeg"], hw_active=False, detect_boxes=lambda planes: [], pts_offset_s=0.0)
+
+    def test_a_text_detection_helper_keeps_its_stderr_in_the_nodes_temp_folder(self):
+        def no_helper(*args, **kwargs):
+            raise OSError("no python here")
+
+        spec = textdet_helper.HelperSpec("cpu", "cpu", None, False, {})
+
+        # The helper gets as far as starting: its stderr file was made.
+        with pytest.raises(textdet_helper.HelperStartError, match="couldn't start"):
+            textdet_helper._start(
+                spec, command=lambda _spec: ["helper"], popen=no_helper, start_timeout_s=1.0, request_timeout_s=1.0
+            )
