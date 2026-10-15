@@ -76,6 +76,7 @@ def test_a_ready_worker_that_is_untested_and_unused_has_only_recommendations():
         (reg.STATE_UPDATE_NEEDED, "node_version"),
         (reg.STATE_NO_FFMPEG, "node_ffmpeg"),
         (reg.STATE_TEMP_PROBLEM, "node_temp"),
+        (reg.STATE_DUPLICATE, "node_duplicate"),
     ],
 )
 def test_connection_problems_are_must_fix(state, failing):
@@ -109,6 +110,18 @@ def test_a_worker_node_that_cant_use_its_temp_folder_says_so_and_the_fix_is_on_t
 
 def test_an_offline_node_shows_only_its_connection():
     assert [s["id"] for s in _envelope(_details(reg.STATE_OFFLINE))["sections"]] == ["node_connection"]
+
+
+def test_a_node_added_twice_is_one_must_fix_row_pointing_at_its_remove_button():
+    """Its Setup Health showed only "Run Test access" and "Not used in any worker group": nothing said it gets no
+    work, and the list's count had no must fix."""
+    reason = "dup2 is dup1 again, added at another address. Remove one of them."
+    envelope = _envelope(_details(reg.STATE_DUPLICATE, roles=(ROLE_WORKER, ROLE_PLEX_DB), reason=reason))
+    assert [s["id"] for s in envelope["sections"]] == ["node_connection"]
+    row = _check(envelope, "node_duplicate")
+    assert (row["label"], row["severity"], row["reason"]) == ("Added twice — remove one", "critical", reason)
+    assert (row["fix_tab"], row["fix_label"]) == ("settings", "Open Settings")
+    assert to_fix(envelope) == {"must_fix": 1, "recommended": 0}
 
 
 def test_a_disabled_node_is_one_neutral_note_and_nothing_else():

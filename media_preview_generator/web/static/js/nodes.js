@@ -78,7 +78,7 @@
         access_problem: ['bad', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
         no_ffmpeg: ['bad', 'FFmpeg missing'],
-        duplicate: ['warn', 'Added twice'],
+        duplicate: ['bad', 'Added twice'],
         temp_problem: ['bad', 'Temp folder problem'],
         offline: ['bad', 'Offline'],
         key_refused: ['bad', 'Key refused'],
@@ -94,6 +94,8 @@
         no_ffmpeg: 'health',
         temp_problem: 'health',
         offline: 'health',
+        // Its Remove button is there.
+        duplicate: 'settings',
     };
     const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];
 

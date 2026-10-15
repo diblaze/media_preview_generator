@@ -564,7 +564,8 @@ _NODE_CARD_TEXT = {
         "{name} is added twice",
         "Nothing is sent to it until one of the two is removed.",
         "Open Nodes",
-        "",
+        # Its Remove button.
+        "settings",
     ),
     "temp_problem": (
         "{name} can't use its temp folder",

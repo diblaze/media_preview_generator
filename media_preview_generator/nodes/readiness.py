@@ -22,6 +22,7 @@ from .registry import (
     STATE_ACCESS_PROBLEM,
     STATE_CONNECTING,
     STATE_DISABLED,
+    STATE_DUPLICATE,
     STATE_KEY_REFUSED,
     STATE_NO_FFMPEG,
     STATE_OFFLINE,
@@ -128,6 +129,22 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
         )
     )
     if not key_ok:
+        return rows
+    if view.state == STATE_DUPLICATE:
+        # What answered here is the other node's machine, so no row below would be about this node.
+        rows.append(
+            _row(
+                "node_duplicate",
+                "Added twice — remove one",
+                severity=CRITICAL,
+                ok=False,
+                explanation="The same machine is added at two addresses. This app sends this one nothing, or the "
+                "machine would get twice the work.",
+                reason=view.reason,
+                fix_tab=TAB_SETTINGS,
+                fix_label="Open Settings",
+            )
+        )
         return rows
     from ..markers.publishers.plex_remote import MIN_AGENT_VERSION
 
@@ -469,7 +486,7 @@ def node_readiness(
     """
     view = details.view
     sections = [_section("node_connection", "Connection", _connection(details, app_version, app_build))]
-    usable = view.state not in (STATE_DISABLED, STATE_OFFLINE, STATE_CONNECTING, STATE_KEY_REFUSED)
+    usable = view.state not in (STATE_DISABLED, STATE_OFFLINE, STATE_CONNECTING, STATE_KEY_REFUSED, STATE_DUPLICATE)
     worker = protocol.ROLE_WORKER in view.roles or not view.roles
     if usable and worker and not view.legacy:
         sections.append(_section("node_media_access", "Media access", _media_access(details)))

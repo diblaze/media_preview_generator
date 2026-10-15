@@ -279,11 +279,17 @@ class TestNodeList:
             "gpu_lost": ("GPU lost", "warn", "Fix"),
             "offline": ("Offline", "bad", "Fix"),
             "key_refused": ("Key refused", "bad", "Fix"),
+            "no_ffmpeg": ("FFmpeg missing", "bad", "Fix"),
+            "temp_problem": ("Temp folder problem", "bad", "Fix"),
+            # It gets no work either, and its Fix opens Settings, where its Remove button is.
+            "duplicate": ("Added twice", "bad", "Fix"),
             "connecting": ("Connecting…", "off", "Open"),
             "disabled": ("Turned off", "off", "Open"),
         }
         nodes = [_node(f"n-{i}", f"node{i}", state, reason=f"why {i}") for i, state in enumerate(states)]
         _open_nodes(authed_page, app_url, nodes)
+        duplicate = list(states).index("duplicate")
+        expect(authed_page.locator(f"#node-n-{duplicate} .nd-open")).to_have_attribute("data-tab", "settings")
 
         for i, (chip, tone, button) in enumerate(states.values()):
             row = authed_page.locator(f"#node-n-{i}")
