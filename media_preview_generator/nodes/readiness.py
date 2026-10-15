@@ -21,6 +21,7 @@ from ..markers.readiness import CRITICAL, RECOMMENDED
 from ..markers.readiness import _row as readiness_row
 from . import protocol
 from .registry import (
+    OFFLINE_NOT_A_NODE,
     OFFLINE_RATE_LIMITED,
     OFFLINE_RESTARTING,
     OFFLINE_STUCK,
@@ -134,10 +135,16 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
                 fix_where=fix_where,
             )
         ]
+    if reachable:
+        label = f"{view.name} answers"
+    elif view.cause == OFFLINE_NOT_A_NODE:
+        label = f"Something else answers at {view.name}'s address"
+    else:
+        label = f"{view.name} isn't answering"
     rows = [
         _row(
             "node_reachable",
-            f"{view.name} answers" if reachable else f"{view.name} isn't answering",
+            label,
             severity=CRITICAL,
             ok=reachable,
             explanation="The app checks every node every 30 seconds.",

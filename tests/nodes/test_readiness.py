@@ -137,10 +137,18 @@ def test_a_node_that_answered_at_its_address_isnt_sent_to_check_it(cause, label,
     assert not {"fix_tab", "fix_label"} & set(row)
 
 
-@pytest.mark.parametrize("cause", [reg.OFFLINE_UNREACHABLE, reg.OFFLINE_NOT_A_NODE, ""])
-def test_a_node_that_didnt_answer_as_a_node_is_sent_to_check_its_address(cause):
+@pytest.mark.parametrize(
+    ("cause", "label"),
+    [
+        (reg.OFFLINE_UNREACHABLE, "nuc isn't answering"),
+        # Its reason says something answered there: "isn't answering" above it contradicted it.
+        (reg.OFFLINE_NOT_A_NODE, "Something else answers at nuc's address"),
+        ("", "nuc isn't answering"),
+    ],
+)
+def test_a_node_that_didnt_answer_as_a_node_is_sent_to_check_its_address(cause, label):
     row = _check(_envelope(_offline(cause)), "node_reachable")
-    assert (row["label"], row["fix_tab"], row["fix_label"]) == ("nuc isn't answering", "settings", "Check the address")
+    assert (row["label"], row["fix_tab"], row["fix_label"]) == (label, "settings", "Check the address")
 
 
 def test_a_node_added_twice_is_one_must_fix_row_pointing_at_its_remove_button():
