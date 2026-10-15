@@ -117,6 +117,33 @@ class SettingsManager:
         else:
             self._settings = {}
         self._migrate_global_plex_webhook_to_per_server()
+        self._give_nodes_ids()
+
+    def _give_nodes_ids(self) -> None:
+        """Give each node record written into settings.json without an ``id`` one, and save it.
+
+        Without one the record is never checked or listed on the Nodes page, and every save of the node list is
+        refused. The id is saved at once so it stays the same across restarts (worker group members and Plex servers
+        point at it).
+        """
+        raw = self._settings.get("nodes")
+        if not isinstance(raw, list):
+            return
+        from ..nodes.settings import new_node_id
+
+        named = []
+        for node in raw:
+            if isinstance(node, dict) and not str(node.get("id") or ""):
+                node["id"] = new_node_id()
+                named.append(str(node.get("name") or node["id"]))
+        if not named:
+            return
+        self._settings["nodes_revision"] = self.nodes_revision + 1
+        logger.info("Gave {} node(s) in settings.json without an id one: {}", len(named), ", ".join(named))
+        try:
+            self._save()
+        except Exception:
+            logger.warning("The new node ids hold until the app restarts; the next settings save stores them.")
 
     def _migrate_global_plex_webhook_to_per_server(self) -> None:
         """One-shot migration: move legacy global Plex webhook keys onto the Plex server entry.
@@ -380,10 +407,10 @@ class SettingsManager:
         """
         from ..nodes.settings import validate_nodes
 
-        clean, err = validate_nodes(nodes)
-        if clean is None:
-            raise ValueError(err)
         with self._lock:
+            clean, err = validate_nodes(nodes, saved=self.nodes)
+            if clean is None:
+                raise ValueError(err)
             revision = self.nodes_revision
             if expected_revision is not None and expected_revision != revision:
                 raise NodesConflict("Nodes changed elsewhere. Reload them before applying your edits.")

@@ -216,22 +216,35 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     }, ""
 
 
-def validate_nodes(raw: object) -> tuple[list[dict] | None, str]:
+def _record_label(entry: dict, fallback: str) -> str:
+    """How an error names a stored record: its name, else ``fallback``."""
+    name = entry.get("name")
+    return name.strip() if isinstance(name, str) and name.strip() else fallback
+
+
+def validate_nodes(raw: object, saved: list[dict] | None = None) -> tuple[list[dict] | None, str]:
     """Validate a whole ``nodes`` list as stored (each record keeps its id, uid and key).
+
+    A record that isn't valid but is exactly as saved (written into settings.json by hand) is kept as it is: it holds
+    up only a change to itself, never a save of the other nodes.
 
     Args:
         raw: The list to store.
+        saved: The list as it is saved now.
 
     Returns:
-        ``(nodes, "")`` or ``(None, message)``.
+        ``(nodes, "")`` or ``(None, message)``; a message about one record names it.
     """
     if not isinstance(raw, list):
         return None, "nodes must be a list"
+    as_saved = {str(n.get("id")): n for n in saved or [] if isinstance(n, dict) and n.get("id")}
     out: list[dict] = []
     seen_ids: set[str] = set()
     for entry in raw:
-        if not isinstance(entry, dict) or not str(entry.get("id") or ""):
-            return None, "Each node needs an id"
+        if not isinstance(entry, dict):
+            return None, "Each node must be an object"
+        if not str(entry.get("id") or ""):
+            return None, f"{_record_label(entry, 'A node')} needs an id"
         node_id = str(entry["id"])
         if node_id in seen_ids:
             return None, f"Node id {node_id} is used twice"
@@ -245,7 +258,10 @@ def validate_nodes(raw: object) -> tuple[list[dict] | None, str]:
         }
         record, err = validate_node({**entry, "key": None}, existing=stored, others=out)
         if record is None:
-            return None, err
+            if as_saved.get(node_id) == entry:
+                out.append(copy.deepcopy(entry))
+                continue
+            return None, f"{_record_label(entry, node_id)}: {err}"
         out.append(record)
     return out, ""
 

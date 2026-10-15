@@ -254,6 +254,36 @@ class TestSettingsManagerNodes:
         assert sm.update_nodes([record]) == 1
         assert sm.update_nodes([record], expected_revision=1) == 2
 
+    def test_a_node_written_by_hand_without_an_id_is_given_one_that_is_saved(self, tmp_path):
+        import json
+
+        hand_written = {"name": "nuc", "url": "http://nuc.lan:9494", "key": "k" * 24, "enabled": True}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [hand_written], "nodes_revision": 4}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        (node,) = sm.nodes
+        assert len(node["id"]) == 32 and node["name"] == "nuc"
+        assert sm.nodes_revision == 5
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["id"] == node["id"]
+        assert SettingsManager(str(tmp_path)).nodes[0]["id"] == node["id"]  # the same id after a restart
+        other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
+        assert sm.update_nodes([*sm.nodes, other]) == 6
+
+    def test_a_bad_record_written_by_hand_holds_up_only_a_change_to_itself(self, tmp_path):
+        import json
+
+        bad = {"id": "bad1", "name": "nas", "url": "not an address", "key": "k" * 24, "enabled": True}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [bad]}))
+        sm = SettingsManager(str(tmp_path))
+        other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
+
+        assert sm.update_nodes([*sm.nodes, other]) == 1
+        assert sm.nodes == [bad, other]
+        with pytest.raises(ValueError, match=r"^nas: "):
+            sm.update_nodes([{**bad, "enabled": False}, other])
+        assert sm.nodes == [bad, other]
+
     def test_an_invalid_list_is_refused_and_nothing_is_saved(self, tmp_path):
         sm = SettingsManager(str(tmp_path))
         with pytest.raises(ValueError):
