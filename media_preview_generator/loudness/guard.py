@@ -144,7 +144,10 @@ class LoudnessPlexDb(LocalPlexDb):
         if not read_only:
             report = self.file_checks(deadline=deadline)
             if not report.ready:
-                raise PublishError(report.message, state=report.state)
+                # A lock probe that gave up on a busy database stays busy, so a node's caller waits it out in slices
+                # (RemoteLoudnessDb._write_in_slices) instead of giving up after the first one.
+                failure = DatabaseBusyError if report.details.get("db_busy") else PublishError
+                raise failure(report.message, state=report.state)
         with super()._database(read_only=read_only, deadline=deadline) as conn:
             if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
                 raise PublishError("Loudness writes require Plex's live WAL database", state=Capability.NEEDS_LOCAL_DB)
