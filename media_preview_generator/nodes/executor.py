@@ -53,8 +53,8 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
-# The read timeout of a DELETE sent from a thread of its own (to a node that stopped answering or didn't answer a
-# start, or again after a lost one), so the file is queued again without waiting for it.
+# The read timeout of a task's DELETE, sent from a thread of its own so the file (its result, or its next try) never
+# waits for it: a node that stops answering right after the result would hold the file for the full read timeout.
 GONE_DELETE_TIMEOUT_S = 3.0
 # A DELETE lost to a passing error is sent again after each of these waits: until one arrives the node keeps the task
 # and its temp dir (a preview's frames and their tar) for 10 minutes.
@@ -336,12 +336,10 @@ class _TaskRun:
         self._cancel_delivered = False
         self._paused_at: float | None = None
         self._forgotten = False
-        self._node_gone = False
         # (node's path, app's path) of the file: the job log names it by this app's path throughout.
         self._path_swap = path_swap
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
-        self._node_gone = True
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
         if self._cancel_seen_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
@@ -361,7 +359,7 @@ class _TaskRun:
             if _start_may_have_reached(exc):
                 # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
                 # running there beside the file's next try until the node's unpolled-task expiry.
-                self._free_later(spec[protocol.CLIENT_TASK_ID_FIELD], first_try=True)
+                self._free_later(spec[protocol.CLIENT_TASK_ID_FIELD])
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
         logger.info(
@@ -539,46 +537,35 @@ class _TaskRun:
         extract_artifact(data, dest)
 
     def delete(self) -> None:
-        """Free the task on the node.
+        """Free the task on the node, from a short-lived thread.
 
-        A DELETE lost to an error that may pass is sent again from a short-lived thread (``DELETE_RETRY_DELAYS_S``).
-        After the node stopped answering every try runs on that thread, so the file is queued again at once: a node
-        that answers in time stops a task it still runs rather than at its unpolled-task expiry; one that doesn't
-        stops it at that expiry.
+        A DELETE lost to an error that may pass is sent again there (``DELETE_RETRY_DELAYS_S``). The file's result is
+        published, or the file queued again, at once: a node that answers in time stops a task it still runs rather
+        than at its unpolled-task expiry; one that doesn't stops it at that expiry.
         """
         if not self._task_id or self._forgotten:
             return
-        if self._node_gone:
-            self._free_later(self._task_id, first_try=True)
-        elif self._send_delete(self._task_id, None):
-            self._free_later(self._task_id, first_try=False)
+        self._free_later(self._task_id)
 
-    def _free_later(self, task_id: str, *, first_try: bool) -> None:
-        """Send the DELETE of ``task_id`` from a short-lived thread, again after each ``DELETE_RETRY_DELAYS_S`` wait
-        while nothing answers it.
+    def _free_later(self, task_id: str) -> None:
+        """Send the DELETE of ``task_id`` from a short-lived thread at once, and again after each
+        ``DELETE_RETRY_DELAYS_S`` wait while nothing answers it.
 
         Args:
             task_id: The node's task id (a start's client task id before the node answered with one).
-            first_try: Send it at once too; False when one was just sent and lost.
         """
-        delays = (0.0, *DELETE_RETRY_DELAYS_S) if first_try else DELETE_RETRY_DELAYS_S
-        threading.Thread(
-            target=self._retry_delete, args=(task_id, delays), name="node-task-delete", daemon=True
-        ).start()
+        threading.Thread(target=self._retry_delete, args=(task_id,), name="node-task-delete", daemon=True).start()
 
-    def _retry_delete(self, task_id: str, delays: tuple[float, ...]) -> None:
-        for delay in delays:
+    def _retry_delete(self, task_id: str) -> None:
+        for delay in (0.0, *DELETE_RETRY_DELAYS_S):
             time.sleep(delay)
-            if not self._send_delete(task_id, GONE_DELETE_TIMEOUT_S):
+            if not self._send_delete(task_id):
                 return
 
-    def _send_delete(self, task_id: str, read_timeout: float | None) -> bool:
+    def _send_delete(self, task_id: str) -> bool:
         """Send one DELETE; True when no answer came from the node, so it may get through if sent again."""
         try:
-            if read_timeout is None:
-                self._client.delete_task(task_id)
-            else:
-                self._client.delete_task(task_id, read_timeout=read_timeout)
+            self._client.delete_task(task_id, read_timeout=GONE_DELETE_TIMEOUT_S)
         except NodeUnknownTaskError:
             pass  # The node doesn't have it: the start never reached it, or it already freed the task.
         except NodeUnreachableError as exc:

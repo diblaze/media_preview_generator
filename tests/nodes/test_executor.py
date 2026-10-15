@@ -17,6 +17,7 @@ from loguru import logger
 from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
+    READ_TIMEOUT_S,
     UNREACHABLE_DNS,
     UNREACHABLE_REFUSED,
     UNREACHABLE_TIMEOUT,
@@ -170,7 +171,7 @@ class TestStartAndResult:
             "gpu": {"type": "NVIDIA", "device": "cuda:0"},
             "params": {"duration_ms": 1000},
         }
-        assert client.named("delete") == [("delete",)]
+        assert _wait_until(lambda: client.named("delete") == [("delete",)])
 
     def test_cpu_task_sends_no_gpu(self, media):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
@@ -558,7 +559,26 @@ class TestFreeingTheTask:
         assert client.deleted == []
 
         assert _wait_until(lambda: client.deleted == ["t1"])
-        assert client.timeouts == [None, executor.GONE_DELETE_TIMEOUT_S]
+        assert client.timeouts == [executor.GONE_DELETE_TIMEOUT_S] * 2
+
+    def test_a_finished_file_is_not_held_by_the_delete_of_a_node_that_stopped_answering(self, media, monkeypatch):
+        """A node that freezes right after it sent the result (or a link that drops after a 1 GB artifact): each DELETE
+        waits out its read timeout, while the file's publish and its worker slot wait for none of them."""
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.0,))
+        waits: list[float] = []
+
+        class HangsAfterResult(ScriptedClient):
+            def delete_task(self, task_id: str, *, read_timeout: float = READ_TIMEOUT_S) -> None:
+                waits.append(read_timeout)
+                time.sleep(read_timeout)
+                raise NodeTimeoutError("http://n didn't answer in time")
+
+        _install(HangsAfterResult(self.DONE))
+
+        started = time.monotonic()
+        assert _run(media) == {"ok": 1}
+        assert time.monotonic() - started < 1.0
+        assert _wait_until(lambda: waits == [executor.GONE_DELETE_TIMEOUT_S] * 2, timeout=10)
 
     @pytest.mark.parametrize("node_gone", [False, True], ids=["after-a-finished-task", "after-the-node-went-away"])
     def test_a_delete_nothing_answers_is_given_up_after_its_retries(self, media, monkeypatch, node_gone):
@@ -726,7 +746,7 @@ class TestCancelAndPause:
             _run(media, cancel_check=cancel.is_set)
 
         assert len(client.named("cancel")) == 1
-        assert client.named("delete") == [("delete",)]
+        assert _wait_until(lambda: client.named("delete") == [("delete",)])
 
     def test_a_cancel_lost_to_one_transient_error_is_sent_again(self, media, monkeypatch):
         monkeypatch.setattr(executor, "CANCEL_WAIT_S", 0.3)
