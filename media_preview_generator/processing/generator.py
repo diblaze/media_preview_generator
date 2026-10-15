@@ -909,6 +909,8 @@ def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
         if found is None or "(attached pic)" in line:
             continue
         codec = found.group(1)
+        if hwaccel is None:
+            return True
         if codec == "h264":
             return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
         return codec not in _GPU_DECODABLE_CODECS.get(hwaccel, frozenset())

@@ -528,3 +528,38 @@ class TestACodecTheGpuHasNoDecoderFor:
         assert [c["use_skip"] for c in outcome.calls] == [True, False]
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "hwaccel"
+
+
+def _stream(codec: str, rest: str = "yuv420p(tv, progressive), 1920x1080, 23.98 fps") -> list[str]:
+    return [f"Stream #0:0: Video: {codec}, {rest}"]
+
+
+class TestEachGpuDecoderHasItsOwnCodecs:
+    """Whether FFmpeg decoded the video in software is judged by the decoder the run asked for: libavcodec's
+    ``*_nvdec``, ``*_vaapi``, ``*_d3d11va`` and ``*_videotoolbox`` hwaccels differ, so a codec one decodes on the GPU
+    is decoded in software by another. Each pair below flips with the decoder, so one set shared by every decoder
+    fails one side of it."""
+
+    @pytest.mark.parametrize(
+        ("codec", "hwaccel", "in_software"),
+        [
+            pytest.param("mpeg1video", "cuda", False, id="mpeg1-nvdec"),
+            pytest.param("mpeg1video", "vaapi", True, id="mpeg1-vaapi"),
+            pytest.param("h263", "cuda", True, id="h263-nvdec"),
+            pytest.param("h263", "vaapi", False, id="h263-vaapi"),
+            pytest.param("vvc", "cuda", True, id="vvc-nvdec"),
+            pytest.param("vvc", "vaapi", False, id="vvc-vaapi"),
+            pytest.param("mpeg4 (Simple Profile) (FMP4 / 0x34504D46)", "cuda", False, id="mpeg4-nvdec"),
+            pytest.param("mpeg4 (Simple Profile) (FMP4 / 0x34504D46)", "d3d11va", True, id="mpeg4-d3d11va"),
+            pytest.param("prores (HQ) (apch / 0x68637061)", "cuda", True, id="prores-nvdec"),
+            pytest.param("prores (HQ) (apch / 0x68637061)", "videotoolbox", False, id="prores-videotoolbox"),
+            pytest.param("hevc (Main 10)", "cuda", False, id="hevc-nvdec"),
+            pytest.param("hevc (Main 10)", None, True, id="hevc-no-gpu-decoder"),
+            pytest.param("h264 (High)", "vaapi", False, id="h264-vaapi"),
+            pytest.param("h264 (High)", None, True, id="h264-no-gpu-decoder"),
+        ],
+    )
+    def test_a_codec_is_decoded_in_software_only_where_that_decoder_lacks_it(self, codec, hwaccel, in_software):
+        from media_preview_generator.processing.generator import _decoded_in_software
+
+        assert _decoded_in_software(_stream(codec), hwaccel) is in_software
