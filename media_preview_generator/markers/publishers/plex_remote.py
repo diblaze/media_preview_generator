@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import requests
 from loguru import logger
 
+from ...nodes.client import answer_pieces
 from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER, relayed_text
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
@@ -63,6 +64,12 @@ AGENT_FIELD_MAX = 200
 # Seconds allowed for the TCP connect, and for the agent to answer after the deadline it was given has passed.
 CONNECT_TIMEOUT_S = 4.0
 ANSWER_GRACE_S = 3.0
+# The read timeout is the longest wait for the next byte, so an answer sent a byte at a time never ran out of it. Each
+# answer must arrive whole within the connect timeout and the time the request allows, counted from the request on.
+# Library Health's rows get this much more: the node reads them all after its wait for the database, then sends them.
+# Measured on 100,000 episodes: a 105 MB answer, read in 4.8 s and sent in 0.4 s here. A machine ten times slower on a
+# 10 Mbit/s link takes ~2 minutes.
+ROWS_ANSWER_S = 600.0
 # One read-back request: at most this many items, and the agent stops reading after this long and answers with what
 # it has (the items left are simply unread, exactly as a cancelled local read-back leaves them).
 READ_BACK_CHUNK = 50
@@ -550,6 +557,10 @@ def _with_time_left(body: dict, left: float) -> dict:
 # --------------------------------------------------------------------------- transport
 
 
+class _TooLargeError(Exception):
+    """An answer past what this app reads of it."""
+
+
 @dataclass(frozen=True)
 class NodeRefusal:
     """Why this app sends nothing to a server's Plex database node: the message, the capability and the badge state."""
@@ -702,6 +713,23 @@ def report_wrong_node(settings: Any) -> None:
         get_registry().report_unavailable(str(node_id))
 
 
+def _parsed(pieces: Iterator[bytes], limit: int) -> Any:
+    """An answer's JSON, read from its ``pieces`` up to ``limit`` bytes; None when it isn't JSON.
+
+    Raises:
+        _TooLargeError: The answer is past ``limit``.
+    """
+    try:
+        body = bytearray()
+        for chunk in pieces:
+            body += chunk
+            if len(body) > limit:
+                raise _TooLargeError
+        return json.loads(body)
+    except (ValueError, RecursionError):  # RecursionError: JSON nested deeper than Python's parser goes
+        return None
+
+
 class AgentClient:
     """One agent's HTTP endpoint: the key, the protocol check and the error mapping, nothing about markers."""
 
@@ -768,6 +796,7 @@ class AgentClient:
         timeout: float,
         unreachable: str = MARKERS_WAIT_FOR_THE_NODE,
         limit: int = MAX_SMALL_ANSWER_BYTES,
+        deadline_s: float | None = None,
     ) -> dict:
         """Send one request and return its ``result``.
 
@@ -777,6 +806,8 @@ class AgentClient:
             timeout: Seconds allowed for the answer, on top of the connect timeout.
             unreachable: What happens to the feature's work while the node doesn't answer, for that message.
             limit: The most bytes of the answer read; a larger one is refused unparsed.
+            deadline_s: Seconds the whole answer may take, from the request on (None: the connect timeout and
+                ``timeout`` together).
 
         Returns:
             The answer's ``result`` object.
@@ -793,7 +824,13 @@ class AgentClient:
         while True:
             try:
                 return self._send(
-                    self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable, limit=limit
+                    self._session.post,
+                    path,
+                    {"json": body},
+                    timeout=timeout,
+                    unreachable=unreachable,
+                    limit=limit,
+                    deadline_s=deadline_s,
                 )
             except NodeFullError:
                 if give_up - time.monotonic() <= NODE_FULL_RETRY_S or wait_cancelled():
@@ -816,8 +853,10 @@ class AgentClient:
         timeout: float,
         unreachable: str = "",
         limit: int = MAX_SMALL_ANSWER_BYTES,
+        deadline_s: float | None = None,
     ) -> dict:
-        """Send one request and read its answer: never a redirect followed, never more than ``limit`` bytes."""
+        """Send one request and read its answer: never a redirect followed, never more than ``limit`` bytes, never
+        past its deadline (``post``)."""
         self._refuse_early()
         uid = self._node_uid() if self._node_uid is not None else ""
         if self._address is not None:
@@ -828,18 +867,20 @@ class AgentClient:
         headers = {"Authorization": f"Bearer {self._token}", PROTOCOL_HEADER: str(sent), "Accept-Encoding": "identity"}
         if uid:
             headers[NODE_UID_HEADER] = uid
+        timeout = max(1.0, timeout)
+        deadline = time.monotonic() + (CONNECT_TIMEOUT_S + timeout if deadline_s is None else deadline_s)
         try:
             response = method(
                 f"{self.url}{path}",
                 headers=headers,
-                timeout=(CONNECT_TIMEOUT_S, max(1.0, timeout)),
+                timeout=(CONNECT_TIMEOUT_S, timeout),
                 # A redirect would carry the key and the request to wherever the node pointed.
                 allow_redirects=False,
                 stream=True,
                 **extra,
             )
             try:
-                payload = self._payload(response, limit)
+                payload = self._payload(response, deadline, limit)
             finally:
                 response.close()
         except requests.RequestException as exc:
@@ -861,11 +902,12 @@ class AgentClient:
             )
         return self._read(response.status_code, payload, sent=sent, unreachable=unreachable)
 
-    def _payload(self, response: Any, limit: int = MAX_SMALL_ANSWER_BYTES) -> Any:
-        """The answer's JSON body, read up to ``limit`` bytes; None when it isn't JSON.
+    def _payload(self, response: Any, deadline: float, limit: int = MAX_SMALL_ANSWER_BYTES) -> Any:
+        """The answer's JSON body, read up to ``limit`` bytes until ``deadline``; None when it isn't JSON.
 
         Raises:
             AgentError: A redirect, a compressed body, or a body larger than any answer.
+            requests.RequestException: The answer didn't arrive whole by ``deadline``, or the connection broke.
         """
         if 300 <= response.status_code < 400:
             self.state = AGENT_UNREACHABLE
@@ -875,23 +917,21 @@ class AgentClient:
                 state=Capability.AGENT_UNAVAILABLE,
             )
         encoding = str(response.headers.get("Content-Encoding") or "identity").strip().lower()
-        body = bytearray()
+        payload = None
+        too_large = False
         if encoding == "identity":
-            for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
-                body += chunk
-                if len(body) > limit:
-                    break
-        if encoding != "identity" or len(body) > limit:
+            try:
+                payload = _parsed(answer_pieces(response, _READ_CHUNK_BYTES, deadline), limit)
+            except _TooLargeError:
+                too_large = True
+        if encoding != "identity" or too_large:
             self.state = AGENT_UNREACHABLE
             raise AgentError(
                 f"The Plex database node {self.describe()} sent an answer this app doesn't read "
                 f"({'compressed' if encoding != 'identity' else 'too large'}).",
                 state=Capability.AGENT_UNAVAILABLE,
             )
-        try:
-            return json.loads(body)
-        except (ValueError, RecursionError):  # RecursionError: JSON nested deeper than Python's parser goes
-            return None
+        return payload
 
     def refusal(self) -> NodeRefusal | None:
         """Why nothing may be sent to this node now, or None when requests may go out."""
@@ -939,6 +979,7 @@ class AgentClient:
 
         Its ``/v1/health`` carries a ``node`` block and no ``agent`` block; the role adds the agent block there.
         """
+        deadline = time.monotonic() + 2 * CONNECT_TIMEOUT_S
         try:
             response = self._session.get(
                 f"{self.url}/v1/health",
@@ -948,7 +989,7 @@ class AgentClient:
                 stream=True,
             )
             try:
-                payload = self._payload(response)
+                payload = self._payload(response, deadline)
             finally:
                 response.close()
         except (requests.RequestException, AgentError):
@@ -1362,6 +1403,7 @@ class RemotePlexDb(PlexDatabase):
             timeout=remaining + ANSWER_GRACE_S,
             unreachable=LIBRARY_HEALTH_WAITS_FOR_THE_NODE,
             limit=MAX_ANSWER_BYTES,
+            deadline_s=remaining + ROWS_ANSWER_S,
         )
         if isinstance(result.get("error"), dict):
             # The node's read failed after its answer's status went out: the refusal comes in the answer instead.

@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -22,6 +23,7 @@ import requests
 
 from media_preview_generator.nodes import client as client_mod
 from media_preview_generator.nodes import executor, protocol
+from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.client import (
     UNREACHABLE_TIMEOUT,
     NodeAddress,
@@ -35,6 +37,7 @@ from media_preview_generator.nodes.client import (
     NodeTimeoutError,
     NodeUnreachableError,
 )
+from tests.nodes.slow_answers import dripping_server
 
 
 def _client(error: Exception) -> NodeClient:
@@ -163,6 +166,90 @@ class TestAFramesDownloadThatStopsPartway:
         )
         stalled_poll_s = executor.NODE_GONE_AFTER_S + executor.MAX_FAILED_POLLS * client_mod.READ_TIMEOUT_S
         assert client_mod.ARTIFACT_TIMEOUT_S <= stalled_poll_s
+
+
+NODE_INFO = {
+    "ok": True,
+    "node": {"id": "uid-1", "name": "nuc", "version": "9.9.9", "protocols": [1], "roles": ["worker"]},
+    "platform": {"os": "Linux", "arch": "x86_64", "python": "3.12"},
+    "worker": {"gpus": [], "cpu": {"cores": 8, "load1": 0.5, "ram_total": 16, "ram_available": 8}, "busy": False},
+    "id": "t1",
+    "status": "running",
+    "lines": [],
+}
+
+
+def _plain_client(url: str) -> NodeClient:
+    session = requests.Session()
+    session.trust_env = False  # no proxy from the environment between the test and its listener
+    return NodeClient(NodeAddress(url, "k" * 24), session=session)
+
+
+class TestAnAnswerSentSlowlyIsGivenUpOn:
+    """requests' read timeout is the longest wait for the next byte, so an answer sent a byte a second was never
+    timed out: a check that never ended (the node stayed "ready" and kept getting files), a poll that never saw its
+    job's cancel, Add node's Connect or the Log tab holding a web server thread. Each answer must now arrive whole
+    within the connect and read timeouts together, counted from the request on."""
+
+    CONNECT_S, READ_S, ARTIFACT_S = 0.5, 1.0, 2.0
+
+    @pytest.fixture(autouse=True)
+    def short_timeouts(self, monkeypatch):
+        monkeypatch.setattr(client_mod, "CONNECT_TIMEOUT_S", self.CONNECT_S)
+        monkeypatch.setattr(client_mod, "READ_TIMEOUT_S", self.READ_S)
+        monkeypatch.setattr(client_mod, "INFO_TIMEOUT_S", self.READ_S)
+        monkeypatch.setattr(client_mod, "ARTIFACT_DEADLINE_S", self.ARTIFACT_S)
+
+    @pytest.mark.parametrize(
+        ("call", "deadline_s"),
+        [
+            (lambda c: c.info(), CONNECT_S + READ_S),
+            (lambda c: c.poll_task("t1"), CONNECT_S + READ_S),
+            (lambda c: c.log(200), CONNECT_S + READ_S),
+            (lambda c: c.health(), CONNECT_S + READ_S),
+            (lambda c: c.fetch_artifact("t1"), ARTIFACT_S),
+        ],
+        ids=["info", "task-poll", "log", "health-without-the-key", "artifact"],
+    )
+    def test_an_answer_dripped_a_byte_at_a_time_times_out_at_its_deadline(self, call, deadline_s):
+        with dripping_server(json.dumps(NODE_INFO).encode(), drip_s=30, gap_s=0.05) as url:
+            started = time.monotonic()
+            with pytest.raises(NodeTimeoutError) as raised:
+                call(_plain_client(url))
+            took = time.monotonic() - started
+        assert raised.value.reason == client_mod.UNREACHABLE_TIMEOUT
+        assert str(raised.value) == f"{url} didn't answer in time"
+        assert deadline_s <= took < deadline_s + 1.0
+
+    def test_an_answer_sent_slowly_that_arrives_whole_in_time_is_read(self):
+        with dripping_server(json.dumps(NODE_INFO).encode(), drip_s=0.5, gap_s=0.05) as url:
+            assert _plain_client(url).info()["node"]["id"] == "uid-1"
+
+    def test_a_ready_node_whose_answers_start_to_drip_reads_offline_as_stuck(self):
+        record = {"id": "n1", "node_uid": None, "name": "nuc", "key": "k" * 24, "enabled": True,
+                  "path_mappings": [{"app_prefix": "/data", "node_prefix": "/mnt"}]}  # fmt: skip
+        with dripping_server(json.dumps(NODE_INFO).encode(), drip_s=60, gap_s=0.05, sent_at_once=1) as url:
+            registry = reg.NodeRegistry(
+                revision_provider=lambda: 1,
+                nodes_provider=lambda: [{**record, "url": url}],
+                client_factory=lambda rec: _plain_client(rec["url"]),
+                record_uid=lambda *_: None,
+                legacy_ping=lambda url, key: ("connected", "1.2.0"),
+                quick_access=lambda client, mappings: True,
+                library_names=lambda paths: [],
+                app_version=lambda: "9.9.9",
+                app_build=lambda: "",
+                attempt_gap_s=0.1,
+            )
+            try:
+                assert registry.check_now("n1").state == reg.STATE_READY
+                started = time.monotonic()
+                view = registry.check_now("n1")
+                took = time.monotonic() - started
+            finally:
+                registry.stop()
+        assert (view.state, view.cause) == (reg.STATE_OFFLINE, reg.OFFLINE_STUCK)
+        assert took < reg.CHECK_ATTEMPTS * (self.CONNECT_S + self.READ_S + 1.0)
 
 
 def _response(status: int, body: bytes) -> requests.Response:

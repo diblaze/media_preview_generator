@@ -40,6 +40,7 @@ from media_preview_generator.markers.publishers.plex_remote import AgentError, R
 from media_preview_generator.markers.settings import ServerMarkersSettings
 from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, RELAY_LINE_MAX
 from media_preview_generator.servers.base import ServerConfig, ServerType
+from tests.nodes.slow_answers import dripping_server
 
 T = MarkerType
 TOKEN = "s3cret-key-nobody-should-see"
@@ -526,6 +527,42 @@ class TestFailuresLookLikeTodays:
         assert _library_health_rows(_answering(_answer_of(2 * 1024 * 1024, rows))) == {"parts": []}
         with pytest.raises(AgentError, match="too large"):
             _library_health_rows(_answering(_answer_of(2 * 1024 * 1024 + 1, rows)))
+
+    @pytest.mark.parametrize(
+        ("call", "deadline_s"),
+        [
+            # A read asked to answer within 0.5 s: the connect timeout, then that plus ANSWER_GRACE_S.
+            (lambda r: r.read_item(7, deadline=_deadline(0.5)), 0.5 + 0.5 + 0.5),
+            (lambda r: r.node_machine_identifier(timeout=1.0), 0.5 + 1.0),
+            # Library Health's own: its wait for the database, then ROWS_ANSWER_S for the read and the sending.
+            (
+                lambda r: r.library_health_rows(
+                    [1], want_markers=False, want_chapters=False, deadline=_deadline(0.5), needs="1"
+                ),
+                0.5 + 1.5,
+            ),
+        ],
+        ids=["item-read", "ping", "library-health-rows"],
+    )
+    def test_an_answer_dripped_a_byte_at_a_time_is_given_up_on_at_its_deadline(self, monkeypatch, call, deadline_s):
+        # requests' read timeout is the longest wait for the next byte: an answer sent a byte a second held a marker
+        # write, a loudness job or Library Health for as long as the sender liked.
+        monkeypatch.setattr(plex_remote, "CONNECT_TIMEOUT_S", 0.5)
+        monkeypatch.setattr(plex_remote, "ANSWER_GRACE_S", 0.5)
+        monkeypatch.setattr(plex_remote, "ROWS_ANSWER_S", 1.5)
+        agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+        body = json.dumps({"ok": True, "agent": agent, "result": {}}).encode()
+        with dripping_server(body, drip_s=60, gap_s=0.05) as url:
+            session = requests.Session()
+            session.trust_env = False
+            remote = RemotePlexDb(url, TOKEN, session=session)
+            remote._client.capabilities = list(_CAPABILITIES)
+            started = time.monotonic()
+            with pytest.raises(plex_remote.AgentUnreachableError, match="Can't reach the Plex database node"):
+                call(remote)
+            took = time.monotonic() - started
+        assert remote._client.state == plex_remote.AGENT_UNREACHABLE
+        assert deadline_s - 0.1 <= took < deadline_s + 1.0
 
     def test_a_connection_cut_mid_answer_is_unreachable(self):
         class _Cut(FakeResponse):

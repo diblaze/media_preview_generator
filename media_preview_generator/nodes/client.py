@@ -8,21 +8,28 @@ from __future__ import annotations
 
 import ssl
 import threading
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import partial
 from json import loads as parse_json
 from typing import Any
 from urllib.parse import urlsplit
 
 import requests
 from urllib3.exceptions import HTTPError, NameResolutionError, NewConnectionError, ProtocolError, ReadTimeoutError
+from urllib3.response import BaseHTTPResponse
 
 from . import protocol
 
 # Connect fast (a LAN node either answers or it doesn't); read long enough for a busy node to answer a poll.
 CONNECT_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 10.0
+# The read timeout is the longest wait for the next byte, so an answer sent a byte at a time never ran out of it. Each
+# answer must arrive whole within the connect and read timeouts together, counted from the request on: what a node that
+# sends nothing gets. Its largest real answer (a poll's 1.3 MB) takes 0.1 s on a 100 Mbit link.
 # /v1/info never waits on GPU detection, so a node that doesn't answer it this fast is stuck; three tries of it then
-# call a hung node offline within a minute, while the files it dropped are held back from it.
+# call a hung node offline within a minute, however slowly it sends, while the files it dropped are held back from it.
 INFO_TIMEOUT_S = 10.0
 # A rescan runs GPU detection while the request waits (measured 0.7-1.3 s; a slow Vulkan probe can take longer).
 GPU_RESCAN_TIMEOUT_S = 60.0
@@ -33,6 +40,8 @@ ARTIFACT_TIMEOUT_S = 30.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
+# The whole artifact must arrive within this, from the request on: MAX_ARTIFACT_BYTES does at 1.2 MB/s (10 Mbit/s).
+ARTIFACT_DEADLINE_S = 15 * 60.0
 # JSON parses into ~25x its size here (each 3-byte ``[],`` is a 64-byte list), so each answer gets a cap that fits it.
 # Most answers are one small object: health 164 bytes and info under 1 KB measured, a few KB with many GPUs.
 MAX_ANSWER_BYTES = 1024 * 1024
@@ -207,6 +216,46 @@ def _answer_lost(exc: requests.ConnectionError) -> bool:
     return any(isinstance(cause, ProtocolError | ConnectionResetError) for cause in (reason, exc.__context__))
 
 
+class AnswerTooSlowError(requests.Timeout):
+    """An answer that didn't arrive whole by its deadline (``answer_pieces``)."""
+
+
+def answer_pieces(response: Any, chunk_bytes: int, deadline: float) -> Iterator[bytes]:
+    """A streamed answer's body as it arrives, given up on once ``deadline`` (``time.monotonic()``) has passed.
+
+    ``iter_content`` waits for a whole chunk, which an answer sent a byte at a time never fills; urllib3's ``read1``
+    hands over what one read of the socket brought, so the answer is given up on at most one read (one read timeout)
+    past the deadline.
+
+    Args:
+        response: A ``requests`` answer, opened with ``stream=True``.
+        chunk_bytes: The most bytes one piece holds.
+        deadline: When to give up.
+
+    Raises:
+        AnswerTooSlowError: The deadline passed before the answer ended.
+        requests.RequestException: The connection timed out, dropped or broke mid-answer.
+    """
+    raw = getattr(response, "raw", None)
+    if isinstance(raw, BaseHTTPResponse):
+        pieces: Iterator[bytes] = iter(partial(raw.read1, chunk_bytes), b"")
+    else:
+        pieces = iter(response.iter_content(chunk_size=chunk_bytes))  # a test's stand-in answer
+    while True:
+        try:
+            piece = next(pieces, b"")
+        # read1 raises urllib3's errors, which iter_content wraps in requests' own (these, as it does).
+        except ReadTimeoutError as exc:
+            raise requests.ConnectionError(exc) from exc
+        except HTTPError as exc:
+            raise requests.exceptions.ChunkedEncodingError(exc) from exc
+        if not piece:
+            return
+        if time.monotonic() >= deadline:
+            raise AnswerTooSlowError("the answer didn't arrive whole in time")
+        yield piece
+
+
 @dataclass(frozen=True)
 class NodeAddress:
     """Where a node is and the key it expects."""
@@ -252,9 +301,16 @@ class NodeClient:
         return {"Authorization": f"Bearer {self._address.key}", protocol.PROTOCOL_HEADER: str(protocol.NODE_PROTOCOL)}
 
     def _call(
-        self, method: str, path: str, *, json: dict | None = None, read_timeout: float = READ_TIMEOUT_S,
-        auth: bool = True, raw: bool = False, limit: int = MAX_ANSWER_BYTES,
+        self, method: str, path: str, *, json: dict | None = None, read_timeout: float | None = None,
+        auth: bool = True, raw: bool = False, limit: int = MAX_ANSWER_BYTES, deadline_s: float | None = None,
     ) -> Any:  # fmt: skip
+        if read_timeout is None:
+            read_timeout = READ_TIMEOUT_S
+        # The whole answer's time, from the request on: by default the connect and read timeouts together, or
+        # ARTIFACT_DEADLINE_S for a raw answer (the artifact).
+        if deadline_s is None:
+            deadline_s = ARTIFACT_DEADLINE_S if raw else CONNECT_TIMEOUT_S + read_timeout
+        deadline = time.monotonic() + deadline_s
         # A node never compresses its answers, and requests would inflate a compressed one in memory past any cap.
         headers = {"Accept-Encoding": "identity", **(self._headers() if auth else {})}
         try:
@@ -279,18 +335,21 @@ class NodeClient:
             # connects; such a node can never answer.
             raise NodeUnreachableError(f"{self._address.base} can't be reached: {type(exc).__name__}") from exc
         with response:
-            return self._answer(response, path, raw=raw, limit=limit)
+            return self._answer(response, path, raw=raw, limit=limit, deadline=deadline)
 
-    def _read(self, response: requests.Response, limit: int) -> bytearray:
-        """The body, refused once it passes ``limit`` bytes (returned as read: a copy of an artifact is ~1 GB)."""
+    def _read(self, response: requests.Response, limit: int, deadline: float) -> bytearray:
+        """The body, refused once it passes ``limit`` bytes (returned as read: a copy of an artifact is ~1 GB), or
+        once ``deadline`` has passed."""
         body = bytearray()
         try:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
+            for chunk in answer_pieces(response, 1024 * 1024, deadline):
                 body += chunk
                 if len(body) > limit:
                     raise NodeProtocolError(f"{self._address.base} sent more than {limit // (1024 * 1024)} MB")
+        # The answer had started, so the node may have acted on the request.
+        except AnswerTooSlowError as exc:
+            raise NodeTimeoutError(f"{self._address.base} didn't answer in time", reason=UNREACHABLE_TIMEOUT) from exc
         except requests.RequestException as exc:
-            # The answer had started, so the node may have acted on the request.
             if exc.args and isinstance(exc.args[0], ReadTimeoutError):
                 # It waited out its whole read timeout, like no answer at all: asking again waits as long again.
                 raise NodeTimeoutError(
@@ -299,18 +358,18 @@ class NodeClient:
             raise NodeTimeoutError(f"{self._address.base} dropped the connection while answering") from exc
         return body
 
-    def _error_kind(self, response: requests.Response) -> str:
+    def _error_kind(self, response: requests.Response, deadline: float) -> str:
         """The ``error.kind`` of a node's JSON answer, or "" when the answer isn't one (a proxy's error page)."""
         try:
-            body = parse_json(self._read(response, MAX_ANSWER_BYTES))
+            body = parse_json(self._read(response, MAX_ANSWER_BYTES, deadline))
         except (ValueError, RecursionError, NodeError):  # RecursionError: JSON nested deeper than the parser goes
             return ""
         error = body.get("error") if isinstance(body, dict) else None
         return str(error.get("kind") or "") if isinstance(error, dict) else ""
 
-    def _answer(self, response: requests.Response, path: str, *, raw: bool, limit: int) -> Any:
+    def _answer(self, response: requests.Response, path: str, *, raw: bool, limit: int, deadline: float) -> Any:
         """The node's answer to ``path``: the JSON body (refused unparsed past ``limit`` bytes), or the bytes when
-        ``raw``; anything else raises."""
+        ``raw``; anything else, or an answer still arriving at ``deadline``, raises."""
         app_instance = str(response.headers.get(protocol.APP_INSTANCE_HEADER) or "")
         if app_instance:
             raise NodeProtocolError(
@@ -323,7 +382,7 @@ class NodeClient:
                 f"{self._address.base} asks this app to wait: too many wrong keys came from here"
             )
         if response.status_code >= 500:
-            if response.status_code == 503 and self._error_kind(response) == protocol.KIND_NODE_STOPPING:
+            if response.status_code == 503 and self._error_kind(response, deadline) == protocol.KIND_NODE_STOPPING:
                 raise NodeStoppingError(f"{self._address.base} is restarting")
             raise NodeUnreachableError(f"{self._address.base} answered HTTP {response.status_code}")
         if 300 <= response.status_code < 400:
@@ -332,9 +391,9 @@ class NodeClient:
         if encoding != "identity":
             raise NodeProtocolError(f"{self._address.base} sent a {encoding}-compressed answer")
         if raw and response.status_code == 200:
-            return self._read(response, MAX_ARTIFACT_BYTES)
+            return self._read(response, MAX_ARTIFACT_BYTES, deadline)
         try:
-            body = parse_json(self._read(response, limit))
+            body = parse_json(self._read(response, limit, deadline))
         except (ValueError, RecursionError) as exc:  # RecursionError: JSON nested deeper than Python's parser goes
             web_page = "html" in str(response.headers.get("Content-Type") or "").lower()
             raise NodeProtocolError(
