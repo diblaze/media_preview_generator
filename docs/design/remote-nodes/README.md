@@ -35,7 +35,9 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
 * **Changes from the design as written:**
   - A node that drops a file is held back until a check begun after the drop finds it ready (or 5 min); starts
     the node never took don't count toward the two-drop limit (max 5 per file). Retries prefer another worker.
+    After a failed start, that node waits on that file 1 s, doubling to 30 s; a ready check doesn't end it early.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
+  - A `DELETE` lost in an outage is kept (256 per node) and sent again when the node next answers a check.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
   - Test access results persist in `node_access_results.json` until that node's address, key or mappings change.
     A test of rows not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
@@ -198,7 +200,8 @@ a small node's memory; one address (or one /64) holds a quarter of it at most, s
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is
-sent again 1 s and 4 s later.
+sent again 1 s and 4 s later. One still unanswered is kept (256 per node) and sent again when the node next answers a
+check.
 
 ### Ops
 
@@ -269,7 +272,8 @@ retry runs (on the **node's** CPU, see §6).
   file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until a registry check begun after the drop comes back
-  ready (5 min at most). The item's retry takes a free worker on another node or this app first; until the node
+  ready (5 min at most). After a failed start, that node also waits on that file 1 s, doubling to 30 s, and a
+  ready check doesn't end that wait early. The item's retry takes a free worker on another node or this app first; until the node
   checks ready again it waits for one of those while one runs its kind now (busy or not), and once the node has
   checked ready it goes back there when none of those is free (a busy one can stay busy for hours: a long film, a
   file its job's schedule froze). If it drops the file again there while one of those still runs its kind, that drop
