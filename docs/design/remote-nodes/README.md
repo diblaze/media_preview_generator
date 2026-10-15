@@ -148,9 +148,9 @@ returns, made JSON-safe.
 "device"} | null, "params": {...}, "client_task_id"?}` — `path` is the **app's** path; the node maps it.
 `client_task_id` (optional, 16-64 of `[A-Za-z0-9_-]`; the app sends a fresh uuid hex per task) becomes the task id. A
 repeated start with an id the node already has answers that task and starts nothing, so a start whose answer was lost
-can't run twice. When the app's start times out after reaching the node, or the connection drops before its answer,
-it sends `DELETE /v1/tasks/<client_task_id>` (404 = it never started), so FFmpeg doesn't keep running there until the
-unpolled-task expiry. The node remembers an id it was asked to delete before knowing it (5 minutes, at most 1024 ids):
+can't run twice. When the app's start may have reached the node (no answer in time, the connection dropped before
+the answer, or a 5xx from a gateway in front of it) it sends `DELETE /v1/tasks/<client_task_id>` from a thread of its
+own (404 = it never started), so FFmpeg doesn't keep running there until the unpolled-task expiry. The node remembers an id it was asked to delete before knowing it (5 minutes, at most 1024 ids):
 a start arriving after that DELETE answers 409 `task_deleted` and runs nothing.
 
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
@@ -162,7 +162,8 @@ Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `
 `unknown_task`, `request`, `task_deleted`.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
-leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll.
+leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is
+sent again 1 s and 4 s later.
 
 ### Ops
 
@@ -227,7 +228,8 @@ retry runs (on the **node's** CPU, see §6).
   file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until a registry check begun after the drop comes back
-  ready (5 min at most), and the item's retry goes to another node or this app when one is free. Health checks
+  ready (5 min at most), and the item's retry waits for another node or this app while one of those runs its kind
+  now (busy or not); it goes back to the same node only when none does. Health checks
   read `/v1/info` with a 10 s timeout, so a node that takes connections but never answers reads offline ("accepts
   connections but doesn't answer") within a minute.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the

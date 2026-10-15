@@ -29,11 +29,14 @@ from ..processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, CodecNotSup
 from . import protocol
 from .client import (
     MAX_ARTIFACT_BYTES,
+    NodeAuthError,
     NodeClient,
     NodeError,
     NodeRequestError,
+    NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnknownTaskError,
+    NodeUnreachableError,
 )
 from .registry import NodeRegistry, get_registry
 
@@ -47,9 +50,12 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
-# The read timeout of the one DELETE sent to a node that stopped answering; it runs on a thread of its own, so the
-# file is queued again without waiting for it.
+# The read timeout of a DELETE sent from a thread of its own (to a node that stopped answering or didn't answer a
+# start, or again after a lost one), so the file is queued again without waiting for it.
 GONE_DELETE_TIMEOUT_S = 3.0
+# A DELETE lost to a passing error is sent again after each of these waits: until one arrives the node keeps the task
+# and its temp dir (a preview's frames and their tar) for 10 minutes.
+DELETE_RETRY_DELAYS_S = (1.0, 4.0)
 # A preview frame is a 320x240 JPEG (tens of KB; raw RGB would be 225 KB), and a 4-hour film at the 1 s interval
 # is 14,400 of them: anything past these is not a preview's frames.
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -269,6 +275,18 @@ def placement_label(gpu: tuple[str, str] | None) -> str:
     return f"{placement.node_name}/{_device_label(get_registry(), placement.node_id, gpu)}"
 
 
+def _start_may_have_reached(exc: NodeError) -> bool:
+    """Whether a start that failed with ``exc`` may have reached the node, which may then run the task.
+
+    Not when the connection was never made (the client names why: refused, no such machine, TLS, a connect timeout)
+    or the node answered that it took nothing (it refused the key, or the task id was already deleted). Anything else
+    may have: no answer in time, a dropped connection, a 5xx from a gateway in front of the node.
+    """
+    if isinstance(exc, NodeAuthError | NodeTaskDeletedError):
+        return False
+    return isinstance(exc, NodeTimeoutError) or not (isinstance(exc, NodeUnreachableError) and exc.reason)
+
+
 def _report(what: str, fn: Callable[..., None], *args: str) -> None:
     """Tell the registry about the node; its failure must not hide the file's own error."""
     try:
@@ -326,25 +344,16 @@ class _TaskRun:
             self._task_id = self._client.start_task(spec)
         except NodeRequestError as exc:
             raise NodeTaskError(protocol.KIND_REQUEST, f"{name} refused the task: {exc}") from exc
-        except NodeTimeoutError as exc:
-            # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
-            # running there beside the file's next try until the node's unpolled-task expiry.
-            self._drop_unanswered(spec[protocol.CLIENT_TASK_ID_FIELD])
-            raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         except NodeError as exc:
+            if _start_may_have_reached(exc):
+                # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
+                # running there beside the file's next try until the node's unpolled-task expiry.
+                self._free_later(spec[protocol.CLIENT_TASK_ID_FIELD], first_try=True)
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
         logger.info(
             "{}Started {}: {}", self._prefix, _OP_LABELS.get(spec["op"], spec["op"]), os.path.basename(spec["path"])
         )
-
-    def _drop_unanswered(self, client_task_id: str) -> None:
-        try:
-            self._client.delete_task(client_task_id)
-        except NodeUnknownTaskError:
-            pass  # It never started.
-        except NodeError as exc:
-            logger.debug("{}couldn't cancel the unanswered start: {}", self._prefix, exc)
 
     def _cancel_requested(self) -> bool:
         return bool(self._cancel_check and self._cancel_check())
@@ -506,29 +515,54 @@ class _TaskRun:
     def delete(self) -> None:
         """Free the task on the node.
 
-        After the node stopped answering the DELETE is sent once from a short-lived thread, so the file is queued
-        again at once: a node that answers it in time stops a task it still runs rather than at its unpolled-task
-        expiry; one that doesn't stops it at that expiry.
+        A DELETE lost to an error that may pass is sent again from a short-lived thread (``DELETE_RETRY_DELAYS_S``).
+        After the node stopped answering every try runs on that thread, so the file is queued again at once: a node
+        that answers in time stops a task it still runs rather than at its unpolled-task expiry; one that doesn't
+        stops it at that expiry.
         """
         if not self._task_id or self._forgotten:
             return
-        if not self._node_gone:
-            self._send_delete(None)
-            return
+        if self._node_gone:
+            self._free_later(self._task_id, first_try=True)
+        elif self._send_delete(self._task_id, None):
+            self._free_later(self._task_id, first_try=False)
+
+    def _free_later(self, task_id: str, *, first_try: bool) -> None:
+        """Send the DELETE of ``task_id`` from a short-lived thread, again after each ``DELETE_RETRY_DELAYS_S`` wait
+        while nothing answers it.
+
+        Args:
+            task_id: The node's task id (a start's client task id before the node answered with one).
+            first_try: Send it at once too; False when one was just sent and lost.
+        """
+        delays = (0.0, *DELETE_RETRY_DELAYS_S) if first_try else DELETE_RETRY_DELAYS_S
         threading.Thread(
-            target=self._send_delete, args=(GONE_DELETE_TIMEOUT_S,), name="node-task-delete", daemon=True
+            target=self._retry_delete, args=(task_id, delays), name="node-task-delete", daemon=True
         ).start()
 
-    def _send_delete(self, read_timeout: float | None) -> None:
+    def _retry_delete(self, task_id: str, delays: tuple[float, ...]) -> None:
+        for delay in delays:
+            time.sleep(delay)
+            if not self._send_delete(task_id, GONE_DELETE_TIMEOUT_S):
+                return
+
+    def _send_delete(self, task_id: str, read_timeout: float | None) -> bool:
+        """Send one DELETE; True when no answer came from the node, so it may get through if sent again."""
         try:
             if read_timeout is None:
-                self._client.delete_task(self._task_id)
+                self._client.delete_task(task_id)
             else:
-                self._client.delete_task(self._task_id, read_timeout=read_timeout)
+                self._client.delete_task(task_id, read_timeout=read_timeout)
+        except NodeUnknownTaskError:
+            pass  # The node doesn't have it: the start never reached it, or it already freed the task.
+        except NodeUnreachableError as exc:
+            logger.debug("{}couldn't free the task: {}", self._prefix, exc)
+            return True
         except NodeError as exc:
             logger.debug("{}couldn't free the task: {}", self._prefix, exc)
         except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
             logger.opt(exception=True).debug("{}freeing the task failed", self._prefix)
+        return False
 
 
 def run_on_node(

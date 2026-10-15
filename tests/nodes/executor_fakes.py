@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from media_preview_generator.nodes import protocol
-from media_preview_generator.nodes.client import NodeUnreachableError
+from media_preview_generator.nodes.client import UNREACHABLE_TIMEOUT, NodeUnreachableError
 from media_preview_generator.nodes.protocol import OpError, PathMapping
 from media_preview_generator.nodes.registry import NodeRegistry, NodeView
 
@@ -107,7 +107,8 @@ class ScriptedClient:
 
 
 def unreachable() -> NodeUnreachableError:
-    return NodeUnreachableError("http://n didn't answer: ConnectTimeout")
+    """What the client raises for a connect timeout: the connection was never made."""
+    return NodeUnreachableError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT)
 
 
 class FakeTaskContext:
