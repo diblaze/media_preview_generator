@@ -386,6 +386,15 @@ class TestErrors:
         assert (raised.value.node_id, raised.value.node_name, raised.value.reason) == (NODE_ID, NODE_NAME, "missing")
         assert registry.reports == [("not_visible", NODE_ID, media, "missing")]
 
+    def test_file_not_visible_says_why_in_plain_words_without_the_nodes_path(self, media):
+        error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file: /mnt/nas/a.mkv", "reason": "missing"}
+        _install(ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)]))
+
+        with pytest.raises(FileNotVisibleError) as raised:
+            _run(media)
+
+        assert str(raised.value) == f"{NODE_NAME} can't see the file: not found on the node"
+
     def test_codec_not_supported_raises_the_apps_exception_with_its_kind(self, media):
         error = {"kind": protocol.KIND_CODEC_NOT_SUPPORTED, "message": "GPU can't", "fallback_kind": FALLBACK_STALL}
         client = ScriptedClient([finished(protocol.STATUS_FAILED, error=error)])
