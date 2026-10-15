@@ -79,6 +79,7 @@ class SeasonEntry:
         self._building: dict[str, threading.Lock] = {}
         self._once: dict[str, Any] = {}
         self._results = SeasonResults(-1)
+        self._guards: dict[str, threading.RLock] = {}
         self._watched: dict[str, int | None] = {}
 
     def watch(self, folders: Collection[str]) -> None:
@@ -111,6 +112,14 @@ class SeasonEntry:
             with self._lock:
                 self._once[key] = value
             return value
+
+    def guard(self, key: str) -> threading.RLock:
+        """A lock for one of :meth:`results`' facts (a member's intro-chapter length, a season group's signature), held
+        while it is read: the first episode of the folder to ask reads it and the ones asking meanwhile wait, then
+        find it read, instead of a dozen threads each reading the whole season at once. A read that wrote to the
+        store (a member probed) moves the generation, so the next asker reads it once more, from the store."""
+        with self._lock:
+            return self._guards.setdefault(key, threading.RLock())
 
     def results(self, generation: int) -> SeasonResults:
         """The store-derived facts valid at ``generation``: the ones read at it, else a new empty set."""

@@ -960,16 +960,22 @@ def _member_intro_chapter_ms(ctx: PipelineContext, view: _SeasonView, path: str)
     results = view.results()
     if path in results.intro_chapter_ms:
         return results.intro_chapter_ms[path]
-    generation = ctx.store.season_generation
-    try:
-        rec = _member_record(ctx, path, with_frame_rate=False)
-    except ProbeStalledError as exc:
-        logger.debug("The season step leaves out {} for now: {}", os.path.basename(path), exc)
-        return None
-    length = _intro_chapter_ms(ctx, rec)
-    if ctx.store.season_generation == generation:
-        results.intro_chapter_ms[path] = length
-    return length
+    # Siblings checked at the same moment ask for the same members in the same order: one reads each, the others
+    # wait for it and find it read.
+    with view.guard(f"intro_chapter_ms:{path}"):
+        results = view.results()
+        if path in results.intro_chapter_ms:
+            return results.intro_chapter_ms[path]
+        generation = ctx.store.season_generation
+        try:
+            rec = _member_record(ctx, path, with_frame_rate=False)
+        except ProbeStalledError as exc:
+            logger.debug("The season step leaves out {} for now: {}", os.path.basename(path), exc)
+            return None
+        length = _intro_chapter_ms(ctx, rec)
+        if ctx.store.season_generation == generation:
+            results.intro_chapter_ms[path] = length
+        return length
 
 
 def season_intro_chapter_limit(ctx: PipelineContext, canonical_path: str) -> int | None:
@@ -1126,17 +1132,25 @@ class _SeasonView:
             self.unreadable |= unreadable
         return self._previous
 
+    def guard(self, key: str) -> threading.RLock:
+        """The season's lock for one kind of :meth:`results` (``SeasonEntry.guard``)."""
+        return self._entry.guard(key)
+
     def signature(self, path: str) -> str:
         """What an answer for ``path`` made from the files on disk now would be based on."""
         results = self.results()
-        if path not in results.signatures:
-            group = self.group(path)
-            if path == self.canonical_path and len(group.episodes) == 1:
-                paths = group.episodes + self.previous_season()
-            else:
-                paths = _signature_paths(path, group, self.configs, self.unreadable, self._ctx.seasons)
-            results.signatures[path] = _signature(self._ctx, paths, on_disk=results.items)
-        return results.signatures[path]
+        if path in results.signatures:
+            return results.signatures[path]
+        group = self.group(path)
+        with self.guard("signatures:" + "\0".join(group.episodes)):
+            results = self.results()
+            if path not in results.signatures:
+                if path == self.canonical_path and len(group.episodes) == 1:
+                    paths = group.episodes + self.previous_season()
+                else:
+                    paths = _signature_paths(path, group, self.configs, self.unreadable, self._ctx.seasons)
+                results.signatures[path] = _signature(self._ctx, paths, on_disk=results.items)
+            return results.signatures[path]
 
 
 def _season_view(ctx: PipelineContext, canonical_path: str) -> _SeasonView:

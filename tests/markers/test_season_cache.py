@@ -15,6 +15,7 @@ from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.markers.audio import season
 from media_preview_generator.markers.models import FileIdentity, Source
 from media_preview_generator.markers.pipeline import SEASON_CACHE_TTL_S
+from media_preview_generator.markers.probe import Chapter, MediaProbe, ProbeStalledError
 from media_preview_generator.markers.season_cache import SeasonCache
 from media_preview_generator.markers.store import MarkerStore
 from tests.markers.audio import test_season
@@ -662,3 +663,117 @@ class TestSeasonReadAhead:
             season._season_view(ctx, s1[0])
         reached.assert_called_once_with(s1[0])
         self._settle(ahead)
+
+
+class TestSiblingsArrivingTogether:
+    """Episodes of one season checked at the same moment read their siblings' facts once between them, not once each,
+    and each gets the answer it gets checked alone."""
+
+    @staticmethod
+    def _together(ctx, paths, ask):
+        ctx.seasons = SeasonCache(ttl_s=SEASON_CACHE_TTL_S)
+        barrier = threading.Barrier(len(paths))
+        answers = {}
+
+        def one(path):
+            with ctx._running(path):
+                season._season_view(ctx, path)
+                barrier.wait()
+                answers[path] = ask(path)
+
+        threads = [threading.Thread(target=one, args=(path,)) for path in paths]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert not any(thread.is_alive() for thread in threads)
+        return answers
+
+    @staticmethod
+    def _alone(ctx, paths, ask):
+        answers = {}
+        for path in paths:
+            ctx.seasons = SeasonCache(ttl_s=SEASON_CACHE_TTL_S)
+            with ctx._running(path):
+                answers[path] = ask(path)
+        return answers
+
+    def test_the_intro_chapter_lengths_are_read_once_for_the_season(self, cached):
+        store = cached.ctx.store
+        real = store.get_evidence
+
+        def slow(file_id):
+            time.sleep(0.02)  # long enough for every sibling to arrive while the first reads
+            return real(file_id)
+
+        def limit(path):
+            return season.season_intro_chapter_limit(cached.ctx, path)
+
+        with patch.object(store, "get_evidence", side_effect=slow) as reads:
+            together = self._together(cached.ctx, cached.paths, limit)
+        assert reads.call_count == len(cached.paths)
+        assert together == self._alone(cached.ctx, cached.paths, limit)
+
+    def test_the_signature_items_are_read_once_for_the_season(self, cached):
+        real = season._signature_item
+
+        def slow(ctx, path):
+            time.sleep(0.02)
+            return real(ctx, path)
+
+        def signature(path):
+            return season._season_view(cached.ctx, path).signature(path)
+
+        with patch.object(season, "_signature_item", side_effect=slow) as items:
+            together = self._together(cached.ctx, cached.paths, signature)
+        assert sorted(c.args[1] for c in items.call_args_list) == sorted(cached.paths)
+        assert together == self._alone(cached.ctx, cached.paths, signature)
+
+    @pytest.fixture
+    def unprobed(self, store, show):
+        """A season none of whose files the store has seen: the season step probes each member."""
+        paths = show(1, 4)
+        return _season_ctx(store, paths[0]), paths
+
+    @staticmethod
+    def _probe(path, **kwargs):
+        intro_ms = 30_000 + 1000 * int(path[-6:-4])  # each episode's intro chapter a little longer
+        return MediaProbe(
+            1_320_000,
+            (
+                Chapter(0, 60_000, "Recap"),
+                Chapter(60_000, 60_000 + intro_ms, "Intro"),
+                Chapter(90_000, None, "Episode"),
+            ),
+        )
+
+    def test_members_still_to_probe_are_probed_once_each(self, unprobed):
+        ctx, paths = unprobed
+
+        def limit(path):
+            return season.season_intro_chapter_limit(ctx, path)
+
+        with patch.object(season, "probe_media", side_effect=self._probe) as probed:
+            together = self._together(ctx, paths, limit)
+            assert sorted(c.args[0] for c in probed.call_args_list) == sorted(paths)
+            assert together == self._alone(ctx, paths, limit)
+
+    def test_a_member_whose_probe_stalls_counts_as_unread_and_holds_no_one_up(self, unprobed):
+        ctx, paths = unprobed
+        stalled = paths[1]
+
+        def probe(path, **kwargs):
+            if path == stalled:
+                raise ProbeStalledError("earlier ffprobes are stuck")
+            return self._probe(path)
+
+        def lengths(path):
+            view = season._season_view(ctx, path)
+            return season._member_intro_chapter_ms(ctx, view, stalled)
+
+        with patch.object(season, "probe_media", side_effect=probe):
+            together = self._together(ctx, paths, lengths)
+        assert set(together.values()) == {None}
+        guard = ctx.seasons.entry(os.path.dirname(stalled)).guard(f"intro_chapter_ms:{stalled}")
+        assert guard.acquire(blocking=False)
+        guard.release()
