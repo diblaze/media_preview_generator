@@ -306,7 +306,10 @@
 
     function isUnder(path, prefix) {
         const p = String(path || '');
-        const pre = String(prefix || '').replace(/\/+$/, '');
+        const raw = String(prefix || '');
+        // Trimming the trailing slash would leave nothing of a "/" row, which covers every path.
+        if (/^\/+$/.test(raw)) return p.startsWith('/');
+        const pre = raw.replace(/\/+$/, '');
         return !!pre && (p === pre || p.startsWith(`${pre}/`));
     }
 
@@ -480,10 +483,12 @@
                 + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>The node sees every library, same files.</div>` : failures);
         }
 
-        // The suggestion swaps the node-side path it names; with no row on that path it becomes a new row.
+        // The suggestion swaps the node-side path of the row covering the library (two rows may share a node path, so
+        // it is found by the library's folder first); with no such row it becomes a new row.
         function applySuggestion(lib) {
             const { from, to } = lib.suggestion;
-            const match = $$('.nd-map-row', rows).find((row) => $('.nd-node', row).value.trim() === from);
+            const match = (lib.app_root && rowFor(lib.app_root))
+                || $$('.nd-map-row', rows).find((row) => $('.nd-node', row).value.trim() === from);
             if (match) {
                 $('.nd-node', match).value = to;
             } else {

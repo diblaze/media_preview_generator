@@ -592,6 +592,67 @@ class TestNodeDialog:
             {"path_mappings": [{"app_prefix": "/data/Movies", "node_prefix": "/mnt/media/Movies"}]}
         ]
 
+    def test_use_this_edits_the_row_of_the_library_it_was_suggested_for(self, authed_page: Page, app_url: str) -> None:
+        # Both libraries pointed at the node's media root: the natural mistake, and the one a real node can list.
+        node = _node(
+            "n-storage",
+            "storage",
+            path_mappings=[
+                {"app_prefix": "/data/TV", "node_prefix": "/mnt/media"},
+                {"app_prefix": "/data/Movies", "node_prefix": "/mnt/media"},
+            ],
+        )
+        api = _open_nodes(authed_page, app_url, [node])
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        listing = {"/mnt/media": ["Movies", "TV"]}
+        api.test_answers = [
+            {
+                "libraries": [
+                    _library("TV", "/data/TV", False, "/mnt/media", nearby=listing,
+                             suggestion={"from": "/mnt/media", "to": "/mnt/media/TV"}),
+                    _library("Movies", "/data/Movies", False, "/mnt/media", nearby=listing,
+                             suggestion={"from": "/mnt/media", "to": "/mnt/media/Movies"}),
+                ]
+            },
+            {"libraries": []},
+        ]  # fmt: skip
+        pane.locator(".nd-test").click()
+        card = pane.locator('.nd-fail[data-library="Movies"]')
+        expect(card).to_be_visible()
+
+        with authed_page.expect_response(lambda r: r.url.endswith("/test-access")):
+            card.locator(".nd-use").click()
+
+        expect(pane.locator(".nd-node").nth(1)).to_have_value("/mnt/media/Movies")
+        expect(pane.locator(".nd-node").nth(0)).to_have_value("/mnt/media")
+
+    def test_a_row_for_the_whole_disk_gets_its_library_chips(self, authed_page: Page, app_url: str) -> None:
+        node = _node("n-storage", "storage", path_mappings=[{"app_prefix": "/", "node_prefix": "/mnt/app"}])
+        api = _open_nodes(authed_page, app_url, [node])
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        api.test_answers = [{"libraries": [_library("Movies", "/data/Movies", True, "/mnt/app/data/Movies")]}]
+
+        pane.locator(".nd-test").click()
+
+        expect(pane.locator(".nd-map-row").nth(0).locator(".nd-chip-slot")).to_have_text("✓ Movies 3/3")
+        expect(pane.locator(".nd-map-results .nd-lib-chips")).to_have_count(0)
+
+    def test_an_empty_library_is_not_a_failure(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        empty = {"server": "Home", "library": "Kids", "app_root": "/data/Movies/Kids", "checked": 0, "ok": False,
+                 "files": [], "error": "No video files found near the top of /data/Movies/Kids", "empty": True}  # fmt: skip
+        api.test_answers = [{"libraries": [_library("Movies", "/data/Movies", True, "/mnt/nas/Movies"), empty]}]
+
+        pane.locator(".nd-test").click()
+
+        expect(pane.locator(".nd-chip-slot").first).to_contain_text("Kids: no files to test")
+        expect(pane.locator(".nd-map-results")).to_contain_text("The node sees every library, same files.")
+        expect(pane.locator(".nd-fail")).to_have_count(0)
+
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())
         api.health_answer = {
