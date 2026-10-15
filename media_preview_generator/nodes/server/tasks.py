@@ -54,6 +54,11 @@ REAP_INTERVAL_S = 5.0
 # start's answer): the id is refused for a start this long after, and this many such ids are remembered.
 DELETED_ID_KEEP_S = 300.0
 DELETED_IDS_MAX = 1024
+# How long a stopping node keeps answering, at most, until the app has asked after each task it cancelled: told it
+# was a restart, the app sends the file back without counting a drop. The app polls every second, and Docker's stop
+# timeout is 10 s (the server's SHUTDOWN_WAIT_S for the ops comes first).
+STOP_TELL_WAIT_S = 3.0
+_STOP_TELL_POLL_S = 0.05
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
 
 # The app's own "cancelled" exceptions, by module: an op that stops because cancel_check() fired raises one of these
@@ -82,7 +87,8 @@ class TaskStartError(Exception):
 
 class NodeStoppingError(Exception):
     """The node is stopping (answered 503, kind ``node_stopping``): nothing ran, and the app sends the file elsewhere.
-    A task started now would outlive the cancel that stopping already sent, and die with the process."""
+    A task started now would outlive the cancel that stopping already sent, and die with the process. A task the
+    stop cancelled is answered the same way: the file did nothing wrong."""
 
 
 # What a write into the temp folder fails with when the folder itself is the problem. Ops write only there (the media
@@ -240,6 +246,9 @@ class NodeTask:
         self.finished: float | None = None
         self.last_contact = self.started
         self.discarded = False
+        # Cancelled by the node's own stop (TaskTable.close), and whether the app has asked after it since.
+        self.stopped_by_node = False
+        self.told_stopping = False
         self._progress: dict[str, Any] = {"percent": 0.0}
         self._log: deque[dict[str, Any]] = deque(maxlen=TASK_LOG_LINES)
         self._next_seq = 0
@@ -597,9 +606,26 @@ class TaskTable:
                 task.last_contact = time.monotonic()
             return task
 
-    def poll(self, task_id: str, log_from: int = 0) -> dict[str, Any] | None:
-        """The task's state (None: unknown), counting as contact."""
+    def _answerable(self, task_id: str) -> NodeTask | None:
+        """The task, counting as contact; the node's stop cancelled it when this raises.
+
+        Raises:
+            NodeStoppingError: The node's own stop cancelled the task (the app is told so, once is enough).
+        """
         task = self._touch(task_id)
+        if task is not None and task.stopped_by_node:
+            with self._lock:
+                task.told_stopping = True
+            raise NodeStoppingError("This node is restarting: it stopped the task")
+        return task
+
+    def poll(self, task_id: str, log_from: int = 0) -> dict[str, Any] | None:
+        """The task's state (None: unknown), counting as contact.
+
+        Raises:
+            NodeStoppingError: The node's own stop cancelled the task.
+        """
+        task = self._answerable(task_id)
         return task.to_json(log_from) if task is not None else None
 
     def cancel(self, task_id: str) -> bool:
@@ -619,8 +645,12 @@ class TaskTable:
         return True
 
     def get(self, task_id: str) -> NodeTask | None:
-        """The task (None: unknown), counting as contact."""
-        return self._touch(task_id)
+        """The task (None: unknown), counting as contact.
+
+        Raises:
+            NodeStoppingError: The node's own stop cancelled the task (its artifact is gone with it).
+        """
+        return self._answerable(task_id)
 
     @property
     def stopping(self) -> bool:
@@ -699,7 +729,10 @@ class TaskTable:
                 logger.opt(exception=True).warning("The node's task reaper failed one pass")
 
     def close(self, wait_s: float = 0.0) -> None:
-        """Stop the reaper and drop every task: running ones are cancelled, which stops their FFmpeg.
+        """Stop the reaper and stop every task: running ones are cancelled, which stops their FFmpeg.
+
+        The tasks stay in the table, answered as stopped by the node (``NodeStoppingError``) rather than unknown: an
+        unknown task reads to the app as a node that dropped the file, and two of those fail it.
 
         Args:
             wait_s: How long to wait, in all, for the cancelled ops to return (a node shutting down waits, so no FFmpeg
@@ -707,7 +740,9 @@ class TaskTable:
         """
         self._stop.set()
         with self._lock:
-            tasks, self._tasks = list(self._tasks.values()), {}
+            tasks = list(self._tasks.values())
+            for task in tasks:
+                task.stopped_by_node = True
         for task in tasks:
             self._discard(task)
         deadline = time.monotonic() + wait_s
@@ -725,3 +760,19 @@ class TaskTable:
                 wait_s,
                 ", ".join(f"{task.id[:8]} ({task.op})" for task in running),
             )
+
+    def wait_until_told(self, timeout_s: float = STOP_TELL_WAIT_S) -> None:
+        """After :meth:`close`: wait until the app has asked after every task the stop cancelled (or deleted it).
+
+        A node that exits first is asked again only once it is back, which then doesn't know the task: the app counts
+        that as the node dropping the file.
+
+        Args:
+            timeout_s: The most this waits.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not any(task.stopped_by_node and not task.told_stopping for task in self._tasks.values()):
+                    return
+            time.sleep(_STOP_TELL_POLL_S)

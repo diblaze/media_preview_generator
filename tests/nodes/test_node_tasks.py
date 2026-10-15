@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
@@ -754,6 +755,50 @@ class TestStopping:
             table.start(_spec(media))
         assert table.stopping and table.busy() == 0 and ran == []
         assert os.listdir(table.temp_root) == []
+
+    def test_a_task_the_stop_cancelled_is_answered_as_stopped_not_unknown(self, make_table, media):
+        # Emptied at close, the table answered the app's next poll "unknown task", which the app counts as the node
+        # dropping the file: two routine restarts failed a healthy file.
+        table = make_table({"test.op": lambda ctx, node_path, params: _until(ctx.cancel_check) or {}})
+        task_id = table.start(_spec(media))
+
+        table.close(wait_s=5)
+
+        with pytest.raises(tasks.NodeStoppingError, match="restarting"):
+            table.poll(task_id)
+        with pytest.raises(tasks.NodeStoppingError):
+            table.get(task_id)
+        assert table.busy() == 0 and os.listdir(table.temp_root) == []
+        assert table.delete(task_id) is True and table.poll(task_id) is None
+
+    def test_the_stopping_node_waits_until_the_app_asked_after_each_task_it_stopped(self, make_table, media):
+        table = make_table({"test.op": lambda ctx, node_path, params: _until(ctx.cancel_check) or {}})
+        task_id = table.start(_spec(media))
+        table.close(wait_s=5)
+
+        def app_polls_later() -> None:
+            time.sleep(0.3)
+            with contextlib.suppress(tasks.NodeStoppingError):
+                table.poll(task_id)
+
+        poller = threading.Thread(target=app_polls_later)
+        poller.start()
+        started = time.monotonic()
+        table.wait_until_told(timeout_s=5)
+        waited = time.monotonic() - started
+        poller.join(5)
+
+        assert 0.25 <= waited < 2
+
+    def test_the_stopping_node_waits_no_longer_than_asked_for_an_app_that_never_asks(self, make_table, media):
+        table = make_table({"test.op": lambda ctx, node_path, params: _until(ctx.cancel_check) or {}})
+        table.start(_spec(media))
+        table.close(wait_s=5)
+
+        started = time.monotonic()
+        table.wait_until_told(timeout_s=0.3)
+
+        assert 0.25 <= time.monotonic() - started < 2
 
     def test_a_start_whose_folder_was_made_as_the_stop_began_is_refused_and_leaves_nothing(
         self, make_table, media, monkeypatch

@@ -118,8 +118,8 @@ class NodeUnavailableError(Exception):
     Attributes:
         node_id: The node.
         node_name: Its name.
-        started: False when the node never ran the task (it didn't take the start) or stopped it for its own temp
-            folder, so the drop doesn't count.
+        started: False when the node never ran the task (it didn't take the start), or stopped it for its own temp
+            folder or its own routine stop (a restart), so the drop doesn't count.
     """
 
     def __init__(self, node_id: str, node_name: str, message: str, *, started: bool = True) -> None:
@@ -469,6 +469,9 @@ class _TaskRun:
             except NodeUnknownTaskError as exc:
                 self._forgotten = True
                 raise self._unavailable(f"{name} no longer knows the task (it restarted?)") from exc
+            except NodeStoppingError as exc:
+                # A routine stop (a restart, an update) cancelled it: not the file's doing, so no drop is counted.
+                raise self._unavailable(f"{name} is restarting", started=False) from exc
             except NodeError as exc:
                 if failed_polls == 0:
                     failing_since = asked_at
@@ -526,7 +529,10 @@ class _TaskRun:
         try:
             data = self._client.fetch_artifact(self._task_id)
         except NodeError as exc:
-            raise self._unavailable(f"{self._placement.node_name} didn't send the frames: {exc}") from exc
+            raise self._unavailable(
+                f"{self._placement.node_name} didn't send the frames: {exc}",
+                started=not isinstance(exc, NodeStoppingError),
+            ) from exc
         extract_artifact(data, dest)
 
     def delete(self) -> None:

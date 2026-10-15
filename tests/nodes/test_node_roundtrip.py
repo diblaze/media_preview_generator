@@ -418,3 +418,37 @@ class TestANodeThatIsStopping:
         assert registry.reports == [("unavailable", NODE_ID)]
         assert client.info()["stopping"] is True and client.health()["stopping"] is True
         assert app.extensions[node_app.EXTENSION].tasks.busy() == 0
+
+    def test_the_file_it_was_running_goes_back_in_the_queue_without_a_drop(self, node, tmp_path):
+        # docker restart twice while a file ran there: the stop emptied the task table, the app's next poll found the
+        # task unknown and counted a drop each time, and the file failed "it dropped the file twice".
+        url, app = node
+        for event in WATCHED.values():
+            event.clear()
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        registry = identity_registry(_client(url))
+        set_registry(registry)
+        ended: list[BaseException] = []
+
+        def work() -> None:
+            try:
+                with placed_on(Placement(NODE_ID, "NAS")):
+                    run_on_node("test.watched", media, {}, gpu=None, cancel_check=None)
+            except BaseException as exc:  # noqa: BLE001 - the test reads how the worker's file ended
+                ended.append(exc)
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        try:
+            assert WATCHED["started"].wait(5)
+            table = app.extensions[node_app.EXTENSION].tasks
+            table.close(wait_s=5)  # what the node's SIGTERM does first
+            table.wait_until_told(timeout_s=5)  # still serving, as the node does before it exits
+            worker.join(10)
+        finally:
+            set_registry(None)
+
+        assert [type(exc) for exc in ended] == [NodeUnavailableError]
+        assert ended[0].started is False and str(ended[0]) == "NAS is restarting"
+        assert requeue_for(ended[0]).reason == REQUEUE_NODE_NOT_STARTED
+        assert registry.reports == [("unavailable", NODE_ID)]
