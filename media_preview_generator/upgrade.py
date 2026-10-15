@@ -1941,9 +1941,10 @@ def _migrate_to_v24(sm) -> list[str]:
 
     ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
     (the address and key now live only on the node record). Servers that share one helper (same address and key)
-    share one node. The node is on when a server had the helper switched on, whatever Intro & Credits says: chapter
-    thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off everywhere becomes a
-    node turned off, so it is never checked or reported offline.
+    share one node. The node is on when a switched-on server had the helper switched on, whatever Intro & Credits
+    says: chapter thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off
+    everywhere, or used only by switched-off servers (never contacted before the upgrade), becomes a node turned off,
+    so it is never checked or reported offline; the server keeps its helper switch for when it is switched on again.
 
     A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
     that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
@@ -1997,17 +1998,18 @@ def _migrate_to_v24(sm) -> list[str]:
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})
             continue
+        node_on = enabled and bool(entry.get("enabled", True))
         node = by_address.get((url, token))
         if node is None:
             # A server's name takes any text; a node's name follows the Nodes page's rules, or every later save of
             # the node (the registry's record of the id the node reports included) is refused.
             name = _helper_node_name(visible_name(str(entry.get("name") or "")) or "Plex", names, NAME_MAX_LEN)
             names.add(name_key(name))
-            node = default_record(name=name, url=url, key=token, enabled=enabled)
+            node = default_record(name=name, url=url, key=token, enabled=node_on)
             nodes.append(node)
             by_address[(url, token)] = node
             created += 1
-        elif enabled and not node.get("enabled"):
+        elif node_on and not node.get("enabled"):
             node["enabled"] = nodes_changed = True
         agent.update({"enabled": enabled, "node_id": node["id"]})
     if not changed:
