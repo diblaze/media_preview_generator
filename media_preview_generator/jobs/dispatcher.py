@@ -574,9 +574,14 @@ def _drops_failure(names: list[str]) -> str:
     """Why a file the nodes kept dropping fails, naming each node behind a drop.
 
     Args:
-        names: The node behind each drop, in order (``MAX_NODE_DROPS`` of them).
+        names: The node behind each drop, in order (``MAX_NODE_DROPS`` of them); "" for a drop a checkpoint from an
+            earlier build counted without its node.
     """
-    nodes = list(dict.fromkeys(names))
+    nodes = list(dict.fromkeys(name for name in names if name))
+    if not nodes:
+        return "nodes unavailable (they dropped the file twice)"
+    if "" in names:
+        nodes.append("an earlier one")
     if len(nodes) == 1:
         return f"node {nodes[0]} unavailable (it dropped the file twice)"
     return f"nodes {', '.join(nodes[:-1])} and {nodes[-1]} unavailable (each dropped the file once)"
