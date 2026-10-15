@@ -18,10 +18,15 @@ https://claude.ai/artifact/G5nBhYJVFBekqJMQ93NCHa
 * Build order and lane ownership: §8. Each phase gets an Architecture Review (`.claude/agents/architecture-review.md`)
   because it touches workers/concurrency, settings schema, auth and paths.
 
-## 0.1 Build status (2026-10-15)
+## 0.1 Build status (2026-10-16)
 
 Built on `stevezau/extra_node` **before the owner reviewed this design** (owner: "build everything, test it, prove it,
-I'll review the design later and may ask for changes"). Not pushed to `dev`, not deployed, not released.
+I'll review the design later and may ask for changes"). Opened as a PR to `dev` and deployed to sflix with a worker
+node on storage (2026-10-16); not released.
+
+* **Bug hunts:** seven rounds of hunters (lab, UI in a browser, config, scheduling, security, Plex database, FFmpeg,
+  docs, no-node regressions), each followed by fix lanes. Round 7 found one MED (cancel during a frames download),
+  fixed; the rest LOW.
 
 * **Built:** every lane in §8: node server + `MODE=node`, Nodes page and API, node devices in worker groups, remote
   execution for previews / Intro & Credits / loudness, the Plex database role (old helper folded in, plus loudness
