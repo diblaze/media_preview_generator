@@ -561,6 +561,7 @@ class TestAFolderThatRefusesTheThumbnails:
         outcome = run([(NOT_PERMITTED, 0, failed, "Conversion failed!")] * 4, gpu="NVIDIA")
 
         assert not isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert _diagnose_ffmpeg_exit_code(NOT_PERMITTED, [failed]) != "folder_write_error"
 
     @pytest.mark.parametrize("gpu", ["NVIDIA", None], ids=["gpu", "cpu"])
     def test_a_keyframe_pass_that_fills_the_folder_is_not_retried_with_full_decode(self, run, gpu):

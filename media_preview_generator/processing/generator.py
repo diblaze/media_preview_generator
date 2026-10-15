@@ -658,7 +658,9 @@ def video_has_no_decoder(stderr_lines: list[str]) -> bool:
     )
 
 
-def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None = None) -> str:
+def _diagnose_ffmpeg_exit_code(
+    returncode: int, stderr_lines: list[str] | None = None, output_folder: str | None = None
+) -> str:
     """Classify FFmpeg exit codes into actionable diagnostics.
 
     Known signal exit codes are explicitly mapped. Values greater than 128
@@ -671,6 +673,7 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
             (``no_decoder``) from other failures, and exit 251 from a GPU error (``gpu_error``) from a disk's
             (``io_error``). A thumbnail write the folder refused (``folder_write_error``) is told by the exit code
             too.
+        output_folder: The folder the run wrote to, so a permission error can be checked against it.
 
     Returns:
         str: Diagnostic classification string
@@ -691,7 +694,7 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
     if returncode in known_signals:
         return f"signal:{known_signals[returncode]}"
 
-    if _folder_write_errno(returncode, stderr_lines or []) is not None:
+    if _folder_write_errno(returncode, stderr_lines or [], output_folder) is not None:
         return "folder_write_error"
 
     if stderr_lines and video_has_no_decoder(stderr_lines):
@@ -784,10 +787,10 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder:
     output_lines = [line for line in _without_metadata_tags(stderr_lines) if _OUTPUT_SIDE_RE.search(line)]
     for code, texts in _FOLDER_WRITE_TEXT.items():
         if any(text in line for text in texts for line in output_lines):
-            if code == errno.EPERM and output_folder is not None:
+            if code == errno.EPERM:
                 # AVERROR(EPERM) is -1, FFmpeg's catch-all, so "Operation not permitted" also ends an encoder's bare
                 # failure: the folder's only when it refuses a new file now.
-                return _folder_refuses_new_files(output_folder)
+                return None if output_folder is None else _folder_refuses_new_files(output_folder)
             return code
     if (
         output_folder is not None
@@ -2524,7 +2527,7 @@ def generate_images(
             error_summary = _extract_ffmpeg_error_summary(stderr_lines_all)
         worker_ctx = "GPU" if gpu is not None else "CPU"
         reason = (
-            f"FFmpeg exit {rc} ({_diagnose_ffmpeg_exit_code(rc, stderr_lines)}){fallback_suffix}"
+            f"FFmpeg exit {rc} ({_diagnose_ffmpeg_exit_code(rc, stderr_lines, output_folder)}){fallback_suffix}"
             if rc != 0
             else f"0 images{fallback_suffix}"
         )

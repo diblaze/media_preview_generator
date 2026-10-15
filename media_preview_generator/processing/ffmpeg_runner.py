@@ -800,7 +800,7 @@ def create_ffmpeg_runner(
             and not gpu_lacks_decoder
             and not chapter_without_frame
         ):
-            exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
+            exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines, output_folder)
             no_decoder = exit_diagnosis == "no_decoder"
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
             if refused is not None:
