@@ -28,6 +28,7 @@ from ...nodes.client import (
     NodeProtocolError,
     NodeRateLimitedError,
     NodeRequestError,
+    NodeStalledError,
     NodeTimeoutError,
     unreachable_advice,
 )
@@ -322,7 +323,9 @@ def _probe(url: str, key: str) -> dict[str, Any]:
     except NodeError as exc:
         reason = UNREACHABLE_RATE_LIMITED if isinstance(exc, NodeRateLimitedError) else getattr(exc, "reason", "")
         answer = _probe_error(KIND_UNREACHABLE, str(exc), reason)
-        answer["error"]["advice"] = unreachable_advice(reason, url, connected=isinstance(exc, NodeTimeoutError))
+        answer["error"]["advice"] = unreachable_advice(
+            reason, url, connected=isinstance(exc, NodeTimeoutError), stalled=isinstance(exc, NodeStalledError)
+        )
         return answer
     return {"ok": True, "info": _probe_info(info)}
 

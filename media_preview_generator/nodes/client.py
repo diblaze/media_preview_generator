@@ -70,7 +70,7 @@ UNREACHABLE_RATE_LIMITED = "rate_limited"
 
 
 def unreachable_advice(
-    reason: str, url: str, name: str = "It", *, was_seen: bool = False, connected: bool = False
+    reason: str, url: str, name: str = "It", *, was_seen: bool = False, connected: bool = False, stalled: bool = False
 ) -> str:
     """What to check when a node didn't answer, in plain words: Add node and the node's card both say this.
 
@@ -82,6 +82,7 @@ def unreachable_advice(
             stopped or was renamed than that the name was typed wrong.
         connected: The connection was made but no answer came (``NodeTimeoutError``). Over http that is a stuck node,
             not a firewall; over https it is what a node without an https proxy in front looks like.
+        stalled: The answer began (its headers came) and then stopped (``NodeStalledError``): the address is right.
 
     Returns:
         One or two sentences.
@@ -89,6 +90,9 @@ def unreachable_advice(
     https = url.lower().startswith("https:")
     if connected and not https:
         return f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it."
+    if stalled:
+        # The headers came, so whatever is there speaks the scheme used (a working https proxy, say): not a wrong scheme.
+        return f"{name} stopped answering partway. It may be stuck or overloaded: try again, or restart it."
     if reason == UNREACHABLE_DNS:
         host = urlsplit(url).hostname or "that machine"
         if was_seen:
@@ -148,6 +152,10 @@ class NodeRateLimitedError(NodeUnreachableError):
 class NodeTimeoutError(NodeUnreachableError):
     """The request reached the node but no answer came: it didn't come in time, or the connection dropped before it
     did. Unlike a refused connection, the node may have acted on it."""
+
+
+class NodeStalledError(NodeTimeoutError):
+    """The answer's headers came, then no byte for a whole read timeout: the address and scheme are right."""
 
 
 class NodeAuthError(NodeError):
@@ -399,7 +407,7 @@ class NodeClient:
         except requests.RequestException as exc:
             if exc.args and isinstance(exc.args[0], ReadTimeoutError):
                 # It waited out its whole read timeout, like no answer at all: asking again waits as long again.
-                raise NodeTimeoutError(
+                raise NodeStalledError(
                     f"{self._address.base} stopped sending partway through its answer", reason=UNREACHABLE_TIMEOUT
                 ) from exc
             raise NodeTimeoutError(f"{self._address.base} dropped the connection while answering") from exc

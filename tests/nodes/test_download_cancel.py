@@ -13,9 +13,11 @@ import pytest
 
 from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
+    UNREACHABLE_TIMEOUT,
     DownloadCancelledError,
     NodeAddress,
     NodeClient,
+    unreachable_advice,
 )
 from media_preview_generator.nodes.executor import NodeTaskCancelledError, Placement, placed_on, run_on_node
 from media_preview_generator.nodes.registry import set_registry
@@ -102,3 +104,8 @@ def test_client_stops_a_flowing_download_when_the_cancel_check_turns_true():
         with pytest.raises(DownloadCancelledError):
             NodeClient(NodeAddress(url, "k")).fetch_artifact("t1", cancel_check=lambda: True)
         assert time.monotonic() - started < 2.0
+
+
+def test_a_stall_after_the_headers_over_https_does_not_say_use_http():
+    advice = unreachable_advice(UNREACHABLE_TIMEOUT, "https://nuc:9494", "It", connected=True, stalled=True)
+    assert "http://" not in advice and "partway" in advice
