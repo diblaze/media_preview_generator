@@ -1162,12 +1162,13 @@ def _season_view(ctx: PipelineContext, canonical_path: str) -> _SeasonView:
     return memo["season"]
 
 
-# How many seasons ahead of the checks a job lists their folders (``SeasonReadAhead``), on how many threads: enough to
-# cover a season folder that takes half a second to list on a network disk while the checks get through several
-# seasons a second, and few enough that a slow stretch (seasons a detector runs for) wastes little when a listing made
-# ahead is older than the cache keeps it by the time its season is reached.
-READ_AHEAD_SEASONS = 4
-READ_AHEAD_THREADS = 4
+# How many seasons ahead of the checks a job lists their folders (``SeasonReadAhead``), on how many threads: the checks
+# (32 threads by default) have several seasons in hand at once and get through ~15 a second, while a season folder can
+# take half a second to list on a network disk, so 4 ahead on 4 threads kept them waiting a fifth of the time; listings
+# on a network disk ran ~2x faster 16 at a time than 4 (sflix, 2026-10-15). Few enough that a slow stretch (seasons a
+# detector runs for) wastes little when a listing made ahead is older than the cache keeps it by the time it's reached.
+READ_AHEAD_SEASONS = 32
+READ_AHEAD_THREADS = 16
 
 
 class SeasonReadAhead:
