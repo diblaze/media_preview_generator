@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import tracemalloc
 from unittest.mock import MagicMock
 
 import pytest
@@ -527,6 +528,50 @@ class TestFailuresLookLikeTodays:
         assert _library_health_rows(_answering(_answer_of(2 * 1024 * 1024, rows))) == {"parts": []}
         with pytest.raises(AgentError, match="too large"):
             _library_health_rows(_answering(_answer_of(2 * 1024 * 1024 + 1, rows)))
+
+    ROWS_HEAD = b'{"ok":true,"agent":{"version":"1.2.0","protocols":[1]},"result":{"rows":{"parts":['
+    ROWS_TAIL = b']},"capability":"library_health_v1"}}'
+
+    @pytest.mark.parametrize(
+        "row",
+        [b"[]", b"[0,0]", b'["ab",1000000]', b"[" + b",".join([b"null"] * 13) + b"]"],
+        ids=["empty", "small-numbers", "short-text", "nulls"],
+    )
+    def test_library_health_rows_are_refused_once_past_the_memory_they_may_take(self, monkeypatch, row):
+        # Read whole and then parsed, a 24 MB answer of tiny rows took ~550 MB (JSON of "[]," parses into ~25x its
+        # size), so one under the 512 MB cap could take ~12 GB. Rows are now parsed as they arrive and counted.
+        budget = 8 * 1024 * 1024
+        monkeypatch.setattr(plex_remote, "MAX_ROWS_MEMORY_BYTES", budget)
+        count = 24 * 1024 * 1024 // (len(row) + 1)
+        remote = _answering(FakeResponse(200, {}, body=self.ROWS_HEAD + b",".join([row] * count) + self.ROWS_TAIL))
+        tracemalloc.start()
+        try:
+            with pytest.raises(AgentError, match="too large"):
+                _library_health_rows(remote)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < budget * 1.5, f"took {peak >> 20} MB"
+
+    def test_library_health_rows_under_their_memory_budget_are_read_whole(self, monkeypatch):
+        rows = [[1, i, 4, i, f"/tv/{i}.mkv", f"{i:040x}", None, "T", "S", "Show", 1, 1, i] for i in range(5000)]
+        body = self.ROWS_HEAD + json.dumps(rows, separators=(",", ":")).encode()[1:-1] + self.ROWS_TAIL
+        assert _library_health_rows(_answering(FakeResponse(200, {}, body=body))) == {"parts": rows}
+        monkeypatch.setattr(plex_remote, "MAX_ROWS_MEMORY_BYTES", 1024 * 1024)
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(FakeResponse(200, {}, body=body)))
+
+    def test_everything_but_library_health_rows_is_held_to_1_mb(self):
+        filler = b'"filler":[' + b",".join([b"[]"] * (400 * 1024)) + b"],"
+        body = self.ROWS_HEAD.replace(b'"result"', filler + b'"result"') + b"[1,2]" + self.ROWS_TAIL
+        with pytest.raises(AgentError, match="too large"):
+            _library_health_rows(_answering(FakeResponse(200, {}, body=body)))
+
+    @pytest.mark.parametrize("row", [b"[[1]]", b'[{"a":1}]', b"5"], ids=["list-in-a-row", "object-in-a-row", "number"])
+    def test_a_library_health_row_that_isnt_a_list_of_values_is_an_answer_the_app_cant_read(self, row):
+        remote = _answering(FakeResponse(200, {}, body=self.ROWS_HEAD + row + self.ROWS_TAIL))
+        with pytest.raises(AgentError, match="instead of a result"):
+            _library_health_rows(remote)
 
     @pytest.mark.parametrize(
         ("call", "deadline_s"),

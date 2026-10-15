@@ -13,7 +13,10 @@ schema it doesn't know, a missing or duplicated marker tag row).
 
 from __future__ import annotations
 
+import codecs
 import json
+import re
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -82,6 +85,10 @@ _WAIT_FIELDS = ("deadline_s", "budget_s")
 # a lab library of 778 parts), so 512 MB fits ~250,000 parts. Answers are never compressed, so a small reply can't
 # expand into gigabytes here.
 MAX_ANSWER_BYTES = 512 * 1024 * 1024
+# Library Health's rows are parsed as they arrive and each is counted at what it takes in memory here (``_RowsReader``):
+# JSON of tiny rows (``[],``) parses into ~25x its size, so the bytes alone don't bound it. Measured: 100,000 episodes'
+# rows take 248 MB (their 105 MB answer peaked at 336 MB read whole, 234 MB now), so this fits ~430,000.
+MAX_ROWS_MEMORY_BYTES = 1024 * 1024 * 1024
 # Every other answer: JSON parses into ~25x its size here (each 3-byte ``[],`` is a 64-byte list), and each is about
 # one item, a check or 50 read-back items (the largest item of that lab library: 13 KB).
 MAX_SMALL_ANSWER_BYTES = 1024 * 1024
@@ -561,6 +568,156 @@ class _TooLargeError(Exception):
     """An answer past what this app reads of it."""
 
 
+_JSON = json.JSONDecoder()
+_SPACES = " \t\n\r"
+_NOT_SPACE = re.compile(f"[^{_SPACES}]")
+# What a row's values may be: JSON's text, numbers, true/false and null.
+_PLAIN_TYPES = frozenset({str, int, float, bool, type(None)})
+
+
+class _RowsReader:
+    """Library Health's answer (``{"ok", "agent", "result": {"rows": {name: [row, ...]}, "capability"}}``), parsed
+    as it arrives: one row at a time, never the whole answer at once.
+
+    Read whole and then parsed, the answer was in memory twice over, and JSON of tiny rows (``[],``) parses into ~25x
+    its size: one answer under MAX_ANSWER_BYTES could take ~12 GB. Each row here must be a list of plain values
+    (text, numbers, true/false, null) and counts what it takes in memory against MAX_ROWS_MEMORY_BYTES; everything
+    outside the rows counts its characters against MAX_SMALL_ANSWER_BYTES.
+
+    Args:
+        pieces: The answer's bytes as they arrive.
+        limit: The most bytes of the answer read.
+    """
+
+    def __init__(self, pieces: Iterator[bytes], limit: int) -> None:
+        self._pieces = pieces
+        self._limit = limit
+        self._decode = codecs.getincrementaldecoder("utf-8")().decode
+        self._text = ""
+        self._at = 0
+        self._ended = False
+        self._read_bytes = 0
+        self._rows_memory = 0
+        self._rest = 0
+
+    def read(self) -> dict:
+        """The whole answer.
+
+        Raises:
+            ValueError: It isn't JSON, or not an object.
+            RecursionError: JSON nested deeper than Python's parser goes.
+            _TooLargeError: It is past one of the limits.
+        """
+        if not self._take("{"):
+            raise ValueError("not a JSON object")
+        answer = self._members(lambda key: self._result() if key == "result" else self._small())
+        if self._next_char():
+            raise ValueError("more after the answer")
+        return answer
+
+    def _result(self) -> Any:
+        if not self._take("{"):
+            return self._small()
+        return self._members(lambda key: self._rows() if key == "rows" else self._small())
+
+    def _rows(self) -> Any:
+        if not self._take("{"):
+            return self._small()
+        return self._members(lambda _name: self._row_list())
+
+    def _row_list(self) -> Any:
+        if not self._take("["):
+            return self._small()
+        rows: list[list] = []
+        if self._take("]"):
+            return rows
+        while True:
+            row, _ = self._value(MAX_SMALL_ANSWER_BYTES)
+            if type(row) is not list or not _PLAIN_TYPES.issuperset(map(type, row)):
+                raise ValueError("a row isn't a list of values")
+            # The row, its place in the list, and each value (small numbers and None are shared, but counted anyway).
+            self._rows_memory += sys.getsizeof(row) + 8 + sum(map(sys.getsizeof, row))
+            if self._rows_memory > MAX_ROWS_MEMORY_BYTES:
+                raise _TooLargeError
+            rows.append(row)
+            if self._take("]"):
+                return rows
+            if not self._take(","):
+                raise ValueError("rows not separated by commas")
+
+    def _members(self, value_of: Callable[[str], Any]) -> dict:
+        """An object's members (its ``{`` already read), each value read by ``value_of(key)``."""
+        members: dict = {}
+        if self._take("}"):
+            return members
+        while True:
+            key = self._small()
+            if not isinstance(key, str) or not self._take(":"):
+                raise ValueError("not a JSON object")
+            members[key] = value_of(key)
+            if self._take("}"):
+                return members
+            if not self._take(","):
+                raise ValueError("members not separated by commas")
+
+    def _small(self) -> Any:
+        """A value outside the rows."""
+        value, length = self._value(MAX_SMALL_ANSWER_BYTES - self._rest)
+        self._rest += length
+        return value
+
+    def _value(self, most: int) -> tuple[Any, int]:
+        """The next JSON value, at most ``most`` characters long, and its length."""
+        self._next_char()
+        while True:
+            try:
+                value, end = _JSON.raw_decode(self._text, self._at)
+            except ValueError:
+                if self._ended:
+                    raise
+            else:
+                # One that reaches the end of what has arrived may go on (a number): it is read again with more.
+                if end - self._at > most:
+                    raise _TooLargeError
+                if end < len(self._text) or self._ended:
+                    length, self._at = end - self._at, end
+                    return value, length
+            if len(self._text) - self._at > most:
+                raise _TooLargeError
+            self._more()
+
+    def _take(self, char: str) -> bool:
+        """Read ``char`` when it is the next character that isn't whitespace."""
+        if self._next_char() != char:
+            return False
+        self._at += 1
+        return True
+
+    def _next_char(self) -> str:
+        """The next character that isn't whitespace, left unread ("" at the end of the answer)."""
+        while True:
+            if self._at < len(self._text) and self._text[self._at] not in _SPACES:
+                return self._text[self._at]
+            found = _NOT_SPACE.search(self._text, self._at)
+            if found:
+                self._at = found.start()
+                return self._text[self._at]
+            self._at = len(self._text)
+            if not self._more():
+                return ""
+
+    def _more(self) -> bool:
+        """Add the next piece to the text read so far (dropping what was parsed); False at the end of the answer."""
+        piece = b"" if self._ended else next(self._pieces, b"")
+        self._read_bytes += len(piece)
+        if self._read_bytes > self._limit:
+            raise _TooLargeError
+        self._ended = not piece
+        self._text = self._text[self._at :] + self._decode(piece, final=self._ended)
+        self._at = 0
+        return bool(piece)
+
+
 @dataclass(frozen=True)
 class NodeRefusal:
     """Why this app sends nothing to a server's Plex database node: the message, the capability and the badge state."""
@@ -713,13 +870,15 @@ def report_wrong_node(settings: Any) -> None:
         get_registry().report_unavailable(str(node_id))
 
 
-def _parsed(pieces: Iterator[bytes], limit: int) -> Any:
+def _parsed(pieces: Iterator[bytes], limit: int, *, rows: bool) -> Any:
     """An answer's JSON, read from its ``pieces`` up to ``limit`` bytes; None when it isn't JSON.
 
     Raises:
-        _TooLargeError: The answer is past ``limit``.
+        _TooLargeError: The answer is past ``limit`` (or, for ``rows``, one of ``_RowsReader``'s limits).
     """
     try:
+        if rows:
+            return _RowsReader(pieces, limit).read()
         body = bytearray()
         for chunk in pieces:
             body += chunk
@@ -797,6 +956,7 @@ class AgentClient:
         unreachable: str = MARKERS_WAIT_FOR_THE_NODE,
         limit: int = MAX_SMALL_ANSWER_BYTES,
         deadline_s: float | None = None,
+        rows: bool = False,
     ) -> dict:
         """Send one request and return its ``result``.
 
@@ -808,6 +968,7 @@ class AgentClient:
             limit: The most bytes of the answer read; a larger one is refused unparsed.
             deadline_s: Seconds the whole answer may take, from the request on (None: the connect timeout and
                 ``timeout`` together).
+            rows: The answer is Library Health's rows (``_RowsReader``).
 
         Returns:
             The answer's ``result`` object.
@@ -831,6 +992,7 @@ class AgentClient:
                     unreachable=unreachable,
                     limit=limit,
                     deadline_s=deadline_s,
+                    rows=rows,
                 )
             except NodeFullError:
                 if give_up - time.monotonic() <= NODE_FULL_RETRY_S or wait_cancelled():
@@ -854,6 +1016,7 @@ class AgentClient:
         unreachable: str = "",
         limit: int = MAX_SMALL_ANSWER_BYTES,
         deadline_s: float | None = None,
+        rows: bool = False,
     ) -> dict:
         """Send one request and read its answer: never a redirect followed, never more than ``limit`` bytes, never
         past its deadline (``post``)."""
@@ -880,7 +1043,7 @@ class AgentClient:
                 **extra,
             )
             try:
-                payload = self._payload(response, deadline, limit)
+                payload = self._payload(response, deadline, limit, rows=rows)
             finally:
                 response.close()
         except requests.RequestException as exc:
@@ -902,7 +1065,9 @@ class AgentClient:
             )
         return self._read(response.status_code, payload, sent=sent, unreachable=unreachable)
 
-    def _payload(self, response: Any, deadline: float, limit: int = MAX_SMALL_ANSWER_BYTES) -> Any:
+    def _payload(
+        self, response: Any, deadline: float, limit: int = MAX_SMALL_ANSWER_BYTES, *, rows: bool = False
+    ) -> Any:
         """The answer's JSON body, read up to ``limit`` bytes until ``deadline``; None when it isn't JSON.
 
         Raises:
@@ -921,7 +1086,7 @@ class AgentClient:
         too_large = False
         if encoding == "identity":
             try:
-                payload = _parsed(answer_pieces(response, _READ_CHUNK_BYTES, deadline), limit)
+                payload = _parsed(answer_pieces(response, _READ_CHUNK_BYTES, deadline), limit, rows=rows)
             except _TooLargeError:
                 too_large = True
         if encoding != "identity" or too_large:
@@ -1404,6 +1569,7 @@ class RemotePlexDb(PlexDatabase):
             unreachable=LIBRARY_HEALTH_WAITS_FOR_THE_NODE,
             limit=MAX_ANSWER_BYTES,
             deadline_s=remaining + ROWS_ANSWER_S,
+            rows=True,
         )
         if isinstance(result.get("error"), dict):
             # The node's read failed after its answer's status went out: the refusal comes in the answer instead.
