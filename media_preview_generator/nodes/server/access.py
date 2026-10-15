@@ -116,21 +116,25 @@ def resolve(app_path: str, size: int | None, mtime_ns: int | None, mappings: lis
 
 
 def nearby(node_path: str, mappings: list[PathMapping]) -> tuple[str, list[str]] | None:
-    """The deepest existing folder above a missing file and up to 50 of its names, so a user can spot the right path.
+    """A folder listing near a missing file, so a user can spot the right path.
+
+    Inside the mapped roots, the deepest existing folder above the file and up to 50 of its names. When the row's own
+    node folder doesn't exist (the usual mistake: a misnamed folder), the folder names beside it instead.
 
     Args:
         node_path: The mapped (missing) path.
-        mappings: The node's mapping rows; nothing outside their roots is ever listed.
+        mappings: The node's mapping rows; nothing outside their roots is listed, except the folder names beside a
+            row's missing node folder.
 
     Returns:
-        ``(folder, names)``, or None when no folder inside the mapped roots exists above it.
+        ``(folder, names)``, or None when there is nothing to list.
     """
     roots = mapped_roots(mappings)
     folder = os.path.dirname(node_path)
     while folder:
         if os.path.isdir(folder):
             if not any(_within(os.path.realpath(folder), root) for root in roots):
-                return None
+                break
             try:
                 names = sorted(os.listdir(folder))[:NEARBY_MAX_NAMES]
             except OSError:
@@ -140,4 +144,33 @@ def nearby(node_path: str, mappings: list[PathMapping]) -> tuple[str, list[str]]
         if parent == folder:
             break
         folder = parent
-    return None
+    return _beside_missing_root(node_path, mappings)
+
+
+def _beside_missing_root(node_path: str, mappings: list[PathMapping]) -> tuple[str, list[str]] | None:
+    """The folder names in the parent of the missing node folder of the row ``node_path`` was mapped through.
+
+    The request's own rows choose the roots, so naming the folders one level above a root it names shows no more
+    than a row for that parent would; files and anything deeper stay unlisted.
+    """
+    path = os.path.normpath(node_path)
+    covering = [row for row in mappings if _within(path, os.path.normpath(row.node_prefix))]
+    if not covering:
+        return None
+    prefix = os.path.normpath(max(covering, key=lambda row: len(row.node_prefix)).node_prefix)
+    parent = os.path.dirname(prefix)
+    if parent == prefix or os.path.exists(prefix) or not os.path.isdir(parent):
+        return None
+    try:
+        with os.scandir(parent) as entries:
+            names = sorted(entry.name for entry in entries if _is_dir(entry))
+    except OSError:
+        return None
+    return parent, names[:NEARBY_MAX_NAMES]
+
+
+def _is_dir(entry: os.DirEntry) -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return False

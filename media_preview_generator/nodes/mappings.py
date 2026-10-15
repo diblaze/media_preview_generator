@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -199,11 +200,27 @@ def _parent(path: str, levels: int) -> str:
     return path
 
 
+def _caseless(name: str) -> str:
+    """``name`` for a case- and Unicode-form-insensitive compare (macOS and SMB often store names decomposed)."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def _closest_name(wanted: str, names: list) -> str | None:
+    """The name in ``names`` that is ``wanted``: exactly, then ignoring case, then ignoring case and Unicode form."""
+    candidates = [n for n in names if isinstance(n, str)]
+    for key in (lambda n: n, str.casefold, _caseless):
+        target = key(wanted)
+        match = next((n for n in candidates if key(n) == target), None)
+        if match is not None:
+            return match
+    return None
+
+
 def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> dict | None:
     """A corrected ``node_prefix`` for the row covering ``app_root``, from the node's folder listings.
 
-    When a listing on the node holds a folder named like the app root's last component (case-insensitive), that
-    folder is where the node sees the root, so the row's ``node_prefix`` moves to match.
+    When a listing on the node holds a folder named like the app root's last component (ignoring case and Unicode
+    form), that folder is where the node sees the root, so the row's ``node_prefix`` moves to match.
 
     Args:
         app_root: The library folder as this app sees it.
@@ -218,13 +235,13 @@ def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> d
         return None
     prefix = row.app_prefix.rstrip("/") or "/"
     rest = [part for part in app_root[len(prefix) :].split("/") if part]
-    last = (rest[-1] if rest else app_root.rstrip("/").rsplit("/", 1)[-1]).casefold()
+    last = rest[-1] if rest else app_root.rstrip("/").rsplit("/", 1)[-1]
     if not last:
         return None
     for node_dir, names in nearby.items():
         if not isinstance(node_dir, str) or not isinstance(names, list):
             continue
-        match = next((n for n in names if isinstance(n, str) and n.casefold() == last), None)
+        match = _closest_name(last, names)
         if match is None:
             continue
         seen_root = _join(node_dir, match)

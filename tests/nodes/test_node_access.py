@@ -170,9 +170,25 @@ class TestNearby:
 
         assert len(names) == access.NEARBY_MAX_NAMES
 
-    def test_nothing_outside_the_mapped_roots_is_listed(self, tmp_path):
+    def test_beside_a_missing_node_folder_only_folder_names_are_listed(self, tmp_path):
         rows = [PathMapping("/data", str(tmp_path / "media" / "not-there"))]
-        (tmp_path / "media").mkdir()
+        (tmp_path / "media" / "Movies" / "private").mkdir(parents=True)
         (tmp_path / "media" / "private.txt").write_text("")
 
-        assert access.nearby(str(tmp_path / "media" / "not-there" / "a.mkv"), rows) is None
+        found = access.nearby(str(tmp_path / "media" / "not-there" / "Movies" / "a.mkv"), rows)
+
+        assert found == (str(tmp_path / "media"), ["Movies"])
+
+    def test_nothing_above_the_node_folders_parent_is_listed(self, tmp_path):
+        rows = [PathMapping("/data", str(tmp_path / "media" / "gone" / "not-there"))]
+        (tmp_path / "media" / "Movies").mkdir(parents=True)
+
+        assert access.nearby(str(tmp_path / "media" / "gone" / "not-there" / "a.mkv"), rows) is None
+
+    def test_an_existing_folder_outside_the_roots_is_not_listed(self, tmp_path):
+        (tmp_path / "media" / "Movies").mkdir(parents=True)
+        (tmp_path / "outside").mkdir()
+        os.symlink(tmp_path / "outside", tmp_path / "media" / "Movies" / "link")
+        rows = [PathMapping("/data", str(tmp_path / "media" / "Movies"))]
+
+        assert access.nearby(str(tmp_path / "media" / "Movies" / "link" / "Sub" / "a.mkv"), rows) is None

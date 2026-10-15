@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 
 import pytest
 
 from media_preview_generator.nodes import mappings as nm
+from media_preview_generator.nodes import protocol
 from media_preview_generator.nodes.protocol import PathMapping, map_app_path
+from media_preview_generator.nodes.server import app as node_app
+from media_preview_generator.nodes.server import info
+
+NODE_KEY = "test-access-key"
 
 
 def _video(path, data=b"x"):
@@ -51,6 +57,33 @@ class FakeClient:
                 }
             )
         return {"ok": True, "results": results, "nearby": self.nearby}
+
+
+class RealNode:
+    """``NodeClient.access_check`` answered by the real node app, so listings are only what a node can send."""
+
+    def __init__(self, app):
+        self._http = app.test_client()
+        self.requests = 0
+
+    def access_check(self, mappings, files):
+        self.requests += 1
+        headers = {"Authorization": f"Bearer {NODE_KEY}", protocol.PROTOCOL_HEADER: "1"}
+        body = {"mapping": [m.to_json() for m in mappings], "files": files}
+        response = self._http.post(protocol.ROUTE_ACCESS_CHECK, headers=headers, json=body)
+        assert response.status_code == 200, response.get_json()
+        return response.get_json()
+
+
+@pytest.fixture
+def real_node(tmp_path, monkeypatch):
+    for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_NAME", "NODE_ROLES", "PLEX_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
+    monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+    app = node_app.create_node_app(config_dir=str(tmp_path / "node-config"), roles=["worker"], key=NODE_KEY, ops={})
+    yield RealNode(app)
+    app.extensions[node_app.EXTENSION].close()
 
 
 class TestLibraryRoots:
@@ -155,17 +188,61 @@ class TestRunTestAccess:
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
         assert "No video files" in nm.run_test_access(FakeClient(), [], servers)["libraries"][0]["error"]
 
-    def test_missing_files_get_a_suggestion_from_the_nodes_listing(self, tmp_path):
-        _video(tmp_path / "media" / "Movies" / "a.mkv")
+    def test_a_misnamed_node_folder_gets_a_suggestion_from_a_real_node(self, tmp_path, real_node):
+        _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
+        nas = tmp_path / "nas"
+        _video(nas / "MOVIES" / "a.mkv", b"x" * 10)
+        (nas / "Music").mkdir()
+        (nas / "notes.txt").write_text("")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
-        rows = [PathMapping(str(tmp_path / "media" / "Movies"), "/mnt/nas/films")]
-        client = FakeClient(visible=lambda path: False, nearby={"/mnt/nas": ["Music", "MOVIES"]})
-        lib = nm.run_test_access(client, rows, servers)["libraries"][0]
-        assert lib["suggestion"] == {"from": "/mnt/nas/films", "to": "/mnt/nas/MOVIES"}
+        rows = [PathMapping(str(tmp_path / "media" / "Movies"), str(nas / "films"))]
 
-    def test_each_library_gets_only_the_listings_above_its_own_missing_files(self, tmp_path):
-        _video(tmp_path / "media" / "Movies" / "a.mkv")
-        _video(tmp_path / "media" / "TV" / "s01e01.mkv")
+        lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
+
+        assert (lib["ok"], lib["files"][0]["kind"]) == (False, protocol.NOT_VISIBLE_MISSING)
+        assert lib["nearby"] == {str(nas): ["MOVIES", "Music"]}
+        assert lib["suggestion"] == {"from": str(nas / "films"), "to": str(nas / "MOVIES")}
+
+    def test_a_node_folder_named_in_another_unicode_form_gets_a_suggestion(self, tmp_path, real_node):
+        name = "Films Étrangers"
+        _video(tmp_path / "media" / unicodedata.normalize("NFC", name) / "a.mkv", b"x" * 10)
+        nas = tmp_path / "nas"
+        seen_name = unicodedata.normalize("NFD", name.upper())  # as a Mac or an SMB share may store it
+        _video(nas / seen_name / "a.mkv", b"x" * 10)
+        servers = [_server(tmp_path, [{"id": "1", "name": "World", "remote_paths": [f"/plexmedia/{name}"]}])]
+        rows = [PathMapping(str(tmp_path / "media" / name), str(nas / "films"))]
+
+        lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
+
+        assert lib["suggestion"] == {"from": str(nas / "films"), "to": str(nas / seen_name)}
+
+    def test_a_root_below_the_mapped_folder_moves_the_rows_prefix_up_to_match(self, tmp_path, real_node):
+        _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
+        share = tmp_path / "volume1"
+        _video(share / "movies" / "a.mkv", b"x" * 10)
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media"), str(share / "old"))]
+
+        lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
+
+        assert lib["suggestion"] == {"from": str(share / "old"), "to": str(share)}, lib["nearby"]
+
+    def test_nothing_is_listed_above_the_node_folders_parent(self, tmp_path, real_node):
+        _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
+        _video(tmp_path / "nas" / "Movies" / "a.mkv", b"x" * 10)
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media" / "Movies"), str(tmp_path / "nas" / "gone" / "films"))]
+
+        lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
+
+        assert (lib["ok"], lib["nearby"], lib["suggestion"]) == (False, {}, None)
+
+    def test_each_library_gets_only_the_listings_above_its_own_missing_files(self, tmp_path, real_node):
+        _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
+        _video(tmp_path / "media" / "TV" / "s01e01.mkv", b"x" * 10)
+        nas = tmp_path / "nas"
+        _video(nas / "Movies" / "a.mkv", b"x" * 10)
+        _video(tmp_path / "srv" / "tv" / "s01e01.mkv", b"x" * 10)
         servers = [
             _server(
                 tmp_path,
@@ -176,15 +253,14 @@ class TestRunTestAccess:
             )
         ]
         rows = [
-            PathMapping(str(tmp_path / "media" / "Movies"), "/mnt/nas"),
-            PathMapping(str(tmp_path / "media" / "TV"), "/srv/tv"),
+            PathMapping(str(tmp_path / "media" / "Movies"), str(nas)),
+            PathMapping(str(tmp_path / "media" / "TV"), str(tmp_path / "srv" / "tv")),
         ]
-        client = FakeClient(
-            visible=lambda path: "TV" in path, nearby={"/mnt/nas": ["Movies", "TV"], "/elsewhere": ["x"]}
-        )
-        movies, tv = nm.run_test_access(client, rows, servers)["libraries"]
-        assert movies["nearby"] == {"/mnt/nas": ["Movies", "TV"]}
-        assert movies["suggestion"] == {"from": "/mnt/nas", "to": "/mnt/nas/Movies"}
+
+        movies, tv = nm.run_test_access(real_node, rows, servers)["libraries"]
+
+        assert movies["nearby"] == {str(nas): ["Movies"]}
+        assert movies["suggestion"] == {"from": str(nas), "to": str(nas / "Movies")}
         assert (tv["ok"], tv["nearby"], tv["suggestion"]) == (True, {}, None)
 
     def test_requests_are_split_into_batches(self, tmp_path, monkeypatch):
@@ -198,19 +274,21 @@ class TestRunTestAccess:
 
 
 class TestSuggestRow:
-    def test_a_root_below_the_mapped_folder_moves_the_rows_prefix_up_to_match(self):
-        rows = [PathMapping("/data", "/srv/old")]
-        suggestion = nm.suggest_row("/data/Movies", rows, {"/volume1/share": ["movies"]})
-        assert suggestion == {"from": "/srv/old", "to": "/volume1/share"}
+    """Windows node paths, which the real node can't produce on this machine; the listing is what it would send."""
 
     def test_a_windows_node(self):
-        rows = [PathMapping("/data/movies", "E:\\Movies")]
-        assert nm.suggest_row("/data/movies", rows, {"D:\\": ["Movies"]}) == {"from": "E:\\Movies", "to": "D:\\Movies"}
+        rows = [PathMapping("/data/movies", "E:\\Films")]
+        suggestion = nm.suggest_row("/data/movies", rows, {"E:\\": ["MOVIES", "TV"]})
+        assert suggestion == {"from": "E:\\Films", "to": "E:\\MOVIES"}
 
     def test_a_windows_node_with_the_root_below_the_mapped_folder(self):
-        rows = [PathMapping("/data", "E:\\Old")]
-        suggestion = nm.suggest_row("/data/movies", rows, {"D:\\Media": ["Movies"]})
-        assert suggestion == {"from": "E:\\Old", "to": "D:\\Media"}
+        rows = [PathMapping("/data", "E:\\Media\\Old")]
+        suggestion = nm.suggest_row("/data/movies", rows, {"E:\\Media": ["Movies", "TV"]})
+        assert suggestion == {"from": "E:\\Media\\Old", "to": "E:\\Media"}
+
+    def test_an_exact_name_wins_over_one_in_another_case(self):
+        rows = [PathMapping("/data/Movies", "/mnt/x")]
+        assert nm.suggest_row("/data/Movies", rows, {"/mnt": ["MOVIES", "Movies"]})["to"] == "/mnt/Movies"
 
     @pytest.mark.parametrize(
         ("rows", "nearby"),
