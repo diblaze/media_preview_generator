@@ -65,6 +65,16 @@ def sendable_key(key: str) -> bool:
     return bool(key) and all(33 <= ord(ch) <= 126 for ch in key)
 
 
+def whole_number(raw: str) -> int | None:
+    """``raw`` as a non-negative int when it is 1 to 18 ASCII digits (surrounding spaces ignored), else None.
+
+    ``str.isdigit()`` alone takes "²", which ``int()`` refuses, and ``int()`` refuses text of over 4,300 digits: a
+    request with either must be refused as malformed, not answered with a 500.
+    """
+    text = str(raw).strip()
+    return int(text) if text.isascii() and text.isdigit() and len(text) <= 18 else None
+
+
 # Routes, so neither side spells them twice.
 ROUTE_HEALTH = "/v1/health"
 ROUTE_INFO = "/v1/info"

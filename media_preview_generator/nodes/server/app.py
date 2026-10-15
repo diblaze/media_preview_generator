@@ -28,6 +28,8 @@ from . import access, identity, nodelog, tasks
 MAX_BODY_BYTES = 2 * 1024 * 1024
 ACCESS_CHECK_MAX_FILES = 200
 LOG_DEFAULT_LINES = 200
+# How much of a protocol header that isn't this node's the refusal repeats back.
+PROTOCOL_ECHO_MAX = 32
 EXTENSION = "mpg_node"
 
 
@@ -195,12 +197,12 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             # No detail: an unauthenticated caller learns nothing about this node.
             return refuse(protocol.KIND_AUTH, 401)
         asked = request.headers.get(protocol.PROTOCOL_HEADER, "").strip()
-        if not (asked.isdigit() and int(asked) == protocol.NODE_PROTOCOL):
+        if protocol.whole_number(asked) != protocol.NODE_PROTOCOL:
             return refuse(
                 protocol.KIND_PROTOCOL,
                 409,
                 f"This node is version {__version__} and speaks node protocol {protocol.NODE_PROTOCOL}; the app "
-                f"asked for {asked or 'none'}.",
+                f"asked for {asked[:PROTOCOL_ECHO_MAX] or 'none'}.",
             )
         return None
 
@@ -209,7 +211,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
         return refuse(protocol.KIND_REQUEST, exc.code or 400, exc.description or exc.name)
 
     def json_body() -> dict | None:
-        body = request.get_json(silent=True)
+        try:
+            body = request.get_json(silent=True)
+        except RecursionError:  # silent=True only covers ValueError; a deeply nested body raises this instead
+            return None
         return body if isinstance(body, dict) else None
 
     def unknown_task() -> Any:
@@ -317,9 +322,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")
     def poll_task(task_id: str) -> Any:
         raw = request.args.get("log_from", "0").strip()
-        if not raw.lstrip("-").isdigit():
+        log_from = protocol.whole_number(raw.lstrip("-"))
+        if log_from is None:
             return refuse(protocol.KIND_REQUEST, 400, "log_from must be a whole number")
-        polled = table.poll(task_id, max(0, int(raw)))
+        polled = table.poll(task_id, 0 if raw.startswith("-") else log_from)
         if polled is None:
             return unknown_task()
         return answer(polled)
@@ -353,10 +359,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
 
     @bp.get(protocol.ROUTE_LOG)
     def node_log() -> Any:
-        raw = request.args.get("lines", str(LOG_DEFAULT_LINES)).strip()
-        if not raw.isdigit():
+        lines = protocol.whole_number(request.args.get("lines", str(LOG_DEFAULT_LINES)))
+        if lines is None:
             return refuse(protocol.KIND_REQUEST, 400, "lines must be a whole number")
-        count = max(1, min(int(raw), nodelog.NODE_LOG_LINES))
+        count = max(1, min(lines, nodelog.NODE_LOG_LINES))
         return answer({"lines": state.log.lines(count)})
 
     return bp

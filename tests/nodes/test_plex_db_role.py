@@ -209,7 +209,11 @@ class TestTheGuards:
         body = agent.post("/v1/checks/file", json={}, headers={"Authorization": "Bearer nope"}).get_data(as_text=True)
         assert "Plex Media Server" not in body and "db_path" not in body
 
-    @pytest.mark.parametrize("asked", [None, "2", "0", "one", ""], ids=["none", "newer", "older", "text", "empty"])
+    @pytest.mark.parametrize(
+        "asked",
+        [None, "2", "0", "one", "", "¹", "1" * 5000],
+        ids=["none", "newer", "older", "text", "empty", "superscript", "past-the-int-digit-limit"],
+    )
     def test_a_protocol_this_build_doesnt_speak_is_refused_with_both_versions(self, agent, asked):
         headers = {"Authorization": f"Bearer {TOKEN}"}
         if asked is not None:
@@ -218,6 +222,15 @@ class TestTheGuards:
         assert response.status_code == 409
         message = response.get_json()["error"]["message"]
         assert plex_db_role.AGENT_VERSION in message and "protocol 1" in message
+
+    def test_a_deeply_nested_body_is_refused_as_malformed(self, agent):
+        headers = {
+            "Authorization": f"Bearer {TOKEN}",
+            plex_remote.PROTOCOL_HEADER: "1",
+            "Content-Type": "application/json",
+        }
+        response = agent.post("/v1/item/read", data="[" * 100_000 + "]" * 100_000, headers=headers)
+        assert response.status_code == 400
 
     @pytest.mark.parametrize("asked", [None, "99"], ids=["no-protocol-header", "another-protocol"])
     def test_the_ping_still_answers_a_caller_whose_protocol_it_doesnt_speak(self, agent, asked):

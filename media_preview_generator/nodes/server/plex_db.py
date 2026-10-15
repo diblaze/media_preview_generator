@@ -56,7 +56,7 @@ from ...markers.publishers.plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from ..protocol import sendable_key
+from ..protocol import sendable_key, whole_number
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
 # numbers, so an image left behind on the Plex host is a message, never a wrong write.
@@ -313,8 +313,7 @@ def register_plex_db(
         return bool(offered) and secrets.compare_digest(offered.encode("utf-8", "surrogateescape"), shared_key_bytes)
 
     def speaks_our_protocol() -> bool:
-        asked = request.headers.get(plex_remote.PROTOCOL_HEADER, "").strip()
-        return asked.isdigit() and int(asked) in PROTOCOLS
+        return whole_number(request.headers.get(plex_remote.PROTOCOL_HEADER, "")) in PROTOCOLS
 
     @bp.before_request
     def _guard() -> Any:
@@ -333,7 +332,7 @@ def register_plex_db(
                         "message": (
                             f"This Plex database node is version {AGENT_VERSION} and speaks protocol "
                             f"{', '.join(str(p) for p in PROTOCOLS)}; the app asked for "
-                            f"{request.headers.get(plex_remote.PROTOCOL_HEADER, 'none')}."
+                            f"{request.headers.get(plex_remote.PROTOCOL_HEADER, 'none')[:32]}."
                         ),
                     },
                 }
@@ -342,7 +341,11 @@ def register_plex_db(
         if (request.content_length or 0) > MAX_BODY_BYTES:
             abort(413)
         request.max_content_length = MAX_BODY_BYTES
-        if request.method == "POST" and not isinstance(request.get_json(silent=True), dict):
+        try:
+            body = request.get_json(silent=True) if request.method == "POST" else {}
+        except RecursionError:  # silent=True only covers ValueError; a deeply nested body raises this instead
+            body = None
+        if not isinstance(body, dict):
             return _bad_request("The request body must be a JSON object")
         return None
 
