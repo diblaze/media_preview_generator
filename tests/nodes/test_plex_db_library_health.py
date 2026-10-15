@@ -8,6 +8,8 @@ counting the same database locally gives.
 from __future__ import annotations
 
 import sqlite3
+import time
+import tracemalloc
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -218,3 +220,82 @@ class TestTheNodeIsBesideThisServersPlex:
             assert previews.state != CellState.ERROR
         else:
             assert previews.state == CellState.ERROR and "beside a different Plex" in previews.reason
+
+
+class TestABigLibraryIsSentAsItIsRead:
+    """A big library's rows held at once, then their JSON, took a Plex database node past its memory limit (50,000
+    episodes at 256 MB, 100,000 at 512 MB): it was killed, and the marker and loudness writes it was running failed."""
+
+    BODY = {"section_ids": [1], "want_markers": True, "want_chapters": True, "deadline_s": 5}
+
+    @pytest.fixture
+    def big_folder(self, tmp_path) -> Path:
+        folder = tmp_path / "big" / "Plex Media Server"
+        path = Path(plex_db_path(str(folder)))
+        path.parent.mkdir(parents=True)
+        extra = "x" * 600  # about the size of a real part's extra_data
+        build_plex_db(path, [_movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", extra, [None]) for i in range(6000)])
+        return folder
+
+    def test_the_rows_are_never_all_in_the_node_s_memory_at_once(self, big_folder, tmp_path):
+        node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        received = 0
+        tracemalloc.start()
+        try:
+            answer = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
+            for piece in answer.response:
+                received += len(piece)
+            answer.close()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert received > 4_000_000  # the parts' rows alone
+        assert peak < received / 4, f"the node held {peak} bytes to send {received}"
+
+    def test_the_streamed_answer_is_the_rows_the_queries_read(self, big_folder, tmp_path, monkeypatch):
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 512)
+        node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        result = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH).get_json()["result"]
+        conn = sqlite3.connect(plex_db_path(str(big_folder)))
+        try:
+            expected = plex_rows.read_rows(conn, [1], want_markers=True, want_chapters=True)
+        finally:
+            conn.close()
+        assert result == {"rows": expected, "capability": plex_rows.LIBRARY_HEALTH_CAPABILITY}
+
+    def test_a_read_that_stops_partway_is_an_answer_the_app_can_t_use_not_a_smaller_library(
+        self, big_folder, tmp_path, monkeypatch
+    ):
+        queries = plex_db_role.query_rows
+
+        def failing_partway(*args, **kwargs):
+            rows = queries(*args, **kwargs)
+
+            def audio_counts():
+                yield from list(rows["audio_counts"])[:10]
+                raise sqlite3.OperationalError("disk I/O error")
+
+            return {**rows, "audio_counts": audio_counts()}
+
+        monkeypatch.setattr(plex_db_role, "query_rows", failing_partway)
+        session = FlaskSession(node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client())
+        with pytest.raises(plex_remote.AgentError, match="can't read"):
+            RemotePlexDb(NODE_URL, TOKEN, session=session).library_health_rows(
+                [1], want_markers=True, want_chapters=True, deadline=time.monotonic() + 5, needs="1.2.0"
+            )
+
+    def test_an_answer_the_app_hung_up_on_lets_go_of_the_database_and_its_slot(self, big_folder, tmp_path):
+        from media_preview_generator.markers.publishers import plex_db
+        from media_preview_generator.nodes.server import app as app_module
+
+        app = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path))
+        app.config[app_module.SERVER_THREADS] = 2  # one slot for the role
+        node = app.test_client()
+        abandoned = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
+        next(iter(abandoned.response))
+        abandoned.close()
+
+        assert not plex_db._db_lock(plex_db_path(str(big_folder))).locked()
+        again = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH)
+        assert again.status_code == 200
+        assert again.get_json()["result"]["capability"] == plex_rows.LIBRARY_HEALTH_CAPABILITY
