@@ -20,6 +20,12 @@ from ..protocol import sendable_key
 from .nodelog import SECRET_EXTRA
 
 IDENTITY_FILE = "node.json"
+# The examples in the docs and compose files once carried keys with this in them; a key copied from there is public.
+PLACEHOLDER_MARK = "change-me"
+# A key set with NODE_KEY is new, so it must be long enough not to be guessed. A Plex helper's AGENT_TOKEN predates the
+# rule: it keeps working whatever its length (with a warning), so an upgrade never locks the app out.
+MIN_KEY_LENGTH = 16
+MAKE_A_KEY = "openssl rand -hex 24"
 
 
 @dataclass(frozen=True)
@@ -41,12 +47,22 @@ def default_config_dir() -> str:
     return os.environ.get("CONFIG_DIR", "").strip() or "/config"
 
 
-def _check_key(key: str, source: str) -> str:
+def _check_key(key: str, source: str, *, min_length: int = 0) -> str:
     # The app refuses to store a key outside printable ASCII without spaces, so such a key could never match one the
     # app sends: every request would 401 and look like a typo on the app's side. Said once, at start.
     if not sendable_key(key):
         raise SystemExit(
             f"{source} must be printable ASCII with no spaces: the app can't send a key with any other character."
+        )
+    if PLACEHOLDER_MARK in key.lower():
+        raise SystemExit(
+            f"{source} is the example key from the docs, so anyone can read it. Remove {source} and the node makes "
+            f"a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
+        )
+    if len(key) < min_length:
+        raise SystemExit(
+            f"{source} is too short to be safe ({len(key)} characters; use at least {min_length}). Remove it and the "
+            f"node makes a key of its own (shown once in its log), or set a random one, made with: {MAKE_A_KEY}"
         )
     return key
 
@@ -123,7 +139,8 @@ def load_identity(config_dir: str | None = None, *, key: str | None = None) -> N
         The identity.
 
     Raises:
-        SystemExit: node.json can't be read or written, or the key isn't printable ASCII.
+        SystemExit: node.json can't be read or written, or the key isn't printable ASCII, is a docs example, or
+            (from ``NODE_KEY``) is shorter than :data:`MIN_KEY_LENGTH`.
     """
     folder = config_dir or default_config_dir()
     stored, created = _load_or_create(folder)
@@ -131,9 +148,17 @@ def load_identity(config_dir: str | None = None, *, key: str | None = None) -> N
     if key is not None:
         chosen, source = _check_key(key.strip(), "The node key"), "argument"
     elif os.environ.get("NODE_KEY", "").strip():
-        chosen, source = _check_key(os.environ["NODE_KEY"].strip(), "NODE_KEY"), "NODE_KEY"
+        chosen = _check_key(os.environ["NODE_KEY"].strip(), "NODE_KEY", min_length=MIN_KEY_LENGTH)
+        source = "NODE_KEY"
     elif os.environ.get("AGENT_TOKEN", "").strip():
         chosen, source = _check_key(os.environ["AGENT_TOKEN"].strip(), "AGENT_TOKEN"), "AGENT_TOKEN"
+        if len(chosen) < MIN_KEY_LENGTH:
+            logger.warning(
+                "AGENT_TOKEN is only {} characters, short enough to be guessed. Set NODE_KEY to a longer one "
+                "(made with: {}) and paste it into the app's node too.",
+                len(chosen),
+                MAKE_A_KEY,
+            )
     else:
         chosen, source = _check_key(stored["key"], os.path.join(folder, IDENTITY_FILE) + "'s key"), IDENTITY_FILE
         if created:

@@ -71,7 +71,7 @@ class TestNodeJson:
 
 class TestKeyPrecedence:
     def test_argument_beats_env_and_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NODE_KEY", "from-node-key")
+        monkeypatch.setenv("NODE_KEY", "from-node-key-0123456789")
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
 
         me = identity.load_identity(str(tmp_path), key="from-arg")
@@ -79,10 +79,10 @@ class TestKeyPrecedence:
         assert (me.key, me.key_source) == ("from-arg", "argument")
 
     def test_node_key_beats_agent_token(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NODE_KEY", "from-node-key")
+        monkeypatch.setenv("NODE_KEY", "from-node-key-0123456789")
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
 
-        assert identity.load_identity(str(tmp_path)).key == "from-node-key"
+        assert identity.load_identity(str(tmp_path)).key == "from-node-key-0123456789"
 
     def test_agent_token_beats_the_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AGENT_TOKEN", "from-agent-token")
@@ -126,6 +126,42 @@ class TestKeyPrecedence:
             identity.load_identity(str(tmp_path), key="ключ")
 
 
+class TestPublicOrWeakKeys:
+    @pytest.mark.parametrize("sample", ["change-me-to-a-long-random-key", "change-me", "CHANGE-ME-please-0123456789"])
+    @pytest.mark.parametrize("variable", ["NODE_KEY", "AGENT_TOKEN"])
+    def test_a_docs_example_key_refuses_to_start(self, tmp_path, monkeypatch, variable, sample):
+        monkeypatch.setenv(variable, sample)
+
+        with pytest.raises(SystemExit, match="example key from the docs") as refused:
+            identity.load_identity(str(tmp_path))
+        assert "openssl rand -hex 24" in str(refused.value)
+
+    def test_a_docs_example_key_as_the_argument_refuses_to_start(self, tmp_path):
+        with pytest.raises(SystemExit, match="example key"):
+            identity.load_identity(str(tmp_path), key="change-me")
+
+    @pytest.mark.parametrize("short", ["x", "abc123", "fifteen-chars-x"])
+    def test_a_short_node_key_refuses_to_start(self, tmp_path, monkeypatch, short):
+        monkeypatch.setenv("NODE_KEY", short)
+
+        with pytest.raises(SystemExit, match=f"too short to be safe \\({len(short)} characters; use at least 16\\)"):
+            identity.load_identity(str(tmp_path))
+
+    def test_a_node_key_of_16_characters_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NODE_KEY", "sixteen-chars-ok")
+
+        assert identity.load_identity(str(tmp_path)).key == "sixteen-chars-ok"
+
+    def test_a_plex_helpers_short_agent_token_keeps_working_with_a_warning(self, tmp_path, monkeypatch, warnings_seen):
+        monkeypatch.setenv("AGENT_TOKEN", "old-token")
+
+        me = identity.load_identity(str(tmp_path))
+
+        assert (me.key, me.key_source) == ("old-token", "AGENT_TOKEN")
+        assert [m for m in warnings_seen if "AGENT_TOKEN is only 9 characters" in m and "NODE_KEY" in m]
+        assert not [m for m in warnings_seen if "old-token" in m]
+
+
 class TestKeyNotice:
     def test_generated_key_announced_once(self, tmp_path, warnings_seen):
         me = identity.load_identity(str(tmp_path))
@@ -136,12 +172,12 @@ class TestKeyNotice:
         assert "Add node" in notices[0] and "NODE_KEY" in notices[0]
 
     def test_no_notice_when_the_key_comes_from_env(self, tmp_path, monkeypatch, warnings_seen):
-        monkeypatch.setenv("NODE_KEY", "mine")
+        monkeypatch.setenv("NODE_KEY", "mine-0123456789abcdef")
 
         identity.load_identity(str(tmp_path))
 
         stored_key = json.loads((tmp_path / "node.json").read_text())["key"]
-        assert not [m for m in warnings_seen if stored_key in m or "mine" in m]
+        assert not [m for m in warnings_seen if stored_key in m or "mine-0123456789abcdef" in m]
 
     def test_notice_never_reaches_the_readable_node_log(self, tmp_path):
         buffer = nodelog.install()

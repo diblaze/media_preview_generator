@@ -5,8 +5,7 @@
 # this machine's.
 #
 # Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
-# http://THIS_MACHINE:9494 and the key (NODE_KEY below, or the one the node prints once in `docker logs` on first
-# start when NODE_KEY isn't set).
+# http://THIS_MACHINE:9494 and the key the node prints once in `docker logs` on first start (or your own NODE_KEY).
 
 services:
   media-preview-node:
@@ -36,8 +35,9 @@ services:
 
     environment:
       - MODE=node
-      # The key the app must send. Leave it out to have the node make one (printed once in `docker logs`).
-      - NODE_KEY=change-me-to-a-long-random-key
+      # The key the app must send. Left empty, the node makes one (printed once in `docker logs`).
+      # To pick your own, put NODE_KEY=<key> in a .env file beside this one; make one with: openssl rand -hex 24
+      - NODE_KEY=${NODE_KEY:-}
       # The name the app shows for this node (default: the container's hostname).
       - NODE_NAME=gpu-box
       # - NODE_PORT=9494

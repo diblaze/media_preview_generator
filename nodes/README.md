@@ -19,13 +19,14 @@ The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`]
   mappings) and checks each file is the same one (size and modification time) before using it.
 * Pass the GPU exactly as you would to the app: `--device /dev/dri:/dev/dri` for Intel/AMD, or
   `--gpus all` / `runtime: nvidia` with `NVIDIA_DRIVER_CAPABILITIES=all` for NVIDIA.
-* Set `NODE_KEY` to a long random key, or leave it out: on first start the node makes one and prints it once in
-  `docker logs`. It is kept in `/config/node.json`, so mount `/config`.
+* The node makes its own key on first start and prints it once in `docker logs`. It is kept in
+  `/config/node.json`, so mount `/config`. To pick your own, add `-e NODE_KEY=...` with a key made by
+  `openssl rand -hex 24` (at least 16 characters).
 * `NODE_NAME` is the name the app shows (default: the hostname). The node listens on port **9494** (`NODE_PORT`).
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e NODE_KEY=change-me -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest
