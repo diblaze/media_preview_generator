@@ -179,8 +179,8 @@
             agent
                 ? kvRow(
                     'How markers get here',
-                    `Written into this Plex server's database, through the agent next to Plex`
-                        + infoIcon('The agent does the database write on the Plex machine. This app never touches the file itself.'),
+                    `Written into this Plex server's database, through the Plex database node`
+                        + infoIcon('The Plex database node does the database write on the Plex machine. This app never touches the file itself.'),
                 )
                 : kvRow(
                     'How markers get here',
@@ -194,7 +194,7 @@
                 ? badge('bad', `✕ network share${details.fs_type ? ` (${details.fs_type})` : ''}`)
                 : badge('ok', '✓ local disk');
             const whereTip = agent
-                ? 'The folder of Plex\'s library database, as the agent on the Plex machine sees it.'
+                ? 'The folder of Plex\'s library database, as the Plex database node on the Plex machine sees it.'
                 : 'The folder of Plex\'s library database, as this app sees it.';
             const whereDetail = agent
                 ? '<p>Markers are written straight into this database, so it has to be on a local disk of that machine.</p>'
