@@ -3551,6 +3551,14 @@ class TestRotatedVideo:
         assert "hwupload" in vf and turn not in vf, vf
 
     @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.parametrize("rotation", ["inf", "-inf", "nan", "abc", None, "45"])
+    def test_a_rotation_that_isnt_a_quarter_turn_is_read_as_none(self, rotation):
+        from types import SimpleNamespace
+
+        from media_preview_generator.processing.generator import display_rotation as read_rotation
+
+        assert read_rotation(SimpleNamespace(video_tracks=[SimpleNamespace(rotation=rotation)])) == 0
+
     @pytest.mark.parametrize("display_rotation", ["-90", "90", "180"])
     def test_the_turn_read_from_mediainfo_is_the_one_ffmpeg_makes_itself(self, display_rotation, tmp_path):
         """Real files and FFmpeg: the filters for MediaInfo's angle, with FFmpeg's own turn off, give the CPU path's

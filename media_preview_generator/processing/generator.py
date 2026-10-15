@@ -1918,7 +1918,7 @@ def display_rotation(media_info: MediaInfo) -> int:
     tracks = media_info.video_tracks
     try:
         degrees = round(float(getattr(tracks[0], "rotation", None))) % 360 if tracks else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return degrees if degrees in (90, 180, 270) else 0
 
