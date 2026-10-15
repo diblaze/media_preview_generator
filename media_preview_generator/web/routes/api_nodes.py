@@ -61,6 +61,7 @@ NODE_LIST_MAX = 64
 NODE_DEPTH_MAX = 4
 KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
 CHANGED_ELSEWHERE = "This node was changed in another tab. Reload the page, then make your change again."
+NODE_REMOVED = "This node was removed in another tab."
 
 
 def _app_version() -> str:
@@ -179,8 +180,9 @@ def _row_for(node_id: str) -> dict[str, Any] | None:
     return _node_row(record, get_registry().details(node_id))
 
 
-def _not_found(node_id: str):
-    return jsonify({"error": f"No node with id {node_id}"}), 404
+def _not_found() -> tuple[Any, int]:
+    # The page lists only saved nodes, so a node it asks about that isn't saved was removed since it loaded.
+    return jsonify({"error": NODE_REMOVED}), 404
 
 
 def _same_address(url: str, record: dict) -> bool:
@@ -498,7 +500,7 @@ def update_node(node_id: str):
         nodes = sm.nodes
         existing = find_node(nodes, node_id)
         if existing is None:
-            return _not_found(node_id)
+            return _not_found()
         if loaded_tag is not None and loaded_tag != _edit_tag(existing):
             return jsonify({"error": CHANGED_ELSEWHERE}), 409
         if "url" in data and data.get("key") in (None, KEY_MASK):
@@ -551,7 +553,7 @@ def delete_node(node_id: str):
         nodes = sm.nodes
         existing = find_node(nodes, node_id)
         if existing is None:
-            return _not_found(node_id)
+            return _not_found()
         used = _used_by(node_id)
         used_by = [{"kind": "group", **g} for g in used["groups"]] + [{"kind": "server", **s} for s in used["servers"]]
         if used_by:
@@ -576,7 +578,7 @@ def delete_node(node_id: str):
 def check_node(node_id: str):
     """Start a health check in the background and answer 202 at once with the ``NODE_ROW`` (``checking`` meanwhile)."""
     if get_registry().request_check(node_id) is None:
-        return _not_found(node_id)
+        return _not_found()
     return jsonify(_row_for(node_id)), 202
 
 
@@ -587,7 +589,7 @@ def test_node_access(node_id: str):
     sm = get_settings_manager()
     record = find_node(sm.nodes, node_id)
     if record is None:
-        return _not_found(node_id)
+        return _not_found()
     data = _json_body()
     stored = record.get("path_mappings") or []
     rows, err = normalise_mappings(data["path_mappings"]) if "path_mappings" in data else (stored, "")
@@ -618,7 +620,7 @@ def suggested_node_mappings(node_id: str):
     """
     sm = get_settings_manager()
     if find_node(sm.nodes, node_id) is None:
-        return _not_found(node_id)
+        return _not_found()
     servers = sm.get("media_servers") or []
     return jsonify({"path_mappings": default_mappings_for(servers), "media_setup": _media_setup(servers)})
 
@@ -631,7 +633,7 @@ def node_health(node_id: str):
     record = find_node(sm.nodes, node_id)
     details = get_registry().details(node_id)
     if record is None or details is None:
-        return _not_found(node_id)
+        return _not_found()
     envelope = node_readiness(
         details,
         key=str(record.get("key") or ""),
@@ -649,7 +651,7 @@ def node_log(node_id: str):
     """The node's own last N log lines, oldest first, as ``{time, level, message}``."""
     record = find_node(get_settings_manager().nodes, node_id)
     if record is None:
-        return _not_found(node_id)
+        return _not_found()
     try:
         lines = max(1, min(LOG_LINES_MAX, int(request.args.get("lines", 200))))
     except ValueError:
@@ -679,5 +681,5 @@ def rescan_node_gpus(node_id: str):
         record = find_node(get_settings_manager().nodes, node_id) or {}
         return jsonify({"error": f"Couldn't ask {record.get('name') or 'the node'}: {exc}"}), 502
     if view is None:
-        return _not_found(node_id)
+        return _not_found()
     return jsonify(_row_for(node_id))

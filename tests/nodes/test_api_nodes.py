@@ -585,8 +585,10 @@ class TestRowState:
         ],
     )
     def test_an_unknown_node_is_404(self, client, nodes, method, path):
+        """The page lists only saved nodes: one it asks about was removed since (it said "No node with id <hex>")."""
         resp = getattr(client, method)(f"/api/nodes/nope{path}", json={})
         assert resp.status_code == 404
+        assert resp.get_json() == {"error": "This node was removed in another tab."}
 
 
 class TestUpdate:

@@ -1136,9 +1136,25 @@
     // A poll refreshes what the open dialog shows about the node, never the fields being edited.
     function refreshOpenNode() {
         const node = openNodeObj();
-        if (!node) return;
+        if (!node) {
+            closeRemovedNode();
+            return;
+        }
         renderHeader(node);
         renderOverview(node);
+    }
+
+    // The open node was removed in another tab: nothing in the dialog can be saved any more, so it closes and says why.
+    function closeRemovedNode() {
+        const id = page.openId;
+        if (!id) return;
+        const name = $('#nodeModalName').textContent || id;
+        page.openId = null;
+        page.nodes = page.nodes.filter((n) => String(n.id) !== String(id));
+        renderList();
+        detail.discardOk = true;
+        bootstrap.Modal.getOrCreateInstance($('#nodeModal')).hide();
+        if (typeof showToast === 'function') showToast('Node removed', `${name} was removed in another tab.`, 'warning');
     }
 
     async function rescanGpus() {
@@ -1151,6 +1167,10 @@
         result.innerHTML = '<span class="sm-spin"></span>Checking the GPUs…';
         const r = await api('POST', `/api/nodes/${encodeURIComponent(node.id)}/rescan-gpus`);
         enable(btn);
+        if (r.status === 404) {
+            closeRemovedNode();
+            return;
+        }
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't rescan");
@@ -1177,6 +1197,10 @@
         btn.disabled = true;
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { path_mappings: mappings, edit_tag: detail.editTag });
         enable(btn);
+        if (r.status === 404) {
+            closeRemovedNode();
+            return;
+        }
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -1240,6 +1264,10 @@
         }
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, { ...body, edit_tag: detail.editTag });
         enable(btn);
+        if (r.status === 404) {
+            closeRemovedNode();
+            return;
+        }
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't save");
@@ -1273,6 +1301,10 @@
         );
         if (!ok) return;
         const r = await api('DELETE', `/api/nodes/${encodeURIComponent(node.id)}`);
+        if (r.status === 404) {
+            closeRemovedNode();
+            return;
+        }
         if (r.status === 409) {
             const parts = usedByParts(r.data && r.data.used_by);
             out.textContent = parts.length
@@ -1286,6 +1318,8 @@
             out.classList.remove('d-none');
             return;
         }
+        // Cleared first: a poll landing while the dialog fades out would read this as removed in another tab.
+        page.openId = null;
         page.nodes = page.nodes.filter((n) => String(n.id) !== String(node.id));
         renderList();
         bootstrap.Modal.getOrCreateInstance($('#nodeModal')).hide();
