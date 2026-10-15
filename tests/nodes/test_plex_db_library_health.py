@@ -351,18 +351,24 @@ class TestABigLibraryIsKeptCompressedUntilSent:
 
     def test_the_rows_are_never_all_in_the_node_s_memory_as_they_are_sent(self, big_folder, tmp_path):
         node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
-        received = 0
+
+        def send() -> int:
+            answer = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
+            received = sum(len(piece) for piece in answer.response)
+            answer.close()
+            return received
+
+        send()  # untraced warm-up: imports and caches other tests may or may not have filled already
         tracemalloc.start()
         try:
-            answer = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
-            for piece in answer.response:
-                received += len(piece)
-            answer.close()
+            received = send()
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
         assert received > 4_000_000  # the parts' rows alone
-        assert peak < received / 4, f"the node held {peak} bytes to send {received}"
+        # The kept answer is compressed (about a quarter of its size); the rows all held at once would be at least
+        # its whole size, so half leaves room for allocator noise without letting that through.
+        assert peak < received / 2, f"the node held {peak} bytes to send {received}"
 
     def test_the_streamed_answer_is_the_rows_the_queries_read(self, big_folder, tmp_path, monkeypatch):
         monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 512)
