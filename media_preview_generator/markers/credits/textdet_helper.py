@@ -1446,14 +1446,32 @@ class TextDetectorPool:
 
 _pool: TextDetectorPool | None = None
 _pool_lock = threading.Lock()
+# Where the process pool's CPU helper count comes from when not the saved settings: a remote node has none.
+_cpu_limit_source: Callable[[], int] | None = None
+
+
+def set_cpu_limit_source(source: Callable[[], int] | None) -> None:
+    """Size the process pool's CPU helpers by ``source()`` instead of the saved CPU worker count (None: the settings).
+
+    Args:
+        source: Read on every CPU request, like the saved count.
+    """
+    global _cpu_limit_source
+    _cpu_limit_source = source
+
+
+def _cpu_limit() -> int:
+    source = _cpu_limit_source
+    return source() if source is not None else _configured_cpu_workers()
 
 
 def get_textdet_pool() -> TextDetectorPool:
-    """The process's helper pool: its CPU helpers follow the saved CPU worker count, and its helpers stop at exit."""
+    """The process's helper pool: its CPU helpers follow the saved CPU worker count (or what
+    :func:`set_cpu_limit_source` set), and its helpers stop at exit."""
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = TextDetectorPool(cpu_limit=_configured_cpu_workers)
+            _pool = TextDetectorPool(cpu_limit=_cpu_limit)
             atexit.register(_pool.close_all)
         return _pool
 

@@ -1838,7 +1838,7 @@ def test_get_textdet_pool_is_one_pool_for_the_process_closed_at_exit(monkeypatch
     assert th.get_textdet_pool() is pool
     assert registered == [pool.close_all]
     # The app's pool sizes its CPU helpers by the saved CPU worker count.
-    assert pool._cpu_limit is th._configured_cpu_workers
+    assert pool._cpu_limit is th._cpu_limit and th._cpu_limit_source is None
 
 
 @pytest.mark.parametrize(("saved", "expected"), [(0, 0), (1, 1), (6, 6)])

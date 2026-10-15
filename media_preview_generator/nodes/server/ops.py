@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import os
 import tarfile
+import threading
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
@@ -305,13 +307,49 @@ def intro_end_picture(ctx: TaskContext, node_path: str, params: dict) -> dict:
     return {"frames": [{"t": float(t), "frame": protocol.encode_array(a, "float32")} for t, a in decoded]}
 
 
+# The app caps its CPU text-detection helpers at its saved CPU worker count; a node has no settings, and runs exactly
+# the CPU credits tasks the app's members send it. So its cap is the most of them it has run at once: never lower, so
+# a helper isn't stopped between one file and the next only to be started again (idle helpers leave on their own).
+_credits_lock = threading.Lock()
+_cpu_credits_running = 0
+_cpu_credits_most = 0
+
+
+def _cpu_credits_cap() -> int:
+    with _credits_lock:
+        return _cpu_credits_most
+
+
+@contextmanager
+def _counted_credits_task(*, on_cpu_worker: bool) -> Iterator[None]:
+    """Count a CPU worker's credits task as running while inside (a GPU worker's text detection is never capped)."""
+    global _cpu_credits_running, _cpu_credits_most
+    if not on_cpu_worker:
+        yield
+        return
+    with _credits_lock:
+        _cpu_credits_running += 1
+        _cpu_credits_most = max(_cpu_credits_most, _cpu_credits_running)
+    try:
+        yield
+    finally:
+        with _credits_lock:
+            _cpu_credits_running -= 1
+
+
 def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
     """``find_credits`` with this node's own text-detection pool; its CPU notes go out as progress ``fallbacks``."""
     from ...markers.credits import frames
     from ...markers.credits.detector import find_credits
-    from ...markers.credits.textdet_helper import TextDetCancelledError, TextDetUnavailableError, get_textdet_pool
+    from ...markers.credits.textdet_helper import (
+        TextDetCancelledError,
+        TextDetUnavailableError,
+        get_textdet_pool,
+        set_cpu_limit_source,
+    )
 
     gpu, device = ctx.gpu or (None, None)
+    set_cpu_limit_source(_cpu_credits_cap)
     pool = get_textdet_pool()
     reporter = _Reporter(ctx)
     detect: dict[str, Any] = {
@@ -322,36 +360,37 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
         "cancel_check": ctx.cancel_check,
     }
     threads = params.get("ffmpeg_threads")
-    try:
-        result = find_credits(
-            node_path,
-            duration_ms=int(params["duration_ms"]),
-            is_episode=bool(params["is_episode"]),
-            tail_s=_optional_float(params, "tail_s"),
-            ffmpeg=_node_ffmpeg(),
-            detect_boxes=lambda planes: pool.detect_boxes(planes, **detect),
-            read_text=(lambda planes: pool.read_text(planes, **detect)) if params.get("read_text", True) else None,
-            gpu=gpu,
-            gpu_device_path=device,
-            cancel_check=ctx.cancel_check,
-            phase=reporter.phase,
-            earliest_start_s=_optional_float(params, "earliest_start_s"),
-            pause_check=ctx.pause_check,
-            ffmpeg_threads=None if threads is None else int(threads),
-            progress_callback=reporter.worker_progress if params.get("progress") else None,
-        )
-    except frames.GpuReadNothingError as exc:
-        # Not the GPU's failure: the app reads the file again on the CPU to tell (detect_credits_text).
-        raise _op_error(ctx, exc) from exc
-    except frames.GpuDecodeError as exc:
-        raise _op_error(ctx, exc, gpu_failed=True, stderr_tail=list(exc.stderr_tail)) from exc
-    except (
-        frames.FrameDecodeError,
-        frames.DecodeCancelledError,
-        TextDetCancelledError,
-        TextDetUnavailableError,
-    ) as exc:
-        raise _op_error(ctx, exc) from exc
+    with _counted_credits_task(on_cpu_worker=not detect["gpu_worker"]):
+        try:
+            result = find_credits(
+                node_path,
+                duration_ms=int(params["duration_ms"]),
+                is_episode=bool(params["is_episode"]),
+                tail_s=_optional_float(params, "tail_s"),
+                ffmpeg=_node_ffmpeg(),
+                detect_boxes=lambda planes: pool.detect_boxes(planes, **detect),
+                read_text=(lambda planes: pool.read_text(planes, **detect)) if params.get("read_text", True) else None,
+                gpu=gpu,
+                gpu_device_path=device,
+                cancel_check=ctx.cancel_check,
+                phase=reporter.phase,
+                earliest_start_s=_optional_float(params, "earliest_start_s"),
+                pause_check=ctx.pause_check,
+                ffmpeg_threads=None if threads is None else int(threads),
+                progress_callback=reporter.worker_progress if params.get("progress") else None,
+            )
+        except frames.GpuReadNothingError as exc:
+            # Not the GPU's failure: the app reads the file again on the CPU to tell (detect_credits_text).
+            raise _op_error(ctx, exc) from exc
+        except frames.GpuDecodeError as exc:
+            raise _op_error(ctx, exc, gpu_failed=True, stderr_tail=list(exc.stderr_tail)) from exc
+        except (
+            frames.FrameDecodeError,
+            frames.DecodeCancelledError,
+            TextDetCancelledError,
+            TextDetUnavailableError,
+        ) as exc:
+            raise _op_error(ctx, exc) from exc
     return {"result": _jsonable(result)}
 
 
