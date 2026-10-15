@@ -470,7 +470,7 @@ def _holding_db_lock(db_path: str, deadline: float, *, shared: bool = False) -> 
                 if busy_for is not None:
                     raise plex_busy_error(busy_for)
                 raise DatabaseBusyError(
-                    f"Another Intro & Credits task is still using this Plex database; {NEXT_RUN}",
+                    f"Another task is still using this Plex database; {NEXT_RUN}",
                     state=Capability.UNREACHABLE,
                 )
             if wait_cancelled():
@@ -553,6 +553,9 @@ def _file_owner(path: str) -> str:
 def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
     """Map a SQLite failure to a ``PublishError`` whose state the UI can explain.
 
+    Intro & Credits, loudness, chapters and Library Health all get these, in this app or on a Plex database node, so
+    none names a feature, nor this app as what opened the file.
+
     Args:
         exc: The SQLite exception.
 
@@ -585,9 +588,9 @@ def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
             state=Capability.MISCONFIGURED,
         )
     if access:
-        return PublishError(f"This app can't use Plex's database file ({text})", state=Capability.MISCONFIGURED)
+        return PublishError(f"Plex's database file can't be opened or written ({text})", state=Capability.MISCONFIGURED)
     return PublishError(
-        f"Plex's database returned an unexpected error; not writing markers ({text})",
+        f"Plex's database returned an unexpected error ({text})",
         state=Capability.UNSUPPORTED_SCHEMA,
     )
 

@@ -187,10 +187,39 @@ class TestADatabaseThatCantBeReadIsRefusedAsItIs:
         assert not plex_db._db_lock(plex_db_path(str(journal_folder))).locked()
         assert len(self._rows(session)["parts"]) == 4  # the slot was given back: the next run counts
 
+    def test_a_database_another_node_task_holds_is_busy_without_naming_intro_and_credits(
+        self, journal_folder, tmp_path
+    ):
+        from media_preview_generator.markers.publishers import plex_db
+
+        db = plex_db_path(str(journal_folder))
+        entered, release = threading.Event(), threading.Event()
+
+        def loudness_write_running() -> None:
+            # The node's own lock, held alone as its loudness or marker write holds it.
+            with plex_db._holding_db_lock(db, time.monotonic() + 5):
+                entered.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=loudness_write_running)
+        holder.start()
+        assert entered.wait(5)
+        try:
+            with pytest.raises(DatabaseBusyError) as busy:
+                self._rows(
+                    FlaskSession(node_app(str(journal_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()),
+                    wait_s=0.5,
+                )
+        finally:
+            release.set()
+            holder.join()
+        assert str(busy.value) == "Another task is still using this Plex database; trying again on the next run"
+        assert busy.value.state == Capability.UNREACHABLE
+
     @pytest.mark.parametrize(
         ("damage", "message"),
         [
-            ("not-a-database", "This app can't use Plex's database file (file is not a database)"),
+            ("not-a-database", "Plex's database file can't be opened or written (file is not a database)"),
             (
                 "malformed",
                 # Library Health counts, it writes no markers: the words name none.
@@ -367,24 +396,45 @@ class TestABigLibraryIsKeptCompressedUntilSent:
         )
 
     @pytest.mark.parametrize(
-        ("failure", "raised", "message"),
+        ("failure", "raised", "message", "state"),
         [
-            (sqlite3.OperationalError("database is locked"), DatabaseBusyError, "Plex is busy writing its database; "),
-            (sqlite3.DatabaseError("database disk image is malformed"), PublishError, "Database damaged: "),
-            (sqlite3.OperationalError("disk I/O error"), PublishError, "This app can't use Plex's database file "),
+            (
+                sqlite3.OperationalError("database is locked"),
+                DatabaseBusyError,
+                "Plex is busy writing its database; ",
+                Capability.UNREACHABLE,
+            ),
+            (
+                sqlite3.DatabaseError("database disk image is malformed"),
+                PublishError,
+                "Database damaged: ",
+                Capability.MISCONFIGURED,
+            ),
+            (
+                sqlite3.OperationalError("disk I/O error"),
+                PublishError,
+                "Plex's database file can't be opened or written ",
+                Capability.MISCONFIGURED,
+            ),
+            # Library Health counts, it writes no markers: the words name none.
+            (
+                sqlite3.OperationalError("no such table: media_streams"),
+                PublishError,
+                "Plex's database returned an unexpected error (",
+                Capability.UNSUPPORTED_SCHEMA,
+            ),
         ],
-        ids=["busy", "damaged", "io-error"],
+        ids=["busy", "damaged", "io-error", "unexpected"],
     )
     def test_a_read_that_stops_partway_is_the_database_s_refusal_not_a_smaller_library(
-        self, big_folder, tmp_path, monkeypatch, failure, raised, message
+        self, big_folder, tmp_path, monkeypatch, failure, raised, message, state
     ):
         self._failing_partway(monkeypatch, failure)
         with pytest.raises(PublishError) as refused:
             self._rows(big_folder, tmp_path)
         assert type(refused.value) is raised
         assert str(refused.value).startswith(message) and str(failure) in str(refused.value)
-        busy = raised is DatabaseBusyError
-        assert refused.value.state == (Capability.UNREACHABLE if busy else Capability.MISCONFIGURED)
+        assert refused.value.state == state
 
     def test_rows_the_node_can_t_send_partway_are_an_answer_the_app_can_t_use_not_a_smaller_library(
         self, big_folder, tmp_path, monkeypatch
@@ -452,8 +502,7 @@ class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
     """Sent as it was read, Library Health's answer held the node's lock on Plex's database, its read transaction and
     the request's slot until the app had read all but its last 16 MB (waitress stops the sending thread there). An
     app that read slowly, or stopped without hanging up (its machine dropped off the network), left every file check
-    and marker or loudness write on the node waiting ("Another Intro & Credits task is still using this Plex
-    database") and Plex's WAL unable to checkpoint, for as long as that lasted."""
+    and marker or loudness write on the node waiting ("Another task is still using this Plex database") and Plex's WAL unable to checkpoint, for as long as that lasted."""
 
     BODY = {"section_ids": [1], "want_markers": True, "want_chapters": True, "deadline_s": 5}
 
