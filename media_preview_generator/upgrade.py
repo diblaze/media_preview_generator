@@ -214,8 +214,12 @@ def run_migrations(settings_manager) -> None:
         settings_manager: A ``SettingsManager`` instance.
 
     """
+    # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
+    # the user set, so no "Settings migrated" card is shown for them.
+    settings_file = getattr(settings_manager, "settings_file", None)
+    fresh_install = bool(settings_file) and not os.path.exists(str(settings_file))
     _migrate_env_vars(settings_manager)
-    _migrate_schema(settings_manager)
+    _migrate_schema(settings_manager, announce=not fresh_install)
     _seed_last_seen_version_for_upgraders(settings_manager)
 
 
@@ -393,11 +397,11 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
         return ""
 
 
-def _migrate_schema(sm) -> None:
+def _migrate_schema(sm, *, announce: bool = True) -> None:
     """Run incremental schema migrations on settings.
 
     Each migration is gated by ``_schema_version`` so it runs at most
-    once.
+    once. ``announce`` False (a brand-new install) leaves out the one-shot "Settings migrated" notice.
 
     Migrations:
         v2 -- Per-GPU config (gpu_config).  If a flat ``gpu_threads``
@@ -554,6 +558,7 @@ def _migrate_schema(sm) -> None:
 
     if log_notes:
         logger.info("Settings schema migrated to v{}: {}", _CURRENT_SCHEMA_VERSION, ", ".join(log_notes))
+    if log_notes and announce:
         # J5: drop a one-shot flag the dashboard's notification bell reads
         # so the user sees a single "we migrated your config" card on next
         # login. Dismissal removes the flag (see notifications.py).

@@ -258,7 +258,11 @@
         list.innerHTML = page.nodes.length ? page.nodes.map(nodeRow).join('') : emptyState();
         initTooltips(list);
         const checkNow = $('#nodesCheckNow');
-        if (checkNow) checkNow.disabled = !page.nodes.length;
+        // With no node there is nothing to check: the button is hidden, not left greyed out.
+        if (checkNow) {
+            checkNow.disabled = !page.nodes.length;
+            checkNow.classList.toggle('d-none', !page.nodes.length);
+        }
     }
 
     async function loadNodes() {

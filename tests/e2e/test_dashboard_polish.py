@@ -441,3 +441,21 @@ def test_toasts_shown_back_to_back_raise_no_error(authed_page: Page, app_url: st
     expect(page.locator("#toastNotification")).to_be_visible()
     page.wait_for_timeout(600)
     assert errors == []
+
+
+@pytest.mark.e2e
+def test_the_bell_stays_quiet_when_the_api_answers_with_the_setup_page(authed_page: Page, app_url: str) -> None:
+    page = authed_page
+    errors: list[str] = []
+    page.on("console", lambda message: message.type == "error" and errors.append(message.text))
+    mock_dashboard_defaults(page)
+    mock_worker_groups(page)
+    # Before setup is finished every API call ends on the setup page, which is HTML.
+    page.route(
+        "**/api/system/notifications",
+        lambda route: route.fulfill(status=200, content_type="text/html", body="<!DOCTYPE html><html></html>"),
+    )
+    with page.expect_response("**/api/system/notifications"):
+        page.goto(f"{app_url}/")
+    page.wait_for_timeout(300)
+    assert not [e for e in errors if "loadNotifications" in e], errors

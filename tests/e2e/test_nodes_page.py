@@ -362,7 +362,8 @@ class TestNodeList:
         expect(empty.locator("a")).to_have_attribute(
             "href", "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
         )
-        expect(authed_page.locator("#nodesCheckNow")).to_be_disabled()
+        # Nothing to check yet: the button is hidden, not greyed out.
+        expect(authed_page.locator("#nodesCheckNow")).to_be_hidden()
         watch_modal_shown(authed_page, "addNodeModal")
         empty.locator(".nd-add").click()
         expect_modal_shown(authed_page, "addNodeModal")
