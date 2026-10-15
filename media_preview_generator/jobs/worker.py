@@ -316,13 +316,20 @@ class Worker:
         self._done_event: threading.Event | None = None
 
     @property
+    def node_device(self) -> str:
+        """``lab-gpu/GPU0`` for a worker on a node; empty for this app's own workers."""
+        if self.node_id is None:
+            return ""
+        device = "CPU" if self.worker_type != "GPU" else f"GPU{'' if self.gpu_index is None else self.gpu_index}"
+        return f"{self.node_name}/{device}"
+
+    @property
     def log_tag(self) -> str:
         """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
         the prefix the node's own lines carry in the job log."""
         if self.node_id is None:
             return f"[GPU {self.gpu_index}]:" if self.worker_type == "GPU" else "[CPU]:"
-        device = "CPU" if self.worker_type != "GPU" else f"GPU{'' if self.gpu_index is None else self.gpu_index}"
-        return f"{self.node_name}/{device} ·"
+        return f"{self.node_device} ·"
 
     @property
     def placement(self) -> Placement | None:
@@ -1080,6 +1087,15 @@ class Worker:
 SUSPECT_NODE_S = 60.0
 
 
+def _group_display_name(group_name: str, worker: Worker) -> str:
+    """A group worker's name in the job log: ``Off-hours · 2`` here, ``Lab nodes · lab-gpu/GPU0`` on a node.
+
+    A node worker is named by its node and device, the prefix its own lines carry; this app's running number would
+    match nothing the user sees for it.
+    """
+    return f"{group_name} · {worker.node_device or worker.worker_id + 1}"
+
+
 class WorkerPool:
     """Manages a pool of workers for processing media items."""
 
@@ -1224,7 +1240,7 @@ class WorkerPool:
                 for index, worker in enumerate(owned):
                     worker.group_name = policy["name"]
                     worker.allowed_job_types = frozenset(policy["job_types"])
-                    worker.display_name = f"{policy['name']} · {worker.worker_id + 1}"
+                    worker.display_name = _group_display_name(policy["name"], worker)
                     if index < desired:
                         worker._pending_removal = False
                         if worker.worker_type == "GPU":
@@ -1253,7 +1269,7 @@ class WorkerPool:
                     worker.group_name = policy["name"]
                     worker.group_resource = resource
                     worker.allowed_job_types = frozenset(policy["job_types"])
-                    worker.display_name = f"{policy['name']} · {worker.worker_id + 1}"
+                    worker.display_name = _group_display_name(policy["name"], worker)
                     self.workers.append(worker)
                     added += 1
             retiring = sum(w._pending_removal for w in self.workers)

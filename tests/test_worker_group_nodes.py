@@ -253,6 +253,17 @@ class TestReconcile:
         assert (worker_node_id(local), local.group_resource, local.ffmpeg_threads) == (None, "gpu:cuda:0", 3)
         assert pool._resource_targets == {"node:storage:gpu:cuda:0": 2, "node:storage:cpu": 1, "gpu:cuda:0": 1}
 
+    def test_job_log_names_a_node_worker_by_its_node_and_device_and_a_local_one_by_number(self, registry):
+        registry.put("storage", name="Storage box")
+        pool = WorkerPool(0, 0, LOCAL_GPU)
+        pool.reconcile_groups(node_groups(), LOCAL_GPU)
+        rows = by_member(pool)
+        gpu_group = rows["ngpu"][0].group_name
+        assert {w.display_name for w in rows["ngpu"]} == {f"{gpu_group} · Storage box/GPU{rows['ngpu'][0].gpu_index}"}
+        assert rows["ncpu"][0].display_name == f"{rows['ncpu'][0].group_name} · Storage box/CPU"
+        local = rows["lgpu"][0]
+        assert local.display_name == f"{local.group_name} · {local.worker_id + 1}"
+
     def test_node_gpu_with_the_same_device_string_does_not_share_the_local_budget(self, registry):
         registry.put("storage")
         pool = WorkerPool(0, 0, LOCAL_GPU)
