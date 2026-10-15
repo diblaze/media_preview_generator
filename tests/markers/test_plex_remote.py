@@ -38,7 +38,7 @@ from media_preview_generator.markers.publishers.plex_db import (
 )
 from media_preview_generator.markers.publishers.plex_remote import AgentError, RemotePlexDb, plex_database
 from media_preview_generator.markers.settings import ServerMarkersSettings
-from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
+from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, RELAY_LINE_MAX
 from media_preview_generator.servers.base import ServerConfig, ServerType
 
 T = MarkerType
@@ -473,6 +473,26 @@ class TestFailuresLookLikeTodays:
         remote, _ = _remote(_Cut(200, {}))
         report = remote.file_checks(deadline=_deadline())
         assert report.state is Capability.AGENT_UNAVAILABLE and "Can't reach" in report.message
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            lambda text: _refusal({"kind": "refused", "message": text}),
+            lambda text: _refusal({"kind": "protocol", "message": text}, protocols=(1, 2)),
+            lambda text: _envelope({}, version=text, protocols=(text,)),
+        ],
+        ids=["refusal-message", "protocol-refusal-message", "version-and-protocols"],
+    )
+    def test_what_the_node_says_reaches_the_app_as_one_short_line(self, answer):
+        # Its words go to the app's log and the job's file rows: line breaks or escapes there forge lines of the
+        # app's own, as worker nodes' words already can't (protocol.relayed_text).
+        said = "refused\n2026-10-16 | ERROR | forged\x1b[31m " + "x" * 20_000
+        remote, _ = _remote(answer(said))
+        with pytest.raises(PublishError) as raised:
+            remote.read_item(7, deadline=_deadline())
+        message = str(raised.value)
+        assert not any(c in message for c in "\n\x1b "), repr(message[:120])
+        assert len(message) <= RELAY_LINE_MAX + 200
 
 
 class TestWhatIsSent:

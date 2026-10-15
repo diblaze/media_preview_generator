@@ -22,7 +22,7 @@ from typing import Any
 import requests
 from loguru import logger
 
-from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER
+from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER, relayed_text
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
 from .base import Capability, CapabilityReport, DatabaseBusyError, ItemNotFoundError, PublishError, Shown
@@ -49,6 +49,8 @@ AGENT_PROTOCOL_NODE_UID = 2
 PROTOCOL_HEADER = "X-Marker-Agent-Protocol"
 # The oldest agent build this app works with. The agent's version is its own (its image tag), not the app's.
 MIN_AGENT_VERSION = "1.0.0"
+# A version or protocol list a node sends is a few characters; it is cut to this before it is quoted.
+AGENT_FIELD_MAX = 200
 # Seconds allowed for the TCP connect, and for the agent to answer after the deadline it was given has passed.
 CONNECT_TIMEOUT_S = 4.0
 ANSWER_GRACE_S = 3.0
@@ -461,7 +463,7 @@ def error_from_json(raw: Any) -> PublishError:
     """
     if not isinstance(raw, dict):
         return PublishError("The Plex database node refused this write without saying why")
-    message = str(raw.get("message") or "The Plex database node refused this write")
+    message = relayed_text(str(raw.get("message") or "The Plex database node refused this write"))
     state = None
     with_state = raw.get("state")
     if with_state:
@@ -857,7 +859,7 @@ class AgentClient:
         agent = advertised_agent if isinstance(advertised_agent, dict) else {}
         advertised = agent.get("capabilities")
         self.capabilities = advertised if isinstance(advertised, list) else []
-        self.version = str(agent.get("version") or "")
+        self.version = relayed_text(str(agent.get("version") or ""), AGENT_FIELD_MAX)
         advertised_protocols = agent.get("protocols")
         protocols = advertised_protocols if isinstance(advertised_protocols, list) else []
         if status_code == 401:
@@ -883,7 +885,7 @@ class AgentClient:
         if not speaks_ours or (self.version and agent_too_old(self.version)):
             self.state = AGENT_INCOMPATIBLE
             named = self.version or "unknown"
-            spoken = ", ".join(str(p) for p in protocols) or "another protocol"
+            spoken = relayed_text(", ".join(str(p) for p in protocols), AGENT_FIELD_MAX) or "another protocol"
             # Which side has to move. An agent this app knows to be too old is updated, and so is one that speaks
             # only older protocols than the one sent (from before the node id check); anything else that doesn't
             # speak it has moved past us, and telling the user to update it again would send them in a circle --
@@ -903,8 +905,11 @@ class AgentClient:
             # the same way, so this is the node's state, not one write's failure. Nothing ran.
             self.state = AGENT_INCOMPATIBLE
             raise AgentError(
-                str(
-                    error.get("message") or f"The Plex database node at {self.describe()} refused this app's protocol."
+                relayed_text(
+                    str(
+                        error.get("message")
+                        or f"The Plex database node at {self.describe()} refused this app's protocol."
+                    )
                 ),
                 state=Capability.AGENT_UNAVAILABLE,
             )
