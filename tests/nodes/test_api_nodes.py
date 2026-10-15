@@ -1293,6 +1293,23 @@ class TestBadAddresses:
         access = client.post(f"/api/nodes/{node_id}/test-access", json={})
         assert (access.status_code, access.get_json()) == (400, no_address)
 
+    @pytest.mark.parametrize("hand_written", [9494, None, "missing"])
+    def test_a_node_whose_key_written_by_hand_isnt_text_doesnt_fail_its_log_tab(self, client, nodes, hand_written):
+        import json
+
+        node_id = _add(client).get_json()["id"]
+        settings_file = Path(_sm().settings_file)
+        saved = json.loads(settings_file.read_text())
+        if hand_written == "missing":
+            del saved["nodes"][0]["key"]
+        else:
+            saved["nodes"][0]["key"] = hand_written
+        settings_file.write_text(json.dumps(saved))
+        _sm().reload()
+
+        assert client.get(f"/api/nodes/{node_id}/log").status_code < 500
+        assert client.post(f"/api/nodes/{node_id}/test-access", json={}).status_code < 500
+
 
 class TestTheSameMachineAddedTwice:
     def test_an_address_differing_only_in_letter_case_is_already_added(self, client, nodes):

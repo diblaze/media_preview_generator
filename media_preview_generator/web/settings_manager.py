@@ -142,6 +142,7 @@ class SettingsManager:
         named: list[str] = []
         switched_off: list[str] = []
         unaddressed: list[str] = []
+        unkeyed: list[str] = []
         seen: set[str] = set()
         for node in raw:
             if not isinstance(node, dict):
@@ -159,7 +160,10 @@ class SettingsManager:
             if not isinstance(node.get("url"), str):
                 node["url"] = ""
                 unaddressed.append(str(node.get("name") or node["id"]))
-        if not (named or switched_off or unaddressed):
+            if not isinstance(node.get("key"), str):
+                node["key"] = ""
+                unkeyed.append(str(node.get("name") or node["id"]))
+        if not (named or switched_off or unaddressed or unkeyed):
             return
         self._settings["nodes_revision"] = self.nodes_revision + 1
         if named:
@@ -178,6 +182,11 @@ class SettingsManager:
             logger.warning(
                 "The address of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
                 ", ".join(unaddressed),
+            )
+        if unkeyed:
+            logger.warning(
+                "The key of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
+                ", ".join(unkeyed),
             )
         try:
             self._save()
