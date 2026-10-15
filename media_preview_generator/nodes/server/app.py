@@ -31,6 +31,8 @@ LOG_DEFAULT_LINES = 200
 # How much of a protocol header that isn't this node's the refusal repeats back.
 PROTOCOL_ECHO_MAX = 32
 EXTENSION = "mpg_node"
+# ``app.config`` key: how many requests the server in front of the app serves at once (``wsgi.create_node_server``).
+SERVER_THREADS = "MPG_NODE_SERVER_THREADS"
 # ``FILE__NODE_KEY=/run/secrets/node_key`` sets NODE_KEY to that file's contents (linuxserver's way to pass secrets).
 FILE_ENV_PREFIX = "FILE__"
 # Read before the node starts (the image's init and wrapper.sh; Python itself reads TZ), so a FILE__ file can't set

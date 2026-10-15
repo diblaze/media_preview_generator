@@ -25,7 +25,15 @@ from loguru import logger
 from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
-from .base import Capability, CapabilityReport, DatabaseBusyError, ItemNotFoundError, PublishError, Shown
+from .base import (
+    Capability,
+    CapabilityReport,
+    DatabaseBusyError,
+    ItemNotFoundError,
+    PublishError,
+    Shown,
+    wait_cancelled,
+)
 from .plex_db import (
     ItemRead,
     LocalPlexDb,
@@ -36,6 +44,7 @@ from .plex_db import (
     ShownBatch,
     WriteRequest,
     WriteResult,
+    report_of_failure,
 )
 
 # The wire contract. Bumped only when a request or answer changes shape; an agent says which protocols it implements
@@ -56,6 +65,10 @@ ANSWER_GRACE_S = 3.0
 # it has (the items left are simply unread, exactly as a cancelled local read-back leaves them).
 READ_BACK_CHUNK = 50
 READ_BACK_BUDGET_S = 60.0
+# How long this app waits before asking a full Plex database node again (``NodeFullError``).
+NODE_FULL_RETRY_S = 0.5
+# The body fields that say how long the node may wait for the database; a request asked again sends what is left.
+_WAIT_FIELDS = ("deadline_s", "budget_s")
 # The most of one answer this app reads. Library Health's rows for a whole large library are the largest answer (each
 # media part's extra_data, a few KB): hundreds of MB at most. Answers are never compressed, so a small reply can't
 # expand into gigabytes here.
@@ -89,6 +102,16 @@ class AgentUnreachableError(AgentError):
 
     Its state stays ``AGENT_UNAVAILABLE``, which the Edit tab and Setup Health explain; a feature that waits for a
     database it can't reach (loudness) tells this one apart from a refusal by its type.
+    """
+
+
+class NodeFullError(DatabaseBusyError):
+    """The Plex database node ran nothing: as many of its requests as it lets wait for Plex's database already do.
+
+    It answers at once rather than tie up one more of its threads (``nodes.server.plex_db``), so its health check and
+    a worker node's task polls keep being answered while Plex keeps its database locked. ``AgentClient.post`` asks
+    again until the request's own wait is used up, then raises it like any busy database: the file is tried again.
+    An app from before it reads the same answer as a plain busy database.
     """
 
 
@@ -443,11 +466,14 @@ def error_to_json(exc: PublishError) -> dict:
             "message": str(exc),
             "state": exc.state.value if exc.state else None,
         }
-    return {
+    answer = {
         "kind": next((name for cls, name in _ERROR_KINDS.items() if isinstance(exc, cls)), "publish"),
         "message": str(exc),
         "state": exc.state.value if exc.state else None,
     }
+    if isinstance(exc, NodeFullError):
+        answer["node_full"] = True
+    return answer
 
 
 def error_from_json(raw: Any) -> PublishError:
@@ -477,8 +503,20 @@ def error_from_json(raw: Any) -> PublishError:
         from ...loudness.plex_db import SourceChangedError
 
         return SourceChangedError(message, state=state)
+    if raw.get("kind") == "busy" and raw.get("node_full") is True:
+        return NodeFullError(message, state=state)
     kind = next((cls for cls, name in _ERROR_KINDS.items() if raw.get("kind") == name), PublishError)
     return kind(message, state=state)
+
+
+def _time_left(body: dict) -> float:
+    """How long a request's body lets the node wait for the database (its longest wait field), or 0."""
+    return max((float(body[name]) for name in _WAIT_FIELDS if type(body.get(name)) in (int, float)), default=0.0)
+
+
+def _with_time_left(body: dict, left: float) -> dict:
+    """``body`` asked again with ``left`` seconds of wait at most."""
+    return {**body, **{name: min(body[name], left) for name in _WAIT_FIELDS if type(body.get(name)) in (int, float)}}
 
 
 # --------------------------------------------------------------------------- transport
@@ -702,9 +740,22 @@ class AgentClient:
         Raises:
             AgentUnreachableError: The agent didn't answer.
             AgentError: The agent refused the key, or speaks another protocol.
+            NodeFullError: The node stayed full for as long as the body lets it wait (it is asked again until then).
             PublishError: The agent ran the request and it was refused (the original exception, rebuilt).
         """
-        return self._send(self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable)
+        # A full node gives back the wait it would have spent on one of its threads: this app spends it instead,
+        # asking again with what is left, and stops asking once the job is cancelled.
+        give_up = time.monotonic() + _time_left(body)
+        while True:
+            try:
+                return self._send(self._session.post, path, {"json": body}, timeout=timeout, unreachable=unreachable)
+            except NodeFullError:
+                if give_up - time.monotonic() <= NODE_FULL_RETRY_S or wait_cancelled():
+                    raise
+                time.sleep(NODE_FULL_RETRY_S)
+            left = max(0.0, give_up - time.monotonic())
+            body = _with_time_left(body, left)
+            timeout = min(timeout, left + ANSWER_GRACE_S)
 
     def ping(self, *, timeout: float) -> dict:
         """Read advertised optional capabilities before sending their typed operations."""
@@ -984,6 +1035,18 @@ class RemotePlexDb(PlexDatabase):
     def _with_agent(self, report: CapabilityReport) -> CapabilityReport:
         return CapabilityReport(report.state, report.message, {**report.details, "agent": self.agent_details()})
 
+    def _failed_check(self, exc: PublishError) -> CapabilityReport:
+        """The report of a check the node couldn't run.
+
+        A node that stayed full is a busy database (``db_busy``), and one that didn't answer, or that is held until a
+        check hears its id (``node_refusal``), is work that waits for it (``node_waits``). A job reuses neither for
+        its next files: a check may confirm the node seconds later.
+        """
+        report = report_of_failure(exc, Capability.AGENT_UNAVAILABLE)
+        if isinstance(exc, AgentUnreachableError):
+            report = CapabilityReport(report.state, report.message, {**report.details, "node_waits": True})
+        return self._with_agent(report)
+
     def file_checks(self, *, deadline: float) -> CapabilityReport:
         """Ask the agent to check the database file on its own machine.
 
@@ -1000,7 +1063,7 @@ class RemotePlexDb(PlexDatabase):
             self._client.machine_identifier = str(result.get("machine_identifier") or "")
             return self._with_agent(report_from_json(result.get("report")))
         except PublishError as exc:
-            return self._with_agent(CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc)))
+            return self._failed_check(exc)
         except ValueError as exc:
             logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)
             return self._with_agent(
@@ -1024,7 +1087,7 @@ class RemotePlexDb(PlexDatabase):
             result = self._client.post("/v1/checks/db", {"deadline_s": remaining}, timeout=remaining + ANSWER_GRACE_S)
             return self._with_agent(report_from_json(result.get("report")))
         except PublishError as exc:
-            return self._with_agent(CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc)))
+            return self._failed_check(exc)
         except ValueError as exc:
             logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)
             return self._with_agent(

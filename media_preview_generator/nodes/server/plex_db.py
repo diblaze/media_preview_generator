@@ -31,23 +31,27 @@ Import-light on purpose: Flask, loguru and the app's ``markers/publishers``, ``l
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 import time
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
-from flask import Blueprint, Flask, abort, jsonify, request
+from flask import Blueprint, Flask, Response, abort, current_app, g, jsonify, request
 from loguru import logger
 
-from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY, read_rows, section_ids_from_json
+from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY, query_rows, section_ids_from_json
 from ...loudness import plex_db as loudness_db
 from ...loudness.guard import LoudnessPlexDb
 from ...markers.fs import filesystem_type, is_network_filesystem, mount_of, mount_root
 from ...markers.publishers import plex_remote
-from ...markers.publishers.base import Capability, PublishError
+from ...markers.publishers.base import NEXT_RUN, Capability, PublishError
 from ...markers.publishers.plex_chapters import (
     CHAPTER_CAPABILITY,
     LocalChapters,
@@ -61,6 +65,7 @@ from ...markers.publishers.plex_db import (
     publish_error_from_sqlite,
 )
 from ..protocol import KIND_PROTOCOL, KIND_RATE_LIMITED, KIND_WRONG_NODE, NODE_UID_HEADER, sendable_key, whole_number
+from .app import SERVER_THREADS
 from .identity import wrong_key_limit
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
@@ -83,6 +88,14 @@ LOUDNESS_MAX_PATHS = 64
 MAX_PATH_CHARS = 32768
 LOUDNESS_OPERATIONS = frozenset({"file_checks", "check", "streams", "snapshot", "write", "mark"})
 DEFAULT_PORT = 9494
+# Each request here can wait minutes for Plex's database on one of the server's threads (a nightly Optimize or a big
+# scan holds its write lock), so at most half the threads run them: the rest keep the node's health check, the app's
+# checks and a worker node's task polls answered. A request that finds them all taken waits for one only while the
+# longest-running has run under SLOT_WAIT_S (a burst of quick ones); past that they are stuck on the database, and it
+# is answered "full" at once (``plex_remote.NodeFullError``): the app waits and asks again, holding none of ours.
+SLOT_WAIT_S = 2.0
+# Library Health's rows go out in pieces of about this many characters, as they are read (``_streamed_rows``).
+ROWS_CHUNK_CHARS = 64 * 1024
 
 _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
@@ -202,6 +215,44 @@ def agent_block() -> dict:
     return {"version": AGENT_VERSION, "protocols": list(PROTOCOLS), "capabilities": list(CAPABILITIES)}
 
 
+class RequestSlots:
+    """The role's requests running now, held under a limit (see ``SLOT_WAIT_S``)."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._started: dict[object, float] = {}
+
+    def take(self, limit: int | None) -> object | None:
+        """A slot for one request, or None when the node is full.
+
+        Args:
+            limit: How many may run at once; None: no limit.
+
+        Returns:
+            The slot to give back once the request is answered, or None.
+        """
+        with self._changed:
+            while limit is not None and len(self._started) >= limit:
+                left = min(self._started.values()) + SLOT_WAIT_S - time.monotonic()
+                if left <= 0:
+                    return None
+                self._changed.wait(left)
+            slot = object()
+            self._started[slot] = time.monotonic()
+            return slot
+
+    def give_back(self, slot: object) -> None:
+        """Free a slot :meth:`take` handed out."""
+        with self._changed:
+            self._started.pop(slot, None)
+            self._changed.notify()
+
+
+def slot_limit(threads: Any) -> int | None:
+    """How many of this role's requests may run at once on a server with ``threads`` threads (None: not known)."""
+    return max(1, threads // 2) if type(threads) is int and threads > 0 else None
+
+
 def info_block(plex_config_dir: str | None = None) -> dict:
     """The role's part of the node's ``/v1/info``: which folder it serves, whether the database is there, which Plex.
 
@@ -249,6 +300,55 @@ def _refused(exc: PublishError) -> Any:
 
 def _bad_request(message: str) -> Any:
     return jsonify({"ok": False, "agent": agent_block(), "error": {"kind": "request", "message": message}}), 400
+
+
+def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Iterator[str]:
+    """Library Health's answer (``{"ok", "agent", "result": {"rows", "capability"}}``), in pieces as rows are read.
+
+    The capability comes last: a read that fails partway, after the answer's status went out, ends the answer
+    without it, which the app reads as an answer it can't use rather than as a library with fewer files.
+    """
+
+    def dumps(value: Any) -> str:
+        return json.dumps(value, separators=(",", ":"))
+
+    out = [dumps({"ok": True, "agent": agent_block()})[:-1], ',"result":{"rows":{']
+    size = 0
+    try:
+        for number, (key, rows) in enumerate(queries.items()):
+            out.append(f"{',' if number else ''}{dumps(key)}:[")
+            for index, row in enumerate(rows):
+                piece = dumps(list(row))
+                out.append(f",{piece}" if index else piece)
+                size += len(piece)
+                if size >= ROWS_CHUNK_CHARS:
+                    yield "".join(out)
+                    out, size = [], 0
+            out.append("]")
+        out.append(f'}},"capability":{dumps(LIBRARY_HEALTH_CAPABILITY)}}}}}')
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        logger.warning("Library Health's rows stopped partway: {}", exc)
+        out.append("]}}}")
+    yield "".join(out)
+
+
+class _ClosingAnswer:
+    """A streamed answer that lets go of what it holds (``held``) once it is sent, or once it never will be."""
+
+    def __init__(self, pieces: Iterator[str], held: contextlib.ExitStack) -> None:
+        self._pieces = pieces
+        self._held = held
+
+    def __iter__(self) -> Iterator[str]:
+        return self._pieces
+
+    def close(self) -> None:
+        # The server calls this on the thread that iterated, which is the one that opened the connection (its lock
+        # is per thread), whether or not the answer was sent.
+        try:
+            self._pieces.close()  # type: ignore[attr-defined]
+        finally:
+            self._held.close()
 
 
 def _deadline(body: dict, key: str = "deadline_s", limit: float = MAX_DEADLINE_S) -> float:
@@ -373,6 +473,7 @@ def register_plex_db(
     chapters = LocalChapters(folder, mountinfo_path=mountinfo_path)
     bp = Blueprint("plex_db", __name__)
     wrong_keys = wrong_key_limit(app)
+    slots = RequestSlots()
 
     def authorised(caller: str) -> bool:
         header = request.headers.get("Authorization", "")
@@ -444,7 +545,25 @@ def register_plex_db(
             body = None
         if not isinstance(body, dict):
             return _bad_request("The request body must be a JSON object")
+        if request.path == "/v1/ping":
+            return None  # it never opens the database
+        limit = slot_limit(current_app.config.get(SERVER_THREADS))
+        slot = slots.take(limit)
+        if slot is None:
+            message = (
+                f"Plex's database is busy: {limit} requests on the Plex database node are waiting for it already; "
+                f"{NEXT_RUN}"
+            )
+            answer, status = _refused(plex_remote.NodeFullError(message, state=Capability.UNREACHABLE))
+            return answer, status, {"Retry-After": "1"}
+        g.plex_db_slot = slot
         return None
+
+    @bp.teardown_request
+    def _give_back_slot(_exc: BaseException | None) -> None:
+        slot = g.pop("plex_db_slot", None)
+        if slot is not None:
+            slots.give_back(slot)
 
     @bp.get("/v1/ping")
     def ping() -> Any:
@@ -668,14 +787,23 @@ def register_plex_db(
         problem = _not_on_a_local_disk(os.path.realpath(plex_db_path(folder)), mountinfo_path)
         if problem:
             return _refused(PublishError(problem, state=Capability.NEEDS_LOCAL_DB))
+        held = contextlib.ExitStack()
         try:
-            with database._database(read_only=True, deadline=_deadline(body)) as conn:
-                rows = read_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+            conn = held.enter_context(database._database(read_only=True, deadline=_deadline(body)))
         except PublishError as exc:
+            held.close()
             return _refused(exc)
         except sqlite3.Error as exc:
+            held.close()
             return _refused(publish_error_from_sqlite(exc))
-        return _ok({"capability": LIBRARY_HEALTH_CAPABILITY, "rows": rows})
+        # The rows go out as they are read, in one read of the database: a big library's rows held at once (and
+        # their JSON) took a node past its memory limit. The connection and this request's slot stay held until the
+        # answer is sent or the app hangs up.
+        slot = g.pop("plex_db_slot", None)
+        if slot is not None:
+            held.callback(slots.give_back, slot)
+        queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+        return Response(_ClosingAnswer(_streamed_rows(queries), held), mimetype="application/json")
 
     app.register_blueprint(bp)
     logger.info("Plex database role {} ready; Plex database: {}", AGENT_VERSION, plex_db_path(folder))
