@@ -8,7 +8,8 @@ import json
 import os
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -66,6 +67,14 @@ _MARKERS_CHECK_SERVERS_DAILY = "__markers_check_servers_daily"
 # strings — keep these literal so a typo in the JS payload can't slip
 # through to a silent no-op.
 _QUIET_HOURS_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _saved_stop_hm(schedule: dict) -> tuple[int, int] | None:
+    """A saved schedule's daily stop time as ``(hour, minute)``; None when it has none or it doesn't parse."""
+    try:
+        return _parse_hhmm(str(schedule.get("stop_time") or ""))
+    except ValueError:
+        return None  # Tolerate bad on-disk data.
 
 
 def normalise_quiet_hours(raw: dict | None) -> dict:
@@ -1460,11 +1469,7 @@ class ScheduleManager:
                 "if the next load fails, run `chown` on the host."
             )
 
-        # Reload so APScheduler picks up the restored crons immediately.
-        with self._lock:
-            self._schedules = {}
-            self._load_status = {"status": "ok"}
-            self._load_schedules()
+        self.reload_schedules()
 
         return {
             "status": "ok",
@@ -1472,6 +1477,49 @@ class ScheduleManager:
             "restored_count": len(self._schedules),
             "chown": chown_result,
         }
+
+    @contextmanager
+    def locked(self) -> Iterator["ScheduleManager"]:
+        """Hold the schedules lock, so no save writes the in-memory schedules over ``schedules.json`` meanwhile.
+
+        Take it before the settings lock, never while holding it: a save takes this lock, then the settings one (its
+        backup trim reads ``config_backup_keep``).
+
+        Yields:
+            This schedule manager.
+        """
+        with self._lock:
+            yield self
+
+    def reload_schedules(self) -> None:
+        """Run the schedules in ``schedules.json`` instead of the ones in memory, once the file was replaced.
+
+        Loading registers each enabled schedule's crons again; the start and stop crons of schedules the file drops or
+        has switched off, and stop crons it no longer sets, are removed here. As at start-up, nothing is removed when
+        the file can't be read: the empty list would wipe every schedule's cron.
+        """
+        with self._lock:
+            self._schedules = {}
+            self._load_status = {"status": "ok"}
+            self._load_schedules()
+            if self._load_status.get("status") != "ok":
+                return
+            try:
+                jobs = self.scheduler.get_jobs()
+            except Exception:
+                logger.warning("Could not list scheduler jobs to drop those of the replaced schedules", exc_info=True)
+                return
+            for job in jobs:
+                if job.func not in (execute_scheduled_job, execute_schedule_stop):
+                    continue
+                schedule = self._schedules.get(job.id.removesuffix("__stop"))
+                if schedule is not None and schedule.get("enabled"):
+                    if job.func is execute_scheduled_job or _saved_stop_hm(schedule) is not None:
+                        continue
+                try:
+                    self.scheduler.remove_job(job.id)
+                except Exception:
+                    logger.debug("Could not remove scheduler job {} of a replaced schedule", job.id, exc_info=True)
 
     def _reregister_loaded_schedules(self) -> None:
         """Re-register every enabled in-memory schedule with APScheduler (D30).
@@ -1547,13 +1595,8 @@ class ScheduleManager:
                         sched.get("name") or sched_id,
                         exc,
                     )
-                # Re-register the daily stop-cron (D20) if configured. _parse_hhmm
-                # returns None for empty/blank, in which case we skip silently.
-                stop_time = str(sched.get("stop_time") or "")
-                try:
-                    stop_hm = _parse_hhmm(stop_time)
-                except ValueError:
-                    stop_hm = None  # tolerate bad on-disk data
+                # Re-register the daily stop-cron (D20) if configured.
+                stop_hm = _saved_stop_hm(sched)
                 if stop_hm is not None:
                     self._register_stop_job(sched_id, stop_hm)
                 registered += 1

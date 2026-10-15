@@ -6963,6 +6963,78 @@ class TestBackupRestore:
                 contents.append(json.load(f)["log_retention_count"])
         assert 7 in contents  # The snapshot to undo the restore with.
 
+    def test_a_restored_schedules_backup_is_what_the_scheduler_then_runs(self, client):
+        """The schedule manager keeps the schedules and their crons in memory: after a restore it must list and run
+        the restored set (crons added, moved and removed to match it), and the next save must keep that set."""
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        def create(name: str, **body) -> str:
+            resp = client.post("/api/schedules", headers=_api_headers(), json={"name": name, **body})
+            assert resp.status_code == 201, resp.get_json()
+            return resp.get_json()["id"]
+
+        def names() -> list[str]:
+            listed = client.get("/api/schedules", headers=_api_headers()).get_json()["schedules"]
+            return sorted(s["name"] for s in listed)
+
+        kept = create("Kept", cron_expression="0 3 * * *", stop_time="07:00")
+        off_later = create("Off later", interval_minutes=60)
+        on_later = create("On later", cron_expression="0 1 * * *", enabled=False)
+        create("Oops", interval_minutes=30)
+        manager = get_schedule_manager()
+        with open(manager.schedules_file) as f:
+            schedules = json.load(f)["schedules"]
+        schedules[kept].update(trigger_value="0 2 * * *", stop_time="")
+        schedules[off_later]["enabled"] = False
+        schedules[on_later].update(enabled=True, stop_time="05:00")
+        backup = "schedules.json.20260101-100000.bak"
+        with open(os.path.join(manager.config_dir, backup), "w") as f:
+            json.dump({"schedules": {k: schedules[k] for k in (kept, off_later, on_later)}}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "schedules.json", "backup": backup},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert names() == ["Kept", "Off later", "On later"]
+        jobs = {job.id: job for job in manager.scheduler.get_jobs() if not job.id.startswith("__")}
+        assert set(jobs) == {kept, on_later, f"{on_later}__stop"}
+        assert {field.name: str(field) for field in jobs[kept].trigger.fields}["hour"] == "2"
+        create("After", interval_minutes=15)
+        with open(manager.schedules_file) as f:
+            saved = sorted(s["name"] for s in json.load(f)["schedules"].values())
+        assert saved == ["After", "Kept", "Off later", "On later"]
+
+    def test_a_restored_webhook_history_backup_is_what_the_webhooks_page_then_shows(self, client, monkeypatch):
+        """The webhook history is read into memory once at start-up: after a restore it must show the restored
+        events, and the next webhook must add to them, not write the replaced ones back."""
+        from collections import deque
+
+        from media_preview_generator.web import webhooks
+
+        monkeypatch.setattr(webhooks, "_webhook_history", deque(maxlen=webhooks._HISTORY_MAX))
+        webhooks._add_history_entry(source="sonarr", event_type="Download", title="Kept", status="queued")
+        live = str(webhooks._history_file_path())
+        backup = "webhook_history.json.20260101-100000.bak"
+        with open(live) as src, open(os.path.join(os.path.dirname(live), backup), "w") as dst:
+            dst.write(src.read())
+        webhooks._add_history_entry(source="sonarr", event_type="Download", title="Oops", status="queued")
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "webhook_history.json", "backup": backup},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        events = client.get("/api/webhooks/history", headers=_api_headers()).get_json()["events"]
+        assert [e["title"] for e in events] == ["Kept"]
+        webhooks._add_history_entry(source="sonarr", event_type="Download", title="Next", status="queued")
+        with open(live) as f:
+            assert [e["title"] for e in json.load(f)] == ["Kept", "Next"]
+
     HELPER_URL = "http://plex-host.lan:9494"
     HELPER_KEY = "helper-key-123456"
 

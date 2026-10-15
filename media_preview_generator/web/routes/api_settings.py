@@ -1866,6 +1866,10 @@ def restore_backup():
     newest available backup (timestamped or legacy) is restored.
     """
     import shutil
+    from contextlib import nullcontext
+
+    from ..scheduler import get_schedule_manager
+    from ..webhooks import _load_history_from_disk
 
     data = _json_object()
     name = (data.get("file") or "").strip()
@@ -1896,14 +1900,16 @@ def restore_backup():
     if refusal:
         return jsonify({"success": False, "error": refusal}), 409
 
-    # The manager keeps its settings in memory, so it must re-read the restored file under its lock; otherwise
-    # the next save of anything would write the old in-memory content back over the restore.
+    # Each file's owner keeps it in memory, so it must re-read the restored file (under its lock where it has one);
+    # otherwise the next save would write the old in-memory content back over the restore.
     settings = get_settings_manager()
+    schedules = get_schedule_manager() if name == "schedules.json" else None
     tmp_path = f"{live}.restore.tmp"
     replaced = False
     failure = None
     try:
-        with settings.locked():
+        # The schedules lock first: a schedule save takes it, then the settings lock.
+        with schedules.locked() if schedules is not None else nullcontext(), settings.locked():
             live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
             # Copied before the snapshot: trimming the backups to the number kept (or by age) can delete this one.
             shutil.copy2(bak_path, tmp_path)
@@ -1915,6 +1921,10 @@ def restore_backup():
                 _bring_restored_settings_up_to_date(settings, live_revisions)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
+            elif schedules is not None:
+                schedules.reload_schedules()
+            elif name == "webhook_history.json":
+                _load_history_from_disk()
     except Exception as exc:
         if not replaced:
             failure = str(exc) if isinstance(exc, OSError) else f"Restore failed: {exc}"
