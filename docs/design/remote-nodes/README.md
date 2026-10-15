@@ -37,8 +37,8 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     the node never took don't count toward the two-drop limit (max 5 per file). Retries prefer another worker.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
-  - Test access results persist in `node_access_results.json` until that node's mappings change. A test of rows
-    not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
+  - Test access results persist in `node_access_results.json` until that node's address, key or mappings change.
+    A test of rows not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
   - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
     restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating; named in the Settings

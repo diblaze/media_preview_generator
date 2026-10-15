@@ -1,10 +1,12 @@
 """The last Test access result of each node, kept across restarts so Setup Health doesn't ask for a new test.
 
 One small JSON file beside ``settings.json`` (``node_access_results.json``), not inside it: a test runs often and its
-result is a cache of what the node saw, not a setting. Each entry keeps the mappings it was tested with; an entry for
-other mappings than the node's saved ones is never handed out, so changing a node's mappings invalidates its result.
+result is a cache of what the node saw, not a setting. Each entry keeps the address and mappings it was tested with;
+an entry for another address (another machine) or other mappings than the node's saved ones is never handed out, so
+changing either invalidates its result.
 
-``{"<node id>": {"mappings": [{"app_prefix", "node_prefix"}], "checked_at": epoch seconds, "result": {...}}}``
+``{"<node id>": {"url": address, "mappings": [{"app_prefix", "node_prefix"}], "checked_at": epoch seconds,
+"result": {...}}}``
 """
 
 from __future__ import annotations
@@ -77,24 +79,33 @@ class AccessResultStore:
                 pass
             raise
 
-    def load(self, node_id: str, mappings: object) -> tuple[dict, float | None] | None:
-        """The node's saved result and when it ran, when it was tested with exactly ``mappings``; else None.
+    def load(self, node_id: str, url: str, mappings: object) -> tuple[dict, float | None] | None:
+        """The node's saved result and when it ran, when it was tested at ``url`` with exactly ``mappings``; else
+        None.
 
         Args:
             node_id: The node.
+            url: Its saved address.
             mappings: Its saved ``path_mappings`` rows.
         """
         with self._lock:
             entry = self._read().get(node_id)
         if not isinstance(entry, dict) or not isinstance(entry.get("result"), dict):
             return None
-        if entry.get("mappings") != _mapping_key(mappings):
+        if entry.get("url") != url or entry.get("mappings") != _mapping_key(mappings):
             return None
         checked_at = entry.get("checked_at")
         return entry["result"], float(checked_at) if isinstance(checked_at, int | float) else None
 
     def save(
-        self, node_id: str, mappings: object, result: dict, checked_at: float, *, keep: Collection[str] = ()
+        self,
+        node_id: str,
+        url: str,
+        mappings: object,
+        result: dict,
+        checked_at: float,
+        *,
+        keep: Collection[str] = (),
     ) -> None:
         """Remember ``result`` for the node; entries for nodes not in ``keep`` (removed nodes) are dropped.
 
@@ -102,6 +113,7 @@ class AccessResultStore:
 
         Args:
             node_id: The node.
+            url: The address it was tested at.
             mappings: The ``path_mappings`` rows it was tested with.
             result: ``{"libraries": [...]}``.
             checked_at: Epoch seconds.
@@ -109,19 +121,25 @@ class AccessResultStore:
         """
         with self._lock:
             data = {k: v for k, v in self._read().items() if k in keep or k == node_id}
-            data[node_id] = {"mappings": _mapping_key(mappings), "checked_at": checked_at, "result": result}
+            data[node_id] = {
+                "url": url,
+                "mappings": _mapping_key(mappings),
+                "checked_at": checked_at,
+                "result": result,
+            }
             try:
                 self._write(data)
             except OSError as exc:
                 logger.warning("Couldn't save the Test access result of node {}: {}", node_id, exc)
 
-    def forget(self, node_id: str, *, keep_mappings: object = None) -> None:
-        """Drop the node's saved result (its mappings changed).
+    def forget(self, node_id: str, *, keep_url: str | None = None, keep_mappings: object = None) -> None:
+        """Drop the node's saved result (its address or mappings changed).
 
         Args:
             node_id: The node.
-            keep_mappings: The node's new ``path_mappings``: a result already saved for exactly these (a test that
-                finished before this ran) is kept.
+            keep_url: The node's address, when only its mappings changed.
+            keep_mappings: The node's new ``path_mappings``: a result already saved at ``keep_url`` for exactly these
+                (a test that finished before this ran) is kept.
         """
         with self._lock:
             data = self._read()
@@ -131,6 +149,7 @@ class AccessResultStore:
             if (
                 keep_mappings is not None
                 and isinstance(entry, dict)
+                and entry.get("url") == keep_url
                 and entry.get("mappings") == _mapping_key(keep_mappings)
             ):
                 return
