@@ -413,6 +413,16 @@ def _readers() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == "credits-frames"]
 
 
+def _frames_refused(stream: str) -> str:
+    """``stream``'s listing, then the GPU-side filter refusing its frames before one is written (exit 218)."""
+    return (
+        f"  {stream}\n"
+        "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' "
+        "and the filter 'auto_scale_0'\n"
+        "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n"
+    )
+
+
 class TestReadFrames:
     def test_the_end_marker_waits_for_room_however_slow_the_consumer_is(self, monkeypatch):
         # Directly pins the reader's half of the end-of-stream contract: with a queue too small for the stream and a
@@ -623,38 +633,87 @@ class TestRunDecode:
         "Conversion failed!\n"
     )
 
+    PRORES_STREAM = (
+        "Stream #0:0[0x1]: Video: prores (4444) (ap4h / 0x68347061), yuv444p12le(progressive), 640x360, 9427 kb/s"
+    )
+    H264_STREAM = "Stream #0:0(eng): Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, 23.98 fps"
+
     @pytest.mark.parametrize(
-        ("exit_code", "stderr", "message", "kind"),
+        ("exit_code", "hwaccel", "stderr", "message", "kind"),
         [
             # No exit code after the decoder's verdict: a run stopped at it would say the kill's.
-            (69, AV1_ON_A_GPU_WITHOUT_AV1, "the GPU can't decode this file's AV1 video", "codec"),
+            (69, "cuda", AV1_ON_A_GPU_WITHOUT_AV1, "the GPU can't decode this file's AV1 video", "codec"),
             (
                 69,
+                "cuda",
                 "[h264 @ 0x1] Decode error rate 1 exceeds maximum 0.666667\nConversion failed!\n",
                 "the GPU can't decode this file's video (ffmpeg exited 69)",
                 "codec",
             ),
             (
                 251,
+                "vaapi",
                 "[hevc @ 0x1] Failed to sync surface 0x5 (operation failed).\n"
                 "[vist#0:0/hevc @ 0x2] Decoding error: Input/output error\nConversion failed!\n",
                 "the GPU's decoder hit a hardware or driver error (ffmpeg exited 251)",
                 "hwaccel",
             ),
-            (218, H264_HI10P_ON_NVDEC, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
-            (218, H264_HIGH_444_ON_VAAPI, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
             (
                 218,
+                "cuda",
+                H264_HI10P_ON_NVDEC,
+                "the GPU can't decode this file's H.264 video (ffmpeg exited 218)",
+                "codec",
+            ),
+            (
+                218,
+                "vaapi",
+                H264_HIGH_444_ON_VAAPI,
+                "the GPU can't decode this file's H.264 video (ffmpeg exited 218)",
+                "codec",
+            ),
+            (
+                218,
+                "cuda",
                 # The GPU decoded these frames: its filter chain refused them, not a codec it lacks.
-                "  Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160\n"
-                "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' "
-                "and the filter 'auto_scale_0'\n"
-                "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n",
+                _frames_refused(
+                    "Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160"
+                ),
+                "the GPU's decoder hit a hardware or driver error (ffmpeg exited 218)",
+                "hwaccel",
+            ),
+            # FFmpeg has no ProRes decoder on NVDEC or VAAPI: it decoded in software without a word.
+            (
+                218,
+                "cuda",
+                _frames_refused(PRORES_STREAM),
+                "the GPU can't decode this file's ProRes video (ffmpeg exited 218)",
+                "codec",
+            ),
+            (
+                218,
+                "vaapi",
+                _frames_refused(PRORES_STREAM),
+                "the GPU can't decode this file's ProRes video (ffmpeg exited 218)",
+                "codec",
+            ),
+            (
+                218,
+                "cuda",
+                _frames_refused(H264_STREAM),
                 "the GPU's decoder hit a hardware or driver error (ffmpeg exited 218)",
                 "hwaccel",
             ),
             (
                 218,
+                "vaapi",
+                _frames_refused(H264_STREAM),
+                "the GPU's decoder hit a hardware or driver error (ffmpeg exited 218)",
+                "hwaccel",
+            ),
+            (
+                218,
+                "cuda",
                 "[h264 @ 0x1] Failed to create decode context: 2 (resource allocation failed).\n"
                 "[h264 @ 0x1] Failed setup for format cuda: hwaccel initialisation returned error.\n"
                 "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n",
@@ -663,6 +722,7 @@ class TestRunDecode:
             ),
             (
                 251,
+                "vaapi",
                 "[matroska,webm @ 0x1] Read error at pos. 5234901 (0x4fe0d5)\n"
                 "[in#0/matroska,webm @ 0x2] Error during demuxing: Input/output error\nConversion failed!\n",
                 "ffmpeg couldn't read the file (an I/O error, ffmpeg exited 251); if this keeps happening, check the "
@@ -671,6 +731,7 @@ class TestRunDecode:
             ),
             (
                 3,
+                "cuda",
                 "[Parsed_scale_0 @ 0x1] Error while filtering: Cannot allocate memory\nConversion failed!\n",
                 "ffmpeg exited 3 decoding Movie.mkv on the GPU: Error while filtering: Cannot allocate memory",
                 None,
@@ -683,17 +744,22 @@ class TestRunDecode:
             "codec-h264-profile-the-gpu-lacks",
             "codec-h264-profile-vaapi-has-no-decoder-for",
             "hwaccel-gpu-decoded-frames-the-filters-refuse",
+            "codec-prores-nvdec-has-no-decoder-for",
+            "codec-prores-vaapi-has-no-decoder-for",
+            "hwaccel-h264-frames-refused-on-nvdec",
+            "hwaccel-h264-frames-refused-on-vaapi",
             "hwaccel-init-failed-without-that-verdict",
             "io-error",
             "anything-else",
         ],
     )
-    def test_a_gpu_failure_names_the_cause_previews_gives_it(self, exit_code, stderr, message, kind):
+    def test_a_gpu_failure_names_the_cause_previews_gives_it(self, exit_code, hwaccel, stderr, message, kind):
         # The worker's CPU rerun shows this as its reason: the last 300 characters of stderr said "inating thread with
         # return code -22 ... Conversion failed!" for a GPU that can't decode AV1.
         with pytest.raises(GpuDecodeError) as excinfo:
             frames.run_decode(
-                fake_ffmpeg([], [], exit_code=exit_code, stderr_tail=stderr),
+                # The GPU in the command (``decode_command``) decides which codecs it decodes; python ignores it.
+                [*fake_ffmpeg([], [], exit_code=exit_code, stderr_tail=stderr), "-hwaccel", hwaccel],
                 hw_active=True,
                 pts_offset_s=0.0,
                 detect_boxes=lambda p: [()] * len(p),

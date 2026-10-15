@@ -368,8 +368,9 @@ class TestACodecTheGpuHasNoDecoderFor:
 
     Captured with the app's own preview command and FFmpeg 8.1.2 on an Intel UHD 770 (VAAPI, iHD 26.1.5) and a
     Quadro P5000 (NVDEC). VAAPI never prints NVDEC's "Hardware is lacking required capabilities". For a codec FFmpeg
-    has no GPU decoder for at all (DivX 3, WMV, H.264 4:2:2 or 4:4:4 on VAAPI) it says nothing, decodes in software
-    and the GPU scaler refuses the frames: that run used to fail the file outright instead of retrying it on the CPU.
+    has no decoder for on that GPU (DivX 3, WMV, ProRes on NVDEC or VAAPI, H.264 4:2:2 or 4:4:4 on VAAPI) it says
+    nothing, decodes in software and the GPU scaler refuses the frames: that run used to fail the file outright instead
+    of retrying it on the CPU.
     """
 
     @pytest.mark.parametrize(
@@ -426,6 +427,34 @@ class TestACodecTheGpuHasNoDecoderFor:
                 ],
                 id="h264-high10-on-vaapi-debug-log",
             ),
+            pytest.param(
+                "NVIDIA",
+                [
+                    # FFmpeg 8.0.1 on the Quadro P5000, with the app's scale_cuda chain: NVDEC has no ProRes decoder.
+                    "Stream #0:0[0x1]: Video: prores (4444) (ap4h / 0x68347061), yuv444p12le(progressive), 640x360, "
+                    "9427 kb/s, SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 12288 tbn (default)",
+                    *_frames_refused("scale_cuda"),
+                ],
+                id="prores-on-nvdec",
+            ),
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: prores (HQ) (apch / 0x68637061), yuv422p10le(progressive), 1920x1080, "
+                    "24 fps, 24 tbr, 12288 tbn (default)",
+                    *_frames_refused("scale_vaapi"),
+                ],
+                id="prores-on-vaapi",
+            ),
+            pytest.param(
+                "AMD",
+                [
+                    "Stream #0:0[0x1e0]: Video: mpeg1video, yuv420p(tv, progressive), 352x240 [SAR 200:219 DAR 4:3], "
+                    "1150 kb/s, 29.97 fps, 29.97 tbr, 90k tbn",
+                    *_frames_refused("scale_vaapi"),
+                ],
+                id="mpeg1-on-vaapi",
+            ),
         ],
     )
     def test_is_handed_to_the_cpu_as_a_codec_the_gpu_cant_decode(self, run, gpu, stderr):  # noqa: F811
@@ -459,6 +488,20 @@ class TestACodecTheGpuHasNoDecoderFor:
                 "Stream #0:0(eng): Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, 23.98 fps",
                 "scale_cuda",
                 id="h264-high-on-nvdec",
+            ),
+            pytest.param(
+                "INTEL",
+                "Stream #0:0(eng): Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, 23.98 fps",
+                "scale_vaapi",
+                id="h264-high-on-vaapi",
+            ),
+            pytest.param(
+                # VAAPI has no MPEG-1 decoder, NVDEC has one.
+                "NVIDIA",
+                "Stream #0:0[0x1e0]: Video: mpeg1video, yuv420p(tv, progressive), 352x240 [SAR 200:219 DAR 4:3], "
+                "1150 kb/s, 29.97 fps, 29.97 tbr, 90k tbn",
+                "scale_cuda",
+                id="mpeg1-on-nvdec",
             ),
         ],
     )

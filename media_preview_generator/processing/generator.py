@@ -30,6 +30,7 @@ import contextvars
 import errno
 import glob
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -41,7 +42,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
 from typing import Any, Protocol
 
@@ -63,6 +64,7 @@ from .hdr_detection import (
     is_dv_no_backward_compat,
     is_hdr_transfer,
 )
+from .hwaccel import hwaccel_decode_args
 from .retry_cascade import (
     classify_cpu_fallback_reason,
     classify_dv_safe_retry_reason,
@@ -219,26 +221,19 @@ _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
 _FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
 # The input's video codec as FFmpeg lists it: "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p, ...".
 _INPUT_VIDEO_CODEC_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)")
-# Codecs FFmpeg has a GPU decoder for on NVDEC, VAAPI, D3D11VA or VideoToolbox. It decodes any other (DivX 3, WMV 7/8)
-# in software on every GPU, without a word at -loglevel info.
-_GPU_DECODABLE_CODECS = frozenset(
-    {
-        "av1",
-        "h263",
-        "h264",
-        "hevc",
-        "mjpeg",
-        "mpeg1video",
-        "mpeg2video",
-        "mpeg4",
-        "prores",
-        "vc1",
-        "vp8",
-        "vp9",
-        "vvc",
-        "wmv3",
-    }
-)
+# The codecs FFmpeg has a GPU decoder for, by ``-hwaccel``: libavcodec's *_nvdec, *_vaapi, *_d3d11va and *_videotoolbox
+# hwaccels (jellyfin-ffmpeg 8.1.3 has the same NVDEC and VAAPI ones). It decodes any other codec in software without a
+# word at -loglevel info: ProRes on CUDA and VAAPI, H.263 and VVC on CUDA, MPEG-1 on VAAPI, DivX 3 and WMV 7/8 on all.
+_GPU_DECODABLE_CODECS = {
+    "cuda": frozenset(
+        {"av1", "h264", "hevc", "mjpeg", "mpeg1video", "mpeg2video", "mpeg4", "vc1", "vp8", "vp9", "wmv3"}
+    ),
+    "vaapi": frozenset(
+        {"av1", "h263", "h264", "hevc", "mjpeg", "mpeg2video", "mpeg4", "vc1", "vp8", "vp9", "vvc", "wmv3"}
+    ),
+    "d3d11va": frozenset({"av1", "h264", "hevc", "mpeg2video", "vc1", "vp9", "wmv3"}),
+    "videotoolbox": frozenset({"av1", "h263", "h264", "hevc", "mpeg1video", "mpeg2video", "mpeg4", "prores", "vp9"}),
+}
 # H.264 profiles FFmpeg offers no VAAPI or D3D11VA decoder for. NVDEC tries them and says it lacks the capabilities.
 _H264_SOFTWARE_ONLY_CHROMA = ("4:2:2", "4:4:4")
 NO_DECODER_SUMMARY = "This file's video can't be decoded by any device (unknown or protected codec)"
@@ -826,8 +821,23 @@ def _io_cut_off(returncode: int, stderr_lines: list[str]) -> bool:
     return returncode == FFMPEG_IO_ERROR_EXIT and _was_interrupted(returncode, stderr_lines)
 
 
+def hwaccel_in(args: Sequence[str]) -> str | None:
+    """The GPU decoder an FFmpeg command asks for (``-hwaccel``: ``cuda``, ``vaapi``…), or None for software decode.
+
+    Args:
+        args: An FFmpeg command, or the arguments before its ``-i``.
+
+    Returns:
+        The value after ``-hwaccel``, or None when there is none.
+    """
+    for flag, value in itertools.pairwise(args):
+        if flag == "-hwaccel":
+            return value
+    return None
+
+
 def _gpu_hand_off(
-    rc: int, stderr_lines: list[str], stderr_lines_all: list[str], *, stopped_part_way: bool
+    rc: int, stderr_lines: list[str], stderr_lines_all: list[str], *, stopped_part_way: bool, hwaccel: str | None
 ) -> tuple[str, str] | None:
     """Whether a failed GPU run goes to the CPU, and why.
 
@@ -836,6 +846,7 @@ def _gpu_hand_off(
         stderr_lines: The last run's stderr (with ``STALL_WATCHDOG_LINE`` when the watchdog stopped it).
         stderr_lines_all: Every run's stderr.
         stopped_part_way: A run's frames were discarded, or a run was cut off, before this point.
+        hwaccel: The GPU decoder the run asked for (``hwaccel_in``).
 
     Returns:
         ``(kind, reason)`` for the hand-off (``FALLBACK_*``), or None when the CPU wouldn't do better.
@@ -859,7 +870,11 @@ def _gpu_hand_off(
     frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
     # A decoder whose GPU set-up failed in the driver falls back to software and ends the same way, so this counts
     # only without a driver error in any run.
-    if frames_refused and _decoded_in_software(stderr_lines) and not _detect_hwaccel_runtime_error(stderr_lines_all):
+    if (
+        frames_refused
+        and _decoded_in_software(stderr_lines, hwaccel)
+        and not _detect_hwaccel_runtime_error(stderr_lines_all)
+    ):
         return FALLBACK_CODEC, "codec error"
     # Judged on the last run's own stderr: a GPU error in an earlier tier's run doesn't make this run's plain 251 one.
     if _io_cut_off(rc, stderr_lines):
@@ -878,15 +893,16 @@ def _gpu_hand_off(
     return None
 
 
-def _decoded_in_software(stderr_lines: list[str]) -> bool:
+def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
     """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec and profile.
 
     Args:
         stderr_lines: One FFmpeg run's stderr, with FFmpeg's listing of the input.
+        hwaccel: The GPU decoder the run asked for (``-hwaccel``); None decodes everything in software.
 
     Returns:
-        True when FFmpeg has no GPU decoder for the input's video (DivX 3, WMV 7/8, H.264 4:2:2 or 4:4:4 on VAAPI);
-        False when it has one, or the listing is missing.
+        True when FFmpeg has no ``hwaccel`` decoder for the input's video (ProRes on CUDA or VAAPI, DivX 3, WMV 7/8,
+        H.264 4:2:2 or 4:4:4 on VAAPI); False when it has one, or the listing is missing.
     """
     for line in stderr_lines:
         found = _INPUT_VIDEO_CODEC_RE.match(line)
@@ -895,7 +911,7 @@ def _decoded_in_software(stderr_lines: list[str]) -> bool:
         codec = found.group(1)
         if codec == "h264":
             return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
-        return codec not in _GPU_DECODABLE_CODECS
+        return codec not in _GPU_DECODABLE_CODECS.get(hwaccel, frozenset())
     return False
 
 
@@ -1976,6 +1992,7 @@ def generate_images(
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
     )
+    hwaccel = hwaccel_in(hwaccel_decode_args(gpu, gpu_device_path, keep_on_gpu=True).args)
 
     def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:
         """One FFmpeg run, on any tier. A run the folder refused to write ends the file at once, frames deleted.
@@ -2325,7 +2342,7 @@ def generate_images(
             image_count = _count_usable_frames(rc, stderr_lines)
 
             if rc != 0 and image_count == 0:
-                cut_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=False)
+                cut_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=False, hwaccel=hwaccel)
                 disk = cut_off if cut_off and cut_off[0] in (FALLBACK_STALL, FALLBACK_IO_ERROR) else None
                 if gpu is not None:
                     # Still failing on GPU even with DV-safe filter -> the same worker retries on the CPU.
@@ -2369,7 +2386,9 @@ def generate_images(
     if rc != 0 and image_count == 0 and gpu is not None:
         if cancel_check and cancel_check():
             raise CancellationError(f"Processing cancelled for {video_file}")
-        hand_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded)
+        hand_off = _gpu_hand_off(
+            rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded, hwaccel=hwaccel
+        )
         if hand_off is not None:
             fallback_kind, fallback_reason = hand_off
             # Log relevant stderr excerpt for debugging

@@ -70,7 +70,15 @@ _Y_BYTES = FRAME_W * FRAME_H
 _PTS_RE = re.compile(rb"pts_time:(\S+)")
 # The input's video stream as ffmpeg lists it: "Stream #0:0(eng): Video: hevc (Main 10), yuv420p10le, ...".
 _VIDEO_STREAM_RE = re.compile(r"Stream #\d+:\d+\S*: Video: (\w+)")
-_CODEC_NAMES = {"h264": "H.264", "mpeg2video": "MPEG-2", "mpeg4": "MPEG-4", "vc1": "VC-1"}
+_CODEC_NAMES = {
+    "h263": "H.263",
+    "h264": "H.264",
+    "mpeg1video": "MPEG-1",
+    "mpeg2video": "MPEG-2",
+    "mpeg4": "MPEG-4",
+    "prores": "ProRes",
+    "vc1": "VC-1",
+}
 # Lines that never say why ffmpeg failed: showinfo's per-frame lines ("color_space:unknown" reads as an error to the
 # summary) and the "Conversion failed!" every failed run ends on, which would hide the line before it.
 _SAYS_NOTHING_RE = re.compile(r"\[Parsed_showinfo_\d+ @|^Conversion failed!\s*$")
@@ -795,16 +803,17 @@ def run_decode(
     if returncode != 0:
         lines = [line for line in stderr.decode("utf-8", "replace").splitlines() if not _SAYS_NOTHING_RE.search(line)]
         logger.debug("ffmpeg exited {} decoding {}; its last lines: {}", returncode, name, "\n".join(lines[-8:]))
-        from ...processing.generator import NO_DECODER_SUMMARY, video_has_no_decoder
+        from ...processing.generator import NO_DECODER_SUMMARY, hwaccel_in, video_has_no_decoder
 
         if video_has_no_decoder(lines):
             raise NoDecoderError(NO_DECODER_SUMMARY)
         if hw_active:
             said = [line.strip()[:STDERR_LINE_CHARS] for line in lines if not _CLOSING_LINE_RE.search(line)]
+            hwaccel = hwaccel_in(command)
             raise GpuDecodeError(
-                _gpu_failure(returncode, lines, name),
+                _gpu_failure(returncode, lines, name, hwaccel),
                 stderr_tail=tuple(line for line in said if line)[-STDERR_LINES:],
-                fallback_kind=_gpu_failure_kind(returncode, lines),
+                fallback_kind=_gpu_failure_kind(returncode, lines, hwaccel),
             )
         raise FrameDecodeError(_with_ffmpegs_error(f"ffmpeg exited {returncode} decoding {name} on the CPU", lines))
     if not boxes and hw_active:
@@ -820,20 +829,21 @@ def run_decode(
     return rows
 
 
-def _gpu_failure_kind(returncode: int, stderr_lines: list[str]) -> str | None:
+def _gpu_failure_kind(returncode: int, stderr_lines: list[str], hwaccel: str | None) -> str | None:
     """Previews' name for a failed GPU decode (``FALLBACK_*`` of ``_gpu_hand_off``), or None when it names none.
 
     The decoder's own "can't decode" verdict is a codec the GPU lacks, whatever else ffmpeg printed after it.
+    ``hwaccel`` is the command's GPU decoder (``-hwaccel``), which decides the codecs it decodes.
     """
     from ...processing.generator import FALLBACK_CODEC, _gpu_hand_off
 
     if any(GPU_CANT_DECODE_VERDICT in line for line in stderr_lines):
         return FALLBACK_CODEC
-    hand_off = _gpu_hand_off(returncode, stderr_lines, stderr_lines, stopped_part_way=False)
+    hand_off = _gpu_hand_off(returncode, stderr_lines, stderr_lines, stopped_part_way=False, hwaccel=hwaccel)
     return hand_off[0] if hand_off else None
 
 
-def _gpu_failure(returncode: int, stderr_lines: list[str], name: str) -> str:
+def _gpu_failure(returncode: int, stderr_lines: list[str], name: str, hwaccel: str | None) -> str:
     """Why a GPU decode failed, as previews names the same failure before its CPU rerun (``_gpu_hand_off``).
 
     Every GPU failure is rerun on the CPU, as before; this only words it. Previews' classifier judges the exit code and
@@ -842,7 +852,7 @@ def _gpu_failure(returncode: int, stderr_lines: list[str], name: str) -> str:
     """
     from ...processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, FALLBACK_IO_ERROR, FALLBACK_SIGNAL
 
-    kind = _gpu_failure_kind(returncode, stderr_lines)
+    kind = _gpu_failure_kind(returncode, stderr_lines, hwaccel)
     said_cant_decode = any(GPU_CANT_DECODE_VERDICT in line for line in stderr_lines)
     if kind == FALLBACK_CODEC:
         codec = _video_codec(stderr_lines)
