@@ -584,8 +584,8 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU,
     has no FFmpeg, is added twice or can't use its temp folder.
 
-    A node nothing uses (no worker group member on it, no Plex server with its Plex database node switched on
-    pointing at it) raises no card: whatever its state, no work waits on it.
+    A node nothing uses (no switched-on worker group with a member on it, no switched-on Plex server with its Plex
+    database node switched on pointing at it) raises no card: whatever its state, no work waits on it.
 
     The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
     dismissal of a state the node has left is lifted, so the next time it happens the card shows again.
@@ -609,7 +609,7 @@ def _build_node_notifications() -> list[dict[str, Any]]:
             if state != view.state:
                 undismiss_session(node_notification_id(view.id, state))
         text = _NODE_CARD_TEXT.get(view.state)
-        if text is None or not any(node_users(view.id, groups, servers).values()):
+        if text is None or not any(node_users(view.id, groups, servers, switched_on_only=True).values()):
             continue
         title, todo, label, target = text
         name = view.name or "A node"

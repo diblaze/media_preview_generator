@@ -274,7 +274,9 @@ def server_agent(entry: object) -> dict | None:
     return agent if isinstance(agent, dict) else None
 
 
-def node_users(node_id: str, worker_groups: object, media_servers: object) -> dict[str, list[dict[str, str]]]:
+def node_users(
+    node_id: str, worker_groups: object, media_servers: object, *, switched_on_only: bool = False
+) -> dict[str, list[dict[str, str]]]:
     """The worker groups with a member on the node, and the Plex servers whose database it opens.
 
     A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
@@ -285,13 +287,15 @@ def node_users(node_id: str, worker_groups: object, media_servers: object) -> di
         node_id: The node.
         worker_groups: settings.json's ``worker_groups``.
         media_servers: settings.json's ``media_servers``.
+        switched_on_only: Leave out a worker group or Plex server that is switched off: nothing of theirs runs, so
+            nothing waits on the node (the bell's rule). "Used by" and Remove count them, as they still point at it.
 
     Returns:
         ``{"groups": [{"id", "name"}], "servers": [{"id", "name"}]}``.
     """
     groups = []
     for group in worker_groups if isinstance(worker_groups, list) else []:
-        if not isinstance(group, dict):
+        if not isinstance(group, dict) or (switched_on_only and not group.get("enabled", True)):
             continue
         members = group.get("members") or []
         if any(isinstance(m, dict) and m.get("node") == node_id for m in members):
@@ -299,8 +303,11 @@ def node_users(node_id: str, worker_groups: object, media_servers: object) -> di
     servers = []
     for entry in media_servers if isinstance(media_servers, list) else []:
         agent = server_agent(entry)
-        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
-            servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
+        if agent is None or not agent.get("enabled") or agent.get("node_id") != node_id:
+            continue
+        if switched_on_only and not entry.get("enabled", True):
+            continue
+        servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
     return {"groups": groups, "servers": servers}
 
 
