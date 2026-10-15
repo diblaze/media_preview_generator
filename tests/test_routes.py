@@ -7208,7 +7208,7 @@ class TestBackupRestore:
         def node(url):
             return {"id": "n1", "name": "nuc", "url": url, "key": "node-key-123456", "enabled": True}
 
-        def failing_migrations(settings):
+        def failing_migrations(settings, **kwargs):
             raise RuntimeError("a migration broke")
 
         sm = get_settings_manager()
@@ -7623,6 +7623,50 @@ class TestBackupRestore:
         has_quiet_hours = case != "restored-file-has-no-quiet-hours"
         assert (manager.scheduler.get_job(_QUIET_HOURS_RECHECK) is not None) is has_quiet_hours
         assert started == ([] if quiet_now else [job.id])
+
+    @pytest.mark.parametrize(
+        ("live_urls", "kept"),
+        [
+            (["http://plex:32400"], True),
+            (["http://plex:32400/"], True),
+            (["http://other-plex:32400"], False),
+            (["http://plex:32400", "http://plex-2:32400"], False),
+        ],
+        ids=["same-address", "trailing-slash", "another-address", "two-plex-servers"],
+    )
+    def test_a_restored_3x_backup_keeps_the_live_plex_servers_id(self, client, live_urls, kept):
+        """A 3.x settings.json has no server list: restored, its upgrade built the same Plex server under a second
+        random id, and the job history, webhook history and webhook address recorded since named no server."""
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        servers = [
+            {
+                "id": f"live-plex-{i}",
+                "type": "plex",
+                "name": f"Plex {i}",
+                "enabled": True,
+                "url": url,
+                "auth": {"method": "token", "token": "t" * 20},
+            }
+            for i, url in enumerate(live_urls)
+        ]
+        sm.apply_changes(updates={"media_servers": servers})
+        backup = "settings.json.20250101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"_schema_version": 6, "plex_url": "http://plex:32400", "plex_token": "p" * 20}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        (restored,) = sm.get("media_servers")
+        assert restored["url"] == "http://plex:32400"
+        if kept:
+            assert restored["id"] == "live-plex-0"
+        else:
+            assert restored["id"] not in {s["id"] for s in servers}
 
     def test_the_backups_list_marks_a_backup_that_cant_be_read(self, client):
         """A backup cut short is newer than the live file, so it was marked "backup is newer", inviting the restore."""

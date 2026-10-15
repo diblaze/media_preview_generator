@@ -210,7 +210,7 @@ _DEPRECATED_ENV_VARS = [
 # =========================================================================
 
 
-def run_migrations(settings_manager) -> None:
+def run_migrations(settings_manager, *, plex_server_id: str | None = None) -> None:
     """Run all pending migrations.
 
     Call once on application startup, before the web server starts
@@ -218,6 +218,8 @@ def run_migrations(settings_manager) -> None:
 
     Args:
         settings_manager: A ``SettingsManager`` instance.
+        plex_server_id: The id v7 gives the Plex server it builds from the legacy ``plex_*`` settings, in place of a
+            new one: a restored legacy file's Plex server keeps the id it got at the first upgrade.
 
     """
     # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
@@ -227,7 +229,7 @@ def run_migrations(settings_manager) -> None:
     no_settings_file = bool(settings_file) and not os.path.exists(str(settings_file))
     seeded_from_env = _migrate_env_vars(settings_manager)
     fresh_install = no_settings_file and not seeded_from_env
-    _migrate_schema(settings_manager, announce=not fresh_install)
+    _migrate_schema(settings_manager, announce=not fresh_install, plex_server_id=plex_server_id)
     _seed_last_seen_version_for_upgraders(settings_manager)
 
 
@@ -451,11 +453,12 @@ def _backup_settings_before_migrating(sm, from_schema: int) -> str:
         return ""
 
 
-def _migrate_schema(sm, *, announce: bool = True) -> None:
+def _migrate_schema(sm, *, announce: bool = True, plex_server_id: str | None = None) -> None:
     """Run incremental schema migrations on settings.
 
     Each migration is gated by ``_schema_version`` so it runs at most
     once. ``announce`` False (a brand-new install) leaves out the one-shot "Settings migrated" notice.
+    ``plex_server_id`` is the id v7 gives the Plex server it builds (None: a new one).
 
     Migrations:
         v2 -- Per-GPU config (gpu_config).  If a flat ``gpu_threads``
@@ -579,7 +582,7 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
     if current < 6:
         _run(6, _migrate_to_v6)
     if current < 7:
-        _run(7, _migrate_to_v7)
+        _run(7, lambda settings: _migrate_to_v7(settings, id_override=plex_server_id))
     if current < 8:
         _run(8, _migrate_to_v8)
     if current < 9:
@@ -984,7 +987,7 @@ def _legacy_plex_to_media_server(sm, *, id_override: str | None = None) -> dict[
     persisted in ``settings.json`` (not a :class:`ServerConfig` instance);
     the runtime hydrates it into the dataclass at load time.
 
-    Used by the v7 migration (no ``id_override`` → a fresh UUID) and by
+    Used by the v7 migration (a fresh UUID, unless a restore passes the live server's id) and by
     runtime callers like :meth:`ServerRegistry.from_legacy_config` (which
     passes the stable slug ``"plex-default"`` because the synthesised
     stub is built repeatedly per request and the id must stay identical
@@ -1041,7 +1044,7 @@ def _legacy_plex_to_media_server(sm, *, id_override: str | None = None) -> dict[
     }
 
 
-def _migrate_to_v7(sm) -> list:
+def _migrate_to_v7(sm, *, id_override: str | None = None) -> list:
     """Add a ``media_servers`` array synthesised from legacy ``plex_*`` keys.
 
     No-op when ``media_servers`` already exists. Legacy ``plex_*`` keys
@@ -1050,13 +1053,17 @@ def _migrate_to_v7(sm) -> list:
     keys (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto
     the synthesised server's ``output`` and are dropped from the top level
     (also on a fresh install, which gets an empty ``media_servers``).
+
+    Args:
+        sm: The settings manager.
+        id_override: The synthesised server's id (None: a new one).
     """
     notes: list[str] = []
     if sm.get("media_servers") is not None:
         return notes
 
     webhook_keys = [key for key in ("plex_webhook_public_url", "plex_webhook_enabled") if sm.get(key) is not None]
-    entry = _legacy_plex_to_media_server(sm)
+    entry = _legacy_plex_to_media_server(sm, id_override=id_override)
     if entry is None:
         # Fresh install: write an empty list so callers can rely on the key
         # always being present.

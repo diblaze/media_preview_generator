@@ -1779,8 +1779,32 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
+def _live_plex_server_id(live_servers: Any, restored_plex_url: Any) -> str | None:
+    """The id of the live file's one Plex server, when the restored file's legacy Plex address is that server's.
+
+    A 3.x settings.json has no server list: its upgrade builds the Plex server with a new random id, and what the app
+    records from then on (job and webhook history, markers, the server's webhook address) names that id.
+
+    Args:
+        live_servers: ``media_servers`` before the restore.
+        restored_plex_url: The restored file's ``plex_url``.
+    """
+    plex = (
+        [s for s in live_servers if isinstance(s, dict) and s.get("type") == "plex"]
+        if isinstance(live_servers, list)
+        else []
+    )
+    if len(plex) != 1 or not isinstance(restored_plex_url, str):
+        return None
+    # A trailing slash doesn't name another server.
+    address = restored_plex_url.strip().rstrip("/")
+    if not address or str(plex[0].get("url") or "").strip().rstrip("/") != address:
+        return None
+    return str(plex[0].get("id") or "") or None
+
+
 def _bring_restored_settings_up_to_date(
-    settings: Any, live_revisions: tuple[int, int], *, setup_finished: bool
+    settings: Any, live_revisions: tuple[int, int], *, setup_finished: bool, live_servers: Any
 ) -> None:
     """Run the start-up migrations on a restored settings.json from before this build's schema, and move its worker
     groups and nodes revisions past the live ones.
@@ -1794,12 +1818,14 @@ def _bring_restored_settings_up_to_date(
     on the old groups or nodes must get "changed elsewhere", not save over the restored ones at a matching number.
 
     A finished setup stays finished: until it is, the setup pages and the settings they save answer without signing
-    in, and a backup from before it (every install's first one holds nothing else) would start it again.
+    in, and a backup from before it (every install's first one holds nothing else) would start it again. And a
+    restored 3.x file's Plex server keeps the id the live one has (``_live_plex_server_id``).
 
     Args:
         settings: The settings manager, holding the restored file.
         live_revisions: ``worker_groups_revision`` and ``nodes_revision`` before the restore.
         setup_finished: Whether setup was finished before the restore.
+        live_servers: ``media_servers`` before the restore.
 
     Raises:
         ValueError: The restored file couldn't be read; nothing is saved over it.
@@ -1811,7 +1837,7 @@ def _bring_restored_settings_up_to_date(
         raise ValueError("the restored file can't be read")
     try:
         if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
-            run_migrations(settings)
+            run_migrations(settings, plex_server_id=_live_plex_server_id(live_servers, settings.get("plex_url")))
     finally:
         # Even when a migration failed: the restored file is in place either way, and the pool must follow it.
         live_groups, live_nodes = live_revisions
@@ -1995,6 +2021,7 @@ def restore_backup():
             live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
             setup_finished = settings.is_setup_complete()
             paused_before = settings.processing_paused
+            live_servers = settings.get("media_servers")
             # Copied before the snapshot: trimming the backups to the number kept (or by age) can delete this one.
             shutil.copy2(bak_path, tmp_path)
             _snapshot_before_restore(live)
@@ -2002,7 +2029,9 @@ def restore_backup():
             replaced = True
             if name == "settings.json":
                 settings.reload()
-                _bring_restored_settings_up_to_date(settings, live_revisions, setup_finished=setup_finished)
+                _bring_restored_settings_up_to_date(
+                    settings, live_revisions, setup_finished=setup_finished, live_servers=live_servers
+                )
             elif name == "setup_state.json":
                 settings.reload_setup_state()
             elif name == "schedules.json":

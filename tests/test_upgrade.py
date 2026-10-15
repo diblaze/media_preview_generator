@@ -1197,6 +1197,18 @@ class TestMigrateToV7:
         assert plex["output"]["webhook_public_url"] == "https://previews.example.com"
         assert sm.get("plex_webhook_enabled") is None and sm.get("plex_webhook_public_url") is None
 
+    def test_a_plex_server_id_given_to_the_migrations_is_the_one_v7_gives_the_plex_server(self, tmp_path):
+        """A restore passes the live Plex server's id, so a restored 3.x file's server keeps the id it has."""
+        from media_preview_generator.upgrade import run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        (tmp_path / "settings.json").write_text(json.dumps(self.FROM_3_7_5))
+        sm = SettingsManager(config_dir=str(tmp_path))
+
+        run_migrations(sm, plex_server_id="live-plex-id")
+
+        assert [s["id"] for s in sm.get("media_servers")] == ["live-plex-id"]
+
     def test_the_pre_upgrade_copy_of_a_3_7_install_is_the_file_3_7_wrote(self, tmp_path):
         self._upgrade_from_3_7_5(tmp_path)
 
