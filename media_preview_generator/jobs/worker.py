@@ -1281,7 +1281,14 @@ class WorkerPool:
                 # draining slots before allocating any replacements.
                 owned.sort(key=lambda w: (w._pending_removal, not w.is_busy))
                 desired = targets[pid]
+                hardware = nodes.member(policy) if policy.get("node") else None
                 for index, worker in enumerate(owned):
+                    if hardware is not None and hardware.available:
+                        # A rename or GPU reorder on the node shows in the job log prefix of workers already running.
+                        worker.node_name = hardware.node_name
+                        if worker.worker_type == "GPU" and hardware.gpu:
+                            worker.gpu_index = hardware.gpu_index
+                            worker.gpu_name = hardware.gpu.get("name") or policy["device"]
                     worker.group_name = policy["name"]
                     worker.allowed_job_types = frozenset(policy["job_types"])
                     worker.display_name = _group_display_name(policy["name"], worker)
@@ -1300,7 +1307,7 @@ class WorkerPool:
                         removed += 1
                 for _ in range(max(0, desired - len(owned))):
                     if policy.get("node"):
-                        worker = self._create_node_worker(policy, nodes.member(policy))
+                        worker = self._create_node_worker(policy, hardware)
                     else:
                         if policy["resource"] == "gpu":
                             self._next_gpu_assignment_index = next(
