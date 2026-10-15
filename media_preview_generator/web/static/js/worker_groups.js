@@ -896,6 +896,8 @@
     const maxMembers = () => snapshot.limits?.members || 8;
 
     const CPU_JOBS = ['previews', 'intro_credits', 'loudness'];
+    // Members whose loudness a switch to a GPU took away, so a switch back to a CPU restores it.
+    const loudnessRemoved = new Set();
     const GPU_JOBS = ['previews', 'intro_credits'];
 
     // The first unused device: this app's GPUs, its CPU, then each ready node's GPUs and CPU; null when all are used.
@@ -1110,6 +1112,7 @@
             const member = memberOf(select);
             const choice = pickerChoices(member).flatMap(section => section.options).find(option => option.value === select.value);
             if (!choice) return;
+            const wasGpu = member.resource === 'gpu';
             member.resource = choice.resource;
             member.device = choice.device;
             if (choice.node) member.node = choice.node; else delete member.node;
@@ -1117,6 +1120,16 @@
             if (member.resource === 'gpu' && member.job_types.includes('loudness')) {
                 member.job_types = member.job_types.filter(kind => kind !== 'loudness');
                 memberNotes.set(member.id, 'Loudness removed — it runs on CPU only.');
+                loudnessRemoved.add(member.id);
+            }
+            // A CPU that was a GPU a moment ago (the next free device, or a switch that took loudness away) takes the
+            // loudness the group runs back.
+            const groupRunsLoudness = loudnessRemoved.has(member.id)
+                || group.members.some(other => other !== member && other.job_types.includes('loudness'));
+            if (wasGpu && member.resource === 'cpu' && groupRunsLoudness && !member.job_types.includes('loudness')) {
+                loudnessRemoved.delete(member.id);
+                member.job_types = [...member.job_types, 'loudness'];
+                memberNotes.set(member.id, 'Loudness added, as the group runs it.');
             }
             changed(); refocus(select.id);
         });

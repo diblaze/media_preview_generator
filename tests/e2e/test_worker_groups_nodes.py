@@ -417,3 +417,21 @@ def test_the_dashboard_says_a_node_problem_once_and_links_the_node(
     expect(block.get_by_role("link", name="Open old-laptop")).to_have_attribute("href", "/nodes#node-laptop")
     expect(authed_page.locator("#workerGroupLiveWarnings")).to_have_text("Loudness needs a CPU group.")
     expect(authed_page.get_by_text("has no workers now")).to_have_count(0)
+
+
+def test_a_member_switched_from_a_gpu_back_to_a_cpu_runs_loudness_again(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    group_api["state"]["nodes"] = NODES
+    settings_page(authed_page, app_url)
+    page = authed_page
+    page.locator('[data-edit="cpu-night"]').click()
+    picker = page.locator('[data-member="m-cpu"] [data-pick]')
+    picker.select_option("node:storage:gpu:cuda:0")
+    expect(page.locator('[data-member="m-cpu"]')).to_contain_text("Loudness removed — it runs on CPU only.")
+    page.locator('[data-member="m-cpu"] [data-pick]').select_option("node:storage:cpu")
+    row = page.locator('[data-member="m-cpu"]')
+    expect(row).to_contain_text("Loudness added, as the group runs it.")
+    expect(row.locator('[data-kind="loudness"]')).to_have_attribute("aria-pressed", "true")
