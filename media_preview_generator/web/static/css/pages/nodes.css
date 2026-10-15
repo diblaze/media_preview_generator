@@ -96,6 +96,14 @@
 .nd-fail { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent); border-radius: var(--radius-card); background: var(--inset); font-size: 13px; min-width: 0; }
 .nd-fail-h { color: var(--bad); font-weight: 700; }
 .nd-fail .nd-mono { overflow-wrap: anywhere; }
+/* A neutral note: something the node can't fix (libraries this app can't open), kept out of the red and amber. */
+.nd-note { display: flex; align-items: baseline; gap: 8px; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--inset); color: var(--muted); font-size: 13px; min-width: 0; }
+.nd-note > i, .nd-note summary > i { color: var(--faint); }
+.nd-note a { font-weight: 600; }
+details.nd-note { display: block; }
+details.nd-note summary { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+details.nd-note ul { margin: 8px 0; padding-left: 22px; display: grid; gap: 4px; }
+#nodeHealthBody .nd-note { margin-bottom: 12px; }
 .nd-diff { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; font: 12.5px var(--mono); }
 .nd-diff s { color: var(--bad); }
 .nd-diff b { color: var(--ok); }

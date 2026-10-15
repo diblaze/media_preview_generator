@@ -159,13 +159,29 @@ def test_a_library_this_app_cant_sample_never_blames_the_node(error):
         ]
     }  # fmt: skip
     envelope = _envelope(_details(access=access))
-    row = _check(envelope, "node_access_1")
-    assert (row["ok"], row["severity"], row["reason"]) == (False, "recommended", error)
-    assert row["label"] == "Home · Kids: not tested, this app can't read it itself"
-    assert (row["help_url"], row["help_label"]) == ("/servers", "Open Media Servers")
+    row = _check(envelope, "node_access_skipped")
+    assert (row["ok"], row["severity"], row["informational"], row["reason"]) == (False, "info", True, "Home · Kids")
+    assert row["label"] == "1 library skipped: this app can't open it"
+    assert (row["help_url"], row["help_label"]) == ("/servers", "Fix on Media Servers")
     assert not {"fix_tab", "fix_action", "suggestion"} & set(row)
     assert _section(envelope, "node_media_access")["severity"] == "recommended"
     assert envelope["overall_ok"] is True
+
+
+def test_libraries_this_app_cant_open_share_one_neutral_note():
+    """Seven Synth libraries the app had no mount for made seven Recommended rows on every node, drowning the one
+    library the node really couldn't see."""
+    skipped = [
+        {"server": "Home", "library": f"Synth {i}", "app_root": f"/media/synth{i}", "checked": 0, "ok": False,
+         "files": [], "error": f"This app can't open /media/synth{i}", "suggestion": None}
+        for i in range(7)
+    ]  # fmt: skip
+    envelope = _envelope(_details(access={"libraries": skipped}))
+    rows = _section(envelope, "node_media_access")["checks"]
+    notes = [r for r in rows if r["id"].startswith("node_access_")]
+    assert [r["id"] for r in notes] == ["node_access_skipped"]
+    assert notes[0]["label"] == "7 libraries skipped: this app can't open them"
+    assert not [r for r in rows if r["ok"] is False and r["severity"] in ("critical", "recommended")]
 
 
 def test_an_empty_library_is_not_a_problem():

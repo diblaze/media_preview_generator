@@ -778,6 +778,55 @@ class TestNodeDialog:
         expect(pane.locator(".nd-map-results")).to_contain_text("The node sees every library, same files.")
         expect(pane.locator(".nd-fail")).to_have_count(0)
 
+    def test_libraries_this_app_cant_open_share_one_neutral_note(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        skipped = [
+            {"server": "Home", "library": f"Synth {i}", "app_root": f"/media/synth{i}", "checked": 0, "ok": False,
+             "files": [], "error": f"This app can't open /media/synth{i}"}
+            for i in range(3)
+        ]  # fmt: skip
+        api.test_answers = [
+            {"libraries": [_library("Movies", "/data/Movies", False, "/mnt/nas/Movies"), *skipped]},
+        ]
+        pane.locator(".nd-test").click()
+
+        results = pane.locator(".nd-map-results")
+        expect(results.locator(".nd-fail")).to_have_count(1)
+        expect(results.locator(".nd-fail")).to_contain_text("Movies")
+        note = results.locator(".nd-skipped")
+        expect(note).to_have_count(1)
+        expect(note.locator("summary")).to_have_text("3 libraries skipped: this app can't open them.")
+        expect(note.locator("a")).to_have_attribute("href", "/servers")
+        expect(results).not_to_contain_text("Synth 0: no files to test")
+
+    def test_setup_health_shows_an_informational_failure_as_a_note_not_a_bucket(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        api = NodesApi(authed_page, _four_nodes())
+        note = {
+            "id": "node_access_skipped",
+            "label": "7 libraries skipped: this app can't open them",
+            "ok": False,
+            "severity": "info",
+            "informational": True,
+            "reason": "Home · Synth",
+            "help_url": "/servers",
+            "help_label": "Fix on Media Servers",
+        }
+        passing = {"id": "lib_movies", "label": "Movies visible", "ok": True, "severity": "critical"}
+        api.health_answer = {"overall_ok": True, "sections": [{"id": "a", "title": "Media", "checks": [passing, note]}]}
+        authed_page.goto(f"{app_url}/nodes")
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "health")
+        body = authed_page.locator("#nodeHealthBody")
+        expect(body.locator(".nd-note")).to_have_text(
+            "7 libraries skipped: this app can't open them. Fix on Media Servers"
+        )
+        expect(body.locator('.readiness-bucket[data-tier="recommended"]')).to_have_count(0)
+        expect(authed_page.locator("#nodeHealthSummary")).to_have_text("✓ All good")
+
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())
         api.health_answer = {

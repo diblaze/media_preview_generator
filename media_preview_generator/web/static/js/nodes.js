@@ -472,6 +472,15 @@
             return `${html}</div>`;
         }
 
+        function skippedNote(skipped) {
+            if (!skipped.length) return '';
+            const count = skipped.length;
+            const items = skipped.map((lib) => `<li><b>${esc([lib.server, lib.library].filter(Boolean).join(' · '))}</b> <span class="nd-faint">${esc(lib.error)}</span></li>`).join('');
+            return `<details class="nd-note nd-skipped"><summary><i class="bi bi-info-circle" aria-hidden="true"></i>`
+                + `${count} ${count === 1 ? 'library' : 'libraries'} skipped: this app can't open ${count === 1 ? 'it' : 'them'}.</summary>`
+                + `<ul>${items}</ul><a href="/servers">Fix on Media Servers</a></details>`;
+        }
+
         function renderResults(libraries) {
             lastLibraries = libraries;
             revealEnds();
@@ -480,18 +489,24 @@
                 results.innerHTML = '<div class="sm-hint">No libraries to test yet. Add a media server with libraries first.</div>';
                 return;
             }
+            // A library this app couldn't sample itself was never asked about: not the node's problem, so they all
+            // share one collapsed note instead of a chip and a red card each.
+            const skipped = libraries.filter((lib) => !Number(lib.checked) && lib.empty !== true && !!lib.error);
             const loose = [];
             libraries.forEach((lib) => {
+                if (skipped.includes(lib)) return;
                 const row = rowFor(lib.app_root);
                 if (row) $('.nd-chip-slot', row).insertAdjacentHTML('beforeend', libraryChip(lib));
                 else loose.push(libraryChip(lib));
             });
             // A library with no video yet has nothing to test; its chip says so and it isn't a failure.
-            const passed = (lib) => lib.ok || lib.empty === true;
+            const passed = (lib) => lib.ok || lib.empty === true || skipped.includes(lib);
             const failures = libraries.map((lib, i) => (passed(lib) ? '' : failureCard(lib, i))).join('');
-            const allOk = libraries.every(passed);
+            const allOk = libraries.every(passed) && skipped.length < libraries.length;
+            const okText = skipped.length ? 'The node sees every library it was asked about, same files.' : 'The node sees every library, same files.';
             results.innerHTML = (loose.length ? `<div class="nd-lib-chips">${loose.join('')}</div>` : '')
-                + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>The node sees every library, same files.</div>` : failures);
+                + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>${okText}</div>` : failures)
+                + skippedNote(skipped);
         }
 
         // The suggestion swaps the node-side path of the row covering the library (two rows may share a node path, so
@@ -1102,20 +1117,31 @@
 
     // Same buckets as server Setup Health: critical + failing must be fixed, recommended + failing is recommended,
     // everything passing is all good; informational rows only show when they say they're meant to be seen.
+    // A failing informational row is a note about something other than the node (libraries this app can't open):
+    // one neutral line above the buckets.
     function partitionChecks(sections) {
         const mustFix = [];
         const recommended = [];
         const allGood = [];
+        const notes = [];
         (sections || []).forEach((section) => {
             (section.checks || []).forEach((check) => {
                 if ((check.severity || 'info') === 'info' && check.informational !== true) return;
                 const item = { check, sectionId: section.id || '', sectionTitle: section.title || section.id || '' };
-                if (check.ok === false && check.severity === 'critical') mustFix.push(item);
+                if (check.ok === false && (check.severity || 'info') === 'info') notes.push(item);
+                else if (check.ok === false && check.severity === 'critical') mustFix.push(item);
                 else if (check.ok === false && check.severity === 'recommended' && check.dismissed !== true) recommended.push(item);
                 else allGood.push(item);
             });
         });
-        return { mustFix, recommended, allGood };
+        return { mustFix, recommended, allGood, notes };
+    }
+
+    function noteLine(check) {
+        const link = typeof check.help_url === 'string' && check.help_url.startsWith('/')
+            ? ` <a href="${esc(check.help_url)}">${esc(check.help_label || 'Open')}</a>` : '';
+        const title = check.reason ? ` title="${esc(check.reason)}"` : '';
+        return `<div class="nd-note"${title}><i class="bi bi-info-circle" aria-hidden="true"></i><span>${esc(check.label)}.${link}</span></div>`;
     }
 
     function healthValue(value) {
@@ -1242,6 +1268,7 @@
         if (partition.allGood.length) {
             body.appendChild(bucket('ok', 'All good', partition.allGood, !partition.mustFix.length && !partition.recommended.length, '<i class="bi bi-check-circle-fill text-success me-2"></i>'));
         }
+        if (partition.notes.length) body.insertAdjacentHTML('afterbegin', partition.notes.map((item) => noteLine(item.check)).join(''));
         if (!body.children.length) body.innerHTML = '<div class="sm-hint">No checks to show yet.</div>';
         const firstFix = $('.nd-health-fix', body);
         if (firstFix) firstFix.classList.add('rd-primary');

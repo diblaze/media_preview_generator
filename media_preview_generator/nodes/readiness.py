@@ -33,6 +33,8 @@ PLEX_DB_CHECK_S = 10.0
 FIX_ON_NODE = "node"
 TAB_MEDIA = "media"
 TAB_SETTINGS = "settings"
+# A row that is neither a problem nor a pass of the node (the Nodes page shows it as a note).
+INFO = "info"
 WORKERS_URL = "/settings#section-workers"
 # Where this app's own path mappings and library checks live.
 SERVERS_URL = "/servers"
@@ -210,6 +212,7 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
             )
         )
         return rows
+    skipped: list[str] = []
     for index, lib in enumerate(result.get("libraries") or []):
         if not isinstance(lib, dict):
             continue
@@ -228,20 +231,8 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
             continue
         if not lib.get("checked"):
             # Nothing was sampled: this app can't open the folder itself or timed out reading it, so the node was
-            # never asked. Blaming the node (critical, "Open Media") would send the user to the wrong machine.
-            rows.append(
-                _row(
-                    f"node_access_{index}",
-                    f"{label}: not tested, this app can't read it itself",
-                    severity=RECOMMENDED,
-                    ok=False,
-                    explanation="Test access needs a file this app sees to ask the node for. Fix this app's own "
-                    "access to the library first; this row says nothing about the node.",
-                    reason=lib.get("error"),
-                    help_url=SERVERS_URL,
-                    help_label="Open Media Servers",
-                )
-            )
+            # never asked. It isn't the node's problem, so all of them share one neutral line below.
+            skipped.append(label)
             continue
         ok = bool(lib.get("ok"))
         missing = [f for f in lib.get("files") or [] if isinstance(f, dict) and not f.get("ok")]
@@ -267,6 +258,23 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
                 suggestion={**suggestion, "app_root": lib.get("app_root")} if suggestion else None,
             )
         )
+    if skipped:
+        count = len(skipped)
+        row = _row(
+            "node_access_skipped",
+            f"{count} {'library' if count == 1 else 'libraries'} skipped: this app can't open "
+            f"{'it' if count == 1 else 'them'}",
+            severity=INFO,
+            ok=False,
+            explanation="Test access needs a file this app sees to ask the node for, so these weren't tested. That is "
+            "about this app's own access to them, not the node: fix it on Media Servers.",
+            reason=", ".join(skipped),
+            help_url=SERVERS_URL,
+            help_label="Fix on Media Servers",
+        )
+        # A note, not a problem of the node: shown on its own line, outside the Must fix / Recommended buckets.
+        row["informational"] = True
+        rows.append(row)
     return rows
 
 
