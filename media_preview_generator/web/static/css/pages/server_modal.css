@@ -220,7 +220,8 @@
 .rd-title .badge.bg-warning-subtle { background: var(--warn-soft) !important; color: var(--warn) !important; }
 .rd-title .badge.bg-success-subtle { background: var(--ok-soft) !important; color: var(--ok) !important; }
 .rd-title .badge.bg-secondary-subtle { background: var(--inset) !important; color: var(--muted) !important; border: 1px solid var(--line) !important; }
-.rd-reason { margin-top: 2px; font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+/* Wraps in full: a reason ends with what to do, so cutting it at one line hid the fix. */
+.rd-reason { margin-top: 2px; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
 .rd-acts { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .rd-acts .btn { margin: 0 !important; height: 30px; padding: 0 12px; font-size: 13px; display: inline-flex; align-items: center; gap: 4px; }
 .rd-acts .btn-warning { background: var(--panel-2); border-color: var(--line-strong); color: var(--sm-text); }

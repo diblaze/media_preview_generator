@@ -1179,6 +1179,26 @@ class TestNodeDialog:
         must.locator(".nd-health-fix").click()
         expect(authed_page.locator("#node-tab-media")).to_be_visible()
 
+    @pytest.mark.parametrize("width", [390, 1440])
+    def test_a_long_reason_shows_in_full_with_its_fix(self, authed_page: Page, app_url: str, width: int) -> None:
+        """The reason was cut to one line, which hid the sentence that says what to do."""
+        authed_page.set_viewport_size({"width": width, "height": 900})
+        api = NodesApi(authed_page, _four_nodes())
+        reason = (
+            "The node can't write to Plex's database folder /config/Library/Application Support/Plex Media Server. "
+            "Give the user the node runs as write access to that folder, then run this check again."
+        )
+        row = {"id": "w", "label": "Can write the database", "ok": False, "severity": "critical", "reason": reason}
+        api.health_answer = {"overall_ok": False, "sections": [{"id": "db", "title": "Plex database", "checks": [row]}]}
+        authed_page.goto(f"{app_url}/nodes")
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "health")
+        shown = authed_page.locator("#nodeHealthBody .rd-reason")
+        expect(shown).to_have_text(reason)
+        cut = shown.evaluate("el => el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1")
+        assert cut is False
+        assert shown.evaluate("el => el.getBoundingClientRect().height") > 20  # Wrapped onto more than one line.
+
     def test_log_tab_shows_the_node_log(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
         _open_node(authed_page, "n-storage")
