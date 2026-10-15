@@ -118,6 +118,8 @@ if ($env:NODE_KEY -and $env:NODE_KEY.Trim()) {
     $key = $env:NODE_KEY.Trim()
     $identity = Get-Content -Raw $identityFile | ConvertFrom-Json
     $identity.key = $key
+    # This script shows the key below, so the node has nothing left to announce at its next start.
+    $identity | Add-Member -NotePropertyName announced -NotePropertyValue $true -Force
     # No byte order mark: Windows PowerShell's -Encoding UTF8 writes one, and the node reads plain UTF-8.
     $noBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($identityFile, ($identity | ConvertTo-Json -Compress), $noBom)

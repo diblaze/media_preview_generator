@@ -273,6 +273,38 @@ class TestTheWindowsEntryPoint:
         entry._log_to(str(tmp_path))
         assert sinks and all(sink.get("diagnose") is False for sink in sinks)
 
+    @pytest.mark.parametrize("installed_with_a_key", [False, True], ids=["key-it-made", "key-in-node-json"])
+    def test_node_log_never_holds_the_key_it_announces(self, tmp_path, monkeypatch, installed_with_a_key):
+        import secrets
+
+        from loguru import logger
+
+        from media_preview_generator.nodes.server import identity, nodelog
+
+        monkeypatch.delenv("NODE_KEY", raising=False)
+        monkeypatch.delenv("AGENT_TOKEN", raising=False)
+        node_dir = tmp_path / "node"
+        if installed_with_a_key:
+            # A node.json someone (an older install.ps1) wrote with the key and announced still false.
+            node_dir.mkdir()
+            (node_dir / "node.json").write_text(
+                json.dumps({"id": "a" * 32, "key": secrets.token_hex(24), "announced": False})
+            )
+        entry = _entry_point()
+        assert entry.CONSOLE_ONLY == nodelog.SECRET_EXTRA
+        monkeypatch.setattr(entry.logging, "basicConfig", lambda **_kw: None)
+        try:
+            log_file = entry._log_to(str(node_dir))
+            me = identity.load_identity(str(node_dir))
+            logger.info("an ordinary line")
+            logger.complete()
+        finally:
+            logger.remove()
+            logger.add(sys.stderr, level="WARNING")
+        text = Path(log_file).read_text(encoding="utf-8")
+        assert "an ordinary line" in text
+        assert me.key not in text
+
     def test_undo_loudness_runs_the_undo_on_the_nodes_record_and_plexs_database(self, tmp_path, monkeypatch):
         from media_preview_generator.loudness import undo
 
@@ -307,6 +339,10 @@ class TestTheInstaller:
     """install.ps1 can't run here; ``windows-node.yml`` runs it. These pin what it must never do again."""
 
     SCRIPT = (REPO_ROOT / "nodes" / "windows" / "install.ps1").read_text()
+
+    def test_the_key_it_prints_is_kept_as_already_shown(self):
+        # Kept as not shown, the node announces it again at its next start.
+        assert "-NotePropertyName announced -NotePropertyValue $true" in self.SCRIPT
 
     def test_it_never_recreates_the_run_key(self):
         # New-Item -Force on an existing registry key deletes it: every other program's logon entry with it.
