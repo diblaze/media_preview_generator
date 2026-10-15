@@ -609,6 +609,20 @@ class TestRunDecode:
         "Conversion failed!\n"
     )
 
+    # An Intel UHD 770 (VAAPI) on an H.264 High 4:4:4 file, with this module's command: FFmpeg has no VAAPI decoder for
+    # the profile, decodes it in software without a word and the GPU-side filter can't take the frames.
+    H264_HIGH_444_ON_VAAPI = (
+        "  Stream #0:0: Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), 640x360 [SAR 1:1 DAR 16:9]\n"
+        "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' and the "
+        "filter 'auto_scale_0'\n"
+        "[vf#0:0 @ 0x55ddfd537ec0] Error reinitializing filters!\n"
+        "[vf#0:0 @ 0x55ddfd537ec0] Task finished with error code: -38 (Function not implemented)\n"
+        "[vost#0:0/rawvideo @ 0x55ddfd4b2f40] [enc:rawvideo @ 0x55ddfd53a280] Could not open encoder before EOF\n"
+        "[out#0/rawvideo @ 0x55ddfd4b2bc0] Nothing was written into output file, because at least one of its streams "
+        "received no packets.\n"
+        "Conversion failed!\n"
+    )
+
     @pytest.mark.parametrize(
         ("exit_code", "stderr", "message", "kind"),
         [
@@ -628,6 +642,7 @@ class TestRunDecode:
                 "hwaccel",
             ),
             (218, H264_HI10P_ON_NVDEC, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
+            (218, H264_HIGH_444_ON_VAAPI, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
             (
                 218,
                 "[h264 @ 0x1] Failed to create decode context: 2 (resource allocation failed).\n"
@@ -656,6 +671,7 @@ class TestRunDecode:
             "codec-unnamed",
             "hwaccel",
             "codec-h264-profile-the-gpu-lacks",
+            "codec-h264-profile-vaapi-has-no-decoder-for",
             "hwaccel-init-failed-without-that-verdict",
             "io-error",
             "anything-else",

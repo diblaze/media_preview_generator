@@ -337,3 +337,109 @@ class TestAProfileTheGpuLacks:
 
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "codec"
+
+
+def _software_frames_refused(scaler: str) -> list[str]:
+    """How the run ends when FFmpeg decoded in software: the GPU scaler (``scale_vaapi``, ``scale_cuda``) can't take
+    the frames, so the filter graph fails before writing one and FFmpeg exits 218."""
+    return [
+        "Impossible to convert between the formats supported by the filter 'Parsed_fps_0' and the filter "
+        "'auto_scale_0'",
+        "Link 'Parsed_fps_0.default' -> 'auto_scale_0.default':",
+        f"Link 'auto_scale_0.default' -> 'Parsed_{scaler}_1.default':",
+        "[vf#0:0 @ 0x6470e4eecb00] Error reinitializing filters!",
+        "[vf#0:0 @ 0x6470e4eecb00] Task finished with error code: -38 (Function not implemented)",
+        "[vf#0:0 @ 0x6470e4eecb00] Terminating thread with return code -38 (Function not implemented)",
+        "[vost#0:0/mjpeg @ 0x6470e4ef2840] [enc:mjpeg @ 0x6470e4ec5380] Could not open encoder before EOF",
+        "[vost#0:0/mjpeg @ 0x6470e4ef2840] Task finished with error code: -22 (Invalid argument)",
+        "[vost#0:0/mjpeg @ 0x6470e4ef2840] Terminating thread with return code -22 (Invalid argument)",
+        "[out#0/image2 @ 0x6470e4ef24c0] Nothing was written into output file, because at least one of its streams "
+        "received no packets.",
+        "Conversion failed!",
+    ]
+
+
+SOFTWARE_FRAMES_EXIT = 218
+
+
+class TestACodecTheGpuHasNoDecoderFor:
+    """A codec or profile the GPU has no decoder for is handed to the CPU as a codec, on Intel/AMD (VAAPI) too.
+
+    Captured with the app's own preview command and FFmpeg 8.1.2 on an Intel UHD 770 (VAAPI, iHD 26.1.5) and a
+    Quadro P5000 (NVDEC). VAAPI never prints NVDEC's "Hardware is lacking required capabilities". For a codec FFmpeg
+    has no GPU decoder for at all (DivX 3, WMV, H.264 4:2:2 or 4:4:4 on VAAPI) it says nothing, decodes in software
+    and the GPU scaler refuses the frames: that run used to fail the file outright instead of retrying it on the CPU.
+    """
+
+    @pytest.mark.parametrize(
+        ("gpu", "stderr"),
+        [
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: msmpeg4v3 (msmpeg4) (MP43 / 0x3334504D), yuv420p, 640x360, 369 kb/s, "
+                    "SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 24 tbn",
+                    *_software_frames_refused("scale_vaapi"),
+                ],
+                id="divx3-on-vaapi",
+            ),
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), 640x360 "
+                    "[SAR 1:1 DAR 16:9], 24 fps, 24 tbr, 1k tbn",
+                    *_software_frames_refused("scale_vaapi"),
+                ],
+                id="h264-high-444-on-vaapi",
+            ),
+            pytest.param(
+                "NVIDIA",
+                [
+                    "Stream #0:0: Video: wmv2 (WMV2 / 0x32564D57), yuv420p, 640x360, 356 kb/s, SAR 1:1 DAR 16:9, "
+                    "24 fps, 24 tbr, 24 tbn",
+                    *_software_frames_refused("scale_cuda"),
+                ],
+                id="wmv8-on-nvdec",
+            ),
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: mpeg4 (Simple Profile) (FMP4 / 0x34504D46), yuv420p, 640x360 "
+                    "[SAR 1:1 DAR 16:9], 384 kb/s, 24 fps, 24 tbr, 24 tbn",
+                    # VAAPI's own verdict: the driver lists no profile for the codec.
+                    "[mpeg4 @ 0x5cc6e7411600] No support for codec mpeg4 profile 0.",
+                    "[mpeg4 @ 0x5cc6e7411600] Failed setup for format vaapi: hwaccel initialisation returned error.",
+                    *_software_frames_refused("scale_vaapi"),
+                ],
+                id="mpeg4-part2-on-vaapi",
+            ),
+            pytest.param(
+                "INTEL",
+                [
+                    "Stream #0:0: Video: h264 (High 10), yuv420p10le(tv, progressive), 640x360 [SAR 1:1 DAR 16:9], "
+                    "24 fps, 24 tbr, 1k tbn",
+                    # VAAPI's verdict for a profile it lacks, printed only at the -loglevel debug of DEBUG logging.
+                    "[h264 @ 0x5fd8fa87d040] Codec h264 profile 110 not supported for hardware decode.",
+                    "[h264 @ 0x5fd8fa87d040] Failed setup for format vaapi: hwaccel initialisation returned error.",
+                    *_software_frames_refused("scale_vaapi"),
+                ],
+                id="h264-high10-on-vaapi-debug-log",
+            ),
+        ],
+    )
+    def test_is_handed_to_the_cpu_as_a_codec_the_gpu_cant_decode(self, run, gpu, stderr):  # noqa: F811
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, *stderr)], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert not _warned(outcome, "GPU driver"), outcome.warnings
+
+    def test_a_driver_failure_before_the_software_decode_stays_a_hardware_accelerator_error(self, run):  # noqa: F811
+        # A decoder whose GPU set-up failed in the driver falls back to software too, and ends the same way.
+        outcome = run(
+            [(SOFTWARE_FRAMES_EXIT, 0, *HEVC_HWACCEL_INIT_ONLY, *_software_frames_refused("scale_vaapi"))],
+            gpu="INTEL",
+        )
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"

@@ -1069,6 +1069,10 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
         # NVDEC's verdict that the GPU has no decoder for this profile (H.264 High 10 or 4:4:4). FFmpeg prints the
         # generic "hwaccel initialisation returned error" right after it, so it has to win over that driver error.
         "hardware is lacking required capabilities",
+        # VAAPI's verdicts: the driver has no profile for the codec (MPEG-4 part 2), or not this one (H.264 High 10,
+        # printed only at -loglevel debug).
+        "no support for codec",
+        "not supported for hardware decode",
         # Generic codec errors (check these carefully - only in GPU context after failure)
         "unsupported codec",
         "codec not supported",
@@ -1078,6 +1082,12 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
     for pattern in codec_error_patterns:
         if pattern in stderr_text:
             return True
+
+    # FFmpeg has no GPU decoder for some codecs (DivX 3, WMV, H.264 4:2:2 or 4:4:4 on VAAPI): it decodes them in
+    # software without a word at -loglevel info, and the GPU scaler can't take the frames. A decoder whose GPU set-up
+    # failed in the driver falls back to software and ends the same way, so this counts only without a driver error.
+    if "impossible to convert between the formats" in stderr_text and not _detect_hwaccel_runtime_error(stderr_lines):
+        return True
 
     # Check exit codes that may indicate codec issues
     # -22 (EINVAL) - invalid argument, often codec-related
