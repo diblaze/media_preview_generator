@@ -359,7 +359,7 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 | `GET /nodes` | – | `{"nodes": [NODE_ROW], "app_version"}` |
 | `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key when `url` is its saved address (400 otherwise) |
 | `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
-| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact) |
+| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact); 409 like `POST` when another saved node has that address or answers there |
 | `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
 | `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |

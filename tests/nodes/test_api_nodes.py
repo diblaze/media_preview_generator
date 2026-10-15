@@ -734,6 +734,36 @@ class TestATestOfRowsSavedLater:
         assert reg.get_registry().details(node_id).access_result is None
 
 
+class TestMovingOntoAnotherNodesAddress:
+    def test_an_address_another_saved_node_uses_is_refused(self, client, nodes):
+        first = _add(client).get_json()
+        nodes("http://other:9494").info_answer = _info(uid="uid-2")
+        second = _add(client, name="other", url="http://other:9494").get_json()
+
+        resp = client.put(f"/api/nodes/{second['id']}", json={"url": "http://nuc:9494/", "key": "node-key"})
+
+        assert resp.status_code == 409
+        assert (resp.get_json()["node_id"], resp.get_json()["name"]) == (first["id"], "nuc")
+        assert _sm().nodes[1]["url"] == "http://other:9494"
+
+    def test_an_address_where_an_added_node_answers_is_refused(self, client, nodes):
+        first = _add(client).get_json()
+        nodes("http://other:9494").info_answer = _info(uid="uid-2")
+        second = _add(client, name="other", url="http://other:9494").get_json()
+        nodes("http://nuc.lan:9494").info_answer = _info(uid="uid-1")  # the first node, by another name
+
+        resp = client.put(f"/api/nodes/{second['id']}", json={"url": "http://nuc.lan:9494", "key": "node-key"})
+
+        assert resp.status_code == 409 and resp.get_json()["node_id"] == first["id"]
+        assert _sm().nodes[1]["url"] == "http://other:9494"
+
+    def test_adding_a_second_node_at_a_saved_address_is_refused_even_while_it_is_offline(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("down")
+        first = _add(client).get_json()
+        resp = _add(client, name="again")
+        assert resp.status_code == 409 and resp.get_json()["node_id"] == first["id"]
+
+
 class TestRemovedDuringAGroupSave:
     def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
         """The group save checks its members against the nodes list under the settings lock, so a Remove that comes

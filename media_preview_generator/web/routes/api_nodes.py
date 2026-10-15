@@ -315,6 +315,22 @@ def probe_node():
     return jsonify(result)
 
 
+def _probed_uid(url: str, key: str) -> str | None:
+    """The id of the node answering at an address with this key, or None when none answers as a node."""
+    probe = _probe(url, key)
+    return probe["info"]["node"]["id"] if probe["ok"] else None
+
+
+def _twin(nodes: list[dict], url: str, uid: str | None) -> dict | None:
+    """The saved node at this address, or the one whose id the node answering there reported."""
+    return next((n for n in nodes if _same_address(url, n) or (uid and n.get("node_uid") == uid)), None)
+
+
+def _already_added(twin: dict) -> tuple[Any, int]:
+    answer = {"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}
+    return jsonify({**answer, "name": twin.get("name", "")}), 409
+
+
 @api.route("/nodes", methods=["POST"])
 @api_token_required
 def create_node():
@@ -324,14 +340,12 @@ def create_node():
     record, err = validate_node({**data, "node_uid": None}, existing=None, others=sm.nodes)
     if record is None:
         return jsonify({"error": err}), 400
-    probe = _probe(record["url"], record["key"])
-    uid = probe["info"]["node"]["id"] if probe["ok"] else None
+    uid = _probed_uid(record["url"], record["key"])
     with sm.locked():
         nodes = sm.nodes
-        twin = next((n for n in nodes if uid and n.get("node_uid") == uid), None)
+        twin = _twin(nodes, record["url"], uid)
         if twin is not None:
-            answer = {"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}
-            return jsonify({**answer, "name": twin.get("name", "")}), 409
+            return _already_added(twin)
         others_err = validate_node(record, existing=None, others=nodes)[1]
         if others_err:
             return jsonify({"error": others_err}), 400
@@ -352,6 +366,12 @@ def update_node(node_id: str):
     """Change a node's name, address, key, on/off switch or mappings."""
     data = {k: v for k, v in _json_body().items() if k in ("name", "url", "key", "enabled", "path_mappings")}
     sm = get_settings_manager()
+    before = find_node(sm.nodes, node_id)
+    new_url = normalise_url(data["url"])[0] if "url" in data else None
+    moving = before is not None and new_url is not None and not _same_address(new_url, before)
+    typed_key = normalise_key(data.get("key"), "")[0] if data.get("key") not in (None, KEY_MASK) else None
+    # Asked before the lock (it waits on the network); a node at the new address may already be added.
+    uid = _probed_uid(new_url, typed_key) if moving and new_url and typed_key else None
     with sm.locked():
         nodes = sm.nodes
         existing = find_node(nodes, node_id)
@@ -365,6 +385,10 @@ def update_node(node_id: str):
         record, err = validate_node(data, existing=existing, others=others)
         if record is None:
             return jsonify({"error": err}), 400
+        if not _same_address(record["url"], existing):
+            twin = _twin(others, record["url"], uid)
+            if twin is not None:
+                return _already_added(twin)
         reconnect = any(record[k] != existing.get(k) for k in ("url", "key", "path_mappings", "enabled"))
         nodes[nodes.index(existing)] = record
         try:
