@@ -1616,6 +1616,25 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
         assert h.registry.plex_db_hold("n1") is None
         assert h.registry.check_now("n1").state == reg.STATE_READY
 
+    @pytest.mark.parametrize("held", ["new-id", "no-id"])
+    def test_a_held_node_is_checked_again_soon_so_the_saved_machines_return_lifts_the_hold(self, h, held):
+        # Lab: once another machine left the node's address, files went on being skipped ("Type the node's key
+        # again") until the regular check, 30 s later: the hold returned before bringing that check forward.
+        client = h.client()
+        client.default_info = self._answer("uid-1")
+        h.registry.check_now("n1")
+        client.default_info = self._answer("uid-2") if held == "new-id" else NodeProtocolError("404")
+        h.registry.check_now("n1")  # the check that held it was a moment ago
+
+        hold = h.registry.plex_db_hold("n1")  # a file's write asks
+
+        assert hold is not None and not hold.waits
+        client.default_info = self._answer("uid-1")  # the saved machine is back at the address
+        h.clock.now += reg.WAITING_RECHECK_S
+        h.registry._tick()
+        assert _wait_for(lambda: not h.registry.view("n1").checking)
+        assert h.registry.plex_db_hold("n1") is None
+
     def test_a_node_that_refuses_the_key_without_an_id_is_held_with_its_own_reason(self, h):
         h.client().default_info = NodeAuthError("401")
 

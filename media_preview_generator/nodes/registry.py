@@ -644,7 +644,9 @@ class NodeRegistry:
 
         Either is known only from a check that reached the node, so until one has since this app started (or since
         the node last didn't answer, or got another address) a node with a saved id gets nothing either: its work
-        waits, and a check starts now (within :data:`WAITING_RECHECK_S` of one that found it down). The node's first
+        waits, and a check starts now (within :data:`WAITING_RECHECK_S` of one that found it down); a held new id or
+        answer with none brings its next check forward the same way, so the hold lifts soon after the saved machine
+        answers there again. The node's first
         check is waited for, up to :data:`FIRST_CHECK_WAIT_S`, so work asked for just after a restart isn't held back
         by a check that is about to answer. A new id taken in place of a saved one is compared with the Plex of the
         servers using the node here first (``_tie_new_uid``): none may have been switched on when it was taken.
@@ -666,21 +668,24 @@ class NodeRegistry:
                     "nothing is lost.",
                     waits=True,
                 )
+                hold = None
                 if live.unconfirmed_uid:
-                    return PlexDbHold(
+                    hold = PlexDbHold(
                         f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key "
                         "again on its Settings tab to confirm."
                     )
-                if not tie_decided:
+                elif not tie_decided:
                     return checking
                 # ``heard_uid`` holds only the saved id or one ``_new_uid`` accepted; an answer with no id ("") says
                 # nothing about which Plex is there.
-                if not live.record.get("node_uid") or live.heard_uid:
+                elif not live.record.get("node_uid") or live.heard_uid:
                     return None
-                if live.heard_uid == "":
-                    if live.probe_state == STATE_READY:
-                        return PlexDbHold(no_id_reason(name))
-                    return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
+                elif live.heard_uid == "" and live.probe_state == STATE_READY:
+                    hold = PlexDbHold(no_id_reason(name))
+                elif live.heard_uid == "":
+                    hold = PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
+                # A new id or none is lifted only by a check that hears the saved machine again (another machine gone
+                # from the address, the node updated), so that check is brought forward too.
                 if not live.checking and not waited and live.record.get("enabled", True):
                     now = self._clock()
                     if live.next_check <= now:
@@ -690,6 +695,8 @@ class NodeRegistry:
                         # One that didn't answer keeps its back-off (a check per request ran them back to back),
                         # brought forward as for a job waiting on it.
                         live.next_check = min(live.next_check, now + WAITING_RECHECK_S)
+                if hold is not None:
+                    return hold
                 left = deadline - time.monotonic()
                 if not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
                     return checking
