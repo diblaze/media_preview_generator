@@ -325,6 +325,9 @@ so the slim Plex database builds (Linux image without the app's dependencies, Wi
 
 Env: `MODE=node` (wrapper.sh), `NODE_PORT` (default 9494), `NODE_ROLES`, `NODE_NAME` (default hostname),
 `NODE_KEY` (else `AGENT_TOKEN`, else generated once into `<CONFIG_DIR>/node.json`), `PLEX_CONFIG_DIR` (plex_db).
+`FILE__<NAME>=<path>` sets `<NAME>` to that file's contents (Docker secrets). The node does it itself (app.py): the main
+image keeps the container's own environment (`S6_KEEP_ENV=1`), so s6's copy never reaches it. A file it can't read
+stops the node.
 
 ### 10.2 Registry (Lane B) used by remote execution (Lane C)
 

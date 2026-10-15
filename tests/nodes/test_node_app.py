@@ -534,3 +534,33 @@ class TestTempFolderAtStart:
         assert client.get("/v1/health").status_code == 200
         response = client.post("/v1/tasks", headers=HEADERS, json={"op": "preview.frames", "path": "/a"})
         assert response.status_code == 400 and response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
+
+
+class TestSecretFiles:
+    def test_a_key_in_the_file_file_node_key_names_is_the_key_the_node_expects(self, make_app, monkeypatch, tmp_path):
+        # linuxserver's FILE__ convention for Docker secrets was ignored: the node made a key of its own and every
+        # request from the app was refused.
+        secret = tmp_path / "node_key"
+        secret.write_text("a-key-from-a-docker-secret\n")
+        monkeypatch.setenv("NODE_KEY", "")  # so monkeypatch takes back the value the node sets
+        monkeypatch.setenv("FILE__NODE_KEY", str(secret))
+
+        client = make_app(key=None).test_client()
+
+        allowed = {"Authorization": "Bearer a-key-from-a-docker-secret", protocol.PROTOCOL_HEADER: "1"}
+        assert client.get("/v1/log", headers=allowed).status_code == 200
+        assert client.get("/v1/log", headers=HEADERS).status_code == 401
+
+    def test_any_setting_can_come_from_a_file(self, make_app, monkeypatch, tmp_path):
+        secret = tmp_path / "name"
+        secret.write_text("gpu-box\n")
+        monkeypatch.setenv("NODE_NAME", "")
+        monkeypatch.setenv("FILE__NODE_NAME", str(secret))
+
+        assert make_app().test_client().get("/v1/health").get_json()["node"]["name"] == "gpu-box"
+
+    def test_a_file_the_node_cant_read_refuses_to_start(self, make_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("FILE__NODE_KEY", str(tmp_path / "missing"))
+
+        with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names .*missing, which the node can't read \(No such"):
+            make_app(key=None)

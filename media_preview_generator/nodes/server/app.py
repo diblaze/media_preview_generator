@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import platform
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +29,8 @@ MAX_BODY_BYTES = 2 * 1024 * 1024
 ACCESS_CHECK_MAX_FILES = 200
 LOG_DEFAULT_LINES = 200
 EXTENSION = "mpg_node"
+# ``FILE__NODE_KEY=/run/secrets/node_key`` sets NODE_KEY to that file's contents (linuxserver's way to pass secrets).
+FILE_ENV_PREFIX = "FILE__"
 
 
 @dataclass
@@ -53,6 +55,38 @@ class NodeServerState:
         self.tasks.close(wait_s)
         if self.worker_info is not None:
             self.worker_info.stop()
+
+
+def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
+    """Set each ``FILE__<NAME>`` variable's ``<NAME>`` to the contents of the file it names (a Docker secret).
+
+    The main image's s6 init would do this, but the image keeps the container's own environment (``S6_KEEP_ENV``), so
+    its copy never reaches the node; the Plex database image has no such init. Trailing newlines (what
+    ``echo key > file`` leaves) are dropped.
+
+    Args:
+        environ: For tests; default ``os.environ``.
+
+    Raises:
+        SystemExit: A named file can't be read: the node would otherwise start with a key of its own, and the app's
+            every request would be refused.
+    """
+    environ = os.environ if environ is None else environ
+    for var, path in sorted(environ.items()):
+        name = var[len(FILE_ENV_PREFIX) :]
+        if not var.startswith(FILE_ENV_PREFIX) or not name:
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = handle.read()
+        except (OSError, ValueError) as exc:
+            reason = getattr(exc, "strerror", None) or type(exc).__name__
+            raise SystemExit(
+                f"{var} names {path}, which the node can't read ({reason}). Fix the path, or let this container's "
+                "user (PUID/PGID) read the file."
+            ) from exc
+        environ[name] = value.rstrip("\r\n")
+        logger.info("{} set from {}", name, var)
 
 
 def _resolve_roles(roles: list[str] | None) -> list[str]:
@@ -127,9 +161,11 @@ def create_node_app(
         The Flask app.
 
     Raises:
-        SystemExit: An unknown role, a bad key, an unreadable node.json, the worker role without a temp folder it can
-            make, or the Plex database role without ``PLEX_CONFIG_DIR``.
+        SystemExit: A ``FILE__`` variable naming a file it can't read, an unknown role, a bad key, an unreadable
+            node.json, the worker role without a temp folder it can make, or the Plex database role without
+            ``PLEX_CONFIG_DIR``.
     """
+    _env_from_files()
     chosen_roles = _resolve_roles(roles)
     me = identity.load_identity(config_dir, key=key)
     node_block = {
