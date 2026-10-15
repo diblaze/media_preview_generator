@@ -19,8 +19,10 @@ from media_preview_generator.library_health import plex as health_plex
 from media_preview_generator.loudness import plex_db as loudness_db
 from media_preview_generator.loudness.guard import RemoteLoudnessDb, create_loudness_db, loudness_capability
 from media_preview_generator.loudness.plex_db import LOUDNESS_CAPABILITY
-from media_preview_generator.markers.publishers import plex_chapters
+from media_preview_generator.markers import pipeline
+from media_preview_generator.markers.publishers import plex_chapters, plex_db
 from media_preview_generator.markers.publishers.base import Capability, PublishError
+from media_preview_generator.markers.publishers.plex_db import PlexMarkerPublisher
 from media_preview_generator.markers.publishers.plex_remote import (
     AGENT_DISABLED,
     AGENT_NO_NODE,
@@ -33,10 +35,16 @@ from media_preview_generator.markers.publishers.plex_remote import (
     plex_database,
 )
 from media_preview_generator.markers.settings import load_server
-from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
+from media_preview_generator.nodes import registry as reg
+from media_preview_generator.nodes.client import NodeUnreachableError
+from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, ROLE_PLEX_DB
 from media_preview_generator.nodes.registry import PlexDbHold, get_registry, set_registry
-from media_preview_generator.servers.base import ServerType
+from media_preview_generator.servers.base import ServerConfig, ServerType
 from tests.loudness.test_plex_db import FIELDS
+from tests.markers.pipeline_helpers import _ctx
+from tests.markers.test_plex_db_publisher import _make_db, _mountinfo
+from tests.nodes.plex_db_harness import NODE_URL, TOKEN, FlaskSession, node_app
+from tests.nodes.test_registry import Harness, _info, _record
 
 NODE = {
     "id": "n1",
@@ -501,3 +509,78 @@ def test_chapters_name_the_saved_id_and_another_machine_there_has_the_node_check
 
     assert session.post.call_args.kwargs["headers"][NODE_UID_HEADER] == NODE["node_uid"]
     get_registry().report_unavailable.assert_called_once_with(NODE["id"])
+
+
+class TestAHeldNodeIsUsedOnceACheckConfirmsIt:
+    """A Plex database node that was down (the Plex host rebooted) is held after it answers again, until the
+    registry's check hears its saved id, at most ``WAITING_RECHECK_S`` later. A markers job that asked in that window
+    was told "Checking ... nothing is lost", and kept that answer for the capability cache's five minutes: every file
+    was skipped although the node was confirmed seconds later."""
+
+    @pytest.fixture
+    def held(self, tmp_path, monkeypatch):
+        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
+        folder = tmp_path / "Plex Media Server"
+        _make_db(folder, journal_mode="wal")
+        node_client = node_app(str(folder), node_uid="uid-1", mountinfo_path=_mountinfo(tmp_path)).test_client()
+        record = _record(node_uid="uid-1", url=NODE_URL, key=TOKEN, name="Plex box", path_mappings=[])
+        reset_settings_manager()
+        sm = get_settings_manager(str(tmp_path / "app"))
+        sm.set("nodes", [record])
+        sm.set("media_servers", [{"id": "plex-1", "type": "plex", "markers": MARKERS}])
+        harness = Harness(nodes=[record])
+        reg.set_registry(harness.registry)
+        config = ServerConfig(
+            id="plex-1",
+            type=ServerType.PLEX,
+            name="Plex",
+            enabled=True,
+            url="http://plex:32400",
+            auth={},
+            output={"plex_config_folder": "/nowhere/plex"},
+            path_mappings=[],
+        )
+        settings = load_server(MARKERS, "plex")
+        server = MagicMock()
+        server.get_server_status.return_value = {"plex_pass": True, "version": "1.43.4"}
+        session = FlaskSession(node_client)
+        db = plex_database(settings, path_provider=lambda: None, label="Plex", session=session)
+        publisher = PlexMarkerPublisher(server, config, settings, db=db, ui_details=False)
+        yield harness, config, publisher, session
+        reg.set_registry(None)
+        harness.registry.stop()
+        reset_settings_manager()
+
+    def test_a_markers_job_writes_once_the_check_confirms_the_node_it_asked_about_while_held(self, held):
+        harness, config, publisher, _session = held
+        client = harness.client()
+        client.default_info = NodeUnreachableError("down")
+        harness.registry.check_now("n1")  # the Plex host rebooted: no answer, the node's next check is backed off
+        back = _info(uid="uid-1", roles=(ROLE_PLEX_DB,))
+        back["plex_db"] = {"machine_identifier": ""}
+        client.default_info = back  # it answers again, with the saved id
+
+        ctx = _ctx(MagicMock(), MagicMock())
+        first = pipeline.cached_capability(ctx, config, publisher)  # the job's first file, before that check
+        assert first.state is Capability.AGENT_UNAVAILABLE
+        assert "nothing is lost" in first.message
+
+        harness.clock.now += reg.WAITING_RECHECK_S
+        harness.registry.check_now("n1")  # the check the hold brought forward hears the saved id
+        assert harness.registry.plex_db_hold("n1") is None
+
+        again = pipeline.cached_capability(ctx, config, publisher)  # the job's next file
+        assert again.ready, f"still the held answer: {again.state.value}: {again.message}"
+
+    def test_a_node_that_did_not_answer_is_asked_again_for_the_job_s_next_file(self, held):
+        harness, config, publisher, session = held
+        harness.registry.check_now("n1")  # heard with its saved id: nothing held
+        session.stopped = True  # the node's host is unplugged
+        ctx = _ctx(MagicMock(), MagicMock())
+        down = pipeline.cached_capability(ctx, config, publisher)
+        assert down.state is Capability.AGENT_UNAVAILABLE and "nothing is lost" in down.message
+
+        session.stopped = False  # back before the registry's next check
+        assert pipeline.cached_capability(ctx, config, publisher).ready

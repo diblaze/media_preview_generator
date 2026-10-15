@@ -1035,6 +1035,18 @@ class RemotePlexDb(PlexDatabase):
     def _with_agent(self, report: CapabilityReport) -> CapabilityReport:
         return CapabilityReport(report.state, report.message, {**report.details, "agent": self.agent_details()})
 
+    def _failed_check(self, exc: PublishError) -> CapabilityReport:
+        """The report of a check the node couldn't run.
+
+        A node that stayed full is a busy database (``db_busy``), and one that didn't answer, or that is held until a
+        check hears its id (``node_refusal``), is work that waits for it (``node_waits``). A job reuses neither for
+        its next files: a check may confirm the node seconds later.
+        """
+        report = report_of_failure(exc, Capability.AGENT_UNAVAILABLE)
+        if isinstance(exc, AgentUnreachableError):
+            report = CapabilityReport(report.state, report.message, {**report.details, "node_waits": True})
+        return self._with_agent(report)
+
     def file_checks(self, *, deadline: float) -> CapabilityReport:
         """Ask the agent to check the database file on its own machine.
 
@@ -1051,8 +1063,7 @@ class RemotePlexDb(PlexDatabase):
             self._client.machine_identifier = str(result.get("machine_identifier") or "")
             return self._with_agent(report_from_json(result.get("report")))
         except PublishError as exc:
-            # A node that stayed full is a busy database here too (``db_busy``): retried, not reused for later files.
-            return self._with_agent(report_of_failure(exc, Capability.AGENT_UNAVAILABLE))
+            return self._failed_check(exc)
         except ValueError as exc:
             logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)
             return self._with_agent(
@@ -1076,7 +1087,7 @@ class RemotePlexDb(PlexDatabase):
             result = self._client.post("/v1/checks/db", {"deadline_s": remaining}, timeout=remaining + ANSWER_GRACE_S)
             return self._with_agent(report_from_json(result.get("report")))
         except PublishError as exc:
-            return self._with_agent(report_of_failure(exc, Capability.AGENT_UNAVAILABLE))
+            return self._failed_check(exc)
         except ValueError as exc:
             logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)
             return self._with_agent(

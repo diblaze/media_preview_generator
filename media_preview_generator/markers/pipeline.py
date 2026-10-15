@@ -2282,7 +2282,9 @@ def cached_capability(ctx: PipelineContext, cfg: ServerConfig, publisher: Marker
 
     An off or unconfirmed answer isn't cached: Plex reads it from the saved settings, and switching Intro & Credits
     back on must reach the job's next file, not one 5 minutes later. Nor is one that gave up on a busy database
-    (``details["db_busy"]``). A ready Plex whose Plex Pass didn't answer is reused for ``PLEX_PASS_UNKNOWN_TTL_S`` only.
+    (``details["db_busy"]``), nor one that waits for a Plex database node that didn't answer or is still to be checked
+    (``details["node_waits"]``). A ready Plex whose Plex Pass didn't answer is reused for ``PLEX_PASS_UNKNOWN_TTL_S``
+    only.
     """
     report = _cached_capability(ctx, cfg, publisher, wait_s=None)
     assert report is not None  # waiting without a bound always gets the check
@@ -2312,8 +2314,9 @@ def _cached_capability(
         if _still_fresh(ctx, cached):
             return cast(tuple[float, CapabilityReport], cached)[1]
         report = publisher.capability()
-        if report.details.get("db_busy"):
-            # A database busy just now says nothing about the job's next file, which asks again.
+        if report.details.get("db_busy") or report.details.get("node_waits"):
+            # A database busy just now, or a Plex database node a check may confirm seconds from now, says nothing
+            # about the job's next file, which asks again.
             ctx._capabilities.pop(cfg.id, None)
         elif report.state not in _SETTINGS_ANSWERS:
             ctx._capabilities[cfg.id] = (time.monotonic(), report)
