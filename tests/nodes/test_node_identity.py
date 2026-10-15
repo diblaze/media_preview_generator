@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from loguru import logger
@@ -213,6 +216,33 @@ class TestKeyNotice:
         assert first.key == second.key
         assert len([m for m in warnings_seen if first.key in m]) == 2
         assert [m for m in warnings_seen if "shown again next start" in m]
+
+    def test_notice_reaches_docker_logs_but_never_app_log(self, tmp_path):
+        """A worker node runs the app's setup_logging (the full image): its app.log is mode 0644 and goes into bug
+        reports, beside the 0600 node.json meant to be the key's only home. A process of its own, so this one's
+        handlers stay as they are."""
+        script = textwrap.dedent(
+            """
+            import os
+            from loguru import logger
+            from media_preview_generator.logging_config import setup_logging
+            from media_preview_generator.nodes.server import identity
+
+            setup_logging(log_level="INFO")
+            identity.load_identity(os.environ["CONFIG_DIR"])
+            logger.complete()
+            """
+        )
+        env = {k: v for k, v in os.environ.items() if k not in ("NODE_KEY", "AGENT_TOKEN")}
+        env.update(CONFIG_DIR=str(tmp_path), LOG_FORMAT="pretty")
+
+        done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=60)
+
+        assert done.returncode == 0, done.stderr
+        key = json.loads((tmp_path / "node.json").read_text())["key"]
+        assert key in done.stderr
+        app_log = (tmp_path / "logs" / "app.log").read_text()
+        assert key not in app_log and "node.json" not in app_log
 
     def test_notice_never_reaches_the_readable_node_log(self, tmp_path):
         buffer = nodelog.install()

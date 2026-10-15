@@ -49,6 +49,9 @@ from .utils import redact_secrets, redacted_traceback
 # Extra key on a record that belongs to one file's step-by-step job log. The job's own log takes it at its level; the
 # app-wide sinks keep it only when they log DEBUG, so the default app log holds job-level lines.
 PER_FILE_LOG = "per_file_log"
+# Extra key on a line meant for the console (docker logs) only: a node's one-time key notice. The same name as
+# nodes.server.nodelog.SECRET_EXTRA, which isn't imported here: the app's web process never loads the node server.
+CONSOLE_ONLY = "node_secret"
 _WARNING_NO = 30  # loguru's WARNING severity
 
 _managed_handler_ids: list[int] = []
@@ -240,11 +243,13 @@ def _route_stdlib_logging() -> None:
                 candidate.removeHandler(handler)
 
 
-def _app_sink_filter(log_level: str):
-    """Filter for the app-wide sinks: drop per-file job-log lines below WARNING unless the sinks log DEBUG.
+def _app_sink_filter(log_level: str, *, console: bool):
+    """Filter for the app-wide sinks: drop per-file job-log lines below WARNING unless the sinks log DEBUG, and a
+    console-only line (``CONSOLE_ONLY``: a node's one-time key notice) everywhere but the console.
 
     Args:
         log_level: The sinks' minimum level name.
+        console: Whether the sink is the console (docker logs), the one place a console-only line may go.
 
     Returns:
         A loguru filter function.
@@ -252,6 +257,8 @@ def _app_sink_filter(log_level: str):
     debug_enabled = log_level.upper() in ("TRACE", "DEBUG")
 
     def keep(record) -> bool:
+        if not console and record["extra"].get(CONSOLE_ONLY):
+            return False
         if not record["extra"].get(PER_FILE_LOG):
             return True
         return debug_enabled or record["level"].no >= _WARNING_NO
@@ -322,7 +329,7 @@ def setup_logging(
                 _json_sink,
                 level=log_level,
                 format="{message}",
-                filter=_app_sink_filter(log_level),
+                filter=_app_sink_filter(log_level, console=True),
                 enqueue=True,
                 diagnose=False,
             )
@@ -331,7 +338,7 @@ def setup_logging(
                 lambda msg: console.print(escape(redact_secrets(msg)), end=""),
                 level=log_level,
                 format=_CONSOLE_FORMAT,
-                filter=_app_sink_filter(log_level),
+                filter=_app_sink_filter(log_level, console=True),
                 enqueue=True,
                 diagnose=False,
             )
@@ -340,7 +347,7 @@ def setup_logging(
                 _write_stderr,
                 level=log_level,
                 format=_CONSOLE_FORMAT,
-                filter=_app_sink_filter(log_level),
+                filter=_app_sink_filter(log_level, console=True),
                 colorize=True,
                 enqueue=True,
                 diagnose=False,
@@ -351,7 +358,7 @@ def setup_logging(
         log_dir = os.path.join(os.environ.get("CONFIG_DIR", "/config"), "logs")
         try:
             os.makedirs(log_dir, exist_ok=True)
-            keep_line = _app_sink_filter(log_level)
+            keep_line = _app_sink_filter(log_level, console=False)
             hid = logger.add(
                 os.path.join(log_dir, "app.log"),
                 level=log_level,
@@ -381,7 +388,7 @@ def setup_logging(
                 broadcaster.sink,
                 level=log_level,
                 format="{message}",
-                filter=_app_sink_filter(log_level),
+                filter=_app_sink_filter(log_level, console=False),
                 enqueue=True,
                 diagnose=False,
             )
