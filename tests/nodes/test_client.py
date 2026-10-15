@@ -22,6 +22,7 @@ from media_preview_generator.nodes.client import (
     NodeClient,
     NodeProtocolError,
     NodeRequestError,
+    NodeStoppingError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnreachableError,
@@ -255,6 +256,18 @@ class TestARefusedStart:
             self._start(serve, "failed")
         with pytest.raises(NodeRequestError):
             self._start(serve, "request")
+
+    def test_a_node_that_is_stopping_is_told_apart_from_another_503(self, serve):
+        body = {"ok": False, "error": {"kind": "node_stopping", "message": "This node is stopping"}}
+        url, _ = serve(503, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        with pytest.raises(NodeStoppingError) as raised:
+            _local(url).start_task({"op": "preview.frames", "path": "/a"})
+        assert str(raised.value) == f"{url} is restarting" and isinstance(raised.value, NodeUnreachableError)
+
+        url, _ = serve(503, b"<html>Service Unavailable</html>", {"Content-Type": "text/html"})
+        with pytest.raises(NodeUnreachableError) as raised:
+            _local(url).start_task({"op": "preview.frames", "path": "/a"})
+        assert not isinstance(raised.value, NodeStoppingError)
 
 
 class TestWhyNothingAnswered:

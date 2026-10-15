@@ -8,10 +8,13 @@ import json
 import os
 import re
 import shutil
+import signal
+import sys
 import tempfile
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -197,6 +200,37 @@ def working_folder_hint() -> tuple[str, str]:
     if is_node_mode():
         return "the node's temp folder", "NODE_TEMP_DIR"
     return "the working folder", "Settings → Advanced"
+
+
+_PR_SET_PDEATHSIG = 1  # linux/prctl.h
+
+
+def kill_with_parent() -> Callable[[], None] | None:
+    """A ``preexec_fn`` that has a node's FFmpeg killed (SIGKILL) when the node dies, on Linux; None elsewhere.
+
+    In Docker the container's end takes every process with it; a node run outside Docker that exits or is killed
+    left its FFmpeg decoding. Linux sends the signal when the *thread* that started the child ends, so pass it only
+    for a child that thread waits for (each FFmpeg run, never a long-lived helper process).
+
+    Returns:
+        The function for ``subprocess.Popen(preexec_fn=...)``, or None (not Linux, not a node, no ``prctl``).
+    """
+    if not sys.platform.startswith("linux") or not is_node_mode():
+        return None
+    import ctypes
+
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl  # loaded here: the child only calls it
+    except (OSError, AttributeError):
+        return None
+    parent = os.getpid()
+
+    def set_parent_death_signal() -> None:
+        prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+        if os.getppid() != parent:  # the node died before the signal was set: nothing would send it
+            os._exit(1)
+
+    return set_parent_death_signal
 
 
 def debug_logging_hint() -> str:

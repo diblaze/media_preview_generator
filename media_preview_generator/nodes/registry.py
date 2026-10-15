@@ -1053,6 +1053,9 @@ class NodeRegistry:
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
         version = str(block.get("version") or "")
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
+        if info.get("stopping") is True:
+            # It refuses every start until it is back (SIGTERM: a restart or an image update).
+            return _Outcome(STATE_OFFLINE, f"{name} is restarting; it gets no files until it is back.", **outcome)
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
             return _Outcome(

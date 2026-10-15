@@ -333,8 +333,9 @@ class _TaskRun:
             self._drop_unanswered(spec[protocol.CLIENT_TASK_ID_FIELD])
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         except NodeError as exc:
-            # No answer, or NodeCantStartError (its temp folder can't be used): nothing ran, so the file goes back in
-            # the queue and the node is checked now, whose /v1/info then names the folder and stops its work.
+            # No answer, NodeCantStartError (its temp folder can't be used) or NodeStoppingError: nothing ran, so the
+            # file goes back in the queue and the node is checked now, whose /v1/info then names the folder, or says
+            # it is stopping, and stops its work.
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
         logger.info(

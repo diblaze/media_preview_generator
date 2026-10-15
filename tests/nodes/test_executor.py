@@ -19,6 +19,7 @@ from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
     NodeAuthError,
     NodeCantStartError,
+    NodeStoppingError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnknownTaskError,
@@ -370,6 +371,8 @@ class TestNodeDrops:
             # Its temp folder can't be used: the file goes back in the queue and the node is checked now, rather than
             # the file failing while the node stays ready for the next one.
             NodeCantStartError("The node can't write to its temp folder /node-tmp (Permission denied)"),
+            # Stopping (SIGTERM): it goes elsewhere, with no drop counted against the file.
+            NodeStoppingError("http://n is restarting"),
         ],
     )
     def test_a_node_that_wont_start_the_task_is_unavailable_and_never_ran_it(self, media, error):

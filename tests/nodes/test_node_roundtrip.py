@@ -233,3 +233,28 @@ class TestATempFolderTheNodeCantWrite:
         assert raised.value.started is False and f"temp folder {read_only_temp}" in str(raised.value)
         assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
+
+
+class TestANodeThatIsStopping:
+    """SIGTERM: the node cancels its tasks and waits for their FFmpeg, and keeps answering meanwhile."""
+
+    def test_it_says_so_and_a_file_sent_there_goes_elsewhere_without_a_drop(self, node, tmp_path):
+        # A file requeued during that wait was started there again, never cancelled, and failed as "dropped twice".
+        url, app = node
+        client = _client(url)
+        assert client.info()["stopping"] is False and client.health()["stopping"] is False
+        app.extensions[node_app.EXTENSION].close()  # what the stop does first
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        registry = identity_registry(client)
+        set_registry(registry)
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError) as raised:
+                run_on_node(protocol.OP_PREVIEW_FRAMES, media, {"frames": 1}, gpu=None, cancel_check=None)
+        finally:
+            set_registry(None)
+
+        assert raised.value.started is False and "is restarting" in str(raised.value)
+        assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
+        assert registry.reports == [("unavailable", NODE_ID)]
+        assert client.info()["stopping"] is True and client.health()["stopping"] is True
+        assert app.extensions[node_app.EXTENSION].tasks.busy() == 0

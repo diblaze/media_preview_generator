@@ -6,6 +6,9 @@ and working directory setup.
 """
 
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 from unittest.mock import patch
@@ -400,6 +403,54 @@ class TestNodeHints:
         advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
 
         assert "the node's temp folder (NODE_TEMP_DIR) isn't full" in advice and "Settings" not in advice
+
+
+def _running(pid: int) -> bool:
+    """A process that exists and isn't a zombie waiting to be reaped."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+class TestKillWithParent:
+    def test_only_a_node_on_linux_gets_one(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        assert utils.kill_with_parent() is None
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils.sys, "platform", "darwin")
+        assert utils.kill_with_parent() is None
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_a_nodes_ffmpeg_dies_with_the_node(self):
+        # Outside Docker (no PID namespace) a node that exited or was killed left its FFmpeg running.
+        node = (
+            "import os, subprocess, sys\n"
+            "from media_preview_generator.utils import kill_with_parent\n"
+            "ffmpeg = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            "                          preexec_fn=kill_with_parent())\n"
+            "print(ffmpeg.pid, flush=True)\n"
+            "os._exit(0)\n"
+        )
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        done = subprocess.run(
+            [sys.executable, "-c", node], cwd=repo, env={**os.environ, "MODE": "node"},
+            capture_output=True, text=True, timeout=30, check=True,
+        )  # fmt: skip
+        pid = int(done.stdout.strip())
+        deadline = time.monotonic() + 10
+        while _running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        still_running = _running(pid)
+        if still_running:
+            os.kill(pid, signal.SIGKILL)
+
+        assert not still_running
 
 
 class TestIsWindows:

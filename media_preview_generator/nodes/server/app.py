@@ -287,7 +287,7 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
     @bp.get(protocol.ROUTE_HEALTH)
     def health() -> Any:
         """Liveness for the container's HEALTHCHECK: no key needed, nothing about the media."""
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = {"stopping": table.stopping}
         if state.plex_db_module is not None:
             body["agent"] = state.plex_db_module.agent_block()
         return answer(body)
@@ -295,7 +295,9 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
     @bp.get(protocol.ROUTE_INFO)
     def info() -> Any:
         body: dict[str, Any] = {
-            "platform": {"os": platform.system(), "arch": platform.machine(), "python": platform.python_version()}
+            "platform": {"os": platform.system(), "arch": platform.machine(), "python": platform.python_version()},
+            # Stopping (SIGTERM): it takes no new task, so the app's check reads it as not ready.
+            "stopping": table.stopping,
         }
         if state.worker_info is not None:
             body["worker"] = state.worker_info.block(busy=table.busy())
@@ -381,6 +383,8 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             return refuse(protocol.KIND_TASK_DELETED, 409, str(exc))
         except tasks.TaskStartError as exc:
             return refuse(protocol.KIND_FAILED, 400, str(exc))
+        except tasks.NodeStoppingError as exc:
+            return refuse(protocol.KIND_NODE_STOPPING, 503, str(exc))
         return answer({"id": task_id}, 202)
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")

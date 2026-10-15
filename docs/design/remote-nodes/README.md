@@ -124,8 +124,8 @@ an update, since pull request and local images all report one version; the Plex 
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /v1/health` | – | `{"ok": true, "node": …}` (no auth; container HEALTHCHECK) |
-| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes, problem}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
+| `GET /v1/health` | – | `{"ok": true, "node": …, "stopping"}` (no auth; container HEALTHCHECK) |
+| `GET /v1/info` | – | `node`, `stopping`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes, problem}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
 | `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |
@@ -153,13 +153,19 @@ it sends `DELETE /v1/tasks/<client_task_id>` (404 = it never started), so FFmpeg
 unpolled-task expiry. The node remembers an id it was asked to delete before knowing it (5 minutes, at most 1024 ids):
 a start arriving after that DELETE answers 409 `task_deleted` and runs nothing.
 
+Stopping (SIGTERM): the node cancels every task first, then waits up to 5 s for their FFmpeg while it still answers.
+Meanwhile `stopping` is true in `/v1/health` and `/v1/info` (the registry reads the node as offline, "<node> is
+restarting") and a start answers 503 `node_stopping` and runs nothing; the app gives the file to another worker with
+no drop counted. On Linux each FFmpeg a node starts gets `PR_SET_PDEATHSIG` (SIGKILL), so it dies with a node run
+outside Docker (`utils.kill_with_parent`).
+
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.
 
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
 `unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`, `task_deleted`.
+`unknown_task`, `request`, `task_deleted`, `node_stopping`.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll.

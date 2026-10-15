@@ -79,6 +79,11 @@ class TaskStartError(Exception):
     Nothing ran, so the app gives the file back to the queue and holds the node until its next check."""
 
 
+class NodeStoppingError(Exception):
+    """The node is stopping (answered 503, kind ``node_stopping``): nothing ran, and the app sends the file elsewhere.
+    A task started now would outlive the cancel that stopping already sent, and die with the process."""
+
+
 # What a write into the temp folder fails with when the folder itself is the problem. Ops write only there (the media
 # is opened read-only), so one of these from an op is the temp folder's.
 _TEMP_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
@@ -391,6 +396,7 @@ class TaskTable:
             TaskSpecError: The spec is malformed or names an op this node doesn't have.
             TaskDeletedError: The app deleted this id in the last ``DELETED_ID_KEEP_S``.
             TaskStartError: The task's temp folder can't be made.
+            NodeStoppingError: :meth:`close` has begun.
         """
         if not isinstance(spec, dict):
             raise TaskSpecError("the task spec must be an object")
@@ -407,6 +413,7 @@ class TaskTable:
         gpu = _parse_gpu(spec.get("gpu"))
         task_id = _client_task_id(spec) or uuid.uuid4().hex
         with self._lock:
+            self._refuse_stopping()
             self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
@@ -414,8 +421,11 @@ class TaskTable:
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
             try:
+                # Checked again under the lock close() takes to collect the tasks: a task registered here is either
+                # in its list (and cancelled) or refused.
+                self._refuse_stopping()
                 self._refuse_deleted(task_id)  # its DELETE may have come while the temp dir was made
-            except TaskDeletedError:
+            except (NodeStoppingError, TaskDeletedError):
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise
             if task_id in self._tasks:  # The same start, twice at once: the first one runs.
@@ -558,6 +568,15 @@ class TaskTable:
     def get(self, task_id: str) -> NodeTask | None:
         """The task (None: unknown), counting as contact."""
         return self._touch(task_id)
+
+    @property
+    def stopping(self) -> bool:
+        """Whether :meth:`close` has begun: the node takes no new task."""
+        return self._stop.is_set()
+
+    def _refuse_stopping(self) -> None:
+        if self._stop.is_set():
+            raise NodeStoppingError("This node is stopping")
 
     def _refuse_deleted(self, task_id: str) -> None:
         # Under the lock. Ids past their time go first; the dict is in deletion order.

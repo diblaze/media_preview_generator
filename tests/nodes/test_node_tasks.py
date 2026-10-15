@@ -654,6 +654,40 @@ class TestExpiry:
         assert sorted(os.listdir(root)) == ["someone-elses"]
 
 
+class TestStopping:
+    """SIGTERM closes the table first; the server answers until the cancelled tasks' FFmpeg has stopped."""
+
+    def test_a_closing_table_refuses_new_tasks_and_runs_none(self, make_table, media):
+        # A file requeued while the node stopped was started there again, never cancelled, and died with the node.
+        ran: list[int] = []
+        table = make_table({"test.op": lambda ctx, node_path, params: ran.append(1) or {}})
+        assert not table.stopping
+
+        table.close()
+
+        with pytest.raises(tasks.NodeStoppingError, match="This node is stopping"):
+            table.start(_spec(media))
+        assert table.stopping and table.busy() == 0 and ran == []
+        assert os.listdir(table.temp_root) == []
+
+    def test_a_start_whose_folder_was_made_as_the_stop_began_is_refused_and_leaves_nothing(
+        self, make_table, media, monkeypatch
+    ):
+        table = make_table({"test.op": lambda ctx, node_path, params: {}})
+        make_temp_dir = table._make_temp_dir
+
+        def stop_meanwhile(task_id: str) -> str:
+            path = make_temp_dir(task_id)
+            table.close()
+            return path
+
+        monkeypatch.setattr(table, "_make_temp_dir", stop_meanwhile)
+
+        with pytest.raises(tasks.NodeStoppingError):
+            table.start(_spec(media))
+        assert table.busy() == 0 and os.listdir(table.temp_root) == []
+
+
 class TestArtifact:
     def test_set_artifact_inside_the_temp_dir(self, make_table, media):
         def op(ctx, node_path, params):

@@ -104,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The exit code: 1 when the node refused to start (the reason is logged once) or couldn't listen.
     """
+    # wrapper.sh sets it in the image; a node started some other way is one too: its log hints name the app's screens
+    # for it, and its FFmpeg dies with it (utils.is_node_mode).
+    os.environ.setdefault("MODE", "node")
     try:
         return _serve(_parse(argv))
     finally:

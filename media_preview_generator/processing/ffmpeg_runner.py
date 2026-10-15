@@ -37,7 +37,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import gpu_settings_hint, working_folder_hint
+from ..utils import gpu_settings_hint, kill_with_parent, working_folder_hint
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -486,6 +486,7 @@ def create_ffmpeg_runner(
                 stderr=stderr_fh,
                 stdout=subprocess.DEVNULL,
                 env=ffmpeg_env,
+                preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
             )
 
             # Signal that FFmpeg process has started

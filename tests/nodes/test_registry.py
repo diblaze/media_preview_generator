@@ -312,6 +312,18 @@ class TestStates:
         assert "/node-tmp (Permission denied)" in view.reason and "NODE_TEMP_DIR" in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node's temp folder can't be used")
 
+    def test_a_node_that_is_stopping_gets_no_work_and_says_it_is_restarting(self, h):
+        # It answers /v1/info while it waits for its cancelled tasks' FFmpeg: read as ready, it was sent files again.
+        info = _info()
+        info["stopping"] = True
+        h.client().default_info = info
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_OFFLINE
+        assert view.reason == "nuc is restarting; it gets no files until it is back."
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+
     @pytest.mark.parametrize("temp", [{"path": "/node-tmp", "problem": None}, {"path": "/node-tmp"}, None])
     def test_a_temp_folder_without_a_problem_leaves_the_node_ready(self, h, temp):
         info = _info()

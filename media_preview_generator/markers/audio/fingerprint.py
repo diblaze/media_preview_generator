@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from loguru import logger
 
+from ...utils import kill_with_parent
 from ..freeze import Freeze
 from ..fs import gone_from_disk
 from ..locks import KeyedLocks
@@ -416,6 +417,7 @@ def _run_fingerprint(
             stderr=subprocess.PIPE,
             start_new_session=True,
             pass_fds=() if progress_pipe is None else (progress_pipe[1],),
+            preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
         )
     except BaseException:
         _close_fds(progress_pipe)

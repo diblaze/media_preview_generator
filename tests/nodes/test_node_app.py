@@ -270,6 +270,24 @@ class TestTaskRoutes:
         assert deleted.status_code == 200 and deleted.get_json()["ok"] is True
         assert after.status_code == 404 and after.get_json()["error"]["kind"] == protocol.KIND_UNKNOWN_TASK
 
+    def test_a_stopping_node_answers_503_to_a_start_and_says_it_is_stopping(self, make_app, media):
+        # wsgi's stop cancels every task, then waits for their FFmpeg while the server still answers.
+        runs: list[int] = []
+        app = make_app(ops={"test.op": lambda *a: runs.append(1) or {}})
+        client = app.test_client()
+        assert client.get("/v1/health").get_json()["stopping"] is False
+        assert client.get("/v1/info", headers=HEADERS).get_json()["stopping"] is False
+        spec = {"op": "test.op", "path": "/data/a.mkv", "size": 10, "mtime_ns": None,
+                "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}], "gpu": None, "params": {}}  # fmt: skip
+
+        app.extensions[node_app.EXTENSION].close()
+        started = client.post("/v1/tasks", headers=HEADERS, json=spec)
+
+        assert started.status_code == 503 and started.get_json()["error"]["kind"] == protocol.KIND_NODE_STOPPING
+        assert runs == []
+        assert client.get("/v1/health").get_json()["stopping"] is True
+        assert client.get("/v1/info", headers=HEADERS).get_json()["stopping"] is True
+
     def test_a_repeated_start_with_the_same_client_id_answers_the_same_task(self, make_app, media):
         runs = []
         client = make_app(ops={"test.op": lambda *a: runs.append(1) or {}}).test_client()
