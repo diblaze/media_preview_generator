@@ -229,8 +229,9 @@ ENV PUID=1000 \
 # Tell s6-overlay to preserve environment variables
 ENV S6_KEEP_ENV=1
 
-# Web UI port, and the node port for MODE=node
-EXPOSE 8080 9494
+# Web UI port only. A node (MODE=node) is published with -p 9494:9494 instead: with a second exposed port, reverse
+# proxies that route to a container's only exposed port (nginx-proxy given just VIRTUAL_HOST) pick port 80 -> 502.
+EXPOSE 8080
 
 # Health check for the web UI (WEB_PORT), or for a node's /v1/health (NODE_PORT) when MODE=node
 # Uses python3 stdlib instead of curl (one fewer binary dependency).

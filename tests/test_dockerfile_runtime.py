@@ -72,6 +72,12 @@ def test_the_plex_database_images_healthcheck_asks_the_port_the_node_listens_on(
     assert _url(PLEX_DB, **env) == url
 
 
+def test_the_main_image_exposes_only_the_web_ui_port():
+    # nginx-proxy given only VIRTUAL_HOST routes to a container's one exposed port; with two it picks 80 (502).
+    exposed = [line.split()[1:] for line in _instructions(MAIN) if line.startswith("EXPOSE ")]
+    assert exposed == [["8080"]]
+
+
 def test_the_plex_database_image_names_the_only_role_it_carries():
     # The node refuses NODE_ROLES=worker when NODE_IMAGE_ROLES says the image can't run it (nodes/server/app.py).
     env = " ".join(line for line in _instructions(PLEX_DB) if line.startswith("ENV "))
