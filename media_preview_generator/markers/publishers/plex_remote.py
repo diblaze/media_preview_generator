@@ -22,7 +22,7 @@ from typing import Any
 import requests
 from loguru import logger
 
-from ...nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
+from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
 from .base import Capability, CapabilityReport, DatabaseBusyError, ItemNotFoundError, PublishError, Shown
@@ -896,6 +896,16 @@ class AgentClient:
                 advice = f"it speaks protocol {spoken} and this app speaks {sent}. Update this app to match the node."
             raise AgentError(
                 f"The Plex database node at {self.describe()} is version {named}; {advice}",
+                state=Capability.AGENT_UNAVAILABLE,
+            )
+        if status_code == 409 and isinstance(error, dict) and error.get("kind") == KIND_PROTOCOL:
+            # The node speaks our protocol and still refused it (a proxy dropped the id header): every request ends
+            # the same way, so this is the node's state, not one write's failure. Nothing ran.
+            self.state = AGENT_INCOMPATIBLE
+            raise AgentError(
+                str(
+                    error.get("message") or f"The Plex database node at {self.describe()} refused this app's protocol."
+                ),
                 state=Capability.AGENT_UNAVAILABLE,
             )
         if status_code == 404 and self._node_without_role():

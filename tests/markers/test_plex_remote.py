@@ -591,6 +591,24 @@ class TestTheNodesSavedId:
         assert remote.agent_details()["state"] == plex_remote.AGENT_INCOMPATIBLE
         assert told == []
 
+    def test_an_id_dropped_on_the_way_is_the_nodes_refusal_and_the_badge_says_so(self):
+        """A proxy that strips the id header: the node speaks protocol 2 and refuses the request without it. Every
+        request fails the same way, so the badge can't say connected, and the node's message names the fix."""
+        said = "The node's id (X-MPG-Node-Uid) didn't arrive with this request, so this node ran nothing."
+        stripped = _refusal(
+            {"kind": "protocol", "message": said, "state": Capability.AGENT_UNAVAILABLE.value},
+            version="1.2.0",
+            protocols=(1, 2),
+        )
+        remote, _, told = self._remote(stripped)
+        with pytest.raises(AgentError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        assert not isinstance(ei.value, plex_remote.AgentUnreachableError)
+        assert str(ei.value) == said
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert remote.agent_details()["state"] == plex_remote.AGENT_INCOMPATIBLE
+        assert told == []
+
     def test_the_id_is_read_for_each_request(self):
         uids = iter(["uid-a", ""])
         session = FakeSession(_envelope({"exists": True}, protocols=(1, 2)), _envelope({"exists": True}))
