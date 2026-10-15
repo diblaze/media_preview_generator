@@ -35,7 +35,7 @@ def _url(dockerfile: Path, **env: str) -> str:
     clean = {
         k: v
         for k, v in os.environ.items()
-        if k not in ("MODE", "NODE_PORT", "WEB_PORT", "AGENT_PORT", "FILE__NODE_PORT")
+        if k not in ("MODE", "NODE_PORT", "WEB_PORT", "AGENT_PORT", "FILE__NODE_PORT", "NODE_HOST", "FILE__NODE_HOST")
     }
     done = subprocess.run(
         [sys.executable, "-c", _RECORD_URL, _healthcheck_code(dockerfile)],
@@ -51,13 +51,13 @@ def _url(dockerfile: Path, **env: str) -> str:
 @pytest.mark.parametrize(
     ("env", "url"),
     [
-        ({"MODE": "node"}, "http://localhost:9494/v1/health"),
+        ({"MODE": "node"}, "http://127.0.0.1:9494/v1/health"),
         # wrapper.sh reads an empty NODE_PORT as the default (${NODE_PORT:-9494}); the check must look there too.
-        ({"MODE": "node", "NODE_PORT": ""}, "http://localhost:9494/v1/health"),
-        ({"MODE": "node", "NODE_PORT": "9500"}, "http://localhost:9500/v1/health"),
+        ({"MODE": "node", "NODE_PORT": ""}, "http://127.0.0.1:9494/v1/health"),
+        ({"MODE": "node", "NODE_PORT": "9500"}, "http://127.0.0.1:9500/v1/health"),
         # The node strips its port: an env file saved with CRLF, or spaces, still serve there (nodes/server/wsgi.py).
-        ({"MODE": "node", "NODE_PORT": "9500\r"}, "http://localhost:9500/v1/health"),
-        ({"MODE": "node", "NODE_PORT": " 9500 "}, "http://localhost:9500/v1/health"),
+        ({"MODE": "node", "NODE_PORT": "9500\r"}, "http://127.0.0.1:9500/v1/health"),
+        ({"MODE": "node", "NODE_PORT": " 9500 "}, "http://127.0.0.1:9500/v1/health"),
         ({}, "http://localhost:8080/api/health"),
         ({"WEB_PORT": ""}, "http://localhost:8080/api/health"),
         ({"WEB_PORT": "8181"}, "http://localhost:8181/api/health"),
@@ -130,7 +130,7 @@ def test_the_main_images_healthcheck_follows_the_same_mode_rule(monkeypatch, mod
     from media_preview_generator.utils import is_node_mode
 
     monkeypatch.setenv("MODE", mode)
-    expected = "http://localhost:9494/v1/health" if is_node_mode() else "http://localhost:8080/api/health"
+    expected = "http://127.0.0.1:9494/v1/health" if is_node_mode() else "http://localhost:8080/api/health"
     assert _url(MAIN, MODE=mode) == expected
 
 
@@ -148,6 +148,31 @@ def test_the_healthcheck_asks_the_port_a_file_names(dockerfile, tmp_path):
     port_file.write_bytes("\ufeff9700\r\n".encode())  # as Notepad saves it
     url = _url(dockerfile, MODE="node", NODE_PORT="9500", FILE__NODE_PORT=str(port_file))
     assert url.endswith(":9700/v1/health")
+
+
+@pytest.mark.parametrize("dockerfile", [MAIN, PLEX_DB], ids=["main", "plex-db"])
+@pytest.mark.parametrize(
+    ("host", "asked"),
+    [
+        ("", "127.0.0.1"),
+        ("0.0.0.0", "127.0.0.1"),
+        # Waitress listens IPv6-only on ::, so 127.0.0.1 is refused there.
+        ("::", "[::1]"),
+        ("172.17.0.1", "172.17.0.1"),
+        ("fd42::101", "[fd42::101]"),
+    ],
+    ids=["unset", "any-ipv4", "any-ipv6", "one-address", "one-ipv6-address"],
+)
+def test_the_healthcheck_asks_the_address_the_node_listens_on(dockerfile, host, asked):
+    # With --network host and NODE_HOST set to one address, a check of 127.0.0.1 read a serving node as unhealthy.
+    assert _url(dockerfile, MODE="node", NODE_HOST=host) == f"http://{asked}:9494/v1/health"
+
+
+@pytest.mark.parametrize("dockerfile", [MAIN, PLEX_DB], ids=["main", "plex-db"])
+def test_the_healthcheck_asks_the_address_a_file_names(dockerfile, tmp_path):
+    host_file = tmp_path / "host"
+    host_file.write_text("10.0.0.5\n")
+    assert _url(dockerfile, MODE="node", FILE__NODE_HOST=str(host_file)) == "http://10.0.0.5:9494/v1/health"
 
 
 def test_the_plex_database_image_names_the_only_role_it_carries():
