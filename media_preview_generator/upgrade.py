@@ -777,7 +777,8 @@ def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bo
 
     A settings file from before v4 restored over an install that already ran it (Settings -> Backups, or copied back
     by hand) runs v4 again; the schedules it made the first time are still in schedules.json, maybe renamed or
-    retimed since.
+    retimed since. For every library, any Recently Added schedule counts: the one v4 made may have been pointed at
+    some libraries since, and Recently Added schedules only exist once v4 has run.
 
     Args:
         schedules: Every stored schedule.
@@ -786,14 +787,13 @@ def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bo
     for schedule in schedules:
         if (schedule.get("config") or {}).get("job_type") != "recently_added":
             continue
+        if entry is None:
+            return True
         ids = {str(x.get("library_id") if isinstance(x, dict) else x) for x in schedule.get("library_ids") or []}
         if schedule.get("library_id"):
             ids.add(str(schedule["library_id"]))
         name = str(schedule.get("library_name") or "")
-        if entry is None:
-            if not ids and not name:
-                return True
-        elif (entry in ids) if entry.isdigit() else (name == entry):
+        if (entry in ids) if entry.isdigit() else (name == entry):
             return True
     return False
 

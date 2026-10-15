@@ -1013,6 +1013,26 @@ class TestMigrateToV4:
         assert settings_manager.get("recently_added_enabled") is None
         assert not any("created" in n for n in notes)
 
+    def test_restoring_over_a_scanner_moved_to_one_library_adds_no_all_libraries_one(
+        self, settings_manager, _fresh_schedule_manager
+    ):
+        """The all-libraries scanner v4 made, since pointed at one library, is still the scanner it would make."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {"recently_added_enabled": True, "recently_added_libraries": []}
+        settings_manager.apply_changes(updates=legacy)
+        _migrate_to_v4(settings_manager)
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        first = manager.get_all_schedules()
+        manager.update_schedule(first[0]["id"], library_id="3", library_name="Movies")
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert [s["id"] for s in manager.get_all_schedules()] == [first[0]["id"]]
+        assert not any("created" in n for n in notes)
+
     def test_a_scanner_for_another_library_is_still_made(self, settings_manager, _fresh_schedule_manager):
         from media_preview_generator.upgrade import _migrate_to_v4
         from media_preview_generator.web.scheduler import get_schedule_manager
