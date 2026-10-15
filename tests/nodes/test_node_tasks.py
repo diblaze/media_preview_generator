@@ -413,6 +413,16 @@ class TestATempFolderThatFilledUp:
 
         assert table.filled_problem() is None
 
+    def test_a_finished_task_waiting_for_its_delete_doesnt_make_the_fill_a_shared_one(self, make_table, media, free):
+        # Its files were there when the filling task started, so that task filled the room it had by itself and the
+        # next file that size fills it again. Counted as running beside it, the folder read fine again at once.
+        table = self._table(make_table)
+        assert _finished(table, table.start(_spec(media, "test.fits")))["status"] == protocol.STATUS_DONE
+
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        assert table.filled_problem() is not None
+
     def test_a_read_only_folder_isnt_one_that_filled_up(self, make_table, media, free):
         # The node's fresh check finds a read-only folder by itself.
         table = self._table(make_table)

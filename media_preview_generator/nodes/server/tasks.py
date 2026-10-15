@@ -601,7 +601,8 @@ class TaskTable:
                 temp_problem, filled = temp_failure
                 if filled:
                     with self._lock:
-                        shared = any(other is not task for other in self._tasks.values())
+                        # A finished task's files (waiting for the app's DELETE) were there when this one started.
+                        shared = any(other is not task and not other.is_finished for other in self._tasks.values())
                         self._filled = (time.monotonic(), task.temp_free_at_start, shared)
                 # The node's condition, not a bug: no traceback.
                 quiet.warning("Task {} ({}) failed: {}", task.id[:8], task.op, temp_problem)
