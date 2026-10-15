@@ -153,6 +153,7 @@ def create_ffmpeg_runner(
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
     # once per media file, not once per FFmpeg invocation.
     from .generator import (
+        _FOLDER_WRITE_TEXT,
         FFMPEG_STALL_TIMEOUT_SEC,
         NO_DECODER_PHRASE,
         CancellationError,
@@ -787,7 +788,7 @@ def create_ffmpeg_runner(
                     video_file,
                     folder,
                     output_folder,
-                    os.strerror(refused),
+                    _FOLDER_WRITE_TEXT[refused][0],
                     proc.returncode,
                     fix,
                     setting,

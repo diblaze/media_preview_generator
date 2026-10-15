@@ -174,6 +174,13 @@ FOLDER_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS})
 _FOLDER_WRITE_EXITS = {
     exit_code: code for code in (errno.ENOSPC, errno.EROFS) for exit_code in (256 - code, 2**32 - code)
 }
+# Their text as FFmpeg prints it (glibc's words; macOS spells EDQUOT's "Disc"). Not os.strerror: Windows has no EDQUOT,
+# and its stand-in's text there is "Unknown error", which any failed run may print.
+_FOLDER_WRITE_TEXT = {
+    errno.ENOSPC: ("No space left on device",),
+    errno.EROFS: ("Read-only file system",),
+    errno.EDQUOT: ("Disk quota exceeded", "Disc quota exceeded"),
+}
 # A line about writing the output: FFmpeg 6.1+ prefixes them [out#N/image2] and [vost#N:M/mjpeg], older builds name
 # the call that failed.
 _OUTPUT_SIDE_RE = re.compile(r"^\[(?:out#|vost#|image2 )|av_interleaved_write_frame\(\)|Error writing trailer")
@@ -707,9 +714,8 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str]) -> int | None:
     if code is not None:
         return code
     output_lines = [line for line in _without_metadata_tags(stderr_lines) if _OUTPUT_SIDE_RE.search(line)]
-    for code in sorted(FOLDER_WRITE_ERRNOS):
-        text = os.strerror(code)
-        if any(text in line for line in output_lines):
+    for code, texts in _FOLDER_WRITE_TEXT.items():
+        if any(text in line for text in texts for line in output_lines):
             return code
     return None
 
@@ -1850,7 +1856,7 @@ def generate_images(
         refused = _folder_write_errno(rc, run_stderr)
         if refused is not None:
             _clean_output_images(output_folder)
-            raise WorkingFolderError(refused, os.strerror(refused), output_folder)
+            raise WorkingFolderError(refused, _FOLDER_WRITE_TEXT[refused][0], output_folder)
         return rc, seconds, speed, run_stderr
 
     # DV Profile 5 paths cannot use -skip_frame (RPU side-data has

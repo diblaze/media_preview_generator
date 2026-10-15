@@ -44,6 +44,7 @@ from media_preview_generator.processing.generator import (
     PUBLISH_MIN_FRAME_RATIO,
     WorkingFolderError,
     _diagnose_ffmpeg_exit_code,
+    _folder_write_errno,
     _was_interrupted,
     clear_failures,
     failure_scope,
@@ -111,9 +112,9 @@ FOLDER_READ_ONLY_STDERR = [
     "Conversion failed!",
 ]
 OVER_QUOTA_LINE = (
-    f"[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -{errno.EDQUOT} ({os.strerror(errno.EDQUOT)})"
+    f"[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -{errno.EDQUOT} (Disk quota exceeded)"
 )
-OLD_FFMPEG_FULL_LINE = f"av_interleaved_write_frame(): {os.strerror(errno.ENOSPC)}"
+OLD_FFMPEG_FULL_LINE = "av_interleaved_write_frame(): No space left on device"
 # Mesa on a read-only root: about its shader cache, not the thumbnails; the run goes on fine.
 MESA_SHADER_CACHE_LINE = "Failed to create //.cache for shader cache (Read-only file system)---disabling."
 
@@ -492,6 +493,19 @@ class TestAFolderThatRefusesTheThumbnails:
 
         assert_refused(outcome)
         assert [c["use_skip"] for c in outcome.calls] == [True]
+
+    def test_the_errors_text_is_read_as_ffmpeg_words_it_whatever_the_os_calls_the_errno(self, monkeypatch):
+        # Windows has no EDQUOT: Python's is WSAEDQUOT, which os.strerror calls "Unknown error".
+        real_strerror = os.strerror
+        monkeypatch.setattr(
+            os, "strerror", lambda code: "Unknown error" if code == errno.EDQUOT else real_strerror(code)
+        )
+        unknown = "[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -1313558101 (Unknown error)"
+
+        assert _folder_write_errno(SELF_EXIT, [unknown]) is None
+        assert _folder_write_errno(SELF_EXIT, [OVER_QUOTA_LINE]) == errno.EDQUOT
+        # macOS words it the BSD way.
+        assert _folder_write_errno(SELF_EXIT, [OVER_QUOTA_LINE.replace("Disk", "Disc")]) == errno.EDQUOT
 
 
 class TestStallWatchdogThroughTheRealRunner:
