@@ -6963,6 +6963,39 @@ class TestBackupRestore:
                 contents.append(json.load(f)["log_retention_count"])
         assert 7 in contents  # The snapshot to undo the restore with.
 
+    def test_a_settings_restore_takes_the_schedule_lock_before_the_settings_lock(self, client, monkeypatch):
+        """A pre-v4 settings.json's upgrade creates a schedule (schedule lock) while the restore holds the settings
+        lock; a schedule save takes them the other way round, so the two could wait on each other for good."""
+        from contextlib import contextmanager
+
+        from media_preview_generator.web.scheduler import get_schedule_manager
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm, manager = get_settings_manager(), get_schedule_manager()
+        order: list[str] = []
+
+        def recording(name, original):
+            @contextmanager
+            def locked():
+                order.append(name)
+                with original():
+                    yield
+
+            return locked
+
+        monkeypatch.setattr(manager, "locked", recording("schedules", manager.locked))
+        monkeypatch.setattr(sm, "locked", recording("settings", sm.locked))
+        backup = "settings.json.20260101-100000.bak"
+        with open(os.path.join(str(sm.config_dir), backup), "w") as f:
+            json.dump(sm.get_all(), f)
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert order[:2] == ["schedules", "settings"]
+
     def test_a_restored_schedules_backup_is_what_the_scheduler_then_runs(self, client):
         """The schedule manager keeps the schedules and their crons in memory: after a restore it must list and run
         the restored set (crons added, moved and removed to match it), and the next save must keep that set."""

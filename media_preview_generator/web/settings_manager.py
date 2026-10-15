@@ -132,7 +132,8 @@ class SettingsManager:
         was, any text counted as on, so a node meant to be off was checked and sent work.
 
         An address that isn't text (a number, ``null``, or none at all) is cleared to ``""``, a node with no address:
-        read as it was, asking the node anything (its log, a Test access) failed with an error page.
+        read as it was, asking the node anything (its log, a Test access) failed with an error page. A key that isn't
+        text is cleared the same way, to be entered again.
         """
         raw = self._settings.get("nodes")
         if not isinstance(raw, list):

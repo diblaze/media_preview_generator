@@ -1903,7 +1903,8 @@ def restore_backup():
     # Each file's owner keeps it in memory, so it must re-read the restored file (under its lock where it has one);
     # otherwise the next save would write the old in-memory content back over the restore.
     settings = get_settings_manager()
-    schedules = get_schedule_manager() if name == "schedules.json" else None
+    # settings.json too: its pre-v4 upgrade creates a schedule, under this same order.
+    schedules = get_schedule_manager() if name in ("schedules.json", "settings.json") else None
     tmp_path = f"{live}.restore.tmp"
     replaced = False
     failure = None
@@ -1921,7 +1922,7 @@ def restore_backup():
                 _bring_restored_settings_up_to_date(settings, live_revisions)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
-            elif schedules is not None:
+            elif name == "schedules.json":
                 schedules.reload_schedules()
             elif name == "webhook_history.json":
                 _load_history_from_disk()

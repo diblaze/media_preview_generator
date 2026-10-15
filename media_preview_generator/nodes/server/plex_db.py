@@ -852,9 +852,10 @@ def register_plex_db(
             held.close()
             return _refused(publish_error_from_sqlite(exc))
         queries["parts"] = itertools.chain(first, queries["parts"])
-        # The rest is read in one read of the database once the 200 is out, kept compressed: a big library's rows
-        # (and their JSON) held as they are took a node past its memory limit. The connection and this request's
-        # slot are let go once the read is done, or when the app hangs up before.
+        # The rest is read in one read of the database before the answer is sent (a keepalive space each second keeps
+        # the app waiting), kept compressed: a big library's rows (and their JSON) held as they are took a node past its
+        # memory limit.
+        # The connection and this request's slot are let go once the read is done, or when the app hangs up before.
         slot = g.pop("plex_db_slot", None)
         if slot is not None:
             held.callback(slots.give_back, slot)
