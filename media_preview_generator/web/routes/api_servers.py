@@ -21,7 +21,7 @@ from flask import jsonify, request
 from loguru import logger
 
 from ...config import resolve_frame_interval
-from ...markers.settings import mask_server
+from ...markers.settings import chosen_node_error, mask_server
 from ...servers import (
     ServerConfig,
     ServerRegistry,
@@ -850,6 +850,9 @@ def create_server():
         servers = _get_media_servers()
         if any(isinstance(s, dict) and s.get("id") == entry["id"] for s in servers):
             return jsonify({"error": f"server id {entry['id']!r} already exists"}), 409
+        error = chosen_node_error(entry.get("markers"), None)
+        if error:
+            return jsonify({"error": error}), 400
         servers.append(entry)
         _save_media_servers(servers)
     logger.info("Added media server {!r} (id={})", entry["name"], entry["id"])
@@ -905,6 +908,9 @@ def update_server(server_id: str):
             if updated is None:
                 return jsonify({"error": error}), 400
             updated["id"] = server_id
+        error = chosen_node_error(updated.get("markers"), servers[index].get("markers"))
+        if error:
+            return jsonify({"error": error}), 400
         if fresh_identity:
             updated["server_identity"] = fresh_identity
         servers[index] = updated

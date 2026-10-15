@@ -370,6 +370,25 @@ def _normalise_agent(raw: object, stored: dict) -> tuple[dict | None, str]:
     return {"enabled": enabled, "node_id": node_id}, ""
 
 
+def chosen_node_error(block: object, existing: object) -> str:
+    """Why the Plex database node newly chosen in a validated ``markers`` block can't open the database ("" if it can).
+
+    Run again under the settings lock before saving: the block was validated before it, and a Remove of that node
+    landing in between would leave the server on a node that is gone.
+
+    Args:
+        block: The validated per-server ``markers`` block.
+        existing: The stored block it replaces (None for a new server).
+
+    Returns:
+        The message to refuse the save with, or "".
+    """
+    node_id = _stored_agent(block).get("node_id")
+    if not node_id or node_id == _stored_agent(existing).get("node_id"):
+        return ""
+    return _node_choice_error(str(node_id))
+
+
 def validate_server(raw: object, server_type: str, existing: object = None) -> tuple[dict | None, str]:
     """Validate and normalise a per-server ``markers`` block.
 

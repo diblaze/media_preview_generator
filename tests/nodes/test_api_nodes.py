@@ -456,6 +456,51 @@ class TestDelete:
         row = client.get("/api/nodes").get_json()["nodes"][0]
         assert row["used_by"] == {"groups": [{"id": "g1", "name": "Night"}], "servers": [{"id": "p1", "name": "Home"}]}
 
+    def test_a_node_removed_while_a_server_is_saved_onto_it_never_leaves_the_server_on_it(
+        self, client, nodes, monkeypatch
+    ):
+        """The server save checks its chosen node before taking the settings lock; a Remove landing in between
+        must make one of the two lose."""
+        import threading
+
+        from media_preview_generator.markers import settings as markers_settings
+
+        nodes("http://nuc:9494").info_answer["node"]["roles"] = ["plex_db"]
+        node_id = _add(client).get_json()["id"]
+        plex = {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": False, "node_id": None}}
+        server = {
+            **_plex_server({}),
+            "enabled": True,
+            "url": "http://plex:32400",
+            "auth": {"method": "token", "token": "t" * 20},
+            "libraries": [],
+            "markers": {"enabled": True, "library_ids": None, "plex": plex},
+        }
+        _sm().set("media_servers", [server])
+        other = client.application.test_client()
+        with other.session_transaction() as session:
+            session["authenticated"] = True
+        removed: list[int] = []
+        check = markers_settings._node_choice_error
+
+        def check_then_remove(chosen: str) -> str:
+            error = check(chosen)
+            if not removed:
+                remove = threading.Thread(
+                    target=lambda: removed.append(other.delete(f"/api/nodes/{chosen}").status_code)
+                )
+                remove.start()
+                remove.join(10)
+            return error
+
+        monkeypatch.setattr(markers_settings, "_node_choice_error", check_then_remove)
+        chosen = {**server["markers"], "plex": {**plex, "agent": {"enabled": True, "node_id": node_id}}}
+        resp = client.put("/api/servers/p1", json={"markers": chosen})
+
+        assert removed == [200] and _sm().nodes == []
+        assert resp.status_code == 400 and "isn't on the Nodes page any more" in resp.get_json()["error"]
+        assert _sm().get("media_servers")[0]["markers"]["plex"]["agent"]["enabled"] is False
+
 
 class TestTestAccess:
     def _library(self, tmp_path):
