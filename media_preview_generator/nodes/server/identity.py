@@ -14,6 +14,7 @@ import math
 import os
 import secrets
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -238,8 +239,21 @@ def _write_private(path: str, data: dict[str, Any]) -> None:
         raise
 
 
+def node_user() -> str:
+    """The user this node runs as, and where that is chosen, for the messages that ask to give it a file.
+
+    The main image applies PUID/PGID itself. The Plex database image runs as a fixed user and ignores them (its compose
+    file hands them to ``user:``), so with ``docker run`` only ``--user`` changes it.
+    """
+    if sys.platform == "win32":
+        return "the Windows account running the node"
+    if os.environ.get("NODE_IMAGE_ROLES"):
+        return "this container's user (`user:` in compose, `--user` with docker run)"
+    return "this container's user (PUID/PGID)"
+
+
 def _unreadable(path: str, exc: OSError) -> str:
-    """Why ``node.json`` can't be read, and the fix (a changed PUID/PGID is the usual cause)."""
+    """Why ``node.json`` can't be read, and the fix (a changed container user is the usual cause)."""
     if not isinstance(exc, PermissionError):
         return f"Can't read {path} ({exc.strerror or type(exc).__name__}); fix it and restart."
     running = getattr(os, "geteuid", lambda: None)()  # Windows has no uids
@@ -249,8 +263,8 @@ def _unreadable(path: str, exc: OSError) -> str:
         owner = None
     whose = f"it belongs to user {owner} and this node runs as user {running}" if None not in (owner, running) else ""
     return (
-        f"Can't read {path}{f' ({whose})' if whose else ''}. Set PUID/PGID back to the user that made it, or give it "
-        "to this container's user, and restart."
+        f"Can't read {path}{f' ({whose})' if whose else ''}. Run the node as the user that made it again, or give it "
+        f"to {node_user()}, and restart."
     )
 
 
@@ -283,8 +297,8 @@ def _load_or_create(config_dir: str) -> tuple[dict[str, Any], bool]:
         _write_private(path, data)
     except OSError as exc:
         raise SystemExit(
-            f"Can't write {path} ({exc.strerror or type(exc).__name__}); make the config folder writable for this "
-            "container's user (PUID/PGID) and restart."
+            f"Can't write {path} ({exc.strerror or type(exc).__name__}); make the config folder writable for "
+            f"{node_user()} and restart."
         ) from exc
     return data, True
 

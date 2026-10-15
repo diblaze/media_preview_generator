@@ -619,6 +619,18 @@ class TestSecretFiles:
         with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names a file the node can't read \(No such"):
             make_app(key=None)
 
+    def test_a_secret_the_plex_database_image_cant_read_names_its_user_setting_not_puid(
+        self, make_app, monkeypatch, tmp_path
+    ):
+        # That image runs as a fixed user and ignores PUID/PGID; only compose's user: or docker run's --user moves it.
+        monkeypatch.setenv("NODE_IMAGE_ROLES", "plex_db")
+        monkeypatch.setenv("NODE_ROLES", "plex_db")
+        monkeypatch.setenv("FILE__NODE_KEY", str(tmp_path / "missing"))
+
+        with pytest.raises(SystemExit) as refused:
+            make_app(key=None)
+        assert "`--user` with docker run" in str(refused.value) and "PUID" not in str(refused.value)
+
     @pytest.mark.parametrize("content", ["", "\n", "   \r\n"], ids=["empty", "newline", "blank"])
     def test_an_empty_file_refuses_to_start(self, make_app, monkeypatch, tmp_path, content):
         # NODE_KEY came out blank, which the node skips for node.json's key without a word: the app's every request

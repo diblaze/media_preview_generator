@@ -92,7 +92,50 @@ class TestNodeJson:
 
         message = str(refused.value)
         assert f"it belongs to user {owner} and this node runs as user 99" in message
-        assert "Set PUID/PGID back to the user that made it" in message and "remove" not in message
+        assert "Run the node as the user that made it again" in message and "remove" not in message
+        assert "this container's user (PUID/PGID)" in message
+
+    @pytest.mark.parametrize(
+        ("image_roles", "platform", "says", "never"),
+        [
+            ("", "linux", "this container's user (PUID/PGID)", "--user"),
+            # The Plex database image runs as a fixed user: PUID/PGID do nothing there with docker run.
+            ("plex_db", "linux", "this container's user (`user:` in compose, `--user` with docker run)", "PUID"),
+            ("", "win32", "the Windows account running the node", "container"),
+        ],
+        ids=["main-image", "plex-db-image", "windows"],
+    )
+    def test_an_unwritable_config_folder_names_how_this_node_chooses_its_user(
+        self, tmp_path, monkeypatch, image_roles, platform, says, never
+    ):
+        monkeypatch.setenv("NODE_IMAGE_ROLES", image_roles)
+        monkeypatch.setattr(sys, "platform", platform)
+
+        def refused(path, data):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(identity, "_write_private", refused)
+        with pytest.raises(SystemExit) as stopped:
+            identity.load_identity(str(tmp_path))
+
+        message = str(stopped.value)
+        assert f"make the config folder writable for {says} and restart." in message
+        assert never not in message
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any file")
+    def test_an_unreadable_node_json_on_the_plex_database_image_doesnt_name_puid(self, tmp_path, monkeypatch):
+        identity.load_identity(str(tmp_path))
+        path = tmp_path / "node.json"
+        path.chmod(0)
+        monkeypatch.setenv("NODE_IMAGE_ROLES", "plex_db")
+        try:
+            with pytest.raises(SystemExit) as refused:
+                identity.load_identity(str(tmp_path))
+        finally:
+            path.chmod(0o600)
+
+        message = str(refused.value)
+        assert "`--user` with docker run" in message and "PUID" not in message
 
     def test_repr_never_shows_the_key(self, tmp_path):
         me = identity.load_identity(str(tmp_path))

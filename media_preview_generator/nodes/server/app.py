@@ -94,7 +94,7 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
             # ``from None`` too: the OSError's own text names the path.
             raise SystemExit(
                 f"{var} names a file the node can't read ({reason}). Set it to the path of a file holding {name} "
-                f"(or set {name} to the value itself), and let this container's user (PUID/PGID) read that file."
+                f"(or set {name} to the value itself), and let {identity.node_user()} read that file."
             ) from None
         if not value:
             # A secret never filled in (``touch``, ``echo $UNSET > file``): NODE_KEY would be blank, which the node
