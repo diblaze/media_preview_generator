@@ -3,7 +3,6 @@
 Creates and configures the Flask application with SocketIO support.
 """
 
-import atexit
 import hashlib
 import hmac
 import json
@@ -22,6 +21,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from ..job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
 from ..nodes.protocol import APP_INSTANCE_HEADER
+from ..shutdown import on_shutdown
 from .auth import log_token_on_startup
 from .jobs import JobStatus, get_job_manager
 from .scheduler import get_schedule_manager
@@ -276,14 +276,14 @@ def _prewarm_caches() -> None:
 
 
 def _start_node_registry() -> None:
-    """Start the remote nodes' health loop; when the process exits, stop it and free the tasks running on nodes."""
+    """Start the remote nodes' health loop; when the process stops, free the tasks running on nodes, then stop it."""
     from ..nodes.executor import cancel_running_tasks
     from ..nodes.registry import get_registry
 
     registry = get_registry()
     registry.start()
-    atexit.register(registry.stop)
-    atexit.register(cancel_running_tasks)
+    on_shutdown(cancel_running_tasks)
+    on_shutdown(registry.stop)
 
 
 # Chains whose `retry_started_at` is older than this at boot time are
@@ -986,10 +986,9 @@ def create_app(config_dir: str | None = None) -> Flask:
     # Start scheduler
     schedule_manager.start()
 
-    # Ensure the scheduler is shut down when the process exits to prevent
-    # orphaned threads from lingering after gunicorn/Flask stops.
-    # Call scheduler.shutdown() directly instead of schedule_manager.stop()
-    # to avoid logger.info() writing to a closed stream during atexit.
+    # Shut the scheduler down as the process stops, so no schedule starts or pauses a job in its last seconds and no
+    # orphaned threads linger after gunicorn/Flask stops. Call scheduler.shutdown() directly instead of
+    # schedule_manager.stop() to avoid logger.info() writing to a closed stream when this runs at exit.
     def _shutdown_scheduler() -> None:
         try:
             if schedule_manager.scheduler.running:
@@ -997,7 +996,7 @@ def create_app(config_dir: str | None = None) -> Flask:
         except Exception:
             logger.debug("Scheduler shutdown error during exit", exc_info=True)
 
-    atexit.register(_shutdown_scheduler)
+    on_shutdown(_shutdown_scheduler)
 
     _start_node_registry()
 

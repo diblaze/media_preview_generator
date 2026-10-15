@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 from loguru import logger
 
 from ..processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, CodecNotSupportedError
+from ..shutdown import is_shutting_down, request_shutdown
 from . import protocol
 from .client import (
     MAX_ARTIFACT_BYTES,
@@ -53,8 +54,8 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
-# The read timeout of a DELETE sent from a thread of its own (to a node that stopped answering or didn't answer a
-# start, or again after a lost one), so the file is queued again without waiting for it.
+# The read timeout of a task's DELETE, sent from a thread of its own so the file (its result, or its next try) never
+# waits for it: a node that stops answering right after the result would hold the file for the full read timeout.
 GONE_DELETE_TIMEOUT_S = 3.0
 # A DELETE lost to a passing error is sent again after each of these waits: until one arrives the node keeps the task
 # and its temp dir (a preview's frames and their tar) for 10 minutes.
@@ -318,6 +319,7 @@ class _TaskRun:
         cancel_check: Callable[[], bool] | None,
         pause_check: Callable[[], bool] | None,
         progress_callback: Callable[[dict], None] | None,
+        start_id: str = "",
         path_swap: tuple[str, str] | None = None,
     ) -> None:
         self._registry = registry
@@ -329,6 +331,8 @@ class _TaskRun:
         self._progress_callback = progress_callback
         self._prefix = f"{placement.node_name}/{_device_label(registry, placement.node_id, gpu)} · "
         self._task_id = ""
+        # The id its start asks the node for, so a stopping app can free a task whose start is still on its way.
+        self._start_id = start_id
         self._next_log = 0
         self._last_progress: dict | None = None
         self._progress_warned = False
@@ -336,16 +340,18 @@ class _TaskRun:
         self._cancel_delivered = False
         self._paused_at: float | None = None
         self._forgotten = False
-        self._node_gone = False
         # (node's path, app's path) of the file: the job log names it by this app's path throughout.
         self._path_swap = path_swap
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
-        self._node_gone = True
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
         if self._cancel_seen_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
             return NodeTaskCancelledError(protocol.KIND_CANCELLED, message)
+        if is_shutting_down():
+            # The stop freed its task (cancel_running_tasks): queued again, it would start on another node, never
+            # freed. Ended as cancelled, it isn't recorded and its job is revived on the next start.
+            return NodeTaskCancelledError(protocol.KIND_CANCELLED, f"{message}; the app is stopping")
         return NodeUnavailableError(self._placement.node_id, self._placement.node_name, message, started=started)
 
     def start(self, spec: dict) -> None:
@@ -361,7 +367,7 @@ class _TaskRun:
             if _start_may_have_reached(exc):
                 # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
                 # running there beside the file's next try until the node's unpolled-task expiry.
-                self._free_later(spec[protocol.CLIENT_TASK_ID_FIELD], first_try=True)
+                self._free_later(spec[protocol.CLIENT_TASK_ID_FIELD])
             raise self._unavailable(f"{name} couldn't start the task: {exc}", started=False) from exc
         # Live, as the node takes it: the step's own lines and progress follow under the same prefix.
         logger.info(
@@ -546,46 +552,35 @@ class _TaskRun:
         extract_artifact(data, dest)
 
     def delete(self) -> None:
-        """Free the task on the node.
+        """Free the task on the node, from a short-lived thread.
 
-        A DELETE lost to an error that may pass is sent again from a short-lived thread (``DELETE_RETRY_DELAYS_S``).
-        After the node stopped answering every try runs on that thread, so the file is queued again at once: a node
-        that answers in time stops a task it still runs rather than at its unpolled-task expiry; one that doesn't
-        stops it at that expiry.
+        A DELETE lost to an error that may pass is sent again there (``DELETE_RETRY_DELAYS_S``). The file's result is
+        published, or the file queued again, at once: a node that answers in time stops a task it still runs rather
+        than at its unpolled-task expiry; one that doesn't stops it at that expiry.
         """
         if not self._task_id or self._forgotten:
             return
-        if self._node_gone:
-            self._free_later(self._task_id, first_try=True)
-        elif self._send_delete(self._task_id, None):
-            self._free_later(self._task_id, first_try=False)
+        self._free_later(self._task_id)
 
-    def _free_later(self, task_id: str, *, first_try: bool) -> None:
-        """Send the DELETE of ``task_id`` from a short-lived thread, again after each ``DELETE_RETRY_DELAYS_S`` wait
-        while nothing answers it.
+    def _free_later(self, task_id: str) -> None:
+        """Send the DELETE of ``task_id`` from a short-lived thread at once, and again after each
+        ``DELETE_RETRY_DELAYS_S`` wait while nothing answers it.
 
         Args:
             task_id: The node's task id (a start's client task id before the node answered with one).
-            first_try: Send it at once too; False when one was just sent and lost.
         """
-        delays = (0.0, *DELETE_RETRY_DELAYS_S) if first_try else DELETE_RETRY_DELAYS_S
-        threading.Thread(
-            target=self._retry_delete, args=(task_id, delays), name="node-task-delete", daemon=True
-        ).start()
+        threading.Thread(target=self._retry_delete, args=(task_id,), name="node-task-delete", daemon=True).start()
 
-    def _retry_delete(self, task_id: str, delays: tuple[float, ...]) -> None:
-        for delay in delays:
+    def _retry_delete(self, task_id: str) -> None:
+        for delay in (0.0, *DELETE_RETRY_DELAYS_S):
             time.sleep(delay)
-            if not self._send_delete(task_id, GONE_DELETE_TIMEOUT_S):
+            if not self._send_delete(task_id):
                 return
 
-    def _send_delete(self, task_id: str, read_timeout: float | None) -> bool:
+    def _send_delete(self, task_id: str) -> bool:
         """Send one DELETE; True when no answer came from the node, so it may get through if sent again."""
         try:
-            if read_timeout is None:
-                self._client.delete_task(task_id)
-            else:
-                self._client.delete_task(task_id, read_timeout=read_timeout)
+            self._client.delete_task(task_id, read_timeout=GONE_DELETE_TIMEOUT_S)
         except NodeUnknownTaskError:
             pass  # The node doesn't have it: the start never reached it, or it already freed the task.
         except NodeUnreachableError as exc:
@@ -605,7 +600,7 @@ _running_lock = threading.Lock()
 
 def _free_for_stop(run: _TaskRun, read_timeout: float) -> None:
     try:
-        run._client.delete_task(run._task_id, read_timeout=read_timeout)
+        run._client.delete_task(run._task_id or run._start_id, read_timeout=read_timeout)
     except NodeError as exc:
         logger.debug("{}couldn't free the task as the app stops: {}", run._prefix, exc)
     except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
@@ -616,8 +611,11 @@ def cancel_running_tasks(budget_s: float = STOP_DELETE_BUDGET_S) -> int:
     """Free every task this app runs on a node, for an app that is stopping.
 
     Without this a task keeps running on its node until the node's unpolled-task expiry, beside the tasks the job
-    revived on the next start gives the node. Each DELETE runs on a daemon thread of its own, so a node that doesn't
-    answer holds up none of the others; one still unanswered after ``budget_s`` is left to that expiry.
+    revived on the next start gives the node. The process is marked as stopping first, under the lock
+    :func:`run_on_node` adds its tasks under: from then on no task starts on a node, and a file whose task was freed
+    isn't queued again for another node (``_TaskRun._unavailable``). A task whose start is still on its way is freed
+    by the id it asked for. Each DELETE runs on a daemon thread of its own, so a node that doesn't answer holds up none
+    of the others; one still unanswered after ``budget_s`` is left to that expiry.
 
     Args:
         budget_s: The most this waits in all.
@@ -626,6 +624,7 @@ def cancel_running_tasks(budget_s: float = STOP_DELETE_BUDGET_S) -> int:
         How many tasks it asked nodes to free.
     """
     with _running_lock:
+        request_shutdown()
         runs = list(_running)
     if not runs:
         return 0
@@ -676,7 +675,7 @@ def run_on_node(
         NodeUnavailableError: The node didn't start the task (``started`` False), stopped answering, or forgot it.
         FileNotVisibleError: The node can't see the file as the app sees it.
         CodecNotSupportedError: The node's GPU couldn't run the op (the worker reruns it on the node's CPU).
-        NodeTaskCancelledError: The job was cancelled.
+        NodeTaskCancelledError: The job was cancelled, or the app is stopping.
         NodeTaskError: The op failed on the node.
         OSError: The app can't stat ``app_path``.
         RuntimeError: No placement is set.
@@ -712,12 +711,17 @@ def run_on_node(
         cancel_check=cancel_check,
         pause_check=pause_check,
         progress_callback=progress_callback,
+        start_id=spec[protocol.CLIENT_TASK_ID_FIELD],
         path_swap=(node_path, app_path) if node_path and node_path != app_path else None,
     )
-    run.start(spec)
     with _running_lock:
+        if is_shutting_down():
+            raise NodeTaskCancelledError(
+                protocol.KIND_CANCELLED, f"Not started on {placement.node_name}: the app is stopping"
+            )
         _running.add(run)
     try:
+        run.start(spec)
         return run.finish(run.wait(), app_path, artifact_to)
     finally:
         with _running_lock:

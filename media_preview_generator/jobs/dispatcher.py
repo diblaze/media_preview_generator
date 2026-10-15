@@ -10,7 +10,7 @@ import itertools
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from functools import partial
 from typing import Any, cast, overload
 
@@ -21,6 +21,7 @@ from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_
 from ..nodes.executor import REQUEUE_NODE_NOT_STARTED, REQUEUE_NODE_UNAVAILABLE, NodeRequeue
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
+from .node_members import EMPTY_NODE_HARDWARE, NodeHardware, checked_ready_since_drop, worker_node_id
 from .worker import JOB_LOG_SKIP, Worker, WorkerPool, logging_for_job
 
 _submission_counter_lock = threading.Lock()
@@ -1180,8 +1181,9 @@ class JobDispatcher:
         """Reserve a compatible job and slot together under a fixed lock order."""
         stranded: list[tuple[JobTracker, Any, str]] = []
         self.worker_pool.refresh_suspect_nodes()
+        back_nodes = self._nodes_back_since_drop()
         try:
-            self._assign_tasks_locked(stranded)
+            self._assign_tasks_locked(stranded, back_nodes)
         finally:
             # Failed outside the locks: completion runs the job's callbacks.
             for tracker, item, reason in stranded:
@@ -1191,18 +1193,32 @@ class JobDispatcher:
                     with self._trackers_lock:
                         tracker.active_processing = max(0, tracker.active_processing - 1)
 
-    def _claim_worker(self, tracker: JobTracker, stranded: list) -> tuple[Worker, Any] | None:
+    def _nodes_back_since_drop(self) -> frozenset[str]:
+        """The nodes behind a queued file's drop that a registry check begun since found ready.
+
+        Asked of the registry before the dispatcher's and pool's locks are taken, like the pool's suspect hold.
+        """
+        with self._trackers_lock:
+            dropped = {node for t in self._trackers.values() if t.item_queue for node in t.dropped_on.values()}
+        return frozenset(node for node in dropped if checked_ready_since_drop(node))
+
+    def _claim_worker(
+        self, tracker: JobTracker, stranded: list, back_nodes: Collection[str] = ()
+    ) -> tuple[Worker, Any] | None:
         """Claim a free worker and the first queued file of the job it may run; the caller holds both locks.
 
-        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped waits
-        for a worker elsewhere while one runs its kind now (busy or not), and goes back to that node only when none
-        does (``WorkerPool.runs_kind_outside``). One that no configured worker can run any more is taken off the
-        queue into ``stranded`` (counted in ``active_processing`` until it is failed). A worker claimed for a file a
-        cancel has since cleared off the queue is given back.
+        A file some nodes can't see only goes to a worker on another node (or this app). A file a node dropped goes to
+        a free worker elsewhere first. Until that node checks ready again, it waits for a worker elsewhere while one
+        runs its kind now (busy or not), and goes back to that node only when none does
+        (``WorkerPool.runs_kind_outside``). Once the node has checked ready, it goes back there when no worker
+        elsewhere is free. One that no configured worker can run any more is taken off the queue into ``stranded``
+        (counted in ``active_processing`` until it is failed). A worker claimed for a file a cancel has since cleared
+        off the queue is given back.
 
         Args:
             tracker: The job.
             stranded: Collects ``(tracker, item, reason)`` to fail once the locks are released.
+            back_nodes: The nodes that checked ready since they last dropped a file (:meth:`_nodes_back_since_drop`).
 
         Returns:
             The claimed worker and the file, or None.
@@ -1225,9 +1241,10 @@ class JobDispatcher:
             if dropped_on is not None:
                 avoid = {*excluded, dropped_on}
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid)
-                if worker is None and pool.runs_kind_outside(tracker.kind, avoid):
-                    # Back on the node that just dropped it, a second drop fails the file. The free worker there
-                    # takes a later file instead.
+                if worker is None and dropped_on not in back_nodes and pool.runs_kind_outside(tracker.kind, avoid):
+                    # Back on a node that hasn't answered since it dropped the file, a second drop fails it. The free
+                    # worker there takes a later file instead. Once the node has checked ready, a busy worker elsewhere
+                    # isn't waited for: it can stay busy for hours (a long film, a file its job's schedule froze).
                     continue
             if worker is None:
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
@@ -1246,7 +1263,7 @@ class JobDispatcher:
                 return None
         return None
 
-    def _assign_tasks_locked(self, stranded: list) -> None:
+    def _assign_tasks_locked(self, stranded: list, back_nodes: Collection[str] = ()) -> None:
         """:meth:`_assign_tasks`'s loop; files no worker can run any more go to ``stranded``."""
         self.worker_pool._apply_deferred_removals()
         while True:
@@ -1275,7 +1292,7 @@ class JobDispatcher:
                     )
                     chosen = None
                     for tracker in eligible:
-                        claimed = self._claim_worker(tracker, stranded)
+                        claimed = self._claim_worker(tracker, stranded, back_nodes)
                         if claimed is not None:
                             chosen = (tracker, *claimed)
                             break
@@ -1667,8 +1684,8 @@ class JobDispatcher:
             active = [t for t in self._trackers.values() if not t.done_event.is_set()]
         now = time.monotonic()
         for tracker in active:
-            # Only a node that can't see a file fills excluded_nodes, so without nodes nothing more runs here.
-            if not tracker.excluded_nodes:
+            # Only nodes fill excluded_nodes and dropped_on, so without nodes nothing more runs here.
+            if not tracker.excluded_nodes and not tracker.dropped_on:
                 tracker.node_wait = ""
             elif now - tracker.node_wait_checked_at >= NODE_WAIT_CHECK_S:
                 tracker.node_wait_checked_at = now
@@ -1679,7 +1696,8 @@ class JobDispatcher:
         """Why the job's queued files all wait for workers that are away, or ``""`` when any of them can run now.
 
         Each file some nodes can't see waits for a worker off those nodes. When nothing of the job runs and every
-        member left for each file is outside its hours, offline or still connecting, the job only waits for them.
+        member left for each file is outside its hours, offline or still connecting, the job only waits for them. A
+        file a node dropped waits for that node until it checks ready again (``_claim_worker``).
 
         Args:
             tracker: The job.
@@ -1694,13 +1712,21 @@ class JobDispatcher:
                 return ""
             waits = []
             for item in _queue_head(tracker.item_queue):
-                excluded = tracker.excluded_nodes.get(item.canonical_path)
-                if not excluded:
+                excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
+                dropped_on = tracker.dropped_on.get(item.canonical_path)
+                if not excluded and dropped_on is None:
                     return ""
-                waits.append(frozenset(excluded))
+                waits.append((frozenset(excluded), dropped_on))
         # The pool lock only copies its snapshot, taken after the dispatcher's lock is released.
         messages = []
-        for excluded in dict.fromkeys(waits):
+        for excluded, dropped_on in dict.fromkeys(waits):
+            if dropped_on is not None and not checked_ready_since_drop(dropped_on):
+                nodes = getattr(self.worker_pool, "_node_hardware", None)
+                name = nodes.node_name(dropped_on) if isinstance(nodes, NodeHardware) else dropped_on
+                messages.append(f"Waiting for a node — {name}: checking it again")
+                continue
+            if not excluded:
+                return ""
             capacity = self.worker_pool.capacity_outside(tracker.kind, excluded)
             if capacity is None or capacity["open"]:
                 return ""
@@ -1736,8 +1762,6 @@ class JobDispatcher:
         labels stay the same whether or not nodes are in use. Each row carries ``node`` (``{"id", "name"}``, ``None``
         for this app) and ``node_state`` (the node's registry state).
         """
-        from .node_members import EMPTY_NODE_HARDWARE, NodeHardware, worker_node_id
-
         all_workers = self.worker_pool._snapshot_workers()
         nodes = getattr(self.worker_pool, "_node_hardware", None)
         if not isinstance(nodes, NodeHardware):

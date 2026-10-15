@@ -26,6 +26,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...utils import FFMPEG_LOG_PREFIX
 from ..protocol import (
     CLIENT_TASK_ID_FIELD,
     CLIENT_TASK_ID_PATTERN,
@@ -55,8 +56,9 @@ REAP_INTERVAL_S = 5.0
 DELETED_ID_KEEP_S = 300.0
 DELETED_IDS_MAX = 1024
 # How long a stopping node keeps answering, at most, until the app has asked after each task it cancelled: told it
-# was a restart, the app sends the file back without counting a drop. The app polls every second, and Docker's stop
-# timeout is 10 s (the server's SHUTDOWN_WAIT_S for the ops comes first).
+# was a restart, the app sends the file back without counting a drop. The app polls every second. In the image s6
+# kills the node 3 s after a stop's SIGTERM (S6_KILL_GRACETIME), cutting this and the server's SHUTDOWN_WAIT_S short
+# when a task is slow to stop; a longer grace would slow every stop by as much, as s6 waits all of it.
 STOP_TELL_WAIT_S = 3.0
 _STOP_TELL_POLL_S = 0.05
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
@@ -397,15 +399,23 @@ class TaskTable:
         return sorted(self._ops)
 
     def _remove_leftovers(self) -> None:
-        # Tasks live in memory only, so a task dir found at start belongs to a process that died mid-task.
+        # Tasks live in memory only, so a task dir found at start belongs to a process that died mid-task, and so does
+        # an FFmpeg log: a preview's FFmpeg writes it here (utils.scratch_dir), outside the task's own dir.
         try:
             names = os.listdir(self.temp_root)
         except OSError:
             return
         for name in names:
             path = os.path.join(self.temp_root, name)
-            if name.startswith(TASK_DIR_PREFIX) and os.path.isdir(path) and not os.path.islink(path):
+            if os.path.islink(path):
+                continue
+            if name.startswith(TASK_DIR_PREFIX) and os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
+            elif name.startswith(FFMPEG_LOG_PREFIX) and name.endswith(".log") and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    logger.debug("Couldn't remove {} left by an earlier run: {}", name, exc)
 
     def start(self, spec: object) -> str:
         """Validate a TASK_SPEC and start its op in a thread.

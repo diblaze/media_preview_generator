@@ -70,7 +70,8 @@ INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
 # while something else holds it.
 REQUEST_BYTES_FREE = 64 * 1024
 REQUEST_BYTES_BUDGET = 64 * 1024 * 1024
-# How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop: inside Docker's 10 s stop timeout.
+# How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop, inside Docker's 10 s stop timeout;
+# in the image s6 kills the node sooner, 3 s after the SIGTERM (see tasks.STOP_TELL_WAIT_S).
 SHUTDOWN_WAIT_S = 5.0
 STOP_POLL_S = 0.2
 
