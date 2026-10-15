@@ -1024,9 +1024,10 @@ def test_the_app_factory_starts_the_registry_and_as_it_stops_frees_the_tasks_on_
     stub = Stub()
     reg.set_registry(stub)
     registered = []
-    monkeypatch.setattr(app_mod, "on_shutdown", registered.append)
+    monkeypatch.setattr(app_mod, "on_shutdown", lambda callback, name=None: registered.append((name, callback)))
     app_mod._start_node_registry()
-    assert calls == ["start"] and registered == [cancel_running_tasks, stub.stop]
+    assert calls == ["start"]
+    assert registered == [("node tasks", cancel_running_tasks), ("node registry", stub.stop)]
 
 
 class _LockProbingStore(AccessResultStore):

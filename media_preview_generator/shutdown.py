@@ -17,7 +17,8 @@ from loguru import logger
 
 # A plain bool: the signal handler sets it, and a handler must not take a lock.
 _shutting_down = False
-_callbacks: list[Callable[[], None]] = []
+# Each stop step with its name (None: unnamed), in the order registered.
+_callbacks: list[tuple[str | None, Callable[[], None]]] = []
 _callbacks_lock = threading.Lock()
 # Held while the callbacks run, so the exit hook waits for a run the signal began rather than starting another.
 _run_lock = threading.Lock()
@@ -38,7 +39,7 @@ def is_shutting_down() -> bool:
     return _shutting_down
 
 
-def on_shutdown(callback: Callable[[], None]) -> None:
+def on_shutdown(callback: Callable[[], None], *, name: str | None = None) -> None:
     """Run ``callback`` once when the process begins stopping: right after SIGTERM / SIGINT, else at exit.
 
     Not only at exit: s6 kills the container's processes 3 s after a stop's SIGTERM (``S6_KILL_GRACETIME``), and
@@ -48,10 +49,16 @@ def on_shutdown(callback: Callable[[], None]) -> None:
 
     Args:
         callback: Takes no arguments; what it raises is logged.
+        name: A step registered again under the same name takes the old one's place: an app made again in one
+            process (the tests make hundreds) stops its own scheduler and nodes, not every app's before it.
     """
     global _exit_hook_registered
     with _callbacks_lock:
-        _callbacks.append(callback)
+        at = next((i for i, (named, _) in enumerate(_callbacks) if name is not None and named == name), None)
+        if at is None:
+            _callbacks.append((name, callback))
+        else:
+            _callbacks[at] = (name, callback)
         if not _exit_hook_registered:
             atexit.register(run_shutdown_callbacks)
             _exit_hook_registered = True
@@ -67,7 +74,7 @@ def run_shutdown_callbacks() -> None:
             return
         _callbacks_ran = True
         with _callbacks_lock:
-            callbacks = list(_callbacks)
+            callbacks = [callback for _, callback in _callbacks]
         for callback in callbacks:
             try:
                 callback()

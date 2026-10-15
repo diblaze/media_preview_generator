@@ -298,3 +298,25 @@ class TestShutdownHooks:
         finally:
             child.kill()
             child.wait(10)
+
+    def test_an_app_made_again_in_one_process_replaces_the_stop_steps_of_the_one_before(
+        self, tmp_path, mock_auth_config
+    ):
+        """Every app the tests make registered its scheduler's and nodes' stop steps again: a stop ran each app's
+        steps, so a SIGTERM stopped every scheduler the process had ever made, and none of them was ever freed."""
+        create_app(config_dir=str(tmp_path))
+        first = list(shutdown._callbacks)
+        create_app(config_dir=str(tmp_path))
+
+        assert first and len(shutdown._callbacks) == len(first)
+
+    def test_a_step_registered_again_under_its_name_takes_the_old_ones_place(self):
+        ran: list[str] = []
+        shutdown.on_shutdown(lambda: ran.append("old scheduler"), name="scheduler")
+        shutdown.on_shutdown(lambda: ran.append("unnamed"))
+        shutdown.on_shutdown(lambda: ran.append("another unnamed"))
+        shutdown.on_shutdown(lambda: ran.append("new scheduler"), name="scheduler")
+
+        shutdown.run_shutdown_callbacks()
+
+        assert ran == ["new scheduler", "unnamed", "another unnamed"]
