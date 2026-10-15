@@ -541,6 +541,7 @@ class TestTheUndoRecordSurvivesAnUpdate:
 
     def test_a_folder_inside_the_volume_counts_as_on_it(self, folder, tmp_path, monkeypatch):
         volume = tmp_path / "node-config"
+        (volume / "sub").mkdir(parents=True)
         monkeypatch.setenv("CONFIG_DIR", str(volume / "sub"))
         extra = f"40 22 0:50 / {volume} rw - ext4 /dev/sdb1 rw\n"
         assert (
@@ -580,6 +581,54 @@ class TestTheUndoRecordSurvivesAnUpdate:
 
     def test_an_unreadable_mountinfo_is_not_a_refusal(self, tmp_path):
         assert plex_db_role.undo_record_problem(mountinfo_path=str(tmp_path / "missing")) == ""
+
+    @linux_mount_table
+    def test_a_config_folder_in_memory_is_refused(self, folder, tmp_path):
+        """--tmpfs /config: the undo record and node.json (the node's id) are gone at every restart."""
+        config_dir = Path(loudness_db.write_log_path()).parent
+        extra = f"40 22 0:50 / {config_dir} rw,nosuid,nodev - tmpfs tmpfs rw\n"
+        problem = plex_db_role.undo_record_problem(mountinfo_path=_mountinfo(tmp_path, fs="overlay", extra_lines=extra))
+        assert problem.startswith(f"{config_dir} on this Plex database node is in memory (tmpfs)")
+        assert "lost at every restart" in problem and f"-v <name>:{config_dir}" in problem
+
+    @pytest.mark.parametrize("journal_there", [False, True], ids=["no-record-yet", "record-there"])
+    @linux_mount_table
+    def test_a_config_folder_the_node_cant_write_reads_misconfigured_before_any_write(
+        self, folder, tmp_path, monkeypatch, journal_there
+    ):
+        """-v vol:/config:ro (or another user's folder): ready would send every file to a write that fails."""
+        journal = Path(loudness_db.write_log_path())
+        if journal_there:
+            journal.write_text('{"kind": "commit"}\n')
+        refused = PermissionError(13, "Permission denied")
+        real_open, real_temp = open, plex_db_role.tempfile.NamedTemporaryFile
+
+        def no_append(path, mode="r", *args, **kwargs):
+            if str(path) == str(journal) and "a" in mode:
+                raise refused
+            return real_open(path, mode, *args, **kwargs)
+
+        def no_new_file(*args, **kwargs):
+            if kwargs.get("dir") == str(journal.parent):
+                raise refused
+            return real_temp(*args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", no_append)
+        monkeypatch.setattr(plex_db_role.tempfile, "NamedTemporaryFile", no_new_file)
+
+        report = self._check(folder, tmp_path, root_fs="overlay", config_mounted=True)
+
+        assert report.state is Capability.MISCONFIGURED
+        assert report.message.startswith(
+            f"This Plex database node can't write its loudness undo record in {journal.parent} (Permission denied)."
+        )
+        assert journal.exists() is journal_there
+
+    def test_the_writable_check_leaves_nothing_behind(self, folder, tmp_path):
+        journal = Path(loudness_db.write_log_path())
+        assert plex_db_role.undo_record_problem(mountinfo_path=str(tmp_path / "missing")) == ""
+        assert sorted(p.name for p in journal.parent.iterdir() if p.name.startswith(".loudness")) == []
+        assert not journal.exists()
 
     def test_the_image_declares_the_volume(self):
         dockerfile = (Path(__file__).parents[2] / "nodes/plex-db/Dockerfile").read_text()
