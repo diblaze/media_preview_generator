@@ -1403,6 +1403,33 @@ class WorkerPool:
             ]
         return list(dict.fromkeys(stuck))
 
+    def capacity_outside(self, kind: str, exclude_nodes: Collection[str]) -> dict | None:
+        """The configured capacity for ``kind`` off ``exclude_nodes``, judged like a job's (``capacity_for_groups``).
+
+        Worked out from the last reconcile's policies and node snapshot after the pool lock is released.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids that can't run the item.
+
+        Returns:
+            ``capacity_for_groups``' dict (``open`` 0 with the ``reason`` when no member left is open now), or None for
+            a pool without worker groups.
+        """
+        from .group_runtime import capacity_for_groups
+
+        with self._workers_lock:
+            if self._policies is None:
+                return None
+            policies = [
+                policy
+                for policy in self._policies.values()
+                if policy.get("node") not in exclude_nodes and policy.get("count", 0) > 0
+            ]
+            selected_gpus = list(self.selected_gpus)
+            nodes = self._node_hardware
+        return capacity_for_groups(policies, selected_gpus, kind, nodes=nodes)
+
     def has_capacity_for(self, kind: str) -> bool:
         """Whether configured slots can run this kind now, even when all are busy."""
         from ..worker_groups import group_is_available, supports_job

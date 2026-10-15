@@ -40,6 +40,8 @@ MAX_NODE_START_FAILURES = 5
 # How far down a job's queue the dispatcher looks for a file a free worker may run, when files at the front can't run
 # on that worker's node.
 EXCLUDED_SCAN_LIMIT = 64
+# How often the dispatch loop works out why a job's queued files all wait for workers that are away.
+NODE_WAIT_CHECK_S = 1.0
 
 
 def _next_submission_order() -> int:
@@ -130,6 +132,11 @@ class JobTracker:
         self.node_start_failures: dict[str, int] = {}
         self.dropped_on: dict[str, str] = {}
         self.excluded_nodes: dict[str, dict[str, str]] = {}
+        # Why every queued file waits for workers that are away (outside their hours, offline, still connecting) while
+        # nothing of the job runs, else "": the kind still has open capacity on the nodes that can't see the files, so
+        # the job never parks. Set by the dispatch loop (``JobDispatcher._node_wait``), read by the banner.
+        self.node_wait = ""
+        self.node_wait_checked_at = 0.0
         self.total_items = len(items)
         self.successful = 0
         self.failed = 0
@@ -345,14 +352,17 @@ class JobTracker:
             completed: The count to show, so the text matches the count sent beside it; the live count when omitted.
 
         Returns:
-            E.g. "Waiting for a free worker", "Checking existing previews… 3/10", "Looking up markers… 3/10" or
-            "3/10 completed".
+            E.g. "Waiting for a free worker", "Checking existing previews… 3/10", "Looking up markers… 3/10",
+            "3/10 completed" or, while every file left waits for a node that is away, "Waiting for a node — nuc:
+            node offline".
         """
         if completed is None:
             completed = self.completed
         if not self.work_started:
             return f"{self.library_prefix}{WAITING_FOR_WORKER}"
         if self.generation_started:
+            if self.node_wait:
+                return f"{self.library_prefix}{self.node_wait}"
             return f"{self.library_prefix}{completed}/{self.total_items} completed"
         check_label = self.handlers.check_label if self.handlers else "Checking existing previews…"
         return f"{self.library_prefix}{check_label} {completed}/{self.total_items}"
@@ -1266,6 +1276,8 @@ class JobDispatcher:
                     tracker, worker, item = chosen
                     tracker.active_processing += 1
                     tracker.generation_started = True
+                    # Its last wait message is stale now; the next check, up to NODE_WAIT_CHECK_S away, would be late.
+                    tracker.node_wait = ""
                     self._stamp_pick(tracker)
                     progress_callback = partial(self.worker_pool._update_worker_progress, worker)
                     try:
@@ -1645,8 +1657,47 @@ class JobDispatcher:
         """
         with self._trackers_lock:
             active = [t for t in self._trackers.values() if not t.done_event.is_set()]
+        now = time.monotonic()
         for tracker in active:
+            # Only a node that can't see a file fills excluded_nodes, so without nodes nothing more runs here.
+            if not tracker.excluded_nodes:
+                tracker.node_wait = ""
+            elif now - tracker.node_wait_checked_at >= NODE_WAIT_CHECK_S:
+                tracker.node_wait_checked_at = now
+                tracker.node_wait = self._node_wait(tracker)
             tracker.emit_progress(min_interval=3.0)
+
+    def _node_wait(self, tracker: JobTracker) -> str:
+        """Why the job's queued files all wait for workers that are away, or ``""`` when any of them can run now.
+
+        Each file some nodes can't see waits for a worker off those nodes. When nothing of the job runs and every
+        member left for each file is outside its hours, offline or still connecting, the job only waits for them.
+
+        Args:
+            tracker: The job.
+
+        Returns:
+            ``capacity_wait_message``'s wording for each distinct wait, joined by "; ", or "".
+        """
+        from .group_runtime import capacity_wait_message
+
+        with self._trackers_lock:
+            if tracker.active_processing or tracker.active_checks or tracker.check_queue:
+                return ""
+            waits = []
+            for item in _queue_head(tracker.item_queue):
+                excluded = tracker.excluded_nodes.get(item.canonical_path)
+                if not excluded:
+                    return ""
+                waits.append(frozenset(excluded))
+        # The pool lock only copies its snapshot, taken after the dispatcher's lock is released.
+        messages = []
+        for excluded in dict.fromkeys(waits):
+            capacity = self.worker_pool.capacity_outside(tracker.kind, excluded)
+            if capacity is None or capacity["open"]:
+                return ""
+            messages.append(capacity_wait_message(capacity))
+        return "; ".join(dict.fromkeys(messages))
 
     def _get_in_progress_fraction(self, job_id: str) -> float:
         """Sum fractional progress of workers busy on a specific job.

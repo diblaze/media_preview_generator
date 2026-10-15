@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import time
+from collections import deque
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
 from media_preview_generator.jobs import parking
-from media_preview_generator.jobs.dispatcher import JobDispatcher, reset_dispatcher
+from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
 from media_preview_generator.jobs.group_runtime import capacity_wait_message, refresh_worker_groups
 from media_preview_generator.jobs.node_members import NODE_GPU_FFMPEG_THREADS, read_node_hardware, worker_node_id
 from media_preview_generator.jobs.worker import WorkerPool
+from media_preview_generator.nodes.executor import FileNotVisibleError, current_placement
 from media_preview_generator.nodes.registry import (
     STATE_GPU_LOST,
     STATE_OFFLINE,
@@ -20,6 +25,8 @@ from media_preview_generator.nodes.registry import (
     NodeView,
     set_registry,
 )
+from media_preview_generator.processing.types import ProcessableItem
+from media_preview_generator.web.settings_manager import reset_settings_manager
 from media_preview_generator.worker_groups import (
     configured_group_totals,
     configured_node_totals,
@@ -444,6 +451,131 @@ class TestCapacityAndParking:
         dispatcher.worker_pool = pool
         parking.park_if_unavailable(dispatcher, MagicMock(park_requested=False), MagicMock(), "job-1", "previews", dict)
         dispatcher.request_park.assert_not_called()
+
+
+def _two_node_groups(*, nuc_availability: dict | None = None) -> list[dict]:
+    """Intro & Credits on one CPU of storage and one of nuc, each in its own group."""
+    nuc = group("night", member("b", node="nuc", kinds=["intro_credits"]))
+    if nuc_availability is not None:
+        nuc["availability"] = nuc_availability
+    return [group("day", member("a", node="storage", kinds=["intro_credits"])), nuc]
+
+
+def _hours_from_now(start: int, end: int) -> dict:
+    """A schedule open only from ``start`` to ``end`` hours from now, so it is closed now."""
+    now = datetime.now()
+    return {
+        "mode": "scheduled",
+        "windows": [
+            {
+                "days": [now.weekday()],
+                "start": (now + timedelta(hours=start)).strftime("%H:%M"),
+                "end": (now + timedelta(hours=end)).strftime("%H:%M"),
+            }
+        ],
+    }
+
+
+class TestWaitingForAnAwayNode:
+    """A file only an away node can see: the kind still has open capacity elsewhere, so the job never parks."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_settings_manager()
+        reset_dispatcher()
+        yield
+        reset_settings_manager()
+        reset_dispatcher()
+
+    @staticmethod
+    def _tracker(*excluded: dict[str, str] | None) -> JobTracker:
+        """A job whose queued files are left out on ``excluded`` (one per file; None for none)."""
+        tracker = JobTracker(job_id="j", items=[], config=MagicMock(), registry=MagicMock(), kind="intro_credits")
+        items = [
+            ProcessableItem(canonical_path=f"/m/{i}.mkv", server_id="s1", title=str(i)) for i in range(len(excluded))
+        ]
+        tracker.item_queue = deque(items)
+        tracker.excluded_nodes = {
+            item.canonical_path: nodes for item, nodes in zip(items, excluded, strict=True) if nodes
+        }
+        return tracker
+
+    def test_the_banner_names_the_offline_node_the_job_waits_for_then_runs_the_file_there(self, registry):
+        registry.put("storage")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        groups = _two_node_groups()
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(groups, [])
+        seen: list[str] = []
+
+        def process(item, **_kwargs):
+            node = current_placement().node_id
+            seen.append(node)
+            if node == "storage":
+                raise FileNotVisibleError(node, "storage", "missing", f"{item.canonical_path} isn't there")
+            return ItemOutcome("markers_published", "ok")
+
+        messages: list[str] = []
+        handlers = KindHandlers(
+            check_fn=lambda item, *, cancel_check: None, process_fn=process, outcome_keys=("markers_published",)
+        )
+        config = MagicMock(scan_workers=1, regenerate_thumbnails=False, server_id_filter=None, worker_groups=groups)
+        dispatcher = JobDispatcher(pool)
+        try:
+            with (
+                patch("media_preview_generator.processing.generator._notify_file_result"),
+                patch("media_preview_generator.jobs.worker._notify_file_result"),
+                patch("media_preview_generator.web.jobs.get_job_manager"),
+            ):
+                tracker = dispatcher.submit_items(
+                    "j1",
+                    [ProcessableItem(canonical_path="/m/sintel.mp4", server_id="s1", title="Sintel")],
+                    config,
+                    MagicMock(),
+                    kind="intro_credits",
+                    handlers=handlers,
+                    callbacks={"progress_callback": lambda _done, _total, message, **_k: messages.append(message)},
+                )
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and "Waiting for a node — nuc: node offline" not in messages:
+                    time.sleep(0.05)
+                assert messages[-1] == "Waiting for a node — nuc: node offline", messages
+                assert seen == ["storage"] and not pool.has_busy_workers()
+
+                registry.put("nuc")
+                pool.reconcile_groups(groups, [])
+                assert tracker.wait(timeout=10)
+        finally:
+            dispatcher.shutdown()
+        assert seen == ["storage", "nuc"] and tracker.successful == 1
+        assert messages[-1] == "1/1 completed"
+
+    def test_an_off_hours_member_is_waited_for_until_it_opens(self, registry):
+        registry.put("storage")
+        registry.put("nuc")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(_two_node_groups(nuc_availability=_hours_from_now(2, 3)), [])
+
+        wait = JobDispatcher(pool)._node_wait(self._tracker({"storage": "storage"}))
+
+        assert wait.startswith("Waiting for worker availability until "), wait
+
+    def test_no_wait_is_shown_while_any_file_or_worker_can_still_go(self, registry):
+        registry.put("storage")
+        registry.put("nuc", state=STATE_OFFLINE, reason="node offline")
+        pool = WorkerPool(0, 0, [])
+        pool.reconcile_groups(_two_node_groups(), [])
+        dispatcher = JobDispatcher(pool)
+        assert dispatcher._node_wait(self._tracker({"storage": "storage"})) != ""
+
+        # A file left out on nuc can run on storage, which is open (busy or not, it's an ordinary wait).
+        assert dispatcher._node_wait(self._tracker({"nuc": "nuc"})) == ""
+        # A file no node has left out can run on any worker.
+        assert dispatcher._node_wait(self._tracker({"storage": "storage"}, None)) == ""
+        # A file of the job is running.
+        running = self._tracker({"storage": "storage"})
+        running.active_processing = 1
+        assert dispatcher._node_wait(running) == ""
 
 
 class TestWorkerStatuses:
