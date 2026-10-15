@@ -348,6 +348,52 @@ class TestATempFolderThatFillsMidTask:
         temp = client.info()["worker"]["temp"]
         assert temp["problem"] == f"The node's temp folder {temp['path']} filled up while working on a file (4 MB free)"
 
+    def test_ffmpeg_filling_it_sends_no_frames_and_the_file_goes_back_in_the_queue(self, node, tmp_path, monkeypatch):
+        # The node's real preview op: FFmpeg stopped with "No space left on device" (exit 228) after 2 of the 44
+        # thumbnails, and those 2 went to Plex as the episode's preview, marked fresh so later scans skipped it.
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from media_preview_generator.nodes import remote_ops
+        from media_preview_generator.nodes.server import ops
+        from media_preview_generator.processing import ffmpeg_runner, generator
+
+        full = "[out#0/image2 @ 0x1] Task finished with error code: -28 (No space left on device)"
+
+        def full_folder_runner(*, output_folder, **_kwargs):
+            def run(*_args, **_run_kwargs):
+                for number in (1, 2):
+                    write_file(os.path.join(output_folder, f"img-{number:06d}.jpg"), b"\xff\xd8\xff\xdb")
+                return 228, 1.0, "10x", [full]
+
+            return run
+
+        url, app = node
+        monkeypatch.setitem(
+            app.extensions[node_app.EXTENSION].tasks._ops, protocol.OP_PREVIEW_FRAMES, ops.preview_frames
+        )
+        monkeypatch.setattr(ffmpeg_runner, "create_ffmpeg_runner", full_folder_runner)
+        monkeypatch.setattr(generator, "_probe_max_keyframe_gap", lambda *_a, **_k: None)
+        monkeypatch.setattr(generator, "MediaInfo", MagicMock(**{"parse.return_value": MagicMock(video_tracks=[])}))
+        monkeypatch.setattr(tasks, "_free_bytes", lambda path: 4 << 20)
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        frames = tmp_path / "app-frames"
+        frames.mkdir()
+        config = SimpleNamespace(plex_bif_frame_interval=10, tonemap_algorithm="hable", thumbnail_quality=4,
+                                 ffmpeg_threads=2, log_level="INFO", server_display_name=None)  # fmt: skip
+        client = _client(url)
+        set_registry(identity_registry(client))
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError) as raised:
+                remote_ops.generate_images(media, str(frames), None, None, config)
+        finally:
+            set_registry(None)
+
+        assert raised.value.started is False and "is full (No space left on device)" in str(raised.value)
+        assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
+        assert list(frames.iterdir()) == []
+        assert "filled up while working on a file" in client.info()["worker"]["temp"]["problem"]
+
 
 class TestANodeThatIsStopping:
     """SIGTERM: the node cancels its tasks and waits for their FFmpeg, and keeps answering meanwhile."""

@@ -65,9 +65,11 @@ from .generator import (
     NO_DECODER_SUMMARY,
     CancellationError,
     CodecNotSupportedError,
+    WorkingFolderError,
     _cleanup_temp_directory,
     generate_images,
     gpu_fallback_announcement,
+    working_folder_failure,
 )
 from .plex_refresh import enqueue_plex_refresh, wait_for_plex_refresh
 
@@ -2153,6 +2155,13 @@ def _process_canonical_path_previews(
                 raise
             except (executor.NodeUnavailableError, executor.FileNotVisibleError):
                 raise  # not this file's failure: the worker gives it back to the queue
+            except WorkingFolderError as exc:
+                # The folder's condition, not the file's: no traceback, and nothing of the run is published.
+                message = working_folder_failure(exc)
+                logger.error("{}: {}", canonical_path, message)
+                return MultiServerResult(
+                    canonical_path=canonical_path, status=MultiServerStatus.FAILED, message=message
+                )
             except Exception as exc:
                 if not os.path.isfile(canonical_path):
                     # It passed the up-front check and went away since (an upgrade replacing it mid-run).

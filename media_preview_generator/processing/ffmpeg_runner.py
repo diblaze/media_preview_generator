@@ -24,6 +24,7 @@ call sites in ``generate_images``' retry cascade don't need to change
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import signal
@@ -157,6 +158,7 @@ def create_ffmpeg_runner(
         CancellationError,
         _crash_signal,
         _diagnose_ffmpeg_exit_code,
+        _folder_write_errno,
         _io_cut_off,
         _is_signal_killed,
         _save_ffmpeg_failure_log,
@@ -774,7 +776,23 @@ def create_ffmpeg_runner(
         if proc.returncode != 0 and not stalled and not gpu_cant_decode and not chapter_without_frame:
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
             no_decoder = exit_diagnosis == "no_decoder"
-            if no_decoder:
+            refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines)
+            if refused is not None:
+                # The folder's, not the file's or the GPU's: no hardware or codec advice.
+                folder, setting = working_folder_hint()
+                fix = "Make it writable" if refused == errno.EROFS else "Free up space there"
+                logger.error(
+                    "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
+                    "{}, or choose another folder ({}). Other files in the queue will keep processing.",
+                    video_file,
+                    folder,
+                    output_folder,
+                    os.strerror(refused),
+                    proc.returncode,
+                    fix,
+                    setting,
+                )
+            elif no_decoder:
                 # The file's only failure line: the caller neither reruns it nor logs it again.
                 logger.error(
                     "This file's video can't be decoded by any device (an unknown or protected codec, such as an "
@@ -798,7 +816,8 @@ def create_ffmpeg_runner(
 
             # Log last few stderr lines at WARNING level so users can diagnose
             # failures without needing DEBUG mode (especially for crashes/signals)
-            crash = _crash_signal(proc.returncode)
+            # A full quota's exit code (134) is also a wrapper shell's SIGABRT: the write failure was said above.
+            crash = _crash_signal(proc.returncode) if refused is None else None
             if crash is not None:
                 logger.warning(
                     "FFmpeg crashed on {} ({}, exit code {}). A crash like this comes from the file itself (damaged "

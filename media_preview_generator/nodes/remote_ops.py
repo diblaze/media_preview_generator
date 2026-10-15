@@ -85,6 +85,14 @@ class _Relay:
 # --- preview.frames --------------------------------------------------------------------------------------------------
 
 
+def _remove_frames(folder: str) -> None:
+    for frame in glob.glob(os.path.join(glob.escape(folder), "*.jpg")):
+        try:
+            os.remove(frame)
+        except OSError:
+            pass
+
+
 def generate_images(
     video_file: str,
     output_folder: str,
@@ -101,8 +109,9 @@ def generate_images(
     Raises:
         CodecNotSupportedError: The node's GPU couldn't produce the preview (the worker reruns it on the node's CPU).
         CancellationError: The job was cancelled.
+        WorkingFolderError: The frames couldn't be unpacked into ``output_folder`` (full or read-only); none are kept.
     """
-    from ..processing.generator import CancellationError, record_failure
+    from ..processing.generator import FOLDER_WRITE_ERRNOS, CancellationError, WorkingFolderError, record_failure
 
     server_name = getattr(config, "server_display_name", None)
     params = {
@@ -115,11 +124,7 @@ def generate_images(
         "ffmpeg_threads_override": None if ffmpeg_threads_override is None else int(ffmpeg_threads_override),
     }
     # generate_images cleans the slot first, so a run only counts the frames it made itself.
-    for stale in glob.glob(os.path.join(glob.escape(output_folder), "*.jpg")):
-        try:
-            os.remove(stale)
-        except OSError:
-            pass
+    _remove_frames(output_folder)
     relay = None
     if progress_callback is not None:
         relay = _Relay(lambda percent, args: progress_callback(percent, *args, media_file=video_file))
@@ -140,6 +145,13 @@ def generate_images(
             {"CancellationError": _plain(CancellationError)},
             lambda message=exc.message: CancellationError(message),
         ) from exc
+    except OSError as exc:
+        # This app's own folder filled up (or is read-only) while the node's frames were unpacked into it: the frames
+        # already there are cut short, as a local run's would be.
+        if exc.errno not in FOLDER_WRITE_ERRNOS:
+            raise
+        _remove_frames(output_folder)
+        raise WorkingFolderError(exc.errno, exc.strerror or os.strerror(exc.errno), output_folder) from exc
     for failure in result.get("failures") or []:
         record_failure(
             video_file,
