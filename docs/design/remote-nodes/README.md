@@ -34,8 +34,9 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
   Plex database nodes (all scenarios passed: [`evidence/lab-final/`](evidence/lab-final/README.md)).
 * **Changes from the design as written:**
   - A node that drops a file is held back until a check begun after the drop finds it ready (or 5 min); starts
-    the node never took don't count toward the two-drop limit (max 5 per file). Retries prefer another worker.
-    After a failed start, that node waits on that file 1 s, doubling to 30 s; a ready check doesn't end it early.
+    the node never took don't count toward the two-drop limit (max 5 per file, counted only once no worker off the
+    nodes that failed it runs its kind). Retries prefer another worker. After a failed start, that node waits on
+    that file 1 s, doubling to 30 s; a ready check doesn't end it early.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
   - A `DELETE` lost in an outage is kept (256 per node) and sent again when the node next answers a check.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
@@ -270,10 +271,12 @@ retry runs (on the **node's** CPU, see §6).
   `NodeUnavailableError` → the item goes back in the queue once (the node is still asked to drop the task, so one
   that comes back stops it); a second drop on the same item fails it ("node <name> unavailable (it dropped the
   file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
-  (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
+  (connection refused, no answer before an id) isn't a drop: the item goes back, and goes to no node that failed its
+  start until that node's wait (1 s, doubling with each start it failed, 30 s at most) runs out; such a start counts
+  toward 5 only once no worker off the nodes that failed it runs its kind, so an outage there can't fail a file
+  another worker will take (at most 5 counted,
   then it fails). After either, the node gets no new file until a registry check begun after the drop comes back
-  ready (5 min at most). After a failed start, that node also waits on that file 1 s, doubling to 30 s, and a
-  ready check doesn't end that wait early. The item's retry takes a free worker on another node or this app first; until the node
+  ready (5 min at most). The item's retry takes a free worker on another node or this app first; until the node
   checks ready again it waits for one of those while one runs its kind now (busy or not), and once the node has
   checked ready it goes back there when none of those is free (a busy one can stay busy for hours: a long film, a
   file its job's schedule froze). If it drops the file again there while one of those still runs its kind, that drop

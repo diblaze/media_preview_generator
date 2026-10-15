@@ -7,14 +7,17 @@ import gzip
 import io
 import os
 import re
+import socket
 import tarfile
 import threading
 import time
 
 import pytest
+import requests
 from loguru import logger
 
 from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
+from media_preview_generator.nodes import client as client_mod
 from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
     READ_TIMEOUT_S,
@@ -22,8 +25,10 @@ from media_preview_generator.nodes.client import (
     UNREACHABLE_REFUSED,
     UNREACHABLE_TIMEOUT,
     UNREACHABLE_TLS,
+    NodeAddress,
     NodeAuthError,
     NodeCantStartError,
+    NodeClient,
     NodeRateLimitedError,
     NodeStoppingError,
     NodeTaskDeletedError,
@@ -410,6 +415,78 @@ class TestArtifact:
 
         assert raised.value.started is started
         assert fetched == ["t1"]
+
+
+@pytest.fixture
+def stalling_node():
+    """``(start, gets)``: ``start(stall_at)`` runs a listener whose every GET stalls (held open, nothing more sent)
+    before its answer's headers, or after the headers and the first 64 KB of a 10 MB tar (a cable pulled, the node
+    machine asleep), and returns its URL; ``gets`` holds when each GET came."""
+    stop = threading.Event()
+    servers: list[socket.socket] = []
+    gets: list[float] = []
+
+    def handle(conn: socket.socket, stall_at: str) -> None:
+        with conn:
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                received += chunk
+            gets.append(time.monotonic())
+            if stall_at == "mid-body":
+                head = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10000000\r\n\r\n"
+                conn.sendall(head + b"\0" * 65536)
+            stop.wait(30)
+
+    def start(stall_at: str) -> str:
+        server = socket.create_server(("127.0.0.1", 0))
+        servers.append(server)
+
+        def serve() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=handle, args=(conn, stall_at), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return f"http://127.0.0.1:{server.getsockname()[1]}"
+
+    yield start, gets
+    stop.set()
+    for server in servers:
+        server.close()
+
+
+class TestAStalledFramesDownload:
+    """The task finished on the node and the frames' download then stalls. Each fetch waited 300 s for the next byte;
+    one that stalled after its headers was taken for a passing error and fetched three times (15 minutes), and a cancel
+    let go of the worker only after the whole wait."""
+
+    @pytest.mark.parametrize("cancelled", [False, True], ids=["running", "cancelled"])
+    @pytest.mark.parametrize("stall_at", ["before-headers", "mid-body"])
+    def test_is_given_up_after_one_read_timeout_and_not_fetched_again(
+        self, media, tmp_path, monkeypatch, stalling_node, stall_at, cancelled
+    ):
+        monkeypatch.setattr(client_mod, "ARTIFACT_TIMEOUT_S", 1.0)  # only how long each wait is
+        start, gets = stalling_node
+        session = requests.Session()
+        session.trust_env = False  # a proxy from the environment must not sit between the test and 127.0.0.1
+        real = NodeClient(NodeAddress(start(stall_at), "k" * 24), session=session)
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        client.fetch_artifact = real.fetch_artifact
+        _install(client)
+        expected = NodeTaskCancelledError if cancelled else NodeUnavailableError
+
+        with pytest.raises(expected, match="didn't send the frames"):
+            _run(media, artifact_to=str(tmp_path / "frames"), cancel_check=lambda: cancelled and bool(gets))
+        ended = time.monotonic()
+
+        assert len(gets) == 1
+        assert ended - gets[0] < client_mod.ARTIFACT_TIMEOUT_S + 2.0
 
 
 class TestNodeDrops:

@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Collection
 from functools import partial
-from typing import Any, cast, overload
+from typing import Any, NamedTuple, cast, overload
 
 from loguru import logger
 
@@ -45,9 +45,11 @@ CAPPED_KINDS_SHARE = 0.75
 # A file whose node drops it this many times fails instead of going back in the queue (spec §6).
 MAX_NODE_DROPS = 2
 # A start the node never took doesn't count as a drop, but a node that answers its health check while refusing every
-# task must not keep a file in the queue forever.
+# task must not keep a file in the queue forever. Such a start counts toward this only once no worker off the nodes
+# that failed the file's start runs its kind: while one does, the file waits for it rather than failing for a node's
+# outage.
 MAX_NODE_START_FAILURES = 5
-# After its node fails to start it, a file waits this long (doubling with each failure, at most
+# After a node fails to start it, a file waits this long (doubling with each of its starts that node failed, at most
 # NODE_START_RETRY_MAX_S) before it goes back to that node, though any other worker may take it meanwhile: the node's
 # health check reads only /v1/info, which may answer while its starts fail, so it can't lift this wait.
 NODE_START_RETRY_S = 1.0
@@ -57,6 +59,15 @@ NODE_START_RETRY_MAX_S = 30.0
 EXCLUDED_SCAN_LIMIT = 64
 # How often the dispatch loop works out why a job's queued files all wait for workers that are away.
 NODE_WAIT_CHECK_S = 1.0
+
+
+class StartWait(NamedTuple):
+    """A node that failed a file's start: its name, how many of the file's starts it failed, and when the file may go
+    back to it (monotonic seconds)."""
+
+    node_name: str
+    failures: int
+    retry_at: float
 
 
 def _next_submission_order() -> int:
@@ -141,12 +152,14 @@ class JobTracker:
         # thread under that lock (see ``JobDispatcher._claim_worker``), and puts files back at its left end.
         self.item_queue: deque = deque()
         # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
-        # the name of the node behind each drop, how often its node never took its start, the node that last did
-        # either (its retry goes elsewhere when it can), and the nodes (id -> name) that can't see it.
+        # the name of the node behind each drop, how many of its never-taken starts counted toward
+        # ``MAX_NODE_START_FAILURES``, the node that last did either (its retry goes elsewhere when it can), and the
+        # nodes (id -> name) that can't see it.
         self.node_drops: dict[str, list[str]] = {}
         self.node_start_failures: dict[str, int] = {}
-        # When a file whose start its node (``dropped_on``) just failed may go back to that node (monotonic seconds).
-        self.start_retry_at: dict[str, float] = {}
+        # Each node that failed a file's start (path -> node id -> its wait), so the file's retry avoids every node
+        # whose wait hasn't run out, not only the last one. Not checkpointed: a resumed file starts with no waits.
+        self.start_waits: dict[str, dict[str, StartWait]] = {}
         self.dropped_on: dict[str, str] = {}
         self.excluded_nodes: dict[str, dict[str, str]] = {}
         # A dropped file handed back to the node that dropped it (path -> node id), and one that node dropped again
@@ -600,6 +613,21 @@ class JobTracker:
             "cancelled": self.cancelled,
             "outcome": dict(self.outcome_counts),
         }
+
+
+def _starts_failure(names: list[str], last_try: str) -> str:
+    """Why a file fails whose start its nodes kept failing, naming each of them, and the last try's reason.
+
+    Args:
+        names: The nodes that failed its start, in the order they first did.
+        last_try: The last failed start's message: the node's own words (its temp folder filling up, say) say what to
+            fix.
+    """
+    if len(names) == 1:
+        why = f"node {names[0]} unavailable (it couldn't start the file {MAX_NODE_START_FAILURES} times)"
+    else:
+        why = f"nodes {', '.join(names[:-1])} and {names[-1]} unavailable (none of them could start the file)"
+    return f"{why}. Last try: {last_try}"
 
 
 def _drops_failure(names: list[str]) -> str:
@@ -1081,9 +1109,10 @@ class JobDispatcher:
 
         A node that dropped the file sends it back once; a second drop fails it, except a drop on the node the file
         was handed back to only because no worker elsewhere was free, while one runs its kind: that one isn't counted
-        and the file then waits for a worker elsewhere. A start the node never took doesn't count as a drop (up to
-        ``MAX_NODE_START_FAILURES``), and the file goes back to that node only after ``NODE_START_RETRY_S``, doubled
-        for each such start. Either way the node gets no new file until it checks ready
+        and the file then waits for a worker elsewhere. A start the node never took doesn't count as a drop; it counts
+        toward ``MAX_NODE_START_FAILURES`` only once no worker off the nodes that failed the file's start runs its
+        kind, and the file goes back to each of those nodes only after ``NODE_START_RETRY_S``, doubled for each start
+        that node failed. Either way the node gets no new file until it checks ready
         again, and this file's retry prefers another node or this app. A node that can't see it is left out for that
         file and it goes back for another worker; once no configured worker outside the nodes that can't see it
         remains, it fails. The file goes back on the queue and ``active_processing`` drops together under
@@ -1103,7 +1132,6 @@ class JobDispatcher:
         with self._trackers_lock:
             if dropped:
                 tracker.dropped_on[path] = requeue.node_id
-                tracker.start_retry_at.pop(path, None)  # a wait is only ever for the node behind the last drop
             sent_back = tracker.sent_back.pop(path, None) == requeue.node_id
             if (
                 requeue.reason == REQUEUE_NODE_UNAVAILABLE
@@ -1119,15 +1147,18 @@ class JobDispatcher:
                 if len(drops) >= MAX_NODE_DROPS:
                     failure = _drops_failure(drops)
             elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
-                starts = tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
-                wait_s = min(NODE_START_RETRY_S * 2 ** (starts - 1), NODE_START_RETRY_MAX_S)
-                tracker.start_retry_at[path] = time.monotonic() + wait_s
-                if starts >= MAX_NODE_START_FAILURES:
-                    # The last try's reason: the node's own words (its temp folder filling up, say) say what to fix.
-                    failure = (
-                        f"node {requeue.node_name} unavailable "
-                        f"(it couldn't start the file {MAX_NODE_START_FAILURES} times). Last try: {requeue.message}"
-                    )
+                waits = tracker.start_waits.setdefault(path, {})
+                earlier = waits.get(requeue.node_id)
+                tries = earlier.failures + 1 if earlier else 1
+                wait_s = min(NODE_START_RETRY_S * 2 ** (tries - 1), NODE_START_RETRY_MAX_S)
+                waits[requeue.node_id] = StartWait(requeue.node_name, tries, time.monotonic() + wait_s)
+                # A worker off those nodes that runs its kind takes the file once it's free, so this try cost nothing.
+                if not self.worker_pool.runs_kind_outside(
+                    tracker.kind, {*tracker.excluded_nodes.get(path, {}), *waits}
+                ):
+                    starts = tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
+                    if starts >= MAX_NODE_START_FAILURES:
+                        failure = _starts_failure([wait.node_name for wait in waits.values()], requeue.message)
             else:
                 excluded = tracker.excluded_nodes.setdefault(path, {})
                 excluded[requeue.node_id] = requeue.node_name
@@ -1256,7 +1287,8 @@ class JobDispatcher:
         a free worker elsewhere first. Until that node checks ready again, it waits for a worker elsewhere while one
         runs its kind now (busy or not), and goes back to that node only when none does
         (``WorkerPool.runs_kind_outside``). Once the node has checked ready, it goes back there when no worker
-        elsewhere is free, but not before its ``start_retry_at`` when the node failed its start. One that no configured worker can run any more is taken off the queue into ``stranded``
+        elsewhere is free. A file goes to no node that failed its start until that node's wait (``start_waits``) has
+        run out. One that no configured worker can run any more is taken off the queue into ``stranded``
         (counted in ``active_processing`` until it is failed). A worker claimed for a file a cancel has since cleared
         off the queue is given back.
 
@@ -1283,21 +1315,24 @@ class JobDispatcher:
         for index, item in enumerate(head):
             excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
             dropped_on = tracker.dropped_on.get(item.canonical_path)
+            waits = tracker.start_waits.get(item.canonical_path) or {}
+            waiting = {node for node, wait in waits.items() if wait.retry_at > now}
             worker = None
             if dropped_on is not None:
                 avoid = {*excluded, dropped_on}
-                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid)
-                start_wait = tracker.start_retry_at.get(item.canonical_path, 0.0) > now
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid | waiting)
                 back = dropped_on in back_nodes and tracker.stays_off.get(item.canonical_path) != dropped_on
-                if worker is None and (start_wait or (not back and pool.runs_kind_outside(tracker.kind, avoid))):
+                if worker is None and (
+                    dropped_on in waiting or (not back and pool.runs_kind_outside(tracker.kind, avoid))
+                ):
                     # Back on a node that hasn't answered since it dropped the file, a second drop fails it. The free
                     # worker there takes a later file instead. Once the node has checked ready, a busy worker elsewhere
                     # isn't waited for: it can stay busy for hours (a long film, a file its job's schedule froze),
                     # unless the node dropped the file again when it was handed back (``stays_off``). A file whose
-                    # start the node just failed waits out ``start_retry_at`` whatever the node's check says.
+                    # start a node just failed waits out that node's wait whatever its check says.
                     continue
             if worker is None:
-                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
+                worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes={*excluded, *waiting})
             if worker is not None:
                 if _take_queued(tracker, index, item) is None:
                     worker.is_busy = False
@@ -1307,9 +1342,9 @@ class JobDispatcher:
                 else:
                     tracker.sent_back.pop(item.canonical_path, None)
                 return worker, item
-            if not excluded:
+            if not excluded and not waiting:
                 return None  # no free worker for this kind at all
-            if not pool.can_run_outside(tracker.kind, excluded):
+            if excluded and not pool.can_run_outside(tracker.kind, excluded):
                 if _take_queued(tracker, index, item) is None:
                     return None
                 tracker.active_processing += 1

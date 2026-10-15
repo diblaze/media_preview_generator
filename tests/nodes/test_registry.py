@@ -1060,6 +1060,79 @@ class TestLoop:
         h.registry.check_now("n1")
         assert h.registry.checked_ready_since_unavailable("n1") is True
 
+    def test_the_refused_polls_of_a_busy_node_whose_key_changed_cost_one_check(self, h):
+        """16 busy workers on a node recreated with another key: each refused poll is reported, and a check per report
+        (one more wrong key each) tripped the node's wrong-key limit, so it held back the right key pasted next."""
+        h.registry.start()
+        assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_READY)
+        client = h.client()
+        checks_before = client.info_calls
+        client.default_info = NodeAuthError("http://nuc:9494 refused the key")
+
+        def refused_poll(turn: int) -> None:
+            time.sleep(turn * 0.01)  # each task's poll comes round in its turn
+            h.registry.report_unavailable("n1")
+
+        tasks = [threading.Thread(target=refused_poll, args=(turn,)) for turn in range(16)]
+        for task in tasks:
+            task.start()
+        for task in tasks:
+            task.join(5)
+        assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_KEY_REFUSED)
+        time.sleep(0.3)  # a check a report asked for would have run by now
+
+        assert client.info_calls - checks_before == 1
+        assert not h.registry._nodes["n1"].checking
+
+    @pytest.mark.parametrize(
+        ("failure", "state", "since", "checked"),
+        [
+            (NodeAuthError("refused"), reg.STATE_KEY_REFUSED, 0.0, False),
+            (NodeAuthError("refused"), reg.STATE_KEY_REFUSED, reg.KEY_REFUSED_RECHECK_S, True),
+            (NodeUnreachableError("gone"), reg.STATE_OFFLINE, 0.0, True),
+        ],
+        ids=["refused-just-now", "refused-a-while-ago", "offline-just-now"],
+    )
+    def test_a_report_checks_the_node_now_unless_a_check_just_found_it_refusing_the_key(
+        self, h, failure, state, since, checked
+    ):
+        h.registry.check_now("n1")
+        h.client().default_info = failure
+        h.registry.check_now("n1")
+        assert h.registry.view("n1").state == state
+        submitted: list = []
+        h.registry._submit = lambda fn, *args: submitted.append(args)
+        h.clock.now += since
+
+        for _ in range(16):
+            h.registry.report_unavailable("n1")
+
+        assert bool(submitted) is checked
+        assert (h.registry._nodes["n1"].next_check == 0.0) is checked
+        assert h.registry.checked_ready_since_unavailable("n1") is False
+
+    def test_a_check_that_finds_the_key_refused_isnt_followed_by_another_for_the_reports_meanwhile(self, h):
+        h.registry.check_now("n1")
+        client = h.client()
+        started, release = threading.Event(), threading.Event()
+
+        def refusing_info():
+            started.set()
+            release.wait(5)
+            raise NodeAuthError("refused")
+
+        client.info = refusing_info
+        checking = threading.Thread(target=h.registry.check_now, args=("n1",))
+        checking.start()
+        assert started.wait(5)
+        h.registry._run_check = lambda *args, **kwargs: None  # keep the report's own check out of it
+        h.registry.report_unavailable("n1")
+        release.set()
+        checking.join(5)
+
+        assert h.registry.view("n1").state == reg.STATE_KEY_REFUSED
+        assert h.registry._nodes["n1"].next_check == h.clock.now + reg.HEALTH_INTERVAL_S
+
     def test_a_check_begun_after_a_drop_that_finds_the_node_down_vouches_for_nothing(self, h):
         h.registry.check_now("n1")
         h.registry._run_check = lambda *args, **kwargs: None

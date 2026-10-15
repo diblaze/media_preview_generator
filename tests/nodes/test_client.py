@@ -21,8 +21,9 @@ import pytest
 import requests
 
 from media_preview_generator.nodes import client as client_mod
-from media_preview_generator.nodes import protocol
+from media_preview_generator.nodes import executor, protocol
 from media_preview_generator.nodes.client import (
+    UNREACHABLE_TIMEOUT,
     NodeAddress,
     NodeCantStartError,
     NodeClient,
@@ -100,6 +101,68 @@ class TestAConnectionDroppedMidAnswer:
         with pytest.raises(NodeUnreachableError) as raised:
             NodeClient(NodeAddress(f"http://127.0.0.1:{port}", "k")).start_task({"op": "x"})
         assert not isinstance(raised.value, NodeTimeoutError)
+
+
+def _node_that_stops_partway(*, then: str) -> tuple[str, threading.Event]:
+    """A listener that answers one GET with a 10 MB tar's headers and its first 64 KB, then holds the connection open
+    sending nothing more (``then="stall"``) or resets it (``then="reset"``). Set the event to let it go."""
+    server = socket.create_server(("127.0.0.1", 0))
+    release = threading.Event()
+
+    def serve() -> None:
+        conn, _ = server.accept()
+        with conn:
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                received += chunk
+            head = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10000000\r\n\r\n"
+            conn.sendall(head + b"\0" * 65536)
+            if then == "reset":
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            else:
+                release.wait(10)
+        server.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{server.getsockname()[1]}", release
+
+
+class TestAFramesDownloadThatStopsPartway:
+    """A stall after the headers (a cable pulled, the node machine asleep mid-transfer) read as a dropped connection,
+    which the executor fetches again: three fetches each waited out the whole read timeout."""
+
+    @pytest.mark.parametrize(
+        ("then", "reason", "words"),
+        [("stall", UNREACHABLE_TIMEOUT, "stopped sending partway through its answer"),
+         ("reset", "", "dropped the connection while answering")],
+        ids=["stalled-waits-out-the-timeout", "reset-came-back-at-once"],
+    )  # fmt: skip
+    def test_says_whether_it_waited_out_the_read_timeout(self, monkeypatch, then, reason, words):
+        monkeypatch.setattr(client_mod, "ARTIFACT_TIMEOUT_S", 0.5)  # only how long the wait is
+        url, release = _node_that_stops_partway(then=then)
+        try:
+            with pytest.raises(NodeTimeoutError) as raised:
+                _local(url).fetch_artifact("t1")
+        finally:
+            release.set()
+        assert (raised.value.reason, str(raised.value)) == (reason, f"{url} {words}")
+
+    def test_waits_for_the_next_byte_no_longer_than_a_stalled_poll_is_given(self):
+        """The node sends a tar it already wrote, so its bytes come at once: 300 s for the next one held the worker
+        (and the node's slot) five minutes after its job was cancelled, against ~30 s for a stalled poll."""
+        session = MagicMock(spec=requests.Session)
+        session.request.return_value = _Streamed(200, b"tar bytes")
+        NodeClient(NodeAddress("http://node:9494", "k"), session=session).fetch_artifact("t1")
+
+        assert session.request.call_args.kwargs["timeout"] == (
+            client_mod.CONNECT_TIMEOUT_S,
+            client_mod.ARTIFACT_TIMEOUT_S,
+        )
+        stalled_poll_s = executor.NODE_GONE_AFTER_S + executor.MAX_FAILED_POLLS * client_mod.READ_TIMEOUT_S
+        assert client_mod.ARTIFACT_TIMEOUT_S <= stalled_poll_s
 
 
 def _response(status: int, body: bytes) -> requests.Response:

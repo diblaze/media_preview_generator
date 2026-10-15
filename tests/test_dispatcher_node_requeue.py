@@ -13,7 +13,7 @@ import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
 from media_preview_generator.jobs import dispatcher as dispatcher_mod
-from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
+from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, StartWait, reset_dispatcher
 from media_preview_generator.jobs.node_members import NodeHardware
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes import registry as reg
@@ -692,6 +692,79 @@ class TestNodeDrops:
         (row,) = rows
         assert "temp folder /scratch is full" in row.args[2], row.args[2]
 
+    @staticmethod
+    def _starts_fail_for(outage_s: float, tries: list, *, local_s: float = 0.0):
+        """A process whose node starts fail (an HTTP 502 from a gateway in front) until ``outage_s`` after the first
+        try; this app's worker takes ``local_s`` per file."""
+        lock = threading.Lock()
+        began: list[float] = []
+
+        def process(item, **_kwargs):
+            node = _node()
+            now = time.monotonic()
+            with lock:
+                if not began:
+                    began.append(now)
+                tries.append((node, now - began[0]))
+            if node is None:
+                time.sleep(local_s)
+            elif now - began[0] < outage_s:
+                raise NodeUnavailableError(
+                    node, node.upper(), f"{node} couldn't start the task: HTTP 502", started=False
+                )
+            return ItemOutcome("markers_published", "ok")
+
+        return process
+
+    @pytest.mark.parametrize(
+        "nodes", [(("n1", "N1"),), (("n1", "N1"), ("n2", "N2"))], ids=["one-node", "two-nodes-behind-one-gateway"]
+    )
+    def test_a_file_survives_a_short_start_outage_on_every_node_not_only_on_one(self, monkeypatch, nodes):
+        """Its waits (0.1 + 0.2 s) outlast the 0.25 s outage; with two nodes the file went n1 -> n2 -> n1 -> n2 -> n1
+        within milliseconds, so all five starts were spent before either wait ran out."""
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 0.1)
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_MAX_S", 30.0)
+        tries: list = []
+
+        tracker, rows = _run(_pool(*nodes), self._starts_fail_for(0.25, tries), "/m/a.mkv")
+
+        assert (tracker.successful, tracker.failed) == (1, 0), (tries, [r.args[:3] for r in rows])
+        assert tracker.node_failures == {}
+
+    def test_a_start_outage_on_the_node_fails_no_file_while_this_apps_worker_takes_them_one_by_one(self, monkeypatch):
+        """One node and this app's one worker, 20 files, the node's starts failing for longer than five waits: 12 of
+        20 files failed on the node although nothing ran and this app's worker would have taken them."""
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 0.02)  # five failures in 0.02+0.04+0.08+0.16 s
+        tries: list = []
+        paths = [f"/m/{n:02}.mkv" for n in range(20)]
+
+        tracker, rows = _run(_pool((None, ""), ("n1", "N1")), self._starts_fail_for(0.6, tries, local_s=0.05), *paths)
+
+        assert (tracker.successful, tracker.failed) == (20, 0), [r.args[:3] for r in rows]
+        assert tracker.node_start_failures == {}
+        assert any(node == "n1" and at >= 0.6 for node, at in tries)  # the node took files again once it was back
+        assert tracker.active_processing == 0
+
+    def test_a_file_no_node_can_ever_start_fails_soon_naming_every_node_that_failed_it(self):
+        """Nothing else runs its kind: each start counts (the first, while the other node hadn't failed it yet,
+        doesn't), so it ends after one try more than the limit."""
+        tries: list = []
+        started = time.monotonic()
+
+        tracker, rows = _run(_pool(("a", "A"), ("b", "B")), self._starts_fail_for(3600.0, tries), "/m/a.mkv")
+
+        assert time.monotonic() - started < 5.0
+        assert len(tries) == dispatcher_mod.MAX_NODE_START_FAILURES + 1
+        assert {node for node, _ in tries} == {"a", "b"}
+        (row,) = rows
+        names = " and ".join(node.upper() for node in dict.fromkeys(node for node, _ in tries))
+        assert row.args[2] == (
+            f"nodes {names} unavailable (none of them could start the file). "
+            f"Last try: {tries[-1][0]} couldn't start the task: HTTP 502"
+        )
+        assert tracker.node_failures == {"/m/a.mkv": row.args[2]}
+        assert tracker.active_processing == 0
+
 
 class TestNotVisible:
     @staticmethod
@@ -802,7 +875,7 @@ class TestClaimWorker:
         pool = _pool(("a", "A"))
         tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
         tracker.dropped_on = {"/m/1.mkv": "a"}
-        tracker.start_retry_at = {"/m/1.mkv": time.monotonic() + 60}
+        tracker.start_waits = {"/m/1.mkv": {"a": StartWait("A", 1, time.monotonic() + 60)}}
         dispatcher = JobDispatcher(pool)
 
         worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a"})
@@ -810,32 +883,94 @@ class TestClaimWorker:
         worker.is_busy = False
         assert dispatcher._claim_worker(tracker, [], back_nodes={"a"}) is None
 
-        tracker.start_retry_at["/m/1.mkv"] = time.monotonic() - 1
+        tracker.start_waits["/m/1.mkv"]["a"] = StartWait("A", 1, time.monotonic() - 1)
         worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a"})
         assert (worker.node_id, item.canonical_path) == ("a", "/m/1.mkv")
 
-    def test_each_start_the_node_fails_doubles_the_files_wait_up_to_the_cap_and_a_drop_ends_it(self, monkeypatch):
+    def test_a_file_goes_to_no_node_whose_start_wait_hasnt_run_out_not_only_the_last_one_that_failed_it(self):
+        """Two nodes behind one gateway fail their starts together: the file went n1 -> n2 -> n1 -> n2 -> n1 within
+        milliseconds and spent its five starts before either wait ran out."""
+        pool = _pool(("a", "A"), ("b", "B"))
+        tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
+        tracker.dropped_on = {"/m/1.mkv": "b"}
+        later = time.monotonic() + 60
+        tracker.start_waits = {"/m/1.mkv": {"a": StartWait("A", 1, later), "b": StartWait("B", 1, later)}}
+        dispatcher = JobDispatcher(pool)
+
+        worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a", "b"})
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/2.mkv")
+        assert dispatcher._claim_worker(tracker, [], back_nodes={"a", "b"}) is None  # b is free, but waited on
+        worker.is_busy = False
+        assert dispatcher._claim_worker(tracker, [], back_nodes={"a", "b"}) is None  # so is a
+
+        tracker.start_waits["/m/1.mkv"]["a"] = StartWait("A", 1, time.monotonic() - 1)
+        worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a", "b"})
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/1.mkv")
+
+    def test_each_start_a_node_fails_doubles_the_files_wait_there_up_to_the_cap_and_leaves_other_nodes_waits(
+        self, monkeypatch
+    ):
         monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 1.0)
         monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_MAX_S", 3.0)
-        pool = _pool(("a", "A"), ("b", "B"))
+        pool = _pool(("a", "A"), ("b", "B"), ("c", "C"))
         tracker = self._tracker()
         dispatcher = JobDispatcher(pool)
         (item,) = _items("/m/1.mkv")
-        not_started = NodeRequeue(REQUEUE_NODE_NOT_STARTED, "a", "A", "A couldn't start the task")
 
-        waits = []
-        for _ in range(dispatcher_mod.MAX_NODE_START_FAILURES - 1):
+        def fail_start(node: str) -> float:
             before = time.monotonic()
-            dispatcher._requeue_or_fail(pool.workers[0], tracker, item, not_started)
-            waits.append(round(tracker.start_retry_at["/m/1.mkv"] - before, 1))
+            requeue = NodeRequeue(REQUEUE_NODE_NOT_STARTED, node, node.upper(), f"{node} couldn't start the task")
+            dispatcher._requeue_or_fail(pool.workers[0], tracker, item, requeue)
             tracker.item_queue.clear()
-        assert waits == [1.0, 2.0, 3.0, 3.0]
-        assert tracker.dropped_on == {"/m/1.mkv": "a"}
+            return round(tracker.start_waits["/m/1.mkv"][node].retry_at - before, 1)
 
-        dropped = NodeRequeue(REQUEUE_NODE_UNAVAILABLE, "b", "B", "B stopped answering")
-        dispatcher._requeue_or_fail(pool.workers[1], tracker, item, dropped)
+        assert [fail_start("a") for _ in range(4)] == [1.0, 2.0, 3.0, 3.0]
+        a_wait = tracker.start_waits["/m/1.mkv"]["a"]
+        assert fail_start("b") == 1.0  # b's own first failure
         assert tracker.dropped_on == {"/m/1.mkv": "b"}
-        assert tracker.start_retry_at == {}
+
+        dropped = NodeRequeue(REQUEUE_NODE_UNAVAILABLE, "c", "C", "C stopped answering")
+        dispatcher._requeue_or_fail(pool.workers[2], tracker, item, dropped)
+        assert tracker.dropped_on == {"/m/1.mkv": "c"}
+        assert tracker.start_waits["/m/1.mkv"]["a"] == a_wait
+        assert [(w.node_name, w.failures) for w in tracker.start_waits["/m/1.mkv"].values()] == [("A", 4), ("B", 1)]
+
+    @pytest.mark.parametrize(
+        ("others", "busy", "failed_before", "hidden_on", "counted"),
+        [
+            ((), False, (), (), 1),
+            (((None, ""),), False, (), (), 0),
+            # Busy or not: it takes the file once it's free.
+            (((None, ""),), True, (), (), 0),
+            ((("b", "B"),), False, (), (), 0),
+            ((("b", "B"),), False, ("b",), (), 1),
+            ((("b", "B"),), False, (), ("b",), 1),
+        ],
+        ids=[
+            "only-that-node",
+            "this-apps-worker",
+            "this-apps-worker-busy",
+            "a-node-that-hasnt-failed-it",
+            "a-node-that-failed-it-too",
+            "a-node-that-cant-see-it",
+        ],
+    )
+    def test_a_failed_start_counts_toward_the_limit_only_once_no_worker_off_the_failing_nodes_runs_its_kind(
+        self, others, busy, failed_before, hidden_on, counted
+    ):
+        pool = _pool(("a", "A"), *others)
+        if busy:
+            pool.workers[1].is_busy = True
+        tracker = self._tracker()
+        tracker.excluded_nodes = {"/m/1.mkv": {node: node.upper() for node in hidden_on}} if hidden_on else {}
+        tracker.start_waits = {"/m/1.mkv": {node: StartWait(node.upper(), 1, 0.0) for node in failed_before}}
+        (item,) = _items("/m/1.mkv")
+
+        not_started = NodeRequeue(REQUEUE_NODE_NOT_STARTED, "a", "A", "A couldn't start the task")
+        JobDispatcher(pool)._requeue_or_fail(pool.workers[0], tracker, item, not_started)
+
+        assert tracker.node_start_failures.get("/m/1.mkv", 0) == counted
+        assert [i.canonical_path for i in tracker.item_queue] == ["/m/1.mkv"]
 
     def test_files_a_free_node_cant_see_are_passed_over_for_one_it_can(self):
         pool = _pool(("a", "A"))
