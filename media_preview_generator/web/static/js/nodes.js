@@ -562,16 +562,44 @@
 
     const add = { probe: null, node: null, editor: null };
 
-    function probeErrorText(error) {
+    // What to check, by why nothing answered (error.reason); url is the address that was tried.
+    function unreachableText(reason, url) {
+        const https = /^https:/i.test(url || '');
+        switch (reason) {
+            case 'dns':
+                return `Can't find ${hostOf(url) || 'that machine'}. Check the name, or use the node's IP address.`;
+            case 'tls':
+                return "It doesn't answer over https. A node speaks http unless you put it behind an https proxy: use http:// instead.";
+            case 'refused':
+                return 'Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node is running.';
+            case 'timeout':
+                return https
+                    ? 'No answer over https in time. A node speaks http unless you put it behind an https proxy: try http:// instead.'
+                    : 'No answer in time. Check the address, that the node is running, and that a firewall lets this app reach it.';
+            default:
+                return 'Nothing answered at this address. Check the address and port, and that the node is running.';
+        }
+    }
+
+    function probeErrorText(error, url) {
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
                 return "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set.";
             case 'unreachable':
-                return 'Nothing answered at this address. Check the address and port, and that the node is running.';
+                return unreachableText(error.reason, url);
             case 'protocol':
                 // A node on another protocol says which version it runs; anything else isn't a node of this app.
                 if (error.node_version) return error.message;
+                if (error.reason === 'this_app') {
+                    return "This address is this app itself, not a node. Use the address of the machine running the node, with the node's port (9494 unless you set NODE_PORT).";
+                }
+                if (error.reason === 'other_app') {
+                    return "This address is another copy of this app, not a node. Run that machine as a node (MODE=node) and use the node's port (9494 unless you set NODE_PORT).";
+                }
+                if (error.reason === 'web_page') {
+                    return "This address answers with a web page, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.";
+                }
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
             case 'request':
                 return "The node didn't accept the request. Update the node and this app to the same version.";
@@ -695,7 +723,7 @@
             add.probe = null;
             $('#addNodeProbe').classList.add('d-none');
             const error = r.data && typeof r.data.error === 'object' ? r.data.error : { message: errorText(r, "Couldn't connect") };
-            addError(probeErrorText(error));
+            addError(probeErrorText(error, url));
             setAddStep(1);
             return;
         }

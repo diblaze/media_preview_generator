@@ -13,7 +13,7 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
-from flask import jsonify, request
+from flask import current_app, jsonify, request
 from loguru import logger
 
 from ...nodes import protocol
@@ -36,6 +36,10 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# Why something that answered isn't a node (``error.reason`` next to the protocol kind).
+PROBE_THIS_APP = "this_app"
+PROBE_OTHER_APP = "other_app"
+PROBE_WEB_PAGE = "web_page"
 # Bounds on what a node sends that is passed on to the browser.
 NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
@@ -157,8 +161,28 @@ def _same_address(url: str, record: dict) -> bool:
     return url == normalise_url(record.get("url"))[0]
 
 
-def _probe_error(kind: str, message: str) -> dict[str, Any]:
-    return {"ok": False, "error": {"kind": kind, "message": message}}
+def _probe_error(kind: str, message: str, reason: str = "") -> dict[str, Any]:
+    """A failed probe; ``reason`` narrows ``kind`` down to what to check (Add node words each one)."""
+    error = {"kind": kind, "message": message}
+    if reason:
+        error["reason"] = reason
+    return {"ok": False, "error": error}
+
+
+def _not_a_node(exc: NodeProtocolError) -> dict[str, Any] | None:
+    """The probe's answer when the address is this app (or another copy of it) or a web page, else None."""
+    if exc.app_instance:
+        own = exc.app_instance == current_app.config.get("APP_INSTANCE_ID")
+        return _probe_error(
+            protocol.KIND_PROTOCOL,
+            "This address is this app itself, not a node."
+            if own
+            else "This address is another copy of this app, not a node.",
+            PROBE_THIS_APP if own else PROBE_OTHER_APP,
+        )
+    if exc.web_page:
+        return _probe_error(protocol.KIND_PROTOCOL, "This address answers with a web page, not a node.", PROBE_WEB_PAGE)
+    return None
 
 
 def _credit_notes(gpus: list[dict]) -> list[dict[str, str]]:
@@ -229,11 +253,13 @@ def _probe(url: str, key: str) -> dict[str, Any]:
             )
             answer["error"]["node_version"] = node_version
             return answer
+        if exc.app_instance:
+            return _not_a_node(exc)
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
         if state != AGENT_CONNECTED:
-            return _probe_error(
+            return _not_a_node(exc) or _probe_error(
                 protocol.KIND_PROTOCOL,
                 "Something answered at this address, but not as a node this app can use.",
             )
@@ -249,7 +275,7 @@ def _probe(url: str, key: str) -> dict[str, Any]:
             },
         }
     except NodeError as exc:
-        return _probe_error(KIND_UNREACHABLE, str(exc))
+        return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
     return {"ok": True, "info": _probe_info(info)}
 
 

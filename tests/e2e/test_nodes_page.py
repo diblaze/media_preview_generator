@@ -538,6 +538,31 @@ class TestAddNode:
         expect(authed_page.locator("#addNodeError")).to_contain_text(text)
         expect(authed_page.locator("#addNodeNext")).to_be_hidden()
 
+    @pytest.mark.parametrize(
+        ("url", "kind", "reason", "text"),
+        [
+            ("http://nas:9494", "protocol", "this_app", "This address is this app itself, not a node."),
+            ("http://nas:8080", "protocol", "other_app", "This address is another copy of this app, not a node."),
+            ("http://nas:80", "protocol", "web_page", "This address answers with a web page, not a node."),
+            ("https://nas:9494", "unreachable", "tls", "It doesn't answer over https."),
+            ("https://nas:9494", "unreachable", "timeout", "No answer over https in time."),
+            ("http://nass.lan:9494", "unreachable", "dns", "Can't find nass.lan."),
+            ("http://nas:9495", "unreachable", "refused", "Nothing is listening on that port."),
+        ],
+        ids=["this-app", "other-app", "web-page", "https", "https-timeout", "dns", "refused"],
+    )
+    def test_probe_errors_say_what_to_check(
+        self, authed_page: Page, app_url: str, url: str, kind: str, reason: str, text: str
+    ) -> None:
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        api.probe_answer = {"ok": False, "error": {"kind": kind, "message": "raw detail", "reason": reason}}
+        authed_page.locator("#addNodeUrl").fill(url)
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeError")).to_contain_text(text)
+        expect(authed_page.locator("#addNodeError")).not_to_contain_text("Update the node")
+
     def test_a_node_on_another_protocol_names_both_versions(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)

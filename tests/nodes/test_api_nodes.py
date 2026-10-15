@@ -195,6 +195,36 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["ok"] is False and body["error"]["kind"] == kind and body["error"]["message"]
 
+    def test_probe_that_nothing_answered_says_why(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("x", reason="refused")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
+
+    def test_probe_of_this_apps_own_address_says_it_is_this_app(self, client, nodes):
+        own = client.application.config["APP_INSTANCE_ID"]
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance=own)
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"] == {
+            "kind": "protocol",
+            "message": "This address is this app itself, not a node.",
+            "reason": "this_app",
+        }
+
+    def test_probe_of_another_copy_of_this_app_says_so(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance="someone-else")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["reason"] == "other_app"
+
+    def test_probe_of_a_web_page_that_is_no_plex_helper_says_web_page(self, client, nodes, monkeypatch):
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("unreachable", ""))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("html", web_page=True)
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["reason"] == "web_page"
+
+    def test_this_apps_answers_carry_its_instance_id(self, client, nodes):
+        resp = client.get("/v1/info")
+        assert resp.headers["X-MPG-App-Instance"] == client.application.config["APP_INSTANCE_ID"]
+
     def test_probe_of_an_old_helper(self, client, nodes):
         nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()

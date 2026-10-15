@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 # apps that speak it are still in the wild.
 NODE_PROTOCOL = 1
 PROTOCOL_HEADER = "X-MPG-Node-Protocol"
+# Sent on every answer of the app's web side (never a node's), with an id per running app: an address entered in
+# Add node that answers with it is this app, or another copy of it, not a node.
+APP_INSTANCE_HEADER = "X-MPG-App-Instance"
 
 DEFAULT_PORT = 9494
 

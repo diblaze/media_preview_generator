@@ -12,7 +12,7 @@ from json import loads as parse_json
 from typing import Any
 
 import requests
-from urllib3.exceptions import ProtocolError
+from urllib3.exceptions import NameResolutionError, NewConnectionError, ProtocolError
 
 from . import protocol
 
@@ -34,8 +34,24 @@ class NodeError(Exception):
     """Base class for every node client failure."""
 
 
+# Why nothing answered (``NodeUnreachableError.reason``), so a caller can say what to check.
+UNREACHABLE_REFUSED = "refused"
+UNREACHABLE_TIMEOUT = "timeout"
+UNREACHABLE_DNS = "dns"
+UNREACHABLE_TLS = "tls"
+
+
 class NodeUnreachableError(NodeError):
-    """No answer: connection refused, timed out, DNS, TLS, or a 5xx from something in between."""
+    """No answer: connection refused, timed out, DNS, TLS, or a 5xx from something in between.
+
+    Args:
+        message: What went wrong, in plain words.
+        reason: One of the ``UNREACHABLE_*`` codes, or "" when it isn't known.
+    """
+
+    def __init__(self, message: str, *, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class NodeTimeoutError(NodeUnreachableError):
@@ -54,11 +70,17 @@ class NodeProtocolError(NodeError):
         message: What went wrong.
         node: The ``node`` block of a node that refused this app's protocol (it names the node's version); None when
             whatever answered isn't a node of this app (an older Plex helper answers without one).
+        web_page: What answered sent a web page (HTML), not a node's JSON.
+        app_instance: What answered is this app's web side (``protocol.APP_INSTANCE_HEADER``): its instance id.
     """
 
-    def __init__(self, message: str, *, node: dict | None = None) -> None:
+    def __init__(
+        self, message: str, *, node: dict | None = None, web_page: bool = False, app_instance: str = ""
+    ) -> None:
         super().__init__(message)
         self.node = node
+        self.web_page = web_page
+        self.app_instance = app_instance
 
 
 class NodeUnknownTaskError(NodeError):
@@ -71,6 +93,24 @@ class NodeRequestError(NodeError):
 
 class NodeTaskDeletedError(NodeError):
     """The node refused a start whose task id this app had already deleted (409 ``task_deleted``): nothing ran."""
+
+
+def _unreachable(base: str, exc: requests.RequestException) -> NodeUnreachableError:
+    """A request that got no answer, saying why in plain words (never the exception's class name)."""
+    cause = getattr(exc.args[0], "reason", None) if exc.args else None
+    if isinstance(exc, requests.exceptions.SSLError):
+        return NodeUnreachableError(f"{base} didn't answer over https", reason=UNREACHABLE_TLS)
+    if isinstance(cause, NameResolutionError):
+        host = base.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0]
+        return NodeUnreachableError(
+            f"{base} didn't answer (no machine called {host} was found)", reason=UNREACHABLE_DNS
+        )
+    if isinstance(exc, requests.Timeout):
+        cls = NodeTimeoutError if isinstance(exc, requests.ReadTimeout) else NodeUnreachableError
+        return cls(f"{base} didn't answer in time", reason=UNREACHABLE_TIMEOUT)
+    if isinstance(cause, NewConnectionError) and "refused" in str(cause).lower():
+        return NodeUnreachableError(f"{base} didn't answer (connection refused)", reason=UNREACHABLE_REFUSED)
+    return NodeUnreachableError(f"{base} didn't answer (no connection)")
 
 
 def _answer_lost(exc: requests.ConnectionError) -> bool:
@@ -141,14 +181,12 @@ class NodeClient:
                 allow_redirects=False,
                 stream=True,
             )
-        except requests.ReadTimeout as exc:
-            raise NodeTimeoutError(f"{self._address.base} didn't answer in time: {type(exc).__name__}") from exc
         except requests.ConnectionError as exc:
-            if _answer_lost(exc):
+            if _answer_lost(exc) and not isinstance(exc, requests.exceptions.SSLError):
                 raise NodeTimeoutError(f"{self._address.base} dropped the connection before answering") from exc
-            raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
+            raise _unreachable(self._address.base, exc) from exc
         except requests.RequestException as exc:
-            raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
+            raise _unreachable(self._address.base, exc) from exc
         with response:
             return self._answer(response, path, raw=raw)
 
@@ -167,6 +205,11 @@ class NodeClient:
 
     def _answer(self, response: requests.Response, path: str, *, raw: bool) -> Any:
         """The node's answer to ``path``: the JSON body, or the bytes when ``raw``; anything else raises."""
+        app_instance = str(response.headers.get(protocol.APP_INSTANCE_HEADER) or "")
+        if app_instance:
+            raise NodeProtocolError(
+                f"{self._address.base} is this app's web page, not a node", app_instance=app_instance
+            )
         if response.status_code == 401:
             raise NodeAuthError(f"{self._address.base} refused the key")
         if response.status_code >= 500:
@@ -181,8 +224,9 @@ class NodeClient:
         try:
             body = parse_json(self._read(response, MAX_ANSWER_BYTES))
         except ValueError as exc:
+            web_page = "html" in str(response.headers.get("Content-Type") or "").lower()
             raise NodeProtocolError(
-                f"{self._address.base} didn't answer as a node (HTTP {response.status_code})"
+                f"{self._address.base} didn't answer as a node (HTTP {response.status_code})", web_page=web_page
             ) from exc
         if not isinstance(body, dict):
             raise NodeProtocolError(f"{self._address.base} didn't answer as a node")
