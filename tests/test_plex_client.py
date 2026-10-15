@@ -1810,6 +1810,34 @@ class TestExpandDirectoryToMediaFiles:
         assert "S01E01.srt" not in basenames
         assert "poster.jpg" not in basenames
 
+    @pytest.mark.parametrize("second_is_folder", [True, False], ids=["then-a-folder", "then-a-file"])
+    def test_a_cancel_after_the_first_folder_keeps_its_files_only(self, tmp_path, second_is_folder):
+        first, second = tmp_path / "Show A", tmp_path / "Show B"
+        first.mkdir()
+        (first / "S01E01.mkv").write_text("")
+        if second_is_folder:
+            second.mkdir()
+            (second / "S01E01.mkv").write_text("")
+        else:
+            second = tmp_path / "movie.mkv"
+            second.write_text("")
+        cancelled = False
+
+        def cancel_check():
+            return cancelled
+
+        walk = os.walk
+
+        def walk_then_cancel(top, *args, **kwargs):
+            nonlocal cancelled
+            yield from walk(top, *args, **kwargs)
+            cancelled = True  # the job is cancelled once the first folder has been walked
+
+        with patch("media_preview_generator.plex_client.os.walk", side_effect=walk_then_cancel):
+            result = _expand_directory_to_media_files([str(first), str(second)], cancel_check=cancel_check)
+
+        assert result == [str(first / "S01E01.mkv")]
+
     def test_empty_directory_passes_through(self, tmp_path):
         """Directory with no media files passes through as-is for downstream error reporting."""
         empty_dir = tmp_path / "empty"

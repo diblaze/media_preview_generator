@@ -1692,6 +1692,16 @@ def _run_webhook_paths_phase(
     for cfg in server_configs:
         all_mappings.extend(getattr(cfg, "path_mappings", None) or [])
     paths = _expand_directory_to_media_files(raw_paths, all_mappings, cancel_check=cancel_check)
+    # A walk cut short by a cancel holds only part of the folders: resolving those would run a cancelled job.
+    if cancel_check and cancel_check():
+        totals["cancelled"] = True
+        return {
+            "unresolved_paths": [],
+            "skipped_paths": [],
+            "resolved_count": 0,
+            "total_paths": 0,
+            "path_hints": [],
+        }
     total_paths = len(paths)
 
     if progress_callback:

@@ -1707,10 +1707,15 @@ class NodeRegistry:
 
 
 def access_passed(result: object) -> bool:
-    """Whether a Test access result saw every sampled file (and sampled at least one)."""
+    """Whether a Test access result saw every sampled file (and sampled at least one).
+
+    A library failed for a row inside it that this app couldn't read counts even with no file checked.
+    """
     if not isinstance(result, dict):
         return False
     libraries = [lib for lib in result.get("libraries") or [] if isinstance(lib, dict)]
+    if any(lib.get("unreadable") for lib in libraries):
+        return False
     checked = [lib for lib in libraries if lib.get("checked")]
     return bool(checked) and all(lib.get("ok") for lib in checked)
 

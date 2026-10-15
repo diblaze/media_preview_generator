@@ -54,14 +54,17 @@ def _process_failing(failing: set[str]):
 
 
 class TestWebhookPhaseRetriesTheFailedPaths:
-    def _run_phase(self, raw_paths, canonical_by_raw, dispatch_result, unowned=()):
+    def _run_phase(self, raw_paths, canonical_by_raw, dispatch_result, unowned=(), cancel_check=None, totals=None):
         config = SimpleNamespace(webhook_paths=raw_paths, webhook_item_id_hints=None)
         registry = MagicMock()
         registry.configs.return_value = []
+        self.dispatched = []
         with (
             patch(
-                "media_preview_generator.plex_client._expand_directory_to_media_files", side_effect=lambda p, m, **_: p
-            ),
+                "media_preview_generator.plex_client._expand_directory_to_media_files",
+                autospec=True,
+                side_effect=lambda p, m, cancel_check=None: p,
+            ) as self.walk,
             patch(f"{MODULE}._log_webhook_owning_servers"),
             patch(
                 f"{MODULE}._resolve_webhook_path_to_canonical",
@@ -76,13 +79,48 @@ class TestWebhookPhaseRetriesTheFailedPaths:
             return orchestrator._run_webhook_paths_phase(
                 config,
                 registry,
-                dispatch_items=lambda items, label: dispatch_result,
+                dispatch_items=lambda items, label: self.dispatched.append(items) or dispatch_result,
                 progress_callback=None,
-                cancel_check=None,
+                cancel_check=cancel_check,
                 job_id="job-1",
-                totals={"processed": 0, "successful": 0, "failed": 0, "cancelled": False},
+                totals=totals
+                if totals is not None
+                else {"processed": 0, "successful": 0, "failed": 0, "cancelled": False},
                 aggregate_outcome={},
             )
+
+    def test_the_folder_walk_is_given_the_jobs_cancel_check(self):
+        def not_cancelled():
+            return False
+
+        self._run_phase(
+            ["/data/a.mkv"],
+            {"/data/a.mkv": "/data/a.mkv"},
+            {"completed": 1, "failed": 0, "cancelled": False, "outcome": {}, "failed_paths": []},
+            cancel_check=not_cancelled,
+        )
+
+        assert self.walk.call_args.kwargs["cancel_check"] is not_cancelled
+
+    def test_a_job_cancelled_during_the_folder_walk_is_cancelled_and_resolves_nothing(self):
+        totals = {"processed": 0, "successful": 0, "failed": 0, "cancelled": False}
+        result = self._run_phase(
+            ["/data/a.mkv"],
+            {"/data/a.mkv": "/data/a.mkv"},
+            {"completed": 1, "failed": 0, "cancelled": False, "outcome": {}, "failed_paths": []},
+            cancel_check=lambda: True,
+            totals=totals,
+        )
+
+        assert totals["cancelled"] is True
+        assert self.dispatched == []
+        assert result == {
+            "unresolved_paths": [],
+            "skipped_paths": [],
+            "resolved_count": 0,
+            "total_paths": 0,
+            "path_hints": [],
+        }
 
     def test_the_failed_path_is_the_one_that_failed_when_a_later_item_fails(self):
         paths = ["/data/a.mkv", "/data/b.mkv", "/data/c.mkv"]

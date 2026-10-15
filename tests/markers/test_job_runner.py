@@ -311,6 +311,18 @@ class TestBuildItems:
         assert list(marker_matches(items[0].canonical_path, reg.configs())) == ["jf-1"]
         assert warnings == []
 
+    def test_a_cancelled_job_builds_no_items_from_a_folder(self, tmp_path):
+        season = tmp_path / "tv" / "Show" / "Season 01"
+        season.mkdir(parents=True)
+        (season / "S01E01.mkv").write_bytes(b"x")
+        reg = FakeRegistry({"jf-1": server_config("jf-1", ServerType.JELLYFIN)})
+
+        items, _warnings, sent = job_runner.build_items(
+            {"file_paths": [str(tmp_path / "tv" / "Show")]}, registry=reg, cancel_check=lambda: True
+        )
+
+        assert items == [] and sent == {}
+
     def test_enumerated_duplicates_keep_the_first_item(self):
         reg = FakeRegistry({"jf-1": server_config("jf-1", ServerType.JELLYFIN)})
         first = ProcessableItem("/media/tv/S/a.mkv", "jf-1", {"jf-1": "x"})

@@ -127,6 +127,13 @@ class TestSampleFiles:
         _video(root / "Film" / "real.mkv")
         assert [os.path.basename(f["path"]) for f in nm.sample_files(str(root))] == ["real.mkv"]
 
+    def test_it_skips_filesystem_housekeeping_folders(self, tmp_path):
+        root = tmp_path / "Movies"
+        _video(root / "lost+found" / "#1234.mkv")
+        _video(root / "System Volume Information" / "x.mkv")
+        _video(root / "Film" / "real.mkv")
+        assert [os.path.basename(f["path"]) for f in nm.sample_files(str(root))] == ["real.mkv"]
+
     def test_film_folders_named_with_hash_or_at_are_sampled(self, tmp_path):
         root = tmp_path / "Movies"
         _video(root / "#Alive (2020)" / "a.mkv")
@@ -773,3 +780,118 @@ class TestAStalledMount:
         sampling = nm._Sampling()
         nm._sample_into(sampling, str(tmp_path / "lib"), limit=3, walk_limit=500, deadline=time.monotonic() - 1)
         assert sampling.timed_out is True and sampling.found == []
+
+
+class TestInnerRowsOneRule:
+    """Test access and the quick access check fail a library tested through rows inside it on the same terms."""
+
+    @staticmethod
+    def _setup(tmp_path):
+        """Movies has no row of its own, only rows A and B inside it; TV, which a row covers, always passes."""
+        _video(tmp_path / "media" / "TV" / "t.mkv")
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                    {"id": "2", "name": "TV", "remote_paths": ["/plexmedia/TV"]},
+                ],
+            )
+        ]
+        movies = tmp_path / "media" / "Movies"
+        rows = [
+            PathMapping(str(movies / "A"), "/mnt/A"),
+            PathMapping(str(movies / "B"), "/mnt/B"),
+            PathMapping(str(tmp_path / "media" / "TV"), "/mnt/TV"),
+        ]
+        return servers, rows, movies
+
+    @pytest.mark.parametrize(
+        ("case", "passes", "error"),
+        [
+            ("both_fine", True, None),
+            ("all_unreadable", False, "This app can't open {A}"),
+            ("one_of_two_unreadable", False, "This app can't open {B}"),
+            ("one_timed_out", False, "Timed out reading {B} (no answer within 0.5 s)"),
+            ("one_the_node_cant_see", False, None),
+        ],
+    )
+    def test_both_checks_agree(self, tmp_path, monkeypatch, case, passes, error):
+        import threading
+
+        servers, rows, movies = self._setup(tmp_path)
+        if case != "all_unreadable":
+            _video(movies / "A" / "a.mkv")
+        if case in ("both_fine", "one_the_node_cant_see", "one_timed_out"):
+            _video(movies / "B" / "b.mkv")
+        visible = (lambda p: "/B/" not in p) if case == "one_the_node_cant_see" else (lambda p: True)
+        release = threading.Event()
+        if case == "one_timed_out":
+            real_scandir = os.scandir
+
+            def scandir(path):
+                if os.fspath(path) == str(movies / "B"):
+                    release.wait(30)  # stands in for a read stuck on a dead NFS server
+                return real_scandir(path)
+
+            monkeypatch.setattr(nm.os, "scandir", scandir)
+            monkeypatch.setattr(nm, "SAMPLE_BUDGET_S", 0.5)
+        try:
+            result = nm.run_test_access(FakeClient(visible=visible), rows, servers)
+            quick = nm.quick_access_check(FakeClient(visible=visible), rows, servers)
+        finally:
+            release.set()
+
+        library = next(lib for lib in result["libraries"] if lib["library"] == "Movies")
+        assert (reg.access_passed(result), quick) == (passes, passes)
+        assert library["ok"] is passes
+        expected = error.format(A=movies / "A", B=movies / "B") if error else None
+        assert library["error"] == expected
+        assert library["unreadable"] is (error is not None)
+
+    def test_a_disk_whose_inner_rows_cant_be_opened_fails_though_another_disk_holds_the_folder(self, tmp_path):
+        _video(tmp_path / "disk2" / "Movies" / "a.mkv")
+        server = _server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/data/Movies"]}])
+        server["path_mappings"] = [
+            {"remote_prefix": "/data", "local_prefix": str(tmp_path / d)} for d in ("disk1", "disk2")
+        ]
+        missing = tmp_path / "disk1" / "Movies" / "A"
+        rows = [PathMapping(str(missing), "/mnt/A"), PathMapping(str(tmp_path / "disk2"), "/mnt/disk2")]
+
+        result = nm.run_test_access(FakeClient(), rows, [server])
+
+        assert [(lib["app_root"], lib["ok"], lib["error"]) for lib in result["libraries"]] == [
+            (str(tmp_path / "disk1" / "Movies"), False, f"This app can't open {missing}"),
+            (str(tmp_path / "disk2" / "Movies"), True, None),
+        ]
+        assert reg.access_passed(result) is False
+        assert nm.quick_access_check(FakeClient(), rows, [server]) is False
+
+    def test_the_library_folder_itself_is_not_read(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        servers, rows, movies = self._setup(tmp_path)
+        for disk in ("A", "B"):
+            _video(movies / disk / f"{disk}.mkv")
+        release = threading.Event()
+        real_scandir = os.scandir
+        read: list[str] = []
+
+        def scandir(path):
+            read.append(os.fspath(path))
+            if os.fspath(path) == str(movies):
+                release.wait(30)  # a stalled library root would hold Test access for the whole budget
+            return real_scandir(path)
+
+        monkeypatch.setattr(nm.os, "scandir", scandir)
+        monkeypatch.setattr(nm, "SAMPLE_BUDGET_S", 3.0)
+        started = time.monotonic()
+        try:
+            result = nm.run_test_access(FakeClient(), rows, servers)
+        finally:
+            release.set()
+
+        assert time.monotonic() - started < 2
+        assert str(movies) not in read
+        assert reg.access_passed(result) is True

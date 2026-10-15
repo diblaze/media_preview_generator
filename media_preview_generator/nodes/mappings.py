@@ -30,7 +30,18 @@ WALK_LIMIT = 500
 # spending the whole walk listing the top folder.
 SUBFOLDERS_PER_FOLDER = 16
 # NAS housekeeping folders (Synology, QNAP, Windows), compared casefolded; they hold no library files.
-NAS_FOLDERS = frozenset({"#recycle", "#snapshot", "@eadir", "@recycle", "@recently-snapshot", "$recycle.bin"})
+NAS_FOLDERS = frozenset(
+    {
+        "#recycle",
+        "#snapshot",
+        "@eadir",
+        "@recycle",
+        "@recently-snapshot",
+        "$recycle.bin",
+        "lost+found",
+        "system volume information",
+    }
+)
 # Files per access-check request; the node checks each one on disk.
 CHECK_BATCH = 30
 # The longest Test access spends reading this app's own library folders. A stalled network mount blocks a directory
@@ -221,6 +232,20 @@ def _rows_inside(app_root: str, mappings: list[PathMapping]) -> list[str]:
     return sorted({row.app_prefix.rstrip("/") for row in mappings if row.app_prefix.rstrip("/").startswith(base)})
 
 
+def _inner_row_problem(folder: str, sampling: _Sampling) -> str | None:
+    """Why a row inside a library fails it before the node is asked: this app read no file from the row's folder.
+
+    Test access and the quick access check share this rule, so they agree on such a library.
+    """
+    if sampling.found:
+        return None
+    if sampling.timed_out:
+        return f"Timed out reading {folder} (no answer within {SAMPLE_BUDGET_S:g} s)"
+    if not sampling.opened:
+        return f"This app can't open {folder}"
+    return None
+
+
 def _interleave(lists: list[list[dict]], limit: int) -> list[dict]:
     """Files taken from each list in turn, each path once, up to ``limit``: every row inside a library gets tested."""
     picked: dict[str, dict] = {}
@@ -405,31 +430,33 @@ def run_test_access(
     Returns:
         ``{"libraries": [{"server", "library", "app_root", "mapped", "checked", "ok", "files": [{"path", "ok",
         "kind", "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
-        "error": str | None, "empty": bool}]}``. ``nearby`` lists what the node does see above the library's
-        missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library (never of a row
-        that also maps a library that passed); ``mapped`` is False for a library no row covers (not tested: other
-        workers take its files); ``empty`` says this app
-        opened the folder and found no video near its top. A disk of a multi-disk library that lacks the folder is
-        left out while another disk holds it.
+        "error": str | None, "empty": bool, "unreadable": bool}]}``. ``nearby`` lists what the node does see above
+        the library's missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library
+        (never of a row that also maps a library that passed); ``mapped`` is False for a library no row covers nor
+        holds a row inside (not tested: other workers take its files). A library with rows inside it is tested through
+        those rows' folders only, and fails (``unreadable``) when this app can't open one of them or reads no file from
+        it in time. ``empty`` says this app opened the folder and found no video near its top. A disk of a multi-disk
+        library that a row covers but lacks the folder is left out while another disk holds it.
 
     Raises:
         NodeError: The node couldn't be asked.
     """
     roots = library_roots(servers)
     inside = {root: folders for root in roots if (folders := _rows_inside(root.app_root, mappings))}
-    nested = [folder for folders in inside.values() for folder in folders]
-    sampled = _sample_folders([root.app_root for root in roots] + nested, SAMPLE_BUDGET_S, limit=SAMPLES_PER_ROOT)
-    samplings = dict(zip(roots, sampled[: len(roots)], strict=True))
-    by_folder = dict(zip(nested, sampled[len(roots) :], strict=True))
+    # A library tested through its inner rows isn't walked itself: a stalled root would only burn the budget.
+    whole = [root for root in roots if root not in inside]
+    nested = list(dict.fromkeys(folder for folders in inside.values() for folder in folders))
+    sampled = _sample_folders([root.app_root for root in whole] + nested, SAMPLE_BUDGET_S, limit=SAMPLES_PER_ROOT)
+    samplings = dict(zip(whole, sampled[: len(whole)], strict=True))
+    by_folder = dict(zip(nested, sampled[len(whole) :], strict=True))
     # An inner row this app can't read isn't tested, so the library can't pass on its other rows' files.
     unread: dict[LibraryRoot, str] = {}
     for root, folders in inside.items():
         parts = [by_folder[folder] for folder in folders]
         for folder, part in zip(folders, parts, strict=True):
-            if part.timed_out and not part.found:
-                unread.setdefault(root, f"Timed out reading {folder} (no answer within {SAMPLE_BUDGET_S:g} s)")
-            elif not part.opened and not part.found:
-                unread.setdefault(root, f"This app can't open {folder}")
+            problem = _inner_row_problem(folder, part)
+            if problem:
+                unread.setdefault(root, problem)
         samplings[root] = _Sampling(
             found=_interleave([list(part.found) for part in parts], max(SAMPLES_PER_ROOT, len(parts))),
             folder=next((part.folder for part in parts if part.folder), ""),
@@ -465,10 +492,11 @@ def run_test_access(
                     "suggestion": None,
                     "error": f"Not mapped on {node_name}. Other workers take its files.",
                     "empty": False,
+                    "unreadable": False,
                 }
             )
             continue
-        if not picked and not sampling.opened and not sampling.timed_out:
+        if root not in inside and not picked and not sampling.opened and not sampling.timed_out:
             if (root.server_id, root.library_id, root.remote) in held:
                 continue
         rows = []
@@ -510,12 +538,11 @@ def run_test_access(
                 "suggestion": None,
                 "error": error,
                 "empty": empty,
+                "unreadable": root in unread,
             }
         )
-    partial = {root.app_root for root in inside}
     for library in libraries:
-        # A row inside a library isn't the library's own row, so there is no corrected folder to offer for it.
-        if library["files"] and not library["ok"] and library["app_root"] not in partial:
+        if library["files"] and not library["ok"]:
             library["suggestion"], reason = _suggest_for(library, mappings, libraries, node_name)
             library["error"] = library["error"] or reason
     return {"libraries": libraries}
@@ -524,9 +551,11 @@ def run_test_access(
 def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers: list[dict]) -> bool:
     """One file per library folder: True when the node sees every one (and there was at least one to check).
 
-    Every library a row covers, as Test access samples them: one file per mapping row passes while a library under the same row
-    is out of the node's sight. Reading this app's folders has the same budget as Test access, so a stalled mount
-    fails the check instead of holding up the node's check.
+    Every library a row covers, as Test access samples them: one file per mapping row passes while a library under
+    the same row is out of the node's sight. A library holding rows inside it is checked through those rows' folders,
+    and fails as in Test access when this app can't open one of them or reads no file from it in time. Reading this
+    app's folders has the same budget as Test access, so a stalled mount fails the check instead of holding up the
+    node's check.
 
     Args:
         client: The node.
@@ -534,19 +563,19 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers:
         servers: The stored ``media_servers`` list.
 
     Returns:
-        Whether every sampled file was visible.
+        Whether every sampled file was visible (from every library a row covers or holds a row inside).
     """
     roots = library_roots(servers)
     inner = list(dict.fromkeys(folder for root in roots for folder in _rows_inside(root.app_root, mappings)))
     whole = [root.app_root for root in roots if _covering_row(root.app_root, mappings)]
     folders = list(dict.fromkeys(whole + inner))
     samplings = _sample_folders(folders, SAMPLE_BUDGET_S, limit=1)
-    if any(sampling.timed_out for sampling in samplings):
+    by_folder = dict(zip(folders, samplings, strict=True))
+    if any(by_folder[folder].timed_out for folder in whole):
         logger.debug("Quick access check gave up: this app's own library folder didn't answer")
         return False
-    # As in Test access: a row inside a library that this app can't open fails the library.
-    if any(not sampling.opened for folder, sampling in zip(folders, samplings, strict=True) if folder in inner):
-        logger.debug("Quick access check failed: a mapped folder inside a library can't be opened here")
+    if any(_inner_row_problem(folder, by_folder[folder]) for folder in inner):
+        logger.debug("Quick access check failed: a mapped folder inside a library can't be read here")
         return False
     files = [f for sampling in samplings for f in sampling.found]
     if not files:
