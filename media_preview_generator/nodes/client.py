@@ -291,7 +291,7 @@ class NodeClient:
         """The ``error.kind`` of a node's JSON answer, or "" when the answer isn't one (a proxy's error page)."""
         try:
             body = parse_json(self._read(response, MAX_ANSWER_BYTES))
-        except (ValueError, NodeError):
+        except (ValueError, RecursionError, NodeError):  # RecursionError: JSON nested deeper than the parser goes
             return ""
         error = body.get("error") if isinstance(body, dict) else None
         return str(error.get("kind") or "") if isinstance(error, dict) else ""
