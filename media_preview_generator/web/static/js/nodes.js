@@ -1007,7 +1007,11 @@
     function renderOverview(node) {
         const [tone, text] = stateOf(node);
         const cpu = node.cpu || {};
-        const rows = [kv('State', `${pill(tone, text)}${node.reason ? `<span class="text-muted">${esc(node.reason)}</span>` : ''}`)];
+        // A turned-off node's reason only repeats its chip: say what that means and where to undo it instead.
+        const why = node.state === 'disabled'
+            ? '<span class="text-muted">No work goes to it and it isn\'t checked. To use it again, turn on "Send work to this node" on its <a href="#" class="nd-to-settings">Settings tab</a>.</span>'
+            : (node.reason ? `<span class="text-muted">${esc(node.reason)}</span>` : '');
+        const rows = [kv('State', `${pill(tone, text)}${why}`)];
         rows.push(kv('Roles', roleChips(node) || '<span class="text-muted">none reported yet</span>'));
         if (node.version) {
             const same = !page.appVersion || node.version === page.appVersion;
@@ -1032,7 +1036,10 @@
         const busy = filesRunningText(node);
         if (busy) rows.push(kv('Busy', esc(busy)));
         const used = usedByParts(node.used_by);
-        rows.push(kv('Used by', used.length ? esc(used.join(', ')) : `<span class="text-muted">nothing yet</span>${isWorker(node) ? ` · <a href="/settings#section-workers">Add it to a worker group</a>` : ''}`));
+        let useIt = '';
+        if (isWorker(node)) useIt = ' · <a href="/settings#section-workers">Add it to a worker group</a>';
+        else if (isPlexDb(node)) useIt = " · <a href=\"/servers\">Pick it on a Plex server's Connection tab</a>";
+        rows.push(kv('Used by', used.length ? esc(used.join(', ')) : `<span class="text-muted">nothing yet</span>${useIt}`));
         const overview = $('#nodeOverview');
         disposeTooltips(overview);
         overview.innerHTML = `<section class="sm-sec"><div class="sm-sec-h">Node</div><div class="markers-kv">${rows.join('')}</div></section>`;
@@ -1286,7 +1293,7 @@
         const shownTime = (time) => String(time || '').replace('T', ' ').replace(/(?:[+-]\d\d:\d\d|Z)$/, '');
         pre.textContent = lines.length
             ? lines.map((line) => [shownTime(line.time), line.level, line.message].filter(Boolean).join(' ')).join('\n')
-            : 'No log lines yet.';
+            : String((r.data && r.data.message) || 'No log lines yet.');
         pre.scrollTop = pre.scrollHeight;
     }
 
@@ -1578,6 +1585,12 @@
             if (!event.target.closest('.nd-health-retry')) return;
             event.preventDefault();
             loadHealth();
+        });
+        $('#nodeOverview').addEventListener('click', (event) => {
+            if (!event.target.closest('.nd-to-settings')) return;
+            event.preventDefault();
+            showTab('settings');
+            $('#nodeSetEnabled').focus();
         });
 
         window.addEventListener('hashchange', openFromHash);

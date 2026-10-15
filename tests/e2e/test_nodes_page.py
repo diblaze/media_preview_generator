@@ -335,9 +335,38 @@ class TestNodeList:
         expect(status).not_to_contain_text("Turned off on the Nodes page")
 
         _open_node(authed_page, "n-off")
+        # One plain line that says how to undo it, not the chip's words twice.
+        state = authed_page.locator("#nodeOverview .markers-kv > div").nth(1)
+        expect(state).to_have_text(
+            'Turned offNo work goes to it and it isn\'t checked. To use it again, turn on "Send work to this node" '
+            "on its Settings tab."
+        )
+        state.get_by_role("link", name="Settings tab").click()
+        expect(authed_page.locator("#nodeSetEnabled")).to_be_focused()
         pane = _node_tab(authed_page, "health")
         expect(pane.locator(".nd-note")).to_have_text("Turned off — no work is sent.")
         expect(pane.locator(".readiness-bucket")).to_have_count(0)
+
+    def test_an_unused_plex_database_node_says_where_to_pick_it(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, [_node("n-db", "plex-box", roles=["plex_db"])])
+        _open_node(authed_page, "n-db")
+        link = authed_page.locator("#nodeOverview").get_by_role(
+            "link", name="Pick it on a Plex server's Connection tab"
+        )
+        expect(link).to_have_attribute("href", "/servers")
+
+    def test_an_older_plex_helpers_log_tab_says_why_it_is_empty_without_an_error(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        errors: list[str] = []
+        authed_page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+        message = "This node is an older Plex helper and can't share its log. Update it to see its log here."
+        api = _open_nodes(authed_page, app_url, [_node("n-old", "helper", roles=["plex_db"], legacy=True)])
+        api.log_answer = {"lines": [], "message": message}
+        _open_node(authed_page, "n-old")
+        _node_tab(authed_page, "log")
+        expect(authed_page.locator("#nodeLog")).to_have_text(message)
+        assert errors == []
         expect(authed_page.locator("#nodeHealthSummary")).to_have_text("")
 
     def test_a_ready_card_says_how_many_setup_health_rows_to_fix(self, authed_page: Page, app_url: str) -> None:
