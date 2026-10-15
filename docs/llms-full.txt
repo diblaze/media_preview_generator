@@ -4663,9 +4663,9 @@ Plex's database for a Plex on another machine or on Windows. Stored in `settings
 
 | Field | Rules |
 |---|---|
-| `id` | Made by the app. Worker group members (`node`) and Plex servers (`markers.plex.agent.node_id`) use it. |
+| `id` | Made by the app. Worker group members (`node`) and Plex servers (`markers.plex.agent.node_id`) use it. A record written into the file without one gets one when the app starts. |
 | `node_uid` | The id the machine reported last; recorded by the app, never posted. |
-| `name` | 1–80 characters, unique (case is ignored). |
+| `name` | 1–80 characters, no line breaks, tabs or hidden characters. Unique: names that look the same (`Café`, `CAFÉ`) count as one. |
 | `url` | `http` or `https` address, e.g. `http://nuc.lan:9494`. A trailing `/` is dropped and the scheme and host are lower-cased. 400 for a query string, fragment, username or password, or a host name that can't be used. |
 | `key` | The node's key: its `NODE_KEY`, or the key it printed in its log on first start. Up to 200 printable ASCII characters, no spaces. Never returned or logged; posting `****` (or leaving it out) keeps the stored key. |
 | `enabled` | Boolean. A node turned off is never checked and gets no work. |
