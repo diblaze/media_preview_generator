@@ -98,7 +98,7 @@ class NodeStoppingError(Exception):
 _TEMP_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
 _TEMP_WRITE_ERRNOS = _TEMP_FULL_ERRNOS | {errno.EROFS}
 # The node's user may not write there (PUID/PGID). Reading a video it may not read fails the same way, so one of these
-# is the temp folder's only when it names a file in it.
+# is the temp folder's only when it names a file in it and the folder refuses a new folder too.
 _TEMP_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
 # After a task filled the temp folder, free space that comes back by less than this isn't room made: a new folder's
 # block, or other files on a shared disk, come and go by that much.
@@ -508,6 +508,10 @@ class TaskTable:
                     blamed = seen.errno in _TEMP_WRITE_ERRNOS
                 else:
                     blamed = _inside(written, self.temp_root)
+                # The node's user made the task's folder, so a refusal there is a security policy on one file or
+                # FFmpeg's catch-all error (-1) read as EPERM, unless the folder refuses a new folder now too.
+                if blamed and seen.errno in _TEMP_PERMISSION_ERRNOS:
+                    blamed = probe_temp_folder(self.temp_root) is not None
                 if blamed:
                     message = temp_folder_problem(self.temp_root, seen)
                     filled = seen.errno in _TEMP_FULL_ERRNOS

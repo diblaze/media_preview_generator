@@ -267,12 +267,17 @@ class TestTempFolder:
 
     @pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM], ids=["no-permission", "not-permitted"])
     def test_ffmpeg_refused_the_temp_folder_by_permission_holds_the_node_with_the_puid_advice(
-        self, make_table, media, code
+        self, make_table, media, monkeypatch, code
     ):
         from media_preview_generator.nodes.registry import _temp_folder_advice
         from media_preview_generator.processing.generator import _FOLDER_WRITE_TEXT, WorkingFolderError
 
+        def refused(*_args, **_kwargs):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
         def op(ctx, node_path, params):
+            # The folder refuses the node's user from now on: a new folder there fails too.
+            monkeypatch.setattr(tasks.tempfile, "mkdtemp", refused)
             raise WorkingFolderError(code, _FOLDER_WRITE_TEXT[code][0], os.path.join(ctx.temp_dir, "frames"))
 
         table = make_table({"test.op": op})
@@ -284,6 +289,22 @@ class TestTempFolder:
         assert message.startswith(f"The node can't write to its temp folder {table.temp_root} ("), message
         assert "twice its frames' size" not in message
         assert "check PUID and PGID" in _temp_folder_advice(message), message
+
+    @pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM], ids=["no-permission", "not-permitted"])
+    def test_a_permission_error_in_a_temp_folder_the_node_can_write_is_the_files(self, make_table, media, code):
+        """The node's user made the task's folder: a refusal there while the folder takes new files is a security
+        policy on one file, or FFmpeg's catch-all error (-1) read as EPERM, not the node's PUID/PGID."""
+        from media_preview_generator.processing.generator import _FOLDER_WRITE_TEXT, WorkingFolderError
+
+        def op(ctx, node_path, params):
+            raise WorkingFolderError(code, _FOLDER_WRITE_TEXT[code][0], os.path.join(ctx.temp_dir, "frames"))
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED and state["error"]["kind"] == protocol.KIND_FAILED
+        assert state["error"]["message"].startswith(f"WorkingFolderError: [Errno {code}]"), state["error"]
 
     @pytest.mark.parametrize(
         "named", [lambda media: str(media / "a.mkv"), lambda media: None], ids=["the-video", "no-file-named"]
