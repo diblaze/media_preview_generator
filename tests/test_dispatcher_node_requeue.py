@@ -14,6 +14,7 @@ import pytest
 from media_preview_generator.job_kinds import ItemOutcome, KindHandlers
 from media_preview_generator.jobs import dispatcher as dispatcher_mod
 from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
+from media_preview_generator.jobs.node_members import NodeHardware
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes.executor import FileNotVisibleError, NodeUnavailableError, current_placement
 from media_preview_generator.nodes.registry import (
@@ -223,11 +224,12 @@ class TestNodeDrops:
         assert tracker.active_processing == 0
 
     @pytest.mark.parametrize(("other", "other_name"), [("b", "B"), (None, "")], ids=["other-node", "this-app"])
-    def test_a_dropped_file_waits_for_the_busy_worker_elsewhere_while_the_node_that_dropped_it_takes_the_next(
-        self, other, other_name
+    def test_a_dropped_file_waits_for_the_busy_worker_elsewhere_until_the_node_that_dropped_it_checks_ready(
+        self, registry, other, other_name
     ):
-        """A flapping node (it checks ready again right after each drop) would drop the file again: a second drop
-        fails it, though the healthy worker that's busy now would run it a moment later."""
+        """Back on a node that hasn't answered since it dropped the file, a second drop would fail it, though the
+        healthy worker that's busy now runs it a moment later."""
+        registry.fresh = False
         calls: list[tuple[str, str | None]] = []
         lock = threading.Lock()
 
@@ -241,13 +243,105 @@ class TestNodeDrops:
                 time.sleep(1.0)
             return ItemOutcome("markers_published", "ok")
 
-        tracker, rows = _run(_pool((other, other_name), ("a", "A")), process, "/m/long.mkv", "/m/x.mkv", "/m/y.mkv")
+        tracker, rows = _run(_pool((other, other_name), ("a", "A")), process, "/m/long.mkv", "/m/x.mkv")
 
         assert [node for path, node in calls if path == "/m/x.mkv"] == ["a", other]
-        assert [node for path, node in calls if path == "/m/y.mkv"] == ["a"]
         assert [r.args[1].value for r in rows if r.args[1].value == "failed"] == []
-        assert (tracker.successful, tracker.failed) == (3, 0)
+        assert (tracker.successful, tracker.failed) == (2, 0)
         assert tracker.active_processing == 0
+
+    def test_a_dropped_file_goes_back_to_its_node_once_it_checks_ready_rather_than_wait_for_a_busy_worker(
+        self, registry
+    ):
+        """This app's one worker holds a file frozen by its job's schedule (or a long film) for hours; node A drops
+        another job's only file once (a restart), checks ready at once and sits idle. The file runs on A again."""
+        registry.fresh = True
+        frozen = threading.Event()
+        tries: list[str | None] = []
+        lock = threading.Lock()
+
+        def frozen_job(item, **_kwargs):
+            frozen.wait(30)
+            return ItemOutcome("markers_published", "ok")
+
+        def webhook_job(item, **_kwargs):
+            with lock:
+                tries.append(_node())
+                first = len(tries) == 1
+            if first:
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        def handlers(process) -> KindHandlers:
+            return KindHandlers(check_fn=lambda item, *, cancel_check: None, process_fn=process, outcome_keys=KEYS)
+
+        pool = _pool((None, ""), ("a", "A"))
+        dispatcher = JobDispatcher(pool)
+        try:
+            with (
+                patch("media_preview_generator.processing.generator._notify_file_result"),
+                patch("media_preview_generator.jobs.worker._notify_file_result"),
+                patch("media_preview_generator.web.jobs.get_job_manager"),
+            ):
+                dispatcher.submit_items(
+                    "F", _items("/m/frozen.mkv"), _config(), MagicMock(), kind="intro_credits",
+                    handlers=handlers(frozen_job),
+                )  # fmt: skip
+                deadline = time.monotonic() + 5
+                while not pool.workers[0].is_busy and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert pool.workers[0].is_busy, "job F's file should hold this app's worker"
+                webhook = dispatcher.submit_items(
+                    "W", _items("/m/new-episode.mkv"), _config(), MagicMock(), kind="intro_credits",
+                    handlers=handlers(webhook_job),
+                )  # fmt: skip
+                finished = webhook.wait(timeout=8)
+        finally:
+            frozen.set()
+            dispatcher.shutdown()
+        assert finished, f"the dropped file is still waiting (tried on {tries})"
+        assert tries == ["a", "a"]
+        assert (webhook.successful, webhook.failed) == (1, 0)
+
+    def test_a_dropped_file_waiting_for_its_node_to_check_ready_says_so(self, registry):
+        registry.fresh = False
+        tries: list[str | None] = []
+        messages: list[str] = []
+
+        def process(item, **_kwargs):
+            tries.append(_node())
+            if len(tries) == 1:
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        pool = _pool(("a", "A"))
+        pool._node_hardware = NodeHardware(views={"a": registry.view("a")})
+        dispatcher = JobDispatcher(pool)
+        try:
+            with (
+                patch("media_preview_generator.processing.generator._notify_file_result"),
+                patch("media_preview_generator.jobs.worker._notify_file_result"),
+                patch("media_preview_generator.web.jobs.get_job_manager"),
+            ):
+                tracker = dispatcher.submit_items(
+                    "j1", _items("/m/x.mkv"), _config(), MagicMock(), kind="intro_credits",
+                    handlers=KindHandlers(
+                        check_fn=lambda item, *, cancel_check: None, process_fn=process, outcome_keys=KEYS
+                    ),
+                    callbacks={"progress_callback": lambda _done, _total, message, **_k: messages.append(message)},
+                )  # fmt: skip
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and messages[-1:] != ["Waiting for a node — A: checking it again"]:
+                    time.sleep(0.05)
+                assert tracker.progress_message() == "Waiting for a node — A: checking it again", messages
+                assert tries == ["a"]
+
+                registry.back("a")
+                assert tracker.wait(timeout=10)
+        finally:
+            dispatcher.shutdown()
+        assert tries == ["a", "a"]
+        assert tracker.progress_message() == "1/1 completed"
 
     def test_a_dropped_file_no_other_worker_can_run_goes_back_to_the_node_that_dropped_it(self):
         calls: list[str | None] = []

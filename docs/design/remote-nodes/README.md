@@ -251,8 +251,11 @@ retry runs (on the **node's** CPU, see §6).
   file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until a registry check begun after the drop comes back
-  ready (5 min at most), and the item's retry waits for another node or this app while one of those runs its kind
-  now (busy or not); it goes back to the same node only when none does. Health checks
+  ready (5 min at most). The item's retry takes a free worker on another node or this app first; until the node
+  checks ready again it waits for one of those while one runs its kind now (busy or not), and once the node has
+  checked ready it goes back there when none of those is free (a busy one can stay busy for hours: a long film, a
+  file its job's schedule froze). While it waits for the node, the job reads "Waiting for a node — <name>: checking
+  it again". Health checks
   read `/v1/info` with a 10 s timeout, so a node that takes connections but never answers reads offline ("accepts
   connections but doesn't answer") within a minute.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the
