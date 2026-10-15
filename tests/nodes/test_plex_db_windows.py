@@ -260,6 +260,46 @@ class TestTheWindowsEntryPoint:
         assert settings["asyncore_use_poll"] is True and settings["ident"] == "mpg-plex-db-node"
         assert settings["outbuf_overflow"] == wsgi.OUTBUF_OVERFLOW_BYTES > settings["outbuf_high_watermark"]
 
+    @pytest.mark.parametrize(
+        ("host", "shown"),
+        [("::", "[::]:9494"), ("fd42::101", "[fd42::101]:9494"), ("0.0.0.0", "0.0.0.0:9494")],
+        ids=["any-ipv6", "one-ipv6-address", "any-ipv4"],
+    )
+    @pytest.mark.parametrize("listens", [True, False], ids=["listening", "cant-listen"])
+    def test_the_address_it_logs_brackets_an_ipv6_host(self, tmp_path, monkeypatch, host, shown, listens):
+        # "http://:::9494" for --host :: is no address anyone can open or paste (the Docker node's already wasn't).
+        import waitress
+        from loguru import logger
+
+        import media_preview_generator.nodes.server.app as node_app_module
+
+        monkeypatch.delenv("CONFIG_DIR", raising=False)
+        monkeypatch.setenv("NODE_KEY", "k" * 32)
+
+        def create_server(app, **kwargs):
+            if not listens:
+                raise OSError("Address already in use")
+            return types.SimpleNamespace(run=lambda: None)
+
+        monkeypatch.setattr(waitress, "create_server", create_server)
+        monkeypatch.setattr(node_app_module, "create_node_app", lambda **kwargs: object())
+        monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
+        entry = _entry_point()
+        monkeypatch.setattr(entry, "_log_to", lambda d: os.path.join(d, "node.log"))
+        plex_dir = tmp_path / "Plex Media Server"
+        plex_dir.mkdir()
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
+        try:
+            argv = ["--config-dir", str(tmp_path / "node"), "--plex-config-dir", str(plex_dir), "--host", host]
+            code = entry.main([*argv, "--port", "9494"])
+        finally:
+            logger.remove(sink)
+        if listens:
+            assert code == 0 and f"Listening on http://{shown} ({entry.THREADS} threads)" in lines
+        else:
+            assert code == 1 and f"Couldn't listen on {shown}: Address already in use" in lines
+
     def test_a_windows_node_without_its_own_folder_writes_no_loudness(self, monkeypatch):
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
         monkeypatch.delenv("CONFIG_DIR", raising=False)

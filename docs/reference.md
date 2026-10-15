@@ -206,7 +206,7 @@ Environment variables of the node's container (the app's image started with `MOD
 | `NODE_NAME` | the hostname | The name the node reports; Add node suggests it. |
 | `NODE_ROLES` | `worker` | `worker`, `plex_db`, or both: `worker,plex_db`. |
 | `NODE_KEY` | made on first start | The key the app sends: 16 to 200 printable ASCII characters, no spaces. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
-| `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. |
+| `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. `::` listens on IPv6 only. |
 | `NODE_PORT` | `9494` | The port the node listens on inside the container; change the published port (`-p`) to match. |
 | `NODE_TEMP_DIR` | `/tmp/mpg-node` | Where a worker node makes a folder for each file it is sent. Point it at a bigger or faster disk, or at a volume in a read-only container. |
 | `FILE__<NAME>` | | Sets `<NAME>` to the contents of the file it names (a Docker secret), e.g. `FILE__NODE_KEY=/run/secrets/node_key`. |

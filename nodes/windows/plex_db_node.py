@@ -204,15 +204,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from media_preview_generator.nodes.server.app import create_node_app
-        from media_preview_generator.nodes.server.wsgi import create_node_server
+        from media_preview_generator.nodes.server.wsgi import _host_port, create_node_server
 
         app = create_node_app(config_dir=args.config_dir, roles=[ROLE_PLEX_DB])
         server = create_node_server(app, host=args.host, port=args.port, threads=THREADS, ident="mpg-plex-db-node")
-        logger.info("Listening on http://{}:{} ({} threads)", args.host, args.port, THREADS)
+        logger.info("Listening on http://{} ({} threads)", _host_port(args.host, args.port), THREADS)
         server.run()
     except OSError as exc:
         # Most often a second copy (the Run entry and a manual start): the port is already taken.
-        logger.error("Couldn't listen on {}:{}: {}", args.host, args.port, exc)
+        logger.error("Couldn't listen on {}: {}", _host_port(args.host, args.port), exc)
         return 1
     except SystemExit as exc:
         logger.error("The node refused to start: {}", exc)
