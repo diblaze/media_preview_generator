@@ -136,6 +136,11 @@ class JobTracker:
         self.node_start_failures: dict[str, int] = {}
         self.dropped_on: dict[str, str] = {}
         self.excluded_nodes: dict[str, dict[str, str]] = {}
+        # A dropped file handed back to the node that dropped it (path -> node id), and one that node dropped again
+        # while a worker elsewhere runs its kind: that drop isn't counted, and the file waits for a worker elsewhere
+        # from then on (a node that passes its idle checks but drops files under load would fail every file).
+        self.sent_back: dict[str, str] = {}
+        self.stays_off: dict[str, str] = {}
         # Why every queued file waits for workers that are away (outside their hours, offline, still connecting) while
         # nothing of the job runs, else "": the kind still has open capacity on the nodes that can't see the files, so
         # the job never parks. Set by the dispatch loop (``JobDispatcher._node_wait``), read by the banner.
@@ -1061,8 +1066,10 @@ class JobDispatcher:
     def _requeue_or_fail(self, worker: Worker, tracker: JobTracker, item, requeue: NodeRequeue) -> None:
         """Put a file a remote worker gave back at the front of its job's queue, or fail it (spec §6).
 
-        A node that dropped the file sends it back once; a second drop fails it. A start the node never took doesn't
-        count as a drop (up to ``MAX_NODE_START_FAILURES``). Either way the node gets no new file until it checks ready
+        A node that dropped the file sends it back once; a second drop fails it, except a drop on the node the file
+        was handed back to only because no worker elsewhere was free, while one runs its kind: that one isn't counted
+        and the file then waits for a worker elsewhere. A start the node never took doesn't count as a drop (up to
+        ``MAX_NODE_START_FAILURES``). Either way the node gets no new file until it checks ready
         again, and this file's retry prefers another node or this app. A node that can't see it is left out for that
         file and it goes back for another worker; once no configured worker outside the nodes that can't see it
         remains, it fails. The file goes back on the queue and ``active_processing`` drops together under
@@ -1082,7 +1089,16 @@ class JobDispatcher:
         with self._trackers_lock:
             if dropped:
                 tracker.dropped_on[path] = requeue.node_id
-            if requeue.reason == REQUEUE_NODE_UNAVAILABLE:
+            sent_back = tracker.sent_back.pop(path, None) == requeue.node_id
+            if (
+                requeue.reason == REQUEUE_NODE_UNAVAILABLE
+                and sent_back
+                and self.worker_pool.runs_kind_outside(
+                    tracker.kind, {*tracker.excluded_nodes.get(path, {}), requeue.node_id}
+                )
+            ):
+                tracker.stays_off[path] = requeue.node_id
+            elif requeue.reason == REQUEUE_NODE_UNAVAILABLE:
                 drops = tracker.node_drops.setdefault(path, [])
                 drops.append(requeue.node_name)
                 if len(drops) >= MAX_NODE_DROPS:
@@ -1241,10 +1257,12 @@ class JobDispatcher:
             if dropped_on is not None:
                 avoid = {*excluded, dropped_on}
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=avoid)
-                if worker is None and dropped_on not in back_nodes and pool.runs_kind_outside(tracker.kind, avoid):
+                back = dropped_on in back_nodes and tracker.stays_off.get(item.canonical_path) != dropped_on
+                if worker is None and not back and pool.runs_kind_outside(tracker.kind, avoid):
                     # Back on a node that hasn't answered since it dropped the file, a second drop fails it. The free
                     # worker there takes a later file instead. Once the node has checked ready, a busy worker elsewhere
-                    # isn't waited for: it can stay busy for hours (a long film, a file its job's schedule froze).
+                    # isn't waited for: it can stay busy for hours (a long film, a file its job's schedule froze),
+                    # unless the node dropped the file again when it was handed back (``stays_off``).
                     continue
             if worker is None:
                 worker = pool._find_available_worker(claim=True, kind=tracker.kind, exclude_nodes=excluded)
@@ -1252,6 +1270,10 @@ class JobDispatcher:
                 if _take_queued(tracker, index, item) is None:
                     worker.is_busy = False
                     return None
+                if dropped_on is not None and worker.node_id == dropped_on:
+                    tracker.sent_back[item.canonical_path] = dropped_on
+                else:
+                    tracker.sent_back.pop(item.canonical_path, None)
                 return worker, item
             if not excluded:
                 return None  # no free worker for this kind at all

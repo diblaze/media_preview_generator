@@ -269,8 +269,10 @@ retry runs (on the **node's** CPU, see §6).
   ready (5 min at most). The item's retry takes a free worker on another node or this app first; until the node
   checks ready again it waits for one of those while one runs its kind now (busy or not), and once the node has
   checked ready it goes back there when none of those is free (a busy one can stay busy for hours: a long film, a
-  file its job's schedule froze). While it waits for the node, the job reads "Waiting for a node — <name>: checking
-  it again". Health checks
+  file its job's schedule froze). If it drops the file again there while one of those still runs its kind, that drop
+  isn't counted and the file waits for one of those from then on: a node that passes its idle checks but drops files
+  under load would otherwise fail every file handed back to it. While it waits for the node, the job reads "Waiting
+  for a node — <name>: checking it again". Health checks
   read `/v1/info` with a 10 s timeout, so a node that takes connections but never answers reads offline ("accepts
   connections but doesn't answer") within a minute.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the

@@ -303,6 +303,61 @@ class TestNodeDrops:
         assert tries == ["a", "a"]
         assert (webhook.successful, webhook.failed) == (1, 0)
 
+    def test_a_flapping_node_a_file_was_sent_back_to_doesnt_fail_it_while_a_worker_elsewhere_runs_its_kind(
+        self, registry
+    ):
+        """A node that passes its idle checks but drops files under load: sent back to it because this app's worker
+        was busy, the file dropped there a second time and failed, though this app's worker ran it a moment later."""
+        registry.fresh = True
+        second_try = threading.Event()
+        tries: list[str | None] = []
+        lock = threading.Lock()
+
+        def frozen_job(item, **_kwargs):
+            second_try.wait(10)
+            return ItemOutcome("markers_published", "ok")
+
+        def flapping(item, **_kwargs):
+            node = _node()
+            with lock:
+                tries.append(node)
+                if len(tries) >= 2:
+                    second_try.set()
+            if node == "a":
+                raise NodeUnavailableError("a", "A", "A stopped answering")
+            return ItemOutcome("markers_published", "ok")
+
+        def handlers(process) -> KindHandlers:
+            return KindHandlers(check_fn=lambda item, *, cancel_check: None, process_fn=process, outcome_keys=KEYS)
+
+        pool = _pool((None, ""), ("a", "A"))
+        dispatcher = JobDispatcher(pool)
+        try:
+            with (
+                patch("media_preview_generator.processing.generator._notify_file_result"),
+                patch("media_preview_generator.jobs.worker._notify_file_result"),
+                patch("media_preview_generator.web.jobs.get_job_manager"),
+            ):
+                dispatcher.submit_items(
+                    "F", _items("/m/long.mkv"), _config(), MagicMock(), kind="intro_credits",
+                    handlers=handlers(frozen_job),
+                )  # fmt: skip
+                deadline = time.monotonic() + 5
+                while not pool.workers[0].is_busy and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert pool.workers[0].is_busy, "job F's file should hold this app's worker"
+                job = dispatcher.submit_items(
+                    "W", _items("/m/x.mkv"), _config(), MagicMock(), kind="intro_credits", handlers=handlers(flapping)
+                )
+                finished = job.wait(timeout=10)
+        finally:
+            second_try.set()
+            dispatcher.shutdown()
+        assert finished, f"the file is still waiting (tried on {tries})"
+        # Sent back once (b018d29c), dropped again: it waits for this app's worker instead of going back for good.
+        assert tries == ["a", "a", None]
+        assert (job.successful, job.failed) == (1, 0)
+
     def test_a_dropped_file_waiting_for_its_node_to_check_ready_says_so(self, registry):
         registry.fresh = False
         tries: list[str | None] = []
