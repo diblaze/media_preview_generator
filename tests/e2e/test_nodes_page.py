@@ -508,7 +508,6 @@ class TestAddNode:
             ("auth", "Key refused. Copy the key again from the node's log, or use the NODE_KEY you set."),
             ("unreachable", "Nothing answered at this address. Check the address and port"),
             ("protocol", "not as a node this app can use. Update the node"),
-            ("different_node", "A different node answered at this address"),
             ("request", "didn't accept the request"),
         ],
     )

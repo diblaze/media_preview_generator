@@ -54,10 +54,8 @@ AGENT_CONNECTED = "connected"
 AGENT_UNREACHABLE = "unreachable"
 AGENT_REJECTED = "rejected"
 AGENT_INCOMPATIBLE = "incompatible"
-# The app refuses to send anything (``node_refusal``): the node is turned off, another node answers at its address, or
-# the server's node record is gone.
+# The app refuses to send anything (``node_refusal``): the node is turned off, or the server's node record is gone.
 AGENT_DISABLED = "disabled"
-AGENT_DIFFERENT_NODE = "different_node"
 AGENT_NO_NODE = "no_node"
 
 
@@ -475,9 +473,9 @@ NO_NODE_REFUSAL = NodeRefusal(
 def node_refusal(settings: Any) -> NodeRefusal | None:
     """Why the server's Plex database node mustn't be used now, or None when it may.
 
-    A node turned off on the Nodes page gets nothing, and neither does an address where the health check found a
-    different node answering (two Plex database nodes that share a key and swapped addresses would otherwise each
-    write the other's Plex). The node's record and the registry are read on every call, so a job that opened the
+    A node turned off on the Nodes page gets nothing. A node that answers with the saved key at the saved address is
+    this server's node even when it reports a new id (it was reinstalled); a node beside the wrong Plex is caught by
+    the Plex machine identifier check instead. The node's record is read on every call, so a job that opened the
     database before the node was turned off is refused from its next request on.
 
     Args:
@@ -503,16 +501,6 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
             Capability.AGENT_UNAVAILABLE,
             AGENT_DISABLED,
         )
-    if node_id:
-        from ...nodes.registry import get_registry
-
-        if not get_registry().identity_ok(str(node_id)):
-            return NodeRefusal(
-                f"A different node answered at {name}'s address, so this app sends it nothing: it could be beside "
-                f"another Plex. Point {name} at its own address on the Nodes page.",
-                Capability.AGENT_UNAVAILABLE,
-                AGENT_DIFFERENT_NODE,
-            )
     return None
 
 
@@ -997,8 +985,8 @@ def plex_database(
 
     Returns:
         A ``RemotePlexDb`` when the server has a Plex database node switched on, else a ``LocalPlexDb``. A node that
-        mustn't be used (``node_refusal``: its record is gone, it is turned off, or a different node answers at its
-        address) still gets a ``RemotePlexDb``, which refuses every call: falling back to this app's own copy of the
+        mustn't be used (``node_refusal``: there is none, its record is gone, or it is turned off) still gets a
+        ``RemotePlexDb``, which refuses every call: falling back to this app's own copy of the
         folder would write a database Plex isn't reading.
     """
     if getattr(settings, "agent_enabled", False):

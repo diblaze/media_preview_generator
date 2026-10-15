@@ -2,8 +2,9 @@
 
 A node record is ``{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings", "added_at"}``. ``id`` is
 assigned here and never changes (worker group members and Plex servers point at it); ``node_uid`` is the id the node
-itself reports, recorded on first contact. The key is a secret: it leaves the app only in the node's Authorization
-header and comes back from the API as ``****``.
+itself reports, recorded on contact. A reinstalled node reports a new id, which replaces the old one: the saved key
+at the saved address is what makes it this node; the id only tells Add node that a node is already added. The key
+is a secret: it leaves the app only in the node's Authorization header and comes back from the API as ``****``.
 """
 
 from __future__ import annotations
@@ -118,7 +119,7 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
 
     Fields left out keep their stored value. ``id``, ``node_uid`` and ``added_at`` are never taken from a client
     for an existing node; a new node gets a fresh id. A new address clears ``node_uid`` (it is recorded again on
-    first contact), so re-pointing a node at another machine isn't refused as "a different node".
+    first contact).
 
     Args:
         raw: The posted fields.
@@ -152,7 +153,7 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
         return None, "enabled must be true or false"
     uid = base.get("node_uid") if existing is not None else raw.get("node_uid")
     if existing is not None and url != normalise_url(base.get("url"))[0]:
-        # A new address may be a different machine: the id is recorded again on its first answer.
+        # A new address may be another machine: its id is recorded on its first answer.
         uid = None
     return {
         "id": str(base.get("id") or "") or new_node_id(),

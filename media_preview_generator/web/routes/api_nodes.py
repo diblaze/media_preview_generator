@@ -33,9 +33,8 @@ from ..settings_manager import get_settings_manager
 from . import api
 
 LOG_LINES_MAX = 2000
-# Probe error kinds beyond the protocol's request-level ones: nothing answered, or another node than the one saved.
+# The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
-KIND_DIFFERENT_NODE = "different_node"
 KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
 
 
@@ -269,10 +268,6 @@ def probe_node():
         return jsonify(result)
     info = result["info"]
     uid = info["node"]["id"]
-    if record is not None and record.get("node_uid") and uid and uid != record["node_uid"]:
-        return jsonify(
-            _probe_error(KIND_DIFFERENT_NODE, f"A different node answered at this address than {record.get('name')}.")
-        )
     own_id = record["id"] if record else None
     twin = next((n for n in sm.nodes if uid and n.get("node_uid") == uid and n["id"] != own_id), None)
     info["already_added"] = {"id": twin["id"], "name": twin.get("name", "")} if twin else None

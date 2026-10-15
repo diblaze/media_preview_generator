@@ -553,8 +553,6 @@
                 return 'Nothing answered at this address. Check the address and port, and that the node is running.';
             case 'protocol':
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
-            case 'different_node':
-                return 'A different node answered at this address than the one added before.';
             case 'request':
                 return "The node didn't accept the request. Update the node and this app to the same version.";
             default:

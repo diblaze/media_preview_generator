@@ -252,11 +252,11 @@ class TestListAndProbe:
         assert client.post("/api/nodes/probe", json=body).status_code == 200
         assert asked == [("http://moved:9494", "typed-key")]
 
-    def test_probe_of_a_saved_node_says_when_a_different_node_answers(self, client, nodes):
+    def test_probe_of_a_saved_node_that_was_reinstalled_with_a_new_id_answers_ok(self, client, nodes):
         node_id = _add(client).get_json()["id"]
-        nodes("http://nuc:9494").info_answer = _info(uid="uid-other")
+        nodes("http://nuc:9494").info_answer = _info(uid="uid-reinstalled")
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id}).get_json()
-        assert body["ok"] is False and body["error"]["kind"] == "different_node" and "nuc" in body["error"]["message"]
+        assert body["ok"] is True and body["info"]["already_added"] is None
 
 
 class TestCreate:
@@ -417,7 +417,7 @@ class TestDelete:
                     "id": "p1",
                     "type": "plex",
                     "name": "Home",
-                    "markers": {"plex": {"agent": {"enabled": False, "node_id": node_id}}},
+                    "markers": {"plex": {"agent": {"enabled": True, "node_id": node_id}}},
                 }
             ],
         )
@@ -583,6 +583,55 @@ class TestAuth:
         monkeypatch.setattr(type(_sm()), "is_setup_complete", lambda self: False)
         fresh = client.application.test_client()
         assert fresh.get("/api/nodes", headers=auth_headers).status_code == 200
+
+
+def _plex_server(agent: dict) -> dict:
+    return {"id": "p1", "type": "plex", "name": "Home", "markers": {"plex": {"agent": agent}}}
+
+
+class TestReinstalledNode:
+    """The saved key at the saved address is what makes a node this node; a new id means it was reinstalled."""
+
+    def _plex_db_info(self, uid: str) -> dict:
+        answer = _info(uid=uid)
+        answer["node"]["roles"] = ["plex_db"]
+        del answer["worker"]
+        return answer
+
+    def test_a_recreated_plex_database_node_keeps_working_and_its_new_id_is_recorded(self, client, nodes):
+        from media_preview_generator.markers.publishers import plex_remote
+        from media_preview_generator.markers.settings import load_server
+
+        helper = nodes("http://plex-host:9494")
+        helper.info_answer = self._plex_db_info("first-container")
+        node_id = _add(client, url="http://plex-host:9494", name="Plex helper").get_json()["id"]
+        _sm().set("media_servers", [_plex_server({"enabled": True, "node_id": node_id})])
+        assert _sm().nodes[0]["node_uid"] == "first-container"
+
+        # docker pull + rm + run without a kept /config: a fresh node.json, so a new id.
+        helper.info_answer = self._plex_db_info("second-container")
+        row = client.post(f"/api/nodes/{node_id}/check").get_json()
+
+        assert row["state"] == "ready", row["reason"]
+        assert _sm().nodes[0]["node_uid"] == "second-container"
+        settings = load_server(_sm().get("media_servers")[0]["markers"], "plex")
+        assert plex_remote.node_refusal(settings) is None
+
+    def test_the_new_id_is_logged_once(self, client, nodes):
+        from loguru import logger
+
+        helper = nodes("http://nuc:9494")
+        node_id = _add(client).get_json()["id"]
+        helper.info_answer = _info(uid="uid-reinstalled")
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
+        try:
+            client.post(f"/api/nodes/{node_id}/check")
+            client.post(f"/api/nodes/{node_id}/check")
+        finally:
+            logger.remove(sink)
+        assert [line for line in lines if "new id" in line] == ["nuc reports a new id; it was probably reinstalled"]
+        assert _sm().nodes[0]["node_uid"] == "uid-reinstalled"
 
 
 class TestBadAddresses:

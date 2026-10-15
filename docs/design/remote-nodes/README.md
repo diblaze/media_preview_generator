@@ -39,6 +39,9 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
   - Test access results persist in `node_access_results.json` until that node's mappings change.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
   - v24 keeps the old helper's `url`/`token` (unused) so a rollback to an older build still works.
+  - A node that answers with the saved key at the saved address is that node even when it reports a new id
+    (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
+    node beside the wrong Plex is caught by the Plex machine identifier check.
   - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
     refuses loudness writes.
 * **Still open:**
@@ -169,8 +172,9 @@ retry runs (on the **node's** CPU, see §6).
 
 * New top-level `nodes`: `[{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings": [{"app_prefix",
   "node_prefix"}], "added_at"}]`. `id` is assigned by the app (stable; members and Plex servers reference it).
-  `node_uid` is the id the node reports, recorded on first contact; a different `node_uid` answering at the same
-  address is refused ("a different node answered at this address"). A legacy helper has no `node_uid`.
+  `node_uid` is the id the node reports, recorded on contact; a node that reports a new one (reinstalled) is
+  still that node, and the new id replaces the old. Add node and an address change refuse an address another
+  saved node has, or where an added node answers. A legacy helper has no `node_uid`.
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.
 * Plex servers: `markers.plex.agent` gains `"node_id"`. Migration v24 turns every enabled helper (`url` + `token`)
@@ -380,8 +384,8 @@ reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `
 ```
 
 Probe error kinds: `auth` (key refused), `unreachable` (no answer), `protocol` (answered, but not as a node or Plex
-helper this app can use), `request` (the node refused the request as malformed), `different_node` (with `id`: another
-node than the saved one answers there).
+helper this app can use; a node on another node protocol adds `node_version`), `request` (the node refused the
+request as malformed).
 
 `LIBRARY_ACCESS = {server, library, app_root, checked, ok, files: [{path, ok, kind, message, node_path}], nearby:
 {node_dir: [names]}, suggestion: {from, to} | null, error: str | null}`. `kind` is a `NOT_VISIBLE_*` reason (`""` when

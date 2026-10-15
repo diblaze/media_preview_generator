@@ -116,7 +116,6 @@ class _Outcome:
     version: str = ""
     roles: tuple[str, ...] = ()
     uid: str = ""
-    different_node: bool = False
 
 
 @dataclass
@@ -141,7 +140,6 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
-    different_node: bool = False
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -182,7 +180,12 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
     return agent.state, agent.version
 
 
-def _default_record_uid(node_id: str, uid: str) -> None:
+def _default_record_uid(node_id: str, uid: str, url: str) -> None:
+    """Save the id a node reported, when the record still has the address it was learnt at.
+
+    The saved key at the saved address is what makes a node this node: one that answers with a new id (recreated
+    without its ``/config``, reinstalled) is the same node, so the new id replaces the old one.
+    """
     from ..web.settings_manager import get_settings_manager
 
     sm = get_settings_manager()
@@ -190,8 +193,10 @@ def _default_record_uid(node_id: str, uid: str) -> None:
         with sm.locked():
             nodes = sm.nodes
             node = find_node(nodes, node_id)
-            if node is None or node.get("node_uid"):
+            if node is None or node.get("node_uid") == uid or node.get("url") != url:
                 return
+            if node.get("node_uid"):
+                logger.info("{} reports a new id; it was probably reinstalled", node.get("name") or node_id)
             node["node_uid"] = uid
             sm.update_nodes(nodes)
     except (OSError, ValueError) as exc:
@@ -254,7 +259,7 @@ class NodeRegistry:
         nodes_provider: Returns the stored node records.
         client_factory: Builds the client for one record.
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
-        record_uid: Persists the ``node_uid`` a node reported on first contact.
+        record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
         quick_access: Checks one file per mapping row on a node; True when every one is visible.
         app_version: This app's version (a worker node must match it exactly).
         attempt_gap_s: Seconds between the attempts of one check.
@@ -269,7 +274,7 @@ class NodeRegistry:
         nodes_provider: Callable[[], list[dict]] = _default_nodes,
         client_factory: Callable[[dict], NodeClient] = _default_client,
         legacy_ping: Callable[[str, str], tuple[str, str]] = _default_legacy_ping,
-        record_uid: Callable[[str, str], None] = _default_record_uid,
+        record_uid: Callable[[str, str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
         app_version: Callable[[], str] = _app_version,
         attempt_gap_s: float = ATTEMPT_GAP_S,
@@ -352,17 +357,6 @@ class NodeRegistry:
         with self._lock:
             live = self._nodes.get(node_id)
             return node_mappings(live.record) if live else []
-
-    def identity_ok(self, node_id: str) -> bool:
-        """False when the last check found a different node answering at this node's address.
-
-        True for a node no check has caught out (including an unknown node and an older Plex helper, which reports
-        no node id): the Plex database role refuses to send anything to an address that answers as another node.
-        """
-        self._sync()
-        with self._lock:
-            live = self._nodes.get(node_id)
-            return live is None or not live.different_node
 
     def capacity(self, node_id: str) -> NodeCapacity:
         """Whether the node's CPU / GPU members may take work now."""
@@ -635,7 +629,6 @@ class NodeRegistry:
             live.not_visible.clear()
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
-                live.different_node = False
         if old.get("path_mappings") != record.get("path_mappings"):
             # A test of other mappings says nothing about these.
             live.access_result = live.access_checked_at = None
@@ -722,8 +715,8 @@ class NodeRegistry:
                         return  # Settings changed while it ran: this answer is about an old address.
                     self._apply(live, outcome)
                     has_access_problem = bool(live.access_problem)
-                if outcome.uid and not record.get("node_uid"):
-                    self._record_uid(node_id, outcome.uid)
+                if outcome.uid and outcome.uid != record.get("node_uid"):
+                    self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -734,12 +727,7 @@ class NodeRegistry:
 
     def _apply(self, live: _Live, outcome: _Outcome) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason
-        live.different_node = outcome.different_node
-        if outcome.different_node:
-            # Something answers; it just isn't this node. Waiting longer won't change that, so no offline backoff.
-            live.offline_streak = 0
-            delay = HEALTH_INTERVAL_S
-        elif outcome.state == STATE_OFFLINE:
+        if outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
         else:
@@ -790,14 +778,6 @@ class NodeRegistry:
         uid = str(block.get("id") or "")
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
         version = str(block.get("version") or "")
-        stored_uid = str(record.get("node_uid") or "")
-        if stored_uid and uid and uid != stored_uid:
-            return _Outcome(
-                STATE_OFFLINE,
-                f"A different node answered at {name}'s address. Point {name} at its own address, or remove it and "
-                "add the new one.",
-                different_node=True,
-            )
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:

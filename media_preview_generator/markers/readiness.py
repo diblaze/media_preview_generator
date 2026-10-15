@@ -109,11 +109,6 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
         "turned off",
         "Turn it on on the Nodes page, then run Intro & Credits again: nothing is written to Plex while it is off.",
     ),
-    "different_node": (
-        "A different node answers at the Plex database node's address",
-        "different node",
-        "Point the node at its own address on the Nodes page: markers could have gone into another Plex.",
-    ),
     "no_node": (
         "This server's Plex database node isn't on the Nodes page",
         "no node",
@@ -123,7 +118,7 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
 AGENT_FALLBACK_STATE = "unreachable"
 # States where this app refused to send anything: the fix is in this app (the Nodes page, Edit → Connection), not on
 # the node's machine.
-AGENT_FIXED_IN_APP = frozenset({"disabled", "different_node", "no_node"})
+AGENT_FIXED_IN_APP = frozenset({"disabled", "no_node"})
 # Connected, and refused anyway: the agent is beside a different Plex than this server (a mistyped address).
 AGENT_WRONG_PLEX = (
     "The Plex database node is beside a different Plex",
