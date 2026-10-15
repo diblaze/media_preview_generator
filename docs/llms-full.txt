@@ -5883,9 +5883,11 @@ plain `reason`, `version`, `roles`, `legacy` (an older Plex helper), `platform`,
 | POST | `/api/nodes` | Add a node (the [`nodes`](https://mediapreviewgenerator.dev/reference/#nodes) fields). `201` with its row; `400` for an invalid field; `409` when the machine answering there is already added. |
 | PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. |
 | DELETE | `/api/nodes/{id}` | Remove it. `409` with `used_by` while a worker group member or a Plex server uses it. |
-| POST | `/api/nodes/{id}/check` | Check it now; answers with the fresh row. |
+| POST | `/api/nodes/check` | Check every turned-on node in the background; `202` at once. Each row's `checking` is `true` until its check ends. |
+| POST | `/api/nodes/{id}/check` | Check it in the background; `202` at once. Its row's `checking` is `true` until the check ends. |
 | POST | `/api/nodes/{id}/rescan-gpus` | Ask it to detect its GPUs again; answers with the fresh row. |
 | POST | `/api/nodes/{id}/test-access` | Sample every enabled library and ask the node to find each file, with its saved `path_mappings` or posted ones. |
+| GET | `/api/nodes/{id}/suggested-mappings` | Rows to pre-fill for a node with none saved: one per library folder, the same path on the node. |
 | GET | `/api/nodes/{id}/health` | Its Setup Health. |
 | GET | `/api/nodes/{id}/log` | Its last `lines` (1–2000, default 200) log lines, oldest first, as `{time, level, message}`. |
 
