@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 from loguru import logger
 
 from ..processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, CodecNotSupportedError
+from ..shutdown import is_shutting_down, request_shutdown
 from . import protocol
 from .client import (
     MAX_ARTIFACT_BYTES,
@@ -318,6 +319,7 @@ class _TaskRun:
         cancel_check: Callable[[], bool] | None,
         pause_check: Callable[[], bool] | None,
         progress_callback: Callable[[dict], None] | None,
+        start_id: str = "",
         path_swap: tuple[str, str] | None = None,
     ) -> None:
         self._registry = registry
@@ -329,6 +331,8 @@ class _TaskRun:
         self._progress_callback = progress_callback
         self._prefix = f"{placement.node_name}/{_device_label(registry, placement.node_id, gpu)} · "
         self._task_id = ""
+        # The id its start asks the node for, so a stopping app can free a task whose start is still on its way.
+        self._start_id = start_id
         self._next_log = 0
         self._last_progress: dict | None = None
         self._progress_warned = False
@@ -344,6 +348,10 @@ class _TaskRun:
         if self._cancel_seen_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
             return NodeTaskCancelledError(protocol.KIND_CANCELLED, message)
+        if is_shutting_down():
+            # The stop freed its task (cancel_running_tasks): queued again, it would start on another node, never
+            # freed. Ended as cancelled, it isn't recorded and its job is revived on the next start.
+            return NodeTaskCancelledError(protocol.KIND_CANCELLED, f"{message}; the app is stopping")
         return NodeUnavailableError(self._placement.node_id, self._placement.node_name, message, started=started)
 
     def start(self, spec: dict) -> None:
@@ -585,7 +593,7 @@ _running_lock = threading.Lock()
 
 def _free_for_stop(run: _TaskRun, read_timeout: float) -> None:
     try:
-        run._client.delete_task(run._task_id, read_timeout=read_timeout)
+        run._client.delete_task(run._task_id or run._start_id, read_timeout=read_timeout)
     except NodeError as exc:
         logger.debug("{}couldn't free the task as the app stops: {}", run._prefix, exc)
     except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
@@ -596,8 +604,11 @@ def cancel_running_tasks(budget_s: float = STOP_DELETE_BUDGET_S) -> int:
     """Free every task this app runs on a node, for an app that is stopping.
 
     Without this a task keeps running on its node until the node's unpolled-task expiry, beside the tasks the job
-    revived on the next start gives the node. Each DELETE runs on a daemon thread of its own, so a node that doesn't
-    answer holds up none of the others; one still unanswered after ``budget_s`` is left to that expiry.
+    revived on the next start gives the node. The process is marked as stopping first, under the lock
+    :func:`run_on_node` adds its tasks under: from then on no task starts on a node, and a file whose task was freed
+    isn't queued again for another node (``_TaskRun._unavailable``). A task whose start is still on its way is freed
+    by the id it asked for. Each DELETE runs on a daemon thread of its own, so a node that doesn't answer holds up none
+    of the others; one still unanswered after ``budget_s`` is left to that expiry.
 
     Args:
         budget_s: The most this waits in all.
@@ -606,6 +617,7 @@ def cancel_running_tasks(budget_s: float = STOP_DELETE_BUDGET_S) -> int:
         How many tasks it asked nodes to free.
     """
     with _running_lock:
+        request_shutdown()
         runs = list(_running)
     if not runs:
         return 0
@@ -656,7 +668,7 @@ def run_on_node(
         NodeUnavailableError: The node didn't start the task (``started`` False), stopped answering, or forgot it.
         FileNotVisibleError: The node can't see the file as the app sees it.
         CodecNotSupportedError: The node's GPU couldn't run the op (the worker reruns it on the node's CPU).
-        NodeTaskCancelledError: The job was cancelled.
+        NodeTaskCancelledError: The job was cancelled, or the app is stopping.
         NodeTaskError: The op failed on the node.
         OSError: The app can't stat ``app_path``.
         RuntimeError: No placement is set.
@@ -692,12 +704,17 @@ def run_on_node(
         cancel_check=cancel_check,
         pause_check=pause_check,
         progress_callback=progress_callback,
+        start_id=spec[protocol.CLIENT_TASK_ID_FIELD],
         path_swap=(node_path, app_path) if node_path and node_path != app_path else None,
     )
-    run.start(spec)
     with _running_lock:
+        if is_shutting_down():
+            raise NodeTaskCancelledError(
+                protocol.KIND_CANCELLED, f"Not started on {placement.node_name}: the app is stopping"
+            )
         _running.add(run)
     try:
+        run.start(spec)
         return run.finish(run.wait(), app_path, artifact_to)
     finally:
         with _running_lock:

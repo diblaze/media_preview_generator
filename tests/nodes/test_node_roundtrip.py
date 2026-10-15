@@ -271,8 +271,9 @@ class TestAppStop:
             assert WATCHED["stopped"].wait(2)
             assert took <= executor.STOP_DELETE_BUDGET_S + 0.5
             worker.join(10)
-            # Not the file's failure: the job stays running and the next start revives it.
-            assert [type(exc) for exc in ended] == [executor.NodeUnavailableError]
+            # Not queued again for another node, where nothing would free it, and not the file's failure (the app is
+            # stopping): the job stays running and the next start revives it.
+            assert [type(exc) for exc in ended] == [executor.NodeTaskCancelledError]
             assert executor.cancel_running_tasks() == 0
         finally:
             set_registry(None)

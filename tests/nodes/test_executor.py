@@ -1040,6 +1040,54 @@ class TestAppStop:
                 worker.join(5)
         assert executor.cancel_running_tasks() == 0
 
+    def test_no_task_starts_on_a_node_once_the_app_is_stopping(self, media):
+        """A file the stop gave back would start on another node, and nothing would ever free that task."""
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        _install(client)
+        assert executor.cancel_running_tasks() == 0
+
+        with pytest.raises(NodeTaskCancelledError, match="the app is stopping"):
+            _run(media)
+        assert client.named("start") == []
+
+    def test_a_task_whose_start_is_still_on_its_way_is_freed_by_the_id_it_asked_for(self, media):
+        class SlowStart(ScriptedClient):
+            """The node takes the start only once ``release`` is set; it refuses one whose id was deleted first."""
+
+            def __init__(self) -> None:
+                super().__init__([running()])
+                self.starting, self.release = threading.Event(), threading.Event()
+
+            def start_task(self, spec: dict) -> str:
+                self.started_with = spec
+                self.starting.set()
+                self.release.wait(5)
+                if spec[protocol.CLIENT_TASK_ID_FIELD] in self.deleted:
+                    raise NodeTaskDeletedError("http://n: the app deleted this task before its start arrived")
+                return super().start_task(spec)
+
+        client = SlowStart()
+        _install(client)
+        ended: list[type[BaseException]] = []
+
+        def work() -> None:
+            try:
+                _run(media)
+            except Exception as exc:  # noqa: BLE001 - the test reads how the file ended
+                ended.append(type(exc))
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        try:
+            assert client.starting.wait(5)
+            assert executor.cancel_running_tasks(budget_s=0.3) == 1
+            assert client.deleted == [client.started_with[protocol.CLIENT_TASK_ID_FIELD]]
+        finally:
+            client.release.set()
+            worker.join(5)
+        assert ended == [NodeTaskCancelledError]
+        assert client.named("poll") == []
+
 
 def _run_on(node_id: str, media: str) -> None:
     """One task on ``node_id``; how it ends doesn't matter here."""
