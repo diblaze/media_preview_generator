@@ -23,6 +23,7 @@ from ...nodes.client import (
     NodeClient,
     NodeError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
@@ -45,6 +46,8 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# The node answered, but holds this address back after too many wrong keys (``error.reason`` next to unreachable).
+PROBE_RATE_LIMITED = "rate_limited"
 # Why something that answered isn't a node (``error.reason`` next to the protocol kind).
 PROBE_THIS_APP = "this_app"
 PROBE_OTHER_APP = "other_app"
@@ -281,6 +284,8 @@ def _probe(url: str, key: str) -> dict[str, Any]:
                 "version_match": None,
             },
         }
+    except NodeRateLimitedError as exc:
+        return _probe_error(KIND_UNREACHABLE, str(exc), PROBE_RATE_LIMITED)
     except NodeError as exc:
         return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
     return {"ok": True, "info": _probe_info(info)}

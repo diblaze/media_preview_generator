@@ -664,6 +664,8 @@
                 return https
                     ? 'No answer over https in time. A node speaks http unless you put it behind an https proxy: try http:// instead.'
                     : 'No answer in time. Check the address, that the node is running, and that a firewall lets this app reach it.';
+            case 'rate_limited':
+                return 'The node is holding back requests from this address after too many wrong keys. Wait a minute and try again. If it keeps happening, something else reaching the node from the same address (or through the same proxy) is using an old key.';
             default:
                 return 'Nothing answered at this address. Check the address and port, and that the node is running.';
         }

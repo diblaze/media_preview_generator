@@ -12,6 +12,7 @@ from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.client import (
     NodeAuthError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
     NodeUnreachableError,
 )
@@ -252,6 +253,12 @@ class TestListAndProbe:
         nodes("http://nuc:9494").info_answer = NodeUnreachableError("x", reason="refused")
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
+
+    def test_probe_of_a_node_holding_this_address_back_says_so(self, client, nodes):
+        # It answered (429): Add node must not word it as "Nothing answered at this address".
+        nodes("http://nuc:9494").info_answer = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "rate_limited"
 
     def test_probe_of_this_apps_own_address_says_it_is_this_app(self, client, nodes):
         own = client.application.config["APP_INSTANCE_ID"]

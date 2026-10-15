@@ -2339,6 +2339,13 @@ docker run -d --name media-preview-node -p 9494:9494 \
 - Don't mount Plex's config folder read-only.
 - Add it once under **Settings → Nodes**, then use it both in a worker group and as your Plex's **Plex database**.
 
+### A node behind a reverse proxy
+
+The node sees every request through a proxy as coming from the proxy's address, and its limits are per address:
+after too many wrong keys it holds back everyone using that proxy for a while, and one address can only hold so many
+connections open. Route only this app to the node through the proxy, and give anything else that reaches it the right
+key.
+
 ---
 
 ## Webhook Integration

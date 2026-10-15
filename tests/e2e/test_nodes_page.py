@@ -705,8 +705,14 @@ class TestAddNode:
             ("https://nas:9494", "unreachable", "timeout", "No answer over https in time."),
             ("http://nass.lan:9494", "unreachable", "dns", "Can't find nass.lan."),
             ("http://nas:9495", "unreachable", "refused", "Nothing is listening on that port."),
+            (
+                "http://proxy.lan/node",
+                "unreachable",
+                "rate_limited",
+                "holding back requests from this address after too many wrong keys. Wait a minute",
+            ),
         ],
-        ids=["this-app", "other-app", "web-page", "https", "https-timeout", "dns", "refused"],
+        ids=["this-app", "other-app", "web-page", "https", "https-timeout", "dns", "refused", "rate-limited"],
     )
     def test_probe_errors_say_what_to_check(
         self, authed_page: Page, app_url: str, url: str, kind: str, reason: str, text: str
