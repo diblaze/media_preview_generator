@@ -109,6 +109,7 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
 | `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
+| `NODE_NAME` | The name the app shows for it (compose default `plex-database`). |
 | `NODE_ROLES` | Set to `plex_db` by the image. Leave it. |
 | `AGENT_BIND` | Host address compose publishes on (default `0.0.0.0`, all interfaces). Set it to the one LAN address the app reaches this machine on if this host has several. |
 | `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. The agent is non-root and can't write the database as anyone else. |

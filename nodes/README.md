@@ -15,8 +15,9 @@ A node has one or both roles:
 The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`](worker/docker-compose.yml).
 
 * Run the **same image tag** as the app: a worker node must be on the app's exact version.
-* Mount your media **read-only**, at any path. The app maps its paths to the node's (Settings → Nodes → path
-  mappings) and checks each file is the same one (size and modification time) before using it.
+* Mount your media **read-only**. At the same path as in the app's container, the mappings Add node fills in work
+  as they are; at any other path, set them on the node's **Media** tab. The app checks each file is the same one
+  (size and modification time) before using it.
 * Pass the GPU exactly as you would to the app: `--device /dev/dri:/dev/dri` for Intel/AMD, or
   `--gpus all` / `runtime: nvidia` with `NVIDIA_DRIVER_CAPABILITIES=all` for NVIDIA. Leave `/dev/dri` out on a machine
   without an Intel or AMD GPU: the container doesn't start without it ("error gathering device information").
@@ -30,7 +31,7 @@ The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`]
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest
@@ -39,8 +40,9 @@ docker run -d --name media-preview-node -p 9494:9494 \
 ### Updating it
 
 Update every worker node to the app's tag whenever you update the app: until then it says **Update needed** and gets
-no work. `docker compose pull && docker compose up -d` (or `docker pull` and the same `docker run` again) keeps its
-`/config`, so its id and key stay. Watchtower can update nodes too.
+no work. `docker compose pull && docker compose up -d` (or `docker pull`, then
+`docker stop media-preview-node && docker rm media-preview-node` and the same `docker run` again) keeps its `/config`,
+so its id and key stay. Watchtower can update nodes too.
 
 ## Plex database node
 

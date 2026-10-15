@@ -330,8 +330,8 @@ def _node_choice_error(node_id: str) -> str:
     # Roles are known once the node has answered; an older Plex helper only has this role.
     if view is not None and view.roles and not view.legacy and protocol.ROLE_PLEX_DB not in view.roles:
         return (
-            f"{view.name or 'That node'} doesn't have its Plex database role turned on. Turn that role on on the "
-            "node, or choose another node."
+            f"{view.name or 'That node'} doesn't have its Plex database role turned on. Start it with that role "
+            "(NODE_ROLES=worker,plex_db), or choose another node."
         )
     return ""
 

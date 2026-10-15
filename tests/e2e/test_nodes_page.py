@@ -382,6 +382,17 @@ class TestNodeList:
         expect(pc.locator(".nd-chips")).not_to_contain_text("Worker")
         expect(pc.locator(".nd-ico i")).to_have_class("bi bi-windows")
 
+    @pytest.mark.parametrize("count", [0, 4], ids=["no-nodes", "four-nodes"])
+    def test_the_header_links_the_guide_whatever_the_list_holds(
+        self, authed_page: Page, app_url: str, count: int
+    ) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes()[:count])
+        guide = authed_page.locator(".page-header").get_by_role("link", name="Nodes guide")
+        expect(guide).to_have_attribute(
+            "href", "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes"
+        )
+        expect(guide).to_have_attribute("target", "_blank")
+
     def test_empty_list_explains_nodes_and_links_the_docs(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, [])
         empty = authed_page.locator(".nd-empty")
@@ -675,6 +686,18 @@ class TestAddNode:
         assert api.bodies("POST", "/nodes")[0]["name"] == "storage"
         assert not [c for c in api.calls if c[1].endswith("/test-access")]
 
+    def test_a_container_id_for_a_name_gives_way_to_the_address(self, authed_page: Page, app_url: str) -> None:
+        # A container started without NODE_NAME reports Docker's hostname: the container id.
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        info = _probe_info()
+        info["node"]["name"] = "3f2a9c1b7d4e"
+        api.probe_answer = {"ok": True, "info": info}
+        authed_page.locator("#addNodeUrl").fill("http://gpu-box.lan:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeName")).to_have_value("gpu-box.lan")
+
     def test_version_mismatch_warns_update_needed(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)
@@ -714,12 +737,36 @@ class TestAddNode:
             ("http://nas:9494", "protocol", "this_app", "This address is this app itself, not a node."),
             ("http://nas:8080", "protocol", "other_app", "This address is another copy of this app, not a node."),
             ("http://nas:80", "protocol", "web_page", "This address answers with a web page, not a node."),
+            ("http://nas:8096", "protocol", "not_a_node", "Something else answers at this address, not a node."),
             ("https://nas:9494", "unreachable", "tls", "It doesn't answer over https."),
+            (
+                "https://nas.lan",
+                "unreachable",
+                "tls_certificate",
+                "It answers over https, but this app doesn't trust its certificate",
+            ),
             ("https://nas:9494", "unreachable", "timeout", "No answer over https in time."),
             ("http://nass.lan:9494", "unreachable", "dns", "Can't find nass.lan."),
             ("http://nas:9495", "unreachable", "refused", "Nothing is listening on that port."),
+            (
+                "http://proxy.lan/node",
+                "unreachable",
+                "rate_limited",
+                "holding back requests from this address after too many wrong keys. Wait a minute",
+            ),
         ],
-        ids=["this-app", "other-app", "web-page", "https", "https-timeout", "dns", "refused"],
+        ids=[
+            "this-app",
+            "other-app",
+            "web-page",
+            "not-a-node",
+            "https",
+            "https-certificate",
+            "https-timeout",
+            "dns",
+            "refused",
+            "rate-limited",
+        ],
     )
     def test_probe_errors_say_what_to_check(
         self, authed_page: Page, app_url: str, url: str, kind: str, reason: str, text: str

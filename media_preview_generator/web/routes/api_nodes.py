@@ -25,6 +25,7 @@ from ...nodes.client import (
     NodeClient,
     NodeError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
@@ -47,10 +48,13 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# The node answered, but holds this address back after too many wrong keys (``error.reason`` next to unreachable).
+PROBE_RATE_LIMITED = "rate_limited"
 # Why something that answered isn't a node (``error.reason`` next to the protocol kind).
 PROBE_THIS_APP = "this_app"
 PROBE_OTHER_APP = "other_app"
 PROBE_WEB_PAGE = "web_page"
+PROBE_NOT_A_NODE = "not_a_node"
 # Bounds on what a node sends that is passed on to the browser.
 NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
@@ -261,7 +265,7 @@ def _probe_info(info: dict) -> dict[str, Any]:
 
 def _probe(url: str, key: str) -> dict[str, Any]:
     """Ask an address what it is, without saving anything: ``{"ok", "info"}`` or ``{"ok": False, "error"}``."""
-    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_REJECTED
+    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_INCOMPATIBLE, AGENT_REJECTED
 
     try:
         info = _make_client(url, key).info()
@@ -284,10 +288,14 @@ def _probe(url: str, key: str) -> dict[str, Any]:
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
+        if state == AGENT_INCOMPATIBLE:
+            # A Plex database node from before /v1/info that doesn't speak this app's protocol: a version problem.
+            return _probe_error(
+                protocol.KIND_PROTOCOL, "Something answered at this address, but not as a node this app can use."
+            )
         if state != AGENT_CONNECTED:
             return _not_a_node(exc) or _probe_error(
-                protocol.KIND_PROTOCOL,
-                "Something answered at this address, but not as a node this app can use.",
+                protocol.KIND_PROTOCOL, "Something else answers at this address, not a node.", PROBE_NOT_A_NODE
             )
         return {
             "ok": True,
@@ -300,6 +308,8 @@ def _probe(url: str, key: str) -> dict[str, Any]:
                 "version_match": None,
             },
         }
+    except NodeRateLimitedError as exc:
+        return _probe_error(KIND_UNREACHABLE, str(exc), PROBE_RATE_LIMITED)
     except NodeError as exc:
         return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
     return {"ok": True, "info": _probe_info(info)}
@@ -638,7 +648,9 @@ def node_log(node_id: str):
     except NodeError as exc:
         # What refuses without a node block is an older Plex helper (as for a check); it has no log to share.
         if isinstance(exc, NodeProtocolError) and exc.node is None:
-            message = "This node is an older Plex helper and can't share its log. Update it to see its log here."
+            message = (
+                "This Plex database node is an older release and can't share its log. Update it to see its log here."
+            )
         else:
             message = f"Couldn't read {record.get('name')}'s log: {exc}"
         return jsonify({"error": message}), 502

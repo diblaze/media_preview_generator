@@ -663,13 +663,15 @@ Use the app's own image, the **same tag** as the app, started with `MODE=node`:
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest
 ```
 
-- Mount your media read-only, at any path.
+- `NODE_NAME` is the name the app shows for it.
+- Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
+  they are.
 - Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").
@@ -687,8 +689,9 @@ docker run -d --name media-preview-node -p 9494:9494 \
    then under each node's name. Hours, job types and worker counts work as for this app's devices.
 
 The node card shows its state: **Ready**, **Connecting…** (not checked yet), **Offline**, **Key refused**,
-**Update needed**, **FFmpeg missing**, **Access problem**, **GPU lost** or **Turned off**. Only a ready node gets work;
-a node that lost its GPU keeps its CPU workers. Each node also has its own **Setup Health** and **Log** tabs.
+**Update needed**, **FFmpeg missing**, **Temp folder problem**, **Access problem**, **GPU lost**, **Added twice** (the
+same machine at two addresses) or **Turned off**. Only a ready node gets work; a node that lost its GPU keeps its CPU
+workers. Each node also has its own **Setup Health** and **Log** tabs.
 
 If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
 at its mapped path runs elsewhere instead of failing.
@@ -697,8 +700,25 @@ at its mapped path runs elsewhere instead of failing.
 
 When you update this app, update every **worker node** to the same image tag: until then its card says **Update
 needed** and it gets no work. Pull the new image and recreate the container with the same settings, keeping its
-`/config` (`docker compose pull && docker compose up -d`, or `docker pull` and the same `docker run` again). Watchtower
-can update nodes too, like the app. A **Plex database node** only has to be new enough: its card says when it isn't.
+`/config`: `docker compose pull && docker compose up -d`, or `docker pull`, then
+`docker stop media-preview-node && docker rm media-preview-node` and the same `docker run` again. Watchtower can update
+nodes too, like the app.
+
+A **Plex database node** only has to be new enough: its Setup Health says when it isn't. On Linux, set its image tag
+to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
+and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays. On
+Windows, download the newest release and run its `install.ps1` again: the key stays.
+
+### Removing a node
+
+Open the node and click **Remove** on its **Settings** tab. A node that a worker group or a Plex server still uses
+can't be removed until you take it out of them. The node itself keeps running: stop and delete its container
+(`docker compose down` in its folder, or `docker rm -f media-preview-node`) and, if you won't add it again, its
+`/config` folder.
+
+A Plex database node keeps the undo record of its loudness writes in that `/config` (`loudness-writes.jsonl`; on
+Windows, in `%LOCALAPPDATA%\MediaPreviewGenerator\node`). Keep it, or [undo](plex-loudness-normalization.md#undoing-it)
+those writes first. On Windows, remove the node with its `uninstall.ps1`, which keeps the record.
 
 ### Plex on another machine
 
@@ -715,7 +735,7 @@ container:
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=plex-box -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
   -e PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server" \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/plex/config:/plex -v /path/to/node/config:/config \
@@ -726,6 +746,19 @@ docker run -d --name media-preview-node -p 9494:9494 \
 - Set `PUID`/`PGID` to the user Plex runs as: the node has to write Plex's database as that user.
 - Don't mount Plex's config folder read-only.
 - Add it once under **Settings → Nodes**, then use it both in a worker group and as your Plex's **Plex database**.
+
+### A node behind a reverse proxy
+
+The node sees every request through a proxy as coming from the proxy's address, and its limits are per address:
+after too many wrong keys it holds back everyone using that proxy for a while, and one address can only hold so many
+connections open. Route only this app to the node through the proxy, and give anything else that reaches it the right
+key.
+
+Over https with a certificate of your own (self-signed, or from your own certificate authority), this app has to
+trust it. Put a file holding the usual public authorities plus yours in the app's container (for example your
+host's `/etc/ssl/certs/ca-certificates.crt` with your certificate added at the end) and set `REQUESTS_CA_BUNDLE` to
+its path. It replaces the app's built-in list for every https connection, Plex, Emby and Jellyfin included, so keep
+the public authorities in it.
 
 ---
 

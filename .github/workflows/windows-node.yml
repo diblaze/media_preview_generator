@@ -163,7 +163,18 @@ jobs:
           }
           if (-not $ping.ok) { throw "after a logon the node doesn't take the key install.ps1 printed" }
           "ok   the key install.ps1 printed still works after the next logon"
-          ./nodes/windows/uninstall.ps1 -RemoveData
+          # A loudness undo record, which -RemoveData keeps: it is the only way to put Plex's audio tracks back.
+          $nodeDir = Join-Path $env:LOCALAPPDATA "MediaPreviewGenerator\node"
+          $undoRecord = Join-Path $nodeDir "loudness-writes.jsonl"
+          Set-Content -Path $undoRecord -Value "{}"
+          # The installed copy, as the README says: it deletes the program folder it runs from.
+          $installedUninstaller = Join-Path $env:LOCALAPPDATA "Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"
+          if (-not (Test-Path $installedUninstaller)) {
+            throw "install.ps1 didn't copy uninstall.ps1 into the program folder"
+          }
+          Push-Location (Split-Path $installedUninstaller)
+          & $installedUninstaller -RemoveData
+          Pop-Location
           if (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue) {
             throw "uninstall.ps1 left the logon entry"
           }
@@ -172,6 +183,12 @@ jobs:
             throw "uninstall.ps1 left the program folder"
           }
           "ok   uninstall.ps1 removed the entry, the process and the folder"
+          if (Test-Path (Join-Path $nodeDir "node.json")) { throw "uninstall.ps1 -RemoveData left the key" }
+          if (-not (Test-Path $undoRecord)) { throw "uninstall.ps1 -RemoveData deleted the loudness undo record" }
+          "ok   -RemoveData deleted the key and kept the loudness undo record"
+          ./nodes/windows/uninstall.ps1 -RemoveUndoRecord
+          if (Test-Path $undoRecord) { throw "uninstall.ps1 -RemoveUndoRecord left the loudness undo record" }
+          "ok   -RemoveUndoRecord deleted the loudness undo record"
       - name: Upload the build
         if: steps.ready.outputs.run == 'true'
         uses: actions/upload-artifact@v4

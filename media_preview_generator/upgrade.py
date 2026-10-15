@@ -106,7 +106,10 @@ def _v14_record_failure(sm) -> None:
 # backup; that's enough on its own.
 # -------------------------------------------------------------------------
 _USER_FACING_NOTES: dict[int, str] = {
-    24: "Your Plex helper now appears on the new Nodes page, which holds its address and key. It works as before.",
+    24: (
+        "Your Plex helper is now a Plex database node, on the new Nodes page, which holds its address and key. "
+        "It works as before."
+    ),
     23: "The Max concurrent jobs setting is gone — jobs now run as soon as a worker that handles them is free.",
     22: "Groups can now include several devices — your existing groups are unchanged.",
     21: "Your worker counts are now worker groups. Existing availability and pauses are preserved.",
@@ -1980,7 +1983,7 @@ def _migrate_to_v24(sm) -> list[str]:
             if has_address and url is None:
                 logger.warning(
                     "The Plex helper address of {} isn't a valid http(s) address, so it wasn't moved to the Nodes "
-                    "page. Add the helper there and choose it in that server's Intro & Credits settings.",
+                    "page. Add it there as a Plex database node and choose it in that server's Edit → Connection.",
                     str(entry.get("name") or "a Plex server"),
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})

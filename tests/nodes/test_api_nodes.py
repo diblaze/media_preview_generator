@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import http.server
+import re
 import threading
 import time
 from pathlib import Path
@@ -12,6 +14,7 @@ from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.client import (
     NodeAuthError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
     NodeUnreachableError,
 )
@@ -254,6 +257,12 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
 
+    def test_probe_of_a_node_holding_this_address_back_says_so(self, client, nodes):
+        # It answered (429): Add node must not word it as "Nothing answered at this address".
+        nodes("http://nuc:9494").info_answer = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "rate_limited"
+
     def test_probe_of_this_apps_own_address_says_it_is_this_app(self, client, nodes):
         own = client.application.config["APP_INSTANCE_ID"]
         nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance=own)
@@ -274,6 +283,23 @@ class TestListAndProbe:
         nodes("http://nuc:9494").info_answer = NodeProtocolError("html", web_page=True)
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["reason"] == "web_page"
+
+    def test_probe_of_something_else_that_answers_says_it_is_not_a_node(self, client, nodes, monkeypatch):
+        # An Emby or Jellyfin address: "update the node" would send the user the wrong way.
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("unreachable", ""))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"] == {
+            "kind": "protocol",
+            "message": "Something else answers at this address, not a node.",
+            "reason": "not_a_node",
+        }
+
+    def test_probe_of_a_plex_helper_on_another_protocol_stays_a_version_problem(self, client, nodes, monkeypatch):
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("incompatible", "0.3.0"))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "protocol" and "reason" not in body["error"]
 
     def test_this_apps_answers_carry_its_instance_id(self, client, nodes):
         resp = client.get("/v1/info")
@@ -356,6 +382,33 @@ class TestListAndProbe:
         assert body["ok"] is False and body["error"]["kind"] == "protocol"
         assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
         assert pinged == []
+
+
+class _NotANode(http.server.BaseHTTPRequestHandler):
+    """What Emby or Jellyfin answers at a path it doesn't have: 404 in plain text."""
+
+    def _answer(self) -> None:
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = _answer  # noqa: N815
+    do_POST = _answer  # noqa: N815
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def test_probe_of_a_media_server_address_says_it_is_not_a_node(client):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NotANode)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with client.application.app_context():
+            answer = api_nodes._probe(f"http://127.0.0.1:{server.server_address[1]}", "k" * 32)
+    finally:
+        server.shutdown()
+    assert answer["error"]["reason"] == "not_a_node"
 
 
 class TestCreate:
@@ -891,7 +944,7 @@ class TestHealthAndLog:
         resp = client.get(f"/api/nodes/{node_id}/log")
         assert resp.status_code == 502
         assert resp.get_json()["error"] == (
-            "This node is an older Plex helper and can't share its log. Update it to see its log here."
+            "This Plex database node is an older release and can't share its log. Update it to see its log here."
         )
 
 
@@ -1308,6 +1361,23 @@ class TestTheReference:
 
     REFERENCE = Path(__file__).resolve().parents[2] / "docs" / "reference.md"
 
+    def test_every_setting_a_node_reads_is_in_the_reference(self):
+        # A user moving the node's temp folder (named by its own Setup Health) must find NODE_TEMP_DIR somewhere.
+        server = Path(api_nodes.__file__).resolve().parents[2] / "nodes" / "server"
+        read = {"MODE", "FILE__"}
+        for module in ("app.py", "identity.py", "wsgi.py", "tasks.py"):
+            source = (server / module).read_text(encoding="utf-8")
+            read |= set(re.findall(r'environ(?:\.get\(|\[)"([A-Z][A-Z0-9_]*)"', source))
+        read.discard("NODE_IMAGE_ROLES")  # set by the Plex database image itself, never by a user
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        assert {"NODE_TEMP_DIR", "NODE_HOST", "NODE_NAME"} <= read
+        assert sorted(name for name in read if f"`{name}" not in text) == []
+
+    def test_the_worker_groups_snapshot_documents_its_nodes(self):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        row = next(line for line in text.splitlines() if "| GET | `/api/worker-groups` |" in line)
+        assert "`nodes`" in row
+
     def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
         text = self.REFERENCE.read_text(encoding="utf-8")
         missing = []
@@ -1325,3 +1395,24 @@ class TestTheReference:
         assert default_plex_agent() == {"enabled": False, "node_id": None}
         assert '"agent": {"enabled": false, "node_id": null}' in text and "`plex.agent.node_id`" in text
         assert "`plex.agent.url`" not in text and "`plex.agent.token`" not in text
+
+
+class TestTheGuide:
+    """The docs a user reads to understand a node card, and the pages that offer another machine's GPU."""
+
+    DOCS = Path(__file__).resolve().parents[2] / "docs"
+
+    def test_it_names_every_state_a_node_card_shows(self):
+        js = (Path(api_nodes.__file__).resolve().parents[1] / "static" / "js" / "nodes.js").read_text(encoding="utf-8")
+        block = js.split("const STATES = {", 1)[1].split("};", 1)[0]
+        labels = [label.removeprefix("✓ ") for label in re.findall(r"\w+: \['\w+', '([^']+)'\]", block)]
+        guide = (self.DOCS / "guides.md").read_text(encoding="utf-8")
+        section = guide.split("## Remote nodes", 1)[1].split("\n## ", 1)[0]
+        assert "Temp folder problem" in labels and "Added twice" in labels
+        assert [label for label in labels if f"**{label}**" not in section] == []
+
+    @pytest.mark.parametrize(
+        "page", ["multi-server.md", "faq.md", "jellyfin-trickplay-gpu.md", "plex-preview-thumbnails-slow.md"]
+    )
+    def test_every_page_offering_another_machine_links_remote_nodes(self, page):
+        assert "guides.md#remote-nodes" in (self.DOCS / page).read_text(encoding="utf-8")

@@ -79,7 +79,7 @@
 
     function oldHelperLabel(server) {
         const url = storedAgent(server).url;
-        return url ? `Through the Plex helper at ${url}` : "Through a Plex helper that isn't on the Nodes page";
+        return url ? `Through the Plex database node at ${url}` : "Through a Plex database node that isn't on the Nodes page";
     }
 
     function isPlexDbNode(node) {
@@ -296,7 +296,7 @@
     function dbChoiceLabel(value) {
         const node = (tab.plexDbNodes || []).find((n) => String(n.id) === String(value));
         if (node) return node.name || String(node.id);
-        if (value === DB_OLD_HELPER) return storedAgent(tab.server).url || 'Plex helper';
+        if (value === DB_OLD_HELPER) return storedAgent(tab.server).url || 'Plex database node';
         return String(value || '');
     }
 

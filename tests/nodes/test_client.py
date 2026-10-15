@@ -6,8 +6,11 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import shutil
 import socket
+import ssl
 import struct
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock
@@ -168,6 +171,28 @@ def serve():
         server.server_close()
 
 
+@pytest.fixture
+def self_signed_https(tmp_path):
+    """A node behind https with a self-signed certificate: ``(url, certificate file)``."""
+    if shutil.which("openssl") is None:
+        pytest.skip("needs the openssl command")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+         "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    handler = type("Handler", (_Answer,), {"status": 200, "body": b'{"ok": true}', "headers_out": {}, "seen": []})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"https://127.0.0.1:{server.server_port}", str(cert)
+    server.shutdown()
+    server.server_close()
+
+
 def _gzipped_zeros(size: int) -> bytes:
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9) as gz:
@@ -305,6 +330,23 @@ class TestWhyNothingAnswered:
             _client(requests.exceptions.SSLError("wrong version number")).info()
         assert raised.value.reason == client_mod.UNREACHABLE_TLS
         assert str(raised.value) == "http://node:9494 didn't answer over https"
+
+    def test_https_with_a_certificate_this_app_does_not_trust_says_so(self, self_signed_https):
+        # It does answer over https (a proxy with a self-signed certificate): "use http://" would be wrong.
+        url, _ = self_signed_https
+        with pytest.raises(NodeUnreachableError) as raised:
+            _local(url).health()
+        assert raised.value.reason == client_mod.UNREACHABLE_TLS_CERTIFICATE
+        assert str(raised.value) == f"{url} answered over https, but its certificate isn't trusted by this app"
+
+    def test_requests_ca_bundle_makes_this_app_trust_it(self, self_signed_https, monkeypatch):
+        # What the guide tells a user with their own certificate to do.
+        url, cert = self_signed_https
+        for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", cert)
+        assert NodeClient(NodeAddress(url, "k")).health() == {"ok": True}
 
     @pytest.mark.parametrize(
         "error", [requests.ReadTimeout("x"), requests.ConnectTimeout("x"), requests.ConnectionError("x")]

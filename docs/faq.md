@@ -40,7 +40,7 @@ Not with Plex itself: Plex documents no GPU option for this job. Media Preview G
 
 ### How do I make Jellyfin trickplay generation faster?
 
-Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, on another machine if you like, and tell Jellyfin about them. [More: Faster Jellyfin trickplay](jellyfin-trickplay-gpu.md)
+Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](guides.md#remote-nodes)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](jellyfin-trickplay-gpu.md)
 
 ### Does Emby's thumbnail extraction use the GPU?
 

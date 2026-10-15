@@ -1,8 +1,8 @@
 # A worker node: another machine lending the app its GPU (or CPU) for previews, loudness and intro/credits steps.
 #
 # It is the app's own image started with MODE=node. It only reads your media and sends results back; the app does
-# every write. Mount the media read-only, at any path you like: the app's Settings -> Nodes page maps its paths to
-# this machine's.
+# every write. Mount the media read-only. At the same path as in the app's container, the mappings Add node fills in
+# work as they are; at any other path, set them on the node's Media tab (Settings -> Nodes).
 #
 # Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
 # http://THIS_MACHINE:9494 and the key the node prints once in `docker logs` on first start (or your own NODE_KEY).
@@ -43,7 +43,7 @@ services:
       # The key the app must send. Left empty, the node makes one (printed once in `docker logs`).
       # To pick your own, put NODE_KEY=<key> in a .env file beside this one; make one with: openssl rand -hex 24
       - NODE_KEY=${NODE_KEY:-}
-      # The name the app shows for this node (default: the container's hostname).
+      # The name the app shows for this node.
       - NODE_NAME=gpu-box
       # The port the node listens on inside the container. Change the ports: mapping above to match (9500:9500).
       # - NODE_PORT=9494

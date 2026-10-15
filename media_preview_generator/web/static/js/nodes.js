@@ -658,12 +658,16 @@
                 return `Can't find ${hostOf(url) || 'that machine'}. Check the name, or use the node's IP address.`;
             case 'tls':
                 return "It doesn't answer over https. A node speaks http unless you put it behind an https proxy: use http:// instead.";
+            case 'tls_certificate':
+                return "It answers over https, but this app doesn't trust its certificate (self-signed, or from your own certificate authority). Let this app trust it with REQUESTS_CA_BUNDLE (see the guide), or use http://.";
             case 'refused':
                 return 'Nothing is listening on that port. Check the port (9494 unless you set NODE_PORT), and that the node is running.';
             case 'timeout':
                 return https
                     ? 'No answer over https in time. A node speaks http unless you put it behind an https proxy: try http:// instead.'
                     : 'No answer in time. Check the address, that the node is running, and that a firewall lets this app reach it.';
+            case 'rate_limited':
+                return 'The node is holding back requests from this address after too many wrong keys. Wait a minute and try again. If it keeps happening, something else reaching the node from the same address (or through the same proxy) is using an old key.';
             default:
                 return 'Nothing answered at this address. Check the address and port, and that the node is running.';
         }
@@ -687,6 +691,9 @@
                 }
                 if (error.reason === 'web_page') {
                     return "This address answers with a web page, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.";
+                }
+                if (error.reason === 'not_a_node') {
+                    return 'Something else answers at this address, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.';
                 }
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
             case 'request':
@@ -826,7 +833,7 @@
         }
         add.probe = r.data.info;
         const nameEl = $('#addNodeName');
-        if (!nameEl.value.trim() && add.probe.node && add.probe.node.name) nameEl.value = add.probe.node.name;
+        if (!nameEl.value.trim()) nameEl.value = suggestedName(add.probe, url);
         renderProbe(add.probe);
         setAddStep(1);
     }
@@ -840,9 +847,16 @@
         try { return new URL(url).hostname; } catch (_) { return ''; }
     }
 
+    // The node's own name (NODE_NAME), else its address's host. A container started without NODE_NAME reports its
+    // hostname, which Docker sets to the container id: hex digits nobody recognises.
+    function suggestedName(info, url) {
+        const own = ((info && info.node) || {}).name || '';
+        return own && !/^[0-9a-f]{12,64}$/.test(own) ? own : hostOf(url);
+    }
+
     async function saveNewNode() {
         const url = $('#addNodeUrl').value.trim();
-        const name = $('#addNodeName').value.trim() || ((add.probe.node || {}).name) || hostOf(url);
+        const name = $('#addNodeName').value.trim() || suggestedName(add.probe, url);
         const body = { name, url, key: $('#addNodeKey').value.trim(), path_mappings: [] };
         const btn = $('#addNodeNext');
         btn.disabled = true;

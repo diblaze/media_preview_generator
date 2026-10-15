@@ -176,6 +176,8 @@ class TestChoosingANode:
         block, err = self._save({"enabled": True, "node_id": "n1"}, {"enabled": False, "node_id": None})
         assert block is None
         assert err.startswith("Plex box doesn't have its Plex database role turned on")
+        # The fix is the setting that turns the role on, not "turn that role on on the node".
+        assert "NODE_ROLES=worker,plex_db" in err and " on on " not in err
 
     @pytest.mark.parametrize(
         ("reported", "legacy"),

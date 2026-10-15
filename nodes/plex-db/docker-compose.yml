@@ -40,6 +40,8 @@ services:
       # Plex's config folder as THIS container sees it. The node derives the database path from it and never takes
       # a path from the app.
       PLEX_CONFIG_DIR: /plex/Library/Application Support/Plex Media Server
+      # The name the app shows for this node.
+      NODE_NAME: ${NODE_NAME:-plex-database}
       NODE_PORT: ${NODE_PORT:-${AGENT_PORT:-9494}}
       TZ: ${TZ:-UTC}
     volumes:
