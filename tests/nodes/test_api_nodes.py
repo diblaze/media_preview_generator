@@ -654,6 +654,39 @@ class TestBadAddresses:
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
 
 
+class TestNodeSentValues:
+    def test_a_nan_load_keeps_the_nodes_list_valid_json(self, client, nodes):
+        import json
+
+        answer = _info()
+        answer["worker"]["cpu"].update({"load1": float("nan"), "ram_total": float("inf")})
+        answer["platform"] = {"os": "L" * 5000, "arch": float("nan")}
+        nodes("http://nuc:9494").info_answer = answer
+        node_id = _add(client).get_json()["id"]
+        client.post(f"/api/nodes/{node_id}/check")
+
+        def refuse(constant):
+            raise ValueError(f"not JSON a browser can parse: {constant}")
+
+        body = json.loads(client.get("/api/nodes").get_data(as_text=True), parse_constant=refuse)
+        row = body["nodes"][0]
+        assert (row["cpu"]["load1"], row["cpu"]["ram_total"], row["cpu"]["cores"]) == (None, None, 8)
+        assert row["platform"]["arch"] is None and len(row["platform"]["os"]) == api_nodes.NODE_TEXT_MAX
+
+    def test_a_nan_in_the_probe_answer_keeps_it_valid_json(self, client, nodes):
+        import json
+
+        answer = _info()
+        answer["worker"]["cpu"]["load1"] = float("nan")
+        nodes("http://nuc:9494").info_answer = answer
+
+        def refuse(constant):
+            raise ValueError(constant)
+
+        text = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_data(as_text=True)
+        assert json.loads(text, parse_constant=refuse)["info"]["worker"]["cpu"]["load1"] is None
+
+
 class TestRemovedDuringAGroupSave:
     def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
         """The group save checks its members against the nodes list under the settings lock, so a Remove that comes

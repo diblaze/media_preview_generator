@@ -35,6 +35,10 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# Bounds on what a node sends that is passed on to the browser.
+NODE_TEXT_MAX = 500
+NODE_LIST_MAX = 64
+NODE_DEPTH_MAX = 4
 KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
 
 
@@ -73,6 +77,34 @@ def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
     return {"groups": groups, "servers": servers}
 
 
+def _finite(value: object) -> int | float | None:
+    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _node_sent(value: object, depth: int = 0) -> Any:
+    """A JSON value a node sent, made safe to pass on to the browser.
+
+    Text is cut to :data:`NODE_TEXT_MAX` characters, lists and objects to :data:`NODE_LIST_MAX` entries and
+    :data:`NODE_DEPTH_MAX` levels; anything that isn't text, a finite number, a bool or null becomes null.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return _finite(value)
+    if isinstance(value, str):
+        return value[:NODE_TEXT_MAX]
+    if depth >= NODE_DEPTH_MAX:
+        return None
+    if isinstance(value, dict):
+        return {str(k)[:NODE_TEXT_MAX]: _node_sent(v, depth + 1) for k, v in list(value.items())[:NODE_LIST_MAX]}
+    if isinstance(value, list | tuple):
+        return [_node_sent(v, depth + 1) for v in value[:NODE_LIST_MAX]]
+    return None
+
+
 def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
     """``NODE_ROW`` for one stored node and its live details (None before the registry has it)."""
     view = details.view if details else None
@@ -87,14 +119,9 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "version": view.version if view else "",
         "roles": list(view.roles) if view else [],
         "legacy": bool(view.legacy) if view else False,
-        "platform": details.platform if details else {},
-        "gpus": [dict(g) for g in details.gpus] if details else [],
-        "cpu": {
-            "cores": cpu.get("cores"),
-            "load1": cpu.get("load1"),
-            "ram_total": cpu.get("ram_total"),
-            "ram_available": cpu.get("ram_available"),
-        },
+        "platform": _node_sent(details.platform) if details else {},
+        "gpus": [_node_sent(dict(g)) for g in details.gpus] if details else [],
+        "cpu": {key: _finite(cpu.get(key)) for key in ("cores", "load1", "ram_total", "ram_available")},
         "busy": details.busy if details else 0,
         "last_seen": view.last_seen if view else None,
         "path_mappings": list(record.get("path_mappings") or []),
@@ -146,26 +173,28 @@ def _probe_info(info: dict) -> dict[str, Any]:
     worker = info.get("worker") if isinstance(info.get("worker"), dict) else None
     gpus = [g for g in (worker or {}).get("gpus") or [] if isinstance(g, dict)]
     plex_db = info.get("plex_db")
-    return {
-        "node": {
-            "id": str(block.get("id") or "") or None,
-            "name": str(block.get("name") or ""),
-            "version": version,
-            "roles": roles,
-        },
-        "legacy": False,
-        "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
-        "worker": None
-        if worker is None
-        else {
-            "gpus": gpus,
-            "cpu": worker.get("cpu") if isinstance(worker.get("cpu"), dict) else {},
-            "temp": worker.get("temp") if isinstance(worker.get("temp"), dict) else {},
-            "notes": _credit_notes(gpus),
-        },
-        "plex_db": plex_db if isinstance(plex_db, dict) else None,
-        "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
-    }
+    return _node_sent(
+        {
+            "node": {
+                "id": str(block.get("id") or "") or None,
+                "name": str(block.get("name") or ""),
+                "version": version,
+                "roles": roles,
+            },
+            "legacy": False,
+            "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
+            "worker": None
+            if worker is None
+            else {
+                "gpus": gpus,
+                "cpu": worker.get("cpu") if isinstance(worker.get("cpu"), dict) else {},
+                "temp": worker.get("temp") if isinstance(worker.get("temp"), dict) else {},
+                "notes": _credit_notes(gpus),
+            },
+            "plex_db": plex_db if isinstance(plex_db, dict) else None,
+            "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
+        }
+    )
 
 
 def _probe(url: str, key: str) -> dict[str, Any]:
