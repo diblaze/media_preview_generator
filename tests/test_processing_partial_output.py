@@ -802,6 +802,37 @@ class TestTheRunnersFailureLines:
             "crashed" in line or "hardware acceleration" in line or "GPU" in line for line in outcome.warnings
         ), outcome.warnings
 
+    @pytest.mark.parametrize("node", [True, False], ids=["node", "app"])
+    @pytest.mark.parametrize(
+        ("rc", "stderr"),
+        [(FOLDER_FULL, "\n".join(FOLDER_FULL_STDERR)), (FOLDER_READ_ONLY, "\n".join(FOLDER_READ_ONLY_STDERR))],
+        ids=["full", "read-only"],
+    )
+    def test_a_refused_write_on_a_node_is_one_warning_for_the_file_it_hands_back(
+        self, run, tmp_path, monkeypatch, rc, stderr, node
+    ):
+        """Lab: a node whose temp folder filled up logged an ERROR and five stderr WARNING lines for a file it only
+        handed back to the queue, so a job that completed with every preview made read as having a failed file."""
+        if node:
+            monkeypatch.setenv("MODE", "node")
+            # Its setpriv lookup would run through the stand-in Popen.
+            monkeypatch.setattr(
+                "media_preview_generator.processing.ffmpeg_runner.dies_with_node", lambda args: (args, None)
+            )
+        else:
+            monkeypatch.delenv("MODE", raising=False)
+
+        outcome = self._run_real(run, tmp_path, rc, stderr)
+
+        assert isinstance(outcome.result, WorkingFolderError)
+        said = [line.split("|", 1)[0] for line in outcome.warnings if "couldn't write thumbnails" in line]
+        stderr_dumps = [line for line in outcome.warnings if "stderr lines" in line]
+        if node:
+            assert (said, stderr_dumps) == (["WARNING"], []), outcome.warnings
+            assert not any(line.startswith("ERROR|") for line in outcome.warnings), outcome.warnings
+        else:
+            assert (said, len(stderr_dumps)) == (["ERROR"], 1), outcome.warnings
+
     def test_a_251_with_a_gpu_error_blames_neither(self, run, tmp_path):
         outcome = self._run_real(run, tmp_path, IO_ERROR, HWACCEL_LINE)
 

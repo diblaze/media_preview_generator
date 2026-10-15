@@ -36,7 +36,14 @@ from typing import Any, cast
 
 from loguru import logger
 
-from ..utils import FFMPEG_LOG_PREFIX, dies_with_node, gpu_settings_hint, scratch_dir, working_folder_hint
+from ..utils import (
+    FFMPEG_LOG_PREFIX,
+    dies_with_node,
+    gpu_settings_hint,
+    is_node_mode,
+    scratch_dir,
+    working_folder_hint,
+)
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -803,11 +810,14 @@ def create_ffmpeg_runner(
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines, output_folder)
             no_decoder = exit_diagnosis == "no_decoder"
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
+            # A node hands such a file back to the queue (nodes/server/tasks.py): its temp folder is the node's state,
+            # which its card and bell say, not a failed file, so one warning and no stderr lines.
+            handed_back = refused is not None and is_node_mode()
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
                 folder, move = working_folder_hint(getattr(config, "tmp_folder", None))
                 fix = folder_write_fix(refused)
-                logger.error(
+                (logger.warning if handed_back else logger.error)(
                     "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
                     "{}, or {}. Other files in the queue will keep processing.",
                     video_file,
@@ -906,7 +916,7 @@ def create_ffmpeg_runner(
                 logger.warning("FFmpeg's last {} stderr lines about the video in {}:", len(tail), video_file)
                 for line in tail:
                     logger.warning("  {}", line)
-            elif ffmpeg_output_lines:
+            elif ffmpeg_output_lines and not handed_back:
                 tail = _without_metadata_tags(ffmpeg_output_lines)[-5:]
                 logger.warning(
                     "FFmpeg's last {} stderr lines for {} (these usually identify the cause):",
