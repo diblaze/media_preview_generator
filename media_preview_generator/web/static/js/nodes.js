@@ -1529,6 +1529,10 @@
                 else connect();
             }
         });
+        // The name is optional (the node's own is used), so typing starts at the address.
+        $('#addNodeModal').addEventListener('shown.bs.modal', () => {
+            if (!$('#addNodeStep1').classList.contains('d-none')) $('#addNodeUrl').focus();
+        });
         $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
             if (!add.node) return;

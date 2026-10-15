@@ -529,6 +529,12 @@ class TestNodeList:
 
 @pytest.mark.e2e
 class TestAddNode:
+    def test_the_dialog_opens_with_the_cursor_in_the_address(self, authed_page: Page, app_url: str) -> None:
+        """The name is optional (the node's own is used), so typing starts at the address."""
+        _open_nodes(authed_page, app_url, _four_nodes()[:1])
+        _open_add(authed_page)
+        expect(authed_page.locator("#addNodeUrl")).to_be_focused()
+
     def test_connect_save_test_access_use_suggestion_and_save(
         self, authed_page: Page, app_url: str, tmp_path: Path
     ) -> None:
