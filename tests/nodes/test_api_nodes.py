@@ -176,6 +176,15 @@ class TestListAndProbe:
         info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
         assert info["suggested_path_mappings"] == [{"app_prefix": str(movies), "node_prefix": str(movies)}]
 
+    @pytest.mark.parametrize(("node_build", "match"), [("b" * 40, False), ("a" * 7, True), ("", True)])
+    def test_probe_compares_the_build_of_the_same_version(self, client, nodes, monkeypatch, node_build, match):
+        monkeypatch.setenv("GIT_SHA", "a" * 40)
+        answer = _info()
+        answer["node"]["build"] = node_build
+        nodes("http://nuc:9494").info_answer = answer
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert info["version_match"] is match
+
     def test_probe_says_when_the_version_differs(self, client, nodes):
         nodes("http://nuc:9494").info_answer = _info(version="1.0.0")
         info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]

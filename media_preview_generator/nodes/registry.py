@@ -873,7 +873,7 @@ class NodeRegistry:
                 **outcome,
             )
         build, app_build = str(block.get("build") or ""), self._app_build()
-        if protocol.ROLE_WORKER in roles and build and app_build and build != app_build:
+        if protocol.ROLE_WORKER in roles and not protocol.same_build(build, app_build):
             return _Outcome(
                 STATE_UPDATE_NEEDED,
                 f"{name} runs another build of version {version} ({build[:7]}) than this app ({app_build[:7]}). "

@@ -204,7 +204,11 @@ def _probe_info(info: dict) -> dict[str, Any]:
                 "notes": _credit_notes(gpus),
             },
             "plex_db": plex_db if isinstance(plex_db, dict) else None,
-            "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
+            "version_match": (
+                version == _app_version() and protocol.same_build(str(block.get("build") or ""), protocol.build_sha())
+                if protocol.ROLE_WORKER in roles
+                else None
+            ),
         }
     )
 
@@ -496,6 +500,7 @@ def node_health(node_id: str):
         key=str(record.get("key") or ""),
         worker_groups=sm.get("worker_groups"),
         app_version=_app_version(),
+        app_build=protocol.build_sha(),
     )
     return jsonify(envelope)
 

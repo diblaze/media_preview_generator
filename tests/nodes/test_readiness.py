@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
@@ -288,6 +290,37 @@ def test_a_plex_database_nodes_version_row_says_new_enough_not_matching(legacy):
     row = _check(envelope, "node_version")
     assert (row["ok"], row["label"]) == (True, "The node's version is new enough")
     assert "1.0.0 or newer" in row["explanation"]
+
+
+def test_a_worker_on_another_build_of_the_same_version_shows_both_short_commits():
+    details = _details(reg.STATE_UPDATE_NEEDED, reason="runs another build")
+    details = dataclasses.replace(details, info={"node": {"build": "b" * 40}})
+    envelope = node_readiness(
+        details,
+        key="k",
+        worker_groups=[],
+        app_version="9.9.9",
+        app_build="a" * 40,
+        file_checks=lambda url, key: pytest.fail("the Plex database must not be checked"),
+    )
+    row = _check(envelope, "node_version")
+    assert (row["ok"], row["current"], row["recommended"]) == (False, "9.9.9 (bbbbbbb)", "9.9.9 (aaaaaaa)")
+
+
+def test_a_worker_on_another_version_shows_the_versions_only():
+    details = _details(reg.STATE_UPDATE_NEEDED, reason="runs 9.9.8")
+    details = dataclasses.replace(details, info={"node": {"build": "b" * 40}})
+    details = dataclasses.replace(details, view=dataclasses.replace(details.view, version="9.9.8"))
+    envelope = node_readiness(
+        details,
+        key="k",
+        worker_groups=[],
+        app_version="9.9.9",
+        app_build="a" * 40,
+        file_checks=lambda url, key: pytest.fail("the Plex database must not be checked"),
+    )
+    row = _check(envelope, "node_version")
+    assert (row["current"], row["recommended"]) == ("9.9.8", "9.9.9")
 
 
 def test_a_worker_nodes_version_row_says_it_matches():

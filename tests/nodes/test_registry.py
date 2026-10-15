@@ -210,11 +210,37 @@ class TestStates:
         assert "bbbbbbb" in view.reason and "aaaaaaa" in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node needs an update")
 
-    @pytest.mark.parametrize(("app_build", "node_build"), [("a" * 40, "a" * 40), ("", "b" * 40), ("a" * 40, "")])
+    @pytest.mark.parametrize(
+        ("app_build", "node_build"),
+        [
+            ("a" * 40, "a" * 40),
+            ("", "b" * 40),
+            ("a" * 40, ""),
+            ("abc1234" + "0" * 33, "abc1234"),
+            ("abc1234", "ABC1234" + "0" * 33),
+        ],
+        ids=["same", "app-unknown", "node-unknown", "node-short", "app-short"],
+    )
     def test_the_same_build_or_an_unknown_one_is_ready(self, h, app_build, node_build):
         h.app_build = app_build
         info = _info()
         info["node"]["build"] = node_build
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
+    def test_a_short_commit_of_another_build_needs_an_update(self, h):
+        h.app_build = "abc1234" + "0" * 33
+        info = _info()
+        info["node"]["build"] = "abc1235"
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_UPDATE_NEEDED
+
+    def test_a_plex_database_only_node_on_another_build_stays_ready(self, h):
+        h.app_build = "a" * 40
+        info = _info(roles=(ROLE_PLEX_DB,))
+        info["node"]["build"] = "b" * 40
         h.client().default_info = info
 
         assert h.registry.check_now("n1").state == reg.STATE_READY
