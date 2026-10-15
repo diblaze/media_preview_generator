@@ -345,6 +345,23 @@ class TestSettingsManagerNodes:
         assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["enabled"] is False
         sm.update_nodes([{**sm.nodes[0], "enabled": True}])  # the record is valid again: it can be switched on
 
+    @pytest.mark.parametrize("hand_written", [9494, None, "missing"])
+    def test_a_hand_written_address_that_isnt_text_is_cleared(self, tmp_path, hand_written):
+        """Read as it was, asking the node anything (its log, a Test access) failed with an error page."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        record = {**first, "url": hand_written}
+        if hand_written == "missing":
+            del record["url"]
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [record], "nodes_revision": 3}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        assert sm.nodes[0]["url"] == "" and sm.nodes_revision == 4
+        assert json.loads((tmp_path / "settings.json").read_text())["nodes"][0]["url"] == ""
+        sm.update_nodes([{**sm.nodes[0], "url": "http://nuc.lan:9494"}])  # an address can be entered again
+
     def test_a_switch_that_is_true_or_false_is_left_alone(self, tmp_path):
         import json
 

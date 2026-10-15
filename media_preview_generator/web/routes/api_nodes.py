@@ -185,6 +185,13 @@ def _not_found() -> tuple[Any, int]:
     return jsonify({"error": NODE_REMOVED}), 404
 
 
+def _no_address(record: dict) -> tuple[Any, int] | None:
+    """A 400 for a node saved with no address (written by hand), which can't be asked anything; None when it has one."""
+    if record.get("url"):
+        return None
+    return jsonify({"error": f"{record.get('name') or 'This node'} has no address. Enter it on the Nodes page."}), 400
+
+
 def _same_address(url: str, record: dict) -> bool:
     """Whether a normalised address is the one the record was saved with."""
     return url == normalise_url(record.get("url"))[0]
@@ -591,6 +598,9 @@ def test_node_access(node_id: str):
     record = find_node(sm.nodes, node_id)
     if record is None:
         return _not_found()
+    no_address = _no_address(record)
+    if no_address:
+        return no_address
     data = _json_body()
     stored = record.get("path_mappings") or []
     rows, err = normalise_mappings(data["path_mappings"]) if "path_mappings" in data else (stored, "")
@@ -653,6 +663,9 @@ def node_log(node_id: str):
     record = find_node(get_settings_manager().nodes, node_id)
     if record is None:
         return _not_found()
+    no_address = _no_address(record)
+    if no_address:
+        return no_address
     try:
         lines = max(1, min(LOG_LINES_MAX, int(request.args.get("lines", 200))))
     except ValueError:
