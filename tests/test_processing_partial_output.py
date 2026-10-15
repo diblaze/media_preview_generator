@@ -527,10 +527,8 @@ class TestAFolderThatRefusesTheThumbnails:
             ((FOLDER_FULL, 2), errno.ENOSPC),
             ((FOLDER_READ_ONLY, 0, *FOLDER_READ_ONLY_STDERR), errno.EROFS),
             ((SHELL_SIGABRT, 40, OVER_QUOTA_LINE), errno.EDQUOT),
-            ((PERMISSION_DENIED, 0, *FOLDER_PERMISSION_DENIED_STDERR), errno.EACCES),
-            ((NOT_PERMITTED, 0, *FOLDER_NOT_PERMITTED_STDERR), errno.EPERM),
         ],
-        ids=["full", "full-stderr-cut-off", "read-only", "over-quota", "no-permission", "not-permitted"],
+        ids=["full", "full-stderr-cut-off", "read-only", "over-quota"],
     )
     def test_the_error_names_the_folder_and_why(self, run, tmp_path, attempt, code):
         # A node reads errno + filename to tell its temp folder's problem from the file's (nodes/server/tasks.py).
@@ -539,6 +537,30 @@ class TestAFolderThatRefusesTheThumbnails:
         assert_refused(outcome)
         assert (outcome.result.errno, outcome.result.filename) == (code, str(tmp_path / "frames"))
         assert _diagnose_ffmpeg_exit_code(attempt[0], list(attempt[2:])) == "folder_write_error"
+
+    @pytest.mark.parametrize(
+        ("attempt", "code"),
+        [
+            ((PERMISSION_DENIED, 0, *FOLDER_PERMISSION_DENIED_STDERR), errno.EACCES),
+            ((NOT_PERMITTED, 0, *FOLDER_NOT_PERMITTED_STDERR), errno.EPERM),
+        ],
+        ids=["no-permission", "not-permitted"],
+    )
+    def test_a_permission_error_on_the_output_is_the_folders_when_the_folder_refuses_a_new_file(
+        self, run, tmp_path, attempt, code
+    ):
+        with self._refusing_new_files(tmp_path / "frames", code):
+            outcome = run([attempt], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert (outcome.result.errno, outcome.result.filename) == (code, str(tmp_path / "frames"))
+
+    def test_operation_not_permitted_on_the_output_of_a_folder_that_takes_files_is_not_the_folders(self, run):
+        # AVERROR(EPERM) is -1, FFmpeg's catch-all: an encoder's bare failure prints it on a [vost#] line.
+        failed = "[vost#0:0/mjpeg @ 0x5c8427bd0700] Task finished with error code: -1 (Operation not permitted)"
+        outcome = run([(NOT_PERMITTED, 0, failed, "Conversion failed!")] * 4, gpu="NVIDIA")
+
+        assert not isinstance(outcome.result, WorkingFolderError), outcome.result
 
     @pytest.mark.parametrize("gpu", ["NVIDIA", None], ids=["gpu", "cpu"])
     def test_a_keyframe_pass_that_fills_the_folder_is_not_retried_with_full_decode(self, run, gpu):

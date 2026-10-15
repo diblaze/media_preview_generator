@@ -784,6 +784,10 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder:
     output_lines = [line for line in _without_metadata_tags(stderr_lines) if _OUTPUT_SIDE_RE.search(line)]
     for code, texts in _FOLDER_WRITE_TEXT.items():
         if any(text in line for text in texts for line in output_lines):
+            if code == errno.EPERM and output_folder is not None:
+                # AVERROR(EPERM) is -1, FFmpeg's catch-all, so "Operation not permitted" also ends an encoder's bare
+                # failure: the folder's only when it refuses a new file now.
+                return _folder_refuses_new_files(output_folder)
             return code
     if (
         output_folder is not None
