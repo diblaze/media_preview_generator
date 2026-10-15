@@ -357,6 +357,20 @@ class TestWrongKeyLimit:
             limit.note_wrong(f"10.0.0.{n + 1}")
         assert limit.blocked_for("10.0.0.4") == 0
 
+    def test_wrong_keys_from_other_addresses_never_free_one_held_back(self, monkeypatch):
+        monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)
+        limit, now = self._limit()
+        for _ in range(3):
+            limit.note_wrong("10.0.0.66")
+        now[0] = 1.0
+        limit.note_wrong("10.0.0.67")  # owing, not held back: forgotten before any newer one
+        for n in range(20):  # an attacker cycling addresses to push 10.0.0.66 out of the table
+            now[0] = 2.0 + n * 0.01
+            limit.note_wrong(f"10.0.1.{n}")
+
+        assert limit.blocked_for("10.0.0.66") > 0
+        assert "10.0.0.67" not in limit._owed and len(limit._owed) <= 10
+
     def test_it_remembers_a_bounded_number_of_addresses(self, monkeypatch):
         monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)
         limit, _now = self._limit()

@@ -39,7 +39,8 @@ MAKE_A_KEY = "openssl rand -hex 24"
 # held back its key isn't compared at all, so the answer is 429 with Retry-After -- a wait, never "wrong key".
 WRONG_KEY_BURST = 20
 WRONG_KEY_REFILL_S = 3.0
-# Addresses remembered at most; past it, those owing nothing are forgotten, then the longest quiet.
+# Addresses remembered at most; past it, those owing nothing are forgotten, then the longest quiet of those not held
+# back. One held back is never forgotten: wrong keys from other addresses would otherwise give it its whole burst again.
 WRONG_KEY_ADDRESSES_MAX = 4096
 _WRONG_KEYS_EXTENSION = "mpg_node_wrong_keys"
 
@@ -117,9 +118,14 @@ class WrongKeyLimit:
             if held_back:
                 self._logged.add(address)
             if len(self._owed) > WRONG_KEY_ADDRESSES_MAX:
-                owing = {a: v for a, v in self._owed.items() if self._owing(a, now) > 0}
-                newest = sorted(owing.items(), key=lambda item: item[1][1])[-WRONG_KEY_ADDRESSES_MAX // 2 :]
-                self._owed = dict(newest)
+                owing = {a: self._owing(a, now) for a in self._owed}
+                held = {a: v for a, v in self._owed.items() if owing[a] > self._burst - 1}
+                room = max(0, WRONG_KEY_ADDRESSES_MAX // 2 - len(held))
+                rest = sorted(
+                    ((a, v) for a, v in self._owed.items() if 0 < owing[a] <= self._burst - 1),
+                    key=lambda item: item[1][1],
+                )
+                self._owed = {**dict(rest[-room:] if room else []), **held}
                 self._logged &= set(self._owed)
         if held_back:
             logger.warning(
