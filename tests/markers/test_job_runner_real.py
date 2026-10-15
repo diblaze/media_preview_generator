@@ -221,6 +221,31 @@ class TestRetryThroughThePipeline:
         stored = JobManager(config_dir=engine.jm.config_dir).get_job(first)
         assert (stored.progress.outcome, stored.progress.marker_sources) == ({"markers_published": 1}, decided)
 
+    def test_the_job_reads_its_files_seasons_ahead_and_stops_when_it_ends(self, engine, setup, monkeypatch):
+        registry, publishers = setup.make([("plex-1", ServerType.PLEX)])
+        made = []
+
+        class Recorded(job_runner.SeasonReadAhead):
+            def __init__(self, ctx, paths, **kwargs):
+                super().__init__(ctx, paths, **kwargs)
+                self.paths, self.closed, self.ctx = list(paths), False, ctx
+                made.append(self)
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        monkeypatch.setattr(job_runner, "SeasonReadAhead", Recorded)
+        first_patch, second_patch = self._run_pipeline(publishers)
+        with first_patch, second_patch:
+            job = triggers.create_intro_credits_job(
+                library_name="Intro & Credits · Pilot", priority=2, source="manual", file_paths=[setup.path]
+            ).id
+            job_runner.run_intro_credits_job(job)
+        assert engine.jm.get_job(job).status is JobStatus.COMPLETED
+        assert [(a.paths, a.closed, a.ctx.season_read_ahead is a) for a in made] == [([setup.path], True, True)]
+        assert made[0]._threads == []  # one season: nothing after it to list
+
     def test_a_file_the_first_run_couldnt_find_counts_in_decided_by_once_the_retry_decides_it(
         self, engine, setup, monkeypatch
     ):

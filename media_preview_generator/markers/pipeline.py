@@ -35,7 +35,7 @@ from ..servers.ownership import OwnershipMatch
 from ..servers.registry import server_config_from_dict
 from ..web.settings_manager import get_settings_manager
 from .audio.fingerprint import ChromaprintState, chromaprint_state
-from .audio.season import frame_rate_of, season_audio_spec, season_intro_chapter_limit
+from .audio.season import SeasonReadAhead, frame_rate_of, season_audio_spec, season_intro_chapter_limit
 from .carry_over import ReadNow, carry_over, is_carried_over, previous_decisions
 from .credits.detector import CPU_RECHECK_PHASE, CUT_SHORT, credits_text_spec
 from .credits.frames import gpu_failure_lines
@@ -406,6 +406,8 @@ class PipelineContext:
         monotonic: The clock the job log's step times are read from (tests use a fake one).
         seasons: What the job's episodes share of their season (``season_cache``); keeps nothing unless it was given a
             time to (``build_context``).
+        season_read_ahead: Lists the next seasons' folders into ``seasons`` ahead of the checks (``job_runner``);
+            None: each season is listed by its first episode.
     """
 
     registry: Any
@@ -430,6 +432,7 @@ class PipelineContext:
     monotonic: Callable[[], float] = time.monotonic
     decided_by: DecidedByTally = field(default_factory=DecidedByTally, repr=False)
     seasons: SeasonCache = field(default_factory=SeasonCache, repr=False)
+    season_read_ahead: SeasonReadAhead | None = field(default=None, repr=False)
     _capabilities: dict[str, tuple[float, CapabilityReport]] = field(default_factory=dict, repr=False)
     _capability_locks: dict[str, threading.Lock] = field(default_factory=dict, repr=False)
     _capability_guard: threading.Lock = field(default_factory=threading.Lock, repr=False)

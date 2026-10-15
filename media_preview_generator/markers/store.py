@@ -615,6 +615,9 @@ class MarkerStore:
     Attributes:
         data_generation: Moves on every committed write to a table a check's reads come from (``_READ_TABLES``). A
             value cached while it was at N is out of date once it isn't N.
+        season_generation: Moves with ``data_generation``, except for a write of a server's marker answer alone, which
+            nothing a job keeps of a season (``season_cache.SeasonResults``) is read from. About one done file in
+            thirty has its Plex markers read again, and each would otherwise end every season's kept reads.
     """
 
     def __init__(self, db_path: str, *, clock: Callable[[], datetime] | None = None) -> None:
@@ -630,6 +633,7 @@ class MarkerStore:
         self._lock = threading.RLock()
         self._tx_owner: int | None = None
         self.data_generation = 0
+        self.season_generation = 0
         self._local = threading.local()  # this thread's read memo and how many writes it has made
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None, timeout=30)
         self._conn.row_factory = sqlite3.Row
@@ -818,7 +822,9 @@ class MarkerStore:
         return False
 
     @contextmanager
-    def _tx(self, *, cached_reads_unchanged: bool = False) -> Iterator[sqlite3.Connection]:
+    def _tx(
+        self, *, cached_reads_unchanged: bool = False, season_reads_unchanged: bool = False
+    ) -> Iterator[sqlite3.Connection]:
         """One ``BEGIN IMMEDIATE`` transaction under the store lock; the lock is released on every path.
 
         A transaction that wrote moves this thread's write count, and ``data_generation`` when it wrote a table the
@@ -827,6 +833,8 @@ class MarkerStore:
         Args:
             cached_reads_unchanged: The caller promises its writes change nothing a cached read returns (a ``files``
                 row's ``updated_at``, which no read hands out but the carry-over's), so neither is moved.
+            season_reads_unchanged: The caller promises its writes change nothing a season's kept reads come from (a
+                server's marker answer), so ``season_generation`` stays.
 
         Raises:
             RuntimeError: Called again on the same thread while its own transaction is still open --
@@ -860,6 +868,8 @@ class MarkerStore:
                     self._local.writes = getattr(self._local, "writes", 0) + 1
                     if seen.tables & _READ_TABLES:
                         self.data_generation += 1
+                        if not season_reads_unchanged:
+                            self.season_generation += 1
 
     @contextmanager
     def read_memo(self) -> Iterator[None]:
@@ -1499,7 +1509,7 @@ class MarkerStore:
             also_replaces: Other sources whose rows and version under the same ``origin`` this answer replaces.
         """
         now = self._now()
-        with self._tx() as conn:
+        with self._tx(season_reads_unchanged={source, *also_replaces} <= SERVER_SOURCES) as conn:
             if source in SERVER_SOURCES and origin:
                 self._count_server_reread(conn, file_id, origin, has_markers=bool(candidates))
             self._write_evidence(conn, file_id, source, candidates, origin, detail, version, also_replaces, now)
@@ -1631,7 +1641,7 @@ class MarkerStore:
             origin: The lookup key.
             version: The version it now counts as.
         """
-        with self._tx() as conn:
+        with self._tx(season_reads_unchanged=source in SERVER_SOURCES) as conn:
             conn.execute(
                 "UPDATE evidence_versions SET version=? WHERE file_id=? AND source=? AND origin=?",
                 (version, file_id, source.value, origin),

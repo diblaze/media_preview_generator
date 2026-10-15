@@ -20,8 +20,11 @@ import hashlib
 import json
 import math
 import os
+import queue
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -957,14 +960,14 @@ def _member_intro_chapter_ms(ctx: PipelineContext, view: _SeasonView, path: str)
     results = view.results()
     if path in results.intro_chapter_ms:
         return results.intro_chapter_ms[path]
-    generation = ctx.store.data_generation
+    generation = ctx.store.season_generation
     try:
         rec = _member_record(ctx, path, with_frame_rate=False)
     except ProbeStalledError as exc:
         logger.debug("The season step leaves out {} for now: {}", os.path.basename(path), exc)
         return None
     length = _intro_chapter_ms(ctx, rec)
-    if ctx.store.data_generation == generation:
+    if ctx.store.season_generation == generation:
         results.intro_chapter_ms[path] = length
     return length
 
@@ -1105,9 +1108,9 @@ class _SeasonView:
         return previous, frozenset(unreadable)
 
     def results(self) -> SeasonResults:
-        """What the store said about the season's files, as long as its ``data_generation`` hasn't moved (a write by
+        """What the store said about the season's files, as long as its ``season_generation`` hasn't moved (a write by
         this run, or by any other thread, to what it was read from, ends it: the next ask starts empty)."""
-        return self._entry.results(self._ctx.store.data_generation)
+        return self._entry.results(self._ctx.store.season_generation)
 
     def group(self, path: str | None = None) -> SeasonGroup:
         """The season group of this run's episode, or of another file of its season."""
@@ -1139,8 +1142,110 @@ class _SeasonView:
 def _season_view(ctx: PipelineContext, canonical_path: str) -> _SeasonView:
     memo = ctx.run_memo(canonical_path)
     if "season" not in memo:
+        if ctx.season_read_ahead is not None:
+            ctx.season_read_ahead.reached(canonical_path)
         memo["season"] = _SeasonView(ctx, canonical_path)
     return memo["season"]
+
+
+# How many seasons ahead of the checks a job lists their folders (``SeasonReadAhead``), on how many threads: enough to
+# cover a season folder that takes half a second to list on a network disk while the checks get through several
+# seasons a second, and few enough that a slow stretch (seasons a detector runs for) wastes little when a listing made
+# ahead is older than the cache keeps it by the time its season is reached.
+READ_AHEAD_SEASONS = 4
+READ_AHEAD_THREADS = 4
+
+
+class SeasonReadAhead:
+    """Lists the next seasons' folders of a job's files while its checks are on the current one.
+
+    Every episode of a season waits for the season's folders to be listed (``_SeasonView``), which on a network disk
+    takes up to half a second, so a job's checks used to stand still at each new season. The next
+    ``READ_AHEAD_SEASONS`` seasons, in the job's order, are listed into the job's season cache ahead of time. An
+    episode then finds its season's listing there, kept as any listing is (``SeasonCache.entry``): listed again once a
+    season folder's mtime moved (a file added, removed or renamed), else used for up to ``ttl_s``. What the season
+    folders' mtimes can't show (a sibling overwritten in place, a new folder of the season on another disk) can so be
+    up to ``ttl_s`` old for the season's first episode too, as it already was for the later ones: the same as if the
+    check had run that much earlier, and the season's signature makes the answer due again once it is read. Only
+    folders are listed; nothing is read from or written to the store.
+
+    The threads are daemons, as the checking threads are: one stuck on a hung network disk doesn't hold up the app's
+    exit. Nothing here can fail a check: a read-ahead that can't start stops, and each season is then listed by its
+    first episode, as before.
+    """
+
+    def __init__(
+        self,
+        ctx: PipelineContext,
+        paths: Iterable[str],
+        *,
+        scope: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> None:
+        """Create the read-ahead for a job.
+
+        Args:
+            ctx: The job's context, whose season cache the listings go to.
+            paths: The job's files, in the order its checks take them.
+            scope: Entered around each listing (the job runner's ties the thread to the job's log for that time).
+        """
+        self._ctx = ctx
+        self._scope = scope
+        firsts: dict[str, str] = {}
+        for path in paths:
+            firsts.setdefault(os.path.dirname(path), path)
+        self._order = list(firsts.values())
+        self._index = {os.path.dirname(path): i for i, path in enumerate(self._order)}
+        self._listed_up_to = 0
+        self._lock = threading.Lock()
+        self._closed = False
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._threads: list[threading.Thread] = []
+
+    def reached(self, canonical_path: str) -> None:
+        """A check reached this file's season: list the seasons after it not asked for yet. Never raises.
+
+        Args:
+            canonical_path: The file being checked.
+        """
+        index = self._index.get(os.path.dirname(canonical_path))
+        if index is None:
+            return
+        with self._lock:
+            start = max(self._listed_up_to, index + 1)
+            end = min(index + 1 + READ_AHEAD_SEASONS, len(self._order))
+            if self._closed or start >= end:
+                return
+            self._listed_up_to = end
+            try:
+                for path in self._order[start:end]:
+                    self._queue.put(path)
+                while len(self._threads) < READ_AHEAD_THREADS:
+                    thread = threading.Thread(target=self._run, name="season-read-ahead", daemon=True)
+                    thread.start()
+                    self._threads.append(thread)
+            except Exception as exc:  # no thread to be had (the container's limit): the checks list as before
+                self._closed = True
+                logger.debug("Season read-ahead stopped: {}", exc)
+
+    def _run(self) -> None:
+        while True:
+            path = self._queue.get()
+            try:
+                if path is None or self._closed or is_shutting_down():
+                    return
+                with self._scope():
+                    _SeasonView(self._ctx, path)
+            except Exception as exc:  # the season's first episode lists it itself, as before
+                logger.debug("Reading ahead couldn't list the season of {}: {}", os.path.basename(str(path)), exc)
+            finally:
+                self._queue.task_done()
+
+    def close(self) -> None:
+        """Stop listing: what is queued is dropped, a listing under way finishes on its own."""
+        with self._lock:
+            self._closed = True
+            for _ in self._threads:
+                self._queue.put(None)
 
 
 def season_audio_due(rec: FileRecord, ctx: PipelineContext) -> bool:

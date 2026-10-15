@@ -15,8 +15,9 @@ Three kinds of facts are kept:
   sibling's own check does the same when its turn comes. An episode checked just before its sibling was overwritten
   could see the old sibling before this cache existed too (the order of two checks was always a race).
 * What ``markers.db`` says about the season's files (their signature items, signatures and intro-chapter lengths).
-  Valid only while ``MarkerStore.data_generation`` is the value it was read at: any write to the tables they come from,
-  by any thread, ends them before the next read.
+  Valid only while ``MarkerStore.season_generation`` is the value it was read at: any write to the tables they come
+  from, by any thread, ends them before the next read (a server's marker answer, which none of them is read from,
+  doesn't).
 * What the folders a season's show is looked for in say (a TV library's folders, holding thousands of shows, read for
   every season of the job): :meth:`SeasonCache.listing`. A listing is reused while the folder's device, inode and
   mtime are the ones stat'd before it was read (a show added, removed or renamed moves the mtime; a remount moves the
@@ -60,7 +61,7 @@ def _folder_mtime_ns(folder: str) -> int | None:
 
 
 class SeasonResults:
-    """What ``markers.db`` said about a season's files while ``MarkerStore.data_generation`` was ``generation``."""
+    """What ``markers.db`` said about a season's files while ``MarkerStore.season_generation`` was ``generation``."""
 
     def __init__(self, generation: int) -> None:
         self.generation = generation
