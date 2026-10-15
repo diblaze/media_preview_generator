@@ -1243,7 +1243,7 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
         assert h.registry.plex_db_hold("n1") is None
         assert h.client().info_calls == 1
 
-    def test_after_a_check_found_it_down_its_work_waits_and_a_check_starts_at_once(self, h):
+    def test_after_a_check_found_it_down_its_work_waits_and_its_next_check_comes_sooner(self, h):
         client = h.client()
         client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
         client.default_info = self._answer("uid-2")
@@ -1257,7 +1257,23 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
             "lost.",
             waits=True,
         )
+        assert h.registry._nodes["n1"].next_check == h.clock.now + reg.WAITING_RECHECK_S
+        h.clock.now += reg.WAITING_RECHECK_S
+        h.registry.plex_db_hold("n1")
         assert _wait_for(lambda: "reports a new id" in h.registry.plex_db_refusal("n1"))
+
+    def test_work_asked_for_while_it_is_down_keeps_its_check_back_off(self, h):
+        # Each request for Plex database work started a check of a node that was down: 8 s checks back to back.
+        client = h.client()
+        client.default_info = NodeUnreachableError("down")
+        h.registry.check_now("n1")
+        live = h.registry._nodes["n1"]
+
+        for _ in range(3):
+            assert h.registry.plex_db_hold("n1").waits
+            assert _wait_for(lambda: not live.checking)
+
+        assert client.info_calls == reg.CHECK_ATTEMPTS
 
     def test_a_node_heard_with_its_saved_id_that_goes_down_is_held_again(self, h):
         client = h.client()

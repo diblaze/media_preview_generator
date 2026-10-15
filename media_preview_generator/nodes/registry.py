@@ -607,8 +607,9 @@ class NodeRegistry:
 
         Either is known only from a check that reached the node, so until one has since this app started (or since
         the node last didn't answer, or got another address) a node with a saved id gets nothing either: its work
-        waits, and a check starts now. The node's first check is waited for, up to :data:`FIRST_CHECK_WAIT_S`, so
-        work asked for just after a restart isn't held back by a check that is about to answer.
+        waits, and a check starts now (within :data:`WAITING_RECHECK_S` of one that found it down). The node's first
+        check is waited for, up to :data:`FIRST_CHECK_WAIT_S`, so work asked for just after a restart isn't held back
+        by a check that is about to answer.
         """
         self._sync()
         deadline = time.monotonic() + FIRST_CHECK_WAIT_S
@@ -639,8 +640,14 @@ class NodeRegistry:
                         )
                     return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
                 if not live.checking and not waited and live.record.get("enabled", True):
-                    live.checking = True
-                    self._submit(self._run_check, node_id, False, True)
+                    now = self._clock()
+                    if live.next_check <= now:
+                        live.checking = True
+                        self._submit(self._run_check, node_id, False, True)
+                    else:
+                        # One that didn't answer keeps its back-off (a check per request ran them back to back),
+                        # brought forward as for a job waiting on it.
+                        live.next_check = min(live.next_check, now + WAITING_RECHECK_S)
                 left = deadline - time.monotonic()
                 if not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
                     return PlexDbHold(
@@ -1016,6 +1023,7 @@ class NodeRegistry:
         if address_changed or restored_uid or (record.get("enabled", True) and not old.get("enabled", True)):
             # Whoever answers there now (or the id a restored settings file names) is still to be checked.
             live.heard_uid = None
+            live.next_check = 0.0
         if address_changed:
             live.client = self._client_factory(record)
         if reconnect:
