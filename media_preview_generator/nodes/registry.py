@@ -326,7 +326,8 @@ def _count(raw: object) -> int:
 
 
 def _bounded(value: object, depth: int = 0) -> Any:
-    """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
+    """A JSON value a node sent, cut to the ``INFO_*`` bounds, each text one line; a number that isn't finite becomes
+    null.
 
     JSON's ``1e400`` parses to infinity, which ``int()`` refuses, a 400-digit whole number is too big for a float, and a
     deeply nested answer breaks ``deepcopy``.
@@ -334,7 +335,7 @@ def _bounded(value: object, depth: int = 0) -> Any:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value[:INFO_TEXT_MAX]
+        return protocol.relayed_text(value, INFO_TEXT_MAX)
     if isinstance(value, int | float):
         try:
             return value if math.isfinite(value) else None

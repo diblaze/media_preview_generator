@@ -270,7 +270,7 @@ class NodeClient:
         raw_error = body.get("error")
         error: dict = raw_error if isinstance(raw_error, dict) else {}
         kind = error.get("kind")
-        message = str(error.get("message") or kind or f"HTTP {response.status_code}")
+        message = protocol.relayed_text(str(error.get("message") or kind or f"HTTP {response.status_code}"))
         if response.status_code == 404 and kind == protocol.KIND_UNKNOWN_TASK:
             raise NodeUnknownTaskError(message)
         if response.status_code == 404:
