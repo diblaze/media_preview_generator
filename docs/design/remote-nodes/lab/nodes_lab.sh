@@ -6,7 +6,7 @@
 #   nodes_lab.sh build <tag>   build the app + plex-db images from this checkout
 #   nodes_lab.sh up <tag>      start mlab-plex, the app (config copied from mlab-app-remote's) and the nodes
 #   nodes_lab.sh down          stop and remove the lab-nodes containers and their own mlab_nodes_* volumes (never
-#                              another mlab_* volume)
+#                              another mlab_* volume); mlab-plex and mlab-plex-agent stay up, other sessions use them
 #
 # The app's config is a COPY of mlab_app_remote_config, so the v24 migration runs on a real lab settings file and
 # its Plex helper (mlab-plex-agent) turns into a legacy Plex database node. The app writes BIFs into mlab-plex's own
@@ -76,7 +76,6 @@ case "$cmd" in
   down)
     docker rm -f "$APP" "$GPU_NODE" "$CPU_NODE" "$DB_NODE" 2>/dev/null || true
     docker volume rm "$APP_VOL" "${NODE_VOLS[@]}" 2>/dev/null || true
-    docker stop mlab-plex mlab-plex-agent >/dev/null 2>&1 || true
     ;;
   *) echo "usage: $0 build|up|down [tag]"; exit 2 ;;
 esac
