@@ -155,3 +155,76 @@ def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it()
         assert b" 413 " in status, status
     finally:
         server.close()
+
+
+@pytest.fixture
+def served(monkeypatch):
+    """A node server in this process for a tiny app; yields its port and lets a test shrink its limits first."""
+    import threading
+
+    from media_preview_generator.nodes.server import wsgi
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    servers = []
+
+    def start(**limits):
+        for name, value in limits.items():
+            monkeypatch.setattr(wsgi, name, value, raising=False)
+        server = wsgi.create_node_server(app, host="127.0.0.1", port=0, threads=2)
+        threading.Thread(target=server.run, daemon=True).start()
+        servers.append(server)
+        return server.effective_port
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _half_sent(port: int, source: str) -> socket.socket:
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0))
+    conn.sendall(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n")
+    return conn
+
+
+def _health_from(port: int, source: str) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0)) as conn:
+        conn.sendall(b"GET /v1/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        return conn.recv(64).split(b"\r\n")[0]
+
+
+def test_one_address_cant_hold_every_connection_the_node_takes(served):
+    port = served(CONNECTION_LIMIT=20, CONNECTIONS_PER_ADDRESS=5)
+    # 127.0.0.2 is another address on the loopback: the flood comes from it, the app's check from 127.0.0.1.
+    held = [_half_sent(port, "127.0.0.2") for _ in range(25)]
+    try:
+        time.sleep(0.5)
+        start = time.monotonic()
+        assert b" 200 " in _health_from(port, "127.0.0.1")
+        assert time.monotonic() - start < 2
+    finally:
+        for conn in held:
+            conn.close()
+
+
+def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):
+    port = served(REQUEST_READ_S=1)
+    started = time.monotonic()
+    conn = _half_sent(port, "127.0.0.1")
+    conn.settimeout(0.3)
+    try:
+        # Never quiet for long, so the channel timeout (inactivity only) would keep it open for good.
+        while time.monotonic() - started < 10:
+            try:
+                conn.sendall(b"X-a: b\r\n")
+                if conn.recv(1) == b"":
+                    break
+            except TimeoutError:
+                continue  # nothing to read: still open
+            except OSError:
+                break
+    finally:
+        conn.close()
+    assert time.monotonic() - started < 5

@@ -229,9 +229,9 @@ class TestTheWindowsEntryPoint:
             seen["server_settings"] = kwargs
             return Server()
 
-        waitress = types.ModuleType("waitress")
-        waitress.create_server = create_server
-        monkeypatch.setitem(sys.modules, "waitress", waitress)
+        import waitress
+
+        monkeypatch.setattr(waitress, "create_server", create_server)
         monkeypatch.setattr(node_app_module, "create_node_app", create_node_app)
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
         entry = _entry_point()
