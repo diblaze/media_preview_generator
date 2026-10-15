@@ -2018,6 +2018,9 @@ def _process_canonical_path_previews(
     cache_hit: bool = False
     cleanup_path: str | None = None
     generation_lock = None
+    # The extraction empties the cache slot first. Until its frames are stored again, an entry left from before (a
+    # regenerate skips the lookup) describes frames that are gone, so a run that stops short drops it.
+    slot_emptied = False
 
     # Acquire the per-path lock first (when caching is on) so the
     # subsequent cache.get / frame_dir_for / os.makedirs can't raise
@@ -2129,6 +2132,7 @@ def _process_canonical_path_previews(
             )
             # A remote worker's frames come from its node; everything around them stays here.
             extract = remote_ops.generate_images if executor.current_placement() else generate_images
+            slot_emptied = use_frame_cache
             try:
                 gen_result = extract(
                     canonical_path,
@@ -2245,6 +2249,7 @@ def _process_canonical_path_previews(
                 extraction_key=extraction_key,
                 source_fingerprint=source_fingerprint,
             )
+            slot_emptied = False
 
         # ``width``/``height`` are documentation-only on BifBundle —
         # adapters that need real frame dimensions (Jellyfin tile-grid)
@@ -2423,6 +2428,8 @@ def _process_canonical_path_previews(
         # entries persist for TTL so subsequent webhooks hit them.
         if cleanup_path is not None:
             _cleanup_temp_directory(cleanup_path)
+        if slot_emptied:
+            cache.invalidate(canonical_path)
         # Release the generation lock so waiting concurrent dispatchers
         # for the same canonical path can wake up and hit the now-
         # populated cache.

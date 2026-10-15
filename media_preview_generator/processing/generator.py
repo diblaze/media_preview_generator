@@ -2481,6 +2481,7 @@ def generate_bif(
 
     Raises:
         PermissionError: If permission denied accessing files or directories
+        ValueError: ``images_path`` holds no thumbnails; nothing is written and the old BIF is kept.
 
     """
     magic = [0x89, 0x42, 0x49, 0x46, 0x0D, 0x0A, 0x1A, 0x0A]
@@ -2498,6 +2499,9 @@ def generate_bif(
         )
         raise
     images.sort()
+    if not images:
+        # A preview with no thumbnails is worse than the old one: Plex and Emby take it as done.
+        raise ValueError(f"no thumbnails in {images_path} to write a preview from")
 
     # Written beside the target and renamed over it once complete, so a crash or error part-way never leaves a
     # short BIF where Plex/Emby read it.

@@ -156,15 +156,12 @@ class TestBIFGeneration:
             assert test_data in content
 
     def test_generate_bif_empty_directory(self, temp_dir, mock_config):
-        """Test BIF generation with no thumbnails."""
+        """No thumbnails, no BIF: Plex and Emby would take an empty one as a finished preview."""
         bif_path = os.path.join(temp_dir, "empty.bif")
-        generate_bif(bif_path, temp_dir, mock_config)
+        with pytest.raises(ValueError, match="no thumbnails"):
+            generate_bif(bif_path, temp_dir, mock_config)
 
-        # Should create BIF with 0 images
-        with open(bif_path, "rb") as f:
-            f.seek(12)  # Skip magic + version
-            image_count = struct.unpack("<I", f.read(4))[0]
-            assert image_count == 0
+        assert not os.path.exists(bif_path)
 
     def test_generate_bif_frame_interval(self, temp_dir, mock_config):
         """Test that frame interval is correctly converted to milliseconds."""
