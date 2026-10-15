@@ -1336,9 +1336,9 @@ class WorkerPool:
         True while nothing at all is configured for the kind (the item waits, as any item does); False when every
         configured slot for it that can come back is on an excluded node. Busy slots, members outside their hours and
         members on a node that is offline right now count: they come back, so the item waits for them instead of
-        failing. Members on a node turned off on the Nodes page or no longer configured, and this app's members on a
-        GPU it hasn't detected, don't count: nothing brings them back without a settings or hardware change, so an
-        item waiting for them would never finish.
+        failing. Members whose node needs someone to act (``NodeHardware.member_can_come_back``: turned off, removed,
+        needing an update, refusing the key, an access problem, no worker role, or not listing the member's GPU) and
+        this app's members on a GPU it hasn't detected don't count: an item waiting for them would never finish.
 
         Args:
             kind: The job kind.
@@ -1369,13 +1369,39 @@ class WorkerPool:
                     policy.get("node")
                     for policy in configured
                     if (
-                        self._node_hardware.node_can_come_back(policy["node"])
+                        self._node_hardware.member_can_come_back(policy)
                         if policy.get("node")
                         else member_detected(policy, devices, self._node_hardware)
                     )
                 ]
                 return any(node is None or node not in exclude_nodes for node in nodes)
             return not nodes or any(node is None or node not in exclude_nodes for node in nodes)
+
+    def stuck_node_members(self, kind: str, exclude_nodes: Collection[str]) -> list[str]:
+        """``"<node> (<reason>)"`` for each node that has members for ``kind`` it won't give work until someone acts.
+
+        What :meth:`can_run_outside` leaves out on nodes outside ``exclude_nodes``, so a file failed for want of
+        anywhere else to run can say why those didn't count.
+
+        Args:
+            kind: The job kind.
+            exclude_nodes: Node ids that can't run the item.
+        """
+        from ..worker_groups import supports_job
+
+        with self._workers_lock:
+            hardware = self._node_hardware
+            stuck = [
+                f"{hardware.node_name(policy['node'])} ({hardware.member(policy).reason})"
+                for policy in (self._policies or {}).values()
+                if policy.get("node")
+                and policy["node"] not in exclude_nodes
+                and policy.get("enabled", True)
+                and policy.get("count", 0) > 0
+                and supports_job(policy, kind)
+                and not hardware.member_can_come_back(policy)
+            ]
+        return list(dict.fromkeys(stuck))
 
     def has_capacity_for(self, kind: str) -> bool:
         """Whether configured slots can run this kind now, even when all are busy."""

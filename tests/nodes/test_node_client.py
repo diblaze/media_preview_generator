@@ -31,8 +31,10 @@ def test_requests_from_two_threads_go_through_two_sessions(monkeypatch):
 
     def request(self, method, url, **kwargs):
         used.append(id(self))
-        response = MagicMock(status_code=200, content=b"{}")
-        response.json.return_value = {"ok": True}
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"ok": true}'
+        response._content_consumed = True
         return response
 
     monkeypatch.setattr(requests.Session, "request", request)

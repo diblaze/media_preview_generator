@@ -21,9 +21,14 @@ from media_preview_generator.nodes.executor import (
     current_placement,
 )
 from media_preview_generator.nodes.registry import (
+    STATE_ACCESS_PROBLEM,
+    STATE_CONNECTING,
     STATE_DISABLED,
+    STATE_GPU_LOST,
+    STATE_KEY_REFUSED,
     STATE_OFFLINE,
     STATE_READY,
+    STATE_UPDATE_NEEDED,
     NodeCapacity,
     NodeRegistry,
     NodeView,
@@ -217,12 +222,15 @@ class TestPoolExcludesNodes:
 
 
 class _Registry(NodeRegistry):
-    """One view per node: its state and when the registry last heard from it."""
+    """One view per node: its state and when the registry last heard from it. Ready nodes give full capacity and
+    others none, unless :attr:`capacities` says otherwise; :attr:`gpus` lists a node's GPUs."""
 
     revision = 0  # shadows the real registry's property
 
     def __init__(self) -> None:
         self.states: dict[str, tuple[str, float | None]] = {}
+        self.capacities: dict[str, NodeCapacity] = {}
+        self.gpus: dict[str, tuple[dict, ...]] = {}
         self._clock = itertools.count(1)
 
     def set(self, node_id: str, state: str, *, seen_now: bool) -> None:
@@ -233,9 +241,12 @@ class _Registry(NodeRegistry):
         if node_id not in self.states:
             return None
         state, seen = self.states[node_id]
-        return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), (), 4, False, seen)
+        gpus = self.gpus.get(node_id, ())
+        return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), gpus, 4, False, seen)
 
     def capacity(self, node_id: str) -> NodeCapacity:
+        if node_id in self.capacities:
+            return self.capacities[node_id]
         ready = self.states.get(node_id, (STATE_OFFLINE, None))[0] == STATE_READY
         return NodeCapacity(ready, ready, "" if ready else "node offline")
 
@@ -273,6 +284,21 @@ class TestCanRunOutsideWithGroups:
         fake.set("a", STATE_READY, seen_now=True)
         fake.set("b", STATE_OFFLINE, seen_now=False)
         fake.set("off", STATE_DISABLED, seen_now=False)
+        for node_id, state in (
+            ("connecting", STATE_CONNECTING),
+            ("update", STATE_UPDATE_NEEDED),
+            ("key", STATE_KEY_REFUSED),
+            ("access", STATE_ACCESS_PROBLEM),
+        ):
+            fake.set(node_id, state, seen_now=False)
+        fake.capacities["update"] = NodeCapacity(False, False, "node needs an update")
+        # Ready, but it lists no GPU, or answers as a Plex database node only.
+        fake.set("no-gpu", STATE_READY, seen_now=True)
+        fake.set("db-only", STATE_READY, seen_now=True)
+        fake.capacities["db-only"] = NodeCapacity(False, False, "node doesn't run workers")
+        # Lost its GPU: the registry rechecks it on its own, and its CPU keeps working.
+        fake.set("gpu-lost", STATE_GPU_LOST, seen_now=True)
+        fake.capacities["gpu-lost"] = NodeCapacity(True, False, "lost its GPU")
         set_registry(fake)
         yield fake
         set_registry(None)
@@ -299,6 +325,13 @@ class TestCanRunOutsideWithGroups:
             (_group("removed-node", node="gone"), False),
             (_group("local-gpu", device="/dev/dri/renderD129"), False),
             (_group("local-gpu", device=DEVICE), True),
+            (_group("node-connecting", node="connecting"), True),
+            (_group("node-gpu-lost", node="gpu-lost", device=DEVICE), True),
+            (_group("node-update-needed", node="update"), False),
+            (_group("node-key-refused", node="key"), False),
+            (_group("node-access-problem", node="access"), False),
+            (_group("ready-node-without-the-gpu", node="no-gpu", device=DEVICE), False),
+            (_group("ready-node-without-the-worker-role", node="db-only"), False),
         ],
         ids=[
             "this-app-off-hours",
@@ -313,6 +346,13 @@ class TestCanRunOutsideWithGroups:
             "removed-node",
             "this-app-gpu-missing",
             "this-app-gpu-detected",
+            "connecting-node",
+            "node-rechecking-a-lost-gpu",
+            "node-needs-an-update",
+            "node-key-refused",
+            "node-access-problem",
+            "ready-node-without-the-gpu",
+            "ready-node-without-the-worker-role",
         ],
     )
     def test_members_that_count(self, other, expected):
@@ -333,6 +373,21 @@ class TestCanRunOutsideWithGroups:
         pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
         pool.reconcile_groups([_group("off", node="off")], [], now=NOON)
         assert pool.can_run_outside("previews", {"a"}) is False
+
+    def test_the_members_left_out_are_named_with_why(self):
+        pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+        groups = [
+            _group("nas", node="a"),
+            _group("upd", node="update"),
+            _group("gpu", node="no-gpu", device=DEVICE),
+            _group("offline", node="b"),
+            _group("loud", node="key", kinds=("loudness",)),
+        ]
+        pool.reconcile_groups(groups, [], now=NOON)
+        assert pool.stuck_node_members("previews", {"a"}) == [
+            "update (node needs an update)",
+            "no-gpu (GPU not found on this node)",
+        ]
 
 
 class TestSuspectNodes:

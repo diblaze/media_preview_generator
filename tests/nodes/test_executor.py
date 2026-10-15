@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
 import io
 import os
 import re
 import tarfile
 import threading
+import time
 
 import pytest
 from loguru import logger
@@ -26,6 +29,7 @@ from media_preview_generator.nodes.executor import (
     NodeUnavailableError,
     Placement,
     current_placement,
+    extract_artifact,
     placed_on,
     run_on_node,
 )
@@ -36,10 +40,18 @@ from .executor_fakes import NODE_ID, NODE_NAME, FakeRegistry, ScriptedClient, fi
 
 PLACEMENT = Placement(NODE_ID, NODE_NAME)
 
+# `truncate -s 4000000000 00001.jpg && tar --sparse --format=gnu -cf bomb.tar 00001.jpg` (10,240 bytes), gzipped.
+SPARSE_BOMB_GZ_B64 = (
+    "H4sIAAAAAAAC/+3QQQrDMAxEUR3FJyhjW7YP0hMYCoWsQpvcP8mikFUChXRR/tuMQALBSFK8DePTrrO+UHXfMraifX5YLKm6sppnU1ynZuFuPzC/"
+    "p/4KwR596kd3Z/uv5VJzqsm3FvaNXPIAAAAAAAAAAAAAAAAAAPAnFj+Ygq8AKAAA"
+)
+
 
 @pytest.fixture(autouse=True)
 def _fast_polls(monkeypatch):
     monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.0)
+    # Polls take no time here, so the node counts as gone on the failed-poll count alone.
+    monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.0)
     yield
     set_registry(None)
 
@@ -196,6 +208,33 @@ class TestArtifact:
         with pytest.raises(NodeTaskError, match="couldn't be unpacked"):
             _run(media, artifact_to=str(tmp_path))
 
+    def test_a_sparse_member_declaring_gigabytes_is_refused_and_nothing_is_written(self, tmp_path):
+        # 10 KB of tar that unpacks into a 4,000,000,000-byte "JPEG" (see SPARSE_BOMB_GZ_B64).
+        data = gzip.decompress(base64.b64decode(SPARSE_BOMB_GZ_B64))
+        assert len(data) == 10240
+        with pytest.raises(NodeTaskError, match="unexpected entry"):
+            extract_artifact(data, str(tmp_path))
+        assert os.listdir(tmp_path) == []
+
+    def test_a_frame_bigger_than_any_preview_frame_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_FRAME_BYTES", 4)
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("1.jpg", b"1234"), ("2.jpg", b"12345")]), str(tmp_path))
+        assert os.listdir(tmp_path) == []
+
+    def test_more_frames_than_any_preview_has_are_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_FRAMES", 2)
+        assert extract_artifact(_tar([("1.jpg", b"a"), ("2.jpg", b"b")]), str(tmp_path)) == ["1.jpg", "2.jpg"]
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("3.jpg", b"a"), ("4.jpg", b"b"), ("5.jpg", b"c")]), str(tmp_path))
+        assert sorted(os.listdir(tmp_path)) == ["1.jpg", "2.jpg"]
+
+    def test_frames_adding_up_past_the_artifact_cap_are_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_ARTIFACT_BYTES", 8)
+        with pytest.raises(NodeTaskError, match="far bigger"):
+            extract_artifact(_tar([("1.jpg", b"12345"), ("2.jpg", b"12345")]), str(tmp_path))
+        assert os.listdir(tmp_path) == []
+
     def test_artifact_download_failure_is_node_unavailable(self, media, tmp_path):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
         client.fetch_artifact = lambda task_id: (_ for _ in ()).throw(unreachable())
@@ -217,7 +256,42 @@ class TestNodeDrops:
         assert "stopped answering" in str(raised.value)
         assert len(client.named("poll")) == 4
         assert registry.reports == [("unavailable", NODE_ID)]
-        assert client.named("delete") == []  # nobody to tell
+        # Still asked to drop it: a node back from a blip stops the task now, not beside the file's next try.
+        assert client.named("delete") == [("delete",)]
+
+    def test_a_blip_shorter_than_the_give_up_time_does_not_drop_a_task_the_node_still_runs(self, media, monkeypatch):
+        # Refused connections fail at once: four failed polls in a row take a fraction of the give-up time.
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.02)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 1.0)
+        client = ScriptedClient(
+            [running(), unreachable(), unreachable(), unreachable(), unreachable(),
+             finished(protocol.STATUS_DONE, result={"ok": 1})]
+        )  # fmt: skip
+        registry = _install(client)
+
+        assert _run(media) == {"ok": 1}
+        assert registry.reports == []
+
+    def test_polls_failing_for_the_whole_give_up_time_drop_it(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.02)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.3)
+        client = ScriptedClient([running(), unreachable()])
+        _install(client)
+
+        started = time.monotonic()
+        with pytest.raises(NodeUnavailableError, match="stopped answering"):
+            _run(media)
+
+        assert time.monotonic() - started >= 0.3
+        assert len(client.named("poll")) > executor.MAX_FAILED_POLLS + 1
+        assert client.named("delete") == [("delete",)]
+
+    def test_a_node_that_forgot_the_task_is_not_asked_to_delete_it(self, media):
+        client = ScriptedClient([running(), NodeUnknownTaskError("unknown_task")])
+        _install(client)
+        with pytest.raises(NodeUnavailableError):
+            _run(media)
+        assert client.named("delete") == []
 
     def test_two_failed_polls_then_an_answer_carry_on(self, media):
         client = ScriptedClient(
@@ -375,6 +449,47 @@ class TestCancelAndPause:
 
         assert len(client.named("cancel")) == 1
         assert client.named("delete") == [("delete",)]
+
+    def test_a_cancel_lost_to_one_transient_error_is_sent_again(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "CANCEL_WAIT_S", 0.3)
+
+        class FlakyCancel(ScriptedClient):
+            def cancel_task(self, task_id: str) -> None:
+                super().cancel_task(task_id)
+                if len(self.named("cancel")) == 1:
+                    raise unreachable()
+
+        client = FlakyCancel([running()])
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError):
+            _run(media, cancel_check=lambda: True)
+
+        assert len(client.named("cancel")) == 2  # sent again until delivered, then never again
+
+    def test_an_undelivered_cancel_is_sent_again_each_slice_without_extra_polls(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.5)
+        monkeypatch.setattr(executor, "_SLICE_S", 0.05)
+
+        class CancelLostTwice(ScriptedClient):
+            def cancel_task(self, task_id: str) -> None:
+                super().cancel_task(task_id)
+                if len(self.named("cancel")) <= 2:
+                    raise unreachable()
+
+        def answer(client):
+            if len(client.named("cancel")) >= 3:
+                return finished(protocol.STATUS_CANCELLED, error={"kind": "cancelled", "message": "stopped"})
+            return running()
+
+        client = CancelLostTwice([answer])
+        _install(client)
+
+        with pytest.raises(NodeTaskCancelledError):
+            _run(media, cancel_check=lambda: True)
+
+        assert len(client.named("cancel")) == 3
+        assert len(client.named("poll")) == 2  # the retries rode the slices; one poll after the delivered cancel
 
     def test_a_cancel_while_the_node_goes_away_ends_as_cancelled(self, media):
         cancel = threading.Event()

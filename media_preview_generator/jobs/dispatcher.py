@@ -124,9 +124,9 @@ class JobTracker:
         # thread under that lock (see ``JobDispatcher._claim_worker``), and puts files back at its left end.
         self.item_queue: deque = deque()
         # Files given back by a remote worker (dispatch loop only, under the dispatcher's ``_trackers_lock``):
-        # how often each one's node dropped it or never took its start, the node that last did (its retry goes
-        # elsewhere when it can), and the nodes (id -> name) that can't see it.
-        self.node_drops: dict[str, int] = {}
+        # the name of the node behind each drop, how often its node never took its start, the node that last did
+        # either (its retry goes elsewhere when it can), and the nodes (id -> name) that can't see it.
+        self.node_drops: dict[str, list[str]] = {}
         self.node_start_failures: dict[str, int] = {}
         self.dropped_on: dict[str, str] = {}
         self.excluded_nodes: dict[str, dict[str, str]] = {}
@@ -211,7 +211,7 @@ class JobTracker:
             self.failed_paths = list(carried_state.get("failed_paths", []))
             self.node_failures = dict(carried_state.get("node_failures", {}))
             # Older snapshots have none of these: their files start with no node tries counted.
-            self.node_drops = dict(carried_state.get("node_drops", {}))
+            self.node_drops = {path: list(names) for path, names in carried_state.get("node_drops", {}).items()}
             self.node_start_failures = dict(carried_state.get("node_start_failures", {}))
             self.dropped_on = dict(carried_state.get("dropped_on", {}))
             self.excluded_nodes = {path: dict(nodes) for path, nodes in carried_state.get("excluded_nodes", {}).items()}
@@ -568,6 +568,18 @@ class JobTracker:
             "cancelled": self.cancelled,
             "outcome": dict(self.outcome_counts),
         }
+
+
+def _drops_failure(names: list[str]) -> str:
+    """Why a file the nodes kept dropping fails, naming each node behind a drop.
+
+    Args:
+        names: The node behind each drop, in order (``MAX_NODE_DROPS`` of them).
+    """
+    nodes = list(dict.fromkeys(names))
+    if len(nodes) == 1:
+        return f"node {nodes[0]} unavailable (it dropped the file twice)"
+    return f"nodes {', '.join(nodes[:-1])} and {nodes[-1]} unavailable (each dropped the file once)"
 
 
 def _queue_head(queue: deque) -> list:
@@ -1052,9 +1064,10 @@ class JobDispatcher:
             if dropped:
                 tracker.dropped_on[path] = requeue.node_id
             if requeue.reason == REQUEUE_NODE_UNAVAILABLE:
-                tracker.node_drops[path] = tracker.node_drops.get(path, 0) + 1
-                if tracker.node_drops[path] >= MAX_NODE_DROPS:
-                    failure = f"node {requeue.node_name} unavailable (it dropped the file twice)"
+                drops = tracker.node_drops.setdefault(path, [])
+                drops.append(requeue.node_name)
+                if len(drops) >= MAX_NODE_DROPS:
+                    failure = _drops_failure(drops)
             elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
                 tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
                 if tracker.node_start_failures[path] >= MAX_NODE_START_FAILURES:
@@ -1066,7 +1079,7 @@ class JobDispatcher:
                 excluded = tracker.excluded_nodes.setdefault(path, {})
                 excluded[requeue.node_id] = requeue.node_name
                 if not self.worker_pool.can_run_outside(tracker.kind, excluded):
-                    failure = f"not visible on {', '.join(excluded.values())}"
+                    failure = self._not_visible_failure(tracker.kind, excluded)
             if failure is None:
                 tracker.item_queue.appendleft(item)
                 tracker.active_processing = max(0, tracker.active_processing - 1)
@@ -1086,6 +1099,17 @@ class JobDispatcher:
         finally:
             with self._trackers_lock:
                 tracker.active_processing = max(0, tracker.active_processing - 1)
+
+    def _not_visible_failure(self, kind: str, excluded: dict[str, str]) -> str:
+        """Why a file fails that no node left can see: the nodes that can't, and any that need someone to act first.
+
+        Args:
+            kind: The job kind.
+            excluded: Node id -> name of the nodes that can't see the file.
+        """
+        failure = f"not visible on {', '.join(excluded.values())}"
+        stuck = self.worker_pool.stuck_node_members(kind, excluded)
+        return f"{failure}; no other worker can take it: {', '.join(stuck)}" if stuck else failure
 
     def _merge_worker_outcome(self, worker: Worker, tracker: JobTracker) -> None:
         """Merge the latest outcome delta from a worker into the tracker.
@@ -1195,7 +1219,7 @@ class JobDispatcher:
                 if _take_queued(tracker, index, item) is None:
                     return None
                 tracker.active_processing += 1
-                stranded.append((tracker, item, f"not visible on {', '.join(excluded.values())}"))
+                stranded.append((tracker, item, self._not_visible_failure(tracker.kind, excluded)))
                 return None
         return None
 

@@ -202,16 +202,20 @@ retry runs (on the **node's** CPU, see §6).
   asks it and either calls the local function or `executor.run(op, …)`.
 * While a task runs the worker polls every 1 s; node log lines are written into the job log by the worker's own
   thread (job-log routing is by registered thread id), prefixed `<node>/<device> ·`.
-* **Node drops** (3 failed polls ≈ 12 s, or the node no longer knows the task): `NodeUnavailableError` → the item
-  goes back in the queue once; a second drop on the same item fails it ("node <name> unavailable (it dropped the
-  file twice)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
+* **Node drops** (polls failing for 12 s, at least 3 in a row, or the node no longer knows the task):
+  `NodeUnavailableError` → the item goes back in the queue once (the node is still asked to drop the task, so one
+  that comes back stops it); a second drop on the same item fails it ("node <name> unavailable (it dropped the
+  file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until the registry's next check of it comes back
   ready (60 s at most), and the item's retry goes to another node or this app when one is free.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the
   item goes to the next eligible worker on a different node (or this app); when every eligible worker has failed it,
-  the item fails "not visible on X, Y". Three different files not visible on one node within 10 minutes → node state
-  `access_problem` (workers paused, alert).
+  the item fails "not visible on X, Y". Members on a node that is offline or connecting (or rechecking a lost GPU)
+  still count, since it comes back on its own; members that wait on someone (node turned off, update needed, key
+  refused, access problem, no worker role, GPU not listed) don't, and the failure names them: "not visible on X; no
+  other worker can take it: Z (node needs an update)". Three different files not visible on one node within 10
+  minutes → node state `access_problem` (workers paused, alert).
 * **GPU failure / codec not supported** on a node: retry on the same node's CPU, never on the app's. GPU lost
   (detection fails after a GPU error) → state `gpu_lost`.
 * Cancel and pause act on the node task: the executor forwards the job's cancel and pause state to

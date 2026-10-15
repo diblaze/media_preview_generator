@@ -43,12 +43,17 @@ def _validate_accounting(snapshot: dict) -> None:
         not isinstance(path, str) or not isinstance(why, str) for path, why in node_failures.items()
     ):
         raise ValueError("Invalid checkpoint node failures")
-    for key in ("node_drops", "node_start_failures"):
-        tries = state.get(key, {})
-        if not isinstance(tries, dict) or any(
-            not isinstance(path, str) or type(count) is not int or count < 0 for path, count in tries.items()
-        ):
-            raise ValueError("Invalid checkpoint node tries")
+    drops = state.get("node_drops", {})
+    if not isinstance(drops, dict) or any(
+        not isinstance(path, str) or not isinstance(names, list) or any(not isinstance(name, str) for name in names)
+        for path, names in drops.items()
+    ):
+        raise ValueError("Invalid checkpoint node tries")
+    starts = state.get("node_start_failures", {})
+    if not isinstance(starts, dict) or any(
+        not isinstance(path, str) or type(count) is not int or count < 0 for path, count in starts.items()
+    ):
+        raise ValueError("Invalid checkpoint node tries")
     dropped_on = state.get("dropped_on", {})
     if not isinstance(dropped_on, dict) or any(
         not isinstance(path, str) or not isinstance(node, str) for path, node in dropped_on.items()

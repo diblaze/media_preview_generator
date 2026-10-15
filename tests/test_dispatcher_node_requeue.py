@@ -15,7 +15,14 @@ from media_preview_generator.jobs import dispatcher as dispatcher_mod
 from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes.executor import FileNotVisibleError, NodeUnavailableError, current_placement
-from media_preview_generator.nodes.registry import STATE_OFFLINE, STATE_READY, NodeRegistry, NodeView, set_registry
+from media_preview_generator.nodes.registry import (
+    STATE_OFFLINE,
+    STATE_READY,
+    NodeCapacity,
+    NodeRegistry,
+    NodeView,
+    set_registry,
+)
 from media_preview_generator.processing.types import ProcessableItem
 
 KEYS = ("markers_published", "failed")
@@ -203,6 +210,24 @@ class TestNodeDrops:
         assert tracker.get_result()["node_failures"] == {"/m/a.mkv": "node NAS unavailable (it dropped the file twice)"}
         assert tracker.active_processing == 0
 
+    def test_one_drop_on_each_of_two_nodes_fails_naming_both(self):
+        seen: list[str] = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            node = _node()
+            with lock:
+                seen.append(node)
+            raise NodeUnavailableError(node, node.upper(), f"{node.upper()} stopped answering")
+
+        tracker, rows = _run(_pool(("a", "A"), ("b", "B")), process, "/m/1.mkv")
+
+        assert sorted(seen) == ["a", "b"]  # the retry went to the other node
+        (row,) = rows
+        first, second = (name.upper() for name in seen)
+        assert row.args[2] == f"nodes {first} and {second} unavailable (each dropped the file once)"
+        assert tracker.node_failures == {"/m/1.mkv": row.args[2]}
+
     def test_a_file_the_worker_itself_fails_is_not_a_node_failure(self):
         def process(item, **_kwargs):
             raise RuntimeError("the detector broke")
@@ -272,6 +297,39 @@ class TestNotVisible:
         assert row.args[2] in ("not visible on A, B", "not visible on B, A")
         assert tracker.node_failures == {"/m/1.mkv": row.args[2]}
         assert tracker.active_processing == 0
+
+    def test_a_file_only_a_member_without_its_gpu_could_run_fails_naming_why(self):
+        """Node B is ready but no longer lists the GPU its member names: nothing brings that member back without
+        someone acting, so a file only it could run fails instead of keeping the job open forever."""
+
+        class Registry(_Registry):
+            revision = 0  # shadows the real registry's property
+
+            def capacity(self, node_id: str) -> NodeCapacity:
+                return NodeCapacity(True, True, "")
+
+        set_registry(Registry())
+
+        def group(gid: str, member: dict) -> dict:
+            return {"id": gid, "name": gid, "enabled": True, "availability": {"mode": "always", "windows": []},
+                    "members": [{"id": "m", "count": 1, "job_types": ["intro_credits"], **member}]}  # fmt: skip
+
+        pool = WorkerPool(cpu_workers=0, gpu_workers=0, selected_gpus=[])
+        pool.reconcile_groups(
+            [
+                group("cpu-a", {"resource": "cpu", "device": None, "node": "a"}),
+                group("gpu-b", {"resource": "gpu", "device": "cuda:0", "node": "b"}),
+            ],
+            [],
+        )
+        assert [w.node_id for w in pool.workers] == ["a"]
+        process, _ = self._hidden_on("a")
+
+        tracker, rows = _run(pool, process, "/m/1.mkv")
+
+        assert (tracker.successful, tracker.failed) == (0, 1)
+        (row,) = rows
+        assert row.args[2] == "not visible on A; no other worker can take it: B (GPU not found on this node)"
 
 
 class TestClaimWorker:
@@ -418,7 +476,7 @@ class TestParkAndResume:
     """A parked job resumes with the per-file node counts it had: a park must not give a file fresh tries."""
 
     NODE_STATE = {
-        "node_drops": {"/m/a.mkv": 1},
+        "node_drops": {"/m/a.mkv": ["N1"]},
         "node_start_failures": {"/m/b.mkv": 4},
         "dropped_on": {"/m/a.mkv": "n1"},
         "excluded_nodes": {"/m/b.mkv": {"n2": "NAS"}},
@@ -469,7 +527,7 @@ class TestParkAndResume:
         ("field", "bad"),
         [
             ("node_drops", {"/m/a.mkv": "1"}),
-            ("node_drops", {"/m/a.mkv": -1}),
+            ("node_drops", {"/m/a.mkv": [1]}),
             ("node_start_failures", {"/m/a.mkv": True}),
             ("dropped_on", {"/m/a.mkv": 5}),
             ("excluded_nodes", {"/m/a.mkv": "n2"}),

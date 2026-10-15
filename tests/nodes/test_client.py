@@ -1,18 +1,24 @@
-"""nodes.client: a request the node may have run (no answer in time) is told apart from one that never reached it."""
+"""nodes.client: a request the node may have run (no answer in time) is told apart from one that never reached it;
+answers are bounded and redirects never followed."""
 
 from __future__ import annotations
 
+import gzip
+import io
 import socket
 import struct
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock
 
 import pytest
 import requests
 
+from media_preview_generator.nodes import client as client_mod
 from media_preview_generator.nodes.client import (
     NodeAddress,
     NodeClient,
+    NodeProtocolError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnreachableError,
@@ -85,12 +91,116 @@ class TestAConnectionDroppedMidAnswer:
         assert not isinstance(raised.value, NodeTimeoutError)
 
 
+def _response(status: int, body: bytes) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response._content = body
+    response._content_consumed = True
+    return response
+
+
 class TestAStartAfterItsDelete:
     def test_is_its_own_error(self):
-        response = MagicMock(status_code=409)
-        response.json.return_value = {"ok": False, "error": {"kind": "task_deleted", "message": "deleted"}}
         session = MagicMock(spec=requests.Session)
-        session.request.return_value = response
+        session.request.return_value = _response(
+            409, b'{"ok": false, "error": {"kind": "task_deleted", "message": "deleted"}}'
+        )
         client = NodeClient(NodeAddress("http://node:9494", "k"), session=session)
         with pytest.raises(NodeTaskDeletedError, match="deleted"):
             client.start_task({"op": "x"})
+
+
+class _Answer(BaseHTTPRequestHandler):
+    """Answers every request with the class's ``status``, ``headers_out`` and ``body``; records the paths asked."""
+
+    status = 200
+    headers_out: dict[str, str] = {}
+    body = b""
+    seen: list[str] = []
+
+    def _answer(self) -> None:
+        type(self).seen.append(self.path)
+        self.send_response(self.status)
+        for name, value in self.headers_out.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        self.wfile.write(self.body)
+
+    do_GET = do_POST = do_DELETE = _answer
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture
+def serve():
+    servers: list[ThreadingHTTPServer] = []
+
+    def start(status: int, body: bytes, headers: dict[str, str] | None = None) -> tuple[str, type[_Answer]]:
+        attrs = {"status": status, "body": body, "headers_out": headers or {}, "seen": []}
+        handler = type("Handler", (_Answer,), attrs)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://127.0.0.1:{server.server_port}", handler
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def _gzipped_zeros(size: int) -> bytes:
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9) as gz:
+        gz.write(b"\0" * size)
+    return buf.getvalue()
+
+
+def _local(url: str) -> NodeClient:
+    session = requests.Session()
+    session.trust_env = False  # a proxy from the environment must not sit between the test and 127.0.0.1
+    return NodeClient(NodeAddress(url, "k"), session=session)
+
+
+class TestAnswersAreBounded:
+    """A node (or whatever answers at its address) can't make the app hold more than a preview's worth of bytes."""
+
+    def test_a_compressed_artifact_is_refused_not_inflated(self, serve):
+        # 16 MiB of zeros in ~16 KB on the wire: requests would inflate it whatever the download cap.
+        url, _ = serve(200, _gzipped_zeros(16 * 1024 * 1024), {"Content-Encoding": "gzip"})
+        with pytest.raises(NodeProtocolError, match="gzip-compressed"):
+            _local(url).fetch_artifact("t1")
+
+    def test_a_compressed_json_answer_is_refused(self, serve):
+        url, _ = serve(200, _gzipped_zeros(1024), {"Content-Encoding": "gzip", "Content-Type": "application/json"})
+        with pytest.raises(NodeProtocolError, match="gzip-compressed"):
+            _local(url).poll_task("t1")
+
+    def test_an_artifact_past_the_cap_is_refused(self, serve, monkeypatch):
+        monkeypatch.setattr(client_mod, "MAX_ARTIFACT_BYTES", 1024 * 1024)
+        url, _ = serve(200, b"x" * (3 * 1024 * 1024))
+        with pytest.raises(NodeProtocolError, match="more than 1 MB"):
+            _local(url).fetch_artifact("t1")
+
+    def test_a_json_answer_past_the_cap_is_refused(self, serve, monkeypatch):
+        monkeypatch.setattr(client_mod, "MAX_ANSWER_BYTES", 1024 * 1024)
+        url, _ = serve(200, b'{"pad": "' + b"x" * (3 * 1024 * 1024) + b'"}')
+        with pytest.raises(NodeProtocolError, match="more than 1 MB"):
+            _local(url).poll_task("t1")
+
+    def test_answers_under_the_caps_come_through(self, serve):
+        url, _ = serve(200, b"tar bytes")
+        assert _local(url).fetch_artifact("t1") == b"tar bytes"
+        url, _ = serve(200, b'{"id": "t1", "status": "running"}', {"Content-Type": "application/json"})
+        assert _local(url).poll_task("t1")["status"] == "running"
+
+
+class TestRedirects:
+    def test_a_redirect_is_an_error_and_the_task_never_reaches_the_other_host(self, serve):
+        other, other_handler = serve(200, b'{"id": "x"}', {"Content-Type": "application/json"})
+        node, _ = serve(307, b"", {"Location": f"{other}/v1/tasks"})
+        with pytest.raises(NodeProtocolError, match="redirect"):
+            _local(node).start_task({"op": "x", "path": "/media/a.mkv"})
+        assert other_handler.seen == []
