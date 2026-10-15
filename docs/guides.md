@@ -280,7 +280,7 @@ On the Dashboard, each device row in the **Workers** panel has a **−** / **+**
 - A group's card shows its state: **Available**, **Workers busy**, **Outside hours**, **Finishing current files** or **Globally paused**. No open workers means waiting for capacity, not a global pause: current files can still finish.
 - Counts from different open groups add, including groups that use the same device. Overlapping windows within one group
   do not multiply its workers. Finishing files still use the shared resource budget, so a newly opened group may
-  wait for them. The weekly peak is limited to 64 CPU and 64 GPU workers across groups; the editor shows the current and peak totals.
+  wait for them. The weekly peak is limited to 64 CPU and 64 GPU workers per machine (this app, and each node on its own), across groups; the editor shows the current and peak totals.
 
 There are three separate timing controls:
 

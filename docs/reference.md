@@ -173,7 +173,7 @@ is rejected with `400`.
 
 Up to 64 groups. An empty list is valid and means no workers. Overlapping windows in one group form a union;
 different groups and devices add their counts. A save is refused when the weekly peak would exceed 64 CPU or 64 GPU
-workers. These are worker slots, not CPU cores.
+workers on one machine (this app, or any one node). These are worker slots, not CPU cores.
 
 ## Nodes
 
