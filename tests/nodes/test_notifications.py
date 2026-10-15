@@ -58,9 +58,10 @@ def _group_off(*node_ids):
 def _clean(tmp_path, monkeypatch):
     from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
 
-    # The bell also builds the Vulkan card from a real FFmpeg probe: on a machine that reports a software device
-    # (CI) it adds a card these tests don't count.
-    monkeypatch.setattr(notif, "_build_vulkan_software_fallback_notification", lambda: None)
+    # The bell also builds cards from this machine's own state (its GPUs, Vulkan, mounts, time zone): on CI, with no
+    # GPU, some of those fire and add cards these tests don't count. Only the node cards are under test here.
+    node_cards = notif._build_node_notifications
+    monkeypatch.setattr(notif, "_notification_sources", lambda: list(node_cards()))
 
     notif.reset_session()
     reset_settings_manager()
