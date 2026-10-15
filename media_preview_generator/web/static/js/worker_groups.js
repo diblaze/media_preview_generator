@@ -502,8 +502,12 @@
         return entry?.host || null;
     }
 
-    function warnings() {
-        return (snapshot.warnings || []).map(warning => typeof warning === 'string' ? warning : warning.message || '').filter(Boolean);
+    // The dashboard's member rows already say why a device has no workers, so its footer leaves those out.
+    const ROW_WARNINGS = ['node_unavailable', 'hardware_unavailable'];
+    function warnings({ skipRowWarnings = false } = {}) {
+        return (snapshot.warnings || [])
+            .filter(warning => !(skipRowWarnings && warning && ROW_WARNINGS.includes(warning.code)))
+            .map(warning => typeof warning === 'string' ? warning : warning.message || '').filter(Boolean);
     }
 
     function replaceDashboardHeader(entry, markup) {
@@ -644,7 +648,9 @@
         const stepper = group.enabled ? memberStepper(group, member, member.count) : '';
         const note = missing ? `${name}: GPU not detected. Its jobs wait; other devices keep working.`
             : nodeDown ? `${title}: ${reason}. Its jobs wait; other devices keep working.` : '';
-        return `<div class="mem-h${problem ? ' miss' : ''}"><span class="devname">${nodeChip(member)}<i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="nm" title="${escapeHtml(title)}">${escapeHtml(name)}</span></span>${problem ? '' : capabilityIcons(member.job_types)}${chip}${stepper}</div>${note ? `<p class="msg ${nodeDown && tone === 'bad' ? 'err' : 'warn'}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><span>${escapeHtml(note)}</span></p>` : ''}`;
+        const nodeLink = nodeDown && nodeFor(member)
+            ? ` <a class="msg-link" href="/nodes#node-${encodeURIComponent(member.node)}">Open ${escapeHtml(nodeName(member))}</a>` : '';
+        return `<div class="mem-h${problem ? ' miss' : ''}"><span class="devname">${nodeChip(member)}<i class="bi bi-${deviceIcon(member)}" aria-hidden="true"></i><span class="nm" title="${escapeHtml(title)}">${escapeHtml(name)}</span></span>${problem ? '' : capabilityIcons(member.job_types)}${chip}${stepper}</div>${note ? `<p class="msg ${nodeDown && tone === 'bad' ? 'err' : 'warn'}"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i><span>${escapeHtml(note)}${nodeLink}</span></p>` : ''}`;
     }
 
     // A member that is no longer configured keeps its row while its last files finish.
@@ -772,7 +778,7 @@
         renderIdleRows();
         applyDenseRows();
         document.getElementById('workerGroupEmpty').hidden = dashboardGroups.size > 0;
-        document.getElementById('workerGroupLiveWarnings').textContent = warnings().join(' ');
+        document.getElementById('workerGroupLiveWarnings').textContent = warnings({ skipRowWarnings: true }).join(' ');
         renderSystemGroups();
         renderGroupVisibility();
         window.dispatchEvent(new CustomEvent('worker-groups-updated', { detail: snapshot }));
