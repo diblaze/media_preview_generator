@@ -1,7 +1,8 @@
 # Plex database node for Windows
 
 A small program that runs beside Plex Media Server on Windows, so that Media Preview Generator, running on another
-machine, can write intro and credits markers (and chapter thumbnails) into Plex's database.
+machine, can write into Plex's database: intro and credits markers, chapter thumbnails, loudness measurements and
+Library Health's database counts.
 
 ## Who needs it
 
