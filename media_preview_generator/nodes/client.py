@@ -291,7 +291,7 @@ class NodeClient:
             raise NodeUnknownTaskError(message)
         if response.status_code == 404:
             # A Plex helper from before nodes existed answers its own routes but 404s the node ones.
-            raise NodeProtocolError(f"{self._address.base} doesn't know {path} (an older Plex helper?)")
+            raise NodeProtocolError(f"{self._address.base} doesn't know {path} (an older Plex database node?)")
         if response.status_code == 409 and kind == protocol.KIND_PROTOCOL:
             node = body.get("node")
             raise NodeProtocolError(message, node=node if isinstance(node, dict) else None)

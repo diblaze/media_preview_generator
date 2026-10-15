@@ -379,6 +379,13 @@ class TestSomethingThatIsNotANode:
             _local(url).info()
         assert raised.value.web_page is True and raised.value.app_instance == ""
 
+    def test_a_json_404_names_an_older_plex_database_node(self, serve):
+        # What an older Plex database node answers for a node route it predates.
+        url, _ = serve(404, b'{"error": "not found"}', {"Content-Type": "application/json"})
+        with pytest.raises(NodeProtocolError) as raised:
+            _local(url).info()
+        assert str(raised.value) == f"{url} doesn't know /v1/info (an older Plex database node?)"
+
     def test_this_apps_web_side_is_named_by_its_instance_header(self, serve):
         url, _ = serve(404, b"<html></html>", {"Content-Type": "text/html", "X-MPG-App-Instance": "abc123"})
         with pytest.raises(NodeProtocolError) as raised:

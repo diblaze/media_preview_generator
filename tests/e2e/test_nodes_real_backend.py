@@ -439,7 +439,7 @@ def test_plex_database_nodes_are_added_and_offered_to_the_plex_server(
     modal = _open_add(page)
     probe = _connect(page, helper_url, HELPER_KEY)
     expect(probe).to_contain_text("version 1.2.0")
-    expect(probe).to_contain_text("Older Plex helper")
+    expect(probe).to_contain_text("Older Plex database node")
     page.locator("#addNodeNext").click()
     expect(modal).to_be_hidden(timeout=10000)
 
@@ -449,7 +449,7 @@ def test_plex_database_nodes_are_added_and_offered_to_the_plex_server(
     expect(plex_box.locator(".nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready", timeout=20000)
     expect(plex_box.locator(".nd-ico i")).to_have_class("bi bi-database")
     expect(helper.locator(".nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready", timeout=20000)
-    expect(helper.locator(".nd-chips")).to_contain_text("Older Plex helper")
+    expect(helper.locator(".nd-chips")).to_contain_text("Older Plex database node")
 
     page.goto(f"{real_app}/servers")
     edit = page.locator(".edit-server-btn[data-id='plex-home']")

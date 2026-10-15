@@ -181,8 +181,8 @@
         if (isPlexDb(node)) html += pill('role', 'Plex database');
         if (isWindows(node)) html += pill('off', 'Windows');
         if (node.legacy) {
-            html += pill('off', 'Older Plex helper')
-                + infoIcon("Keeps working as it is. Update it to a Plex database node for Setup Health and Windows support.");
+            html += pill('off', 'Older Plex database node')
+                + infoIcon("Keeps working as it is. Update it to the latest version for Setup Health and Windows support.");
         }
         return html;
     }
@@ -778,7 +778,7 @@
             + '</div>');
         let found = infoRoles(info).map((role) => pill('role', role === ROLE_PLEX_DB ? 'Plex database' : 'Worker')).join('');
         if (String((info.platform || {}).os || '').toLowerCase().startsWith('win')) found += pill('off', 'Windows');
-        if (info.legacy) found += pill('off', 'Older Plex helper');
+        if (info.legacy) found += pill('off', 'Older Plex database node');
         (Array.isArray(worker.gpus) ? worker.gpus : []).forEach((gpu) => {
             const okGpu = !gpu.status || gpu.status === 'ok';
             const label = [gpu.device, gpu.name].filter(Boolean).join(' · ');
