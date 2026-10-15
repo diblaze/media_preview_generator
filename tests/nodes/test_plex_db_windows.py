@@ -284,6 +284,16 @@ class TestTheWindowsEntryPoint:
         assert "No loudness undo record" in capsys.readouterr().err
 
 
+class TestTheInstaller:
+    """install.ps1 can't run here; ``windows-node.yml`` runs it. These pin what it must never do again."""
+
+    SCRIPT = (REPO_ROOT / "nodes" / "windows" / "install.ps1").read_text()
+
+    def test_it_never_recreates_the_run_key(self):
+        # New-Item -Force on an existing registry key deletes it: every other program's logon entry with it.
+        assert "New-Item -Path $RunKey -Force" not in self.SCRIPT
+
+
 def test_off_windows_the_preferences_file_beside_the_database_names_plex(tmp_path, monkeypatch):
     folder = tmp_path / "Plex Media Server"
     folder.mkdir()

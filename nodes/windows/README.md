@@ -23,7 +23,8 @@ You don't need it when:
 
 ## Install
 
-1. Download the `PlexDbNode-windows` build (or build it yourself, below) and unzip it anywhere.
+1. Download the `PlexDbNode-windows` build (or build it yourself, below) and unzip it anywhere. The folder holds
+   `install.ps1`, `uninstall.ps1`, this README and the `PlexDbNode` program folder.
 2. Sign in to Windows **as the user Plex runs as**, open PowerShell in the unzipped folder and run:
 
    ```powershell
@@ -43,10 +44,23 @@ Options:
   uses Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
   `%LOCALAPPDATA%\Plex Media Server`.
 
-The node keeps its id, key and log in `%LOCALAPPDATA%\MediaPreviewGenerator\node` (`node.json`, `logs\node.log`).
-Setting `NODE_KEY` in the environment uses that key instead of the generated one.
+The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\MediaPreviewGenerator\node`
+(`node.json`, `logs\node.log`, `loudness-writes.jsonl`). To use a key of your own, set it before installing
+(`$env:NODE_KEY = "..."`); the installer saves it in `node.json`, so it still works after a reboot.
 
 To remove it: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1` (`-RemoveData` also deletes the key).
+
+## Undoing loudness writes
+
+Stop Plex, then in PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\PlexDbNode-debug.exe" --undo-loudness --dry-run
+```
+
+`--dry-run` only counts what would be put back; run it again without `--dry-run` to restore. If you installed with
+`-PlexConfigDir`, add the same `--plex-config-dir "..."` here. What it restores and what it leaves alone is in
+[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it).
 
 ## Why it starts at logon instead of as a Windows service
 
