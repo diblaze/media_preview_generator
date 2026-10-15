@@ -74,7 +74,7 @@ class Clock:
 
 
 class Harness:
-    def __init__(self, nodes=None, access_store=None):
+    def __init__(self, nodes=None, access_store=None, attempt_gap_s=0.0):
         self.nodes = nodes if nodes is not None else [_record()]
         self.revision = 1
         self.clients: dict[str, FakeClient] = {}
@@ -94,7 +94,7 @@ class Harness:
             library_names=lambda paths: list(self.libraries),
             app_version=lambda: APP_VERSION,
             app_build=lambda: self.app_build,
-            attempt_gap_s=0.0,
+            attempt_gap_s=attempt_gap_s,
             clock=self.clock,
             wall_clock=lambda: 1_700_000_000.0,
             access_store=access_store,
@@ -727,6 +727,73 @@ class TestLoop:
         assert h.registry.rescan_gpus("nope") is None
 
 
+class TestRequestedChecks:
+    """Check now: the check runs on the health checks' pool and the request returns at once."""
+
+    def _slow(self, client):
+        started, release = threading.Event(), threading.Event()
+
+        def slow_info():
+            client.info_calls += 1
+            started.set()
+            release.wait(5)
+            return _info()
+
+        client.info = slow_info
+        return started, release
+
+    def test_it_returns_at_once_and_says_checking_until_the_check_is_done(self):
+        h = Harness(attempt_gap_s=reg.ATTEMPT_GAP_S)
+        client = h.client()
+        client.default_info = NodeUnreachableError("http://nuc:9494 didn't answer: ConnectTimeout")
+        try:
+            started = time.monotonic()
+            view = h.registry.request_check("n1")
+
+            assert time.monotonic() - started < 0.5  # its attempts are 4 s apart
+            assert view.checking is True
+            assert _wait_for(lambda: client.info_calls == 1)
+            assert h.registry.view("n1").checking is True
+        finally:
+            h.registry.stop()  # ends the wait before its next attempt
+        assert _wait_for(lambda: not h.registry.view("n1").checking)
+        assert h.registry.view("n1").state == reg.STATE_OFFLINE
+
+    def test_asking_again_while_a_check_runs_starts_no_second_one(self, h):
+        client = h.client()
+        started, release = self._slow(client)
+        h.registry.request_check("n1")
+        assert started.wait(5)
+
+        assert h.registry.request_check("n1").checking is True
+
+        release.set()
+        assert _wait_for(lambda: not h.registry.view("n1").checking)
+        assert not _wait_for(lambda: client.info_calls > 1, timeout=0.3)
+        assert h.registry.view("n1").state == reg.STATE_READY
+
+    def test_one_asked_for_while_another_check_runs_still_clears_a_fixed_access_problem(self, h):
+        h.registry.check_now("n1")
+        for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):
+            h.registry.report_not_visible("n1", path, "missing")
+        assert h.registry.view("n1").state == reg.STATE_ACCESS_PROBLEM
+        started, release = self._slow(h.client())
+        h.registry.report_unavailable("n1")  # a check of its own, which skips the quick access check
+        assert started.wait(5)
+
+        h.registry.request_check("n1")
+        release.set()
+
+        assert _wait_for(lambda: not h.registry.view("n1").checking)
+        assert h.registry.view("n1").state == reg.STATE_READY
+
+    def test_a_turned_off_or_unknown_node_is_not_checked(self, h):
+        h.change(enabled=False)
+        assert h.registry.request_check("n1").checking is False
+        assert h.client().info_calls == 0
+        assert h.registry.request_check("nope") is None
+
+
 def test_get_registry_is_a_singleton_and_set_registry_replaces_it():
     first = reg.get_registry()
     assert reg.get_registry() is first
@@ -734,8 +801,9 @@ def test_get_registry_is_a_singleton_and_set_registry_replaces_it():
     assert reg.get_registry() is not first
 
 
-def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
+def test_the_app_factory_starts_the_registry_and_at_exit_stops_it_and_frees_the_tasks_on_nodes(monkeypatch):
     import media_preview_generator.web.app as app_mod
+    from media_preview_generator.nodes.executor import cancel_running_tasks
 
     calls = []
 
@@ -753,7 +821,7 @@ def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
     registered = []
     monkeypatch.setattr(app_mod.atexit, "register", registered.append)
     app_mod._start_node_registry()
-    assert calls == ["start"] and registered == [stub.stop]
+    assert calls == ["start"] and registered == [stub.stop, cancel_running_tasks]
 
 
 class _LockProbingStore(AccessResultStore):

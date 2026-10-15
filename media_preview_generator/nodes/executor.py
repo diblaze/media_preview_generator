@@ -56,6 +56,8 @@ GONE_DELETE_TIMEOUT_S = 3.0
 # A DELETE lost to a passing error is sent again after each of these waits: until one arrives the node keeps the task
 # and its temp dir (a preview's frames and their tar) for 10 minutes.
 DELETE_RETRY_DELAYS_S = (1.0, 4.0)
+# How long a stopping app waits in all for the DELETEs of its tasks still running on nodes (cancel_running_tasks).
+STOP_DELETE_BUDGET_S = 1.0
 # A preview frame is a 320x240 JPEG (tens of KB; raw RGB would be 225 KB), and a 4-hour film at the 1 s interval
 # is 14,400 of them: anything past these is not a preview's frames.
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -565,6 +567,50 @@ class _TaskRun:
         return False
 
 
+# The tasks running on nodes now, so a stopping app can free them (cancel_running_tasks).
+_running: set[_TaskRun] = set()
+_running_lock = threading.Lock()
+
+
+def _free_for_stop(run: _TaskRun, read_timeout: float) -> None:
+    try:
+        run._client.delete_task(run._task_id, read_timeout=read_timeout)
+    except NodeError as exc:
+        logger.debug("{}couldn't free the task as the app stops: {}", run._prefix, exc)
+    except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
+        logger.opt(exception=True).debug("{}freeing the task as the app stops failed", run._prefix)
+
+
+def cancel_running_tasks(budget_s: float = STOP_DELETE_BUDGET_S) -> int:
+    """Free every task this app runs on a node, for an app that is stopping.
+
+    Without this a task keeps running on its node until the node's unpolled-task expiry, beside the tasks the job
+    revived on the next start gives the node. Each DELETE runs on a daemon thread of its own, so a node that doesn't
+    answer holds up none of the others; one still unanswered after ``budget_s`` is left to that expiry.
+
+    Args:
+        budget_s: The most this waits in all.
+
+    Returns:
+        How many tasks it asked nodes to free.
+    """
+    with _running_lock:
+        runs = list(_running)
+    if not runs:
+        return 0
+    logger.info("The app is stopping: freeing {} task(s) running on nodes", len(runs))
+    deadline = time.monotonic() + budget_s
+    threads = [
+        threading.Thread(target=_free_for_stop, args=(run, budget_s), name="node-task-stop", daemon=True)
+        for run in runs
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return len(runs)
+
+
 def run_on_node(
     op: str,
     app_path: str,
@@ -638,7 +684,11 @@ def run_on_node(
         path_swap=(node_path, app_path) if node_path and node_path != app_path else None,
     )
     run.start(spec)
+    with _running_lock:
+        _running.add(run)
     try:
         return run.finish(run.wait(), app_path, artifact_to)
     finally:
+        with _running_lock:
+            _running.discard(run)
         run.delete()

@@ -5,6 +5,10 @@
     'use strict';
 
     const POLL_MS = 10000;
+    // Check now: the server checks in the background, so the list is read again every second until no node is
+    // still being checked (a node that doesn't answer takes up to ~40 s), giving up after a minute.
+    const CHECK_POLL_MS = 1000;
+    const CHECK_WAIT_MS = 60000;
     const LOG_LINES = 200;
     const DOCS_URL = 'https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#remote-nodes';
     const ROLE_WORKER = 'worker';
@@ -197,7 +201,7 @@
 
     // ---------- list ---------------------------------------------------------------------------------------------
 
-    const page = { nodes: [], appVersion: '', loaded: false, timer: null, loading: false, openId: null };
+    const page = { nodes: [], appVersion: '', loaded: false, timer: null, loading: false, checking: false, openId: null };
 
     function nodeIcon(node) {
         if (isWindows(node)) return 'bi-windows';
@@ -260,13 +264,14 @@
         const checkNow = $('#nodesCheckNow');
         // With no node there is nothing to check: the button is hidden, not left greyed out.
         if (checkNow) {
-            checkNow.disabled = !page.nodes.length;
+            checkNow.disabled = !page.nodes.length || page.checking;
             checkNow.classList.toggle('d-none', !page.nodes.length);
         }
     }
 
+    // Answers the rows it showed, or null when it read nothing (a read already under way, or a failed one).
     async function loadNodes() {
-        if (page.loading) return;
+        if (page.loading) return null;
         page.loading = true;
         const r = await api('GET', '/api/nodes');
         page.loading = false;
@@ -275,7 +280,7 @@
             if (!page.loaded) {
                 $('#nodeList').innerHTML = `<div class="nd-state"><div class="alert alert-danger mb-0">${esc(errorText(r, "Couldn't load nodes"))}</div></div>`;
             }
-            return;
+            return null;
         }
         page.nodes = Array.isArray(r.data && r.data.nodes) ? r.data.nodes : [];
         page.appVersion = (r.data && r.data.app_version) || '';
@@ -284,6 +289,7 @@
         renderList();
         if (page.openId) refreshOpenNode();
         if (first) openFromHash();
+        return page.nodes;
     }
 
     function nodeById(id) {
@@ -300,10 +306,20 @@
 
     async function checkAll() {
         const btn = $('#nodesCheckNow');
+        page.checking = true;
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Checking…';
-        await Promise.all(page.nodes.map((n) => api('POST', `/api/nodes/${encodeURIComponent(n.id)}/check`)));
+        const r = await api('POST', '/api/nodes/check');
+        // Only reads begun after the request say whether its checks are done (a poll already under way doesn't).
+        let rows = r.ok && r.data && Array.isArray(r.data.nodes) ? r.data.nodes : [];
+        const until = Date.now() + CHECK_WAIT_MS;
+        while (rows.some((n) => n.checking) && Date.now() < until) {
+            await new Promise((resolve) => setTimeout(resolve, CHECK_POLL_MS));
+            rows = (await loadNodes()) || rows;
+        }
+        page.checking = false;
         btn.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>Check now';
+        btn.disabled = !page.nodes.length;
         await loadNodes();
     }
 

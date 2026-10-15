@@ -88,6 +88,8 @@ class NodeView:
     cpu_cores: int
     legacy: bool
     last_seen: float | None
+    # A health check is running or queued for it.
+    checking: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,8 @@ class _Live:
     offline_streak: int = 0
     next_check: float = 0.0
     checking: bool = False
+    # Check now asked for the quick access check too: the next check to finish runs it.
+    access_wanted: bool = False
     not_visible: deque = field(default_factory=lambda: deque(maxlen=64))
     access_problem: str = ""
     gpu_lost: str = ""
@@ -622,6 +626,31 @@ class NodeRegistry:
         self._run_check(node_id, access=True)
         return self.view(node_id)
 
+    def request_check(self, node_id: str) -> NodeView | None:
+        """Start the check :meth:`check_now` runs on the health checks' pool, and return at once.
+
+        A node that doesn't answer takes up to ~40 s to check (three attempts 4 s apart), far too long to hold a
+        web server thread for. A check already running or queued for the node answers this request too, so asking
+        again queues nothing more.
+
+        Returns:
+            The view now (``checking`` until the check is done), or None for an unknown node.
+        """
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None:
+                return None
+            if not live.record.get("enabled", True):
+                return self._view(live)
+            live.access_wanted = True
+            if live.checking:
+                return self._view(live)
+            live.checking = True
+            view = self._view(live)
+        self._submit(self._run_check, node_id, False, True)
+        return view
+
     def rescan_gpus(self, node_id: str) -> NodeView | None:
         """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back.
 
@@ -851,6 +880,7 @@ class NodeRegistry:
             cpu_cores=cores,
             legacy=live.legacy,
             last_seen=live.last_seen,
+            checking=live.checking,
         )
 
     def _touch(self) -> None:
@@ -897,6 +927,8 @@ class NodeRegistry:
                         return  # Settings changed while it ran: this answer is about an old address.
                     self._apply(live, outcome, number)
                     has_access_problem = bool(live.access_problem)
+                    access = access or live.access_wanted
+                    live.access_wanted = False
                 if outcome.uid and outcome.uid != record.get("node_uid"):
                     self._new_uid(node_id, live, record, outcome)
                 elif outcome.uid:
