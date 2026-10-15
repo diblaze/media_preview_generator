@@ -374,9 +374,9 @@ class TaskTable:
         self._finished_keep_s = finished_keep_s
         self._on_gpu_failed = on_gpu_failed
         self._tasks: dict[str, NodeTask] = {}
-        # When a task last filled the temp folder, and the free space that task started with. The folder reads full until
-        # it has more room than that, or a task started after it finishes; the app sends no files meanwhile.
-        self._filled: tuple[float, int | None] | None = None
+        # When a task last filled the temp folder, the free space that task started with, and whether another task's
+        # files were there too (:meth:`filled_problem` says until when it reads full); the app sends no files meanwhile.
+        self._filled: tuple[float, int | None, bool] | None = None
         # Task id -> when a DELETE found no such task (oldest first), so a start arriving after it never runs.
         self._deleted_unknown: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
@@ -504,7 +504,11 @@ class TaskTable:
         """The temp folder's problem after a task filled it up, while it lasts; None when no task did.
 
         Once the task's folder is removed the folder has room again, and a fresh check of it finds nothing wrong, so
-        without this the app would send the next big file straight back to fill it.
+        without this the app would send the next big file straight back to fill it. A task that filled the folder by
+        itself keeps it reading full until there is more room than that task started with. One that filled it beside
+        other tasks' files only shows the folder is too small for them all at once: it reads full until no task runs
+        and that room is back (until no task runs, when the room can't be read). A task started after the fill that
+        finishes clears it too.
 
         Returns:
             A sentence naming the folder and the free space that turned out too little, or None.
@@ -513,9 +517,15 @@ class TaskTable:
             filled = self._filled
         if filled is None or self.temp_root is None:
             return None
-        _started, free_then = filled
+        _started, free_then, shared = filled
         free_now = _free_bytes(self.temp_root)
-        if free_then is not None and free_now is not None and free_now > free_then + TEMP_ROOM_MADE_BYTES:
+        if free_then is None or free_now is None:
+            cleared = self.busy() == 0
+        elif shared:
+            cleared = self.busy() == 0 and free_now >= free_then - TEMP_ROOM_MADE_BYTES
+        else:
+            cleared = free_now > free_then + TEMP_ROOM_MADE_BYTES
+        if cleared:
             with self._lock:
                 if self._filled == filled:
                     self._filled = None
@@ -573,7 +583,8 @@ class TaskTable:
                 temp_problem, filled = temp_failure
                 if filled:
                     with self._lock:
-                        self._filled = (time.monotonic(), task.temp_free_at_start)
+                        shared = any(other is not task for other in self._tasks.values())
+                        self._filled = (time.monotonic(), task.temp_free_at_start, shared)
                 # The node's condition, not a bug: no traceback.
                 quiet.warning("Task {} ({}) failed: {}", task.id[:8], task.op, temp_problem)
                 task.finish(STATUS_FAILED, error={"kind": KIND_TEMP_FOLDER, "message": temp_problem})
