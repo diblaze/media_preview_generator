@@ -32,6 +32,7 @@ Import-light on purpose: Flask, loguru and the app's ``markers/publishers``, ``l
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import re
@@ -306,7 +307,9 @@ def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Iterator[s
     """Library Health's answer (``{"ok", "agent", "result": {"rows", "capability"}}``), in pieces as rows are read.
 
     The capability comes last: a read that fails partway, after the answer's status went out, ends the answer
-    without it, which the app reads as an answer it can't use rather than as a library with fewer files.
+    without it, which the app reads as an answer it can't use rather than as a library with fewer files. A failure
+    SQLite reports goes in the answer as its ``error`` too, so the app tells it as the refusal it is (a busy database
+    is tried again on the next run).
     """
 
     def dumps(value: Any) -> str:
@@ -328,7 +331,10 @@ def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Iterator[s
         out.append(f'}},"capability":{dumps(LIBRARY_HEALTH_CAPABILITY)}}}}}')
     except (sqlite3.Error, TypeError, ValueError) as exc:
         logger.warning("Library Health's rows stopped partway: {}", exc)
-        out.append("]}}}")
+        out.append("]}")
+        if isinstance(exc, sqlite3.Error):
+            out.append(f',"error":{dumps(plex_remote.error_to_json(publish_error_from_sqlite(exc)))}')
+        out.append("}}")
     yield "".join(out)
 
 
@@ -790,19 +796,23 @@ def register_plex_db(
         held = contextlib.ExitStack()
         try:
             conn = held.enter_context(database._database(read_only=True, deadline=_deadline(body)))
+            queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+            # Opening the file reads nothing: a locked or damaged database shows first at the first row, read here
+            # so it is refused as on every other route, not found after the answer's 200 went out.
+            first = list(itertools.islice(queries["parts"], 1))
         except PublishError as exc:
             held.close()
             return _refused(exc)
         except sqlite3.Error as exc:
             held.close()
             return _refused(publish_error_from_sqlite(exc))
+        queries["parts"] = itertools.chain(first, queries["parts"])
         # The rows go out as they are read, in one read of the database: a big library's rows held at once (and
         # their JSON) took a node past its memory limit. The connection and this request's slot stay held until the
         # answer is sent or the app hangs up.
         slot = g.pop("plex_db_slot", None)
         if slot is not None:
             held.callback(slots.give_back, slot)
-        queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
         return Response(_ClosingAnswer(_streamed_rows(queries), held), mimetype="application/json")
 
     app.register_blueprint(bp)
