@@ -5,9 +5,11 @@ Tests BIF generation, FFmpeg execution, progress parsing, path mapping,
 HDR detection, and the complete processing pipeline.
 """
 
+import json
 import os
 import shutil
 import struct
+import subprocess
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -35,6 +37,7 @@ from media_preview_generator.processing import (
     parse_ffmpeg_progress_line,
     record_failure,
 )
+from media_preview_generator.processing.generator import _video_details_from_ffprobe, read_media_info
 from media_preview_generator.processing.hdr_detection import (
     detect_dolby_vision_rpu_error as _detect_dolby_vision_rpu_error,
 )
@@ -1486,6 +1489,54 @@ class TestDetailsMediaInfoCantRead:
         assert success and image_count >= 3
         assert len(os.listdir(tmp_path / "frames")) == image_count
         assert len(warnings) == 1 and video_mediainfo_cant_read in warnings[0], warnings
+
+
+class TestDetailsMediaInfoCantReadKeepsHdrAndRotation:
+    """When MediaInfo's answer can't be read, ffprobe still tells an HDR file from an SDR one, and its rotation."""
+
+    def test_hdr10_clip_is_still_seen_as_hdr(self, hdr10_video_mediainfo_cant_read):
+        track = read_media_info(hdr10_video_mediainfo_cant_read).video_tracks[0]
+        assert is_hdr_transfer(track.transfer_characteristics)
+
+    def test_hdr10_clip_gets_the_tone_mapping_path(self, hdr10_video_mediainfo_cant_read, mock_config, tmp_path):
+        mock_config.ffmpeg_path = shutil.which("ffmpeg")
+        mock_config.plex_bif_frame_interval = 1
+        infos: list[str] = []
+        sink = logger.add(lambda m: infos.append(m.record["message"]), level="INFO")
+        try:
+            with failure_scope("mediainfo-cant-read-hdr"):
+                success, *_ = generate_images(
+                    hdr10_video_mediainfo_cant_read, str(tmp_path / "frames"), None, None, mock_config
+                )
+        finally:
+            logger.remove(sink)
+        assert success
+        assert any("HDR transfer detected" in m for m in infos), infos
+
+    @pytest.mark.parametrize(
+        "side_data,expected",
+        [
+            pytest.param([{"rotation": -90}], {"Rotation": "90"}, id="turned-90-clockwise"),
+            pytest.param([{"rotation": 180}], {"Rotation": "180"}, id="upside-down"),
+            pytest.param(
+                [{"dv_profile": 5, "dv_bl_signal_compatibility_id": 0}], {"HDR_format": "Dolby Vision"}, id="dv-p5"
+            ),
+            pytest.param(
+                [{"dv_profile": 8, "dv_bl_signal_compatibility_id": 1}],
+                {"HDR_format": "Dolby Vision", "Transfer_characteristics": "PQ"},
+                id="dv-p8-hdr10-base",
+            ),
+        ],
+    )
+    def test_side_data_is_mapped_to_mediainfo_fields(self, side_data, expected):
+        stream = json.dumps({"streams": [{"color_transfer": "unknown", "side_data_list": side_data}]})
+        done = subprocess.CompletedProcess([], 0, stdout=stream)
+        with patch("media_preview_generator.processing.generator.subprocess.run", return_value=done):
+            assert _video_details_from_ffprobe("x.mkv") == expected
+
+    def test_a_file_ffprobe_cant_read_is_one_track_with_no_details(self):
+        with patch("media_preview_generator.processing.generator.subprocess.run", side_effect=OSError):
+            assert _video_details_from_ffprobe("x.mkv") == {}
 
 
 class TestDVNoBackwardCompat:

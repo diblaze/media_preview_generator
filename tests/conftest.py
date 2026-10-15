@@ -425,6 +425,34 @@ def video_mediainfo_cant_read(tmp_path_factory) -> str:
     pytest.skip("this MediaInfo writes the tag into XML pymediainfo can read")
 
 
+@pytest.fixture(scope="session")
+def hdr10_video_mediainfo_cant_read(tmp_path_factory) -> str:
+    """Like ``video_mediainfo_cant_read``, but an HDR10 (PQ) clip: only FFmpeg and ffprobe can say it is HDR."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    from pymediainfo import MediaInfo
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg and ffprobe")
+    path = tmp_path_factory.mktemp("mediainfo-cant-read-hdr") / "Tagged HDR (2020).mkv"
+    result = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=4:s=64x36:r=5",
+         "-vf", "setparams=color_trc=smpte2084:colorspace=bt2020nc:color_primaries=bt2020",
+         "-c:v", "libx264", "-metadata", "title=q￿r", str(path)],
+        capture_output=True,
+        timeout=60,
+    )  # fmt: skip
+    if result.returncode != 0:
+        pytest.skip("needs ffmpeg with libx264")
+    try:
+        MediaInfo.parse(str(path))
+    except ET.ParseError:
+        return str(path)
+    pytest.skip("this MediaInfo writes the tag into XML pymediainfo can read")
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for tests that is cleaned up afterwards."""

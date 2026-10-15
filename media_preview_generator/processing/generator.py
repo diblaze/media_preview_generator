@@ -1835,24 +1835,56 @@ def _thumbnails_lost_their_colour(output_folder: str) -> bool:
     return True
 
 
-# What a file MediaInfo can't read is taken to hold: one video track with nothing known about it, in the XML layout
-# pymediainfo's constructor reads.
-_UNREAD_MEDIA_INFO_XML = '<Mediainfo><File><track type="Video"/></File></Mediainfo>'
+_FFPROBE_TRANSFER_TO_MEDIAINFO = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
+_FFPROBE_FALLBACK_TIMEOUT_S = 30
+
+
+def _video_details_from_ffprobe(video_file: str) -> dict[str, str]:
+    """The HDR and rotation details of the first video stream, in MediaInfo's field names; empty if ffprobe can't say.
+
+    Args:
+        video_file: The file.
+
+    Returns:
+        ``Transfer_characteristics`` (PQ or HLG), ``HDR_format`` (Dolby Vision) and ``Rotation`` (clockwise degrees),
+        for those the stream declares.
+    """
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", video_file]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFPROBE_FALLBACK_TIMEOUT_S, check=False)
+        stream = json.loads(proc.stdout or "{}")["streams"][0]
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError, TypeError):
+        return {}
+    details: dict[str, str] = {}
+    transfer = _FFPROBE_TRANSFER_TO_MEDIAINFO.get(str(stream.get("color_transfer")))
+    for side_data in stream.get("side_data_list") or []:
+        if "dv_profile" in side_data:
+            details["HDR_format"] = "Dolby Vision"
+            # Profile 5 (compatibility id 0) has no HDR10/HLG base layer: MediaInfo declares no transfer for it.
+            transfer = {0: None, 1: "PQ", 4: "HLG"}.get(side_data.get("dv_bl_signal_compatibility_id"), transfer)
+        if "rotation" in side_data:
+            # ffprobe's angle is counter-clockwise; MediaInfo's is clockwise.
+            with contextlib.suppress(TypeError, ValueError):
+                details["Rotation"] = str(round(-float(side_data["rotation"])) % 360)
+    if transfer:
+        details["Transfer_characteristics"] = transfer
+    return details
 
 
 def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
-    """The file's details as MediaInfo reads them; a file it can't read is one video track with none, and one warning.
+    """The file's details as MediaInfo reads them; a file it can't read gets its HDR and rotation from ffprobe, and
+    one warning.
 
     MediaInfo copies a tag into its XML as it is, so a title holding U+FFFF makes the XML unreadable and pymediainfo
-    raises ``ParseError``. FFmpeg reads the file fine, so it is processed as one that declares nothing (SDR, no
-    runtime) rather than failed over a tag.
+    raises ``ParseError``. FFmpeg reads the file fine, so it is processed on what ffprobe says about its HDR and
+    rotation (an HDR file is still tone mapped) rather than failed over a tag.
 
     Args:
         video_file: The file.
         **parse_options: Passed on to ``MediaInfo.parse`` (``parse_speed``).
 
     Returns:
-        The file's details, or a video track with none when MediaInfo's answer can't be read.
+        The file's details, or a video track holding ffprobe's HDR and rotation when MediaInfo's answer can't be read.
 
     Raises:
         OSError: The file is missing, or the MediaInfo library can't be loaded.
@@ -1860,9 +1892,14 @@ def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
     """
     try:
         return MediaInfo.parse(video_file, **parse_options)
-    except (ET.ParseError, ValueError) as exc:
-        logger.warning("MediaInfo couldn't read the details of {} ({}); carrying on without them.", video_file, exc)
-        return MediaInfo(_UNREAD_MEDIA_INFO_XML)
+    except ET.ParseError as exc:
+        logger.warning(
+            "MediaInfo couldn't read the details of {} ({}); using what ffprobe says about its HDR and rotation.",
+            video_file,
+            exc,
+        )
+        fields = "".join(f"<{name}>{value}</{name}>" for name, value in _video_details_from_ffprobe(video_file).items())
+        return MediaInfo(f'<Mediainfo><File><track type="Video">{fields}</track></File></Mediainfo>')
 
 
 def display_rotation(media_info: MediaInfo) -> int:
