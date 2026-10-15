@@ -645,6 +645,16 @@ class TestRunDecode:
             (218, H264_HIGH_444_ON_VAAPI, "the GPU can't decode this file's H.264 video (ffmpeg exited 218)", "codec"),
             (
                 218,
+                # The GPU decoded these frames: its filter chain refused them, not a codec it lacks.
+                "  Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160\n"
+                "Impossible to convert between the formats supported by the filter 'graph -1 input from stream 0:0' "
+                "and the filter 'auto_scale_0'\n"
+                "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n",
+                "the GPU's decoder hit a hardware or driver error (ffmpeg exited 218)",
+                "hwaccel",
+            ),
+            (
+                218,
                 "[h264 @ 0x1] Failed to create decode context: 2 (resource allocation failed).\n"
                 "[h264 @ 0x1] Failed setup for format cuda: hwaccel initialisation returned error.\n"
                 "[vf#0:0 @ 0x2] Error reinitializing filters!\nConversion failed!\n",
@@ -672,6 +682,7 @@ class TestRunDecode:
             "hwaccel",
             "codec-h264-profile-the-gpu-lacks",
             "codec-h264-profile-vaapi-has-no-decoder-for",
+            "hwaccel-gpu-decoded-frames-the-filters-refuse",
             "hwaccel-init-failed-without-that-verdict",
             "io-error",
             "anything-else",

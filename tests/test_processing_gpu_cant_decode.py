@@ -339,9 +339,10 @@ class TestAProfileTheGpuLacks:
         assert outcome.result.kind == "codec"
 
 
-def _software_frames_refused(scaler: str) -> list[str]:
-    """How the run ends when FFmpeg decoded in software: the GPU scaler (``scale_vaapi``, ``scale_cuda``) can't take
-    the frames, so the filter graph fails before writing one and FFmpeg exits 218."""
+def _frames_refused(scaler: str) -> list[str]:
+    """How the run ends when the GPU scaler (``scale_vaapi``, ``scale_cuda``) can't take the frames: software-decoded
+    ones, or GPU frames in a format the filter chain doesn't take. The filter graph fails before writing a frame and
+    FFmpeg exits 218."""
     return [
         "Impossible to convert between the formats supported by the filter 'Parsed_fps_0' and the filter "
         "'auto_scale_0'",
@@ -379,7 +380,7 @@ class TestACodecTheGpuHasNoDecoderFor:
                 [
                     "Stream #0:0: Video: msmpeg4v3 (msmpeg4) (MP43 / 0x3334504D), yuv420p, 640x360, 369 kb/s, "
                     "SAR 1:1 DAR 16:9, 24 fps, 24 tbr, 24 tbn",
-                    *_software_frames_refused("scale_vaapi"),
+                    *_frames_refused("scale_vaapi"),
                 ],
                 id="divx3-on-vaapi",
             ),
@@ -388,7 +389,7 @@ class TestACodecTheGpuHasNoDecoderFor:
                 [
                     "Stream #0:0: Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), 640x360 "
                     "[SAR 1:1 DAR 16:9], 24 fps, 24 tbr, 1k tbn",
-                    *_software_frames_refused("scale_vaapi"),
+                    *_frames_refused("scale_vaapi"),
                 ],
                 id="h264-high-444-on-vaapi",
             ),
@@ -397,7 +398,7 @@ class TestACodecTheGpuHasNoDecoderFor:
                 [
                     "Stream #0:0: Video: wmv2 (WMV2 / 0x32564D57), yuv420p, 640x360, 356 kb/s, SAR 1:1 DAR 16:9, "
                     "24 fps, 24 tbr, 24 tbn",
-                    *_software_frames_refused("scale_cuda"),
+                    *_frames_refused("scale_cuda"),
                 ],
                 id="wmv8-on-nvdec",
             ),
@@ -409,7 +410,7 @@ class TestACodecTheGpuHasNoDecoderFor:
                     # VAAPI's own verdict: the driver lists no profile for the codec.
                     "[mpeg4 @ 0x5cc6e7411600] No support for codec mpeg4 profile 0.",
                     "[mpeg4 @ 0x5cc6e7411600] Failed setup for format vaapi: hwaccel initialisation returned error.",
-                    *_software_frames_refused("scale_vaapi"),
+                    *_frames_refused("scale_vaapi"),
                 ],
                 id="mpeg4-part2-on-vaapi",
             ),
@@ -421,7 +422,7 @@ class TestACodecTheGpuHasNoDecoderFor:
                     # VAAPI's verdict for a profile it lacks, printed only at the -loglevel debug of DEBUG logging.
                     "[h264 @ 0x5fd8fa87d040] Codec h264 profile 110 not supported for hardware decode.",
                     "[h264 @ 0x5fd8fa87d040] Failed setup for format vaapi: hwaccel initialisation returned error.",
-                    *_software_frames_refused("scale_vaapi"),
+                    *_frames_refused("scale_vaapi"),
                 ],
                 id="h264-high10-on-vaapi-debug-log",
             ),
@@ -437,9 +438,50 @@ class TestACodecTheGpuHasNoDecoderFor:
     def test_a_driver_failure_before_the_software_decode_stays_a_hardware_accelerator_error(self, run):  # noqa: F811
         # A decoder whose GPU set-up failed in the driver falls back to software too, and ends the same way.
         outcome = run(
-            [(SOFTWARE_FRAMES_EXIT, 0, *HEVC_HWACCEL_INIT_ONLY, *_software_frames_refused("scale_vaapi"))],
+            [(SOFTWARE_FRAMES_EXIT, 0, *HEVC_HWACCEL_INIT_ONLY, *_frames_refused("scale_vaapi"))],
             gpu="INTEL",
         )
 
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+
+    @pytest.mark.parametrize(
+        ("gpu", "stream", "scaler"),
+        [
+            pytest.param(
+                "INTEL",
+                "Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160, 23.98 fps",
+                "scale_vaapi",
+                id="hevc-main10-on-vaapi",
+            ),
+            pytest.param(
+                "NVIDIA",
+                "Stream #0:0(eng): Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, 23.98 fps",
+                "scale_cuda",
+                id="h264-high-on-nvdec",
+            ),
+        ],
+    )
+    def test_frames_of_a_codec_the_gpu_decodes_are_refused_as_a_gpu_error(self, run, gpu, stream, scaler):  # noqa: F811
+        """The GPU decoded these frames, so the filter chain failed on the GPU (a 10-bit surface into an 8-bit chain):
+        the hand-off says to check the GPU, and a node re-checks its GPU, rather than calling it a codec."""
+        outcome = run([(SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused(scaler))], gpu=gpu)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "hwaccel"
+
+    def test_a_driver_error_in_an_earlier_run_stays_a_hardware_accelerator_error(self, run):  # noqa: F811
+        stream = "Stream #0:0: Video: msmpeg4v3 (msmpeg4) (MP43 / 0x3334504D), yuv420p, 640x360, 24 fps"
+        driver_error = "[AVHWFramesContext @ 0x6470e4f1a2c0] Failed to create surface: 2 (resource allocation failed)."
+        outcome = run(
+            [
+                (SOFTWARE_FRAMES_EXIT, 0, stream, driver_error, *_frames_refused("scale_vaapi")),
+                (SOFTWARE_FRAMES_EXIT, 0, stream, *_frames_refused("scale_vaapi")),
+            ],
+            gpu="INTEL",
+            keyframe_gap=1.0,
+        )
+
+        assert [c["use_skip"] for c in outcome.calls] == [True, False]
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "hwaccel"

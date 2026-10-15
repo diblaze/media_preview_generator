@@ -214,6 +214,33 @@ NO_DECODER_PHRASE = "no decoder found for"
 # say the phrase above. The wording in the brackets depends on the build.
 _KEYFRAME_OPTION_UNUSED_RE = re.compile(r"Codec AVOption skip_frame(?::v)? \(.*\) is not a decoding option")
 _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
+# The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
+# in software, nor GPU frames in a format the chain wasn't built for.
+_FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
+# The input's video codec as FFmpeg lists it: "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p, ...".
+_INPUT_VIDEO_CODEC_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)")
+# Codecs FFmpeg has a GPU decoder for on NVDEC, VAAPI, D3D11VA or VideoToolbox. It decodes any other (DivX 3, WMV 7/8)
+# in software on every GPU, without a word at -loglevel info.
+_GPU_DECODABLE_CODECS = frozenset(
+    {
+        "av1",
+        "h263",
+        "h264",
+        "hevc",
+        "mjpeg",
+        "mpeg1video",
+        "mpeg2video",
+        "mpeg4",
+        "prores",
+        "vc1",
+        "vp8",
+        "vp9",
+        "vvc",
+        "wmv3",
+    }
+)
+# H.264 profiles FFmpeg offers no VAAPI or D3D11VA decoder for. NVDEC tries them and says it lacks the capabilities.
+_H264_SOFTWARE_ONLY_CHROMA = ("4:2:2", "4:4:4")
 NO_DECODER_SUMMARY = "This file's video can't be decoded by any device (unknown or protected codec)"
 
 # A failure log keeps this many lines from each end: one file's stderr reached 280,594 lines (21 MB).
@@ -829,11 +856,19 @@ def _gpu_hand_off(
     )
     if should_fallback and reason == "codec error":
         return FALLBACK_CODEC, reason
+    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
+    # A decoder whose GPU set-up failed in the driver falls back to software and ends the same way, so this counts
+    # only without a driver error in any run.
+    if frames_refused and _decoded_in_software(stderr_lines) and not _detect_hwaccel_runtime_error(stderr_lines_all):
+        return FALLBACK_CODEC, "codec error"
     # Judged on the last run's own stderr: a GPU error in an earlier tier's run doesn't make this run's plain 251 one.
     if _io_cut_off(rc, stderr_lines):
         return FALLBACK_IO_ERROR, "I/O error"
     if should_fallback and reason == "hardware accelerator runtime error":
         return FALLBACK_HWACCEL, reason
+    # The GPU decoded the frames, so its filter chain failed on them (a 10-bit surface into an 8-bit chain).
+    if frames_refused:
+        return FALLBACK_HWACCEL, "the GPU's filters couldn't take the decoded frames"
     if should_fallback:
         return FALLBACK_SIGNAL, reason or "signal kill"
     if rc == FFMPEG_SIGNALLED_EXIT:
@@ -841,6 +876,27 @@ def _gpu_hand_off(
     if stopped_part_way:
         return FALLBACK_STOPPED_PART_WAY, "GPU run stopped part-way"
     return None
+
+
+def _decoded_in_software(stderr_lines: list[str]) -> bool:
+    """Whether FFmpeg decodes this video in software on a GPU worker, told by its codec and profile.
+
+    Args:
+        stderr_lines: One FFmpeg run's stderr, with FFmpeg's listing of the input.
+
+    Returns:
+        True when FFmpeg has no GPU decoder for the input's video (DivX 3, WMV 7/8, H.264 4:2:2 or 4:4:4 on VAAPI);
+        False when it has one, or the listing is missing.
+    """
+    for line in stderr_lines:
+        found = _INPUT_VIDEO_CODEC_RE.match(line)
+        if found is None or "(attached pic)" in line:
+            continue
+        codec = found.group(1)
+        if codec == "h264":
+            return any(chroma in line for chroma in _H264_SOFTWARE_ONLY_CHROMA)
+        return codec not in _GPU_DECODABLE_CODECS
+    return False
 
 
 def _without_metadata_tags(stderr_lines: list[str]) -> list[str]:
@@ -1162,12 +1218,6 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
     for pattern in codec_error_patterns:
         if pattern in stderr_text:
             return True
-
-    # FFmpeg has no GPU decoder for some codecs (DivX 3, WMV, H.264 4:2:2 or 4:4:4 on VAAPI): it decodes them in
-    # software without a word at -loglevel info, and the GPU scaler can't take the frames. A decoder whose GPU set-up
-    # failed in the driver falls back to software and ends the same way, so this counts only without a driver error.
-    if "impossible to convert between the formats" in stderr_text and not _detect_hwaccel_runtime_error(stderr_lines):
-        return True
 
     # Check exit codes that may indicate codec issues
     # -22 (EINVAL) - invalid argument, often codec-related
