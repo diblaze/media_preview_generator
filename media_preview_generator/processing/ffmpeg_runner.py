@@ -153,6 +153,7 @@ def create_ffmpeg_runner(
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
     # once per media file, not once per FFmpeg invocation.
     from .generator import (
+        _FOLDER_WRITE_TEXT,
         FFMPEG_STALL_TIMEOUT_SEC,
         NO_DECODER_PHRASE,
         CancellationError,
@@ -776,7 +777,7 @@ def create_ffmpeg_runner(
         if proc.returncode != 0 and not stalled and not gpu_cant_decode and not chapter_without_frame:
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
             no_decoder = exit_diagnosis == "no_decoder"
-            refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines)
+            refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
                 folder, setting = working_folder_hint()
@@ -787,7 +788,7 @@ def create_ffmpeg_runner(
                     video_file,
                     folder,
                     output_folder,
-                    os.strerror(refused),
+                    _FOLDER_WRITE_TEXT[refused][0],
                     proc.returncode,
                     fix,
                     setting,
@@ -845,8 +846,9 @@ def create_ffmpeg_runner(
                     proc.returncode,
                     video_file,
                 )
-            elif _io_cut_off(proc.returncode, ffmpeg_output_lines):
+            elif refused is None and _io_cut_off(proc.returncode, ffmpeg_output_lines):
                 # Exit 251 with a GPU error in the stderr is the GPU's, not a disk's: the stderr lines below say so.
+                # One the folder refused (it couldn't create a frame file) was said above.
                 folder, setting = working_folder_hint()
                 logger.warning(
                     "FFmpeg hit an I/O error on {}: reading the video from its disk or network share, or writing "

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
 import os
 import time
 from dataclasses import replace
@@ -13,11 +15,13 @@ import pytest
 
 from media_preview_generator.bif_reader import read_bif_metadata
 from media_preview_generator.output.plex_hash import get_source_fingerprint
+from media_preview_generator.processing import CodecNotSupportedError
 from media_preview_generator.processing.frame_cache import (
     FrameCache,
     get_frame_cache,
     reset_frame_cache,
 )
+from media_preview_generator.processing.generator import WorkingFolderError
 from media_preview_generator.processing.multi_server import (
     MultiServerStatus,
     process_canonical_path,
@@ -152,6 +156,22 @@ class TestCacheValidity:
 
         assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
         assert len(cache) == 0  # entry was evicted on lookup
+
+    @pytest.mark.parametrize("left", [0, 1], ids=["emptied", "partly-emptied"])
+    def test_a_slot_that_lost_frames_since_they_were_stored_misses(self, tmp_path, left):
+        """A regenerate empties the slot before extracting into it; the entry mustn't send a BIF writer to what's left."""
+        cache = FrameCache(tmp_path / "cache")
+        media = tmp_path / "m.mkv"
+        media.write_bytes(b"x")
+        slot = cache.frame_dir_for(str(media))
+        _populate_real_jpgs(slot, count=3)
+        cache.put(str(media), frame_dir=slot, frame_count=3, extraction_key=_EXTRACTION_KEY)
+
+        for jpg in sorted(slot.glob("*.jpg"))[left:]:
+            jpg.unlink()
+
+        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
+        assert len(cache) == 0
 
     def test_missing_source_file_invalidates(self, tmp_path):
         cache = FrameCache(tmp_path / "cache")
@@ -679,6 +699,63 @@ class TestDispatcherIntegration:
 
         # regenerate=True forces a fresh extraction, no cache shortcut.
         assert gen.call_count == 2
+
+    @pytest.mark.parametrize("failure", ["no-frames", "cpu-hand-off", "folder-full", "error"])
+    def test_a_failed_regenerate_leaves_no_entry_for_the_frames_it_deleted(self, mock_config, tmp_path, failure):
+        """A regenerate skips the cache lookup but extracts into the same slot, emptying it first. When it fails, the
+        next dispatch within the TTL extracts again instead of packing the emptied slot into an empty BIF."""
+        mock_config.tmp_folder = str(tmp_path / "tmp")
+        mock_config.working_tmp_folder = str(tmp_path / "tmp")
+        media = tmp_path / "movies" / "Test.mkv"
+        _seed_canonical_file(media)
+        registry = ServerRegistry.from_settings(
+            [
+                {
+                    "id": "emby-1",
+                    "type": "emby",
+                    "name": "Emby",
+                    "enabled": True,
+                    "url": "http://emby:8096",
+                    "auth": {},
+                    "libraries": [
+                        {"id": "1", "name": "Movies", "remote_paths": [str(tmp_path / "movies")], "enabled": True}
+                    ],
+                    "output": {"adapter": "emby_sidecar", "width": 320, "frame_interval": 10},
+                }
+            ],
+        )
+        sidecar = media.parent / "Test-320-10.bif"
+        runs: list[str] = []
+
+        def fake_generate_images(video_file, output_folder, *args, **kwargs):
+            # generate_images empties the slot first, so a run only counts the frames it made itself.
+            for jpg in Path(output_folder).glob("*.jpg"):
+                jpg.unlink()
+            runs.append(output_folder)
+            if len(runs) == 2:
+                if failure == "cpu-hand-off":
+                    raise CodecNotSupportedError("GPU processing failed (I/O error)", kind="io_error")
+                if failure == "folder-full":
+                    raise WorkingFolderError(errno.ENOSPC, "No space left on device", output_folder)
+                if failure == "error":
+                    raise RuntimeError("FFmpeg went away")
+                return (False, 0, False, 1.0, "1x", "Error muxing a packet")
+            _populate_real_jpgs(Path(output_folder), count=3)
+            return (True, 3, False, 1.0, "30x", None)
+
+        with patch("media_preview_generator.processing.multi_server.generate_images", side_effect=fake_generate_images):
+            first = process_canonical_path(canonical_path=str(media), registry=registry, config=mock_config)
+            with contextlib.suppress(CodecNotSupportedError):
+                process_canonical_path(
+                    canonical_path=str(media), registry=registry, config=mock_config, regenerate=True
+                )
+            sidecar.unlink(missing_ok=True)
+            third = process_canonical_path(canonical_path=str(media), registry=registry, config=mock_config)
+
+        assert first.status is MultiServerStatus.PUBLISHED
+        assert len(runs) == 3, "the third dispatch reused the slot the failed regenerate emptied"
+        assert third.status is MultiServerStatus.PUBLISHED
+        assert read_bif_metadata(str(sidecar)).frame_count == 3
 
     def test_use_frame_cache_false_uses_adhoc_tmp(self, mock_config, tmp_path):
         mock_config.working_tmp_folder = str(tmp_path / "tmp")

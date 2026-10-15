@@ -262,6 +262,18 @@ class TestPublication:
         assert destination.read_bytes()[80:] == image
         assert not list(tmp_path.glob(".*.bif-tmp"))
 
+    def test_no_thumbnails_writes_nothing_and_keeps_the_old_bif(self, tmp_path, config):
+        out_dir = tmp_path / "Indexes"
+        out_dir.mkdir()
+        bif = out_dir / "index-sd.bif"
+        generate_bif(str(bif), _frames(tmp_path / "old", 4), config)
+
+        with pytest.raises(ValueError, match="no thumbnails"):
+            generate_bif(str(bif), _frames(tmp_path / "emptied", 0), config)
+
+        assert sorted(os.listdir(out_dir)) == ["index-sd.bif"]
+        assert _image_count(bif) == 4
+
     @pytest.mark.parametrize("existing", [False, True])
     @pytest.mark.parametrize("failure", ["missing_image", "replace"])
     def test_failed_publication_preserves_destination_and_removes_staging(
