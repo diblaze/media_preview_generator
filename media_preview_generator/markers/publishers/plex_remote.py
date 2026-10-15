@@ -88,7 +88,8 @@ class AgentUnreachableError(AgentError):
 
 def _version_tuple(version: str) -> tuple[int, ...] | None:
     parts = str(version or "").strip().split(".")
-    if not parts or not all(p.isdigit() for p in parts):
+    # isascii: "²" is a digit to isdigit() but not to int(); the length keeps int() under its digit limit.
+    if not parts or not all(p.isascii() and p.isdigit() and len(p) <= 9 for p in parts):
         return None
     return tuple(int(p) for p in parts)
 

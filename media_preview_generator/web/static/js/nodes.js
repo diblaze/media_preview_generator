@@ -78,6 +78,7 @@
         access_problem: ['bad', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
         no_ffmpeg: ['bad', 'FFmpeg missing'],
+        duplicate: ['warn', 'Added twice'],
         offline: ['bad', 'Offline'],
         key_refused: ['bad', 'Key refused'],
         connecting: ['off', 'Connecting…'],

@@ -6,8 +6,9 @@ Library Health's database counts (1.2.0 and newer).
 
 This is the container that used to be called the **Plex marker agent**. It is now the Plex database role of a
 Media Preview Generator *node* (the app's code in `media_preview_generator/nodes/server/`), but nothing you set up
-changes: the same image, the same `AGENT_TOKEN`, the same port and the same address in the app. An existing helper
-keeps working with this app, and a 1.2.0 helper keeps working with an older app.
+changes: the same image, the same key (an existing install's `AGENT_TOKEN` keeps working), the same port and the
+same address in the app. An existing helper keeps working with this app, and a 1.2.0 helper keeps working with an
+older app.
 
 You only need it in that one case. If the app and Plex already run on the same machine, don't run this — the app
 writes Plex's database itself.
@@ -65,13 +66,14 @@ It refuses exactly what the in-process writer refuses, because it *is* the in-pr
 ## Running it
 
 `docker-compose.yml` is in this folder; everything that has to match your machine lives in `.env` beside it.
-`AGENT_TOKEN` and `PLEX_CONFIG` have no default — leave either out and compose stops with a message naming it,
-instead of starting an agent with nothing mounted. `PUID`/`PGID` do fall back to `1000`, so set them if Plex runs
-as anyone else: an agent running as the wrong user starts and reports healthy, then writes no markers at all.
+`PLEX_CONFIG` has no default — leave it out and compose stops with a message naming it, instead of starting an
+agent with nothing mounted. Without `NODE_KEY` the node makes a key of its own and prints it once in `docker logs`.
+`PUID`/`PGID` do fall back to `1000`, so set them if Plex runs as anyone else: an agent running as the wrong user
+starts and reports healthy, then writes no markers at all.
 
 ```bash
 {
-  printf 'AGENT_TOKEN=%s\n' "$(openssl rand -hex 24)"
+  printf 'NODE_KEY=%s\n' "$(openssl rand -hex 24)"
   printf 'PLEX_CONFIG=%s\n' /path/to/plex/config
   printf 'PUID=%s\nPGID=%s\n' 1000 1000
 } > .env
@@ -85,7 +87,7 @@ The node can be chosen there while Intro & Credits remains off. Chapter thumbnai
 checkbox in the General tab and do not require marker consent or Plex Pass.
 
 Without compose — note `--env-file .env`, so the key comes out of the file you just wrote rather than an empty
-shell variable (with an empty `AGENT_TOKEN` the node generates a key of its own, which the app doesn't have):
+shell variable (with an empty `NODE_KEY` the node generates a key of its own, which the app doesn't have):
 
 ```bash
 # --user takes no .env value here; put the uid:gid that owns Plex's database in it yourself.
@@ -102,7 +104,8 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 
 | Setting | What it is |
 |---|---|
-| `AGENT_TOKEN` | The key both sides share: printable ASCII with no spaces. Never logged. (`NODE_KEY` is the node server's name for it; either works.) Compose requires it; without either, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. |
+| `NODE_KEY` | The key both sides share: at least 16 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. |
+| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (any length, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. |
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
 | `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
@@ -187,7 +190,7 @@ as before, and its "Keep Plex's" keeps stale markers even where the app has an a
 ## The contract
 
 Everything is `POST` with a JSON body, except `/v1/health` and `/v1/ping`. Every request carries
-`Authorization: Bearer <AGENT_TOKEN>` and `X-Marker-Agent-Protocol: 1`; every answer carries
+`Authorization: Bearer <key>` and `X-Marker-Agent-Protocol: 1`; every answer carries
 `{"agent": {"version", "protocols", "capabilities"}}`.
 
 | Endpoint | What it does | Answers |
@@ -217,7 +220,7 @@ sides, so they can't disagree about a field.
 | What you see | What it means |
 |---|---|
 | **Can't reach it** | The agent isn't running, or the address or port is wrong. Markers wait; nothing is lost. |
-| **Key refused** | The keys don't match. Set the same `AGENT_TOKEN` on both sides. |
+| **Key refused** | The keys don't match. Paste the node's key (its `NODE_KEY` or `AGENT_TOKEN`, or the one it printed in `docker logs`) into the app's node. |
 | **Update needed** | The app and the agent are different versions. The message says which side to update. |
 | "is next to a different Plex server" | The address points at the agent of another Plex. Both sides compare Plex's own machine identifier, so markers never go into the wrong database. |
 | "Plex's database is on a network share" | The *agent's* mount is a network share. It has to be a local disk on the Plex machine. |

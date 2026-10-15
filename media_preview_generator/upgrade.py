@@ -573,11 +573,9 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         if isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed:
             sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
             existing = {}
-        # An unread notice's backup, while still on disk, is the copy that matches the "from" version the card
-        # keeps reporting; this boot's snapshot is from a later version.
-        earlier_backup = existing.get("backup")
-        if isinstance(earlier_backup, str) and os.path.isfile(earlier_backup):
-            bak_path = earlier_backup
+        # The card always names this boot's snapshot, never an unread notice's older one: rolling back means
+        # restoring the settings as this build found them (an older notice's copy can be from a fresh install's
+        # first boot, holding nothing), and only the build that wrote them reads them as they are.
         # An existing notice's notes are unread, so merge into it rather than overwrite it —
         # regardless of whether this boot is a real version move or a retry-only boot.
         merged_notes = list(existing.get("notes") or [])
@@ -937,21 +935,29 @@ def _migrate_to_v7(sm) -> list:
     are *not* removed yet — the read path continues to honour them so
     Phase 1 ships the schema change without breaking existing single-Plex
     deployments. A later migration removes them once all callers have
-    been routed through the server registry.
+    been routed through the server registry. The Plex Direct webhook keys
+    (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto the
+    synthesised server's ``output``.
     """
     notes: list[str] = []
     if sm.get("media_servers") is not None:
         return notes
 
+    webhook_keys = [key for key in ("plex_webhook_public_url", "plex_webhook_enabled") if sm.get(key) is not None]
     entry = _legacy_plex_to_media_server(sm)
     if entry is None:
         # Fresh install: write an empty list so callers can rely on the key
         # always being present.
-        sm.apply_changes(updates={"media_servers": []})
+        sm.apply_changes(updates={"media_servers": []}, deletes=webhook_keys)
         notes.append("v7: initialised empty media_servers array")
         return notes
 
-    sm.apply_changes(updates={"media_servers": [entry]})
+    webhook_url = (sm.get("plex_webhook_public_url") or "").strip()
+    if webhook_url:
+        entry["output"]["webhook_public_url"] = webhook_url
+    if sm.get("plex_webhook_enabled") is not None:
+        entry["output"]["webhook_enabled"] = bool(sm.get("plex_webhook_enabled"))
+    sm.apply_changes(updates={"media_servers": [entry]}, deletes=webhook_keys)
     notes.append("v7: synthesised media_servers[0] from legacy plex_* settings")
     return notes
 
@@ -1825,8 +1831,9 @@ def _migrate_to_v24(sm) -> list[str]:
 
     ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
     (the address and key now live only on the node record). Servers that share one helper (same address and key)
-    share one node. The node is on when a server uses it: the helper switched on, Intro & Credits on and the server
-    itself on. Otherwise it is added turned off, so a helper nothing uses is never checked or reported offline.
+    share one node. The node is on when a server had the helper switched on, whatever Intro & Credits says: chapter
+    thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off everywhere becomes a
+    node turned off, so it is never checked or reported offline.
 
     A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
     that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
@@ -1880,16 +1887,15 @@ def _migrate_to_v24(sm) -> list[str]:
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})
             continue
-        in_use = enabled and bool(markers.get("enabled")) and entry.get("enabled", True) is not False
         node = by_address.get((url, token))
         if node is None:
             name = _helper_node_name(str(entry.get("name") or "").strip() or "Plex", names, NAME_MAX_LEN)
             names.add(name.casefold())
-            node = default_record(name=name, url=url, key=token, enabled=in_use)
+            node = default_record(name=name, url=url, key=token, enabled=enabled)
             nodes.append(node)
             by_address[(url, token)] = node
             created += 1
-        elif in_use and not node.get("enabled"):
+        elif enabled and not node.get("enabled"):
             node["enabled"] = nodes_changed = True
         agent.update({"enabled": enabled, "node_id": node["id"]})
     if not changed:

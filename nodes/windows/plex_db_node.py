@@ -24,6 +24,9 @@ from loguru import logger
 DEFAULT_HOST = "0.0.0.0"  # nosec B104
 DEFAULT_PORT = 9494
 THREADS = 4
+# A line bound with this extra goes to the console only (the node's one-time key notice). The same name as
+# nodes.server.nodelog.SECRET_EXTRA, written out: the package is imported only after logging is set up.
+CONSOLE_ONLY = "node_secret"
 
 
 def node_config_dir() -> str:
@@ -51,7 +54,15 @@ def _log_to(config_dir: str) -> str:
     # diagnose=False: a traceback's variable values could hold the key or a request body.
     if sys.stderr is not None:
         logger.add(sys.stderr, level="INFO", diagnose=False)
-    logger.add(log_file, level="INFO", rotation="5 MB", retention=3, encoding="utf-8", diagnose=False)
+    logger.add(
+        log_file,
+        level="INFO",
+        rotation="5 MB",
+        retention=3,
+        encoding="utf-8",
+        diagnose=False,
+        filter=lambda record: not record["extra"].get(CONSOLE_ONLY),
+    )
     logging.basicConfig(handlers=[_ToLoguru()], level=logging.INFO, force=True)
     return log_file
 

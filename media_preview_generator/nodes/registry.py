@@ -10,12 +10,13 @@ answering, a file it couldn't see, a GPU that failed); every state change bumps 
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 from loguru import logger
@@ -35,6 +36,8 @@ STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
 STATE_NO_FFMPEG = "no_ffmpeg"
 STATE_DISABLED = "disabled"
+# The machine is already added as another node (the same node id answers at both addresses).
+STATE_DUPLICATE = "duplicate"
 
 # States that raise a bell notification (``web.notifications``).
 ALERT_STATES = (
@@ -44,6 +47,7 @@ ALERT_STATES = (
     STATE_ACCESS_PROBLEM,
     STATE_GPU_LOST,
     STATE_NO_FFMPEG,
+    STATE_DUPLICATE,
 )
 
 HEALTH_INTERVAL_S = 30.0
@@ -57,6 +61,11 @@ NOT_VISIBLE_LIMIT = 3
 PENDING_ACCESS_TTL_S = 600.0
 GPU_LOST_RECHECK_S = 300.0
 MAX_PARALLEL_CHECKS = 8
+# Bounds on what a node's /v1/info and GPU rescan answers may hold once kept here (every reader copies them): far
+# above what a node sends (a few GPUs, short facts), low enough that a broken or hostile answer can't break readers.
+INFO_TEXT_MAX = 4096
+INFO_LIST_MAX = 256
+INFO_DEPTH_MAX = 8
 LEGACY_PING_TIMEOUT_S = 10.0
 LOOP_TICK_S = 1.0
 
@@ -69,6 +78,7 @@ _CAPACITY_REASONS = {
     STATE_ACCESS_PROBLEM: "fix media access first",
     STATE_NO_FFMPEG: "FFmpeg missing on node",
     STATE_DISABLED: "node turned off",
+    STATE_DUPLICATE: "node added twice",
 }
 
 
@@ -247,6 +257,8 @@ def _default_record_uid(node_id: str, uid: str, url: str) -> None:
             node = find_node(nodes, node_id)
             if node is None or node.get("node_uid") == uid or node.get("url") != url:
                 return
+            if any(other.get("node_uid") == uid and other.get("id") != node_id for other in nodes):
+                return  # Another node is this machine already (two checks can race): this one reads as added twice.
             if node.get("node_uid"):
                 logger.info("{} reports a new id; it was probably reinstalled", node.get("name") or node_id)
             node["node_uid"] = uid
@@ -296,8 +308,28 @@ def _clean_gpus(raw: object) -> tuple[dict, ...]:
 def _count(raw: object) -> int:
     try:
         return max(0, int(raw or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _bounded(value: object, depth: int = 0) -> Any:
+    """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
+
+    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, and a deeply nested answer breaks ``deepcopy``.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:INFO_TEXT_MAX]
+    if isinstance(value, int | float):
+        return value if math.isfinite(value) else None
+    if depth >= INFO_DEPTH_MAX:
+        return None
+    if isinstance(value, dict):
+        return {str(k)[:INFO_TEXT_MAX]: _bounded(v, depth + 1) for k, v in list(value.items())[:INFO_LIST_MAX]}
+    if isinstance(value, list | tuple):
+        return [_bounded(v, depth + 1) for v in value[:INFO_LIST_MAX]]
+    return None
 
 
 def _gpus_in(answer: object) -> tuple[dict, ...]:
@@ -394,6 +426,14 @@ class NodeRegistry:
         self._executor: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------ reading
+
+    def settings_replaced(self) -> None:
+        """Re-read the nodes on the next read, whatever ``nodes_revision`` says.
+
+        A restored settings.json can hold other nodes at the same revision as the file it replaced.
+        """
+        with self._lock:
+            self._settings_key = object()
 
     @property
     def revision(self) -> int:
@@ -863,10 +903,7 @@ class NodeRegistry:
         state, reason = self._state(live)
         worker = (live.info or {}).get("worker") or {}
         cpu = worker.get("cpu") or {}
-        try:
-            cores = int(cpu.get("cores") or 0)
-        except (TypeError, ValueError):
-            cores = 0
+        cores = _count(cpu.get("cores"))
         return NodeView(
             id=str(live.record.get("id") or ""),
             name=str(live.record.get("name") or ""),
@@ -925,11 +962,20 @@ class NodeRegistry:
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.
+                    twin = self._twin_of(node_id, outcome.uid)
+                    if twin:
+                        # Sent work as two nodes, one machine would get twice its workers' files.
+                        outcome = replace(
+                            outcome,
+                            state=STATE_DUPLICATE,
+                            reason=f"{record.get('name') or 'This node'} is {twin} again, added at another address. "
+                            "Remove one of them.",
+                        )
                     self._apply(live, outcome, number)
                     has_access_problem = bool(live.access_problem)
                     access = access or live.access_wanted
                     live.access_wanted = False
-                if outcome.uid and outcome.uid != record.get("node_uid"):
+                if outcome.uid and not twin and outcome.uid != record.get("node_uid"):
                     self._new_uid(node_id, live, record, outcome)
                 elif outcome.uid:
                     with self._lock:
@@ -941,6 +987,13 @@ class NodeRegistry:
         finally:
             with self._lock:
                 live.checking = False
+
+    def _twin_of(self, node_id: str, uid: str) -> str:
+        """The name of another node already saved with id ``uid`` ("" when none; the caller holds the lock)."""
+        for other_id, other in self._nodes.items():
+            if uid and other_id != node_id and other.record.get("node_uid") == uid:
+                return str(other.record.get("name") or other_id)
+        return ""
 
     def _new_uid(self, node_id: str, live: _Live, record: dict, outcome: _Outcome) -> None:
         """Record a node's new id, or hold back a Plex database node's until it is tied to its Plex."""
@@ -1030,7 +1083,7 @@ class NodeRegistry:
         timeouts = 0
         for attempt in range(CHECK_ATTEMPTS):
             try:
-                info = client.info()
+                info = _bounded(client.info())
                 break
             except NodeAuthError:
                 return _Outcome(
@@ -1039,7 +1092,7 @@ class NodeRegistry:
                 )
             except NodeProtocolError as exc:
                 if exc.node is not None:
-                    return self._other_protocol(name, exc.node)
+                    return self._other_protocol(name, _bounded(exc.node))
                 return self._probe_legacy(record)
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
@@ -1105,6 +1158,15 @@ class NodeRegistry:
                 "(or put it on its PATH), then restart the node.",
                 **outcome,
             )
+        # The node answers a path with no version when the FFmpeg it found won't run (wrong architecture, a missing
+        # library, no permission): every file would fail just the same.
+        if protocol.ROLE_WORKER in roles and isinstance(ffmpeg, dict) and not ffmpeg.get("version"):
+            return _Outcome(
+                STATE_NO_FFMPEG,
+                f"{name} found FFmpeg at {ffmpeg.get('path')}, but it doesn't run, so every file sent to it would "
+                "fail. Reinstall FFmpeg on that machine, then restart the node.",
+                **outcome,
+            )
         agent = info.get("agent")
         agent_version = str(agent.get("version") or "") if isinstance(agent, dict) else ""
         if protocol.ROLE_PLEX_DB in roles and agent_version and agent_too_old(agent_version):
@@ -1167,7 +1229,7 @@ class NodeRegistry:
                 return
             client, name = live.client, str(live.record.get("name") or "The node")
         try:
-            answer = client.rescan_gpus()
+            answer = _bounded(client.rescan_gpus())
             gpus = _gpus_in(answer)
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)

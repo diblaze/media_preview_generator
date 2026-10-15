@@ -205,11 +205,26 @@ class TestTheGuards:
         app = create_node_app(config_dir=str(tmp_path / "node"), roles=["plex_db"])
         assert "/v1/ping" in {rule.rule for rule in app.url_map.iter_rules()}
 
+    def test_an_address_that_sent_too_many_wrong_keys_is_refused_even_with_the_right_one(self, agent):
+        from media_preview_generator.nodes.server import identity
+
+        wrong = {"Authorization": "Bearer nope", plex_remote.PROTOCOL_HEADER: "1"}
+        right = {"Authorization": f"Bearer {TOKEN}", plex_remote.PROTOCOL_HEADER: "1"}
+        guesser = {"REMOTE_ADDR": "10.0.0.66"}
+        for _ in range(identity.WRONG_KEY_BURST):
+            assert agent.get("/v1/ping", headers=wrong, environ_base=guesser).status_code == 401
+        assert agent.get("/v1/ping", headers=right, environ_base=guesser).status_code == 401
+        assert agent.get("/v1/ping", headers=right, environ_base={"REMOTE_ADDR": "10.0.0.5"}).status_code == 200
+
     def test_a_wrong_key_says_nothing_about_this_plex(self, agent):
         body = agent.post("/v1/checks/file", json={}, headers={"Authorization": "Bearer nope"}).get_data(as_text=True)
         assert "Plex Media Server" not in body and "db_path" not in body
 
-    @pytest.mark.parametrize("asked", [None, "2", "0", "one", ""], ids=["none", "newer", "older", "text", "empty"])
+    @pytest.mark.parametrize(
+        "asked",
+        [None, "2", "0", "one", "", "¹", "1" * 5000],
+        ids=["none", "newer", "older", "text", "empty", "superscript", "past-the-int-digit-limit"],
+    )
     def test_a_protocol_this_build_doesnt_speak_is_refused_with_both_versions(self, agent, asked):
         headers = {"Authorization": f"Bearer {TOKEN}"}
         if asked is not None:
@@ -218,6 +233,15 @@ class TestTheGuards:
         assert response.status_code == 409
         message = response.get_json()["error"]["message"]
         assert plex_db_role.AGENT_VERSION in message and "protocol 1" in message
+
+    def test_a_deeply_nested_body_is_refused_as_malformed(self, agent):
+        headers = {
+            "Authorization": f"Bearer {TOKEN}",
+            plex_remote.PROTOCOL_HEADER: "1",
+            "Content-Type": "application/json",
+        }
+        response = agent.post("/v1/item/read", data="[" * 100_000 + "]" * 100_000, headers=headers)
+        assert response.status_code == 400
 
     @pytest.mark.parametrize("asked", [None, "99"], ids=["no-protocol-header", "another-protocol"])
     def test_the_ping_still_answers_a_caller_whose_protocol_it_doesnt_speak(self, agent, asked):
@@ -569,6 +593,14 @@ class TestTheImageStaysInStepWithTheApp:
         tags = set(re.findall(r"ghcr\.io/[\w.-]+/plex-marker-agent:(\S+)", text))
         assert tags, f"{document} should name the image tag the user is told to pull"
         assert tags == {plex_db_role.AGENT_VERSION}
+
+    def test_a_new_install_is_told_to_set_node_key_and_an_old_agent_token_still_works(self):
+        # NODE_KEY must be 16 characters or more; AGENT_TOKEN predates the rule and works at any length.
+        compose = (AGENT_DIR / "docker-compose.yml").read_text()
+        readme = (AGENT_DIR / "README.md").read_text()
+        assert "#   NODE_KEY=<paste the output of: openssl rand -hex 24>" in compose
+        assert "NODE_KEY: ${NODE_KEY:-}" in compose and "AGENT_TOKEN: ${AGENT_TOKEN:-}" in compose
+        assert "printf 'NODE_KEY=%s\\n'" in readme and "printf 'AGENT_TOKEN" not in readme
 
 
 class TestWhichPlexTheAgentServes:

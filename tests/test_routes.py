@@ -6914,6 +6914,90 @@ class TestBackupRestore:
         assert live.read_text() == '{"label": "from-february"}'
         assert (tmp_path / "settings.json.20260901-120000.bak").read_text() == '{"label": "current"}'
 
+    HELPER_URL = "http://plex-host.lan:9494"
+    HELPER_KEY = "helper-key-123456"
+
+    def _write_backup_from_5_1_0(self, config_dir) -> str:
+        """A settings backup 5.1.0 wrote (schema 23): its Plex helper's address and key sit on the server."""
+        agent = {"enabled": True, "url": self.HELPER_URL, "token": self.HELPER_KEY}
+        server = {
+            "id": "s1",
+            "type": "plex",
+            "name": "Home Plex",
+            "enabled": True,
+            "url": "http://plex:32400",
+            "auth": {"method": "token", "token": "t" * 20},
+            "libraries": [],
+            "markers": {
+                "enabled": True,
+                "library_ids": None,
+                "plex": {"db_write_confirmed_at": "2026-10-01T00:00:00+00:00", "agent": agent},
+            },
+        }
+        name = "settings.json.20261014-030000.bak"
+        with open(os.path.join(config_dir, name), "w") as f:
+            json.dump({"_schema_version": 23, "setup_complete": True, "media_servers": [server]}, f)
+        return name
+
+    def test_a_backup_from_before_an_upgrade_is_brought_up_to_this_version(self, client):
+        """Run as it was, a 5.1.0 backup's Plex helper is refused "no Plex database node" until a restart, and a
+        save of its server meanwhile drops the helper's address and key for good."""
+        from media_preview_generator.markers.publishers.plex_remote import node_refusal
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
+        from media_preview_generator.web.settings_manager import SettingsManager, get_settings_manager
+
+        sm = get_settings_manager()
+        backup = self._write_backup_from_5_1_0(sm.config_dir)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": backup},
+        )
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.get("_schema_version") == _CURRENT_SCHEMA_VERSION
+        assert node_refusal(load_server(sm.get("media_servers")[0]["markers"], "plex")) is None
+
+        stored = client.get("/api/servers/s1", headers=_api_headers()).get_json()
+        resp = client.put("/api/servers/s1", headers=_api_headers(), json={"markers": stored["markers"]})
+        assert resp.status_code == 200, resp.get_json()
+        restarted = SettingsManager(config_dir=str(sm.config_dir))
+        run_migrations(restarted)
+        (node,) = restarted.nodes
+        assert (node["url"], node["key"]) == (self.HELPER_URL, self.HELPER_KEY)
+        assert restarted.get("media_servers")[0]["markers"]["plex"]["agent"] == {"enabled": True, "node_id": node["id"]}
+
+    def test_a_restore_with_the_same_nodes_revision_is_seen_by_the_registry(self, client):
+        """Undoing a restore can bring back other nodes at the same ``nodes_revision``; the registry must not keep
+        checking and sending tasks to the machine settings no longer name."""
+        from media_preview_generator.nodes import registry as reg
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        def node(url):
+            return {"id": "n1", "name": "nuc", "url": url, "key": "node-key-123456", "enabled": True}
+
+        sm = get_settings_manager()
+        registry = reg.NodeRegistry(record_uid=lambda *a: None, attempt_gap_s=0.0)
+        reg.set_registry(registry)
+        try:
+            backup = "settings.json.20261015-010000.bak"
+            snapshot = dict(sm.get_all(), nodes=[node("http://machine-a:9494")], nodes_revision=1)
+            with open(os.path.join(sm.config_dir, backup), "w") as f:
+                json.dump(snapshot, f)
+            sm.update_nodes([node("http://machine-c:9494")])
+            assert sm.nodes_revision == 1 and registry.views()[0].url == "http://machine-c:9494"
+
+            resp = client.post(
+                "/api/settings/backups/restore",
+                headers=_api_headers(),
+                json={"file": "settings.json", "backup": backup},
+            )
+            assert resp.status_code == 200, resp.get_json()
+            assert registry.views()[0].url == sm.nodes[0]["url"] == "http://machine-a:9494"
+        finally:
+            reg.set_registry(None)
+
     def test_restore_defaults_to_newest_when_backup_param_omitted(self, client, monkeypatch, tmp_path):
         """Backwards-compat: restore without `backup` picks the newest snapshot."""
         from media_preview_generator.web.settings_manager import get_settings_manager

@@ -118,9 +118,23 @@ class TestAuth:
     def test_delete_needs_the_key(self, make_app):
         assert make_app().test_client().delete("/v1/tasks/x").status_code == 401
 
+    def test_an_address_that_sent_too_many_wrong_keys_is_refused_even_with_the_right_one(self, make_app):
+        from media_preview_generator.nodes.server import identity
+
+        client = make_app().test_client()
+        guesser, app_address = {"REMOTE_ADDR": "10.0.0.66"}, {"REMOTE_ADDR": "10.0.0.5"}
+        wrong = {"Authorization": "Bearer wrong", protocol.PROTOCOL_HEADER: "1"}
+        for _ in range(identity.WRONG_KEY_BURST):
+            assert client.get("/v1/info", headers=wrong, environ_base=guesser).status_code == 401
+
+        # Its key isn't compared any more, so the right one can't be told from a wrong one...
+        assert client.get("/v1/info", headers=HEADERS, environ_base=guesser).status_code == 401
+        # ...while the app, at another address, is answered as always.
+        assert client.get("/v1/info", headers=HEADERS, environ_base=app_address).status_code == 200
+
 
 class TestProtocolHeader:
-    @pytest.mark.parametrize("value", [None, "2", "one", ""])
+    @pytest.mark.parametrize("value", [None, "2", "one", "", "¹", "1" * 5000], ids=lambda v: repr(v)[:12])
     def test_missing_or_other_protocol_is_409(self, make_app, value):
         headers = {"Authorization": f"Bearer {KEY}"}
         if value is not None:
@@ -343,10 +357,23 @@ class TestTaskRoutes:
         assert response.status_code == 404
         assert response.get_json()["error"]["kind"] == protocol.KIND_UNKNOWN_TASK
 
-    def test_bad_log_from_is_400(self, make_app):
-        response = make_app().test_client().get("/v1/tasks/x?log_from=abc", headers=HEADERS)
+    # "²" is a digit to str.isdigit() but not to int(); int() refuses text of over 4,300 digits.
+    @pytest.mark.parametrize("value", ["abc", "²", "9" * 5000, "--"], ids=lambda v: repr(v)[:12])
+    def test_bad_log_from_is_400(self, make_app, value):
+        response = make_app().test_client().get(f"/v1/tasks/x?log_from={value}", headers=HEADERS)
 
         assert response.status_code == 400
+        assert response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
+
+    @pytest.mark.parametrize("route", [protocol.ROUTE_TASKS, protocol.ROUTE_ACCESS_CHECK])
+    def test_a_deeply_nested_body_is_400(self, make_app, route):
+        deep = "[" * 100_000 + "]" * 100_000
+        response = (
+            make_app().test_client().post(route, headers={**HEADERS, "Content-Type": "application/json"}, data=deep)
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
 
     def test_body_over_2_mb_is_refused(self, make_app):
         response = (
@@ -377,8 +404,9 @@ class TestLogRoute:
         assert before - 1 <= line["ts"] <= time.time() + 1
         assert abs(datetime.fromisoformat(line["time"]).timestamp() - line["ts"]) < 1
 
-    def test_bad_lines_is_400(self, make_app):
-        assert make_app().test_client().get("/v1/log?lines=x", headers=HEADERS).status_code == 400
+    @pytest.mark.parametrize("value", ["x", "²", "9" * 5000], ids=lambda v: repr(v)[:12])
+    def test_bad_lines_is_400(self, make_app, value):
+        assert make_app().test_client().get(f"/v1/log?lines={value}", headers=HEADERS).status_code == 400
 
 
 class TestRoles:

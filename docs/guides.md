@@ -1321,8 +1321,8 @@ folder mounted: the Linux image in [`nodes/plex-db/`](https://github.com/steveza
 it to do the database write on Plex's machine. It is the only supported way to write markers to a Plex on another
 machine: without it that Plex stays read-only for markers. If the app and Plex are on the same machine, don't run it.
 
-1. Run the node as its README says: the compose file, the settings (`AGENT_TOKEN` or `NODE_KEY`, `PLEX_CONFIG`,
-   `PUID`/`PGID`) and the key.
+1. Run the node as its README says: the compose file, the settings (`NODE_KEY`, `PLEX_CONFIG`, `PUID`/`PGID`) and
+   the key. An install from the Plex marker agent days keeps its `AGENT_TOKEN`.
 2. In the app: **Settings → Nodes → Add node** with its address (for example `http://plex-host.lan:9494`) and key.
    See [Remote nodes](#remote-nodes).
 3. **Servers → your Plex → Edit → Connection → Plex database**: pick the node. The one-time database-write

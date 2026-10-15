@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -392,6 +393,25 @@ class TestCreate:
         assert resp.status_code == 400 and resp.get_json()["error"]
         assert _sm().nodes == []
 
+    @pytest.mark.parametrize(
+        ("fields", "error"),
+        [
+            ({"name": ["nuc"]}, "The node's name must be text"),
+            ({"url": ["http://nuc:9494"]}, "The node's address must be text"),
+            ({"key": 5}, "The node's key must be text"),
+            ({"key": {"k": "v"}}, "The node's key must be text"),
+        ],
+        ids=["name-list", "url-list", "key-number", "key-object"],
+    )
+    def test_a_name_address_or_key_that_isnt_text_is_refused_not_turned_into_text(self, client, nodes, fields, error):
+        resp = _add(client, **fields)
+        assert (resp.status_code, resp.get_json()["error"]) == (400, error)
+        assert _sm().nodes == []
+
+    def test_a_probe_with_a_key_that_isnt_text_is_refused(self, client, nodes):
+        resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": 12345678})
+        assert resp.status_code == 400
+
     def test_a_duplicate_name_is_refused(self, client, nodes):
         _add(client)
         nodes("http://other:9494").info_answer = _info(uid="uid-2")
@@ -617,6 +637,51 @@ class TestDelete:
         row = client.get("/api/nodes").get_json()["nodes"][0]
         assert row["used_by"] == {"groups": [{"id": "g1", "name": "Night"}], "servers": [{"id": "p1", "name": "Home"}]}
 
+    def test_a_node_removed_while_a_server_is_saved_onto_it_never_leaves_the_server_on_it(
+        self, client, nodes, monkeypatch
+    ):
+        """The server save checks its chosen node before taking the settings lock; a Remove landing in between
+        must make one of the two lose."""
+        import threading
+
+        from media_preview_generator.markers import settings as markers_settings
+
+        nodes("http://nuc:9494").info_answer["node"]["roles"] = ["plex_db"]
+        node_id = _add(client).get_json()["id"]
+        plex = {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": False, "node_id": None}}
+        server = {
+            **_plex_server({}),
+            "enabled": True,
+            "url": "http://plex:32400",
+            "auth": {"method": "token", "token": "t" * 20},
+            "libraries": [],
+            "markers": {"enabled": True, "library_ids": None, "plex": plex},
+        }
+        _sm().set("media_servers", [server])
+        other = client.application.test_client()
+        with other.session_transaction() as session:
+            session["authenticated"] = True
+        removed: list[int] = []
+        check = markers_settings._node_choice_error
+
+        def check_then_remove(chosen: str) -> str:
+            error = check(chosen)
+            if not removed:
+                remove = threading.Thread(
+                    target=lambda: removed.append(other.delete(f"/api/nodes/{chosen}").status_code)
+                )
+                remove.start()
+                remove.join(10)
+            return error
+
+        monkeypatch.setattr(markers_settings, "_node_choice_error", check_then_remove)
+        chosen = {**server["markers"], "plex": {**plex, "agent": {"enabled": True, "node_id": node_id}}}
+        resp = client.put("/api/servers/p1", json={"markers": chosen})
+
+        assert removed == [200] and _sm().nodes == []
+        assert resp.status_code == 400 and "isn't on the Nodes page any more" in resp.get_json()["error"]
+        assert _sm().get("media_servers")[0]["markers"]["plex"]["agent"]["enabled"] is False
+
 
 class TestTestAccess:
     def _library(self, tmp_path):
@@ -755,8 +820,19 @@ class TestHealthAndLog:
     def test_log_errors(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         assert client.get(f"/api/nodes/{node_id}/log?lines=x").status_code == 400
-        nodes("http://nuc:9494").log_answer = NodeProtocolError("old helper")
-        assert client.get(f"/api/nodes/{node_id}/log").status_code == 502
+        nodes("http://nuc:9494").log_answer = NodeProtocolError("other protocol", node={"version": "8.0.0"})
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 502 and resp.get_json()["error"] == "Couldn't read nuc's log: other protocol"
+
+    def test_the_log_of_an_older_plex_helper_says_it_cant_share_one_in_plain_words(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        refusal = "This Plex marker agent is version 1.0.0 and speaks protocol 1; the app asked for none."
+        nodes("http://nuc:9494").log_answer = NodeProtocolError(refusal)
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 502
+        assert resp.get_json()["error"] == (
+            "This node is an older Plex helper and can't share its log. Update it to see its log here."
+        )
 
 
 class TestAuth:
@@ -932,6 +1008,7 @@ class TestBadAddresses:
         "http://nuc lan:9494",
         "http://nuc:9494#",
         "http://nuc:9494?",
+        "http://nas..lan:9494",
     ]
 
     @pytest.mark.parametrize("url", BAD)
@@ -942,6 +1019,38 @@ class TestBadAddresses:
         node_id = _add(client).get_json()["id"]
         assert client.put(f"/api/nodes/{node_id}", json={"url": url, "key": "new-key"}).status_code == 400
         assert _sm().nodes[0]["url"] == "http://nuc:9494"
+
+
+class TestTheSameMachineAddedTwice:
+    def test_an_address_differing_only_in_letter_case_is_already_added(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("didn't answer")
+        nodes("http://NUC:9494").info_answer = NodeUnreachableError("didn't answer")
+        assert _add(client, url="http://nuc:9494").status_code == 201
+        assert _add(client, name="living room", url="http://NUC:9494").status_code == 409
+        assert len(_sm().nodes) == 1
+
+    def test_the_second_record_of_one_machine_is_flagged_and_gets_no_work(self, client, nodes):
+        # Added while the node was off (nothing to compare), at two addresses of the one machine.
+        for url in ("http://nuc:9494", "http://10.0.0.5:9494"):
+            nodes(url).info_answer = NodeUnreachableError("didn't answer")
+        first = _add(client, url="http://nuc:9494").get_json()["id"]
+        second = _add(client, name="nuc by ip", url="http://10.0.0.5:9494").get_json()["id"]
+        registry = reg.get_registry()
+        deadline = time.monotonic() + 10
+        # Adding a node checks it in the background: let those checks end before the machine starts answering.
+        while time.monotonic() < deadline and any(
+            registry._nodes[n].checks_begun < 1 or registry._nodes[n].checking for n in (first, second)
+        ):
+            time.sleep(0.01)
+        for url in ("http://nuc:9494", "http://10.0.0.5:9494"):
+            nodes(url).info_answer = _info(uid="the-one-machine")
+        client.post(f"/api/nodes/{first}/check")
+        client.post(f"/api/nodes/{second}/check")
+
+        assert registry.view(first).state == reg.STATE_READY
+        assert registry.view(second).state == reg.STATE_DUPLICATE and "Remove one" in registry.view(second).reason
+        assert registry.capacity(second).cpu is False
+        assert [n.get("node_uid") for n in _sm().nodes] == ["the-one-machine", None]
 
 
 class TestNodeSentValues:
@@ -975,6 +1084,42 @@ class TestNodeSentValues:
 
         text = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_data(as_text=True)
         assert json.loads(text, parse_constant=refuse)["info"]["worker"]["cpu"]["load1"] is None
+
+    def _good_and_bad(self, client, nodes):
+        nodes("http://good:9494").info_answer = _info(uid="uid-good")
+        nodes("http://bad:9494").info_answer = _info(uid="uid-bad")
+        good = _add(client, name="good", url="http://good:9494").get_json()["id"]
+        bad = _add(client, name="bad", url="http://bad:9494").get_json()["id"]
+        return good, bad
+
+    @pytest.mark.parametrize("field", ["cores", "busy"])
+    def test_an_out_of_range_number_from_one_node_keeps_every_node_listed(self, client, nodes, field):
+        import json
+
+        good, bad = self._good_and_bad(client, nodes)
+        answer = _info(uid="uid-bad")
+        # JSON's 1e400 parses to infinity, which int() refuses.
+        target = answer["worker"]["cpu"] if field == "cores" else answer["worker"]
+        target[field] = json.loads("1e400")
+        nodes("http://bad:9494").info_answer = answer
+        client.post(f"/api/nodes/{good}/check")
+        client.post(f"/api/nodes/{bad}/check")
+        resp = client.get("/api/nodes")
+        assert resp.status_code == 200
+        assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
+        assert {v.id for v in reg.get_registry().views()} == {good, bad}
+
+    def test_a_deeply_nested_answer_from_one_node_keeps_every_node_listed(self, client, nodes):
+        import json
+
+        good, bad = self._good_and_bad(client, nodes)
+        answer = _info(uid="uid-bad")
+        answer["extra"] = json.loads("[" * 600 + "]" * 600)
+        nodes("http://bad:9494").info_answer = answer
+        client.post(f"/api/nodes/{bad}/check")
+        resp = client.get("/api/nodes")
+        assert resp.status_code == 200
+        assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
 
 
 class TestATestOfRowsSavedLater:
@@ -1072,3 +1217,27 @@ class TestRemovedDuringAGroupSave:
 
         assert deleted == [409]
         assert [n["id"] for n in _sm().nodes] == [node_id]
+
+
+class TestTheReference:
+    """docs/reference.md is what a script follows: it must describe the routes and the stored shape as they are."""
+
+    REFERENCE = Path(__file__).resolve().parents[2] / "docs" / "reference.md"
+
+    def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        missing = []
+        for rule in client.application.url_map.iter_rules():
+            if rule.rule.startswith("/api/nodes"):
+                path = rule.rule.replace("<node_id>", "{id}")
+                methods = sorted(rule.methods - {"HEAD", "OPTIONS"})
+                missing += [f"{m} {path}" for m in methods if f"| {m} | `{path}` |" not in text]
+        assert missing == []
+
+    def test_a_plex_servers_database_node_choice_is_documented_as_it_is_stored(self):
+        from media_preview_generator.markers.settings import default_plex_agent
+
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        assert default_plex_agent() == {"enabled": False, "node_id": None}
+        assert '"agent": {"enabled": false, "node_id": null}' in text and "`plex.agent.node_id`" in text
+        assert "`plex.agent.url`" not in text and "`plex.agent.token`" not in text

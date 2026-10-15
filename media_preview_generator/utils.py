@@ -258,13 +258,12 @@ def _backup_retention() -> int:
 
     Uses :func:`peek_settings_manager` (a lock-free accessor) rather than
     :func:`get_settings_manager`. The standard accessor acquires
-    ``_settings_lock``, which is already held by the caller during
-    first-boot ``SettingsManager.__init__`` → ``_load`` →
-    ``_migrate_global_plex_webhook_to_per_server`` → ``_save``. A
-    re-entry deadlocks the worker for any user whose settings.json
-    carries the legacy ``plex_webhook_*`` keys (i.e., every 3.7.5
-    upgrader). When the singleton isn't built yet, fall through to env /
-    default — same value a brand-new install gets.
+    ``_settings_lock``, which ``get_settings_manager`` holds around
+    ``SettingsManager.__init__``, so a save made while the singleton is
+    being built would deadlock re-entering it (every 3.7.5 upgrader hit
+    this once, when ``_load`` saved the ``plex_webhook_*`` move). When the
+    singleton isn't built yet, fall through to env / default — same value
+    a brand-new install gets.
     """
     raw = None
     try:

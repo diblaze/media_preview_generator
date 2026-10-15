@@ -100,6 +100,18 @@ def _response(status: int, body: bytes) -> requests.Response:
     return response
 
 
+class TestEveryFailureIsANodeError:
+    def test_an_address_urllib3_refuses_before_connecting_is_unreachable(self):
+        # A real session: requests prepares "nas..lan", then urllib3 raises LocationParseError, not a requests error.
+        with pytest.raises(NodeUnreachableError):
+            NodeClient(NodeAddress("http://nas..lan:9494", "k")).info()
+
+    def test_json_nested_deeper_than_the_parser_goes_is_a_protocol_error(self, serve):
+        url, _ = serve(200, b"[" * 100_000 + b"]" * 100_000)
+        with pytest.raises(NodeProtocolError):
+            _local(url).info()
+
+
 class TestAStartAfterItsDelete:
     def test_is_its_own_error(self):
         session = MagicMock(spec=requests.Session)

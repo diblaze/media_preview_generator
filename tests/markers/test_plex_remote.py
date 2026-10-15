@@ -259,7 +259,18 @@ class TestVersionSkew:
 
     @pytest.mark.parametrize(
         ("version", "too_old"),
-        [("0.9.0", True), ("1.0.0", False), ("1.0.1", False), ("2.0.0", False), ("", False), ("dev", False)],
+        [
+            ("0.9.0", True),
+            ("1.0.0", False),
+            ("1.0.1", False),
+            ("2.0.0", False),
+            ("", False),
+            ("dev", False),
+            # A digit to str.isdigit() that int() refuses, and a number past int()'s digit limit: unreadable.
+            ("0.²", False),
+            ("0." + "9" * 5000, False),
+        ],
+        ids=lambda v: repr(v)[:12],
     )
     def test_only_a_lower_readable_version_counts_as_too_old(self, version, too_old):
         assert plex_remote.agent_too_old(version) is too_old

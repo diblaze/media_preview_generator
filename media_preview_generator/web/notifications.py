@@ -560,6 +560,12 @@ _NODE_CARD_TEXT = {
         "Open Nodes",
         "health",
     ),
+    "duplicate": (
+        "{name} is added twice",
+        "Nothing is sent to it until one of the two is removed.",
+        "Open Nodes",
+        "",
+    ),
 }
 
 
@@ -569,8 +575,11 @@ def node_notification_id(node_id: str, state: str) -> str:
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
-    """One card per node that is offline, needs an update, refused the key, can't see media, lost its GPU or has no
-    FFmpeg.
+    """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU or
+    has no FFmpeg.
+
+    A node nothing uses (no worker group member on it, no Plex server with its Plex database node switched on
+    pointing at it) raises no card: whatever its state, no work waits on it.
 
     The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
     dismissal of a state the node has left is lifted, so the next time it happens the card shows again.
@@ -578,9 +587,13 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     from markupsafe import escape
 
     from ..nodes.registry import ALERT_STATES, get_registry
+    from ..nodes.settings import node_users
+    from .settings_manager import get_settings_manager
 
     try:
         views = get_registry().views()
+        settings = get_settings_manager()
+        groups, servers = settings.get("worker_groups"), settings.get("media_servers")
     except Exception as exc:
         logger.debug("node notifications skipped: {}", exc)
         return []
@@ -590,7 +603,7 @@ def _build_node_notifications() -> list[dict[str, Any]]:
             if state != view.state:
                 undismiss_session(node_notification_id(view.id, state))
         text = _NODE_CARD_TEXT.get(view.state)
-        if text is None:
+        if text is None or not any(node_users(view.id, groups, servers).values()):
             continue
         title, todo, label, target = text
         name = view.name or "A node"

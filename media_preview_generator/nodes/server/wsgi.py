@@ -5,7 +5,9 @@ One process: the task table lives in its memory, so a second process would answe
 and the Plex database role's "one writer at a time" is a lock inside it. waitress reads each request whole in its own
 event loop before a thread takes it, so connections that send a request slowly, or never finish one, hold no thread:
 ``/v1/health`` and the app's polls keep answering. Nothing here needs the key, so anyone who can reach the port could
-otherwise freeze the node with a few half-sent requests.
+otherwise freeze the node with a few half-sent requests. Nor can they hold every connection the node takes: one
+address gets :data:`CONNECTIONS_PER_ADDRESS` at once, and each request must arrive whole within
+:data:`REQUEST_READ_S`.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import select
 import signal
 import sys
 import threading
+import time
 from types import FrameType
 from typing import Any
 
@@ -34,6 +37,14 @@ CHANNEL_TIMEOUT_S = 60
 CONNECTION_LIMIT = 1000
 # Windows has no poll(), and its select() takes at most 512 sockets: room is left for the listener and waitress's own.
 SELECT_CONNECTION_LIMIT = 500
+# Connections one address may hold at once. The app keeps a few per running task on the node, far under this, and no
+# single machine can take every connection the node has (waitress has no per-address limit of its own).
+CONNECTIONS_PER_ADDRESS = 100
+# A request (headers and body) must arrive whole within this long of its first byte. CHANNEL_TIMEOUT_S only closes a
+# connection that went quiet, so one header line every few seconds would otherwise hold a connection forever.
+REQUEST_READ_S = 30
+# A node refusing connections says so at most this often.
+REFUSED_WARNING_S = 60.0
 # Above the routes' own 2 MB limit, so they answer an oversized body in the node's JSON; anything far beyond it is
 # refused before waitress buffers it.
 MAX_REQUEST_BODY_BYTES = 2 * MAX_BODY_BYTES
@@ -52,6 +63,54 @@ def _setup_logging() -> None:
         logger.add(sys.stderr, level=level, diagnose=False)
         return
     setup_logging(log_level=level)
+
+
+def _limited_channels(listen_map: dict) -> Any:
+    """A waitress ``channel_class`` that refuses an address's connection past :data:`CONNECTIONS_PER_ADDRESS` and
+    closes one whose request hasn't arrived whole within :data:`REQUEST_READ_S`.
+
+    Args:
+        listen_map: The server's socket map: every open connection is in it.
+
+    Returns:
+        What the server calls for each accepted connection.
+    """
+    from waitress.channel import HTTPChannel
+
+    class NodeChannel(HTTPChannel):
+        reading_since: float | None = None
+
+        def received(self, data: bytes) -> bool:
+            if self.request is None and data:
+                self.reading_since = time.monotonic()
+            done = super().received(data)
+            if self.request is None:
+                self.reading_since = None
+            return done
+
+        def readable(self) -> bool:
+            # waitress asks every connection this on each pass of its loop (at least once a second).
+            if self.reading_since is not None and time.monotonic() - self.reading_since > REQUEST_READ_S:
+                self.will_close = True
+            return super().readable()
+
+    warned_at: list[float] = []
+
+    def accept(server: Any, sock: Any, addr: Any, adj: Any, map: dict | None = None) -> NodeChannel | None:
+        peer = addr[0] if isinstance(addr, tuple) else str(addr)
+        held = sum(1 for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.addr[0] == peer)
+        if held < CONNECTIONS_PER_ADDRESS:
+            return NodeChannel(server, sock, addr, adj, map=map)
+        sock.close()
+        now = time.monotonic()
+        if not warned_at or now - warned_at[0] > REFUSED_WARNING_S:
+            warned_at[:] = [now]
+            logger.warning(
+                "Refused connections from {}: it already holds {} open to this node", peer, CONNECTIONS_PER_ADDRESS
+            )
+        return None
+
+    return accept
 
 
 def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: str = "mpg-node") -> Any:
@@ -74,8 +133,10 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
     """
     from waitress import create_server
 
-    return create_server(
+    listen_map: dict = {}
+    server = create_server(
         app,
+        map=listen_map,
         host=host,
         port=port,
         threads=threads,
@@ -85,6 +146,12 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
         max_request_body_size=MAX_REQUEST_BODY_BYTES,
         ident=ident,
     )
+    accept = _limited_channels(listen_map)
+    # One listener per address it listens on (a host name can resolve to both IPv4 and IPv6), all in the one map.
+    for dispatcher in list(listen_map.values()):
+        if hasattr(dispatcher, "channel_class"):
+            dispatcher.channel_class = accept
+    return server
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:

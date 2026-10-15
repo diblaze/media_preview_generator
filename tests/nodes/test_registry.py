@@ -303,6 +303,14 @@ class TestStates:
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
         assert reg.STATE_NO_FFMPEG in reg.ALERT_STATES
 
+    def test_a_worker_node_whose_ffmpeg_doesnt_run_is_not_ready_and_gets_no_work(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": None}
+        h.client().default_info = info
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_NO_FFMPEG and "/usr/bin/ffmpeg, but it doesn't run" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
+
     def test_a_worker_node_with_ffmpeg_is_ready(self, h):
         info = _info()
         info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": "7.1"}
@@ -1103,3 +1111,13 @@ class TestAgainstARealNode:
         outcome = registry._probe(record, NewerAppClient(NodeAddress(node_url, self.KEY), session=session))
         assert outcome.state == reg.STATE_UPDATE_NEEDED, outcome.reason
         assert __version__ in outcome.reason and "0.0.1" in outcome.reason
+
+
+def test_a_saved_address_urllib3_refuses_reads_offline_not_connecting_forever():
+    # Saved before the address rules refused it: requests prepares it, urllib3 refuses it before connecting.
+    record = {"id": "n1", "name": "nas", "url": "http://nas..lan:9494", "key": "k", "enabled": True}
+    registry = reg.NodeRegistry(
+        nodes_provider=lambda: [record], revision_provider=lambda: 1, record_uid=lambda *a: None, attempt_gap_s=0.0
+    )
+    view = registry.check_now("n1")
+    assert view is not None and view.state == reg.STATE_OFFLINE

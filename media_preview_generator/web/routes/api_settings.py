@@ -1745,6 +1745,22 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
+def _bring_restored_settings_up_to_date(settings: Any) -> None:
+    """Run the start-up migrations on a restored settings.json from before this build's schema.
+
+    A backup taken before an upgrade holds settings this build no longer reads as they are (a Plex helper's address
+    on its server instead of on a node). Run on them until the next restart, any save would store them half-moved
+    and lose what the migration would have moved.
+
+    Args:
+        settings: The settings manager, holding the restored file.
+    """
+    from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
+
+    if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
+        run_migrations(settings)
+
+
 @api.route("/settings/backups/restore", methods=["POST"])
 @api_token_required
 def restore_backup():
@@ -1755,6 +1771,7 @@ def restore_backup():
     preserved so the user can restore the same point-in-time again).
     Before overwriting, the current live contents are saved as a fresh
     timestamped backup so a misclick is recoverable via a second restore.
+    A settings.json from an older schema is then migrated, as at start-up.
 
     For backwards compatibility, ``backup`` is optional — if omitted, the
     newest available backup (timestamped or legacy) is restored.
@@ -1809,17 +1826,23 @@ def restore_backup():
             os.replace(tmp_path, live)
             if name == "settings.json":
                 settings.reload()
+                _bring_restored_settings_up_to_date(settings)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
     except OSError as exc:
         return jsonify({"success": False, "error": str(exc)}), 500
+    except Exception as exc:
+        logger.exception("Restored {} from {}, but updating it to this version failed", live, bak_path)
+        return jsonify({"success": False, "error": f"Restored, but updating it to this version failed: {exc}"}), 500
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
     if name == "settings.json":
         from ...config import clear_config_cache
+        from ...nodes.registry import get_registry
 
         clear_config_cache()
+        get_registry().settings_replaced()
 
     logger.info("Restored {} from {}", live, bak_path)
     return jsonify({"success": True, "file": name, "backup": os.path.basename(bak_path)})

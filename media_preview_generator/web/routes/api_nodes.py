@@ -28,7 +28,16 @@ from ...nodes.client import (
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
 from ...nodes.readiness import node_readiness, to_fix
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
-from ...nodes.settings import KEY_MASK, find_node, normalise_key, normalise_mappings, normalise_url, validate_node
+from ...nodes.settings import (
+    KEY_MASK,
+    find_node,
+    node_users,
+    normalise_key,
+    normalise_mappings,
+    normalise_url,
+    server_agent,
+    validate_node,
+)
 from ..auth import api_token_required
 from ..settings_manager import get_settings_manager
 from . import api
@@ -61,36 +70,10 @@ def _legacy_ping(url: str, key: str) -> tuple[str, str]:
     return _default_legacy_ping(url, key)
 
 
-def _server_agent(entry: object) -> dict | None:
-    """A Plex server entry's ``markers.plex.agent`` block, or None."""
-    if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
-        return None
-    markers = entry.get("markers")
-    plex = markers.get("plex") if isinstance(markers, dict) else None
-    agent = plex.get("agent") if isinstance(plex, dict) else None
-    return agent if isinstance(agent, dict) else None
-
-
 def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
-    """The worker groups with a member on the node, and the Plex servers whose database it opens.
-
-    A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
-    database), even though it remembers the node for when it is switched on again.
-    """
+    """The worker groups and Plex servers that use the node (:func:`nodes.settings.node_users`)."""
     sm = get_settings_manager()
-    groups = []
-    for group in sm.get("worker_groups") or []:
-        if not isinstance(group, dict):
-            continue
-        members = group.get("members") or []
-        if any(isinstance(m, dict) and m.get("node") == node_id for m in members):
-            groups.append({"id": str(group.get("id") or ""), "name": str(group.get("name") or "")})
-    servers = []
-    for entry in sm.get("media_servers") or []:
-        agent = _server_agent(entry)
-        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
-            servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
-    return {"groups": groups, "servers": servers}
+    return node_users(node_id, sm.get("worker_groups"), sm.get("media_servers"))
 
 
 def _finite(value: object) -> int | float | None:
@@ -504,7 +487,7 @@ def _forget_switched_off_choice(sm: Any, node_id: str) -> None:
     servers = copy.deepcopy(sm.get("media_servers") or [])
     changed = False
     for entry in servers:
-        agent = _server_agent(entry)
+        agent = server_agent(entry)
         if agent is not None and agent.get("node_id") == node_id:
             agent["node_id"] = None
             changed = True
@@ -621,7 +604,12 @@ def node_log(node_id: str):
     try:
         answer = _make_client(record["url"], record["key"]).log(lines)
     except NodeError as exc:
-        return jsonify({"error": f"Couldn't read {record.get('name')}'s log: {exc}"}), 502
+        # What refuses without a node block is an older Plex helper (as for a check); it has no log to share.
+        if isinstance(exc, NodeProtocolError) and exc.node is None:
+            message = "This node is an older Plex helper and can't share its log. Update it to see its log here."
+        else:
+            message = f"Couldn't read {record.get('name')}'s log: {exc}"
+        return jsonify({"error": message}), 502
     raw = answer.get("lines")
     return jsonify({"lines": [_log_line(line) for line in raw] if isinstance(raw, list) else []})
 

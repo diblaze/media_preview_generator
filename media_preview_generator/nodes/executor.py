@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import tarfile
 import threading
 import time
@@ -63,6 +64,10 @@ STOP_DELETE_BUDGET_S = 1.0
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_FRAMES = 100_000
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
+# A relayed node log line is cut to this many characters (an FFmpeg line is well under it).
+RELAY_LINE_MAX = 4096
+# Control characters but tab: a line break in a relayed line would add lines to the app's log that read as its own.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 REQUEUE_NODE_UNAVAILABLE = "node_unavailable"
 # The node never ran the task (it refused the connection or didn't answer the start): no drop counts against the file.
@@ -76,6 +81,17 @@ _OP_LABELS = {
     protocol.OP_INTRO_END_PICTURE: "end-picture frames",
     protocol.OP_CREDITS_FIND: "credit text",
 }
+
+
+def _relayed_text(raw: object) -> str:
+    """A node's log line as one line of at most :data:`RELAY_LINE_MAX` characters, control characters escaped.
+
+    Whatever answers at a node's address writes these into the app's log and the job log, so they are kept to what
+    a real node sends: single lines.
+    """
+    text = raw[:RELAY_LINE_MAX] if isinstance(raw, str) else ""
+    # repr() spells "\n" as the two characters \n and "\x1b" as \x1b.
+    return _CONTROL_CHARS.sub(lambda match: repr(match.group())[1:-1], text)
 
 
 @dataclass(frozen=True)
@@ -427,7 +443,7 @@ class _TaskRun:
             if not isinstance(line, dict):
                 continue
             level = str(line.get("level") or "INFO").upper()
-            message = str(line.get("message", ""))
+            message = _relayed_text(line.get("message"))
             if self._path_swap:
                 message = message.replace(*self._path_swap)
             logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, message)

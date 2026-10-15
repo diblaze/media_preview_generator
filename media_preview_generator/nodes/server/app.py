@@ -28,6 +28,8 @@ from . import access, identity, nodelog, tasks
 MAX_BODY_BYTES = 2 * 1024 * 1024
 ACCESS_CHECK_MAX_FILES = 200
 LOG_DEFAULT_LINES = 200
+# How much of a protocol header that isn't this node's the refusal repeats back.
+PROTOCOL_ECHO_MAX = 32
 EXTENSION = "mpg_node"
 
 
@@ -141,7 +143,7 @@ def create_node_app(
     )
     app.extensions[EXTENSION] = state
 
-    app.register_blueprint(_node_blueprint(state))
+    app.register_blueprint(_node_blueprint(state, identity.wrong_key_limit(app)))
 
     if protocol.ROLE_PLEX_DB in chosen_roles:
         plex_config_dir = os.environ.get("PLEX_CONFIG_DIR", "").strip()
@@ -163,7 +165,7 @@ def create_node_app(
     return app
 
 
-def _node_blueprint(state: NodeServerState) -> Blueprint:
+def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) -> Blueprint:
     """The node routes. Their auth and protocol checks live on the blueprint, not the app, so the Plex database
     role's routes keep the agent's own header check."""
     bp = Blueprint("node", __name__)
@@ -181,11 +183,17 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
         return answer({"error": error}, status, ok=False)
 
     def authorised() -> bool:
+        caller = request.remote_addr or ""
+        if wrong_keys.blocked(caller):
+            return False
         header = request.headers.get("Authorization", "")
         offered = header[7:].strip() if header.startswith("Bearer ") else ""
         # Compared as BYTES: werkzeug decodes headers as latin-1, and compare_digest raises TypeError on a str
         # holding anything above U+007F, so a stray non-ASCII byte would 500 on the auth path instead of 401.
-        return bool(offered) and secrets.compare_digest(offered.encode("utf-8", "surrogateescape"), key_bytes)
+        ok = bool(offered) and secrets.compare_digest(offered.encode("utf-8", "surrogateescape"), key_bytes)
+        if not ok:
+            wrong_keys.note_wrong(caller)
+        return ok
 
     @bp.before_request
     def _guard() -> Any:
@@ -195,12 +203,12 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             # No detail: an unauthenticated caller learns nothing about this node.
             return refuse(protocol.KIND_AUTH, 401)
         asked = request.headers.get(protocol.PROTOCOL_HEADER, "").strip()
-        if not (asked.isdigit() and int(asked) == protocol.NODE_PROTOCOL):
+        if protocol.whole_number(asked) != protocol.NODE_PROTOCOL:
             return refuse(
                 protocol.KIND_PROTOCOL,
                 409,
                 f"This node is version {__version__} and speaks node protocol {protocol.NODE_PROTOCOL}; the app "
-                f"asked for {asked or 'none'}.",
+                f"asked for {asked[:PROTOCOL_ECHO_MAX] or 'none'}.",
             )
         return None
 
@@ -209,7 +217,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
         return refuse(protocol.KIND_REQUEST, exc.code or 400, exc.description or exc.name)
 
     def json_body() -> dict | None:
-        body = request.get_json(silent=True)
+        try:
+            body = request.get_json(silent=True)
+        except RecursionError:  # silent=True only covers ValueError; a deeply nested body raises this instead
+            return None
         return body if isinstance(body, dict) else None
 
     def unknown_task() -> Any:
@@ -317,9 +328,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")
     def poll_task(task_id: str) -> Any:
         raw = request.args.get("log_from", "0").strip()
-        if not raw.lstrip("-").isdigit():
+        log_from = protocol.whole_number(raw.lstrip("-"))
+        if log_from is None:
             return refuse(protocol.KIND_REQUEST, 400, "log_from must be a whole number")
-        polled = table.poll(task_id, max(0, int(raw)))
+        polled = table.poll(task_id, 0 if raw.startswith("-") else log_from)
         if polled is None:
             return unknown_task()
         return answer(polled)
@@ -353,10 +365,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
 
     @bp.get(protocol.ROUTE_LOG)
     def node_log() -> Any:
-        raw = request.args.get("lines", str(LOG_DEFAULT_LINES)).strip()
-        if not raw.isdigit():
+        lines = protocol.whole_number(request.args.get("lines", str(LOG_DEFAULT_LINES)))
+        if lines is None:
             return refuse(protocol.KIND_REQUEST, 400, "lines must be a whole number")
-        count = max(1, min(int(raw), nodelog.NODE_LOG_LINES))
+        count = max(1, min(lines, nodelog.NODE_LOG_LINES))
         return answer({"lines": state.log.lines(count)})
 
     return bp

@@ -12,6 +12,7 @@ is a secret: it leaves the app only in the node's Authorization header and comes
 from __future__ import annotations
 
 import copy
+import ipaddress
 import re
 import urllib.parse
 import uuid
@@ -27,6 +28,9 @@ KEY_MAX_LEN = 200
 MAX_MAPPINGS = 50
 # "/v1", or a route under it, at the end of an address ("http://nuc:9494/v1/health").
 _NODE_ROUTE_TAIL = re.compile(r"/v1(?:/[a-z/-]*)?$")
+# One label of a host name as requests sends it (IDNA-encoded): letters, digits, hyphens and underscores (Docker
+# service names have them), 1 to 63 of them.
+_HOST_LABEL = re.compile(r"[A-Za-z0-9_-]{1,63}")
 
 
 def new_node_id() -> str:
@@ -38,6 +42,32 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _sendable_host(url: str) -> bool:
+    """Whether requests can send to ``url``: it prepares it, and its host is an IP address or a well-formed name.
+
+    requests prepares ``nas..lan`` (an empty label) or a 64-character label, then urllib3 refuses it at connect time;
+    each check of such a node would fail with a traceback instead of reading as a wrong address.
+    """
+    import requests
+    import urllib3
+
+    try:
+        prepared = requests.PreparedRequest()
+        prepared.prepare_url(url, None)
+        host = urllib3.util.parse_url(prepared.url).host or ""
+    except (requests.RequestException, urllib3.exceptions.HTTPError, ValueError, UnicodeError):
+        return False
+    if host.startswith("["):
+        return True  # An IPv6 address, which urllib3 has just parsed.
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    name = host[:-1] if host.endswith(".") else host
+    return 0 < len(name) <= 253 and all(_HOST_LABEL.fullmatch(label) for label in name.split("."))
+
+
 def normalise_url(raw: object) -> tuple[str | None, str]:
     """Validate a node address.
 
@@ -45,9 +75,12 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
         raw: The posted address.
 
     Returns:
-        ``(url, "")`` without a trailing slash, or ``(None, message)``.
+        ``(url, "")`` without a trailing slash, its scheme and host in lower case (``http://NUC:9494`` is the same
+        address as ``http://nuc:9494``), or ``(None, message)``.
     """
-    url = str(raw or "").strip().rstrip("/")
+    if raw is not None and not isinstance(raw, str):
+        return None, "The node's address must be text"
+    url = (raw or "").strip().rstrip("/")
     # Every node route starts /v1/, so an address ending in one is a route pasted from the docs or the node's log.
     url = _NODE_ROUTE_TAIL.sub("", url)
     if not url:
@@ -63,7 +96,9 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
     # A bare "?" or "#" parses as an empty query or fragment, and would swallow every route path sent after it.
     if "@" in parsed.netloc or "?" in url or "#" in url or len(url) > URL_MAX_LEN:
         return None, "The node's address must be a plain address with no username, password or query"
-    return url, ""
+    if not _sendable_host(url):
+        return None, "The node's address has a host name that can't be used, e.g. two dots in a row. Check it."
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "")), ""
 
 
 def normalise_key(raw: object, stored: str) -> tuple[str | None, str]:
@@ -76,7 +111,9 @@ def normalise_key(raw: object, stored: str) -> tuple[str | None, str]:
     Returns:
         ``(key, "")`` or ``(None, message)``.
     """
-    key = stored if raw is None or raw == KEY_MASK else str(raw).strip()
+    if raw is not None and not isinstance(raw, str):
+        return None, "The node's key must be text"
+    key = stored if raw is None or raw == KEY_MASK else raw.strip()
     if not key:
         return None, "Enter the node's key (shown in the node's log the first time it starts)"
     if key != stored and not (len(key) <= KEY_MAX_LEN and sendable_key(key)):
@@ -139,7 +176,10 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     if not isinstance(raw, dict):
         return None, "A node must be an object"
     base = existing or {}
-    name = str(raw.get("name", base.get("name", "")) or "").strip()
+    name = raw.get("name", base.get("name", ""))
+    if name is not None and not isinstance(name, str):
+        return None, "The node's name must be text"
+    name = (name or "").strip()
     if not name:
         return None, "Give the node a name"
     if len(name) > NAME_MAX_LEN:
@@ -222,6 +262,46 @@ def find_node(nodes: object, node_id: object) -> dict | None:
     if not isinstance(nodes, list) or not node_id:
         return None
     return next((n for n in nodes if isinstance(n, dict) and str(n.get("id") or "") == str(node_id)), None)
+
+
+def server_agent(entry: object) -> dict | None:
+    """A Plex server entry's ``markers.plex.agent`` block (its Plex database node choice), or None."""
+    if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        return None
+    markers = entry.get("markers")
+    plex = markers.get("plex") if isinstance(markers, dict) else None
+    agent = plex.get("agent") if isinstance(plex, dict) else None
+    return agent if isinstance(agent, dict) else None
+
+
+def node_users(node_id: str, worker_groups: object, media_servers: object) -> dict[str, list[dict[str, str]]]:
+    """The worker groups with a member on the node, and the Plex servers whose database it opens.
+
+    A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
+    database), even though it remembers the node for when it is switched on again. One switched on uses it for
+    everything that writes Plex's database: markers, chapter thumbnails, loudness and Library Health's counts.
+
+    Args:
+        node_id: The node.
+        worker_groups: settings.json's ``worker_groups``.
+        media_servers: settings.json's ``media_servers``.
+
+    Returns:
+        ``{"groups": [{"id", "name"}], "servers": [{"id", "name"}]}``.
+    """
+    groups = []
+    for group in worker_groups if isinstance(worker_groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        members = group.get("members") or []
+        if any(isinstance(m, dict) and m.get("node") == node_id for m in members):
+            groups.append({"id": str(group.get("id") or ""), "name": str(group.get("name") or "")})
+    servers = []
+    for entry in media_servers if isinstance(media_servers, list) else []:
+        agent = server_agent(entry)
+        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
+            servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
+    return {"groups": groups, "servers": servers}
 
 
 def node_mappings(node: dict) -> list[PathMapping]:
