@@ -1242,6 +1242,30 @@ class TestNodeDialog:
         expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
 
     @pytest.mark.parametrize(
+        ("label", "field", "focused"),
+        [
+            ("Change the key", "key", "#nodeSetKey"),
+            ("Type the key again", "key", "#nodeSetKey"),
+            ("Check the address", "url", "#nodeSetUrl"),
+            ("Open Settings", None, "#nodeSetName"),
+        ],
+    )
+    def test_a_setup_health_fix_focuses_the_field_it_names(
+        self, authed_page: Page, app_url: str, label: str, field: str | None, focused: str
+    ) -> None:
+        """The key and address fixes put the cursor in Name, a field nobody was asked to change."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", "key_refused")])
+        row = {**KEY_REFUSED, "fix_label": label}
+        api.health_answer = _health({**row, "fix_field": field} if field else row)
+        _open_node(authed_page, "n-nuc")
+        pane = _node_tab(authed_page, "health")
+
+        pane.locator(".nd-health-fix").click()
+
+        expect(authed_page.locator("#node-tab-settings")).to_be_visible()
+        expect(authed_page.locator(focused)).to_be_focused()
+
+    @pytest.mark.parametrize(
         ("rows", "removed", "focused"),
         [
             (2, 0, ".nd-remove >> nth=0"),
