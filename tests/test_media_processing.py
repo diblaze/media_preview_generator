@@ -6,10 +6,12 @@ HDR detection, and the complete processing pipeline.
 """
 
 import os
+import shutil
 import struct
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+from loguru import logger
 
 from media_preview_generator.gpu import VulkanProbeResult
 from media_preview_generator.processing import (
@@ -1448,6 +1450,29 @@ class TestMediaInfoImport:
         # This should not raise an exception in the test environment
         result = MediaInfo.can_parse()
         assert result is True or result is False  # Just check it doesn't crash
+
+
+class TestDetailsMediaInfoCantRead:
+    """A tag MediaInfo writes into its XML as it is (U+FFFF in a title) makes pymediainfo raise ``ParseError``; FFmpeg
+    reads the file fine, so it gets its thumbnails without the details rather than failing."""
+
+    def test_the_file_gets_its_thumbnails_and_one_warning_naming_it(
+        self, video_mediainfo_cant_read, mock_config, tmp_path
+    ):
+        mock_config.ffmpeg_path = shutil.which("ffmpeg")
+        mock_config.plex_bif_frame_interval = 1
+        warnings: list[str] = []
+        sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+        try:
+            with failure_scope("mediainfo-cant-read"):
+                success, image_count, *_ = generate_images(
+                    video_mediainfo_cant_read, str(tmp_path / "frames"), None, None, mock_config
+                )
+        finally:
+            logger.remove(sink)
+        assert success and image_count >= 3
+        assert len(os.listdir(tmp_path / "frames")) == image_count
+        assert len(warnings) == 1 and video_mediainfo_cant_read in warnings[0], warnings
 
 
 class TestDVNoBackwardCompat:

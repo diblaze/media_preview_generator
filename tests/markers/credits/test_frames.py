@@ -15,6 +15,7 @@ import sys
 import textwrap
 import threading
 import time
+import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -1588,8 +1589,11 @@ class TestAFirstFrameTheGpuDecodedWrong:
             pytest.param("cuda", True, HEVC_LISTING, ("HEVC", "Y"), False, id="grey-hevc-nvdec-refuses-by-itself"),
             pytest.param("cuda", True, GREY_H264_LISTING, ("AVC", "YUV"), True, id="colour-h264"),
             pytest.param("cuda", True, GREY_H264_LISTING, OSError("unreadable"), True, id="mediainfo-cant-read-it"),
+            # What pymediainfo raises for a tag MediaInfo writes into its XML as it is (U+FFFF in a title).
+            pytest.param("cuda", True, GREY_H264_LISTING, ET.ParseError("not well-formed (invalid token): line 50, "
+                         "column 8"), True, id="mediainfo-xml-unreadable"),
         ],
-    )
+    )  # fmt: skip
     def test_everything_else_reads_every_frame(self, monkeypatch, hwaccel, hw, listing, answer, asked):
         mediainfo = _mediainfo(monkeypatch, answer)
         rows = frames.run_decode(
@@ -1600,6 +1604,24 @@ class TestAFirstFrameTheGpuDecodedWrong:
         )
         assert [row[0] for row in rows] == [1.0, 2.0]
         assert mediainfo.parse.called is asked
+
+    def test_an_nvdec_decode_of_a_file_whose_details_mediainfo_cant_read_reads_every_frame(
+        self, video_mediainfo_cant_read
+    ):
+        warnings: list[str] = []
+        sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+        try:
+            rows = frames.run_decode(
+                fake_ffmpeg([10, 250], ["1", "2"], stderr_head=GREY_H264_LISTING)
+                + ["-hwaccel", "cuda", "-i", video_mediainfo_cant_read],
+                hw_active=True,
+                pts_offset_s=0.0,
+                detect_boxes=_detector([]),
+            )
+        finally:
+            logger.remove(sink)
+        assert [row[0] for row in rows] == [1.0, 2.0]
+        assert len(warnings) == 1 and video_mediainfo_cant_read in warnings[0], warnings
 
 
 @pytest.fixture

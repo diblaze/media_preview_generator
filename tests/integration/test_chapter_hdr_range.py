@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image, ImageChops, ImageStat
+from pymediainfo import MediaInfo
 
 from media_preview_generator.config import _resolve_ffmpeg_path
 from media_preview_generator.processing import chapters
@@ -146,7 +147,7 @@ def test_missing_video_duration_never_turns_empty_output_into_missing_source_ret
     hdr_movie, tmp_path, monkeypatch, general_duration_known, start_ms, message
 ):
     source, config, _ = hdr_movie
-    media = chapters.MediaInfo.parse(str(source))
+    media = MediaInfo.parse(str(source))
     assert float(media.general_tracks[0].duration) == 2000
     # Reproduce MediaInfo's container-only duration shape seen in production.
     media.video_tracks[0].duration = None

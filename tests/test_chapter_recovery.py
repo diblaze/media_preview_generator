@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
+from pymediainfo import MediaInfo
 
 from media_preview_generator.bif_reader import BIF_MAGIC
 from media_preview_generator.output.journal import write_meta
@@ -231,7 +232,7 @@ def test_one_failed_seek_switches_remaining_chapters_to_safe_recovery(bound_bif,
     plan.manifest_path = plan.folder / "chapter-thumbnails.mpg.json"
     monkeypatch.setattr(chapters, "inspect_seek_index", lambda *a, **kw: None)
     monkeypatch.setattr(
-        chapters.MediaInfo,
+        MediaInfo,
         "parse",
         lambda _: SimpleNamespace(
             video_tracks=[SimpleNamespace(duration=6000, transfer_characteristics=None, hdr_format=None)]

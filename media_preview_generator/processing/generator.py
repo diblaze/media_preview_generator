@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
 from typing import Any, Protocol
@@ -1828,6 +1829,36 @@ def _thumbnails_lost_their_colour(output_folder: str) -> bool:
     return True
 
 
+# What a file MediaInfo can't read is taken to hold: one video track with nothing known about it, in the XML layout
+# pymediainfo's constructor reads.
+_UNREAD_MEDIA_INFO_XML = '<Mediainfo><File><track type="Video"/></File></Mediainfo>'
+
+
+def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
+    """The file's details as MediaInfo reads them; a file it can't read is one video track with none, and one warning.
+
+    MediaInfo copies a tag into its XML as it is, so a title holding U+FFFF makes the XML unreadable and pymediainfo
+    raises ``ParseError``. FFmpeg reads the file fine, so it is processed as one that declares nothing (SDR, no
+    runtime) rather than failed over a tag.
+
+    Args:
+        video_file: The file.
+        **parse_options: Passed on to ``MediaInfo.parse`` (``parse_speed``).
+
+    Returns:
+        The file's details, or a video track with none when MediaInfo's answer can't be read.
+
+    Raises:
+        OSError: The file is missing, or the MediaInfo library can't be loaded.
+        RuntimeError: MediaInfo couldn't open the file.
+    """
+    try:
+        return MediaInfo.parse(video_file, **parse_options)
+    except (ET.ParseError, ValueError) as exc:
+        logger.warning("MediaInfo couldn't read the details of {} ({}); carrying on without them.", video_file, exc)
+        return MediaInfo(_UNREAD_MEDIA_INFO_XML)
+
+
 def is_greyscale_h264(media_info: MediaInfo) -> bool:
     """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
     4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
@@ -1879,7 +1910,7 @@ def generate_images(
         WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota,
             read-only, or not writable by this user); none of them are kept.
     """
-    media_info = MediaInfo.parse(video_file)
+    media_info = read_media_info(video_file)
     if gpu == "NVIDIA" and is_greyscale_h264(media_info):
         # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
         # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.

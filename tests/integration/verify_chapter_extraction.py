@@ -13,10 +13,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image
+from pymediainfo import MediaInfo
 
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapters, ffmpeg_runner
-from media_preview_generator.processing.chapters import MediaInfo, extract_chapter_frame
+from media_preview_generator.processing.chapters import extract_chapter_frame
 from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.servers.plex_chapters import Chapter, ChapterTarget
 
