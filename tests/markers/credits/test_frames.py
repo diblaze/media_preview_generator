@@ -1542,6 +1542,16 @@ class TestAFirstFrameTheGpuDecodedWrong:
         assert [row[0] for row in rows] == [1.0, 2.0]
         assert [plane.shape for plane in np.concatenate(calls)] == [(180 * scale, 320 * scale)] * 2
 
+    def test_a_gpu_decode_whose_first_frame_is_all_green_reads_every_frame(self):
+        # Limited-range pure green is Cb 54 / Cr 34, under the chroma bar, but its brightness is real (a green plate).
+        rows = frames.run_decode(
+            fake_ffmpeg([145, 250], ["1", "2"], chroma=40),
+            hw_active=True,
+            pts_offset_s=0.0,
+            detect_boxes=_detector([]),
+        )
+        assert [row[0] for row in rows] == [1.0, 2.0]
+
     def test_the_colour_check_reads_a_scaled_frames_own_chroma(self):
         with pytest.raises(GpuDecodeError, match="without its colours"):
             frames.run_decode(

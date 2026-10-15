@@ -535,18 +535,20 @@ def _said_cant_decode(stderr_file: BinaryIO, offset: int) -> tuple[bool, int]:
             return False, offset
 
 
-def _gpu_misdecoded(command: list[str], stderr_file: BinaryIO, chroma: bytes) -> str | None:
+def _gpu_misdecoded(command: list[str], stderr_file: BinaryIO, luma: bytes, chroma: bytes) -> str | None:
     """Why a GPU decode's frames are wrong although ffmpeg reports success, judged at its first frame; None when they
     aren't. Previews hand the same two cases to the CPU (``processing.generator``).
 
     - Greyscale H.264 on NVDEC comes out in coloured stripes with its brightness off too (a Quadro P5000 and a TITAN
       RTX; Intel's VAAPI decodes it right). ffmpeg lists it as 4:2:0, so MediaInfo tells it, read only for an input
       ffmpeg lists as H.264 on NVDEC.
-    - The decoder lost the colours: no chroma byte above ``_LOST_COLOUR_CHROMA_MAX``.
+    - The decoder lost the colours: no chroma byte above ``_LOST_COLOUR_CHROMA_MAX``, and no luma byte either (it
+      hands back a quarter of every value or less; a real all-green frame keeps its brightness).
 
     Args:
         command: The decode's argv (its ``-hwaccel`` names the GPU decoder, its ``-i`` the file).
         stderr_file: ffmpeg's stderr so far, its listing of the input among it.
+        luma: The first frame's luma plane.
         chroma: The first frame's chroma plane.
 
     Returns:
@@ -559,7 +561,11 @@ def _gpu_misdecoded(command: list[str], stderr_file: BinaryIO, chroma: bytes) ->
         found = _VIDEO_STREAM_RE.search(listing)
         if found is not None and found.group(1) == "h264" and _input_is_greyscale_h264(command):
             return "the GPU decodes greyscale H.264 into the wrong colours"
-    if int(np.frombuffer(chroma, dtype=np.uint8).max()) <= _LOST_COLOUR_CHROMA_MAX:
+    lost = _LOST_COLOUR_CHROMA_MAX
+    if (
+        int(np.frombuffer(chroma, dtype=np.uint8).max()) <= lost
+        and int(np.frombuffer(luma, dtype=np.uint8).max()) <= lost
+    ):
         return "the GPU decoded this file's video without its colours"
     return None
 
@@ -820,7 +826,9 @@ def run_decode(
                 if first_frame:
                     first_frame = False
                     y_bytes = _Y_BYTES * scale * scale
-                    misdecoded = _gpu_misdecoded(command, stderr_file, item[y_bytes:]) if hw_active else None
+                    misdecoded = (
+                        _gpu_misdecoded(command, stderr_file, item[:y_bytes], item[y_bytes:]) if hw_active else None
+                    )
                     if misdecoded is not None:
                         logger.debug("{}: {}; its GPU decode is stopped at the first frame", name, misdecoded)
                         _kill(proc)
