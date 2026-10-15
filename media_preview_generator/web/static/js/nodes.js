@@ -321,7 +321,7 @@
                 </div>
                 <div class="nd-map-cols">
                     <span>Path on this app ${infoIcon('Where this app sees a library folder, inside its own container.')}</span><span></span>
-                    <span>Path on the node ${infoIcon('Where the node sees that same folder on its machine.')}</span><span></span><span></span>
+                    <span>Path on the node ${infoIcon('Where the node sees that same folder on its machine.')}</span><span></span>
                 </div>
                 <div class="nd-map-rows"></div>
                 <div><button type="button" class="btn btn-sm btn-outline-secondary nd-add-row"><i class="bi bi-plus-lg me-1"></i>Add row</button></div>

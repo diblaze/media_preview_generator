@@ -77,7 +77,11 @@
 .nd-map { display: grid; gap: 10px; min-width: 0; }
 .nd-map-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .nd-map-head h3 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; min-width: 0; }
-.nd-map-cols, .nd-map-row { display: grid; grid-template-columns: minmax(0, 1fr) 16px minmax(0, 1fr) minmax(110px, auto) 32px; gap: 8px; align-items: center; }
+.nd-map-cols, .nd-map-row { display: grid; grid-template-columns: minmax(0, 1fr) 16px minmax(0, 1fr) 32px; gap: 8px; align-items: center; }
+/* Test access results go on their own line under the two paths: one row can cover many libraries. */
+.nd-map-row .nd-remove { grid-column: 4; grid-row: 1; }
+.nd-map-row .nd-chip-slot { grid-column: 1 / 4; grid-row: 2; }
+.nd-map-row .nd-chip-slot:empty { display: none; }
 .nd-map-cols { font-size: 12px; font-weight: 600; color: var(--faint); }
 .nd-map-cols > span { display: flex; align-items: center; gap: 4px; }
 .nd-arrow { color: var(--faint); text-align: center; }
