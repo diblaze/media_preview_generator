@@ -167,7 +167,14 @@ jobs:
           $nodeDir = Join-Path $env:LOCALAPPDATA "MediaPreviewGenerator\node"
           $undoRecord = Join-Path $nodeDir "loudness-writes.jsonl"
           Set-Content -Path $undoRecord -Value "{}"
-          ./nodes/windows/uninstall.ps1 -RemoveData
+          # The installed copy, as the README says: it deletes the program folder it runs from.
+          $installedUninstaller = Join-Path $env:LOCALAPPDATA "Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"
+          if (-not (Test-Path $installedUninstaller)) {
+            throw "install.ps1 didn't copy uninstall.ps1 into the program folder"
+          }
+          Push-Location (Split-Path $installedUninstaller)
+          & $installedUninstaller -RemoveData
+          Pop-Location
           if (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue) {
             throw "uninstall.ps1 left the logon entry"
           }

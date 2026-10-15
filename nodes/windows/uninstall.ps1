@@ -25,6 +25,10 @@ $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $RunValue = "MediaPreviewGeneratorPlexDbNode"
 $RuleName = "Media Preview Generator Plex database node"
 
+# This script may run from the program folder it deletes, and Windows can't delete a process's working folder.
+Set-Location $env:USERPROFILE
+[Environment]::CurrentDirectory = $env:USERPROFILE
+
 Get-Process -Name "PlexDbNode", "PlexDbNode-debug" -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 Remove-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue

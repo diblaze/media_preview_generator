@@ -34,8 +34,8 @@ You don't need it when:
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
 
-   It copies the program to `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode`, makes it start at every logon
-   of this user, starts it, and prints the **address** and **key** to paste into the app
+   It copies the program and `uninstall.ps1` to `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode`, makes
+   it start at every logon of this user, starts it, and prints the **address** and **key** to paste into the app
    (Settings → Nodes → Add node).
 
 Options:
@@ -51,7 +51,11 @@ The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\Medi
 (`node.json`, `logs\node.log`, `loudness-writes.jsonl`). To use a key of your own, set it before installing
 (`$env:NODE_KEY = "..."`); the installer saves it in `node.json`, so it still works after a reboot.
 
-To remove it: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`.
+To update it, download the newest release, unzip it and run `install.ps1` again as the same user, with the options
+you installed with (`-Port`, `-PlexConfigDir`). It replaces the program and keeps the key and the undo record.
+
+To remove it:
+`powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"`.
 `-RemoveData` also deletes the key and log but keeps the loudness undo record, the only way to put Plex's audio
 tracks back; add `-RemoveUndoRecord` to delete it too. To undo loudness writes after removing the node, install it
 again first.
@@ -78,7 +82,8 @@ no administrator rights, starts and stops with Plex's own session, and can't rea
 
 ## Build
 
-On Windows with Python 3.12 and a git checkout of the repository:
+On Windows with Python 3.12 and a git clone of the repository with its tags (the build reads the app's version from
+them):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File nodes\windows\build.ps1

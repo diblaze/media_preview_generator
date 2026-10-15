@@ -385,6 +385,12 @@ class TestTheInstaller:
         # New-Item -Force on an existing registry key deletes it: every other program's logon entry with it.
         assert "New-Item -Path $RunKey -Force" not in self.SCRIPT
 
+    def test_it_installs_the_uninstaller_with_the_program(self):
+        # The unzipped download may be long gone when the node is removed.
+        assert "Copy-Item -Force $Uninstaller $InstallDir" in self.SCRIPT
+        readme = (REPO_ROOT / "nodes" / "windows" / "README.md").read_text()
+        assert r"$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1" in readme
+
 
 class TestTheUninstaller:
     """uninstall.ps1 can't run here; ``windows-node.yml`` runs it. The loudness undo record is the only way to put
@@ -406,6 +412,12 @@ class TestTheUninstaller:
         removal = next(line for line in self.README.split("\n\n") if "-RemoveData" in line)
         for text in (help_text, removal):
             assert "-RemoveUndoRecord" in text and "loudness undo record" in text
+
+    def test_it_steps_out_of_the_program_folder_before_deleting_it(self):
+        # Run from its installed copy, it deletes the folder it runs from; Windows can't delete a working folder.
+        left = self.SCRIPT.index("Set-Location $env:USERPROFILE")
+        assert left < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
+        assert "[Environment]::CurrentDirectory = $env:USERPROFILE" in self.SCRIPT
 
     def test_it_says_where_the_kept_record_is(self):
         assert '" Its loudness undo record stays: $record"' in self.SCRIPT
