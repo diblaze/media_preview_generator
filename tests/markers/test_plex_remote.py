@@ -279,6 +279,31 @@ class TestVersionSkew:
     def test_only_a_lower_readable_version_counts_as_too_old(self, version, too_old):
         assert plex_remote.agent_too_old(version) is too_old
 
+    @pytest.mark.parametrize(
+        ("version", "needed", "older"),
+        [
+            # A :dev image (setuptools-scm: 3 commits after 5.1.0, heading for 5.1.1) and a local build.
+            ("4.4.3.dev5", "9.9.0", True),
+            ("9.9.0", "4.4.3.dev5", False),
+            ("5.1.0", "5.1.1.dev3", True),
+            ("5.1.1.dev3", "5.1.0", False),
+            ("5.1.1.dev3+g1234abc", "5.1.0", False),
+            # A dev build of a release comes before that release, and two of them order by their dev number.
+            ("5.1.1.dev3", "5.1.1", True),
+            ("5.1.1", "5.1.1.dev3", False),
+            ("5.1.1.dev3", "5.1.1.dev5", True),
+            ("5.1.1.dev5", "5.1.1.dev3", False),
+            ("5.1.1.dev3", "5.1.1.dev3", False),
+            ("5.1.1rc1", "5.1.1", True),
+            ("5.1.1rc1", "5.1.0", False),
+            ("5.1.0+local", "5.1.0", False),
+            ("dev", "5.1.0", False),
+            ("5.1.0", "dev", False),
+        ],
+    )
+    def test_a_dev_or_local_build_is_ordered_by_its_release(self, version, needed, older):
+        assert plex_remote.agent_older_than(version, needed) is older
+
     def test_an_agent_ahead_of_this_app_says_to_update_the_app(self):
         remote, _ = _remote(FakeResponse(409, {"agent": {"version": "2.0.0", "protocols": [2]}, "error": {}}))
         with pytest.raises(AgentError) as ei:

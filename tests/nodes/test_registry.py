@@ -302,6 +302,24 @@ class TestStates:
             view.reason == f"nuc runs version {version} and this app runs {APP_VERSION}. Update this app to {version}."
         )
 
+    @pytest.mark.parametrize(
+        ("app_version", "node_version", "update"),
+        [
+            # Lab: an app on a :dev image read "Update the node to 4.4.3.dev5." for a node on 9.9.0.
+            ("4.4.3.dev5", "9.9.0", "Update this app to 9.9.0."),
+            ("5.1.0", "5.1.1.dev3", "Update this app to 5.1.1.dev3."),
+            ("5.1.1.dev3", "5.1.0", "Update the node to 5.1.1.dev3."),
+            ("5.1.1.dev3", "5.1.1", "Update this app to 5.1.1."),
+            ("5.1.1", "5.1.1.dev3", "Update the node to 5.1.1."),
+        ],
+    )
+    def test_a_dev_build_on_either_side_is_never_told_to_go_back(self, h, app_version, node_version, update):
+        h.registry._app_version = lambda: app_version
+        h.client().default_info = _info(version=node_version)
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_UPDATE_NEEDED
+        assert view.reason.endswith(update), view.reason
+
     def test_a_worker_on_another_build_of_the_same_version_needs_an_update(self, h):
         # Pull request images and local builds all report one version: their commit tells them apart.
         h.app_build = "a" * 40
