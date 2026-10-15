@@ -267,6 +267,7 @@ def _load_or_create(config_dir: str) -> tuple[dict[str, Any], bool]:
         if (
             not isinstance(stored, dict)
             or not isinstance(stored.get("id"), str)
+            or not stored["id"].strip()
             or not isinstance(stored.get("key"), str)
         ):
             raise SystemExit(f"{path} isn't a node identity file; restore it from a backup and restart. {rekeys}")

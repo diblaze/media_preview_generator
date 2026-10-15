@@ -61,8 +61,15 @@ class TestNodeJson:
         assert (tmp_path / "node.json").read_text() == "{not json"
         assert "gives the node a new id and key, and every app that added it has to add it again" in str(refused.value)
 
-    def test_wrong_shape_refuses_to_start(self, tmp_path):
-        (tmp_path / "node.json").write_text('{"id": 3}')
+    @pytest.mark.parametrize(
+        "stored",
+        ['{"id": 3}', '{"id": "", "key": "k"}', '{"id": "  ", "key": "k"}'],
+        ids=["not-text", "blank-id", "spaces-id"],
+    )
+    def test_wrong_shape_refuses_to_start(self, tmp_path, stored):
+        # A blank id is no id: the app could never save one for the node, so nothing would check which machine
+        # answers at its address.
+        (tmp_path / "node.json").write_text(stored)
 
         with pytest.raises(SystemExit, match="isn't a node identity file; restore it from a backup"):
             identity.load_identity(str(tmp_path))
