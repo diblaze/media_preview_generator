@@ -1362,19 +1362,17 @@ function renderNoWorkersWarning(message) {
         return;
     }
     if (!banner) {
+        // Above the Workers card; a page without it has nowhere to show the warning.
+        const workersBlock = document.getElementById('dashboard-workers');
+        if (!workersBlock) return;
         const row = document.createElement('div');
         row.id = 'noWorkersWarningRow';
-        row.className = 'row';
-        row.innerHTML = `<div class="col-12 mb-3">
-            <div class="alert alert-warning mb-0 d-flex align-items-center" id="noWorkersWarningBanner">
+        row.className = 'mb-3';
+        row.innerHTML = `<div class="alert alert-warning mb-0 d-flex align-items-center" id="noWorkersWarningBanner">
                 <i class="bi bi-exclamation-triangle-fill me-2"></i>
                 <span id="noWorkersWarningText"></span>
-            </div>
-        </div>`;
-        const workerSection = document.getElementById('workerStatusContainer');
-        if (workerSection) {
-            workerSection.closest('.row').before(row);
-        }
+            </div>`;
+        workersBlock.before(row);
         banner = document.getElementById('noWorkersWarningBanner');
     }
     const textEl = document.getElementById('noWorkersWarningText');
@@ -4456,12 +4454,19 @@ function _archiveVisibleToast(toast) {
 }
 
 function showToast(title, message, type = 'info') {
-    const toast = document.getElementById('toastNotification');
+    let toast = document.getElementById('toastNotification');
+    if (toast.classList.contains('show') || toast.classList.contains('showing')) _archiveVisibleToast(toast);
+    if (bootstrap.Toast.getInstance(toast)) {
+        // Disposing a toast still fading in or out makes Bootstrap's queued transition callback throw on its cleared
+        // element; the old toast finishes that harmlessly off the page and a fresh copy takes its place.
+        const fresh = toast.cloneNode(true);
+        fresh.classList.remove('show', 'showing', 'hide');
+        toast.replaceWith(fresh);
+        toast = fresh;
+    }
     const toastTitle = document.getElementById('toastTitle');
     const toastBody = document.getElementById('toastBody');
     const toastIcon = document.getElementById('toastIcon');
-
-    if (toast.classList.contains('show')) _archiveVisibleToast(toast);
     toastTitle.textContent = title;
     toastBody.textContent = message;
 
@@ -4470,8 +4475,6 @@ function showToast(title, message, type = 'info') {
     toast.setAttribute('aria-live', type === 'danger' ? 'assertive' : 'polite');
     toastIcon.className = `bi ${_TOAST_ICONS[type] || _TOAST_ICONS.info} me-2`;
 
-    const previous = bootstrap.Toast.getInstance(toast);
-    if (previous) previous.dispose();
     new bootstrap.Toast(toast, { autohide: type !== 'danger', delay: 5000 }).show();
 }
 

@@ -403,3 +403,41 @@ def test_settings_touch_targets_reach_switches_and_day_chips(browser, app_url: s
     assert hit_ids == ["autoRequeueOnRestart", "autoRequeueOnRestart"]
     assert day_chips
     assert all(width >= 44 and height >= 44 for width, height in day_chips)
+
+
+@pytest.mark.e2e
+def test_the_no_workers_warning_shows_above_the_workers_card(authed_page: Page, app_url: str) -> None:
+    page = authed_page
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on("console", lambda message: message.type == "warning" and errors.append(message.text))
+    mock_dashboard_defaults(page)
+    mock_worker_groups(page)
+    page.route(
+        "**/api/system/config",
+        lambda route: _fulfill_json(
+            route, {"gpu_threads": 0, "cpu_threads": 0, "config_warning": "No workers configured. Add a group."}
+        ),
+    )
+    page.goto(f"{app_url}/")
+    expect(page.locator("#noWorkersWarningBanner")).to_have_text("No workers configured. Add a group.")
+    assert page.evaluate(
+        "() => document.getElementById('noWorkersWarningRow').nextElementSibling.id === 'dashboard-workers'"
+    )
+    assert not [e for e in errors if "renderNoWorkersWarning" in e or "reading 'before'" in e], errors
+
+
+@pytest.mark.e2e
+def test_toasts_shown_back_to_back_raise_no_error(authed_page: Page, app_url: str) -> None:
+    page = authed_page
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    mock_dashboard_defaults(page)
+    mock_worker_groups(page)
+    page.goto(f"{app_url}/")
+    # The second toast arrives while the first is still fading in.
+    page.evaluate("() => { showToast('One', 'first', 'success'); showToast('Two', 'second', 'info'); }")
+    expect(page.locator("#toastTitle")).to_have_text("Two")
+    expect(page.locator("#toastNotification")).to_be_visible()
+    page.wait_for_timeout(600)
+    assert errors == []
