@@ -52,6 +52,7 @@ PROBE_RATE_LIMITED = "rate_limited"
 PROBE_THIS_APP = "this_app"
 PROBE_OTHER_APP = "other_app"
 PROBE_WEB_PAGE = "web_page"
+PROBE_NOT_A_NODE = "not_a_node"
 # Bounds on what a node sends that is passed on to the browser.
 NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
@@ -245,7 +246,7 @@ def _probe_info(info: dict) -> dict[str, Any]:
 
 def _probe(url: str, key: str) -> dict[str, Any]:
     """Ask an address what it is, without saving anything: ``{"ok", "info"}`` or ``{"ok": False, "error"}``."""
-    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_REJECTED
+    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_INCOMPATIBLE, AGENT_REJECTED
 
     try:
         info = _make_client(url, key).info()
@@ -268,10 +269,14 @@ def _probe(url: str, key: str) -> dict[str, Any]:
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
+        if state == AGENT_INCOMPATIBLE:
+            # A Plex database node from before /v1/info that doesn't speak this app's protocol: a version problem.
+            return _probe_error(
+                protocol.KIND_PROTOCOL, "Something answered at this address, but not as a node this app can use."
+            )
         if state != AGENT_CONNECTED:
             return _not_a_node(exc) or _probe_error(
-                protocol.KIND_PROTOCOL,
-                "Something answered at this address, but not as a node this app can use.",
+                protocol.KIND_PROTOCOL, "Something else answers at this address, not a node.", PROBE_NOT_A_NODE
             )
         return {
             "ok": True,

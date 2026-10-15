@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.server
 import threading
 import time
 from pathlib import Path
@@ -281,6 +282,23 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["reason"] == "web_page"
 
+    def test_probe_of_something_else_that_answers_says_it_is_not_a_node(self, client, nodes, monkeypatch):
+        # An Emby or Jellyfin address: "update the node" would send the user the wrong way.
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("unreachable", ""))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"] == {
+            "kind": "protocol",
+            "message": "Something else answers at this address, not a node.",
+            "reason": "not_a_node",
+        }
+
+    def test_probe_of_a_plex_helper_on_another_protocol_stays_a_version_problem(self, client, nodes, monkeypatch):
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("incompatible", "0.3.0"))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "protocol" and "reason" not in body["error"]
+
     def test_this_apps_answers_carry_its_instance_id(self, client, nodes):
         resp = client.get("/v1/info")
         assert resp.headers["X-MPG-App-Instance"] == client.application.config["APP_INSTANCE_ID"]
@@ -362,6 +380,33 @@ class TestListAndProbe:
         assert body["ok"] is False and body["error"]["kind"] == "protocol"
         assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
         assert pinged == []
+
+
+class _NotANode(http.server.BaseHTTPRequestHandler):
+    """What Emby or Jellyfin answers at a path it doesn't have: 404 in plain text."""
+
+    def _answer(self) -> None:
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = _answer  # noqa: N815
+    do_POST = _answer  # noqa: N815
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def test_probe_of_a_media_server_address_says_it_is_not_a_node(client):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NotANode)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with client.application.app_context():
+            answer = api_nodes._probe(f"http://127.0.0.1:{server.server_address[1]}", "k" * 32)
+    finally:
+        server.shutdown()
+    assert answer["error"]["reason"] == "not_a_node"
 
 
 class TestCreate:

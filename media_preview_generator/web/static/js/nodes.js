@@ -690,6 +690,9 @@
                 if (error.reason === 'web_page') {
                     return "This address answers with a web page, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.";
                 }
+                if (error.reason === 'not_a_node') {
+                    return 'Something else answers at this address, not a node. Check the address and the port: a node uses 9494 unless you set NODE_PORT.';
+                }
                 return `Something answered, but not as a node this app can use. Update the node to the same version as this app${page.appVersion ? ` (${page.appVersion})` : ''}.`;
             case 'request':
                 return "The node didn't accept the request. Update the node and this app to the same version.";
