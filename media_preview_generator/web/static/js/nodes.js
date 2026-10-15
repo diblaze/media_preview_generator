@@ -972,8 +972,10 @@
     // mapDirty / setDirty: the Media rows / the Settings fields were edited and not saved; discardOk lets one close
     // through after the user said Discard. editTag: the node's edit_tag as the dialog opened it (or as its own last
     // save left it); polls don't move it, so a save over another tab's change is refused, not applied on top.
+    // rescanning: a Rescan GPUs is under way, so a poll leaves its button off.
     const detail = {
         editor: null, healthSeq: 0, healthStartedAt: 0, mapDirty: false, setDirty: false, discardOk: false, editTag: undefined,
+        rescanning: false,
     };
 
     function setMapDirty(dirty) {
@@ -1056,25 +1058,46 @@
         if (isWorker(node)) useIt = ' · <a href="/settings#section-workers">Add it to a worker group</a>';
         else if (isPlexDb(node)) useIt = " · <a href=\"/servers\">Pick it on a Plex server's Connection tab</a>";
         rows.push(kv('Used by', used.length ? esc(used.join(', ')) : `<span class="text-muted">nothing yet</span>${useIt}`));
-        const overview = $('#nodeOverview');
-        disposeTooltips(overview);
-        overview.innerHTML = `<section class="sm-sec"><div class="sm-sec-h">Node</div><div class="markers-kv">${rows.join('')}</div></section>`;
-        initTooltips(overview);
+        redrawKeepingFocus($('#nodeOverview'), `<section class="sm-sec"><div class="sm-sec-h">Node</div><div class="markers-kv">${rows.join('')}</div></section>`);
 
         const gpuSection = $('#nodeGpuSection');
         gpuSection.classList.toggle('d-none', !isWorker(node));
         const list = $('#nodeGpuList');
         const items = gpus(node);
+        // An old answer (or another machine's) says nothing about whether a GPU works now.
         list.innerHTML = items.length
             ? items.map((gpu) => {
                 const okGpu = !gpu.status || gpu.status === 'ok';
+                const status = okGpu ? pill('ok', '✓ Working') : pill('bad', '✗ Not working');
                 return `<div class="nd-gpu"><b>${esc(gpu.name || gpu.device || 'GPU')}</b>`
                     + pill('off', [gpu.type, gpu.device].filter(Boolean).join(' · '), { mono: true })
-                    + (okGpu ? pill('ok', '✓ Working') : pill('bad', '✗ Not working'))
-                    + (gpu.error ? `<span class="nd-faint">${esc(gpu.error)}</span>` : '')
+                    + (current ? status : '')
+                    + (current && gpu.error ? `<span class="nd-faint">${esc(gpu.error)}</span>` : '')
                     + '</div>';
             }).join('')
             : '<div class="sm-hint">No GPU found. CPU work still runs on this node.</div>';
+        // A node that isn't answering as itself can't rescan its GPUs. Focus moves to the dialog first: disabling the
+        // focused button would drop it to the page, where Esc no longer closes the dialog.
+        const rescan = $('#nodeRescanGpus');
+        if (!detail.rescanning) {
+            if (!current && document.activeElement === rescan) $('#nodeModal').focus();
+            rescan.disabled = !current;
+        }
+    }
+
+    // Redrawn only when it changed, with focus given back to the same link or button: a poll rewrote it every 10 s
+    // under the focus, which fell to the page, where Esc no longer closes the dialog.
+    function redrawKeepingFocus(el, html) {
+        if (el._markup === html) return;
+        const key = (node) => `${node.tagName}|${node.className}|${node.textContent}`;
+        const focused = el.contains(document.activeElement) ? key(document.activeElement) : null;
+        disposeTooltips(el);
+        el.innerHTML = html;
+        el._markup = html;
+        initTooltips(el);
+        if (focused === null) return;
+        const same = $$('a, button', el).find((node) => key(node) === focused);
+        (same || el.closest('.modal')).focus();
     }
 
     function renderSettings(node) {
@@ -1148,14 +1171,18 @@
         if (!node) return;
         const btn = $('#nodeRescanGpus');
         const result = $('#nodeRescanResult');
+        detail.rescanning = true;
         btn.disabled = true;
         result.className = 'sm-tres';
         result.innerHTML = '<span class="sm-spin"></span>Checking the GPUs…';
         const r = await api('POST', `/api/nodes/${encodeURIComponent(node.id)}/rescan-gpus`);
+        detail.rescanning = false;
         enable(btn);
         if (!r.ok) {
             result.className = 'sm-tres bad';
             result.textContent = errorText(r, "Couldn't rescan");
+            // A poll during the rescan may have found the node gone: its button goes off again.
+            refreshOpenNode();
             return;
         }
         replaceNode(r.data);

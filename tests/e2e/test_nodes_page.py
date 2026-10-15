@@ -931,6 +931,47 @@ class TestNodeDialog:
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("RTX 4070")
         assert api.bodies("POST", "/nodes/n-storage/rescan-gpus") == [None]
 
+    @pytest.mark.parametrize("state", ["offline", "duplicate"])
+    def test_a_node_not_answering_as_itself_shows_its_gpus_without_saying_they_work(
+        self, authed_page: Page, app_url: str, state: str
+    ) -> None:
+        """An offline node's Overview said its last answer's GPU was "✓ Working", with Rescan GPUs ready to press."""
+        nodes = _four_nodes()
+        nodes[3]["state"] = state
+        _open_nodes(authed_page, app_url, nodes)
+        _open_node(authed_page, "n-old")
+        gpus = authed_page.locator("#nodeGpuList")
+        expect(gpus).to_contain_text("GTX 1650")
+        expect(gpus).not_to_contain_text("Working")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_disabled()
+
+    def test_rescan_is_ready_again_once_the_node_answers(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-old")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_disabled()
+        api.nodes[3] = {**api.nodes[3], "state": "ready", "reason": "", "last_seen": time.time() - 2}
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        expect(authed_page.locator("#nodeGpuList")).to_contain_text("✓ Working")
+        expect(authed_page.locator("#nodeRescanGpus")).to_be_enabled()
+
+    def test_a_poll_keeps_the_focus_on_the_overview_so_esc_still_closes_the_dialog(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """Every poll rewrote the Overview under the focused link: focus fell to the page and Esc did nothing."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-nuc")
+        _node_tab(authed_page, "overview")
+        link = authed_page.locator("#nodeOverview a", has_text="Add it to a worker group")
+        link.focus()
+        api.nodes[2] = {**api.nodes[2], "cpu": {**api.nodes[2]["cpu"], "load1": 2.5}}
+
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        expect(authed_page.locator("#nodeOverview")).to_contain_text("load 2.5")
+        expect(link).to_be_focused()
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
     def test_rescan_of_a_node_that_does_not_answer_says_so_in_red(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
         api.rescan_answer = (502, {"error": "Couldn't ask storage: http://storage.lan:9494 didn't answer"})
