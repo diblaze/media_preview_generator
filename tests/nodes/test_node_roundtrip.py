@@ -604,7 +604,7 @@ class TestAPlexDatabaseNodeSwappedAtItsAddress:
         assert _served(machines["a"][1]) == [("intro", 11_000, 37_000)]
 
         answering["app"] = machines["b"][0]  # the same key, another machine
-        with pytest.raises(AgentUnreachableError, match="isn't the Plex database node saved there"):
+        with pytest.raises(AgentUnreachableError, match="isn't Plex box, the Plex database node saved there"):
             db.write_item(write, deadline=time.monotonic() + 10)
 
         assert _served(machines["b"][1]) == []
@@ -647,7 +647,7 @@ class TestAPlexDatabaseNodeSwappedAtItsAddress:
         assert registered == [machines["a"][1]]
 
         answering["app"] = machines["b"][0]  # the same key, another machine
-        with pytest.raises(AgentUnreachableError, match="isn't the Plex database node saved there"):
+        with pytest.raises(AgentUnreachableError, match="isn't Plex box, the Plex database node saved there"):
             plex_chapters.register_chapters(server, target, {1: "b" * 64})
 
         assert registered == [machines["a"][1]]

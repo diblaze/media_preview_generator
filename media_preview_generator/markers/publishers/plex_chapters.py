@@ -618,6 +618,7 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
         backend = AgentClient(
             settings.agent_url,
             settings.agent_token,
+            name=getattr(settings, "agent_node_name", ""),
             refusal=lambda: node_refusal(settings, live),
             node_uid=lambda: saved_node_uid(settings),
             wrong_node=lambda: report_wrong_node(settings),

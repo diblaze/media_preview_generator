@@ -367,16 +367,18 @@ def report_of_failure(exc: PublishError, default: Capability, details: dict | No
     return CapabilityReport(exc.state or default, str(exc), {**(details or {}), **busy})
 
 
-def beside_another_plex(url: str, server_name: str, written: str) -> str:
+def beside_another_plex(url: str, server_name: str, written: str, name: str = "") -> str:
     """The refusal of a Plex database node beside a different Plex than the server (a mistyped address).
 
     Args:
         url: The node's address.
         server_name: The server's name.
         written: What would have gone into the wrong database ("markers").
+        name: The node's name ("" for one without).
     """
+    where = f"at {url or 'this address'}"
     return (
-        f"The Plex database node at {url or 'this address'} is next to a different Plex server than "
+        f"The Plex database node {f'{name} {where}' if name else where} is next to a different Plex server than "
         f"{server_name or 'this one'}. Check the address: {written} would have gone into the wrong database."
     )
 
@@ -2069,7 +2071,9 @@ class PlexMarkerPublisher(MarkerPublisher):
             return None
         return CapabilityReport(
             Capability.AGENT_UNAVAILABLE,
-            beside_another_plex(str(agent.get("url") or ""), self._config.name, "markers"),
+            beside_another_plex(
+                str(agent.get("url") or ""), self._config.name, "markers", str(agent.get("name") or "")
+            ),
             {**report.details, "agent": {**agent, "wrong_plex": True}},
         )
 

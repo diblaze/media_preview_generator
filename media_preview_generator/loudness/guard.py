@@ -321,8 +321,9 @@ class RemoteLoudnessDb:
             return ""
         if not theirs or theirs == ours:
             return ""
+        agent = self._remote.agent_details()
         return beside_another_plex(
-            self._remote.agent_details().get("url", ""), self.server_name, "loudness measurements"
+            agent.get("url", ""), self.server_name, "loudness measurements", agent.get("name", "")
         )
 
     def _call(self, operation: str, body: dict, *, deadline: float, trust_recent: bool = True) -> dict:

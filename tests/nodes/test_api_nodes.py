@@ -964,7 +964,7 @@ class TestHealthAndLog:
         assert body["overall_ok"] is False
         rows = next(s for s in body["sections"] if s["id"] == "node_plex_db")["checks"]
         assert [(r["id"], r["ok"]) for r in rows] == [("plex_db_reachable", False)]
-        assert "isn't the Plex database node saved there" in rows[0]["reason"]
+        assert "isn't nuc, the Plex database node saved there" in rows[0]["reason"]
 
     def test_a_plex_database_must_fix_its_setup_health_found_is_counted_on_its_card(self, client, nodes, monkeypatch):
         """The card said Ready with nothing to fix while Setup Health said the node can't write Plex's database."""

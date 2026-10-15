@@ -432,6 +432,7 @@ class TestFailuresLookLikeTodays:
         assert "Can't reach the Plex database node" in report.message and "nothing is lost" in report.message
         assert report.details["agent"] == {
             "url": URL,
+            "name": "",
             "version": "",
             "state": "unreachable",
             "machine_identifier": "",
@@ -746,6 +747,78 @@ class TestTheNodesSavedId:
         assert [c["headers"].get(NODE_UID_HEADER) for c in session.calls] == ["uid-a", None]
 
 
+class TestARefusalCallsTheNodeByItsName:
+    """Lab: every relayed refusal, in the job log and Setup Health, said "The Plex database node at http://...", where
+    the Nodes page knows the node by its name. The address stays only where checking it is the fix."""
+
+    WRONG_NODE = _refusal({"kind": KIND_WRONG_NODE, "message": "another id"}, version="1.2.0", protocols=(1, 2))
+    OLDER = FakeResponse(409, {"agent": {"version": "1.2.0", "protocols": [1]}, "error": {"kind": "protocol"}})
+
+    @pytest.mark.parametrize(
+        ("answer", "named", "unnamed"),
+        [
+            (
+                requests.ConnectionError("refused"),
+                f"Can't reach the Plex database node plex-box at {URL} (ConnectionError).",
+                f"Can't reach the Plex database node at {URL} (ConnectionError).",
+            ),
+            (
+                FakeResponse(302, {}),
+                f"The Plex database node plex-box at {URL} answered with a redirect; this app doesn't follow one. "
+                "Check the node's address.",
+                f"The Plex database node at {URL} answered with a redirect; this app doesn't follow one. "
+                "Check the node's address.",
+            ),
+            (
+                FakeResponse(401, {}),
+                "The Plex database node plex-box refused this app's key. Set the same key on both sides.",
+                f"The Plex database node at {URL} refused this app's key. Set the same key on both sides.",
+            ),
+            (
+                OLDER,
+                "The Plex database node plex-box is version 1.2.0; it speaks protocol 1 and this app needs 2. "
+                "Update the node.",
+                f"The Plex database node at {URL} is version 1.2.0; it speaks protocol 1 and this app needs 2. "
+                "Update the node.",
+            ),
+            (
+                WRONG_NODE,
+                f"The machine answering at {URL} isn't plex-box, the Plex database node saved there (it has another "
+                "id), so it ran nothing.",
+                f"The machine answering at {URL} isn't the Plex database node saved there (it has another id), so it "
+                "ran nothing.",
+            ),
+            (
+                FakeResponse(500, {}),
+                "The Plex database node plex-box answered 500 instead of a result.",
+                f"The Plex database node at {URL} answered 500 instead of a result.",
+            ),
+        ],
+        ids=["unreachable", "redirect", "key-refused", "older-protocol", "another-machine", "no-result"],
+    )
+    @pytest.mark.parametrize("name", ["plex-box", ""], ids=["named", "no-name"])
+    def test_a_refusal_says_the_nodes_name(self, answer, named, unnamed, name):
+        remote = RemotePlexDb(URL, TOKEN, name=name, session=FakeSession(answer), node_uid=lambda: "uid-a")
+
+        with pytest.raises(PublishError) as ei:
+            remote.item_exists(7, deadline=_deadline())
+
+        assert str(ei.value).startswith(named if name else unnamed), str(ei.value)
+
+    @pytest.mark.parametrize(
+        ("name", "said"),
+        [
+            ("plex-box", f"The Plex database node plex-box at {URL} is next"),
+            ("", f"The Plex database node at {URL} is next"),
+        ],
+        ids=["named", "no-name"],
+    )
+    def test_one_beside_another_plex_is_named_with_the_address_to_check(self, name, said):
+        from media_preview_generator.markers.publishers.plex_db import beside_another_plex
+
+        assert beside_another_plex(URL, "Home", "markers", name).startswith(said)
+
+
 class FakeDatabase:
     """Records what the publisher asks the database half to do."""
 
@@ -930,7 +1003,8 @@ class TestWhichDatabaseHalfAServerGets:
         publisher = publisher_for(MagicMock(), config)
         reset_settings_manager()
         assert isinstance(publisher._db, RemotePlexDb)
-        assert publisher._db.agent_details()["url"] == URL
+        # Its messages call it by its name on the Nodes page.
+        assert (publisher._db.agent_details()["url"], publisher._db.agent_details()["name"]) == (URL, "Plex box")
 
     def test_the_factory_gives_a_plex_server_without_one_the_local_half(self):
         from media_preview_generator.markers.publishers.factory import publisher_for

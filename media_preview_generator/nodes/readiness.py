@@ -453,20 +453,22 @@ def _report_key(url: str, key: str, node_uid: str) -> tuple[str, str, str]:
     return url, hashlib.sha256(key.encode()).hexdigest(), node_uid
 
 
-def _default_file_checks(url: str, key: str, node_uid: str = "") -> Any:
+def _default_file_checks(url: str, key: str, node_uid: str = "", name: str = "") -> Any:
     from ..markers.publishers.plex_remote import RemotePlexDb
 
     # Named like every request to the node: another machine at the address refuses, rather than answering with its
     # own Plex database as this node's.
-    db = RemotePlexDb(url, key, node_uid=lambda: node_uid)
+    db = RemotePlexDb(url, key, name=name, node_uid=lambda: node_uid)
     report = db.file_checks(deadline=time.monotonic() + PLEX_DB_CHECK_S)
     with _last_reports_lock:
         _last_reports[_report_key(url, key, node_uid)] = report
     return report
 
 
-def cached_file_checks(url: str, key: str, node_uid: str = "") -> Any:
+def cached_file_checks(url: str, key: str, node_uid: str = "", name: str = "") -> Any:
     """The last Plex database check Setup Health ran on the node at ``url`` with ``key``, or None (never asks it).
+
+    ``name`` is the node's, which the check's messages call it by; it isn't part of which check this is.
 
     The node list counts its rows from this, so a card stops saying Ready while its Setup Health has a must fix,
     without a call to every node on every poll.
@@ -495,12 +497,12 @@ def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
 
 
 def _plex_db(
-    view: NodeView, key: str, node_uid: str, file_checks: Callable[[str, str, str], Any]
+    view: NodeView, key: str, node_uid: str, file_checks: Callable[[str, str, str, str], Any]
 ) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
     from ..markers.publishers.plex_db import node_wording
 
-    checked = file_checks(view.url, key, node_uid)
+    checked = file_checks(view.url, key, node_uid, view.name)
     if checked is None:
         return []  # Not checked yet (cached_file_checks): no rows rather than a guess.
     # The check ran on the node: its refusals are about the node, not this app.
@@ -587,7 +589,7 @@ def node_readiness(
     app_version: str,
     app_build: str = "",
     node_uid: str = "",
-    file_checks: Callable[[str, str, str], Any] | None = _default_file_checks,
+    file_checks: Callable[[str, str, str, str], Any] | None = _default_file_checks,
 ) -> dict[str, Any]:
     """The Setup Health envelope for one node.
 
@@ -598,7 +600,8 @@ def node_readiness(
         app_version: This app's version.
         app_build: This app's commit ("" when unknown); shown when only the node's commit differs.
         node_uid: The node's saved id ("" before first contact), named on the Plex database file checks.
-        file_checks: ``(url, key, node_uid) -> CapabilityReport`` for the Plex database role (tests pass their own);
+        file_checks: ``(url, key, node_uid, name) -> CapabilityReport`` for the Plex database role (tests pass their
+            own);
             an answer of None (not checked yet) adds no rows. None leaves the database checks out. The node list's
             count passes :func:`cached_file_checks`: asking the node is too slow for it.
 

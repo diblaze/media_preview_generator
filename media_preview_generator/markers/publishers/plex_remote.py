@@ -702,6 +702,7 @@ class AgentClient:
         url: str,
         token: str,
         *,
+        name: str = "",
         session: Any = None,
         refusal: Callable[[], NodeRefusal | None] | None = None,
         node_uid: Callable[[], str] | None = None,
@@ -713,6 +714,7 @@ class AgentClient:
         Args:
             url: The agent's base address, e.g. ``http://plex-host.lan:9494``.
             token: The key both sides share. Never logged, never in an error message.
+            name: The node's name on the Nodes page, which messages call it by ("" names it by its address).
             session: A ``requests.Session`` to use (tests pass their own).
             refusal: Asked before every request why nothing may be sent to this node now (``node_refusal``); a
                 refusal fails that request.
@@ -725,6 +727,7 @@ class AgentClient:
                 re-pointed to another node is ``refusal``'s to stop.
         """
         self._set_address(url, token)
+        self.name = str(name or "").strip()
         self._session = session or requests.Session()
         self._refusal_check = refusal
         self._node_uid = node_uid
@@ -741,9 +744,13 @@ class AgentClient:
         self.url = str(url or "").strip().rstrip("/")
         self._token = str(token or "")
 
-    def describe(self) -> str:
-        """The address, for messages the user reads."""
-        return self.url or "(no address)"
+    def describe(self, *, address: bool = False) -> str:
+        """The node in a message the user reads, after "The Plex database node": its name, with its address too when
+        ``address`` (where checking the address is the fix), or "at <address>" for a node without a name."""
+        where = f"at {self.url or '(no address)'}"
+        if not self.name:
+            return where
+        return f"{self.name} {where}" if address else self.name
 
     def post(
         self,
@@ -831,7 +838,8 @@ class AgentClient:
             self.state = AGENT_UNREACHABLE
             # The exception text can hold the URL but never the key (it is a header).
             raise AgentUnreachableError(
-                f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}). {unreachable}".strip(),
+                f"Can't reach the Plex database node {self.describe(address=True)} ({type(exc).__name__}). "
+                f"{unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             ) from exc
         if response.status_code == 429:
@@ -839,7 +847,7 @@ class AgentClient:
             # didn't compare this key, so it is a wait, not a refused key.
             self.state = AGENT_UNREACHABLE
             raise AgentUnreachableError(
-                f"The Plex database node at {self.describe()} asks this app to wait: too many wrong keys came from "
+                f"The Plex database node {self.describe()} asks this app to wait: too many wrong keys came from "
                 f"this app's address. {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             )
@@ -854,8 +862,8 @@ class AgentClient:
         if 300 <= response.status_code < 400:
             self.state = AGENT_UNREACHABLE
             raise AgentError(
-                f"The Plex database node at {self.describe()} answered with a redirect; this app doesn't follow one. "
-                "Check the node's address.",
+                f"The Plex database node {self.describe(address=True)} answered with a redirect; this app doesn't "
+                "follow one. Check the node's address.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         encoding = str(response.headers.get("Content-Encoding") or "identity").strip().lower()
@@ -868,7 +876,7 @@ class AgentClient:
         if encoding != "identity" or len(body) > limit:
             self.state = AGENT_UNREACHABLE
             raise AgentError(
-                f"The Plex database node at {self.describe()} sent an answer this app doesn't read "
+                f"The Plex database node {self.describe()} sent an answer this app doesn't read "
                 f"({'compressed' if encoding != 'identity' else 'too large'}).",
                 state=Capability.AGENT_UNAVAILABLE,
             )
@@ -913,7 +921,7 @@ class AgentClient:
         self.ping(timeout=timeout)
         if capability not in self.capabilities:
             raise AgentError(
-                f"The Plex database node at {self.describe()} is version {self.version or 'unknown'}; {feature} "
+                f"The Plex database node {self.describe()} is version {self.version or 'unknown'}; {feature} "
                 f"needs version {needs} or newer. Update the node.",
                 state=Capability.PLUGIN_OUTDATED,
             )
@@ -952,7 +960,7 @@ class AgentClient:
         if status_code == 401:
             self.state = AGENT_REJECTED
             raise AgentError(
-                f"The Plex database node at {self.describe()} refused this app's key. Set the same key on both sides.",
+                f"The Plex database node {self.describe()} refused this app's key. Set the same key on both sides.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         error = payload.get("error")
@@ -964,8 +972,9 @@ class AgentClient:
             if self._wrong_node is not None:
                 self._wrong_node()
             raise AgentUnreachableError(
-                f"The machine answering at {self.describe()} isn't the Plex database node saved there (it has another "
-                f"id), so it ran nothing. This app checks it again. {unreachable}".strip(),
+                f"The machine answering at {self.url or '(no address)'} isn't {f'{self.name}, ' if self.name else ''}"
+                "the Plex database node saved there (it has another id), so it ran nothing. This app checks it "
+                f"again. {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             )
         speaks_ours = sent in protocols if protocols else True
@@ -984,7 +993,7 @@ class AgentClient:
             else:
                 advice = f"it speaks protocol {spoken} and this app speaks {sent}. Update this app to match the node."
             raise AgentError(
-                f"The Plex database node at {self.describe()} is version {named}; {advice}",
+                f"The Plex database node {self.describe()} is version {named}; {advice}",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         if status_code == 409 and isinstance(error, dict) and error.get("kind") == KIND_PROTOCOL:
@@ -994,8 +1003,7 @@ class AgentClient:
             raise AgentError(
                 relayed_text(
                     str(
-                        error.get("message")
-                        or f"The Plex database node at {self.describe()} refused this app's protocol."
+                        error.get("message") or f"The Plex database node {self.describe()} refused this app's protocol."
                     )
                 ),
                 state=Capability.AGENT_UNAVAILABLE,
@@ -1003,7 +1011,7 @@ class AgentClient:
         if status_code == 404 and self._node_without_role():
             self.state = AGENT_NO_ROLE
             raise AgentError(
-                f"The node at {self.describe()} answers, but its Plex database role is off. Start it with that role "
+                f"The node {self.describe()} answers, but its Plex database role is off. Start it with that role "
                 "(NODE_ROLES=worker,plex_db), or choose another node in Edit → Connection.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
@@ -1013,7 +1021,7 @@ class AgentClient:
         if status_code != 200 or not isinstance(payload.get("result"), dict):
             self.state = AGENT_UNREACHABLE
             raise AgentError(
-                f"The Plex database node at {self.describe()} answered {status_code} instead of a result.",
+                f"The Plex database node {self.describe()} answered {status_code} instead of a result.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         self.state = AGENT_CONNECTED
@@ -1023,6 +1031,7 @@ class AgentClient:
         """What the Edit tab shows about the agent: address, version, connection state and which Plex it serves."""
         return {
             "url": self.url,
+            "name": self.name,
             "version": self.version,
             "state": self.state,
             "machine_identifier": self.machine_identifier,
@@ -1045,6 +1054,7 @@ class RemotePlexDb(PlexDatabase):
         url: str,
         token: str,
         *,
+        name: str = "",
         session: Any = None,
         refusal: Callable[[], NodeRefusal | None] | None = None,
         node_uid: Callable[[], str] | None = None,
@@ -1056,6 +1066,7 @@ class RemotePlexDb(PlexDatabase):
         Args:
             url: The agent's base address.
             token: The key both sides share.
+            name: The node's name, for messages (``AgentClient``).
             session: A ``requests.Session`` (tests pass their own).
             refusal: Asked before every call why nothing may be sent to the node now (``node_refusal``).
             node_uid: The id this app saved for the node, named on every call (``AgentClient``).
@@ -1063,7 +1074,14 @@ class RemotePlexDb(PlexDatabase):
             address: The node's address and key as saved now, read before every call (``AgentClient``).
         """
         self._client = AgentClient(
-            url, token, session=session, refusal=refusal, node_uid=node_uid, wrong_node=wrong_node, address=address
+            url,
+            token,
+            name=name,
+            session=session,
+            refusal=refusal,
+            node_uid=node_uid,
+            wrong_node=wrong_node,
+            address=address,
         )
 
     def agent_details(self) -> dict:
@@ -1110,7 +1128,7 @@ class RemotePlexDb(PlexDatabase):
             return self._with_agent(
                 CapabilityReport(
                     Capability.AGENT_UNAVAILABLE,
-                    f"The Plex database node at {self._client.describe()} sent an answer this app can't read.",
+                    f"The Plex database node {self._client.describe()} sent an answer this app can't read.",
                 )
             )
 
@@ -1134,7 +1152,7 @@ class RemotePlexDb(PlexDatabase):
             return self._with_agent(
                 CapabilityReport(
                     Capability.AGENT_UNAVAILABLE,
-                    f"The Plex database node at {self._client.describe()} sent an answer this app can't read.",
+                    f"The Plex database node {self._client.describe()} sent an answer this app can't read.",
                 )
             )
 
@@ -1344,7 +1362,7 @@ class RemotePlexDb(PlexDatabase):
     def _unreadable(self, exc: Exception) -> AgentError:
         logger.debug("Plex marker agent {}: unreadable answer: {}", self._client.describe(), exc)
         return AgentError(
-            f"The Plex database node at {self._client.describe()} sent an answer this app can't read.",
+            f"The Plex database node {self._client.describe()} sent an answer this app can't read.",
             state=Capability.AGENT_UNAVAILABLE,
         )
 
@@ -1379,6 +1397,7 @@ def plex_database(
         return RemotePlexDb(
             settings.agent_url,
             getattr(settings, "agent_token", ""),
+            name=getattr(settings, "agent_node_name", ""),
             session=session,
             refusal=lambda: node_refusal(settings, live_node_id),
             node_uid=lambda: saved_node_uid(settings),
