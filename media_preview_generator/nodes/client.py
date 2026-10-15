@@ -6,6 +6,7 @@ class, never on status codes or message text. The key is sent only in the Author
 
 from __future__ import annotations
 
+import socket
 import ssl
 import threading
 import time
@@ -17,7 +18,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import HTTPError, NameResolutionError, NewConnectionError, ProtocolError, ReadTimeoutError
+from urllib3.poolmanager import PoolManager
 from urllib3.response import BaseHTTPResponse
 
 from . import protocol
@@ -249,6 +254,118 @@ def _set_body_timeout(response: Any, seconds: float) -> None:
         sock.settimeout(seconds)
 
 
+class _HeadersDeadline:
+    """A connection whose answer's status line and headers must all arrive within its read timeout.
+
+    The socket's timeout bounds each read, not their sum, so headers sent a byte at a time, each just inside it, held
+    the calling thread for as long as the sender liked (the body has its own deadline: ``answer_pieces``). At the
+    deadline the socket is shut down, which wakes the blocked read; the request then fails as a read timeout, and
+    urllib3 closes the connection rather than pooling it.
+    """
+
+    timeout: Any
+    sock: Any
+
+    def getresponse(self) -> Any:
+        """The answer once its headers have come, as urllib3's; a read timeout once they haven't by the deadline.
+
+        Raises:
+            TimeoutError: The headers didn't all arrive within the read timeout (urllib3 makes it a read timeout).
+        """
+        budget = self.timeout
+        sock = self.sock
+        if not isinstance(budget, int | float) or sock is None:
+            return super().getresponse()  # type: ignore[misc]
+        lock = threading.Lock()
+        expired = finished = False
+
+        def expire() -> None:
+            nonlocal expired
+            with lock:
+                if finished:
+                    return
+                expired = True
+            _shut_down(sock)
+
+        timer = threading.Timer(budget, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            response = super().getresponse()  # type: ignore[misc]
+        finally:
+            timer.cancel()
+            # Under the lock, so a watchdog firing just as the headers came either shut the socket and is seen here,
+            # or sees ``finished`` and leaves alone a socket whose body is still to be read.
+            with lock:
+                finished = True
+                gave_up = expired
+            if gave_up:
+                # A shut socket ends the headers early (http.client reads its EOF as their end) or fails the read.
+                raise TimeoutError(f"the answer's headers didn't arrive within {budget} s")
+        return response
+
+
+def _shut_down(sock: Any) -> None:
+    """Shut ``sock`` down for reading and writing, waking a read blocked on it in another thread.
+
+    ``ssl.SSLSocket.shutdown`` also drops its TLS state, which the thread inside the read still uses; the plain
+    socket's shutdown leaves that alone. Through an https proxy the TLS layer wraps the socket as ``.socket``.
+    """
+    raw = getattr(sock, "socket", sock)
+    if isinstance(raw, socket.socket):
+        try:
+            socket.socket.shutdown(raw, socket.SHUT_RDWR)
+        except OSError:
+            pass  # already closed
+
+
+class _HeadersDeadlineHTTPConnection(_HeadersDeadline, HTTPConnection):
+    pass
+
+
+class _HeadersDeadlineHTTPSConnection(_HeadersDeadline, HTTPSConnection):
+    pass
+
+
+class _HeadersDeadlineHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _HeadersDeadlineHTTPConnection
+
+
+class _HeadersDeadlineHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _HeadersDeadlineHTTPSConnection
+
+
+_HEADERS_DEADLINE_POOLS = {"http": _HeadersDeadlineHTTPPool, "https": _HeadersDeadlineHTTPSPool}
+
+
+class _HeadersDeadlineAdapter(HTTPAdapter):
+    """requests' adapter, with connections that give up on headers that don't arrive within the read timeout."""
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = _HEADERS_DEADLINE_POOLS
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> PoolManager:
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        # A SOCKS proxy's manager brings its own connection classes; only an http(s) proxy's uses urllib3's.
+        if manager.pool_classes_by_scheme.get("https") is HTTPSConnectionPool:
+            manager.pool_classes_by_scheme = _HEADERS_DEADLINE_POOLS
+        return manager
+
+
+def new_session() -> requests.Session:
+    """A ``requests.Session`` for talking to nodes: an answer's headers, like its body, have a deadline.
+
+    Returns:
+        The session.
+    """
+    session = requests.Session()
+    adapter = _HeadersDeadlineAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 class DownloadCancelledError(NodeError):
     """The caller's ``cancel_check`` turned true while an answer was arriving."""
 
@@ -333,7 +450,7 @@ class NodeClient:
             return self._shared_session
         session = getattr(self._local, "session", None)
         if session is None:
-            session = self._local.session = requests.Session()
+            session = self._local.session = new_session()
         return session
 
     @property

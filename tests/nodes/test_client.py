@@ -37,7 +37,7 @@ from media_preview_generator.nodes.client import (
     NodeTimeoutError,
     NodeUnreachableError,
 )
-from tests.nodes.slow_answers import answering_late, dripping_server
+from tests.nodes.slow_answers import answering_late, dripping_server, headers_dripping_server
 
 
 def _client(error: Exception) -> NodeClient:
@@ -287,6 +287,104 @@ def _response(status: int, body: bytes) -> requests.Response:
     response._content = body
     response._content_consumed = True
     return response
+
+
+def _self_signed_certificate(tmp_path: Path) -> tuple[str, str]:
+    """A certificate for 127.0.0.1 and its key: ``(certificate file, key file)``."""
+    if shutil.which("openssl") is None:
+        pytest.skip("needs the openssl command")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+         "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    return str(cert), str(key)
+
+
+class TestHeadersSentSlowlyAreGivenUpOn:
+    """The body had a deadline but the status line and headers didn't: each read waited at most the read timeout, so
+    headers sent a byte at a time, each just inside it, held the app's thread for as long as whatever answered liked.
+    The headers must now all arrive within the read timeout (the artifact's headers wait) from the request on."""
+
+    CONNECT_S, READ_S, ARTIFACT_HEADERS_S = 0.5, 1.0, 1.5
+
+    @pytest.fixture(autouse=True)
+    def short_timeouts(self, monkeypatch):
+        monkeypatch.setattr(client_mod, "CONNECT_TIMEOUT_S", self.CONNECT_S)
+        monkeypatch.setattr(client_mod, "READ_TIMEOUT_S", self.READ_S)
+        monkeypatch.setattr(client_mod, "INFO_TIMEOUT_S", self.READ_S)
+        monkeypatch.setattr(client_mod, "ARTIFACT_HEADERS_TIMEOUT_S", self.ARTIFACT_HEADERS_S)
+        # The client's own session, as the app uses it, with no proxy between it and 127.0.0.1.
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+
+    @pytest.mark.parametrize(
+        ("call", "deadline_s"),
+        [
+            (lambda c: c.info(), CONNECT_S + READ_S),
+            (lambda c: c.poll_task("t1"), CONNECT_S + READ_S),
+            (lambda c: c.health(), CONNECT_S + READ_S),
+            (lambda c: c.fetch_artifact("t1"), CONNECT_S + ARTIFACT_HEADERS_S),
+        ],
+        ids=["info", "task-poll", "health-without-the-key", "artifact"],
+    )
+    def test_headers_dripped_a_byte_at_a_time_time_out_by_the_deadline(self, call, deadline_s):
+        with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=10, gap_s=0.05) as url:
+            started = time.monotonic()
+            with pytest.raises(NodeTimeoutError) as raised:
+                call(NodeClient(NodeAddress(url, "k" * 24)))
+            took = time.monotonic() - started
+        assert raised.value.reason == client_mod.UNREACHABLE_TIMEOUT
+        assert str(raised.value) == f"{url} didn't answer in time"
+        assert took < deadline_s + 0.5
+
+    def test_headers_dripped_over_https_time_out_by_the_deadline(self, tmp_path, monkeypatch):
+        cert, key = _self_signed_certificate(tmp_path)
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", cert)
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=10, gap_s=0.05, tls=tls) as url:
+            started = time.monotonic()
+            with pytest.raises(NodeTimeoutError):
+                NodeClient(NodeAddress(url, "k" * 24)).info()
+            took = time.monotonic() - started
+        assert took < self.CONNECT_S + self.READ_S + 0.5
+
+    def test_headers_sent_slowly_that_arrive_in_time_are_read(self):
+        with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=0.5, gap_s=0.01) as url:
+            assert NodeClient(NodeAddress(url, "k" * 24)).info()["node"]["id"] == "uid-1"
+
+    def test_the_connection_given_up_on_is_not_used_again(self):
+        """Its socket still has the rest of the dripped headers coming: reused, the next answer would be those."""
+        with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=10, gap_s=0.05, dripped=1) as url:
+            client = NodeClient(NodeAddress(url, "k" * 24))
+            with pytest.raises(NodeTimeoutError):
+                client.info()
+            assert client.info()["node"]["id"] == "uid-1"
+
+    def test_a_prompt_answer_is_read_and_its_connection_kept_for_the_next_request(self):
+        connections: list[object] = []
+
+        class KeepAlive(_Answer):
+            protocol_version = "HTTP/1.1"
+            body = json.dumps(NODE_INFO).encode()
+            seen: list[str] = []
+
+            def setup(self) -> None:
+                connections.append(self.request)
+                super().setup()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAlive)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = NodeClient(NodeAddress(f"http://127.0.0.1:{server.server_port}", "k" * 24))
+            assert [client.info()["node"]["id"] for _ in range(3)] == ["uid-1"] * 3
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert len(connections) == 1
 
 
 class TestEveryFailureIsANodeError:
