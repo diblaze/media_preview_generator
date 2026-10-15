@@ -1456,11 +1456,7 @@ class NodeRegistry:
             )
         # Over https, timeouts are what a node without an https proxy in front looks like: the address is wrong.
         if info is None and timeouts == CHECK_ATTEMPTS and not url.lower().startswith("https:"):
-            return _Outcome(
-                STATE_OFFLINE,
-                f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it.",
-                cause=OFFLINE_STUCK,
-            )
+            return _Outcome(STATE_OFFLINE, unreachable_advice(why, url, name, connected=True), cause=OFFLINE_STUCK)
         if info is None:
             return _Outcome(STATE_OFFLINE, unreachable_advice(why, url, name), cause=OFFLINE_UNREACHABLE)
         return self._read_info(record, info)

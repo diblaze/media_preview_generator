@@ -55,18 +55,22 @@ UNREACHABLE_TLS_CERTIFICATE = "tls_certificate"
 UNREACHABLE_RATE_LIMITED = "rate_limited"
 
 
-def unreachable_advice(reason: str, url: str, name: str = "It") -> str:
+def unreachable_advice(reason: str, url: str, name: str = "It", *, connected: bool = False) -> str:
     """What to check when a node didn't answer, in plain words: Add node and the node's card both say this.
 
     Args:
         reason: One of the ``UNREACHABLE_*`` codes, or "" when it isn't known.
         url: The address that was tried.
         name: Who starts a sentence about the node: "It" in Add node, the node's name on its card.
+        connected: The connection was made but no answer came (``NodeTimeoutError``). Over http that is a stuck node,
+            not a firewall; over https it is what a node without an https proxy in front looks like.
 
     Returns:
         One or two sentences.
     """
     https = url.lower().startswith("https:")
+    if connected and not https:
+        return f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it."
     if reason == UNREACHABLE_DNS:
         host = urlsplit(url).hostname or "that machine"
         return f"Can't find {host}. Check the name, or use the node's IP address."

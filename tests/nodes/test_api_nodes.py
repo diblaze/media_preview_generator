@@ -16,6 +16,7 @@ from media_preview_generator.nodes.client import (
     NodeProtocolError,
     NodeRateLimitedError,
     NodeRequestError,
+    NodeTimeoutError,
     NodeUnreachableError,
 )
 from media_preview_generator.web.routes import api_nodes
@@ -271,6 +272,34 @@ class TestListAndProbe:
         nodes(url).info_answer = NodeUnreachableError("x", reason=reason)
         body = client.post("/api/nodes/probe", json={"url": url, "key": "k"}).get_json()
         assert advice in body["error"]["advice"], body["error"]
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            NodeTimeoutError("http://nuc:9494 didn't answer in time", reason="timeout"),
+            NodeTimeoutError("http://nuc:9494 dropped the connection before answering"),
+        ],
+        ids=["read-timeout", "dropped"],
+    )
+    def test_probe_of_a_node_that_accepts_connections_but_never_answers_says_what_its_card_says(
+        self, client, nodes, answer
+    ):
+        """Lab: a node that took the connection and hung. Add node said to check a firewall (the connection was made),
+        while the node's card said to restart it."""
+        node_id = _add(client).get_json()["id"]
+        nodes("http://nuc:9494").info_answer = answer
+        card = _checked(client, node_id)["reason"]
+        assert card == "nuc accepts connections but doesn't answer. It may be stuck or overloaded: restart it."
+
+        probe = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        advice = probe["error"]["advice"]
+        assert advice == "It accepts connections but doesn't answer. It may be stuck or overloaded: restart it."
+        assert "firewall" not in advice
+
+    def test_probe_of_a_node_whose_connection_timed_out_still_says_to_check_the_firewall(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("x didn't answer in time", reason="timeout")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert "firewall" in body["error"]["advice"]
 
     def test_probe_of_a_node_holding_this_address_back_says_so(self, client, nodes):
         # It answered (429): Add node must not word it as "Nothing answered at this address".
