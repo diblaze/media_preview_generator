@@ -523,8 +523,8 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
   library. Chapters starts preview jobs for exactly those files; previews that already exist are skipped.
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
-- **How long it takes.** Plex with access to its database takes seconds, even for 100,000+ files. Without that
-  access (for example, Plex reached through the marker helper, or Plex's folder on a network share such as Docker
+- **How long it takes.** Plex with access to its database, directly or through a Plex database node, takes
+  seconds, even for 100,000+ files. Without it (for example, Plex's folder on a network share such as Docker
   Desktop's mount of a Windows folder), only previews are counted. Jellyfin Intro and
   Credits and Emby previews take longer, because they need one request or one folder read per file. While a check
   runs, they show the last check's numbers.
@@ -672,7 +672,8 @@ docker run -d --name media-preview-node -p 9494:9494 \
 - `NODE_NAME` is the name the app shows for it.
 - Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
   they are.
-- Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA). Keep `--device /dev/dri:/dev/dri` only
+- Pass the GPU the same way you pass it to the app: for NVIDIA, `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`
+  (Dolby Vision tone mapping needs the second). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").
 - The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
@@ -694,7 +695,7 @@ same machine at two addresses) or **Turned off**. Only a ready node gets work; a
 workers. Each node also has its own **Setup Health** and **Log** tabs.
 
 If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
-at its mapped path runs elsewhere instead of failing.
+at its mapped path goes to another worker, and fails only when no other worker can run it.
 
 ### Updating a node
 
@@ -706,8 +707,10 @@ nodes too, like the app.
 
 A **Plex database node** only has to be new enough: its Setup Health says when it isn't. On Linux, set its image tag
 to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
-and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays. On
-Windows, download the newest release and run its `install.ps1` again: the key stays.
+and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays.
+An install from before nodes has no `/config` volume: add `-v plex-db-node-config:/config` (or the compose file's
+`volumes:` line) when you update, or it writes no loudness. On Windows, download the newest release and run its
+`install.ps1` again, with the options you installed with (`-Port`, `-PlexConfigDir`): the key stays.
 
 ### Removing a node
 
@@ -1359,16 +1362,15 @@ machine: without it that Plex stays read-only for markers. If the app and Plex a
 2. In the app: **Settings → Nodes → Add node** with its address (for example `http://plex-host.lan:9494`) and key.
    See [Remote nodes](#remote-nodes).
 3. **Servers → your Plex → Edit → Connection → Plex database**: pick the node. The one-time database-write
-   confirmation applies when enabling Intro & Credits. Chapter thumbnails have their own opt-in under General and can
+   confirmation applies when enabling Intro & Credits. Chapter thumbnails have their own opt-in under Processing and can
    use this node while Intro & Credits is off.
 4. The node's card on the Nodes page shows its state (**Ready**, **Connecting…**, **Offline**, **Key refused**,
    **Update needed**, **Turned off**). A version the app doesn't accept is refused on the first call, in either
    direction, with a message saying which side to update. On the server's **Connection** tab, a node that reports a
    new id shows **Not confirmed**, and gets nothing until you type its key again on its Settings tab.
 
-A Plex helper set up before this version is moved to the Nodes page on upgrade and keeps working. For loudness it
-now needs a volume at `/config` (its old setup had none): add one when you update it, or the node writes no loudness,
-because its undo record would be lost on the next update.
+A Plex database node set up before this version is moved to the Nodes page on upgrade and keeps working. For
+loudness it needs a `/config` volume: see [Updating a node](#updating-a-node).
 
 For Intro & Credits, the node writes the marker rows of one item into Plex's library database. A compatible agent
 also supports [chapter thumbnails](#plex-chapter-thumbnails), updating only existing chapter image references.

@@ -84,7 +84,7 @@ docker compose up -d
 Then add it in the app: **Nodes → Add node**, with the address (`http://<this-machine>:9494`) and the same key,
 and choose it for the server in **Servers → your Plex → Edit → Connection → Plex database**.
 The node can be chosen there while Intro & Credits remains off. Chapter thumbnails use their own
-checkbox in the General tab and do not require marker consent or Plex Pass.
+checkbox in the Processing tab and do not require marker consent or Plex Pass.
 
 Without compose — note `--env-file .env`, so the key comes out of the file you just wrote rather than an empty
 shell variable (with an empty `NODE_KEY` the node generates a key of its own, which the app doesn't have):
@@ -104,15 +104,15 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 
 | Setting | What it is |
 |---|---|
-| `NODE_KEY` | The key both sides share: at least 16 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. To keep it in a file (a Docker secret), set `FILE__NODE_KEY` to that file's path instead. |
-| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (any length, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
+| `NODE_KEY` | The key both sides share: 16 to 200 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. To keep it in a file (a Docker secret), set `FILE__NODE_KEY` to that file's path instead. |
+| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (up to 200 characters, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
 | `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
 | `NODE_NAME` | The name the app shows for it (compose default `plex-database`). |
 | `NODE_ROLES` | Set to `plex_db` by the image. Leave it. |
 | `AGENT_BIND` | Host address compose publishes on (default `0.0.0.0`, all interfaces). Set it to the one LAN address the app reaches this machine on if this host has several. |
-| `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. The agent is non-root and can't write the database as anyone else. |
+| `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. Compose runs the node as them (`user:`); with `docker run`, use `--user <uid>:<gid>` instead. The agent is non-root and can't write the database as anyone else. |
 
 Three things to keep in mind:
 
@@ -213,8 +213,9 @@ into its Plex what was meant for that node's.
 
 Status codes: `200` a result, `400` a body the agent can't read, `401` no key or the wrong key (and nothing else —
 an unauthenticated caller learns nothing about this Plex), `409` a refusal the app re-raises as its own error (a
-network filesystem, an unknown schema, a missing marker tag row, Plex busy) or a protocol it doesn't speak, `413` a
-body over 2 MB.
+network filesystem, an unknown schema, a missing marker tag row, Plex busy), a protocol it doesn't speak, or
+`wrong_node`, `413` (plain text) a body over 512 KB, `429` `rate_limited` with `Retry-After`: too many wrong keys
+came from that address, so the key isn't checked until then.
 
 The payload shapes live in `media_preview_generator/markers/publishers/plex_remote.py` — one codec, used by both
 sides, so they can't disagree about a field.

@@ -205,12 +205,12 @@ Environment variables of the node's container (the app's image started with `MOD
 | `MODE` | | `node` starts the app's image as a node instead of the app. |
 | `NODE_NAME` | the hostname | The name the node reports; Add node suggests it. |
 | `NODE_ROLES` | `worker` | `worker`, `plex_db`, or both: `worker,plex_db`. |
-| `NODE_KEY` | made on first start | The key the app sends, at least 16 characters. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
+| `NODE_KEY` | made on first start | The key the app sends: 16 to 200 printable ASCII characters, no spaces. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
 | `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. |
 | `NODE_PORT` | `9494` | The port the node listens on inside the container; change the published port (`-p`) to match. |
 | `NODE_TEMP_DIR` | `/tmp/mpg-node` | Where a worker node makes a folder for each file it is sent. Point it at a bigger or faster disk, or at a volume in a read-only container. |
 | `FILE__<NAME>` | | Sets `<NAME>` to the contents of the file it names (a Docker secret), e.g. `FILE__NODE_KEY=/run/secrets/node_key`. |
-| `PUID` / `PGID` | `1000` | The user the node runs as: one that can read your media and, for the Plex database role, owns Plex's database. |
+| `PUID` / `PGID` | `1000` | The user the node runs as: one that can read your media and, for the Plex database role, owns Plex's database. The Plex database image reads them only through its compose file; with `docker run`, use `--user <uid>:<gid>`. |
 | `PLEX_CONFIG_DIR` | | Plex database role: Plex's config folder as the container sees it. The database path is derived from it; the app never sends a path. |
 | `CONFIG_DIR` | `/config` | The node's own folder: its id, its key and the loudness undo record. Mount it so they survive an update. |
 | `LOG_LEVEL` | `INFO` | How much the node logs; `DEBUG` for more. |
@@ -1413,8 +1413,9 @@ schedule or global holds. Ordinary interrupted running jobs continue to follow t
 ### Nodes Endpoints
 
 API token or session, like every other route. A `NODE_ROW` is a node's `id`, `name`, `url`, `enabled`, `state` and
-plain `reason`, `version`, `roles`, `legacy` (an older Plex helper), `platform`, `gpus`, `cpu`, `busy`, `last_seen`,
-`path_mappings`, `used_by` (`{"groups": [...], "servers": [...]}`) and `edit_tag`. It never holds the key.
+plain `reason`, `version`, `roles`, `legacy` (an older Plex database node that only answers `/v1/ping`), `platform`,
+`gpus`, `cpu`, `busy`, `last_seen`, `path_mappings`, `used_by` (`{"groups": [...], "servers": [...]}`) and
+`edit_tag`. It never holds the key.
 
 | Method | Endpoint | Description |
 |---|---|---|
