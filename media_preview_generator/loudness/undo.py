@@ -72,7 +72,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     # mode=rw: a mistyped path fails instead of creating an empty database next to Plex's.
     uri = f"file:{urllib.parse.quote(args.db)}?mode=rw"
-    conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    except sqlite3.Error as exc:
+        print(f"Can't open the Plex database {args.db} ({exc}); nothing changed.", file=sys.stderr)
+        return 2
     count = skipped = 0
     try:
         identity = database_identity(args.db)
@@ -128,6 +132,15 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute(f"UPDATE {table} SET extra_data = ? WHERE id = ?", (back, row_id))  # noqa: S608 - fixed names
             count += 1
         conn.execute("ROLLBACK" if args.dry_run else "COMMIT")
+    except (sqlite3.Error, OSError, PublishError) as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        # A PublishError (Plex's schema changed since) already says what it refused; the others need the file named.
+        if isinstance(exc, PublishError):
+            print(exc, file=sys.stderr)
+        else:
+            print(f"Can't use the Plex database {args.db} ({exc}); nothing changed.", file=sys.stderr)
+        return 2
     except BaseException:
         if conn.in_transaction:
             conn.execute("ROLLBACK")

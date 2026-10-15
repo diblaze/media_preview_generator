@@ -64,13 +64,44 @@ def test_a_torn_last_line_is_skipped_and_the_rest_restored(db, tmp_path):  # noq
     assert _extra(db._path(), 11) == BEFORE
 
 
-def test_a_mistyped_db_path_fails_and_creates_nothing(tmp_path):
+@pytest.mark.parametrize("dry_run", [False, True], ids=["restore", "dry-run"])
+def test_a_mistyped_db_path_is_one_plain_line_and_creates_nothing(tmp_path, capsys, dry_run):
+    # A host path typed in the container, or "Application Support" unquoted: it was a sqlite3 traceback.
     log = tmp_path / "loudness-writes.jsonl"
     log.write_text("")
-    missing = tmp_path / "no-such.db"
-    with pytest.raises(sqlite3.OperationalError):
-        undo(["--db", str(missing), "--log", str(log)])
+    missing = tmp_path / "nope" / "no-such.db"
+    argv = ["--db", str(missing), "--log", str(log)]
+
+    assert undo([*argv, "--dry-run"] if dry_run else argv) == 2
+    said = capsys.readouterr().err.strip()
+    assert said == f"Can't open the Plex database {missing} (unable to open database file); nothing changed."
     assert not missing.exists()
+
+
+def test_a_file_that_isnt_a_database_is_one_plain_line(tmp_path, capsys):
+    log = tmp_path / "loudness-writes.jsonl"
+    log.write_text("")
+    not_a_db = tmp_path / "com.plexapp.plugins.library.db"
+    not_a_db.write_bytes(b"not sqlite" * 100)
+
+    assert undo(["--db", str(not_a_db), "--log", str(log), "--dry-run"]) == 2
+    said = capsys.readouterr().err.strip().splitlines()
+    assert said == [f"Can't use the Plex database {not_a_db} (file is not a database); nothing changed."]
+
+
+def test_a_database_plex_has_changed_the_schema_of_is_one_plain_line(tmp_path, capsys):
+    # Plex updated since the tested version: check_schema's refusal, not its traceback.
+    log = tmp_path / "loudness-writes.jsonl"
+    log.write_text("")
+    other = tmp_path / "com.plexapp.plugins.library.db"
+    conn = sqlite3.connect(other)
+    conn.execute("CREATE TABLE media_streams (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    assert undo(["--db", str(other), "--log", str(log), "--dry-run"]) == 2
+    said = capsys.readouterr().err.strip().splitlines()
+    assert len(said) == 1 and said[0].startswith("Plex database looks different from the tested version")
 
 
 def test_a_missing_undo_record_is_one_plain_line_and_changes_nothing(db, tmp_path, capsys):  # noqa: F811
