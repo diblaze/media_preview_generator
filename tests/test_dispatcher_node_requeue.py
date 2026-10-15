@@ -18,7 +18,14 @@ from media_preview_generator.jobs.node_members import NodeHardware
 from media_preview_generator.jobs.worker import Worker, WorkerPool
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.client import NodeUnreachableError
-from media_preview_generator.nodes.executor import FileNotVisibleError, NodeUnavailableError, current_placement
+from media_preview_generator.nodes.executor import (
+    REQUEUE_NODE_NOT_STARTED,
+    REQUEUE_NODE_UNAVAILABLE,
+    FileNotVisibleError,
+    NodeRequeue,
+    NodeUnavailableError,
+    current_placement,
+)
 from media_preview_generator.nodes.registry import (
     STATE_OFFLINE,
     STATE_READY,
@@ -83,6 +90,13 @@ def registry():
     fake = _Registry()
     set_registry(fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _quick_start_retries(monkeypatch):
+    # A file whose start a node failed waits a second (doubling) before it goes back there; tests that don't look at
+    # that wait keep it short.
+    monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 0.01)
 
 
 def _config():
@@ -590,6 +604,78 @@ class TestNodeDrops:
         assert tracker.node_drops == {}
         assert tracker.active_processing == 0
 
+    @pytest.mark.parametrize(
+        ("cap", "waits"), [(30.0, [0.1, 0.2, 0.4]), (0.2, [0.1, 0.2, 0.2])], ids=["doubling", "capped"]
+    )
+    def test_a_node_whose_starts_fail_while_its_check_answers_gets_the_file_back_only_after_a_doubling_wait(
+        self, monkeypatch, cap, waits
+    ):
+        """Its check reads only /v1/info, which answered while its starts failed (out of threads, a gateway's 5xx):
+        the check vouched for it within milliseconds, and the file's five starts were spent in ~70 ms."""
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 0.1)
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_MAX_S", cap)
+        tries: list[tuple[str | None, float]] = []
+
+        def process(item, **_kwargs):
+            tries.append((_node(), time.monotonic()))
+            if len(tries) <= len(waits):
+                raise NodeUnavailableError("n1", "NAS", "NAS couldn't start the task", started=False)
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool(("n1", "NAS")), process, "/m/a.mkv")
+
+        assert (tracker.successful, tracker.failed) == (1, 0), rows
+        assert [node for node, _ in tries] == ["n1"] * (len(waits) + 1)
+        gaps = [later - earlier for (_, earlier), (_, later) in itertools.pairwise(tries)]
+        assert all(gap >= wait for gap, wait in zip(gaps, waits, strict=True)), gaps
+        # Capped: the third wait is the cap, not the doubled 0.4 s (a wide margin for a loaded box).
+        assert cap > 0.4 or gaps[2] < 0.35, gaps
+
+    def test_a_file_the_node_cant_start_runs_on_this_apps_worker_once_it_is_free_rather_than_failing_there(
+        self, monkeypatch
+    ):
+        """This app's one worker is busy with the job's other file for a moment; the node answers its check while
+        every start fails. The file waited for neither and failed on the node within milliseconds."""
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 0.3)
+        done: list[tuple[str, str | None]] = []
+        node_starts: list[str] = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            node = _node()
+            if node == "n1":
+                with lock:
+                    node_starts.append(item.canonical_path)
+                raise NodeUnavailableError("n1", "NAS", "NAS couldn't start the task", started=False)
+            time.sleep(0.5)
+            with lock:
+                done.append((item.canonical_path, node))
+            return ItemOutcome("markers_published", "ok")
+
+        tracker, rows = _run(_pool((None, ""), ("n1", "NAS")), process, "/m/a.mkv", "/m/b.mkv")
+
+        assert (tracker.successful, tracker.failed) == (2, 0), rows
+        assert sorted(done) == [("/m/a.mkv", None), ("/m/b.mkv", None)]
+        assert len(node_starts) < dispatcher_mod.MAX_NODE_START_FAILURES
+        assert tracker.active_processing == 0
+
+    def test_a_file_the_node_cant_start_goes_to_a_free_worker_elsewhere_without_waiting(self, monkeypatch):
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 10.0)
+        calls = []
+
+        def process(item, **_kwargs):
+            calls.append(_node())
+            if len(calls) == 1:
+                raise NodeUnavailableError("n1", "NAS", "NAS couldn't start the task", started=False)
+            return ItemOutcome("markers_published", "ok")
+
+        started = time.monotonic()
+        tracker, _ = _run(_pool(("n1", "NAS"), (None, ""), gpu_on=frozenset({"n1"})), process, "/m/a.mkv")
+
+        assert calls == ["n1", None]
+        assert (tracker.successful, tracker.failed) == (1, 0)
+        assert time.monotonic() - started < 5.0
+
     def test_a_file_that_keeps_filling_a_nodes_temp_folder_fails_naming_it(self, monkeypatch):
         # It failed as only "it couldn't start the file 5 times": nothing said the temp folder was too small for it.
         monkeypatch.setattr(dispatcher_mod, "MAX_NODE_START_FAILURES", 2)
@@ -709,6 +795,47 @@ class TestClaimWorker:
         worker, item = JobDispatcher(pool)._claim_worker(tracker, [])
         assert (worker.node_id, item.canonical_path) == ("a", "/m/1.mkv")
         assert not tracker.item_queue
+
+    def test_a_file_whose_start_its_node_failed_goes_back_there_only_after_its_wait_though_the_node_checked_ready(
+        self,
+    ):
+        pool = _pool(("a", "A"))
+        tracker = self._tracker("/m/1.mkv", "/m/2.mkv")
+        tracker.dropped_on = {"/m/1.mkv": "a"}
+        tracker.start_retry_at = {"/m/1.mkv": time.monotonic() + 60}
+        dispatcher = JobDispatcher(pool)
+
+        worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a"})
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/2.mkv")
+        worker.is_busy = False
+        assert dispatcher._claim_worker(tracker, [], back_nodes={"a"}) is None
+
+        tracker.start_retry_at["/m/1.mkv"] = time.monotonic() - 1
+        worker, item = dispatcher._claim_worker(tracker, [], back_nodes={"a"})
+        assert (worker.node_id, item.canonical_path) == ("a", "/m/1.mkv")
+
+    def test_each_start_the_node_fails_doubles_the_files_wait_up_to_the_cap_and_a_drop_ends_it(self, monkeypatch):
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_S", 1.0)
+        monkeypatch.setattr(dispatcher_mod, "NODE_START_RETRY_MAX_S", 3.0)
+        pool = _pool(("a", "A"), ("b", "B"))
+        tracker = self._tracker()
+        dispatcher = JobDispatcher(pool)
+        (item,) = _items("/m/1.mkv")
+        not_started = NodeRequeue(REQUEUE_NODE_NOT_STARTED, "a", "A", "A couldn't start the task")
+
+        waits = []
+        for _ in range(dispatcher_mod.MAX_NODE_START_FAILURES - 1):
+            before = time.monotonic()
+            dispatcher._requeue_or_fail(pool.workers[0], tracker, item, not_started)
+            waits.append(round(tracker.start_retry_at["/m/1.mkv"] - before, 1))
+            tracker.item_queue.clear()
+        assert waits == [1.0, 2.0, 3.0, 3.0]
+        assert tracker.dropped_on == {"/m/1.mkv": "a"}
+
+        dropped = NodeRequeue(REQUEUE_NODE_UNAVAILABLE, "b", "B", "B stopped answering")
+        dispatcher._requeue_or_fail(pool.workers[1], tracker, item, dropped)
+        assert tracker.dropped_on == {"/m/1.mkv": "b"}
+        assert tracker.start_retry_at == {}
 
     def test_files_a_free_node_cant_see_are_passed_over_for_one_it_can(self):
         pool = _pool(("a", "A"))
