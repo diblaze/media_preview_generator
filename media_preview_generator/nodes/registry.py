@@ -568,6 +568,7 @@ class NodeRegistry:
         except Exception as exc:
             logger.debug("Node settings unreadable: {}", exc)
             return
+        store_work: list[tuple[str, str, Any]] = []
         with self._lock:
             if key == self._settings_key:
                 return
@@ -576,23 +577,44 @@ class NodeRegistry:
                 node_id = str(record.get("id") or "")
                 if not node_id or node_id in fresh:
                     continue
-                fresh[node_id] = self._merge(self._nodes.get(node_id), record)
+                fresh[node_id] = self._merge(self._nodes.get(node_id), record, store_work)
             self._nodes = fresh
             self._settings_key = key
             self._touch()
         self._wake.set()
+        self._run_store_work(store_work)
 
-    def _merge(self, live: _Live | None, record: dict) -> _Live:
-        """A node's live record after its stored record changed (or a new one for a new node)."""
+    def _run_store_work(self, work: list[tuple[str, str, Any]]) -> None:
+        """The access store's file reads and writes ``_merge`` asked for, done after the registry's lock is released
+        (registry before store, never the other way round)."""
+        store = self._access_store
+        if store is None:
+            return
+        for action, node_id, mappings in work:
+            if action == "forget":
+                store.forget(node_id, keep_mappings=mappings)
+                continue
+            stored = store.load(node_id, mappings)
+            if stored is None:
+                continue
+            with self._lock:
+                live = self._nodes.get(node_id)
+                # A test recorded meanwhile, or mappings changed again, wins over what was on disk.
+                if live is not None and live.access_result is None and live.record.get("path_mappings") == mappings:
+                    live.access_result, live.access_checked_at = stored
+
+    def _merge(self, live: _Live | None, record: dict, store_work: list[tuple[str, str, Any]]) -> _Live:
+        """A node's live record after its stored record changed (or a new one for a new node).
+
+        Args:
+            live: The node's live record, or None for a new node.
+            record: Its stored record.
+            store_work: Collects ``("load" | "forget", node id, mappings)`` for :meth:`_run_store_work`.
+        """
         if live is None:
             live = _Live(record=copy.deepcopy(record), client=self._client_factory(record))
-            stored = (
-                self._access_store.load(str(record.get("id")), record.get("path_mappings"))
-                if self._access_store
-                else None
-            )
-            if stored is not None:
-                live.access_result, live.access_checked_at = stored
+            if self._access_store is not None:
+                store_work.append(("load", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
             return live
         old = live.record
         address_changed = (old.get("url"), old.get("key")) != (record.get("url"), record.get("key"))
@@ -618,7 +640,7 @@ class NodeRegistry:
             # A test of other mappings says nothing about these.
             live.access_result = live.access_checked_at = None
             if self._access_store is not None:
-                self._access_store.forget(str(record.get("id")))
+                store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
         return live
 
     # ------------------------------------------------------------------ state

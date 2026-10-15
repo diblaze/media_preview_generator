@@ -115,11 +115,24 @@ class AccessResultStore:
             except OSError as exc:
                 logger.warning("Couldn't save the Test access result of node {}: {}", node_id, exc)
 
-    def forget(self, node_id: str) -> None:
-        """Drop the node's saved result (its mappings changed)."""
+    def forget(self, node_id: str, *, keep_mappings: object = None) -> None:
+        """Drop the node's saved result (its mappings changed).
+
+        Args:
+            node_id: The node.
+            keep_mappings: The node's new ``path_mappings``: a result already saved for exactly these (a test that
+                finished before this ran) is kept.
+        """
         with self._lock:
             data = self._read()
-            if node_id not in data:
+            entry = data.get(node_id)
+            if entry is None:
+                return
+            if (
+                keep_mappings is not None
+                and isinstance(entry, dict)
+                and entry.get("mappings") == _mapping_key(keep_mappings)
+            ):
                 return
             del data[node_id]
             try:

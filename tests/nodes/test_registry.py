@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import pytest
@@ -499,6 +500,75 @@ def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
     monkeypatch.setattr(app_mod.atexit, "register", registered.append)
     app_mod._start_node_registry()
     assert calls == ["start"] and registered == [stub.stop]
+
+
+class _LockProbingStore(AccessResultStore):
+    """Records, for each file read or write, whether another thread could take the registry's lock meanwhile."""
+
+    def __init__(self, folder: str) -> None:
+        super().__init__(lambda: folder)
+        self.registry: reg.NodeRegistry | None = None
+        self.calls: list[tuple[str, bool]] = []
+
+    def _lock_free(self) -> bool:
+        free: list[bool] = []
+
+        def probe() -> None:
+            got = self.registry._lock.acquire(timeout=1.0)
+            if got:
+                self.registry._lock.release()
+            free.append(got)
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join()
+        return free[0]
+
+    def load(self, node_id, mappings):
+        self.calls.append(("load", self._lock_free()))
+        return super().load(node_id, mappings)
+
+    def forget(self, node_id, **kwargs):
+        self.calls.append(("forget", self._lock_free()))
+        return super().forget(node_id, **kwargs)
+
+
+class TestAccessStoreIoOutsideTheLock:
+    """The store reads and writes a file; under the registry's lock every view() (each worker's capacity read, each
+    page load) would wait on that disk."""
+
+    RESULT = {"libraries": [{"checked": 3, "ok": True}]}
+
+    def test_a_new_nodes_saved_result_is_read_outside_the_lock_and_still_handed_out(self, tmp_path):
+        AccessResultStore(lambda: str(tmp_path)).save("n1", MAPPINGS, self.RESULT, 5.0)
+        store = _LockProbingStore(str(tmp_path))
+        h = Harness(access_store=store)
+        store.registry = h.registry
+
+        assert h.registry.details("n1").access_result == self.RESULT
+        assert store.calls == [("load", True)]
+
+    def test_changed_mappings_forget_the_result_outside_the_lock(self, tmp_path):
+        store = _LockProbingStore(str(tmp_path))
+        h = Harness(access_store=store)
+        store.registry = h.registry
+        h.registry.record_access_result("n1", self.RESULT, tested_mappings=MAPPINGS)
+
+        h.change(path_mappings=[{"app_prefix": "/data", "node_prefix": "/volume1"}])
+        h.registry.views()
+
+        assert store.calls[-1] == ("forget", True)
+        assert h.registry.details("n1").access_result is None
+        assert json.loads((tmp_path / "node_access_results.json").read_text()) == {}
+
+    def test_a_result_saved_for_the_new_mappings_before_the_old_one_is_forgotten_is_kept(self, tmp_path):
+        store = AccessResultStore(lambda: str(tmp_path))
+        new = [{"app_prefix": "/data", "node_prefix": "/volume1"}]
+        store.save("n1", new, self.RESULT, 5.0)
+
+        store.forget("n1", keep_mappings=new)
+
+        assert store.load("n1", new) == (self.RESULT, 5.0)
 
 
 class TestAccessResultSurvivesRestart:
