@@ -1745,20 +1745,27 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
-def _bring_restored_settings_up_to_date(settings: Any) -> None:
-    """Run the start-up migrations on a restored settings.json from before this build's schema.
+def _bring_restored_settings_up_to_date(settings: Any, live_groups_revision: int) -> None:
+    """Run the start-up migrations on a restored settings.json from before this build's schema, and move its worker
+    groups revision past the live one.
 
     A backup taken before an upgrade holds settings this build no longer reads as they are (a Plex helper's address
     on its server instead of on a node). Run on them until the next restart, any save would store them half-moved
     and lose what the migration would have moved.
 
+    The running worker pool ignores groups older than the last revision it applied, so an older backup's groups (and
+    every Workers save after it, until one passed the old number) would wait for a restart.
+
     Args:
         settings: The settings manager, holding the restored file.
+        live_groups_revision: ``worker_groups_revision`` before the restore.
     """
     from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
 
     if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
         run_migrations(settings)
+    revision = max(settings.worker_groups_revision, live_groups_revision) + 1
+    settings.apply_changes(updates={"worker_groups_revision": revision})
 
 
 @api.route("/settings/backups/restore", methods=["POST"])
@@ -1822,11 +1829,12 @@ def restore_backup():
     tmp_path = f"{live}.restore.tmp"
     try:
         with settings.locked():
+            live_groups_revision = settings.worker_groups_revision
             shutil.copy2(bak_path, tmp_path)
             os.replace(tmp_path, live)
             if name == "settings.json":
                 settings.reload()
-                _bring_restored_settings_up_to_date(settings)
+                _bring_restored_settings_up_to_date(settings, live_groups_revision)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
     except OSError as exc:
@@ -1837,12 +1845,19 @@ def restore_backup():
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+    body = {"success": True, "file": name, "backup": os.path.basename(bak_path)}
     if name == "settings.json":
         from ...config import clear_config_cache
         from ...nodes.registry import get_registry
 
         clear_config_cache()
         get_registry().settings_replaced()
+        if isinstance(settings.get("worker_groups"), list):
+            from .api_worker_groups import reconcile_group_settings
+
+            warning = reconcile_group_settings(settings)
+            if warning:
+                body["warning"] = warning
 
     logger.info("Restored {} from {}", live, bak_path)
-    return jsonify({"success": True, "file": name, "backup": os.path.basename(bak_path)})
+    return jsonify(body)
