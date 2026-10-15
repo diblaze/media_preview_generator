@@ -3363,8 +3363,9 @@ class TestMigrateToV24:
         assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
 
     @pytest.mark.parametrize("off", ["intro_credits", "server"])
-    def test_a_helper_nothing_uses_becomes_a_node_turned_off(self, settings_manager, off):
-        """A turned-off node is never checked, so a helper machine that is gone raises no offline card."""
+    def test_a_switched_on_helper_stays_on_whatever_intro_and_credits_or_the_server_say(self, settings_manager, off):
+        """Chapter thumbnails went through a switched-on helper with Intro & Credits off (5.1.0's own docs), so
+        its node stays on: off, chapters would be refused "turned off on the Nodes page" after the upgrade."""
         from media_preview_generator.upgrade import _migrate_to_v24
 
         entry = _plex_entry("p1", "Home", self.HELPER)
@@ -3377,8 +3378,33 @@ class TestMigrateToV24:
         _migrate_to_v24(settings_manager)
 
         node = settings_manager.get("nodes")[0]
-        assert node["enabled"] is False
+        assert node["enabled"] is True
         assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+
+    def test_chapter_thumbnails_keep_going_through_a_helper_whose_intro_and_credits_is_off(self, settings_manager):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from media_preview_generator.markers.publishers import plex_chapters
+        from media_preview_generator.markers.publishers.plex_remote import AgentClient
+        from media_preview_generator.upgrade import _migrate_to_v24
+        from media_preview_generator.web import settings_manager as sm_mod
+
+        entry = _plex_entry("p1", "Home", self.HELPER)
+        entry["markers"]["enabled"] = False
+        entry["output"] = {"adapter": "plex_bundle", "plex_config_folder": "", "chapter_thumbnails": True}
+        settings_manager.apply_changes(updates={"media_servers": [entry]})
+        _migrate_to_v24(settings_manager)
+
+        migrated = settings_manager.get("media_servers")[0]
+        config = SimpleNamespace(markers=migrated["markers"], output=migrated["output"])
+        sm_mod._settings_manager = settings_manager
+        try:
+            with patch.object(plex_chapters, "_server_identity", return_value=("machine", "1.43.4.1")):
+                backend, *_ = plex_chapters._context(MagicMock(), config)
+        finally:
+            sm_mod.reset_settings_manager()
+        assert isinstance(backend, AgentClient)
 
     def test_a_block_that_already_has_a_node_keeps_it_and_loses_its_old_address_and_key(self, settings_manager):
         """Called on a block that already has node_id, it drops url/token beside it and keeps the node; twice is a

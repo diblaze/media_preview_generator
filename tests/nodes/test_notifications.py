@@ -1,4 +1,4 @@
-"""Bell cards for nodes that need the user: one per node in an alert state, session-only dismissal."""
+"""Bell cards for nodes that need the user: one per node in use in an alert state, session-only dismissal."""
 
 from __future__ import annotations
 
@@ -34,12 +34,28 @@ class StubRegistry:
         return list(self._views)
 
 
+def _group_on(*node_ids):
+    members = [{"id": f"m-{n}", "resource": "cpu", "device": None, "count": 1, "node": n} for n in node_ids]
+    return [{"id": "g1", "name": "Nodes", "enabled": True, "members": members}]
+
+
+def _plex_on(node_id, *, enabled):
+    agent = {"enabled": enabled, "node_id": node_id}
+    return [{"id": "p1", "type": "plex", "name": "Home", "markers": {"enabled": False, "plex": {"agent": agent}}}]
+
+
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(tmp_path):
+    from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
     notif.reset_session()
+    reset_settings_manager()
+    # The node the cards are about is in use: a worker group has a member on it.
+    get_settings_manager(str(tmp_path)).apply_changes(updates={"worker_groups": _group_on("abc123")})
     yield
     notif.reset_session()
     reg.set_registry(None)
+    reset_settings_manager()
 
 
 def _cards(*views):
@@ -56,6 +72,7 @@ def _cards(*views):
         (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media"),
         (reg.STATE_GPU_LOST, "storage", "storage lost its GPU"),
         (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg"),
+        (reg.STATE_DUPLICATE, "nuc", "nuc is added twice"),
     ],
 )
 def test_each_alert_state_gets_a_plain_card(state, name, title):
@@ -109,6 +126,23 @@ def test_a_permanent_dismissal_never_hides_a_node_card():
 )
 def test_the_dismiss_routes_know_node_card_ids(notification_id, known):
     assert _is_known_notification_id(notification_id) is known
+
+
+@pytest.mark.parametrize(
+    ("groups", "servers", "carded"),
+    [
+        ([], [], False),
+        ([], _plex_on("abc123", enabled=False), False),
+        ([], _plex_on("abc123", enabled=True), True),
+        (_group_on("abc123"), [], True),
+    ],
+    ids=["nothing", "plex-database-node-switched-off", "plex-database-node-on", "group-member"],
+)
+def test_only_a_node_something_uses_gets_a_card(groups, servers, carded):
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    get_settings_manager().apply_changes(updates={"worker_groups": groups, "media_servers": servers})
+    assert bool(_cards(_view(reg.STATE_OFFLINE))) is carded
 
 
 def test_the_builder_survives_a_registry_that_fails():

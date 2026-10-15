@@ -253,6 +253,46 @@ def find_node(nodes: object, node_id: object) -> dict | None:
     return next((n for n in nodes if isinstance(n, dict) and str(n.get("id") or "") == str(node_id)), None)
 
 
+def server_agent(entry: object) -> dict | None:
+    """A Plex server entry's ``markers.plex.agent`` block (its Plex database node choice), or None."""
+    if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        return None
+    markers = entry.get("markers")
+    plex = markers.get("plex") if isinstance(markers, dict) else None
+    agent = plex.get("agent") if isinstance(plex, dict) else None
+    return agent if isinstance(agent, dict) else None
+
+
+def node_users(node_id: str, worker_groups: object, media_servers: object) -> dict[str, list[dict[str, str]]]:
+    """The worker groups with a member on the node, and the Plex servers whose database it opens.
+
+    A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
+    database), even though it remembers the node for when it is switched on again. One switched on uses it for
+    everything that writes Plex's database: markers, chapter thumbnails, loudness and Library Health's counts.
+
+    Args:
+        node_id: The node.
+        worker_groups: settings.json's ``worker_groups``.
+        media_servers: settings.json's ``media_servers``.
+
+    Returns:
+        ``{"groups": [{"id", "name"}], "servers": [{"id", "name"}]}``.
+    """
+    groups = []
+    for group in worker_groups if isinstance(worker_groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        members = group.get("members") or []
+        if any(isinstance(m, dict) and m.get("node") == node_id for m in members):
+            groups.append({"id": str(group.get("id") or ""), "name": str(group.get("name") or "")})
+    servers = []
+    for entry in media_servers if isinstance(media_servers, list) else []:
+        agent = server_agent(entry)
+        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
+            servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
+    return {"groups": groups, "servers": servers}
+
+
 def node_mappings(node: dict) -> list[PathMapping]:
     """A record's mapping rows as :class:`PathMapping` (rows that don't parse are skipped)."""
     out: list[PathMapping] = []

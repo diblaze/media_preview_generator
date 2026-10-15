@@ -1820,8 +1820,9 @@ def _migrate_to_v24(sm) -> list[str]:
 
     ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
     (the address and key now live only on the node record). Servers that share one helper (same address and key)
-    share one node. The node is on when a server uses it: the helper switched on, Intro & Credits on and the server
-    itself on. Otherwise it is added turned off, so a helper nothing uses is never checked or reported offline.
+    share one node. The node is on when a server had the helper switched on, whatever Intro & Credits says: chapter
+    thumbnails went through a switched-on helper with Intro & Credits off. A helper switched off everywhere becomes a
+    node turned off, so it is never checked or reported offline.
 
     A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
     that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
@@ -1875,16 +1876,15 @@ def _migrate_to_v24(sm) -> list[str]:
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})
             continue
-        in_use = enabled and bool(markers.get("enabled")) and entry.get("enabled", True) is not False
         node = by_address.get((url, token))
         if node is None:
             name = _helper_node_name(str(entry.get("name") or "").strip() or "Plex", names, NAME_MAX_LEN)
             names.add(name.casefold())
-            node = default_record(name=name, url=url, key=token, enabled=in_use)
+            node = default_record(name=name, url=url, key=token, enabled=enabled)
             nodes.append(node)
             by_address[(url, token)] = node
             created += 1
-        elif in_use and not node.get("enabled"):
+        elif enabled and not node.get("enabled"):
             node["enabled"] = nodes_changed = True
         agent.update({"enabled": enabled, "node_id": node["id"]})
     if not changed:
