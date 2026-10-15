@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from loguru import logger
 
@@ -53,6 +53,8 @@ CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
 NOT_VISIBLE_LIMIT = 3
+# A Test access of rows not saved yet is adopted only if those rows are saved within this long.
+PENDING_ACCESS_TTL_S = 600.0
 GPU_LOST_RECHECK_S = 300.0
 MAX_PARALLEL_CHECKS = 8
 LEGACY_PING_TIMEOUT_S = 10.0
@@ -127,6 +129,16 @@ class _Outcome:
     uid: str = ""
 
 
+class _PendingAccess(NamedTuple):
+    """A Test access of rows not saved yet, kept until exactly those rows are saved at the same address."""
+
+    rows: list
+    result: dict
+    checked_at: float
+    url: str
+    held_at: float
+
+
 @dataclass
 class _Live:
     record: dict
@@ -149,9 +161,8 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
-    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save): kept as
-    # ``(rows, result, checked_at)`` and adopted when exactly those rows are saved.
-    pending_access: tuple[list, dict, float] | None = None
+    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save).
+    pending_access: _PendingAccess | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -451,26 +462,35 @@ class NodeRegistry:
                 return
         self._submit(self._gpu_check, node_id, device)
 
-    def record_access_result(self, node_id: str, result: dict, *, tested_mappings: list[dict]) -> None:
+    def record_access_result(
+        self, node_id: str, result: dict, *, tested_mappings: list[dict], tested_url: str | None = None
+    ) -> None:
         """Remember a Test access result; a passing one clears an access problem.
 
         A result for rows other than the saved ones (rows still being edited, or mappings that changed during the
         test) says nothing about how the node runs work now. It is held aside and adopted only if exactly those
-        rows are saved next.
+        rows are saved next, at the same address, within :data:`PENDING_ACCESS_TTL_S`. A result from an address the
+        node no longer has is dropped: it was another machine's answer.
 
         Args:
             node_id: The node.
             result: ``{"libraries": [...]}`` as ``mappings.run_test_access`` returns it.
             tested_mappings: The ``path_mappings`` rows the test ran with.
+            tested_url: The address the test asked; None for the node's saved one.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return
+            url = str(live.record.get("url") or "")
+            if tested_url is not None and tested_url != url:
+                return
             checked_at = self._wall_clock()
             if tested_mappings != (live.record.get("path_mappings") or []):
-                live.pending_access = (copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at)
+                live.pending_access = _PendingAccess(
+                    copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at, url, self._clock()
+                )
                 return
             live.pending_access = None
             mappings, keep = self._adopt_access(live, result, checked_at), set(self._nodes)
@@ -672,13 +692,20 @@ class NodeRegistry:
             live.not_visible.clear()
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
+                # A test held aside was another machine's answer, or one asked with the old key.
+                live.pending_access = None
         if old.get("path_mappings") != record.get("path_mappings"):
             # A test of other mappings says nothing about these, unless it tested exactly the rows just saved.
             pending, live.pending_access = live.pending_access, None
-            if pending is not None and pending[0] == (record.get("path_mappings") or []):
-                rows = self._adopt_access(live, pending[1], pending[2])
+            if (
+                pending is not None
+                and pending.rows == (record.get("path_mappings") or [])
+                and pending.url == str(record.get("url") or "")
+                and self._clock() - pending.held_at <= PENDING_ACCESS_TTL_S
+            ):
+                rows = self._adopt_access(live, pending.result, pending.checked_at)
                 if self._access_store is not None:
-                    store_work.append(("save", str(record.get("id")), (rows, pending[1], pending[2])))
+                    store_work.append(("save", str(record.get("id")), (rows, pending.result, pending.checked_at)))
             else:
                 live.access_result = live.access_checked_at = None
                 if self._access_store is not None:

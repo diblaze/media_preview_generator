@@ -385,6 +385,47 @@ class TestAccessProblem:
         assert h.registry.view("n1").state == reg.STATE_ACCESS_PROBLEM
         assert h.registry.details("n1").access_result is None
 
+    NEW_ROWS = [{"app_prefix": "/data", "node_prefix": "/volume1"}]
+    PASS = {"libraries": [{"checked": 3, "ok": True}]}
+
+    def test_a_test_of_unsaved_rows_is_adopted_when_those_rows_are_saved(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        assert h.registry.details("n1").access_result is None
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result == self.PASS
+
+    def test_a_held_test_is_dropped_when_the_address_changes_with_the_rows(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+
+        h.change(url="http://other:9494", path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_held_test_is_dropped_when_the_key_changes(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        h.change(key="another-key")
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_held_test_expires_after_ten_minutes(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        h.clock.now += reg.PENDING_ACCESS_TTL_S + 1
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_test_of_an_address_the_node_no_longer_has_is_dropped(self, h):
+        h.change(url="http://other:9494")
+
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=MAPPINGS, tested_url="http://nuc:9494")
+
+        assert h.registry.details("n1").access_result is None
+
     def test_check_now_clears_it_only_when_the_quick_access_check_passes(self, h):
         self.test_three_different_files_in_ten_minutes_is_an_access_problem(h)
         h.quick = False

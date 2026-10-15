@@ -482,7 +482,7 @@ def test_node_access(node_id: str):
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
     # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.
-    get_registry().record_access_result(node_id, result, tested_mappings=rows)
+    get_registry().record_access_result(node_id, result, tested_mappings=rows, tested_url=record["url"])
     return jsonify(result)
 
 
