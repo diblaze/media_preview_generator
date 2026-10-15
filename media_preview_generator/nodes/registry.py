@@ -423,6 +423,14 @@ class NodeRegistry:
 
     # ------------------------------------------------------------------ reading
 
+    def settings_replaced(self) -> None:
+        """Re-read the nodes on the next read, whatever ``nodes_revision`` says.
+
+        A restored settings.json can hold other nodes at the same revision as the file it replaced.
+        """
+        with self._lock:
+            self._settings_key = object()
+
     @property
     def revision(self) -> int:
         """Bumps on any state, capacity or settings change."""
