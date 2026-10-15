@@ -2058,6 +2058,7 @@ def _build_idle_workers_from_config():
         "chapter_progress": None,
         "node": None,
         "node_state": None,
+        "node_cause": None,
     }
 
     # Use the shared label helper so the panel reads identically whether
@@ -2120,6 +2121,7 @@ def _build_idle_workers_from_config():
                     entry["group_resource"] = group_resource_key(policy)
                     entry["node"] = nodes.node_ref(node)
                     entry["node_state"] = nodes.node_state(node)
+                    entry["node_cause"] = nodes.node_cause(node)
                 statuses.append(entry)
         return statuses
 

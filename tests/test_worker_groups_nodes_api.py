@@ -194,6 +194,8 @@ class TestIdleWorkers:
             ("lgpu", "night 1", None, None),
         ]
         assert rows[0]["group_resource"] == "node:storage:gpu:cuda:0"
+        # The same keys as the dispatcher's rows: a ready node has no offline cause, this app's worker no node.
+        assert [row["node_cause"] for row in rows] == ["", "", "", None]
 
     def test_idle_list_leaves_out_members_on_an_offline_node(self, client, registry, app):  # noqa: F811
         registry.put("storage")

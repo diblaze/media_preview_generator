@@ -255,6 +255,42 @@ def test_a_worker_cards_node_state_has_the_nodes_pages_name_and_colour(
     expect(badge).to_have_class(f"pill {tone}")
 
 
+@pytest.mark.parametrize(
+    ("cause", "text"),
+    [
+        ("restarting", "Node restarting"),
+        ("rate_limited", "Node asks to wait"),
+        ("unreachable", "Node offline"),
+        ("", "Node offline"),
+    ],
+)
+def test_a_worker_card_says_why_its_offline_node_is_offline(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+    cause: str,
+    text: str,
+) -> None:
+    """A restarting node's card read "Node offline" while the bell and Workers said it is restarting."""
+    offline_node_group(group_api)
+    mock_dashboard_defaults(authed_page)
+    worker = {
+        "worker_id": 4,
+        "worker_type": "GPU",
+        "worker_name": "old-laptop · GPU Worker 1 (GTX 1650)",
+        "group_name": "Video",
+        "group_id": "gpu-video",
+        "member_id": "m-laptop",
+        "status": "idle",
+        "node": {"id": "laptop", "name": "old-laptop"},
+        "node_state": "offline",
+        "node_cause": cause,
+    }
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [worker]}))
+    authed_page.goto(app_url + "/")
+    expect(authed_page.locator('[data-worker-key="GPU_4"] [data-status-badge]')).to_have_text(text)
+
+
 LONG_REASON = (
     "old-laptop's temp folder can't be used, so it gets no files: no space left on device: /ntmp. Free up space "
     "there, or set NODE_TEMP_DIR on the node to a folder it can write to."

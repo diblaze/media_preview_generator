@@ -68,6 +68,11 @@ class NodeHardware:
         view = self.views.get(node_id)
         return getattr(view, "state", None) if view is not None else None
 
+    def node_cause(self, node_id: str) -> str:
+        """Why an offline node is offline (``restarting``, ``rate_limited``...); ``""`` otherwise or when unknown."""
+        view = self.views.get(node_id)
+        return str(getattr(view, "cause", "") or "") if view is not None else ""
+
     def member_can_come_back(self, policy: dict) -> bool:
         """Whether a node member has workers now, or may get them again without anyone changing anything.
 
