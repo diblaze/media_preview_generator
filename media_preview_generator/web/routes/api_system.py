@@ -101,12 +101,12 @@ _NODE_NOTIFICATION_ID_RE = _re.compile(r"node:[0-9a-f]{1,64}:[a-z_]{1,32}")
 def _is_known_notification_id(notification_id: str) -> bool:
     """Whether ``build_active_notifications`` can emit this id (fixed ids, a per-GPU or a per-node card id)."""
     from ...jobs.gpu_fallback import is_gpu_notification_id
-    from ...nodes.registry import ALERT_STATES
     from ..notifications import (
         DEPRECATED_IMAGE_ID,
         LIBRARY_HEALTH_CHECK_FAILED_ID,
         LIBRARY_HEALTH_NOT_SHOWING_ID,
         MEDIA_MOUNT_UNHEALTHY_ID,
+        NODE_CARD_KINDS,
         NODE_UNCONFIRMED,
         SCHEMA_MIGRATION_ID,
         TIMEZONE_MISCONFIGURED_ID,
@@ -125,7 +125,7 @@ def _is_known_notification_id(notification_id: str) -> bool:
     if notification_id in fixed:
         return True
     if _NODE_NOTIFICATION_ID_RE.fullmatch(notification_id):
-        return notification_id.rsplit(":", 1)[1] in {*ALERT_STATES, NODE_UNCONFIRMED}
+        return notification_id.rsplit(":", 1)[1] in {*NODE_CARD_KINDS, NODE_UNCONFIRMED}
     return is_gpu_notification_id(notification_id) and _GPU_NOTIFICATION_ID_RE.fullmatch(notification_id) is not None
 
 

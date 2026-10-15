@@ -943,6 +943,64 @@ class TestChapterRefusalsNameTheNode:
         assert str(refused.value) == "The Plex database node Plex box sent a chapter snapshot this app can't read"
 
 
+class TestChapterFileCheckRefusalsAreSaidAboutTheNode:
+    """Markers and loudness word a node's database file check about the node (``node_wording``); chapter thumbnails
+    passed the check's own words on, which are about this app: "The app must run on the same machine as Plex"."""
+
+    @staticmethod
+    def _chapter_check(folder: Path, tmp_path: Path, monkeypatch, *, fs: str = "ext4"):
+        from media_preview_generator.markers.publishers import plex_chapters
+
+        (folder / "Preferences.xml").write_text('<Preferences ProcessedMachineIdentifier="plex-b"/>')
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path, fs=fs)).test_client()
+        client = plex_remote.AgentClient(NODE_URL, TOKEN, name="Plex box", session=FlaskSession(node))
+        monkeypatch.setattr(plex_chapters, "_context", lambda *_a, **_kw: (client, "plex-b", "1.43.4.10127", None))
+        report = plex_chapters.chapter_capability(MagicMock(), SimpleNamespace(name="Home"))
+        with pytest.raises(plex_chapters.ChapterError) as refused:
+            plex_chapters.resolve_chapter_target(MagicMock(), "/data/tv/S01E01.mkv")
+        assert str(refused.value) == report.message  # a job's chapter row says what Setup Health says
+        return report
+
+    def test_a_database_the_node_doesnt_find(self, tmp_path, monkeypatch):
+        folder = tmp_path / "node" / "Plex Media Server"
+        folder.mkdir(parents=True)
+        report = self._chapter_check(folder, tmp_path, monkeypatch)
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            f"The Plex database node doesn't find Plex's database at {plex_db.plex_db_path(str(folder))} on its "
+            "machine. Give the node Plex's own config folder.",
+        )
+
+    def test_a_database_on_a_network_share_where_the_node_runs(self, plex_config, tmp_path, monkeypatch):
+        report = self._chapter_check(plex_config, tmp_path, monkeypatch, fs="nfs4")
+        assert (report.state, report.message) == (
+            Capability.NEEDS_LOCAL_DB,
+            "Plex's database is on a network share (nfs4) where the Plex database node runs. Give the node Plex's "
+            "config folder from a local disk of the Plex machine (in Docker, mount it from one); Plex stays read-only.",
+        )
+
+    def test_a_database_the_node_can_t_write(self, plex_config, tmp_path, monkeypatch):
+        db = str(_db_file(plex_config))
+        monkeypatch.setattr(plex_db.LocalPlexDb, "_unwritable_paths", staticmethod(lambda _db: [db]))
+        monkeypatch.setattr(plex_db, "_file_owner", lambda _p: "999")
+        monkeypatch.setattr(plex_db, "_this_user", lambda: "1000")
+        report = self._chapter_check(plex_config, tmp_path, monkeypatch)
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            f"The Plex database node (user 1000) can't write {db}. Run the node as the user that owns Plex's "
+            "database (user 999).",
+        )
+
+    def test_a_database_plex_doesn_t_hold_open_through_the_node_s_folder(self, plex_config, tmp_path, monkeypatch):
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: False)
+        report = self._chapter_check(plex_config, tmp_path, monkeypatch)
+        assert (report.state, report.message) == (
+            Capability.UNREACHABLE,
+            "Plex doesn't have its database open through the folder the Plex database node was given (Plex is "
+            "stopped, or the node sees a different path to the file). Nothing is written while Plex isn't running.",
+        )
+
+
 class TestADatabaseTheNodeDoesntFindIsSaidToBeOnTheNode:
     """The path a node looks in is its own: said bare ("Plex database not found at <path>"), it reads as a folder to
     fix on this app's side."""

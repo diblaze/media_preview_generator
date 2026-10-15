@@ -289,8 +289,16 @@ def test_an_empty_library_is_not_a_problem():
 @pytest.mark.parametrize(
     ("details", "check_id", "pointer"),
     [
-        (_details(reg.STATE_OFFLINE), "node_reachable", {"fix_tab": "settings", "fix_label": "Check the address"}),
-        (_details(reg.STATE_KEY_REFUSED), "node_key", {"fix_tab": "settings", "fix_label": "Change the key"}),
+        (
+            _details(reg.STATE_OFFLINE),
+            "node_reachable",
+            {"fix_tab": "settings", "fix_label": "Check the address", "fix_field": "url"},
+        ),
+        (
+            _details(reg.STATE_KEY_REFUSED),
+            "node_key",
+            {"fix_tab": "settings", "fix_label": "Change the key", "fix_field": "key"},
+        ),
         (_details(reg.STATE_UPDATE_NEEDED), "node_version", {"fix_where": "node"}),
         (_details(reg.STATE_ACCESS_PROBLEM), "node_access_problem", {"fix_tab": "media", "fix_action": "test_access"}),
         (_details(), "node_access_untested", {"fix_tab": "media", "fix_action": "test_access"}),
@@ -671,7 +679,7 @@ def test_a_plex_database_node_with_a_new_id_has_a_must_fix_that_opens_its_key():
 
     row = _check(envelope, "plex_db_confirmed")
     assert (row["ok"], row["severity"], row["label"]) == (False, "critical", "nuc reports a new id")
-    assert (row["fix_tab"], row["fix_label"]) == ("settings", "Type the key again")
+    assert (row["fix_tab"], row["fix_label"], row["fix_field"]) == ("settings", "Type the key again", "key")
     assert envelope["overall_ok"] is False
     counted = node_readiness(details, key="k", worker_groups=[], app_version="9.9.9", file_checks=None)
     assert to_fix(counted) == {"must_fix": 1, "recommended": 0}

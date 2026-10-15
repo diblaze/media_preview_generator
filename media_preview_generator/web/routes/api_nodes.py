@@ -28,6 +28,7 @@ from ...nodes.client import (
     NodeProtocolError,
     NodeRateLimitedError,
     NodeRequestError,
+    NodeTimeoutError,
     unreachable_advice,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
@@ -321,7 +322,7 @@ def _probe(url: str, key: str) -> dict[str, Any]:
     except NodeError as exc:
         reason = UNREACHABLE_RATE_LIMITED if isinstance(exc, NodeRateLimitedError) else getattr(exc, "reason", "")
         answer = _probe_error(KIND_UNREACHABLE, str(exc), reason)
-        answer["error"]["advice"] = unreachable_advice(reason, url)
+        answer["error"]["advice"] = unreachable_advice(reason, url, connected=isinstance(exc, NodeTimeoutError))
         return answer
     return {"ok": True, "info": _probe_info(info)}
 

@@ -3195,10 +3195,11 @@ function updateWorkerStatuses(workers, options = {}) {
 // One name and colour per node state for every page that shows one (Nodes, Workers, the dashboard): red gets no
 // work (its Setup Health has a Must fix), amber still works in part, grey isn't checked yet or is switched off.
 // ``short`` is the "0 now" chip's text, the same words the server gives a member with no workers; ``causes`` the
-// ones for an offline node that answered (restarting, asking to wait), which has nothing to fix.
+// ones for an offline node that answered (restarting, asking to wait), which has nothing to fix, and for a worker
+// node ahead of this app, where this app is the one to update.
 window.NODE_STATES = Object.freeze({
     ready: { tone: 'ok', label: 'Ready', short: '' },
-    update_needed: { tone: 'bad', label: 'Update needed', short: 'node needs an update' },
+    update_needed: { tone: 'bad', label: 'Update needed', short: 'node needs an update', causes: { app_behind: 'app needs an update' } },
     access_problem: { tone: 'bad', label: 'Access problem', short: 'fix media access first' },
     gpu_lost: { tone: 'warn', label: 'GPU lost', short: 'GPU lost' },
     no_ffmpeg: { tone: 'bad', label: 'FFmpeg missing', short: 'FFmpeg missing on node' },
@@ -3321,7 +3322,8 @@ function _patchWorkerCard(col, worker) {
     const nodeStateText = String(nodeState ? nodeState.label : worker.node_state);
     // "Node offline", "Node FFmpeg missing": only a capitalised word is lowered, never a name like FFmpeg or GPU.
     const nodeStatus = /^[A-Z][a-z]/.test(nodeStateText) ? nodeStateText[0].toLowerCase() + nodeStateText.slice(1) : nodeStateText;
-    // An offline node that answered ("node restarting", "node asks to wait") isn't called offline.
+    // An offline node that answered ("node restarting", "node asks to wait") isn't called offline, nor is a node
+    // ahead of this app said to need the update ("app needs an update").
     const nodeCause = nodeState?.causes?.[worker.node_cause];
     const nodeText = nodeCause ? nodeCause[0].toUpperCase() + nodeCause.slice(1) : `Node ${nodeStatus}`;
     const workerStatus = nodeDown ? nodeText : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';

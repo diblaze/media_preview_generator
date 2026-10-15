@@ -781,6 +781,44 @@ class TestAddNode:
             {"path_mappings": [{"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"}], "edit_tag": "n-new-1"}
         ]
 
+    @pytest.mark.parametrize("close", ["finish_later", "escape"])
+    def test_finish_later_with_a_half_filled_row_says_so_instead_of_dropping_every_row(
+        self, authed_page: Page, app_url: str, close: str
+    ) -> None:
+        """A row with one side filled in made Finish later and Esc save nothing, the suggested rows included, without a
+        word; Save refuses the same row with "Fill in both paths, or remove the row."."""
+        page = authed_page
+        api = _open_nodes(page, app_url, [])
+        _open_add(page)
+        self._to_step_2(page)
+        editor = page.locator("#addNodeMappings")
+        editor.locator(".nd-add-row").click()
+        editor.locator(".nd-app").nth(1).fill("/data/Movies")
+
+        if close == "escape":
+            page.keyboard.press("Escape")
+        else:
+            page.locator("#addNodeCancel").click()
+
+        expect(editor.locator(".nd-map-error")).to_have_text("Fill in both paths, or remove the row.")
+        expect(editor.locator(".nd-node").nth(1)).to_be_focused()
+        expect(page.locator("#addNodeModal")).to_be_visible()
+        assert not api.bodies("PUT", "/nodes/n-new")
+
+        editor.locator(".nd-node").nth(1).fill("/mnt/nas/Movies")
+        with page.expect_response(lambda r: r.request.method == "PUT" and r.url.endswith("/api/nodes/n-new")):
+            page.locator("#addNodeCancel").click()
+        expect(page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        assert api.bodies("PUT", "/nodes/n-new") == [
+            {
+                "path_mappings": [
+                    {"app_prefix": "/data/TV Shows", "node_prefix": "/mnt/nas/tv"},
+                    {"app_prefix": "/data/Movies", "node_prefix": "/mnt/nas/Movies"},
+                ],
+                "edit_tag": "n-new-1",
+            }
+        ]
+
     def test_step_2_with_servers_but_no_libraries_says_to_refresh_them(self, authed_page: Page, app_url: str) -> None:
         page = authed_page
         api = _open_nodes(page, app_url, [])
@@ -1240,6 +1278,30 @@ class TestNodeDialog:
         expect(authed_page.locator(focused)).to_be_focused()
         authed_page.keyboard.press("Escape")
         expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+
+    @pytest.mark.parametrize(
+        ("label", "field", "focused"),
+        [
+            ("Change the key", "key", "#nodeSetKey"),
+            ("Type the key again", "key", "#nodeSetKey"),
+            ("Check the address", "url", "#nodeSetUrl"),
+            ("Open Settings", None, "#nodeSetName"),
+        ],
+    )
+    def test_a_setup_health_fix_focuses_the_field_it_names(
+        self, authed_page: Page, app_url: str, label: str, field: str | None, focused: str
+    ) -> None:
+        """The key and address fixes put the cursor in Name, a field nobody was asked to change."""
+        api = _open_nodes(authed_page, app_url, [_node("n-nuc", "nuc", "key_refused")])
+        row = {**KEY_REFUSED, "fix_label": label}
+        api.health_answer = _health({**row, "fix_field": field} if field else row)
+        _open_node(authed_page, "n-nuc")
+        pane = _node_tab(authed_page, "health")
+
+        pane.locator(".nd-health-fix").click()
+
+        expect(authed_page.locator("#node-tab-settings")).to_be_visible()
+        expect(authed_page.locator(focused)).to_be_focused()
 
     @pytest.mark.parametrize(
         ("rows", "removed", "focused"),
@@ -1900,7 +1962,7 @@ class TestPlexDatabaseSelector:
         self._open(authed_page, app_url, None)
         # storage, nuc and old-laptop are worker-only nodes: not a route to Plex's database.
         expect(authed_page.locator("#markersPlexDatabase option")).to_have_text(
-            ["Open it from this app", "Through a Plex database node: gaming-pc", "Add a Plex database node…"]
+            ["Open it from this app", "Through a Plex database node: gaming-pc"]
         )
         expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
         expect(authed_page.locator("#markersAgentState")).to_be_hidden()
@@ -1975,27 +2037,46 @@ class TestPlexDatabaseSelector:
         body = _save_and_read_put(authed_page, "plex-1")
         assert body["markers"]["plex"]["agent"] == {"enabled": False, "node_id": "n-off"}
 
-    def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(self, authed_page: Page, app_url: str) -> None:
-        self._open(authed_page, app_url, None)
+    @pytest.mark.parametrize("agent", [None, {"enabled": True, "node_id": "n-pc"}], ids=["this-app", "node"])
+    def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(
+        self, authed_page: Page, app_url: str, agent: dict | None
+    ) -> None:
+        self._open(authed_page, app_url, agent)
+        chosen = "n-pc" if agent else ""
         with authed_page.context.expect_page() as opened:
-            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+            authed_page.locator("#markersAddPlexDbNode").click()
         new_page = opened.value
         new_page.wait_for_load_state("domcontentloaded")
         assert new_page.url.endswith("/nodes#add")
         new_page.close()
-        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value(chosen)
 
     def test_add_a_node_is_not_an_edit_of_the_server(self, authed_page: Page, app_url: str) -> None:
         """The select's input event reached the dialog: Save turned on and closing asked to discard nothing."""
         self._open(authed_page, app_url, None)
         expect(authed_page.locator("#editServerSave")).to_be_disabled()
         with authed_page.context.expect_page() as opened:
-            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+            authed_page.locator("#markersAddPlexDbNode").click()
         opened.value.close()
 
         expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
         expect(authed_page.locator("#editServerDirty")).to_be_hidden()
         expect(authed_page.locator("#editServerSave")).to_be_disabled()
+
+    @pytest.mark.parametrize("key", ["End", "ArrowDown"])
+    def test_arrowing_through_the_choices_never_opens_the_nodes_page(
+        self, authed_page: Page, app_url: str, key: str
+    ) -> None:
+        """Lab: "Add a Plex database node…" was the list's last entry, so End, or the arrow keys past the last node,
+        opened the Nodes page in a new tab on every key press that reached it."""
+        self._open(authed_page, app_url, None)
+        select = authed_page.locator("#markersPlexDatabase")
+        select.focus()
+        for _ in range(3):
+            authed_page.keyboard.press(key)
+        authed_page.wait_for_timeout(300)
+        assert len(authed_page.context.pages) == 1, [p.url for p in authed_page.context.pages]
+        expect(select).to_have_value("n-pc")
 
     def test_setup_health_link_lands_on_the_selector(self, authed_page: Page, app_url: str) -> None:
         server = _plex_server()

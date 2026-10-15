@@ -4,7 +4,8 @@
 "must fix" (``critical``) when it stops the node doing work, "recommended" otherwise.
 
 A failing row says where its fix is: ``fix_tab`` (``media`` / ``settings`` / ``overview``, the node dialog tab, with
-``fix_label`` naming the button and, on media rows, the ``suggestion`` {from, to, app_root} the button applies),
+``fix_label`` naming the button, ``fix_field`` the Settings field it focuses (``url`` / ``key``; else the tab's first)
+and, on media rows, the ``suggestion`` {from, to, app_root} the button applies),
 ``fix_where: "node"`` (only the node's own machine can fix it), or ``help_url`` + ``help_label`` (a page of this app).
 ``docs_url`` + ``help_label`` point at the docs section with the steps.
 """
@@ -45,6 +46,9 @@ PLEX_DB_CHECK_S = 10.0
 FIX_ON_NODE = "node"
 TAB_MEDIA = "media"
 TAB_SETTINGS = "settings"
+# The Settings fields a Fix button focuses (``fix_field``): the node's address and its key.
+FIELD_URL = "url"
+FIELD_KEY = "key"
 # A row that is neither a problem nor a pass of the node (the Nodes page shows it as a note).
 INFO = "info"
 WORKERS_URL = "/settings#section-workers"
@@ -58,7 +62,7 @@ _last_reports_lock = threading.Lock()
 # The Linux Plex database node's image, still published under the Plex marker agent's name (nodes/plex-db/README.md).
 PLEX_DB_IMAGE = "ghcr.io/stevezau/plex-marker-agent"
 # Node-only row keys; the shared row builder doesn't know them.
-_NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label", "docs_url")
+_NODE_KEYS = ("fix_tab", "fix_field", "suggestion", "help_url", "help_label", "docs_url")
 # An offline node that answered at its address: (row label, where the fix is). A restart ends by itself, and a node
 # asking this app to wait is held back by something else at this app's address, so neither has a fix on the node.
 _ANSWERED_OFFLINE = {
@@ -155,6 +159,7 @@ def _connection(
             reason=None if reachable else view.reason,
             fix_tab=TAB_SETTINGS,
             fix_label="Check the address",
+            fix_field=FIELD_URL,
         )
     ]
     if not reachable:
@@ -170,6 +175,7 @@ def _connection(
             reason=None if key_ok else view.reason,
             fix_tab=TAB_SETTINGS,
             fix_label="Change the key",
+            fix_field=FIELD_KEY,
         )
     )
     if not key_ok:
@@ -492,6 +498,7 @@ def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
             reason="Type the node's key again on its Settings tab to confirm it is the same Plex.",
             fix_tab=TAB_SETTINGS,
             fix_label="Type the key again",
+            fix_field=FIELD_KEY,
         )
     ]
 

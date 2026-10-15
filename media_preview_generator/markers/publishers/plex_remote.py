@@ -142,12 +142,26 @@ class NodeFullError(DatabaseBusyError):
     """
 
 
-def _version_tuple(version: str) -> tuple[int, ...] | None:
-    parts = str(version or "").strip().split(".")
-    # isascii: "²" is a digit to isdigit() but not to int(); the length keeps int() under its digit limit.
-    if not parts or not all(p.isascii() and p.isdigit() and len(p) <= 9 for p in parts):
+# Dotted release numbers, then an optional pre-release (rc1), dev number (.dev3) and local part (+g1234abc): the
+# PEP 440 shapes setuptools-scm writes for a release, a :dev image and a local build. re.ASCII: "²" is a digit to \d
+# but not to int(); the 9-digit cap keeps int() under its digit limit.
+_VERSION_RE = re.compile(
+    r"(\d{1,9}(?:\.\d{1,9})*)((?:a|b|rc)\d{0,9})?(?:\.?dev(\d{1,9}))?(?:\+[a-z0-9.]{1,64})?", re.ASCII | re.IGNORECASE
+)
+
+
+def _version_key(version: str) -> tuple[tuple[int, ...], bool, int] | None:
+    """A version's sort key, or None when it isn't one this app can read.
+
+    A dev or pre-release build comes after every earlier release and before the release it leads to (5.1.0 <
+    5.1.1.dev3 < 5.1.1); two dev builds of one release order by their dev number. The local part is ignored.
+    """
+    match = _VERSION_RE.fullmatch(str(version or "").strip())
+    if match is None:
         return None
-    return tuple(int(p) for p in parts)
+    release, pre, dev = match.groups()
+    final = pre is None and dev is None
+    return tuple(int(p) for p in release.split(".")), final, int(dev or 0)
 
 
 def agent_too_old(version: str) -> bool:
@@ -157,7 +171,7 @@ def agent_too_old(version: str) -> bool:
         version: The version the agent reports.
 
     Returns:
-        True only when both versions parse as dotted numbers and the agent's is lower. A version this app can't read
+        True only when both versions parse (``_version_key``) and the agent's is lower. A version this app can't read
         (including the ``""`` of an answer with no ``agent`` block at all) is not "too old": neither this check nor
         the protocol one -- which passes an empty ``protocols`` list (``_read``) -- refuses such an answer on its own.
         Something that isn't our agent is turned away by the ``result`` it doesn't send, as "answered N instead of a
@@ -167,8 +181,8 @@ def agent_too_old(version: str) -> bool:
 
 
 def agent_older_than(version: str, needed: str) -> bool:
-    """Whether both versions parse as dotted numbers and ``version`` is lower than ``needed``."""
-    theirs, mine = _version_tuple(version), _version_tuple(needed)
+    """Whether both versions parse (``_version_key``) and ``version`` is lower than ``needed``."""
+    theirs, mine = _version_key(version), _version_key(needed)
     return bool(theirs and mine and theirs < mine)
 
 
@@ -495,12 +509,20 @@ _ERROR_KINDS: dict[type[PublishError], str] = {ItemNotFoundError: "item_not_foun
 
 def error_to_json(exc: PublishError) -> dict:
     """Serialise a refusal so the app can raise the very same exception."""
-    from ...loudness.plex_db import SourceChangedError
+    from ...loudness.plex_db import NotAnalysedError, SourceChangedError
     from .plex_chapters import ChapterError
 
     if isinstance(exc, SourceChangedError):
         # Loudness retries a changed source later instead of failing it, so the type has to survive the trip.
         return {"kind": "source_changed", "message": str(exc), "state": exc.state.value if exc.state else None}
+    if isinstance(exc, NotAnalysedError):
+        # Loudness skips an item Plex lists as an extra instead of failing it: its type has to survive the trip too.
+        return {
+            "kind": "not_analysed",
+            "plex_type": exc.plex_type,
+            "message": str(exc),
+            "state": exc.state.value if exc.state else None,
+        }
     if isinstance(exc, ChapterError):
         return {
             "kind": "chapter",
@@ -545,6 +567,11 @@ def error_from_json(raw: Any) -> PublishError:
         from ...loudness.plex_db import SourceChangedError
 
         return SourceChangedError(message, state=state)
+    plex_type = raw.get("plex_type")
+    if raw.get("kind") == "not_analysed" and type(plex_type) is int:
+        from ...loudness.plex_db import NotAnalysedError
+
+        return NotAnalysedError(message, plex_type=plex_type, state=state)
     if raw.get("kind") == "busy" and raw.get("node_full") is True:
         return NodeFullError(message, state=state)
     kind = next((cls for cls, name in _ERROR_KINDS.items() if raw.get("kind") == name), PublishError)

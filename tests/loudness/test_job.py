@@ -97,16 +97,102 @@ def test_a_trailer_or_other_extra_is_skipped_not_a_failed_music_file(ctx, db, me
     conn.commit()
     conn.close()
 
-    outcome = job.check_item(_item(str(local)), ctx=ctx)
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=ctx)
 
-    assert (outcome.outcome_key, outcome.message, outcome.publisher_rows) == (
-        job.SKIPPED,
-        "Extras aren't analysed for loudness",
-        [],
-    )
+    assert (outcome.outcome_key, outcome.message) == (job.SKIPPED, "Extras aren't analysed for loudness")
+    assert [(row["server_id"], row["status"]) for row in outcome.publisher_rows] == [("plex1", job.SKIPPED)]
+    # The job log names each file as it happens: a skipped extra wrote no line at all.
+    write_line.assert_called_once_with(f"{job.display_name(str(local))}: extras aren't analysed for loudness")
     assert job.SKIPPED in job.OUTCOME_KEYS
     # Neither a success nor a failure: a job of nothing else completes without an error or a warning.
     assert job._completion({job.SKIPPED: 2}, []) == (0, None)
+
+
+def _plex_lists(db, local: Path, plex_path: str, metadata_type: int) -> None:  # noqa: F811
+    conn = sqlite3.connect(db._path())
+    conn.execute("UPDATE metadata_items SET metadata_type = ? WHERE id = 1", (metadata_type,))
+    conn.execute(
+        "UPDATE media_parts SET file = ?, hash = ?, size = ? WHERE id = 1",
+        (plex_path, calculate_plex_hash(str(local)), local.stat().st_size),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _flat_library(db, folder: str, local: Path) -> tuple[job.LoudnessContext, ServerConfig]:  # noqa: F811
+    cfg = ServerConfig(
+        id="plex1",
+        type=ServerType.PLEX,
+        name="Plex",
+        enabled=True,
+        url="http://plex",
+        auth={},
+        libraries=[Library(id="7", name="Home Videos", remote_paths=(f"/data/{folder}",), enabled=True, kind="movie")],
+        path_mappings=[{"remote_prefix": f"/data/{folder}", "local_prefix": str(local.parent)}],
+        loudness={"enabled": True, "library_ids": None},
+        markers={"plex": {"db_write_confirmed_at": "2026-09-29T00:00:00Z"}},
+    )
+    c = job.LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
+    c._dbs[cfg.id], c._ready[cfg.id] = db, ("", time.monotonic())
+    return c, cfg
+
+
+@pytest.mark.parametrize("folder", ["Other", "Shorts", "Trailers"])
+def test_a_movie_in_a_library_folder_named_like_an_extras_folder_is_analysed(db, tmp_path, folder):  # noqa: F811
+    """Lab (5.1.0 analysed these): a flat "Home Videos" library at /data/Other had every movie skipped as an extra,
+    from its folder's name alone, though Plex lists each as a movie."""
+    local = tmp_path / folder / "Birthday Party 2019.mp4"
+    local.parent.mkdir()
+    local.write_bytes(b"home video")
+    _plex_lists(db, local, f"/data/{folder}/Birthday Party 2019.mp4", 1)
+    c, cfg = _flat_library(db, folder, local)
+    with patch.object(job, "owners", return_value=[cfg]), patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert outcome is None  # its audio has no loudness yet: a worker analyses it
+    write_line.assert_not_called()
+
+
+def test_a_file_plex_lists_as_an_extra_is_skipped_whatever_its_path(db, tmp_path):  # noqa: F811
+    local = tmp_path / "Movies" / "Heat (1995) behind the camera.mp4"
+    local.parent.mkdir()
+    local.write_bytes(b"featurette")
+    _plex_lists(db, local, "/data/Movies/Heat (1995) behind the camera.mp4", 12)
+    c, cfg = _flat_library(db, "Movies", local)
+    with patch.object(job, "owners", return_value=[cfg]), patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert (outcome.outcome_key, outcome.message) == (job.SKIPPED, job.EXTRAS_NOT_ANALYSED)
+    write_line.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [("Heat (1995)-sample.mkv", job.SKIPPED), ("Heat (1995).mkv", job.NOT_IN_LIBRARY)],
+    ids=["extra-by-its-name", "feature"],
+)
+def test_a_file_plex_doesnt_list_is_judged_an_extra_by_its_path(db, tmp_path, name, key):  # noqa: F811
+    """Plex ignores samples and adds the rest later: only a file that looks like an extra isn't waited for."""
+    local = tmp_path / "Movies" / name
+    local.parent.mkdir()
+    local.write_bytes(b"x")
+    c, cfg = _flat_library(db, "Movies", local)
+    with (
+        patch.object(job, "owners", return_value=[cfg]),
+        patch.object(job, "write_line"),
+        patch.object(c, "request_plex_scan") as scan,
+    ):
+        outcome = job.check_item(_item(str(local)), ctx=c)
+    assert outcome.outcome_key == key
+    assert scan.called is (key == job.NOT_IN_LIBRARY)
+
+
+def test_an_extras_refusal_from_a_plex_database_node_keeps_its_type():
+    from media_preview_generator.loudness.plex_db import PLEX_TYPE_EXTRA, NotAnalysedError
+    from media_preview_generator.markers.publishers import plex_remote
+
+    sent = NotAnalysedError("trailers and other extras aren't analysed", plex_type=PLEX_TYPE_EXTRA)
+    error = plex_remote.error_from_json(plex_remote.error_to_json(sent))
+    assert type(error) is NotAnalysedError and (error.plex_type, str(error)) == (PLEX_TYPE_EXTRA, str(sent))
 
 
 def test_every_outcome_a_job_records_is_in_the_references_table():
@@ -158,9 +244,23 @@ def test_a_date_named_file_replaced_in_its_folder_is_skipped_not_retried(tmp_pat
 
 
 def test_a_missing_file_nothing_replaced_is_still_not_found(ctx, tmp_path):
-    with patch.object(job, "source_replaced_reason", return_value=None):
-        outcome = job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx)
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    with (
+        patch.object(job, "source_replaced_reason", return_value=None),
+        patch.object(job, "write_line") as write_line,
+    ):
+        outcome = job.check_item(_item(gone), ctx=ctx)
     assert outcome.outcome_key == job.FILE_NOT_FOUND
+    write_line.assert_called_once_with("Anna Pigeon S01E10: not on disk")
+
+
+def test_a_missing_file_an_import_webhook_deleted_gets_its_job_log_line(ctx, tmp_path):
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    ctx.deleted_paths = frozenset({gone})
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(gone), ctx=ctx)
+    assert outcome.outcome_key == job.SOURCE_GONE
+    write_line.assert_called_once_with(f"Anna Pigeon S01E10: {outcome.message}")
 
 
 def test_worker_analyses_each_stream_once_and_writes_it(ctx, db, media):  # noqa: F811

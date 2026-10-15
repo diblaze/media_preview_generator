@@ -993,10 +993,17 @@
         (field || $('#nodeModal')).focus();
     }
 
-    // A tab opened from a button on another tab: that button is hidden now, so focus goes to the tab's first field.
-    function showTabFocused(tab) {
+    // The Settings fields a Setup Health Fix names (its row's ``fix_field``).
+    const FIX_FIELDS = { url: '#nodeSetUrl', key: '#nodeSetKey' };
+
+    // A tab opened from a button on another tab: that button is hidden now, so focus goes to the field the button
+    // names ("Change the key" to the key), else the tab's first field.
+    function showTabFocused(tab, fieldName) {
         showTab(tab);
-        (firstField($(`#node-tab-${tab}`)) || $('#nodeModal')).focus();
+        const pane = $(`#node-tab-${tab}`);
+        const named = FIX_FIELDS[fieldName] ? $(FIX_FIELDS[fieldName], pane) : null;
+        const field = named && !named.disabled && named.getClientRects().length ? named : firstField(pane);
+        (field || $('#nodeModal')).focus();
     }
 
     // Close, Esc and the backdrop all end in hide(): while there are edits, ask first, on the tab that holds them.
@@ -1485,7 +1492,7 @@
             fix.className = 'btn btn-sm btn-warning nd-health-fix';
             fix.textContent = check.fix_label || 'Fix';
             fix.addEventListener('click', () => {
-                showTabFocused(check.fix_tab);
+                showTabFocused(check.fix_tab, check.fix_field);
                 if (check.fix_tab !== 'media') return;
                 if (check.suggestion && check.suggestion.to) {
                     detail.editor.applySuggestion({ suggestion: check.suggestion, app_root: check.suggestion.app_root || '' });
@@ -1637,6 +1644,13 @@
         // The name is optional (the node's own is used), so typing starts at the address.
         $('#addNodeModal').addEventListener('shown.bs.modal', () => {
             if (!$('#addNodeStep1').classList.contains('d-none')) $('#addNodeUrl').focus();
+        });
+        // Finish later, Esc and the backdrop save the rows shown (keepStep2Rows). A row with one side filled in is
+        // refused as Save refuses it ("Fill in both paths, or remove the row."): closing on it saved no row at all.
+        $('#addNodeModal').addEventListener('hide.bs.modal', (event) => {
+            if (event.target !== $('#addNodeModal') || add.finished || !add.node) return;
+            if ($('#addNodeStep2').classList.contains('d-none')) return;
+            if (add.editor.read() === null) event.preventDefault();
         });
         $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
