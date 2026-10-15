@@ -7,10 +7,14 @@ counting the same database locally gives.
 
 from __future__ import annotations
 
+import json
+import socket
 import sqlite3
+import threading
 import time
 import tracemalloc
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -18,6 +22,7 @@ import pytest
 
 from media_preview_generator.library_health import plex, plex_rows
 from media_preview_generator.library_health.models import CellState, Feature
+from media_preview_generator.loudness.guard import RemoteLoudnessDb
 from media_preview_generator.markers.publishers import plex_remote
 from media_preview_generator.markers.publishers.base import Capability, DatabaseBusyError, PublishError
 from media_preview_generator.markers.publishers.plex_chapters import CHAPTER_CAPABILITY
@@ -295,9 +300,10 @@ class TestTheNodeIsBesideThisServersPlex:
             assert previews.state == CellState.ERROR and "beside a different Plex" in previews.reason
 
 
-class TestABigLibraryIsSentAsItIsRead:
+class TestABigLibraryIsKeptCompressedUntilSent:
     """A big library's rows held at once, then their JSON, took a Plex database node past its memory limit (50,000
-    episodes at 256 MB, 100,000 at 512 MB): it was killed, and the marker and loudness writes it was running failed."""
+    episodes at 256 MB, 100,000 at 512 MB): it was killed, and the marker and loudness writes it was running failed.
+    The node keeps the answer compressed instead, from the read until the app has it."""
 
     BODY = {"section_ids": [1], "want_markers": True, "want_chapters": True, "deadline_s": 5}
 
@@ -310,7 +316,7 @@ class TestABigLibraryIsSentAsItIsRead:
         build_plex_db(path, [_movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", extra, [None]) for i in range(6000)])
         return folder
 
-    def test_the_rows_are_never_all_in_the_node_s_memory_at_once(self, big_folder, tmp_path):
+    def test_the_rows_are_never_all_in_the_node_s_memory_as_they_are_sent(self, big_folder, tmp_path):
         node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
         received = 0
         tracemalloc.start()
@@ -386,18 +392,170 @@ class TestABigLibraryIsSentAsItIsRead:
         with pytest.raises(plex_remote.AgentError, match="can't read"):
             self._rows(big_folder, tmp_path)
 
-    def test_an_answer_the_app_hung_up_on_lets_go_of_the_database_and_its_slot(self, big_folder, tmp_path):
+    def test_spaces_keep_the_app_waiting_while_a_big_library_is_read_and_the_app_reads_past_them(
+        self, big_folder, tmp_path, monkeypatch
+    ):
+        # The answer's first byte waits for the whole read: on a slow machine that outlasted the app's wait for it.
+        monkeypatch.setattr(plex_db_role, "ROWS_KEEPALIVE_S", 0.0)
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 512)
+        node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        body = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH).get_data()
+        assert body.startswith(b"    ") and body.lstrip(b" ").startswith(b'{"ok":true')
+
+        rows = self._rows(big_folder, tmp_path)
+        conn = sqlite3.connect(plex_db_path(str(big_folder)))
+        try:
+            assert rows == plex_rows.read_rows(conn, [1], want_markers=True, want_chapters=True)
+        finally:
+            conn.close()
+
+    def test_the_node_stops_reading_past_what_the_app_reads_and_the_app_refuses_it_as_too_large(
+        self, big_folder, tmp_path, monkeypatch
+    ):
+        from media_preview_generator.markers.publishers import plex_db
+
+        monkeypatch.setattr(plex_remote, "MAX_ANSWER_BYTES", 100_000)
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 512)
+        node = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        sent = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH).get_data()
+        assert 100_000 < len(sent) < 100_000 + 2 * 512 + 1000  # one piece past the cap, of a 4 MB library
+        assert not plex_db._db_lock(plex_db_path(str(big_folder))).locked()
+
+        with pytest.raises(plex_remote.AgentError, match="too large"):
+            self._rows(big_folder, tmp_path)
+
+    @pytest.mark.parametrize("pieces_read", [0, 1], ids=["before-the-first-byte", "while-the-rows-are-read"])
+    def test_an_answer_the_app_hung_up_on_lets_go_of_the_database_and_its_slot(
+        self, big_folder, tmp_path, monkeypatch, pieces_read
+    ):
         from media_preview_generator.markers.publishers import plex_db
         from media_preview_generator.nodes.server import app as app_module
 
+        monkeypatch.setattr(plex_db_role, "ROWS_KEEPALIVE_S", 0.0)  # a space after the first piece read
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 512)
         app = node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path))
         app.config[app_module.SERVER_THREADS] = 2  # one slot for the role
         node = app.test_client()
         abandoned = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
-        next(iter(abandoned.response))
+        pieces = iter(abandoned.response)
+        assert [next(pieces) for _ in range(pieces_read)] == [b" "] * pieces_read
         abandoned.close()
 
         assert not plex_db._db_lock(plex_db_path(str(big_folder))).locked()
         again = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH)
         assert again.status_code == 200
         assert again.get_json()["result"]["capability"] == plex_rows.LIBRARY_HEALTH_CAPABILITY
+
+
+class TestAnAnswerTheAppIsSlowToReadHoldsNothingOfTheNodes:
+    """Sent as it was read, Library Health's answer held the node's lock on Plex's database, its read transaction and
+    the request's slot until the app had read all but its last 16 MB (waitress stops the sending thread there). An
+    app that read slowly, or stopped without hanging up (its machine dropped off the network), left every file check
+    and marker or loudness write on the node waiting ("Another Intro & Credits task is still using this Plex
+    database") and Plex's WAL unable to checkpoint, for as long as that lasted."""
+
+    BODY = {"section_ids": [1], "want_markers": True, "want_chapters": True, "deadline_s": 5}
+
+    @pytest.fixture(autouse=True)
+    def plex_holds_the_database(self, monkeypatch):
+        """The real lock probe runs, taking the node's lock; only its answer (Plex has the file open) is stubbed."""
+        from media_preview_generator.markers.publishers import plex_db
+
+        monkeypatch.setattr(plex_db, "_shm_dms_locked_elsewhere", lambda _db: True)
+
+    @staticmethod
+    def _ask(app, asked: str):
+        remote = RemotePlexDb(NODE_URL, TOKEN, session=FlaskSession(app.test_client()))
+        deadline = time.monotonic() + 3
+        if asked == "file check":
+            return remote.file_checks(deadline=deadline).state
+        if asked == "loudness file check":
+            return RemoteLoudnessDb(MagicMock(), remote, server_name="Plex").file_checks(deadline=deadline).state
+        rows = remote.library_health_rows([1], want_markers=True, want_chapters=True, deadline=deadline, needs="1.2.0")
+        return len(rows["parts"])
+
+    @pytest.mark.parametrize(
+        ("asked", "answered"),
+        [("file check", Capability.READY), ("loudness file check", Capability.READY), ("Library Health", 4)],
+    )
+    def test_the_node_answers_while_an_answer_waits_for_the_app(
+        self, monkeypatch, node_folder, tmp_path, asked, answered
+    ):
+        from media_preview_generator.nodes.server import app as app_module
+
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 1)  # a piece per row: the app stops mid-read
+        app = node_app(str(node_folder), mountinfo_path=_mountinfo(tmp_path))
+        app.config[app_module.SERVER_THREADS] = 2  # one slot for the role
+        waiting = app.test_client().post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
+        try:
+            next(iter(waiting.response))  # the app read the first piece, then stopped
+            # Asked on another of the node's threads, as the server would.
+            with ThreadPoolExecutor(1) as another_thread:
+                assert another_thread.submit(self._ask, app, asked).result(timeout=30) == answered
+        finally:
+            waiting.close()
+
+    def test_plex_checkpoints_its_wal_while_an_answer_waits_for_the_app(self, monkeypatch, node_folder, tmp_path):
+        monkeypatch.setattr(plex_db_role, "ROWS_CHUNK_CHARS", 1)
+        node = node_app(str(node_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        waiting = node.post("/v1/library-health/rows", json=self.BODY, headers=AUTH, buffered=False)
+        plex = sqlite3.connect(plex_db_path(str(node_folder)), timeout=0)
+        try:
+            next(iter(waiting.response))
+            with plex:
+                plex.execute("UPDATE metadata_items SET title = title || ' (2)'")
+            busy, _frames, _done = plex.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            plex.close()
+            waiting.close()
+        assert busy == 0
+
+    def test_an_app_that_stopped_reading_a_big_answer_over_http_leaves_the_database_free(self, tmp_path):
+        from media_preview_generator.nodes.server import wsgi
+
+        # Bigger than waitress's 16 MB of unsent answer plus the sockets' buffers, so its sending thread stops.
+        folder = tmp_path / "huge" / "Plex Media Server"
+        path = Path(plex_db_path(str(folder)))
+        path.parent.mkdir(parents=True)
+        extra = "x" * 4000
+        build_plex_db(path, [_movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", extra, [None]) for i in range(8000)])
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        server = wsgi.create_node_server(
+            node_app(str(folder), mountinfo_path=_mountinfo(tmp_path)), host="127.0.0.1", port=0, threads=4
+        )
+        threading.Thread(target=server.run, daemon=True).start()
+        port = server.effective_port
+        body = json.dumps(self.BODY).encode()
+        head = "\r\n".join(
+            [
+                "POST /v1/library-health/rows HTTP/1.1",
+                f"Host: 127.0.0.1:{port}",
+                *(f"{name}: {value}" for name, value in AUTH.items()),
+                "Content-Type: application/json",
+                f"Content-Length: {len(body)}",
+                "Connection: close",
+            ]
+        )
+        stalled = socket.create_connection(("127.0.0.1", port))
+        try:
+            stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
+            stalled.sendall(head.encode() + b"\r\n\r\n" + body)
+            received = stalled.recv(64 * 1024)
+            assert received.startswith(b"HTTP/1.1 200")
+            # The app stops reading here without hanging up; a Setup Health or job check of the node follows.
+            report = RemotePlexDb(f"http://127.0.0.1:{port}", TOKEN).file_checks(deadline=time.monotonic() + 5)
+            # Then it reads again, at full speed.
+            stalled.settimeout(30)
+            stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            while piece := stalled.recv(1024 * 1024):
+                received += piece
+        finally:
+            stalled.close()
+            server.close()
+
+        assert report.state is Capability.READY, report.message
+        # And the answer that waited is whole once the app reads again: the capability comes last.
+        assert len(received) > 32_000_000
+        assert f'"capability":"{plex_rows.LIBRARY_HEALTH_CAPABILITY}"}}}}'.encode() in received[-200:]
