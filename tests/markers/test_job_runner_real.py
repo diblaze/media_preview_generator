@@ -26,6 +26,7 @@ from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.servers.base import ServerType
 from media_preview_generator.web.job_gate import JobGate
 from media_preview_generator.web.jobs import JobManager, JobStatus, is_user_visible_job
+from media_preview_generator.web.settings_manager import reset_settings_manager
 from tests.markers.fakes import FakeRegistry, ready_publisher, server_config, wait_for
 from tests.markers.test_external_ids import EXTRA_SUFFIXES, EXTRAS_FOLDERS
 
@@ -41,6 +42,9 @@ CHAPTERS = (
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
     """Real JobManager + JobGate + shared dispatcher (1 CPU worker); settings, config and GPUs stubbed."""
+    # The pool reads its worker groups from the live settings singleton first: one an earlier test left behind
+    # would rebuild this test's workers from that test's groups.
+    reset_settings_manager()
     reset_dispatcher()
     jm = JobManager(config_dir=str(tmp_path / "config"))
     gate = JobGate()
@@ -57,6 +61,7 @@ def engine(tmp_path, monkeypatch):
     monkeypatch.setattr(job_runner, "_build_selected_gpus", lambda s, **kw: [])
     yield SimpleNamespace(jm=jm, gate=gate, settings=settings)
     reset_dispatcher()
+    reset_settings_manager()
 
 
 def _outcome(jm, job_id):
