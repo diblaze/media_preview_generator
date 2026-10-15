@@ -24,12 +24,12 @@ The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`]
   `/config/node.json`, so mount `/config`. To pick your own, add `-e NODE_KEY=...` with a key made by
   `openssl rand -hex 24` (at least 16 characters). To keep it in a file (a Docker secret), set `FILE__NODE_KEY`
   to that file's path instead; any setting works this way.
-* `NODE_NAME` is the name the app shows (default: the hostname). The node listens on port **9494** (`NODE_PORT`;
-  change the published port, `-p`, to match).
+* `NODE_NAME` is the name the app shows for it. The node listens on port **9494** (`NODE_PORT`; change the
+  published port, `-p`, to match).
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest

@@ -2275,12 +2275,13 @@ Use the app's own image, the **same tag** as the app, started with `MODE=node`:
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/node/config:/config \
   stevezzau/media_preview_generator:latest
 ```
 
+- `NODE_NAME` is the name the app shows for it.
 - Mount your media read-only, at any path.
 - Pass the GPU the same way you pass it to the app (`--gpus all` for NVIDIA). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
@@ -2327,7 +2328,7 @@ container:
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
-  -e MODE=node -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
+  -e MODE=node -e NODE_NAME=plex-box -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
   -e PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server" \
   --device /dev/dri:/dev/dri \
   -v /path/to/media:/media:ro -v /path/to/plex/config:/plex -v /path/to/node/config:/config \

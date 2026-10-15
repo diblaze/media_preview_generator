@@ -662,6 +662,18 @@ class TestAddNode:
         assert api.bodies("POST", "/nodes")[0]["name"] == "storage"
         assert not [c for c in api.calls if c[1].endswith("/test-access")]
 
+    def test_a_container_id_for_a_name_gives_way_to_the_address(self, authed_page: Page, app_url: str) -> None:
+        # A container started without NODE_NAME reports Docker's hostname: the container id.
+        api = _open_nodes(authed_page, app_url, [])
+        _open_add(authed_page)
+        info = _probe_info()
+        info["node"]["name"] = "3f2a9c1b7d4e"
+        api.probe_answer = {"ok": True, "info": info}
+        authed_page.locator("#addNodeUrl").fill("http://gpu-box.lan:9494")
+        authed_page.locator("#addNodeKey").fill("k")
+        authed_page.locator("#addNodeConnect").click()
+        expect(authed_page.locator("#addNodeName")).to_have_value("gpu-box.lan")
+
     def test_version_mismatch_warns_update_needed(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)

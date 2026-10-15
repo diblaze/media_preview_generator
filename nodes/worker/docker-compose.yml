@@ -43,7 +43,7 @@ services:
       # The key the app must send. Left empty, the node makes one (printed once in `docker logs`).
       # To pick your own, put NODE_KEY=<key> in a .env file beside this one; make one with: openssl rand -hex 24
       - NODE_KEY=${NODE_KEY:-}
-      # The name the app shows for this node (default: the container's hostname).
+      # The name the app shows for this node.
       - NODE_NAME=gpu-box
       # The port the node listens on inside the container. Change the ports: mapping above to match (9500:9500).
       # - NODE_PORT=9494

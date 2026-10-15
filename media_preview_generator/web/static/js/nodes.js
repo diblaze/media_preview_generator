@@ -833,7 +833,7 @@
         }
         add.probe = r.data.info;
         const nameEl = $('#addNodeName');
-        if (!nameEl.value.trim() && add.probe.node && add.probe.node.name) nameEl.value = add.probe.node.name;
+        if (!nameEl.value.trim()) nameEl.value = suggestedName(add.probe, url);
         renderProbe(add.probe);
         setAddStep(1);
     }
@@ -847,9 +847,16 @@
         try { return new URL(url).hostname; } catch (_) { return ''; }
     }
 
+    // The node's own name (NODE_NAME), else its address's host. A container started without NODE_NAME reports its
+    // hostname, which Docker sets to the container id: hex digits nobody recognises.
+    function suggestedName(info, url) {
+        const own = ((info && info.node) || {}).name || '';
+        return own && !/^[0-9a-f]{12,64}$/.test(own) ? own : hostOf(url);
+    }
+
     async function saveNewNode() {
         const url = $('#addNodeUrl').value.trim();
-        const name = $('#addNodeName').value.trim() || ((add.probe.node || {}).name) || hostOf(url);
+        const name = $('#addNodeName').value.trim() || suggestedName(add.probe, url);
         const body = { name, url, key: $('#addNodeKey').value.trim(), path_mappings: [] };
         const btn = $('#addNodeNext');
         btn.disabled = true;
