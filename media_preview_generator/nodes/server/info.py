@@ -172,9 +172,15 @@ class WorkerInfo:
         # Set once any detection has stored its answer.
         self._detected = threading.Event()
         self._thread: threading.Thread | None = None
+        self._temp_lock = threading.Lock()
+        self._temp_logged: str | None = None
 
     def start(self) -> None:
-        """Start the background re-check (its first pass detects at once, so the first /v1/info is quick)."""
+        """Start the background re-check (its first pass detects at once, so the first /v1/info is quick).
+
+        The temp folder is checked now too, so a node that can't use it says so in its own log from the start.
+        """
+        self._note_temp_problem(probe_temp_folder(self._temp_root))
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop, name="node-gpu-recheck", daemon=True)
             self._thread.start()
@@ -268,6 +274,23 @@ class WorkerInfo:
         """Why the last GPU detection failed, or None when it worked."""
         return self._gpu_error
 
+    def _note_temp_problem(self, problem: str | None) -> None:
+        """Log the temp folder's problem when it appears or changes, and when it is gone.
+
+        The app holds a node with one, and the node's own log is where someone setting it up looks first.
+
+        Args:
+            problem: What the temp folder's check found, or None when it can be used.
+        """
+        with self._temp_lock:
+            if problem == self._temp_logged:
+                return
+            self._temp_logged = problem
+        if problem:
+            logger.warning("{}: the app sends this node no files until that's fixed", problem)
+        else:
+            logger.info("The node's temp folder {} can be used again", self._temp_root)
+
     def block(self, *, busy: int) -> dict[str, Any]:
         """The ``worker`` block of /v1/info.
 
@@ -282,6 +305,7 @@ class WorkerInfo:
         # Every start makes a folder there; one that can't would refuse each file the app sends, so the app reads
         # this and sends none.
         temp_problem = probe_temp_folder(self._temp_root)
+        self._note_temp_problem(temp_problem)
         try:
             free_bytes: int | None = shutil.disk_usage(self._temp_root).free
         except OSError:

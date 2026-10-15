@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -294,6 +295,66 @@ class TestHost:
         monkeypatch.setattr(config, "_resolve_ffmpeg_path", lambda: None)
 
         assert info._ffmpeg() == {"path": None, "version": None}
+
+
+class TestTempFolderInTheNodesLog:
+    """The app holds a node whose temp folder can't be used; the node's own log, read first when setting one up, says
+    so when that starts and when it ends."""
+
+    @pytest.fixture
+    def lines(self):
+        seen: list[str] = []
+        sink = logger.add(lambda m: seen.append(f"{m.record['level'].name} {m.record['message']}"), level="INFO")
+        yield seen
+        logger.remove(sink)
+
+    @staticmethod
+    def _worker(tmp_path, monkeypatch, problems: list[str | None]) -> info.WorkerInfo:
+        answers = iter(problems)
+        monkeypatch.setattr(info, "probe_temp_folder", lambda root: next(answers))
+        monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+        return info.WorkerInfo(temp_root=str(tmp_path), recheck_s=3600, detect=list)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a 0500 folder")
+    def test_a_temp_folder_the_node_cant_write_is_named_at_start(self, tmp_path, lines):
+        temp_root = tmp_path / "scratch"
+        temp_root.mkdir()
+        temp_root.chmod(0o500)
+        worker = info.WorkerInfo(temp_root=str(temp_root), recheck_s=3600, detect=list)
+        try:
+            worker.start()
+        finally:
+            worker.stop()
+            temp_root.chmod(0o700)
+
+        assert [line for line in lines if line.startswith("WARNING")] == [
+            f"WARNING The node can't write to its temp folder {temp_root} (Permission denied): the app sends this "
+            "node no files until that's fixed"
+        ]
+
+    def test_a_usable_temp_folder_logs_nothing(self, tmp_path, monkeypatch, lines):
+        worker = self._worker(tmp_path, monkeypatch, [None, None])
+        worker.start()
+        worker.block(busy=0)
+        worker.stop()
+
+        assert not [line for line in lines if "temp folder" in line], lines
+
+    def test_a_problem_is_logged_once_while_it_lasts_again_when_it_changes_and_when_it_ends(
+        self, tmp_path, monkeypatch, lines
+    ):
+        full, read_only = f"The node's temp folder {tmp_path} is full", f"The node can't write to {tmp_path}"
+        worker = self._worker(tmp_path, monkeypatch, [None, full, full, full, read_only, None, None])
+        worker.start()
+        for _ in range(6):  # every /v1/info checks the folder; the app asks every few seconds
+            worker.block(busy=0)
+        worker.stop()
+
+        assert [line for line in lines if "temp folder" in line or "can't write" in line] == [
+            f"WARNING {full}: the app sends this node no files until that's fixed",
+            f"WARNING {read_only}: the app sends this node no files until that's fixed",
+            f"INFO The node's temp folder {tmp_path} can be used again",
+        ]
 
 
 class TestCreditText:
