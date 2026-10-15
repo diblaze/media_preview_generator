@@ -4,10 +4,11 @@ Plex on Windows keeps its database on the machine's own disk, and SQLite's locks
 machine, so an app elsewhere can only write markers through a node running here. This is that node, built into a
 self-contained folder by ``plex-db-node.spec`` and started at logon by ``install.ps1`` (``HKCU\\...\\Run``, no admin).
 
-Its own files (``node.json`` with the node's id and key, ``logs\\node.log``) live in
-``%LOCALAPPDATA%\\MediaPreviewGenerator\\node``. Plex's folder is ``PLEX_CONFIG_DIR`` when set, else the one Plex itself
-uses for this user (``winplatform.default_plex_config_dir``). It serves with waitress (gunicorn doesn't run on
-Windows) in one process: the role's "one writer at a time" guarantee is a lock inside that process.
+Its own files (``node.json`` with the node's id and key, ``logs\\node.log``, ``loudness-writes.jsonl``: the undo record
+of each loudness write) live in ``%LOCALAPPDATA%\\MediaPreviewGenerator\\node``, which it makes its ``CONFIG_DIR``.
+Plex's folder is ``PLEX_CONFIG_DIR`` when set, else the one Plex itself uses for this user
+(``winplatform.default_plex_config_dir``). It serves with waitress (gunicorn doesn't run on Windows) in one process:
+the role's "one writer at a time" guarantee is a lock inside that process.
 """
 
 from __future__ import annotations
@@ -47,9 +48,10 @@ def _log_to(config_dir: str) -> str:
     log_file = os.path.join(config_dir, "logs", "node.log")
     logger.remove()
     # The windowed build has no console: sys.stderr is None there.
+    # diagnose=False: a traceback's variable values could hold the key or a request body.
     if sys.stderr is not None:
-        logger.add(sys.stderr, level="INFO")
-    logger.add(log_file, level="INFO", rotation="5 MB", retention=3, encoding="utf-8")
+        logger.add(sys.stderr, level="INFO", diagnose=False)
+    logger.add(log_file, level="INFO", rotation="5 MB", retention=3, encoding="utf-8", diagnose=False)
     logging.basicConfig(handlers=[_ToLoguru()], level=logging.INFO, force=True)
     return log_file
 
@@ -65,6 +67,12 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--plex-config-dir", default=os.environ.get("PLEX_CONFIG_DIR"), help="Plex's data folder")
     parser.add_argument("--self-test", action="store_true", help="check the build has what the role needs, then exit")
+    parser.add_argument(
+        "--undo-loudness",
+        action="store_true",
+        help="put back the audio tracks this node's loudness writes changed (stop Plex first), then exit",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="with --undo-loudness: count, change nothing")
     return parser.parse_args(argv)
 
 
@@ -78,6 +86,7 @@ def self_test() -> int:
 
     from PIL import Image
 
+    from media_preview_generator.loudness import undo  # noqa: F401
     from media_preview_generator.markers.publishers import plex_chapters, plex_db  # noqa: F401
     from media_preview_generator.nodes.server import app, winplatform  # noqa: F401
 
@@ -92,6 +101,32 @@ def self_test() -> int:
     return 0
 
 
+def _plex_folder(args: argparse.Namespace) -> str:
+    from media_preview_generator.nodes.server import winplatform
+
+    return args.plex_config_dir or winplatform.default_plex_config_dir()
+
+
+def undo_loudness(args: argparse.Namespace) -> int:
+    """Run the loudness undo (``loudness.undo``) on this node's undo record and the Plex database it wrote.
+
+    The Windows counterpart of running ``python -m media_preview_generator.loudness.undo`` in a node's container.
+
+    Returns:
+        The undo's exit code.
+    """
+    from media_preview_generator.loudness import undo
+    from media_preview_generator.loudness.plex_db import write_log_path
+    from media_preview_generator.markers.publishers.plex_db import plex_db_path
+
+    log = write_log_path()
+    if not os.path.isfile(log):
+        print(f"No loudness undo record at {log}: this node hasn't written loudness.", file=sys.stderr)
+        return 1
+    undo_args = ["--db", plex_db_path(_plex_folder(args)), "--log", log]
+    return undo.main([*undo_args, "--dry-run"] if args.dry_run else undo_args)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Start the node and serve until stopped.
 
@@ -104,14 +139,18 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     if args.self_test:
         return self_test()
+    # The loudness undo record (loudness.plex_db.write_log_path) goes to CONFIG_DIR: the node's own folder here, not
+    # the container's /config, which on Windows would be \config on whatever drive the node started from.
+    os.environ["CONFIG_DIR"] = args.config_dir
+    if args.undo_loudness:
+        return undo_loudness(args)
     os.makedirs(args.config_dir, exist_ok=True)
     log_file = _log_to(args.config_dir)
 
     # Imported after logging is set up, so an import failure in the windowed build lands in the log file.
     from media_preview_generator.nodes.protocol import ROLE_PLEX_DB
-    from media_preview_generator.nodes.server import winplatform
 
-    plex_dir = args.plex_config_dir or winplatform.default_plex_config_dir()
+    plex_dir = _plex_folder(args)
     os.environ["PLEX_CONFIG_DIR"] = plex_dir
     os.environ["NODE_ROLES"] = ROLE_PLEX_DB
     logger.info(

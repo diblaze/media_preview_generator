@@ -27,6 +27,8 @@ from collections.abc import Callable, Iterator
 from types import ModuleType
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from loguru import logger
 
 from ..decide import FileLimits, unusable_server_marker
@@ -50,6 +52,9 @@ from .base import (
 # Windows has no fcntl: there the Plex database role asks ``nodes.server.winplatform`` instead (``_winplatform``).
 if sys.platform != "win32":
     import fcntl
+
+# Plex on Windows keeps its preferences in the registry and never writes a Preferences.xml.
+_PLEX_PREFS_IN_REGISTRY = sys.platform == "win32"
 
 if TYPE_CHECKING:
     from ...servers.base import ServerConfig
@@ -296,6 +301,34 @@ def report_of_failure(exc: PublishError, default: Capability, details: dict | No
 def plex_db_path(plex_config_folder: str) -> str:
     """Library DB path under the "Plex Media Server" folder the app already uses for previews."""
     return os.path.join(plex_config_folder, "Plug-in Support", "Databases", "com.plexapp.plugins.library.db")
+
+
+def plex_machine_identifier(plex_config_folder: str) -> str:
+    """Plex's own server id (``ProcessedMachineIdentifier``) for the Plex whose config folder this is, or "".
+
+    Plex writes it into ``Preferences.xml`` in that folder; Plex on Windows keeps it in the registry instead
+    (``winplatform.plex_machine_identifier``). No database is opened.
+
+    Args:
+        plex_config_folder: The "Plex Media Server" folder as this process sees it.
+
+    Returns:
+        The identifier, or "" when it can't be read.
+    """
+    if _PLEX_PREFS_IN_REGISTRY:
+        found = _winplatform().plex_machine_identifier(plex_config_folder)
+        if found:
+            return found
+    try:
+        root = ET.parse(
+            os.path.join(plex_config_folder, "Preferences.xml"),
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        ).getroot()
+    except (OSError, ET.ParseError, DefusedXmlException):
+        return ""
+    return str(root.get("ProcessedMachineIdentifier") or "")
 
 
 def _lock_key(db_path: str) -> object:

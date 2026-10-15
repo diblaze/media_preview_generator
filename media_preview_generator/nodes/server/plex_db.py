@@ -30,11 +30,9 @@ Import-light on purpose: Flask, loguru and the app's ``markers/publishers``, ``l
 from __future__ import annotations
 
 import os
-import re
 import secrets
 import sqlite3
 import time
-from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, Flask, abort, jsonify, request
@@ -52,7 +50,12 @@ from ...markers.publishers.plex_chapters import (
     target_from_json,
     target_to_json,
 )
-from ...markers.publishers.plex_db import LocalPlexDb, plex_db_path, publish_error_from_sqlite
+from ...markers.publishers.plex_db import (
+    LocalPlexDb,
+    plex_db_path,
+    plex_machine_identifier,
+    publish_error_from_sqlite,
+)
 from ..protocol import sendable_key
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
@@ -76,10 +79,6 @@ MAX_PATH_CHARS = 32768
 LOUDNESS_OPERATIONS = frozenset({"file_checks", "check", "streams", "snapshot", "write", "mark"})
 DEFAULT_PORT = 9494
 
-# Plex writes its own server id into Preferences.xml beside the database. The app compares it with the
-# machineIdentifier its Plex reports, so a node set up beside the wrong Plex is refused instead of writing another
-# server's database. Read per request: it changes when a server is claimed.
-_MACHINE_ID_RE = re.compile(r'ProcessedMachineIdentifier="([^"]+)"')
 _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
 _CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
@@ -89,7 +88,11 @@ _registered_config_dir = ""
 
 
 def machine_identifier(config_dir: str) -> str:
-    """Plex's own server id from ``Preferences.xml``, or "" when it can't be read (no database is opened).
+    """Plex's own server id, from its preferences beside the database, or "" when it can't be read.
+
+    The app compares it with the machineIdentifier its Plex reports, so a node set up beside the wrong Plex (or a
+    different node answering at a node's address) is refused instead of writing another server's database. Read per
+    request: it changes when a server is claimed.
 
     Args:
         config_dir: Plex's config folder as this node sees it.
@@ -97,12 +100,7 @@ def machine_identifier(config_dir: str) -> str:
     Returns:
         The identifier, or "" — which the app treats as "unknown", never as a mismatch.
     """
-    try:
-        text = Path(config_dir, "Preferences.xml").read_text(errors="replace")
-    except OSError:
-        return ""
-    found = _MACHINE_ID_RE.search(text)
-    return found.group(1) if found else ""
+    return plex_machine_identifier(config_dir)
 
 
 def _in_container(root_fs: str | None) -> bool:
@@ -117,15 +115,18 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
     The record is ``<CONFIG_DIR>/loudness-writes.jsonl`` (``loudness.plex_db.write_log_path``). In a container whose
     ``CONFIG_DIR`` is no mount of its own, it lives in the container's writable layer and goes with the container on
     the next update (and so do the node's id and generated key), whatever storage driver that layer sits on (overlay,
-    rootless Podman's fuse-overlayfs, unRAID's btrfs, ZFS). Windows keeps it under ``%LOCALAPPDATA%``, and a Linux
-    node outside a container keeps it on the machine's own disk; neither needs a volume.
+    rootless Podman's fuse-overlayfs, unRAID's btrfs, ZFS). The Windows node keeps it in its own folder under
+    ``%LOCALAPPDATA%`` (its entry point sets ``CONFIG_DIR`` to it), and a Linux node outside a container keeps it on
+    the machine's own disk; neither needs a volume.
 
     Args:
         mountinfo_path: For tests.
     """
-    if _ON_WINDOWS:
-        return ""
     folder = os.path.dirname(loudness_db.write_log_path())
+    if _ON_WINDOWS:
+        if os.environ.get("CONFIG_DIR", "").strip():
+            return ""
+        return f"Set CONFIG_DIR to this node's own folder: the loudness undo record would go to {folder}."
     found = mount_of(os.path.realpath(folder), mountinfo_path=mountinfo_path)
     if found is None or found[0] != "/" or not _in_container(found[1]):
         return ""
@@ -155,6 +156,25 @@ def info_block(plex_config_dir: str | None = None) -> dict:
         "db_present": bool(folder) and os.path.isfile(plex_db_path(folder)),
         "machine_identifier": machine_identifier(folder) if folder else "",
     }
+
+
+def _not_on_a_local_disk(db_path: str, mountinfo_path: str) -> str:
+    """Why SQLite can't read the database at ``db_path`` safely here, or "" when it can.
+
+    Windows has no mountinfo: there the drive type decides, as ``LocalPlexDb.file_checks`` does.
+    """
+    if _ON_WINDOWS:
+        from . import winplatform
+
+        if winplatform.is_local_drive(db_path):
+            return ""
+        fs_type: str | None = winplatform.filesystem_label(db_path)
+    else:
+        fs_type = filesystem_type(db_path, mountinfo_path=mountinfo_path)
+        if not is_network_filesystem(fs_type):
+            return ""
+    where = "a network share" if is_network_filesystem(fs_type) else "a drive that isn't a local disk"
+    return f"Plex's database is on {where} ({fs_type}) on this node; it has to be a local disk on the Plex machine"
 
 
 def _ok(result: dict) -> Any:
@@ -545,17 +565,9 @@ def register_plex_db(
                 raise ValueError("want_markers and want_chapters must be true or false")
         except ValueError as exc:
             return _bad_request(str(exc))
-        db_path = plex_db_path(folder)
-        fs_type = filesystem_type(os.path.realpath(db_path), mountinfo_path=mountinfo_path)
-        if is_network_filesystem(fs_type):
-            # SQLite can't read a WAL database over a network share reliably: the same refusal the app makes.
-            return _refused(
-                PublishError(
-                    f"Plex's database is on a network share ({fs_type}) on this node; it has to be a local disk on "
-                    "the Plex machine",
-                    state=Capability.NEEDS_LOCAL_DB,
-                )
-            )
+        problem = _not_on_a_local_disk(os.path.realpath(plex_db_path(folder)), mountinfo_path)
+        if problem:
+            return _refused(PublishError(problem, state=Capability.NEEDS_LOCAL_DB))
         try:
             with database._database(read_only=True, deadline=_deadline(body)) as conn:
                 rows = read_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)

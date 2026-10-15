@@ -13,6 +13,7 @@ import stat
 import string
 import subprocess
 import sys
+import types
 import uuid
 
 import pytest
@@ -74,12 +75,65 @@ class TestOffWindows:
             lambda: winplatform.same_user_can_write("/x"),
             winplatform.current_user,
             winplatform.default_plex_config_dir,
+            lambda: winplatform.plex_machine_identifier("/x"),
         ],
-        ids=["plex_holds_db", "is_local_drive", "same_user_can_write", "current_user", "default_plex_config_dir"],
+        ids=[
+            "plex_holds_db",
+            "is_local_drive",
+            "same_user_can_write",
+            "current_user",
+            "default_plex_config_dir",
+            "plex_machine_identifier",
+        ],
     )
     def test_windows_calls_raise_elsewhere(self, call):
         with pytest.raises(winplatform.WindowsOnlyError):
             call()
+
+
+class _FakeKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestPlexMachineIdentifierFromAFakeRegistry:
+    """Runs everywhere: ``winreg`` and the platform are stood in for."""
+
+    @pytest.fixture
+    def registry(self, tmp_path, monkeypatch) -> dict:
+        values: dict = {winplatform.PLEX_MACHINE_ID_VALUE: "plex-a"}
+
+        def query_value(_key, name):
+            if name not in values:
+                raise FileNotFoundError(name)
+            return values[name], 1
+
+        fake = types.ModuleType("winreg")
+        fake.HKEY_CURRENT_USER = object()
+        fake.OpenKey = lambda _root, _path: _FakeKey()
+        fake.QueryValueEx = query_value
+        monkeypatch.setitem(sys.modules, "winreg", fake)
+        monkeypatch.setattr(winplatform, "IS_WINDOWS", True)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        return values
+
+    def test_this_users_plex_folder_gets_its_identifier(self, registry, tmp_path):
+        assert winplatform.plex_machine_identifier(str(tmp_path / "Plex Media Server")) == "plex-a"
+
+    def test_another_folder_gets_none_of_it(self, registry, tmp_path):
+        assert winplatform.plex_machine_identifier(str(tmp_path / "Copy" / "Plex Media Server")) == ""
+
+    def test_a_plex_that_never_ran_has_none(self, registry, tmp_path):
+        registry.clear()
+        assert winplatform.plex_machine_identifier(str(tmp_path / "Plex Media Server")) == ""
+
+    def test_the_moved_data_folder_is_the_one_named(self, registry, tmp_path):
+        registry[winplatform.PLEX_REGISTRY_VALUE] = str(tmp_path / "PlexData")
+        assert winplatform.plex_machine_identifier(str(tmp_path / "PlexData" / "Plex Media Server")) == "plex-a"
+        assert winplatform.plex_machine_identifier(str(tmp_path / "Plex Media Server")) == ""
 
 
 @windows_only

@@ -23,8 +23,6 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from defusedxml import ElementTree as ET
-from defusedxml.common import DefusedXmlException
 from PIL import Image
 
 from ..settings import load_server
@@ -35,6 +33,7 @@ from .plex_db import (
     LocalPlexDb,
     is_tested_pms_version,
     plex_db_path,
+    plex_machine_identifier,
     publish_error_from_sqlite,
 )
 from .plex_remote import AgentClient, agent_older_than, node_refusal, report_from_json
@@ -223,14 +222,7 @@ class LocalChapters:
         self.database = LocalPlexDb(lambda: plex_db_path(config_dir), mountinfo_path=mountinfo_path)
 
     def _identity(self, expected: str, version: str) -> None:
-        try:
-            actual = (
-                ET.parse(self.folder / "Preferences.xml", forbid_dtd=True, forbid_entities=True, forbid_external=True)
-                .getroot()
-                .get("ProcessedMachineIdentifier")
-            )
-        except (OSError, ET.ParseError, DefusedXmlException):
-            actual = None
+        actual = plex_machine_identifier(str(self.folder))
         if not expected or not actual or expected != actual:
             raise ChapterError(
                 "Cannot prove this database belongs to the connected Plex server",

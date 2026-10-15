@@ -38,8 +38,10 @@ DRIVE_LABELS = {
     DRIVE_RAMDISK: "ram disk",
 }
 
+# Plex on Windows keeps its preferences here, not in a Preferences.xml (support.plex.tv/articles/201105343).
 PLEX_REGISTRY_KEY = r"Software\Plex, Inc.\Plex Media Server"
 PLEX_REGISTRY_VALUE = "LocalAppDataPath"
+PLEX_MACHINE_ID_VALUE = "ProcessedMachineIdentifier"
 
 _GENERIC_READ, _GENERIC_WRITE = 0x80000000, 0x40000000
 _FILE_ADD_FILE = 0x0002
@@ -407,15 +409,15 @@ def file_owner(path: str) -> str | None:
         api.k32.LocalFree(descriptor)
 
 
-def _registry_local_app_data_path() -> str | None:
+def _plex_registry_value(name: str) -> str | None:
     import winreg
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, PLEX_REGISTRY_KEY) as key:
-            value, _kind = winreg.QueryValueEx(key, PLEX_REGISTRY_VALUE)
+            value, _kind = winreg.QueryValueEx(key, name)
     except OSError:
         return None
-    return os.path.expandvars(str(value)).strip() or None
+    return str(value).strip() or None
 
 
 def default_plex_config_dir() -> str:
@@ -428,5 +430,31 @@ def default_plex_config_dir() -> str:
         WindowsOnlyError: Not on Windows.
     """
     _require_windows()
-    base = _registry_local_app_data_path() or os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    moved = os.path.expandvars(_plex_registry_value(PLEX_REGISTRY_VALUE) or "").strip()
+    base = moved or os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
     return os.path.join(base, "Plex Media Server")
+
+
+def plex_machine_identifier(plex_config_dir: str) -> str:
+    """The ``ProcessedMachineIdentifier`` of the Plex whose data folder is ``plex_config_dir``, from the registry.
+
+    The registry holds the preferences of the one Plex that runs as this user, so its value only names a folder that
+    is that Plex's own (:func:`default_plex_config_dir`); any other folder belongs to some other Plex, and gets "".
+
+    Args:
+        plex_config_dir: Plex's data folder as this node was given it.
+
+    Returns:
+        The identifier, or "" when it isn't there or the folder isn't this user's Plex's.
+
+    Raises:
+        WindowsOnlyError: Not on Windows.
+    """
+    _require_windows()
+
+    def same(path: str) -> str:
+        return os.path.normcase(os.path.realpath(path))
+
+    if same(plex_config_dir) != same(default_plex_config_dir()):
+        return ""
+    return _plex_registry_value(PLEX_MACHINE_ID_VALUE) or ""
