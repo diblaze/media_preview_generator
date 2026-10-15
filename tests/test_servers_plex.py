@@ -2597,14 +2597,68 @@ class TestPlexMarkersReadiness(_MarkerReadinessHarness):
 
         assert "markers_plex_detection" not in self._marker_checks(self._readiness(server, capability))
 
-    @pytest.mark.parametrize("state", ["unreachable", "misconfigured", "unsupported_schema", "unknown"])
-    def test_a_capability_that_knows_nothing_emits_no_section(self, state):
+    def test_a_capability_that_knows_nothing_emits_no_section(self):
         """No facts → no rows, rather than a guessed row: the card must not cry wolf."""
         server = self._server({"enabled": True, "library_ids": None, "plex": self.CONFIRMED})
 
-        payload = self._readiness(server, self._capability(state))
+        payload = self._readiness(server, self._capability("unknown"))
 
         assert [s["id"] for s in payload["sections"] if s["id"] == "markers"] == []
+
+    @pytest.mark.parametrize(
+        ("state", "message", "details"),
+        [
+            ("misconfigured", "Plex database not found at /plex/x.db", {}),
+            ("misconfigured", "Can't write /plex/x.db", {"db_path": "/plex/x.db", "unwritable": ["/plex/x.db"]}),
+            ("unsupported_schema", "Plex's database has a layout this app doesn't know", {}),
+            (
+                "unreachable",
+                "Plex doesn't have its database open through this folder right now",
+                {"lock_holder": False},
+            ),
+            ("misconfigured", "", {}),
+        ],
+        ids=["no-database", "read-only", "unknown-layout", "not-held-open", "no-message"],
+    )
+    def test_a_refused_database_fails_the_section_with_the_checks_own_reason(self, tmp_path, state, message, details):
+        """Every Intro & Credits file is skipped with this message, so Setup Health can't be all green."""
+        capability = {**self._capability(state, plex_pass=True, **details), "message": message}
+
+        payload = self._readiness(self._server_on(str(tmp_path)), capability)
+
+        checks = self._marker_checks(payload)
+        assert list(checks) == ["markers_plex_pass", "markers_plex_db"]
+        row = checks["markers_plex_db"]
+        assert (row["ok"], row["severity"]) == (False, "critical")
+        assert row["reason"] == (
+            message or "Markers aren't written until this is fixed. The Intro & Credits tab says why."
+        )
+        assert self._failing_critical(payload) == ["markers_plex_db"]
+        assert row["fix_where"] == "app"
+
+    def test_a_refused_database_behind_a_node_is_fixed_on_the_node(self, tmp_path):
+        agent = {"state": "connected", "url": "http://plex-host:9494", "version": "1.2.0"}
+        capability = {
+            **self._capability("misconfigured", agent=agent, plex_pass=True),
+            "message": "Plex database not found at /plex/x.db",
+        }
+
+        checks = self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
+
+        assert checks["markers_plex_agent"]["ok"] is True
+        assert (checks["markers_plex_db"]["ok"], checks["markers_plex_db"]["fix_where"]) == (False, "agent")
+
+    def test_a_refusal_another_row_explains_gets_no_second_row(self, tmp_path):
+        capability = self._capability("needs_local_db", fs_type="nfs4", db_path="/plex/x.db", plex_pass=True)
+
+        checks = self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
+
+        assert "markers_plex_db" not in checks and checks["markers_plex_db_local"]["ok"] is False
+
+    def test_a_busy_database_is_not_a_refusal(self, tmp_path):
+        capability = self._capability("unreachable", plex_pass=True, db_busy=True)
+
+        assert "markers_plex_db" not in self._marker_checks(self._readiness(self._server_on(str(tmp_path)), capability))
 
     def test_unreadable_settings_emit_no_section_rather_than_the_off_row(self, tmp_path):
         """Settings that can't be read are unknown, not "off" — the card says nothing either way."""
@@ -3161,8 +3215,13 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
             plex_remote.AGENT_NO_ROLE,
             plex_remote.AGENT_DISABLED,
             plex_remote.AGENT_NO_NODE,
+            plex_remote.AGENT_UNCONFIRMED_NODE,
         }
-        assert readiness.AGENT_FIXED_IN_APP == {plex_remote.AGENT_DISABLED, plex_remote.AGENT_NO_NODE}
+        assert readiness.AGENT_FIXED_IN_APP == {
+            plex_remote.AGENT_DISABLED,
+            plex_remote.AGENT_NO_NODE,
+            plex_remote.AGENT_UNCONFIRMED_NODE,
+        }
         assert readiness.AGENT_RECOMMENDED == plex_remote.AGENT_CONNECTED
         assert readiness.AGENT_FALLBACK_STATE == plex_remote.AGENT_UNREACHABLE
 

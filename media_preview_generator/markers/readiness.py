@@ -79,6 +79,18 @@ LOCAL_DB_TODO_AGENT = (
     "disks (in Docker, mount it from one). Everything else about this server keeps working either way.</p>"
 )
 
+# Any other refusal by the capability check (the database not found or not writable, a layout this app doesn't know,
+# Plex not answering): the check's own message is the reason, since no other row explains it.
+DB_REFUSED_LABEL = "Plex's database can't take markers"
+DB_REFUSED_REASON = "Markers aren't written until this is fixed. The Intro & Credits tab says why."
+DB_REFUSED_TOOLTIP = "Markers go straight into Plex's database. This is what the check found when it tried it."
+DB_REFUSED_EXPLANATION = (
+    "<p><strong>What it checks:</strong> that Plex's library database can be found and written, and that this app "
+    "knows its layout.</p>"
+    "<p><strong>Why it matters:</strong> while the check refuses it, every Intro &amp; Credits file is skipped with "
+    "this message and nothing reaches Plex.</p>"
+)
+
 AGENT_LABEL_OK = "The Plex database node is connected"
 AGENT_RECOMMENDED = "connected"
 AGENT_TOOLTIP = (
@@ -253,6 +265,7 @@ class MarkerFacts:
         state: The :class:`~media_preview_generator.markers.publishers.base.Capability` value the check
             returned, or ``"unknown"``.
         details: That report's ``details`` — the facts the rows below are read from.
+        message: That report's message, for a refusal no other row explains.
         keep_plex: Whether this Plex server is set to "Keep Plex's" (``on_plex_redetect``).
         libraries: ``(id, name)`` of each library in this server's Intro & Credits selection, in order.
         library_detection: Each library's own "Intro markers" / "Credits markers" settings, as
@@ -263,6 +276,7 @@ class MarkerFacts:
     enabled: bool | None
     state: str = _UNKNOWN_STATE
     details: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
     keep_plex: bool = False
     libraries: tuple[tuple[str, str], ...] = ()
     library_detection: dict[str, dict[str, Any]] | None = None
@@ -442,6 +456,7 @@ def marker_facts(server: Any, config: ServerConfig | None) -> MarkerFacts:
         enabled=bool(payload.get("enabled")),
         state=str(capability.get("state") or _UNKNOWN_STATE),
         details=dict(details) if isinstance(details, dict) else {},
+        message=str(capability.get("message") or ""),
     )
     if config.type is not ServerType.PLEX:
         return facts
@@ -701,6 +716,23 @@ def plex_section(facts: MarkerFacts) -> dict[str, Any] | None:
                 recommended=here,
                 reason=None if local_db else reason,
                 fix_where="agent" if facts.agent is not None else None,
+            )
+        )
+
+    # A busy database is "can't tell" (asked again on the next run), not a refusal.
+    refused = facts.state not in (Capability.READY.value, _UNKNOWN_STATE) and not facts.details.get("db_busy")
+    if refused and not any(c["ok"] is False and c["severity"] == CRITICAL for c in checks):
+        checks.append(
+            _row(
+                "markers_plex_db",
+                DB_REFUSED_LABEL,
+                severity=CRITICAL,
+                ok=False,
+                tooltip=DB_REFUSED_TOOLTIP,
+                explanation=DB_REFUSED_EXPLANATION,
+                reason=facts.message or DB_REFUSED_REASON,
+                # The database, its folder and the user writing it are set where the check ran.
+                fix_where="agent" if facts.agent is not None else "app",
             )
         )
 
