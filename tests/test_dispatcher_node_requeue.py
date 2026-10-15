@@ -210,6 +210,24 @@ class TestNodeDrops:
         assert tracker.get_result()["node_failures"] == {"/m/a.mkv": "node NAS unavailable (it dropped the file twice)"}
         assert tracker.active_processing == 0
 
+    def test_one_drop_on_each_of_two_nodes_fails_naming_both(self):
+        seen: list[str] = []
+        lock = threading.Lock()
+
+        def process(item, **_kwargs):
+            node = _node()
+            with lock:
+                seen.append(node)
+            raise NodeUnavailableError(node, node.upper(), f"{node.upper()} stopped answering")
+
+        tracker, rows = _run(_pool(("a", "A"), ("b", "B")), process, "/m/1.mkv")
+
+        assert sorted(seen) == ["a", "b"]  # the retry went to the other node
+        (row,) = rows
+        first, second = (name.upper() for name in seen)
+        assert row.args[2] == f"nodes {first} and {second} unavailable (each dropped the file once)"
+        assert tracker.node_failures == {"/m/1.mkv": row.args[2]}
+
     def test_a_file_the_worker_itself_fails_is_not_a_node_failure(self):
         def process(item, **_kwargs):
             raise RuntimeError("the detector broke")
@@ -458,7 +476,7 @@ class TestParkAndResume:
     """A parked job resumes with the per-file node counts it had: a park must not give a file fresh tries."""
 
     NODE_STATE = {
-        "node_drops": {"/m/a.mkv": 1},
+        "node_drops": {"/m/a.mkv": ["N1"]},
         "node_start_failures": {"/m/b.mkv": 4},
         "dropped_on": {"/m/a.mkv": "n1"},
         "excluded_nodes": {"/m/b.mkv": {"n2": "NAS"}},
@@ -509,7 +527,7 @@ class TestParkAndResume:
         ("field", "bad"),
         [
             ("node_drops", {"/m/a.mkv": "1"}),
-            ("node_drops", {"/m/a.mkv": -1}),
+            ("node_drops", {"/m/a.mkv": [1]}),
             ("node_start_failures", {"/m/a.mkv": True}),
             ("dropped_on", {"/m/a.mkv": 5}),
             ("excluded_nodes", {"/m/a.mkv": "n2"}),

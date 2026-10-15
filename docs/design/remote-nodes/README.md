@@ -200,7 +200,7 @@ retry runs (on the **node's** CPU, see §6).
 * **Node drops** (polls failing for 12 s, at least 3 in a row, or the node no longer knows the task):
   `NodeUnavailableError` → the item goes back in the queue once (the node is still asked to drop the task, so one
   that comes back stops it); a second drop on the same item fails it ("node <name> unavailable (it dropped the
-  file twice)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
+  file twice)", or "nodes A and B unavailable (each dropped the file once)"; a webhook job counts it failed, never "not found on any server"). A start the node never took
   (connection refused, no answer before an id) isn't a drop: the item goes back without counting (at most 5 times,
   then it fails). After either, the node gets no new file until the registry's next check of it comes back
   ready (60 s at most), and the item's retry goes to another node or this app when one is free.
