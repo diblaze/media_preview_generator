@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import re
+import unicodedata
 import urllib.parse
 import uuid
 from datetime import UTC, datetime
@@ -158,6 +159,12 @@ def normalise_mappings(raw: object) -> tuple[list[dict[str, str]] | None, str]:
     return rows, ""
 
 
+def _name_key(name: str) -> str:
+    """A name as the unique-name rule compares it: names that look the same ("Café" typed two ways, "ＮＵＣ" and
+    "nuc") compare equal."""
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+
+
 def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> tuple[dict | None, str]:
     """Validate one posted node against the record it updates and the other nodes.
 
@@ -184,7 +191,13 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
         return None, "Give the node a name"
     if len(name) > NAME_MAX_LEN:
         return None, f"The node's name must be at most {NAME_MAX_LEN} characters"
-    if any(str(o.get("name") or "").strip().casefold() == name.casefold() for o in others):
+    # The name starts every job-log line of the node: a line break would forge a second line, and a hidden or
+    # right-to-left character would make it read as something else.
+    if any(unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in ("Zl", "Zp") for ch in name):
+        return None, "The node's name can't have line breaks, tabs or hidden characters"
+    if not any(unicodedata.category(ch)[0] in "LNPS" for ch in name):
+        return None, "Give the node a name"
+    if any(_name_key(str(o.get("name") or "").strip()) == _name_key(name) for o in others):
         return None, f"Another node is already called {name}"
     url, err = normalise_url(raw.get("url", base.get("url")))
     if url is None:

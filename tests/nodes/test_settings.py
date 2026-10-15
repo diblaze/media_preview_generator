@@ -107,6 +107,44 @@ class TestValidateNode:
         assert record is None and "already called" in err
 
     @pytest.mark.parametrize(
+        "name",
+        [
+            "nuc\n2026-10-15 01:00:00 | ERROR | forged line",
+            "nuc\rforged",
+            "a\x00b",
+            "a\tb",
+            "nuc forged",
+            "nuc\x85forged",
+            "‮edon",
+            "nuc​",
+        ],
+        ids=["newline", "carriage-return", "nul", "tab", "line-separator", "next-line", "rtl-override", "zero-width"],
+    )
+    def test_a_name_with_a_line_break_or_hidden_character_is_refused(self, name):
+        """Every job-log line of the node starts with its name: a line break there forges a second line."""
+        record, err = ns.validate_node(_post(name=name), existing=None, others=[])
+        assert record is None and err == "The node's name can't have line breaks, tabs or hidden characters"
+
+    @pytest.mark.parametrize("name", ["́", "　́"], ids=["combining-mark", "wide-space-and-mark"])
+    def test_a_name_with_nothing_to_see_is_refused(self, name):
+        record, err = ns.validate_node(_post(name=name), existing=None, others=[])
+        assert record is None and err == "Give the node a name"
+
+    @pytest.mark.parametrize("name", ["Café", "日本のNAS", "nuc-01 (GPU) #2", "Ünïcødé ✓"])
+    def test_ordinary_names_in_any_script_are_kept_as_typed(self, name):
+        record, err = ns.validate_node(_post(name=f" {name} "), existing=None, others=[])
+        assert err == "" and record["name"] == name
+
+    @pytest.mark.parametrize(
+        ("taken", "typed"),
+        [("Café", "Café"), ("nuc", "ＮＵＣ"), ("Straße", "STRASSE")],
+        ids=["combining-accent", "full-width", "sharp-s"],
+    )
+    def test_names_that_look_the_same_count_as_the_same_name(self, taken, typed):
+        record, err = ns.validate_node(_post(name=typed), existing=None, others=[{"name": taken}])
+        assert record is None and err == f"Another node is already called {typed}"
+
+    @pytest.mark.parametrize(
         "key", ["", "has space", "curly\u2019quote", "k" * 201], ids=["empty", "space", "non-ascii", "long"]
     )
     def test_keys_it_refuses(self, key):
