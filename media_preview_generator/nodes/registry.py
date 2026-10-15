@@ -1284,7 +1284,8 @@ class NodeRegistry:
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
         info: dict | None = None
-        timeouts = rate_limited = 0
+        timeouts = 0
+        rate_limited = False
         for attempt in range(CHECK_ATTEMPTS):
             try:
                 info = _bounded(client.info())
@@ -1303,7 +1304,8 @@ class NodeRegistry:
                 # held back once by something else sharing this app's address mustn't read the node as offline.
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
                 timeouts += isinstance(exc, NodeTimeoutError)
-                rate_limited += isinstance(exc, NodeRateLimitedError)
+                # Only the last attempt's: a wait that passed, then refused connections, is a node that's down.
+                rate_limited = isinstance(exc, NodeRateLimitedError)
                 if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
                     break
         if info is None and rate_limited:

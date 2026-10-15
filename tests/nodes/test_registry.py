@@ -1385,6 +1385,24 @@ def test_a_node_asking_to_wait_and_something_that_isnt_a_node_say_why_they_are_o
     assert h.registry.check_now("n1").cause == reg.OFFLINE_NOT_A_NODE
 
 
+@pytest.mark.parametrize(
+    ("last", "cause"),
+    [("wait", reg.OFFLINE_RATE_LIMITED), ("refused", reg.OFFLINE_UNREACHABLE)],
+    ids=["wait", "refused"],
+)
+def test_an_offline_node_is_read_by_its_last_attempt_not_by_one_wait_among_them(h, last, cause):
+    # One 429 among the attempts was reported as the cause though the node then refused connections: "something at
+    # this app's address has an old key" sent the user after the wrong fix.
+    from media_preview_generator.nodes.client import NodeRateLimitedError
+
+    wait = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+    refused = NodeUnreachableError("http://nuc:9494 didn't answer")
+    attempts = [wait, refused] * reg.CHECK_ATTEMPTS
+    h.client().infos = attempts[: reg.CHECK_ATTEMPTS - 1] + [wait if last == "wait" else refused]
+
+    assert h.registry.check_now("n1").cause == cause
+
+
 def test_one_wait_then_an_answer_is_ready_not_offline(h):
     """Something sharing the address keeps it at the edge of the limit: a check held back once must not flap."""
     from media_preview_generator.nodes.client import NodeRateLimitedError
