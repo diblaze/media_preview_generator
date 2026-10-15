@@ -43,6 +43,7 @@ from .plex_remote import (
     node_refusal,
     report_from_json,
     report_wrong_node,
+    saved_node_address,
     saved_node_uid,
 )
 
@@ -616,6 +617,7 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
             refusal=lambda: node_refusal(settings),
             node_uid=lambda: saved_node_uid(settings),
             wrong_node=lambda: report_wrong_node(settings),
+            address=lambda: saved_node_address(settings),
         )
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
