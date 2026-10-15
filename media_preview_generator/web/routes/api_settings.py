@@ -1768,6 +1768,33 @@ def _bring_restored_settings_up_to_date(settings: Any, live_groups_revision: int
     settings.apply_changes(updates={"worker_groups_revision": revision})
 
 
+def _newer_settings_refusal(path: str) -> str:
+    """Why a settings.json backup can't be put back by this build ("" when it can).
+
+    A backup a newer build wrote holds fields this one doesn't know: its next save would drop them, and the next
+    start would refuse the file (``SchemaDowngradeError``).
+
+    Args:
+        path: The backup file.
+    """
+    import json
+
+    from ...upgrade import _CURRENT_SCHEMA_VERSION
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return ""  # Not this check's to judge: the file is copied back as it always was.
+    version = data.get("_schema_version", 1) if isinstance(data, dict) else 1
+    if isinstance(version, int) and version > _CURRENT_SCHEMA_VERSION:
+        return (
+            "This backup was saved by a newer version of the app, and this version can't read all of it. Nothing "
+            "was changed. Update the app, then restore it."
+        )
+    return ""
+
+
 @api.route("/settings/backups/restore", methods=["POST"])
 @api_token_required
 def restore_backup():
@@ -1810,6 +1837,9 @@ def restore_backup():
         bak_path = match["path"]
     else:
         bak_path = available[0]["path"]
+    refusal = _newer_settings_refusal(bak_path) if name == "settings.json" else ""
+    if refusal:
+        return jsonify({"success": False, "error": refusal}), 409
 
     # Snapshot the current live contents into a fresh timestamped backup
     # before overwriting. Lets the user undo a restore by restoring this

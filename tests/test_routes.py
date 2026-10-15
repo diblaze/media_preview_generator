@@ -7074,6 +7074,33 @@ class TestBackupRestore:
         assert body["success"] is False
         assert "No backups available" in body["error"]
 
+    def test_a_backup_a_newer_version_saved_is_refused_and_nothing_changes(self, client):
+        """Put back, its next save would drop the fields this version doesn't know and the next start would refuse
+        the file; the live settings must stay as they were."""
+        from media_preview_generator.upgrade import _CURRENT_SCHEMA_VERSION
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        live = os.path.join(sm.config_dir, "settings.json")
+        sm.set("log_retention_count", 9)
+        with open(live) as f:
+            before = f.read()
+        backup = "settings.json.20261101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump({"_schema_version": _CURRENT_SCHEMA_VERSION + 1, "log_retention_count": 3, "future": 1}, f)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": backup},
+        )
+
+        assert resp.status_code == 409
+        assert "saved by a newer version of the app" in resp.get_json()["error"]
+        with open(live) as f:
+            assert f.read() == before
+        assert sm.get("log_retention_count") == 9
+
 
 class TestSettingsManagerWebhookMigration:
     """Settings load migrates legacy global Plex webhook keys onto the Plex server."""
