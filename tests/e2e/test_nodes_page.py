@@ -852,7 +852,7 @@ class TestAddNode:
         [
             (
                 "auth",
-                "Key refused. Copy the key again from the node's log, or use the NODE_KEY (or AGENT_TOKEN) you set.",
+                "Key refused. Copy the key again from the node's log (Docker) or node.json (Windows), or use the NODE_KEY (or AGENT_TOKEN) you set.",
             ),
             ("unreachable", "Nothing answered at this address. Check the address and port"),
             ("protocol", "not as a node this app can use. Update the node"),

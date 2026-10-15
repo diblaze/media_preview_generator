@@ -106,7 +106,7 @@ REGISTRY_REASONS = {
         "update the node",
     ),
     reg.STATE_KEY_REFUSED: (
-        "flaky-node refused the key. Copy the key from the node's log or settings into this node's key field.",
+        "flaky-node refused the key. Copy the key from the node's log (Docker) or node.json (Windows) into this node's key field.",
         "copy",
     ),
     reg.STATE_ACCESS_PROBLEM: (

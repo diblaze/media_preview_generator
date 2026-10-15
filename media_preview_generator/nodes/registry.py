@@ -1424,7 +1424,7 @@ class NodeRegistry:
             except NodeAuthError:
                 return _Outcome(
                     STATE_KEY_REFUSED,
-                    f"{name} refused the key. Copy the key from the node's log or settings into this node's key field.",
+                    f"{name} refused the key. Copy the key from the node's log (Docker) or node.json (Windows) into this node's key field.",
                 )
             except NodeProtocolError as exc:
                 if exc.node is not None:

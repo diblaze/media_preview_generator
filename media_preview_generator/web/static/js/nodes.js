@@ -715,7 +715,7 @@
         const kind = (error && error.kind) || '';
         switch (kind) {
             case 'auth':
-                return "Key refused. Copy the key again from the node's log, or use the NODE_KEY (or AGENT_TOKEN) you set.";
+                return "Key refused. Copy the key again from the node's log (Docker) or node.json (Windows), or use the NODE_KEY (or AGENT_TOKEN) you set.";
             case 'unreachable':
                 // What to check, worded by the app by why nothing answered: the node's card says the same.
                 return error.advice || error.message || "Couldn't connect to the node.";
