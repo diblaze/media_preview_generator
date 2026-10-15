@@ -288,9 +288,97 @@ class TestArtifact:
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
         client.fetch_artifact = lambda task_id: (_ for _ in ()).throw(unreachable())
         registry = _install(client)
-        with pytest.raises(NodeUnavailableError):
+        with pytest.raises(NodeUnavailableError) as raised:
             _run(media, artifact_to=str(tmp_path))
+        assert raised.value.started is True
+        assert len(client.named("poll")) == 1
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NodeRateLimitedError("http://n asks this app to wait: too many wrong keys came from here"),
+            NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT),
+            NodeTimeoutError("http://n dropped the connection while answering"),
+            NodeUnreachableError("http://n answered HTTP 502"),
+            NodeUnreachableError("http://n can't be reached (connection refused)", reason=UNREACHABLE_REFUSED),
+        ],
+        ids=["429", "no-answer-in-time", "connection-dropped", "gateway-502", "refused"],
+    )
+    def test_a_passing_error_fetching_the_finished_frames_is_tried_again_not_a_drop(self, media, tmp_path, error):
+        """The node keeps a finished task for minutes: the finished frames were thrown away and the file went back
+        in the queue with a drop counted (two fail it) for a 429 or a moment's drop."""
+        tar = _tar([("0000000000.jpg", b"a")])
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={"frames": 1})], artifact=tar)
+        answers = [error, error]
+
+        def fetch(task_id):
+            client.calls.append(("artifact",))
+            if answers:
+                raise answers.pop(0)
+            return tar
+
+        client.fetch_artifact = fetch
+        registry = _install(client)
+        dest = tmp_path / "frames"
+        dest.mkdir()
+
+        assert _run(media, artifact_to=str(dest)) == {"frames": 1}
+
+        assert os.listdir(dest) == ["0000000000.jpg"]
+        assert len(client.named("artifact")) == 3
+        assert registry.reports == []
+
+    @pytest.mark.parametrize(
+        ("error", "started"),
+        [
+            (NodeRateLimitedError("http://n asks this app to wait"), False),
+            (NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT), True),
+        ],
+        ids=["429-is-no-drop", "no-answer-is-a-drop"],
+    )
+    def test_a_fetch_failing_as_long_as_a_poll_may_is_given_up(self, media, tmp_path, monkeypatch, error, started):
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 12.0)
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        fetched_at: list[float] = []
+
+        def fetch(task_id):
+            fetched_at.append(clock.now)
+            if len(fetched_at) > 1000:  # a build that never gives up fails here instead of hanging
+                return _tar([])
+            raise error
+
+        client.fetch_artifact = fetch
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError, match="didn't send the frames") as raised:
+            _run(media, artifact_to=str(tmp_path))
+
+        assert raised.value.started is started
+        assert fetched_at[-1] - fetched_at[0] == 12.0
+        assert len(fetched_at) == 13
+        reason = executor.REQUEUE_NODE_UNAVAILABLE if started else executor.REQUEUE_NODE_NOT_STARTED
+        assert executor.requeue_for(raised.value).reason == reason
+
+    @pytest.mark.parametrize(
+        ("error", "started"),
+        [(NodeUnknownTaskError("unknown_task"), True), (NodeStoppingError("http://n is restarting"), False)],
+        ids=["forgot-the-task", "restarting"],
+    )
+    def test_a_node_that_no_longer_has_the_frames_isnt_asked_again(self, media, tmp_path, error, started):
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        fetched: list[str] = []
+        client.fetch_artifact = lambda task_id: fetched.append(task_id) or (_ for _ in ()).throw(error)
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError) as raised:
+            _run(media, artifact_to=str(tmp_path))
+
+        assert raised.value.started is started
+        assert fetched == ["t1"]
 
 
 class TestNodeDrops:

@@ -611,15 +611,33 @@ class _TaskRun:
         raise NodeTaskError(kind or protocol.KIND_FAILED, message, error_type=error_type, extra=extra)
 
     def _download(self, dest: str) -> None:
-        try:
-            data = self._client.fetch_artifact(self._task_id)
-        except NodeAuthError as exc:
-            raise self._refused_key() from exc
-        except NodeError as exc:
-            raise self._unavailable(
-                f"{self._placement.node_name} didn't send the frames: {exc}",
-                started=not isinstance(exc, NodeStoppingError),
-            ) from exc
+        """Fetch the finished task's frames into ``dest``.
+
+        The node keeps a finished task for minutes, so a fetch lost to an error that may pass (a 429, no answer in
+        time, a dropped connection, a 5xx) is tried again, given up by the same rule as the task's polls rather than
+        throwing the finished work away. A 429 given up on is no drop (neither the node's doing nor the file's).
+        """
+        failed = 0
+        failing_since = 0.0
+        while True:
+            try:
+                data = self._client.fetch_artifact(self._task_id)
+                break
+            except NodeAuthError as exc:
+                raise self._refused_key() from exc
+            except NodeError as exc:
+                if failed == 0:
+                    failing_since = time.monotonic()
+                failed += 1
+                passing = isinstance(exc, NodeUnreachableError) and not isinstance(exc, NodeStoppingError)
+                if passing and (failed < MAX_FAILED_POLLS or time.monotonic() - failing_since < NODE_GONE_AFTER_S):
+                    logger.debug("{}frames not fetched yet: {}", self._prefix, exc)
+                    time.sleep(POLL_INTERVAL_S)
+                    continue
+                raise self._unavailable(
+                    f"{self._placement.node_name} didn't send the frames: {exc}",
+                    started=not isinstance(exc, NodeStoppingError | NodeRateLimitedError),
+                ) from exc
         extract_artifact(data, dest)
 
     def delete(self) -> None:
