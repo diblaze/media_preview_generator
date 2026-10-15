@@ -279,6 +279,11 @@ class SettingsManager:
         with self._lock:
             self._load()
 
+    @property
+    def load_failed(self) -> bool:
+        """Whether settings.json exists but couldn't be read at the last load (the settings in memory are empty)."""
+        return self._load_failed
+
     def reload_setup_state(self) -> None:
         """Re-read setup_state.json into memory (after the file was replaced on disk)."""
         with self._lock:

@@ -474,6 +474,7 @@ def mock_settings_backups(page: Page, files: list[dict] | None = None) -> None:
                         "timestamp": "20260201-100000",
                         "mtime": 1900.0,
                         "legacy": False,
+                        "readable": True,
                     },
                     {
                         "filename": "settings.json.20260101-100000.bak",
@@ -481,6 +482,7 @@ def mock_settings_backups(page: Page, files: list[dict] | None = None) -> None:
                         "timestamp": "20260101-100000",
                         "mtime": 1500.0,
                         "legacy": False,
+                        "readable": True,
                     },
                     {
                         "filename": "settings.json.bak",
@@ -488,6 +490,7 @@ def mock_settings_backups(page: Page, files: list[dict] | None = None) -> None:
                         "timestamp": None,
                         "mtime": 500.0,
                         "legacy": True,
+                        "readable": True,
                     },
                 ],
                 "has_bak": True,
