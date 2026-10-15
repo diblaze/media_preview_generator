@@ -116,6 +116,28 @@ def placed_on(placement: Placement | None) -> Iterator[None]:
         _placement.reset(token)
 
 
+# Set while a step reads a file other than the worker's own (a season sibling, an end-picture partner).
+_other_file: ContextVar[bool] = ContextVar("node_other_file", default=False)
+
+
+@contextmanager
+def reading_other_file(other: bool = True) -> Iterator[None]:
+    """Run the block's node steps on a file other than the worker's own (when ``other``).
+
+    One the node can't see still raises :class:`FileNotVisibleError`, for the caller to leave out, but isn't reported
+    to the registry: another worker may see it fine, and each episode of its season would count it towards pausing
+    the node.
+
+    Args:
+        other: False runs the block as the worker's own file (for a caller that reads both).
+    """
+    token = _other_file.set(other)
+    try:
+        yield
+    finally:
+        _other_file.reset(token)
+
+
 class NodeUnavailableError(Exception):
     """The node stopped answering mid-task, no longer knows the task, or couldn't take its start (no answer, or a
     temp folder it can't use). Not the file's failure: it is queued again.
@@ -565,7 +587,8 @@ class _TaskRun:
             return result if isinstance(result, dict) else {}
         if status == protocol.STATUS_FILE_NOT_VISIBLE or kind == protocol.KIND_FILE_NOT_VISIBLE:
             reason = protocol.relayed_text(str(error.get("reason") or protocol.NOT_VISIBLE_MISSING))
-            _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
+            if not _other_file.get():
+                _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
             # The job log names the file by this app's path already; the node's message would add its own path.
             plain = protocol.not_visible_text(reason)
             raise FileNotVisibleError(node_id, name, reason, f"{name} can't see the file: {plain}")

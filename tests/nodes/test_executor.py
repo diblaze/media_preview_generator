@@ -810,16 +810,23 @@ class TestARefusedKeyMidTask:
 
 
 class TestErrors:
-    def test_file_not_visible_is_reported_and_raised_with_the_reason(self, media):
+    @pytest.mark.parametrize("other", [None, False, True], ids=["own-file", "own-file-said-so", "other-file"])
+    def test_file_not_visible_is_raised_with_the_reason_and_reported_unless_it_isnt_the_workers_own(self, media, other):
+        """A season sibling the node can't see is left out by the step reading it; reported, each episode of its
+        season counted it towards pausing the node."""
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file", "reason": "missing"}
         client = ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)])
         registry = _install(client)
 
         with pytest.raises(FileNotVisibleError) as raised:
-            _run(media)
+            if other is None:
+                _run(media)
+            else:
+                with executor.reading_other_file(other):
+                    _run(media)
 
         assert (raised.value.node_id, raised.value.node_name, raised.value.reason) == (NODE_ID, NODE_NAME, "missing")
-        assert registry.reports == [("not_visible", NODE_ID, media, "missing")]
+        assert registry.reports == ([] if other else [("not_visible", NODE_ID, media, "missing")])
 
     def test_file_not_visible_says_why_in_plain_words_without_the_nodes_path(self, media):
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file: /mnt/nas/a.mkv", "reason": "missing"}
