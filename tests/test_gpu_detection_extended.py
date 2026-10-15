@@ -1162,6 +1162,30 @@ class TestDetectAllGPUsEdgeCases:
         assert len(apple_gpus) > 0
         assert "M1 Max" in apple_gpus[0][2]["name"]
 
+    @pytest.mark.parametrize(
+        ("mode", "where"),
+        [
+            ("", "Settings → Processing Options → GPU Configuration"),
+            ("node", "this node's Overview tab on the app's Nodes page"),
+        ],
+    )
+    @patch("media_preview_generator.gpu.detect._test_acceleration_method", return_value=False)
+    def test_a_failed_gpu_test_points_at_the_screen_that_shows_it(self, _mock_test, monkeypatch, mode, where):
+        # A node's log pointed at the app's GPU settings, a screen the node doesn't have.
+        from loguru import logger
+
+        from media_preview_generator.gpu import detect
+
+        monkeypatch.setenv("MODE", mode)
+        warnings: list[str] = []
+        handler = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING", format="{message}")
+        try:
+            detect._detect_macos_gpus()
+        finally:
+            logger.remove(handler)
+
+        assert any(w.endswith(f"See {where} for details.") for w in warnings), warnings
+
     @patch("media_preview_generator.gpu.detect.is_macos")
     @patch("media_preview_generator.gpu.detect.is_windows")
     @patch("media_preview_generator.gpu.detect.platform.system")

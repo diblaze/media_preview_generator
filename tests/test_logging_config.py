@@ -175,6 +175,22 @@ class TestLoggingConfig:
         mock_logger.remove.assert_called_once()
         assert mock_logger.add.call_count == 1
 
+    @pytest.mark.parametrize(
+        ("mode", "where"), [("", "the live web log viewer"), ("node", "this node's Log tab on the app's Nodes page")]
+    )
+    @patch("media_preview_generator.logging_config.os.makedirs", side_effect=PermissionError)
+    @patch("media_preview_generator.logging_config.logger")
+    def test_a_log_folder_it_cant_make_names_the_log_still_shown(
+        self, mock_logger, mock_makedirs, monkeypatch, mode, where
+    ):
+        # A node has no web log viewer: its lines are read on the app's Nodes page.
+        monkeypatch.setenv("MODE", mode)
+
+        setup_logging()
+
+        message, *args = mock_logger.warning.call_args.args
+        assert f"Logging continues to the console and {where}, but" in message.format(*args)
+
     def test_a_logged_exception_shows_no_local_values(self, tmp_path):
         """loguru's ``diagnose`` prints each frame's variable values under a traceback; a token among them would land
         in ``docker logs`` and app.log. The traceback itself stays."""

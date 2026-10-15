@@ -168,6 +168,44 @@ def is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
+# A node runs the same GPU, FFmpeg and logging code as the app but has no screens of its own: its log is read on the
+# app's Nodes page, so a hint in a line it logs must name the app's screen for it, or the node's own setting.
+def is_node_mode() -> bool:
+    """Whether this process is a remote node (``MODE=node``), not the app."""
+    return os.environ.get("MODE", "").strip().lower() == "node"
+
+
+def gpu_settings_hint() -> str:
+    """Where a GPU is turned off: the app's GPU settings, or for a node's GPUs, the app's worker groups."""
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU Configuration"
+
+
+def gpu_details_hint() -> str:
+    """Where each GPU's test result is shown."""
+    if is_node_mode():
+        return "this node's Overview tab on the app's Nodes page"
+    return "Settings → Processing Options → GPU Configuration"
+
+
+def log_viewer_hint() -> str:
+    """Where the live log is read."""
+    return "this node's Log tab on the app's Nodes page" if is_node_mode() else "the live web log viewer"
+
+
+def working_folder_hint() -> tuple[str, str]:
+    """The folder FFmpeg writes thumbnails to, and where it is set: ``(name, setting)``."""
+    if is_node_mode():
+        return "the node's temp folder", "NODE_TEMP_DIR"
+    return "the working folder", "Settings → Advanced"
+
+
+def debug_logging_hint() -> str:
+    """How to see FFmpeg's detailed output (a node keeps no DEBUG lines for the app to read; its console has them)."""
+    if is_node_mode():
+        return "set LOG_LEVEL=DEBUG on the node and read its docker logs"
+    return "enable Debug logging (Settings → Logging)"
+
+
 def sanitize_path(path: str) -> str:
     """Sanitize file path for cross-platform compatibility.
 

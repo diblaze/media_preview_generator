@@ -38,7 +38,7 @@ from loguru import logger
 from rich.console import Console
 from rich.markup import escape
 
-from .utils import redact_secrets, redacted_traceback
+from .utils import log_viewer_hint, redact_secrets, redacted_traceback
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -380,11 +380,12 @@ def setup_logging(
         except (PermissionError, OSError) as exc:
             logger.warning(
                 "Could not create the persistent log file at {}: {}. "
-                "Logging continues to the console and the live web log viewer, but log history won't survive restarts. "
+                "Logging continues to the console and {}, but log history won't survive restarts. "
                 "Usually a permissions problem — make sure the user running this app can write to that folder "
                 "(check PUID/PGID and the volume mount).",
                 os.path.join(log_dir, "app.log"),
                 exc,
+                log_viewer_hint(),
             )
 
         # --- 3. SocketIO broadcaster (live log viewer) ---

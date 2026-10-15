@@ -45,6 +45,7 @@ from loguru import logger
 
 from ..config import Config
 from ..shutdown import is_shutting_down
+from ..utils import debug_logging_hint, is_node_mode, working_folder_hint
 from .ffmpeg_runner import GPU_CANT_DECODE_LINE, STALL_WATCHDOG_LINE
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
@@ -195,11 +196,13 @@ FALLBACK_STOPPED_PART_WAY = "stopped_part_way"
 FALLBACK_IO_ERROR = "io_error"
 FALLBACK_STALL = "stall"
 FALLBACK_SIGNAL = "signal"
-# Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder.
-_IO_ERROR_PLACES = (
-    "the disk or network share the video is on, and that the working folder (Settings → Advanced) isn't full and "
-    "is writable"
-)
+
+
+def _io_error_places() -> str:
+    """Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder."""
+    folder, setting = working_folder_hint()
+    return f"the disk or network share the video is on, and that {folder} ({setting}) isn't full and is writable"
+
 
 # ---------------------------------------------------------------------------
 # Failure tracker — collects per-file failure info for end-of-run summary
@@ -476,7 +479,7 @@ def gpu_fallback_announcement(kind: str, video_file: str) -> str:
     if kind == FALLBACK_IO_ERROR:
         return (
             f"FFmpeg hit an I/O error on {video_file} on the GPU — retrying on CPU automatically. If this keeps "
-            f"happening, check {_IO_ERROR_PLACES}."
+            f"happening, check {_io_error_places()}."
         )
     if kind == FALLBACK_STOPPED_PART_WAY:
         return f"The GPU run for {video_file} stopped part-way — retrying on CPU automatically, from the start."
@@ -505,7 +508,7 @@ def gpu_fallback_advice(kind: str) -> str:
             "a slow or failing read slows the CPU retry too."
         )
     if kind == FALLBACK_IO_ERROR:
-        return f"No action needed for one file. If it keeps happening, check {_IO_ERROR_PLACES}."
+        return f"No action needed for one file. If it keeps happening, check {_io_error_places()}."
     if kind == FALLBACK_CODEC:
         return (
             "No action needed — the file will still get a preview, it'll just be slower. If this happens for many "
@@ -1615,22 +1618,28 @@ def generate_images(
                 #    rasterizer (llvmpipe/lavapipe) produces a green
                 #    overlay on DV5 output.  Probe the Vulkan state
                 #    first and drop to the DV-safe filter when software.
-                from ..gpu.vulkan_probe import get_vulkan_device_info
+                from ..gpu.vulkan_probe import DV5_NO_VULKAN_FIX, get_vulkan_device_info
 
                 vulkan_info = get_vulkan_device_info()
                 vk_device = vulkan_info.device
                 vk_is_software = vulkan_info.is_software
                 if vk_is_software or vk_device is None:
+                    # A node has no dashboard: the fix is for its own container, so it is said here.
+                    how_to_fix = (
+                        DV5_NO_VULKAN_FIX
+                        if is_node_mode()
+                        else "See the dashboard notification centre for steps to enable Vulkan."
+                    )
                     logger.warning(
                         "Dolby Vision Profile 5 file {} (hdr_format={!r}, transfer={!r}) needs a real GPU "
                         "with Vulkan to produce correctly-coloured thumbnails. No working Vulkan device was found "
                         "(detected device: {!r}), so this file's thumbnails will have the wrong colours, "
-                        "a green and purple tint. The file is still processed. See the dashboard "
-                        "notification centre for steps to enable Vulkan.",
+                        "a green and purple tint. The file is still processed. {}",
                         video_file,
                         hdr_fmt,
                         transfer,
                         vk_device,
+                        how_to_fix,
                     )
                     dv5_software_fallback = True
                 else:
@@ -2103,7 +2112,7 @@ def generate_images(
                         diag_label,
                         video_file,
                         disk[1],
-                        _IO_ERROR_PLACES if disk[0] == FALLBACK_IO_ERROR else "the disk or network share it is on",
+                        _io_error_places() if disk[0] == FALLBACK_IO_ERROR else "the disk or network share it is on",
                     )
                 else:
                     # Already on CPU: no further fallback available without remuxing/bitstream filtering.
@@ -2211,10 +2220,11 @@ def generate_images(
                 "FFmpeg produced no preview frames for {}{}. "
                 "Common causes: video file is corrupted, codec is unsupported by your FFmpeg build, "
                 "or hardware acceleration failed silently. Try playing the file in a media player to "
-                "confirm it's intact, then enable Debug logging (Settings → Logging) to see FFmpeg's "
+                "confirm it's intact, then {} to see FFmpeg's "
                 "detailed output. The rest of the queue continues; only this file is skipped.",
                 video_file,
                 fallback_suffix,
+                debug_logging_hint(),
             )
             error_summary = _extract_ffmpeg_error_summary(stderr_lines_all)
         worker_ctx = "GPU" if gpu is not None else "CPU"

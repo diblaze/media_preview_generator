@@ -37,6 +37,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from ..utils import gpu_settings_hint, working_folder_hint
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -703,9 +704,10 @@ def create_ffmpeg_runner(
                         "This usually means a slow disk, a stuck hardware decoder, or a damaged file. "
                         "Other files in the queue will keep processing; this one will be marked failed. "
                         "If it happens often on the same file, try toggling hardware acceleration off "
-                        "in Settings → Processing Options → GPU Configuration.",
+                        "in {}.",
                         FFMPEG_STALL_TIMEOUT_SEC,
                         video_file,
+                        gpu_settings_hint(),
                     )
                     stalled = True
                     proc.kill()
@@ -786,10 +788,11 @@ def create_ffmpeg_runner(
                     "(unsupported codec, broken hardware acceleration, corrupted file, full disk). "
                     "Other files in the queue will keep processing. "
                     "If this happens often on the same file, try toggling hardware acceleration off "
-                    "in Settings → Processing Options → GPU Configuration.",
+                    "in {}.",
                     video_file,
                     proc.returncode,
                     exit_diagnosis,
+                    gpu_settings_hint(),
                 )
 
             # Log last few stderr lines at WARNING level so users can diagnose
@@ -824,14 +827,18 @@ def create_ffmpeg_runner(
                 )
             elif _io_cut_off(proc.returncode, ffmpeg_output_lines):
                 # Exit 251 with a GPU error in the stderr is the GPU's, not a disk's: the stderr lines below say so.
+                folder, setting = working_folder_hint()
                 logger.warning(
                     "FFmpeg hit an I/O error on {}: reading the video from its disk or network share, or writing "
-                    "thumbnails to the working folder ({}, exists: {}), failed. Check that disk or share, and that "
-                    "the working folder isn't full and is writable (Settings → Advanced). "
+                    "thumbnails to {} ({}, exists: {}), failed. Check that disk or share, and that "
+                    "{} isn't full and is writable ({}). "
                     "Other files in the queue will keep processing.",
                     video_file,
+                    folder,
                     output_folder,
                     os.path.isdir(output_folder),
+                    folder,
+                    setting,
                 )
             elif exit_diagnosis == "high_exit_non_signal":
                 logger.warning(

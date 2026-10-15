@@ -364,6 +364,44 @@ class TestSafeResolveWithin:
         assert str(not_yet) in result or str(not_yet.parent) in result
 
 
+class TestNodeHints:
+    """A node logs the app's GPU, FFmpeg and logging lines, but has none of the app's screens."""
+
+    APP = {
+        "gpu_settings_hint": "Settings → Processing Options → GPU Configuration",
+        "gpu_details_hint": "Settings → Processing Options → GPU Configuration",
+        "log_viewer_hint": "the live web log viewer",
+        "working_folder_hint": ("the working folder", "Settings → Advanced"),
+        "debug_logging_hint": "enable Debug logging (Settings → Logging)",
+    }
+    NODE = {
+        "gpu_settings_hint": "the app's Settings → Workers",
+        "gpu_details_hint": "this node's Overview tab on the app's Nodes page",
+        "log_viewer_hint": "this node's Log tab on the app's Nodes page",
+        "working_folder_hint": ("the node's temp folder", "NODE_TEMP_DIR"),
+        "debug_logging_hint": "set LOG_LEVEL=DEBUG on the node and read its docker logs",
+    }
+
+    @pytest.mark.parametrize("hint", sorted(APP))
+    def test_the_app_keeps_its_wording_and_a_node_names_what_it_has(self, monkeypatch, hint):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        assert getattr(utils, hint)() == self.APP[hint]
+
+        monkeypatch.setenv("MODE", "node")
+        assert getattr(utils, hint)() == self.NODE[hint]
+
+    def test_a_node_says_its_temp_folder_is_where_an_io_error_may_come_from(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        monkeypatch.setenv("MODE", "node")
+
+        advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
+
+        assert "the node's temp folder (NODE_TEMP_DIR) isn't full" in advice and "Settings" not in advice
+
+
 class TestIsWindows:
     """Test Windows platform detection."""
 
