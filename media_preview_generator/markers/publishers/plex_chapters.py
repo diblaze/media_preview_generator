@@ -32,6 +32,7 @@ from .plex_db import (
     TESTED_PMS_LABEL,
     TESTED_PMS_VERSIONS,
     LocalPlexDb,
+    beside_another_plex,
     is_tested_pms_version,
     plex_db_path,
     plex_machine_identifier,
@@ -639,25 +640,53 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
 _AGENT_FOR_PMS_1_43_5 = "1.1.2"
 
 
-def _remote(client: AgentClient, operation: str, machine: str, version: str, **body: Any) -> dict:
+def _server_name(server: Any, server_config: Any = None) -> str:
+    config = server_config if server_config is not None else server._server_config
+    return str(getattr(config, "name", "") or "")
+
+
+def _running(client: AgentClient) -> str:
+    return f"The Plex database node {client.describe()} is version {client.version or 'unknown'}"
+
+
+def _remote(
+    client: AgentClient, operation: str, machine: str, version: str, *, server_name: str = "", **body: Any
+) -> dict:
+    """One chapter operation on the Plex database node, after the checks that it can run it for this Plex.
+
+    Args:
+        client: The server's Plex database node.
+        operation: ``check``, ``read`` or ``register``.
+        machine: The connected Plex's machine identifier.
+        version: The connected Plex's version.
+        server_name: The server's name, for the refusal of a node beside a different Plex.
+        **body: The operation's own fields.
+    """
     identity = client.ping(timeout=5)
     if CHAPTER_CAPABILITY not in client.capabilities:
         raise ChapterError(
-            "Update the Plex database node to version 1.1.0 or newer for chapter registration",
+            f"{_running(client)}; chapter thumbnails need version 1.1.0 or newer. Update the node.",
             state=Capability.PLUGIN_OUTDATED,
         )
     if version.startswith("1.43.5.") and agent_older_than(client.version, _AGENT_FOR_PMS_1_43_5):
         raise ChapterError(
-            f"Update the Plex database node to version {_AGENT_FOR_PMS_1_43_5} or newer for Plex 1.43.5",
+            f"{_running(client)}; chapter thumbnails for Plex 1.43.5 need version {_AGENT_FOR_PMS_1_43_5} or newer. "
+            "Update the node.",
             state=Capability.PLUGIN_OUTDATED,
+        )
+    if not machine:
+        raise ChapterError(
+            f"Plex didn't say which server it is, so this app can't tell whether the Plex database node "
+            f"{client.describe()} is beside it.",
+            state=Capability.MISCONFIGURED,
         )
     # A node that can't say (it can't read Plex's Preferences.xml: usually it runs as another user than Plex) is asked
     # anyway: its own checks name what it can't read or write, and it refuses every operation until it can prove
     # which Plex it is beside.
     theirs = identity.get("machine_identifier")
-    if not machine or (theirs and theirs != machine):
+    if theirs and theirs != machine:
         raise ChapterError(
-            "The Plex database node is beside a different Plex server, or can't say which one",
+            beside_another_plex(client.url, server_name, "chapter thumbnails", client.name),
             state=Capability.MISCONFIGURED,
         )
     result = client.post(
@@ -672,22 +701,28 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
         unreachable=CHAPTERS_WAIT_FOR_THE_NODE,
     )
     if result.get("capability") != CHAPTER_CAPABILITY:
-        raise ChapterError("Update the Plex database node for chapter registration", state=Capability.PLUGIN_OUTDATED)
+        raise ChapterError(
+            f"The Plex database node {client.describe()} sent no chapter answer. Update the node.",
+            state=Capability.PLUGIN_OUTDATED,
+        )
     return result
 
 
 def chapter_capability(server: Any, server_config: Any = None) -> CapabilityReport:
     """Readiness independently of marker settings, consent, or Plex Pass."""
+    backend: AgentClient | LocalChapters | None = None
     try:
         backend, machine, version, _ = _context(server, server_config)
         if isinstance(backend, AgentClient):
-            return report_from_json(_remote(backend, "check", machine, version)["report"])
+            checked = _remote(backend, "check", machine, version, server_name=_server_name(server, server_config))
+            return report_from_json(checked["report"])
         return backend.capability(machine, version, deadline=time.monotonic() + 10)
     except PublishError as exc:
         return CapabilityReport(exc.state or Capability.UNREACHABLE, str(exc))
     except (KeyError, TypeError, ValueError):
+        node = f" {backend.describe()}" if isinstance(backend, AgentClient) else ""
         return CapabilityReport(
-            Capability.AGENT_UNAVAILABLE, "The Plex database node sent a chapter answer this app can't read"
+            Capability.AGENT_UNAVAILABLE, f"The Plex database node{node} sent a chapter answer this app can't read"
         )
 
 
@@ -707,13 +742,23 @@ def resolve_chapter_target(
     backend, machine, version, _ = _context(server, reuse_recent=reuse_recent_checks)
     if isinstance(backend, AgentClient):
         try:
-            result = _remote(backend, "read", machine, version, source_path=canonical_path, item_id_hint=item_id_hint)
+            result = _remote(
+                backend,
+                "read",
+                machine,
+                version,
+                server_name=_server_name(server),
+                source_path=canonical_path,
+                item_id_hint=item_id_hint,
+            )
             target = target_from_json(result["target"])
             if target.machine_identifier != machine or target.source_path != canonical_path:
                 raise ValueError("Wrong source identity")
             return target
         except (KeyError, TypeError, ValueError) as exc:
-            raise ChapterError("The Plex database node sent a chapter snapshot this app can't read") from exc
+            raise ChapterError(
+                f"The Plex database node {backend.describe()} sent a chapter snapshot this app can't read"
+            ) from exc
     return backend.read(
         canonical_path,
         machine,
@@ -748,6 +793,7 @@ def register_chapters(
                 "register",
                 machine,
                 version,
+                server_name=_server_name(server),
                 target=target_to_json(snapshot),
                 revisions=[{"index": index, "sha256": sha} for index, sha in revisions.items()],
             )
