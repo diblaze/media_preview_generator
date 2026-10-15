@@ -1826,7 +1826,9 @@ You don't have to do anything for these — the container handles them on startu
 >
 > **Fix:** add `-e NVIDIA_DRIVER_CAPABILITIES=all` to your `docker run` command (or set it in the `environment:` block of your compose file) and restart the container. `all` is what the official NVIDIA Vulkan images use. If you prefer minimum privilege, `compute,video,utility,graphics` works too.
 >
-> If the in-app warning banner persists after the restart, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
+> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out.
+>
+> If the banner persists after that, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
 
 ---
 
@@ -1857,7 +1859,7 @@ Use this table to diagnose common failures quickly.
 | Job warning: "N file(s) still weren't indexed by the media server after N retries, so no more retries are queued. The next scheduled scan will pick them up." | The media server hadn't added the file to its library by the last retry | Nothing, if you have a scheduled scan: it picks the file up once the server has it. Otherwise raise **Retry count** or **Initial retry delay** (Settings → Retry policy), or check the file is under a library folder the server scans. |
 | Radarr/Sonarr cannot reach webhook URL | Network routing or hostname issue | Use host IP or reachable Docker hostname (not `localhost`), then verify firewall and port `8080`. |
 | New job starts after I paused | Global pause not set or UI not refreshed | Use **Pause** in the **Workers** header. Global pause is persisted and pauses in-flight processing. Group reductions and closing worker hours instead let current files finish. |
-| DV Profile 5 thumbnails have a green and purple tint, and the log warns that no working Vulkan device was found | The container can't reach a hardware Vulkan device, so the app skips Profile 5 tone mapping and extracts plain frames instead | Pass an iGPU to the container with `--device /dev/dri:/dev/dri` (Intel/AMD), or for NVIDIA set `NVIDIA_DRIVER_CAPABILITIES=all` so the NVIDIA Vulkan driver gets injected. Most users already pass `/dev/dri` for hardware video acceleration, which brings the Vulkan driver along for free. |
+| DV Profile 5 thumbnails have a green and purple tint, and the log warns that no working Vulkan device was found | The container can't reach a hardware Vulkan device, so the app skips Profile 5 tone mapping and extracts plain frames instead | Pass an iGPU to the container with `--device /dev/dri:/dev/dri` (Intel/AMD), or for NVIDIA set `NVIDIA_DRIVER_CAPABILITIES=all` so the NVIDIA Vulkan driver gets injected; if they're still tinted, also start the container with `--runtime=nvidia`. Most users already pass `/dev/dri` for hardware video acceleration, which brings the Vulkan driver along for free. |
 
 ### Validate Plex Config Path
 
