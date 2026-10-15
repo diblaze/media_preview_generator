@@ -480,6 +480,19 @@ class TestNodeList:
         expect(authed_page.locator("#node-n-old .nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready")
         assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/check"]
 
+    def test_check_now_gives_focus_back_to_its_button_when_done(self, authed_page: Page, app_url: str) -> None:
+        """Disabled while checking, the button dropped the focus to the page and never took it back."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.check_reads = 1
+        button = authed_page.locator("#nodesCheckNow")
+        button.focus()
+
+        authed_page.keyboard.press("Enter")
+
+        expect(button).to_have_text("Checking…")
+        expect(button).to_have_text("Check now", timeout=10000)
+        expect(button).to_be_focused()
+
     def test_check_now_says_how_often_nodes_are_checked_without_it(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         button = authed_page.locator("#nodesCheckNow")
@@ -582,6 +595,14 @@ class TestAddNode:
         _open_nodes(authed_page, app_url, _four_nodes()[:1])
         _open_add(authed_page)
         expect(authed_page.locator("#addNodeUrl")).to_be_focused()
+
+    def test_closing_the_dialog_gives_focus_back_to_add_node(self, authed_page: Page, app_url: str) -> None:
+        """Opened from code, it gave focus back to the page itself: Tab started again from the top."""
+        _open_nodes(authed_page, app_url, _four_nodes()[:1])
+        _open_add(authed_page)
+        authed_page.keyboard.press("Escape")
+        expect(authed_page.locator("#addNodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#nodesAddBtn")).to_be_focused()
 
     def test_connect_save_test_access_use_suggestion_and_save(
         self, authed_page: Page, app_url: str, tmp_path: Path

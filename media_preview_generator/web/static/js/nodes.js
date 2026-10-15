@@ -365,7 +365,8 @@
         }
         page.checking = false;
         btn.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>Check now';
-        btn.disabled = !page.nodes.length;
+        if (page.nodes.length) enable(btn);
+        else btn.disabled = true;
         await loadNodes();
     }
 
@@ -1556,6 +1557,8 @@
         });
         $('#addNodeModal').addEventListener('hidden.bs.modal', async () => {
             if (window.location.hash === '#add') history.replaceState(null, '', window.location.pathname);
+            // Opened from code, the dialog gives focus back to nothing: the page's Add node button takes it.
+            $('#nodesAddBtn').focus();
             if (!add.node) return;
             await keepStep2Rows();
             loadNodes();
