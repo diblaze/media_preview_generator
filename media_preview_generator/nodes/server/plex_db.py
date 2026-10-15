@@ -81,6 +81,9 @@ DEFAULT_PORT = 9494
 # server's database. Read per request: it changes when a server is claimed.
 _MACHINE_ID_RE = re.compile(r'ProcessedMachineIdentifier="([^"]+)"')
 _ON_WINDOWS = os.name == "nt"
+# How undo_record_problem tells it runs in a container.
+_CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
+_IMAGE_ROOT_FS = frozenset({"overlay", "fuse.fuse-overlayfs"})
 # The folder the last register_plex_db call serves, for info_block() (one node process serves one Plex).
 _registered_config_dir = ""
 
@@ -102,13 +105,20 @@ def machine_identifier(config_dir: str) -> str:
     return found.group(1) if found else ""
 
 
+def _in_container(root_fs: str | None) -> bool:
+    # Docker and Podman leave a marker file; an overlay root is some other runtime's image layers. An LXC container
+    # has neither, and keeps its root across updates.
+    return root_fs in _IMAGE_ROOT_FS or any(os.path.exists(marker) for marker in _CONTAINER_MARKERS)
+
+
 def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
     """Why the loudness undo record wouldn't survive an update of this node, or "" when it would.
 
     The record is ``<CONFIG_DIR>/loudness-writes.jsonl`` (``loudness.plex_db.write_log_path``). In a container whose
     ``CONFIG_DIR`` is no mount of its own, it lives in the container's writable layer and goes with the container on
-    the next update (and so do the node's id and generated key). Windows keeps it under ``%LOCALAPPDATA%``, and a
-    Linux node outside a container keeps it on the machine's own disk; neither needs a volume.
+    the next update (and so do the node's id and generated key), whatever storage driver that layer sits on (overlay,
+    rootless Podman's fuse-overlayfs, unRAID's btrfs, ZFS). Windows keeps it under ``%LOCALAPPDATA%``, and a Linux
+    node outside a container keeps it on the machine's own disk; neither needs a volume.
 
     Args:
         mountinfo_path: For tests.
@@ -117,7 +127,7 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
         return ""
     folder = os.path.dirname(loudness_db.write_log_path())
     found = mount_of(os.path.realpath(folder), mountinfo_path=mountinfo_path)
-    if found is None or found[0] != "/" or found[1] != "overlay":
+    if found is None or found[0] != "/" or not _in_container(found[1]):
         return ""
     return (
         f"Mount a volume at {folder} on this Plex database node so the loudness undo record survives updates. "
