@@ -25,6 +25,7 @@ from typing import Any
 from loguru import logger
 
 from .app import EXTENSION, MAX_BODY_BYTES, create_node_app
+from .identity import caller_key
 
 # Every interface: the app on another machine is the whole point.
 DEFAULT_HOST = "0.0.0.0"  # nosec B104
@@ -37,8 +38,9 @@ CHANNEL_TIMEOUT_S = 60
 CONNECTION_LIMIT = 1000
 # Windows has no poll(), and its select() takes at most 512 sockets: room is left for the listener and waitress's own.
 SELECT_CONNECTION_LIMIT = 500
-# Connections one address may hold at once. The app keeps a few per running task on the node, far under this, and no
-# single machine can take every connection the node has (waitress has no per-address limit of its own).
+# Connections one address (an IPv6 caller's whole /64: ``identity.caller_key``) may hold at once. The app keeps a few
+# per running task on the node, far under this, and no single machine can take every connection the node has (waitress
+# has no per-address limit of its own).
 CONNECTIONS_PER_ADDRESS = 100
 # A request (headers and body) must arrive whole within this long of its first byte. CHANNEL_TIMEOUT_S only closes a
 # connection that went quiet, so one header line every few seconds would otherwise hold a connection forever.
@@ -79,6 +81,7 @@ def _limited_channels(listen_map: dict) -> Any:
 
     class NodeChannel(HTTPChannel):
         reading_since: float | None = None
+        caller = ""
 
         def received(self, data: bytes) -> bool:
             if self.request is None and data:
@@ -97,10 +100,12 @@ def _limited_channels(listen_map: dict) -> Any:
     warned_at: list[float] = []
 
     def accept(server: Any, sock: Any, addr: Any, adj: Any, map: dict | None = None) -> NodeChannel | None:
-        peer = addr[0] if isinstance(addr, tuple) else str(addr)
-        held = sum(1 for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.addr[0] == peer)
+        peer = caller_key(addr[0] if isinstance(addr, tuple) else str(addr))
+        held = sum(1 for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.caller == peer)
         if held < CONNECTIONS_PER_ADDRESS:
-            return NodeChannel(server, sock, addr, adj, map=map)
+            channel = NodeChannel(server, sock, addr, adj, map=map)
+            channel.caller = peer
+            return channel
         sock.close()
         now = time.monotonic()
         if not warned_at or now - warned_at[0] > REFUSED_WARNING_S:

@@ -8,6 +8,7 @@ shown once in the console the first time it is the one in use (``announced`` rec
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -43,9 +44,33 @@ WRONG_KEY_ADDRESSES_MAX = 4096
 _WRONG_KEYS_EXTENSION = "mpg_node_wrong_keys"
 
 
+def caller_key(address: str) -> str:
+    """What one caller's wrong keys and connections are counted by: its IPv4 address, or its IPv6 address's /64.
+
+    An IPv6 machine is usually handed a whole /64 and can use a new address in it for every request, so counting
+    each IPv6 address would let it guess keys, or take connections, without limit.
+
+    Args:
+        address: The caller's address as the server saw it.
+
+    Returns:
+        The address (an IPv4-mapped IPv6 address as plain IPv4), the /64 network for IPv6, or ``address`` unchanged
+        when it isn't an IP address.
+    """
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
+
 class WrongKeyLimit:
-    """The wrong keys each caller address sent lately, so a node's guards stop comparing keys from one that sends
-    too many and tell it to wait (thread-safe).
+    """The wrong keys each caller sent lately (by :func:`caller_key`), so a node's guards stop comparing keys from
+    one that sends too many and tell it to wait (thread-safe).
 
     Args:
         burst: Wrong keys an address may send at once.
@@ -76,11 +101,12 @@ class WrongKeyLimit:
         While it is above 0 the guards answer 429 without comparing the key, so a guesser learns nothing.
         """
         with self._lock:
-            over = self._owing(address, self._clock()) - (self._burst - 1)
+            over = self._owing(caller_key(address), self._clock()) - (self._burst - 1)
         return max(1, math.ceil(over * self._refill_s)) if over > 0 else 0
 
     def note_wrong(self, address: str) -> None:
         """Count one wrong (or missing) key from ``address``; the first time it is held back, say so in the log."""
+        address = caller_key(address)
         with self._lock:
             now = self._clock()
             before = self._owing(address, now)
