@@ -512,12 +512,17 @@ class NodeRegistry:
         """Why this app sends no Plex database work to the node now ("" when it may).
 
         A Plex database node that reports a new id could be a different machine that was given the same key and
-        address; unless its Plex is the one the server uses, the user confirms it by typing its key again.
+        address; unless its Plex is the one the server uses, the user confirms it by typing its key again. A node
+        that answers as another saved node is refused too: its answer is that other machine's, not this one's.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
-            if live is None or not live.unconfirmed_uid:
+            if live is None:
+                return ""
+            if live.probe_state == STATE_DUPLICATE:
+                return f"{live.probe_reason} Until then this app doesn't use it for Plex's database."
+            if not live.unconfirmed_uid:
                 return ""
             name = str(live.record.get("name") or "The Plex database node")
         return (
@@ -982,9 +987,14 @@ class NodeRegistry:
                     live.access_wanted = False
                 if outcome.uid and not twin and outcome.uid != record.get("node_uid"):
                     self._new_uid(node_id, live, record, outcome)
-                elif outcome.uid:
+                elif outcome.uid and outcome.uid == record.get("node_uid"):
                     with self._lock:
                         live.unconfirmed_uid = ""
+                elif outcome.uid and record.get("node_uid"):
+                    # A twin's id is never recorded, so another machine stays unconfirmed: once the other node is
+                    # removed, the next check decides whether this one is the same Plex.
+                    with self._lock:
+                        live.unconfirmed_uid = outcome.uid
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:

@@ -1045,6 +1045,55 @@ class TestNewPlexDatabaseNodeId:
         h.registry.stop()
 
 
+class TestTwinOfAPlexDatabaseNode:
+    """A Plex database node answered by the machine of another saved node must not take that machine's Plex writes.
+
+    Node B (``n2``, saved id ``uid-b``) serves a Plex; machine A (``uid-a``, beside another Plex) is saved as ``n1``.
+    When A answers at B's address the check reads "added twice", and with either Plex's machine id unknown nothing
+    proves A's Plex is B's.
+    """
+
+    def _harness(self):
+        nodes = [
+            _record(id="n1", name="nuc-a", url="http://a:9494", node_uid="uid-a"),
+            _record(id="n2", name="nuc-b", url="http://b:9494", node_uid="uid-b"),
+        ]
+        harness = Harness(nodes=nodes)
+        harness.registry._served_plex_ids = lambda node_id: [""] if node_id == "n2" else []
+        return harness
+
+    def _answer(self, h, node_id, uid):
+        info = _info(uid=uid, roles=(ROLE_PLEX_DB,))
+        info["plex_db"] = {"machine_identifier": ""}
+        h.client(node_id).default_info = info
+        h.registry.check_now(node_id)
+
+    def test_its_plex_database_work_is_refused_with_a_plain_reason(self):
+        h = self._harness()
+        self._answer(h, "n2", "uid-a")
+
+        assert h.registry.view("n2").state == reg.STATE_DUPLICATE
+        refusal = h.registry.plex_db_refusal("n2")
+        assert "nuc-b is nuc-a again" in refusal and "Plex's database" in refusal
+        assert h.uids == []
+        h.registry.stop()
+
+    def test_a_twin_check_holds_the_other_machines_id_instead_of_clearing_the_hold(self):
+        h = self._harness()
+        h.nodes = [h.nodes[1]]  # B alone first: A answers there with a new id, held back
+        h.revision += 1
+        self._answer(h, "n2", "uid-a")
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n2")
+
+        h.nodes = [_record(id="n1", name="nuc-a", url="http://a:9494", node_uid="uid-a"), h.nodes[0]]
+        h.revision += 1
+        self._answer(h, "n2", "uid-a")  # now a twin of n1
+
+        # Still held once n1 is removed, until a check of B alone decides.
+        assert h.registry._nodes["n2"].unconfirmed_uid == "uid-a"
+        h.registry.stop()
+
+
 class TestRecordedNodeId:
     """What ``_default_record_uid`` writes to settings.json."""
 
