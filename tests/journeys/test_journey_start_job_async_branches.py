@@ -3163,3 +3163,108 @@ class TestARetryKeepsWhatTheJobAskedFor:
         replaced = [f"{self.LIBRARY}/Film (2024)/Film (2024) 720p.mkv"]
 
         assert self._dispatches(app, {"webhook_deleted_paths": replaced}) == [(False, replaced)] * 3
+
+
+class TestARegenerateRetryRegeneratesOnlyFilesWithoutOutput:
+    """Review of the fix above: a Regenerate job's retry also carries the files that were regenerated and only wait on
+    a server indexing them or on Plex chapters. Forcing those again re-ran FFmpeg, rewrote their previews and forced
+    their chapters on every retry (1m, 2m, 5m, 15m, 60m). The orchestrator, dispatcher, checking stage and worker run
+    for real; only ``process_canonical_path`` is stood in for."""
+
+    LIBRARY = "/media/movies"
+    WAITING = f"{LIBRARY}/Waiting (2024)/Waiting (2024).mkv"
+    CHAPTERS = f"{LIBRARY}/Chapters (2024)/Chapters (2024).mkv"
+    FAILING = f"{LIBRARY}/Failing (2024)/Failing (2024).mkv"
+    NODE = f"{LIBRARY}/Node (2024)/Node (2024).mkv"
+    MISSING = f"{LIBRARY}/Missing (2024)/Missing (2024).mkv"
+    # How each file's dispatch ends: the job's, its retry's, the retry's retry's.
+    ENDS = {
+        WAITING: ["waiting", "waiting", "waiting"],
+        CHAPTERS: ["chapters", "chapters", "chapters"],
+        FAILING: ["failed", "waiting", "waiting"],
+        NODE: ["node", "failed", "waiting"],
+        MISSING: ["not_found", "waiting", "waiting"],
+    }
+
+    @pytest.fixture()
+    def owned_movies(self, app):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        manager = get_settings_manager()
+        servers = manager.get("media_servers")
+        for server in servers:
+            for library in server["libraries"]:
+                library["remote_paths"] = [self.LIBRARY]
+        manager.set("media_servers", servers)
+
+    def _regenerate_flags(self, app, asked: dict) -> dict[str, list[tuple[bool, bool]]]:
+        """Run a job over :attr:`ENDS` (two retries allowed). Returns each file's ``regenerate`` given to
+        ``process_canonical_path`` per dispatch, as ``(checking stage, worker)``."""
+        from media_preview_generator.jobs.worker import WorkerPool
+        from media_preview_generator.nodes.executor import FileNotVisibleError
+        from media_preview_generator.processing.multi_server import (
+            MultiServerResult,
+            MultiServerStatus,
+            PublisherResult,
+            PublisherStatus,
+        )
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes.job_runner import _start_job_async
+
+        flags: dict[str, list[tuple[bool, ...]]] = {}
+
+        def fake_process(**kwargs):
+            path = kwargs["canonical_path"]
+            if kwargs.get("check_only"):
+                flags.setdefault(path, []).append((kwargs["regenerate"],))
+                return MultiServerResult(path, MultiServerStatus.NEEDS_GENERATION)
+            flags[path][-1] += (kwargs["regenerate"],)
+            end = self.ENDS[path][len(flags[path]) - 1]
+            if end == "node":
+                raise FileNotVisibleError("nas", "NAS", "missing", "NAS can't see the file")
+            if end == "failed":
+                return MultiServerResult(path, MultiServerStatus.FAILED, message="FFmpeg failed")
+            if end == "not_found":
+                return MultiServerResult(path, MultiServerStatus.SKIPPED_FILE_NOT_FOUND, message="not on disk yet")
+            if end == "chapters":
+                waits = PublisherResult(
+                    "plex-1",
+                    "Plex Main",
+                    "plex_bundle",
+                    PublisherStatus.PUBLISHED_PENDING_CHAPTERS,
+                    artifacts={"chapters": {"status": "waiting", "retryable": True}},
+                )
+            else:
+                waits = PublisherResult(
+                    "emby-1", "Emby Spare", "emby_sidecar", PublisherStatus.PUBLISHED_PENDING_REGISTRATION
+                )
+            return MultiServerResult(path, MultiServerStatus.PUBLISHED, publishers=[waits], frame_count=4)
+
+        overrides = {"webhook_paths": list(self.ENDS), **asked}
+        with (
+            app.app_context(),
+            patch("media_preview_generator.processing.multi_server.process_canonical_path", side_effect=fake_process),
+            # No other worker can run a file its node can't see, so it fails as a node failure.
+            patch.object(WorkerPool, "can_run_outside", return_value=False),
+        ):
+            jm = get_job_manager()
+            job = jm.create_job(library_name="Manual: 5 files", config=dict(overrides))
+            _start_job_async(job.id, config_overrides={**overrides, "webhook_retry_count": 2})
+            assert len(_retries_of(jm, job.id)) == 2
+        return flags
+
+    @pytest.mark.parametrize("asked", [{"force_generate": True}, {"regenerate_thumbnails": True}])
+    def test_each_retry_regenerates_only_the_files_that_got_no_output(self, app, owned_movies, no_retry_wait, asked):
+        forced, checked = (True, True), (False, False)
+
+        assert self._regenerate_flags(app, asked) == {
+            self.WAITING: [forced, checked, checked],
+            self.CHAPTERS: [forced, checked, checked],
+            self.FAILING: [forced, forced, checked],
+            self.NODE: [forced, forced, forced],
+            self.MISSING: [forced, forced, checked],
+        }
+
+    @pytest.mark.parametrize("asked", [{"force_generate": False}, {}])
+    def test_a_job_that_did_not_regenerate_never_regenerates_on_retry(self, app, owned_movies, no_retry_wait, asked):
+        assert self._regenerate_flags(app, asked) == {path: [(False, False)] * 3 for path in self.ENDS}

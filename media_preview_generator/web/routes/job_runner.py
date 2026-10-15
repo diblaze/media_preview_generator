@@ -890,6 +890,9 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         config.regenerate_thumbnails = bool(value)
                     elif key == "webhook_paths":
                         config.webhook_paths = [str(path).strip() for path in value if str(path).strip()]
+                    elif key == "regenerated_paths":
+                        if isinstance(value, list | tuple):
+                            config.regenerated_paths = frozenset(str(path) for path in value if path) or None
                     elif key == "webhook_deleted_paths":
                         # Radarr/Sonarr deletedFiles[] from upgrade events.
                         # Forwarded to process_canonical_path so cleanup +
@@ -1600,6 +1603,15 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     for np_ in (*failed_paths, *node_failed):
                         if np_ not in retry_paths:
                             retry_paths.append(np_)
+                    # A Regenerate job's retry regenerates only the files that never got output this run. A file that
+                    # only waits on a server or on chapters was already regenerated, so its retry checks it normally.
+                    # Pending paths are the canonical paths a retry's items carry; the others are webhook inputs.
+                    no_output = {*unresolved_paths, *stale_inputs, *failed_paths, *node_failed}
+                    regenerated_paths = [
+                        pp
+                        for pp in pending_registration_paths
+                        if pp not in no_output and input_by_canonical.get(pp, pp) not in no_output
+                    ]
 
                     def _spawn_retry_job(paths, attempt, retry_reason=None):
                         """Create and start a retry job for unresolved webhook paths.
@@ -1711,11 +1723,15 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         }
                         if current_job and (current_job.config or {}).get("source"):
                             retry_async_config["source"] = current_job.config["source"]
-                        # What the job asked for, not which files: a Regenerate job's retry regenerates too, and an
-                        # upgrade's retry still removes the replaced release's previews.
+                        # What the job asked for: a Regenerate job's retry regenerates too (bar the files it already
+                        # regenerated), and an upgrade's retry still removes the replaced release's previews.
                         for key in ("force_generate", "regenerate_thumbnails", "webhook_deleted_paths"):
                             if job_config.get(key):
                                 retry_async_config[key] = job_config[key]
+                        if regenerated_paths and (
+                            retry_async_config.get("force_generate") or retry_async_config.get("regenerate_thumbnails")
+                        ):
+                            retry_async_config["regenerated_paths"] = regenerated_paths
                         # K1: thread server_id through so the retry's worker
                         # builds Config from the right per-server view.
                         # CRITICAL: only inherit the publish-pin when the

@@ -1599,7 +1599,7 @@ class JobDispatcher:
 
         from ..processing.generator import failure_scope
         from ..processing.multi_server import MultiServerStatus, process_canonical_path
-        from .worker import register_job_thread, resolve_per_item_pin
+        from .worker import register_job_thread, resolve_per_item_pin, resolve_per_item_regenerate
 
         # Register under the job so the per-job log captures the check's
         # Dispatch / Owners-resolved lines (mirrors the processing worker).
@@ -1622,7 +1622,7 @@ class JobDispatcher:
                     progress_callback=None,
                     cancel_check=tracker.is_cancelled,
                     server_id_filter=per_item_pin,
-                    regenerate=bool(getattr(tracker.config, "regenerate_thumbnails", False)),
+                    regenerate=resolve_per_item_regenerate(tracker.config, item),
                     check_only=True,
                 )
 

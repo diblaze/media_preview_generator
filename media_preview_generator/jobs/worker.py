@@ -26,6 +26,7 @@ from ..processing.generator import (
     failure_scope,
     gpu_fallback_advice,
 )
+from ..processing.types import ProcessableItem
 from ..utils import format_display_title, redact_secrets, redacted_traceback
 from .gpu_fallback import get_gpu_fallback_tracker
 from .node_members import (
@@ -144,6 +145,28 @@ def resolve_per_item_pin(config, item, registry) -> str | None:
         origin_is_plex = bool(origin_cfg and origin_cfg.type is _ST.PLEX)
         return item.server_id if not origin_is_plex else None
     return None
+
+
+def resolve_per_item_regenerate(config: Config, item: ProcessableItem) -> bool:
+    """Decide whether a dispatch regenerates this item's previews.
+
+    Shared by the processing path and the dispatcher's checking stage, like
+    :func:`resolve_per_item_pin`. A Regenerate job regenerates every file,
+    except the ones its retry chain already regenerated
+    (``config.regenerated_paths``): those only wait on a server indexing them
+    or on Plex chapters, so each retry checks them like a normal run instead of
+    re-running FFmpeg on them.
+
+    Args:
+        config: The job's Config.
+        item: The :class:`ProcessableItem` being dispatched.
+
+    Returns:
+        True when the item's previews and chapters must be made again.
+    """
+    if not getattr(config, "regenerate_thumbnails", False):
+        return False
+    return item.canonical_path not in (getattr(config, "regenerated_paths", None) or ())
 
 
 def _extracted_frames(ms_result) -> bool:
@@ -588,7 +611,7 @@ class Worker:
                     cancel_check=self.cancel_check,
                     pause_check=self.pause_check,
                     server_id_filter=per_item_pin,
-                    regenerate=bool(getattr(config, "regenerate_thumbnails", False)),
+                    regenerate=resolve_per_item_regenerate(config, item),
                     phase_callback=_phase_cb,
                     chapter_progress_callback=_chapter_progress_cb,
                     # Radarr/Sonarr deletedFiles[] from upgrade webhooks.

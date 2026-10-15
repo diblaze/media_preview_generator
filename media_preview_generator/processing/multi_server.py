@@ -2507,10 +2507,6 @@ def process_canonical_path(
 
     from .chapters import ChapterOutcome, _failure, chapter_work_needed, prepare_chapters, publish_chapters
 
-    # Retry jobs complete the still-missing artifacts, even when their
-    # original dispatch was an explicit regeneration.
-    force = regenerate and retry_attempt == 0
-    options["regenerate"] = force
     plans = {}
     planning_failures = {}
 
@@ -2533,7 +2529,7 @@ def process_canonical_path(
                     item_id_hint=bare_hint,
                     cancel_check=cancel_check,
                     trust_server_hash=_is_bulk_scan(source, config),
-                    regenerate=force,
+                    regenerate=regenerate,
                     source_fingerprint=fingerprint,
                     reuse_recent_checks=True,
                 )
@@ -2574,7 +2570,7 @@ def process_canonical_path(
         prepare(result.canonical_path)
     if plans:
         preparing_chapters()
-    needs_chapters = any(chapter_work_needed(plan, regenerate=force) for plan in plans.values())
+    needs_chapters = any(chapter_work_needed(plan, regenerate=regenerate) for plan in plans.values())
     if check_only and not needs_chapters:
         needs_chapters = any(
             publisher.plex_refresh_requested
@@ -2643,13 +2639,13 @@ def process_canonical_path(
                         item_id_hint=plan.target.rating_key if plan.target else None,
                         cancel_check=cancel_check,
                         trust_server_hash=_is_bulk_scan(source, config),
-                        regenerate=force,
+                        regenerate=regenerate,
                     )
-                    had_work = chapter_work_needed(plan, regenerate=force)
+                    had_work = chapter_work_needed(plan, regenerate=regenerate)
                     outcome = publish_chapters(
                         plan,
                         config,
-                        regenerate=force,
+                        regenerate=regenerate,
                         cancel_check=cancel_check,
                         pause_check=pause_check,
                         ffmpeg_threads_override=ffmpeg_threads_override,

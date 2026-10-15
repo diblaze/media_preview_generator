@@ -148,6 +148,9 @@ class Config:
     # upgrade victim used. None = no upgrade signal; cleanup falls back
     # to its post-publish neighbor sweep only.
     webhook_deleted_paths: list[str] | None = None
+    # A Regenerate job's retry: the files its chain already regenerated, which only wait on a server indexing them or
+    # on Plex chapters. They aren't regenerated again (see ``jobs.worker.resolve_per_item_regenerate``).
+    regenerated_paths: frozenset[str] | None = None
     # Trigger-source pill (``"sonarr"``, ``"radarr"``, ``"sportarr"``,
     # ``"plex"``, ``"emby"``, ``"jellyfin"``, ``"custom"``, ``"scheduled"``,
     # …) the dispatcher carries down to ``process_canonical_path`` so the
