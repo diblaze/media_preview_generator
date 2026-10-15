@@ -28,10 +28,13 @@ Only the FFmpeg boundary is mocked; counting, cleanup, renaming and the cascade 
 import errno
 import itertools
 import os
+import shutil
 import signal
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -109,6 +112,16 @@ FOLDER_READ_ONLY_STDERR = [
     "[image2 @ 0x619ec303d300] Could not open file : /work/frames/img-000001.jpg",
     "[vost#0:0/mjpeg @ 0x619ec3037bc0] Error submitting a packet to the muxer: Read-only file system",
     "[out#0/image2 @ 0x619ec3055180] Task finished with error code: -30 (Read-only file system)",
+    "Conversion failed!",
+]
+# Stock FFmpeg 8.0.1 (Ubuntu) whose image2 muxer can't create a frame file: AVERROR(EIO) whatever the real error, so
+# exit 251 and no errno text. A full btrfs, ZFS or XFS folder refuses the file itself this way, as does a read-only one.
+CANT_OPEN_FRAME_STDERR = [
+    "[image2 @ 0x5bd024a95f80] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x5bd024a96380] Error submitting a packet to the muxer: Input/output error",
+    "[out#0/image2 @ 0x5bd024a95e80] Error muxing a packet",
+    "[out#0/image2 @ 0x5bd024a95e80] Task finished with error code: -5 (Input/output error)",
+    "[out#0/image2 @ 0x5bd024a95e80] Terminating thread with return code -5 (Input/output error)",
     "Conversion failed!",
 ]
 OVER_QUOTA_LINE = (
@@ -493,6 +506,70 @@ class TestAFolderThatRefusesTheThumbnails:
 
         assert_refused(outcome)
         assert [c["use_skip"] for c in outcome.calls] == [True]
+
+    @staticmethod
+    def _refusing_new_files(folder: Path, code: int):
+        """The folder refuses any new file with ``code``, as a full btrfs, ZFS or XFS one does."""
+        real_open = os.open
+
+        def refusing_open(path, *args, **kwargs):
+            if Path(path).parent == folder:
+                raise OSError(code, os.strerror(code), path)
+            return real_open(path, *args, **kwargs)
+
+        return patch.object(os, "open", refusing_open)
+
+    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS], ids=["full", "read-only"])
+    def test_a_frame_file_ffmpeg_could_not_create_is_the_folders_when_it_takes_no_new_file(self, run, tmp_path, code):
+        with self._refusing_new_files(tmp_path / "frames", code):
+            outcome = run([(IO_ERROR, 0, *CANT_OPEN_FRAME_STDERR)], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert outcome.result.errno == code
+
+    def test_a_frame_file_ffmpeg_could_not_create_in_a_folder_that_takes_files_is_a_plain_io_error(self, run, tmp_path):
+        outcome = run([(IO_ERROR, 0, *CANT_OPEN_FRAME_STDERR)], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "io_error"
+        assert os.listdir(tmp_path / "frames") == [], "the check leaves no file behind"
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a folder without write permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_that_could_not_create_a_frame_file_in_a_full_folder_ends_on_the_folder(
+        self, run, tmp_path, mock_config
+    ):
+        """Real FFmpeg, runner and cascade. A folder without write permission makes FFmpeg's image2 muxer fail to
+        create its first frame file, exactly as a full btrfs folder does; the check then finds the folder full."""
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        made = subprocess.run(
+            [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=20:s=64x36:r=5"]
+            + ["-c:v", "mpeg4", str(tmp_path / "movie.mkv")],
+            capture_output=True,
+            timeout=60,
+        )
+        assert made.returncode == 0, made.stderr
+        mock_config.ffmpeg_path = ffmpeg
+        frames = tmp_path / "frames"
+        frames.mkdir()
+        frames.chmod(0o555)
+        try:
+            with self._refusing_new_files(frames, errno.ENOSPC):
+                outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            frames.chmod(0o755)
+
+        assert isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert (outcome.result.errno, outcome.result.filename) == (errno.ENOSPC, str(frames))
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and "No space left on device (exit code 251)" in refused[0], outcome.warnings
+        # Nor is it put down to the video's disk as well.
+        assert not any("hit an I/O error" in line for line in outcome.warnings), outcome.warnings
 
     def test_the_errors_text_is_read_as_ffmpeg_words_it_whatever_the_os_calls_the_errno(self, monkeypatch):
         # Windows has no EDQUOT: Python's is WSAEDQUOT, which os.strerror calls "Unknown error".

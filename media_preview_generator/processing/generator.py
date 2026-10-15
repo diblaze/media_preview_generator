@@ -184,6 +184,11 @@ _FOLDER_WRITE_TEXT = {
 # A line about writing the output: FFmpeg 6.1+ prefixes them [out#N/image2] and [vost#N:M/mjpeg], older builds name
 # the call that failed.
 _OUTPUT_SIDE_RE = re.compile(r"^\[(?:out#|vost#|image2 )|av_interleaved_write_frame\(\)|Error writing trailer")
+# FFmpeg's image2 muxer couldn't create a frame file. It reports that as AVERROR(EIO), exit 251, whatever the real error:
+# a full btrfs, ZFS or XFS folder refuses the new file itself, and so does a read-only one.
+_FRAME_FILE_NOT_CREATED_RE = re.compile(r"^\[image2 @ [^\]]*\] Could not open file")
+# What the check that asks the folder why writes: a few thumbnails' worth.
+_WRITE_CHECK_BYTES = 1 << 16
 # The signals FFmpeg dies of on the file itself. A crash is deterministic: the same file crashes the same way on every
 # scan. Any other signal (SIGTERM, SIGINT, SIGHUP, the stall watchdog's or an OOM kill's SIGKILL) stopped it from
 # outside, wherever it was. Popen reports a signal as -n; a wrapper shell as 128+n.
@@ -694,16 +699,18 @@ def _was_interrupted(returncode: int, stderr_lines: list[str]) -> bool:
     return returncode == FFMPEG_SIGNALLED_EXIT or _is_signal_killed(returncode)
 
 
-def _folder_write_errno(returncode: int, stderr_lines: list[str]) -> int | None:
+def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder: str | None = None) -> int | None:
     """Why a run couldn't write its thumbnails, when the folder was the problem (``FOLDER_WRITE_ERRNOS``).
 
     Told by the exit code, or by the error's text on a line about the output: a full folder may cut off the stderr
     log too, and older FFmpeg builds exit 1 after a failed write. Not by the text alone on any line: Mesa says
-    "Read-only file system" about its shader cache on a read-only root, and the run is fine.
+    "Read-only file system" about its shader cache on a read-only root, and the run is fine. When FFmpeg couldn't
+    create a frame file it says only "I/O error", so the folder itself is asked (:func:`_folder_refuses_new_files`).
 
     Args:
         returncode: FFmpeg exit code.
         stderr_lines: That run's stderr.
+        output_folder: The folder the run wrote to, so it can be asked; None to judge by the exit code and text alone.
 
     Returns:
         The errno, or None when the run didn't fail on writing.
@@ -717,6 +724,39 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str]) -> int | None:
     for code, texts in _FOLDER_WRITE_TEXT.items():
         if any(text in line for text in texts for line in output_lines):
             return code
+    if (
+        output_folder is not None
+        and returncode == FFMPEG_IO_ERROR_EXIT
+        and any(_FRAME_FILE_NOT_CREATED_RE.match(line) for line in stderr_lines)
+    ):
+        return _folder_refuses_new_files(output_folder)
+    return None
+
+
+def _folder_refuses_new_files(folder: str) -> int | None:
+    """Whether ``folder`` is full, over its quota or read-only now, found by writing a small file there and removing it.
+
+    Args:
+        folder: The folder FFmpeg couldn't create a frame file in, its frames not yet deleted.
+
+    Returns:
+        The errno (``FOLDER_WRITE_ERRNOS``), or None when the file was written or failed for another reason.
+    """
+    path = os.path.join(folder, f".write-check-{uuid.uuid4().hex}")
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, bytes(_WRITE_CHECK_BYTES))
+        # NFS only reports a full disk once the bytes are flushed.
+        os.fsync(fd)
+    except OSError as exc:
+        return exc.errno if exc.errno in FOLDER_WRITE_ERRNOS else None
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                os.remove(path)
     return None
 
 
@@ -1853,7 +1893,7 @@ def generate_images(
             WorkingFolderError: The folder is full, over its quota, or read-only.
         """
         rc, seconds, speed, run_stderr = run_ffmpeg_once(*args, **kwargs)
-        refused = _folder_write_errno(rc, run_stderr)
+        refused = _folder_write_errno(rc, run_stderr, output_folder)
         if refused is not None:
             _clean_output_images(output_folder)
             raise WorkingFolderError(refused, _FOLDER_WRITE_TEXT[refused][0], output_folder)
