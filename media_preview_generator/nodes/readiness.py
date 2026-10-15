@@ -48,8 +48,8 @@ WORKERS_URL = "/settings#section-workers"
 SERVERS_URL = "/servers"
 # The docs section with the steps to update a node to this app's version.
 UPDATE_DOCS_URL = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
-# The last Plex database check of each (address, key hash), for the node list (cached_file_checks).
-_last_reports: dict[tuple[str, str], Any] = {}
+# The last Plex database check of each (address, key hash, saved node id), for the node list (cached_file_checks).
+_last_reports: dict[tuple[str, str, str], Any] = {}
 _last_reports_lock = threading.Lock()
 # The Linux Plex database node's image, still published under the Plex marker agent's name (nodes/plex-db/README.md).
 PLEX_DB_IMAGE = "ghcr.io/stevezau/plex-marker-agent"
@@ -415,27 +415,30 @@ def _gpu_reason(error: object) -> str:
     return f"{found}Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
 
 
-def _report_key(url: str, key: str) -> tuple[str, str]:
-    return url, hashlib.sha256(key.encode()).hexdigest()
+def _report_key(url: str, key: str, node_uid: str) -> tuple[str, str, str]:
+    return url, hashlib.sha256(key.encode()).hexdigest(), node_uid
 
 
-def _default_file_checks(url: str, key: str) -> Any:
+def _default_file_checks(url: str, key: str, node_uid: str = "") -> Any:
     from ..markers.publishers.plex_remote import RemotePlexDb
 
-    report = RemotePlexDb(url, key).file_checks(deadline=time.monotonic() + PLEX_DB_CHECK_S)
+    # Named like every request to the node: another machine at the address refuses, rather than answering with its
+    # own Plex database as this node's.
+    db = RemotePlexDb(url, key, node_uid=lambda: node_uid)
+    report = db.file_checks(deadline=time.monotonic() + PLEX_DB_CHECK_S)
     with _last_reports_lock:
-        _last_reports[_report_key(url, key)] = report
+        _last_reports[_report_key(url, key, node_uid)] = report
     return report
 
 
-def cached_file_checks(url: str, key: str) -> Any:
+def cached_file_checks(url: str, key: str, node_uid: str = "") -> Any:
     """The last Plex database check Setup Health ran on the node at ``url`` with ``key``, or None (never asks it).
 
     The node list counts its rows from this, so a card stops saying Ready while its Setup Health has a must fix,
     without a call to every node on every poll.
     """
     with _last_reports_lock:
-        return _last_reports.get(_report_key(url, key))
+        return _last_reports.get(_report_key(url, key, node_uid))
 
 
 def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
@@ -457,11 +460,11 @@ def _plex_db_confirmed(details: NodeDetails) -> list[dict[str, Any]]:
     ]
 
 
-def _plex_db(url: str, key: str, file_checks: Callable[[str, str], Any]) -> list[dict[str, Any]]:
+def _plex_db(url: str, key: str, node_uid: str, file_checks: Callable[[str, str, str], Any]) -> list[dict[str, Any]]:
     from ..markers.publishers.base import Capability
     from ..markers.publishers.plex_db import node_wording
 
-    checked = file_checks(url, key)
+    checked = file_checks(url, key, node_uid)
     if checked is None:
         return []  # Not checked yet (cached_file_checks): no rows rather than a guess.
     # The check ran on the node: its refusals are about the node, not this app.
@@ -545,7 +548,8 @@ def node_readiness(
     worker_groups: object,
     app_version: str,
     app_build: str = "",
-    file_checks: Callable[[str, str], Any] | None = _default_file_checks,
+    node_uid: str = "",
+    file_checks: Callable[[str, str, str], Any] | None = _default_file_checks,
 ) -> dict[str, Any]:
     """The Setup Health envelope for one node.
 
@@ -555,9 +559,10 @@ def node_readiness(
         worker_groups: The stored ``worker_groups`` list.
         app_version: This app's version.
         app_build: This app's commit ("" when unknown); shown when only the node's commit differs.
-        file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own); an answer
-            of None (not checked yet) adds no rows. None leaves the database checks out. The node list's count passes
-            :func:`cached_file_checks`: asking the node is too slow for it.
+        node_uid: The node's saved id ("" before first contact), named on the Plex database file checks.
+        file_checks: ``(url, key, node_uid) -> CapabilityReport`` for the Plex database role (tests pass their own);
+            an answer of None (not checked yet) adds no rows. None leaves the database checks out. The node list's
+            count passes :func:`cached_file_checks`: asking the node is too slow for it.
 
     Returns:
         ``{"overall_ok", "sections"}``.
@@ -572,7 +577,7 @@ def node_readiness(
     if usable and protocol.ROLE_PLEX_DB in view.roles:
         rows = _plex_db_confirmed(details)
         if file_checks is not None:
-            rows += _plex_db(view.url, key, file_checks)
+            rows += _plex_db(view.url, key, node_uid, file_checks)
         sections.append(_section("node_plex_db", "Plex database", rows))
     kept = [s for s in sections if s is not None]
     overall_ok = not any(c["severity"] == CRITICAL and c["ok"] is False for s in kept for c in s["checks"])

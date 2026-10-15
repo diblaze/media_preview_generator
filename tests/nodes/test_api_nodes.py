@@ -911,6 +911,44 @@ class TestHealthAndLog:
         assert set(body) == {"overall_ok", "sections"}
         assert body["sections"][0]["id"] == "node_connection"
 
+    def test_another_machine_at_a_plex_database_nodes_address_is_a_must_fix_not_its_database(
+        self, client, nodes, monkeypatch
+    ):
+        """Another machine given the node's address and key showed its own Plex database as this node's."""
+        import json
+        from unittest.mock import MagicMock
+
+        from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
+        from media_preview_generator.markers.publishers.plex_remote import report_to_json
+        from media_preview_generator.nodes import readiness
+        from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
+
+        def other_machine(session, url, *, headers, **kwargs):
+            # Its own database is fine; work that names another node's id, it refuses.
+            agent = {"version": "1.2.0", "protocols": [1, 2]}
+            if headers.get(NODE_UID_HEADER, "uid-2") != "uid-2":
+                status, body = 409, {"ok": False, "agent": agent, "error": {"kind": KIND_WRONG_NODE}}
+            else:
+                report = CapabilityReport(Capability.READY, "", {"db_path": "/b/db", "fs_type": "ext4"})
+                status, body = 200, {"ok": True, "agent": agent, "result": {"report": report_to_json(report)}}
+            answer = MagicMock(status_code=status, headers={})
+            answer.iter_content.return_value = [json.dumps(body).encode()]
+            return answer
+
+        monkeypatch.setattr(readiness, "_last_reports", {})
+        monkeypatch.setattr("requests.Session.post", other_machine)
+        nodes("http://nuc:9494").info_answer["node"]["roles"] = ["plex_db"]
+        node_id = _add(client).get_json()["id"]
+        _checked(client, node_id)
+        assert _sm().nodes[0]["node_uid"] == "uid-1"
+
+        body = client.get(f"/api/nodes/{node_id}/health").get_json()
+
+        assert body["overall_ok"] is False
+        rows = next(s for s in body["sections"] if s["id"] == "node_plex_db")["checks"]
+        assert [(r["id"], r["ok"]) for r in rows] == [("plex_db_reachable", False)]
+        assert "isn't the Plex database node saved there" in rows[0]["reason"]
+
     def test_a_plex_database_must_fix_its_setup_health_found_is_counted_on_its_card(self, client, nodes, monkeypatch):
         """The card said Ready with nothing to fix while Setup Health said the node can't write Plex's database."""
         from media_preview_generator.markers.publishers import plex_remote
@@ -918,7 +956,7 @@ class TestHealthAndLog:
         from media_preview_generator.nodes import readiness
 
         class CantWrite:
-            def __init__(self, url, key):
+            def __init__(self, url, key, **kwargs):
                 pass
 
             def file_checks(self, *, deadline):
