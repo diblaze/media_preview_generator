@@ -376,6 +376,34 @@ class TestQuickAccessCheck:
         rows = [PathMapping(str(tmp_path / "movies"), "/m")]
         assert nm.quick_access_check(FakeClient(visible=lambda p: False), rows) is False
 
+    def test_a_folder_that_hangs_fails_it_within_the_budget(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        _video(tmp_path / "movies" / "a.mkv")
+        stalled = tmp_path / "tv"
+        stalled.mkdir()
+        release = threading.Event()
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == str(stalled):
+                release.wait(30)  # stands in for a read stuck on a dead NFS server
+            return real_scandir(path)
+
+        monkeypatch.setattr(nm.os, "scandir", scandir)
+        monkeypatch.setattr(nm, "SAMPLE_BUDGET_S", 0.5)
+        rows = [PathMapping(str(tmp_path / "movies"), "/m"), PathMapping(str(stalled), "/t")]
+        client = FakeClient()
+        started = time.monotonic()
+        try:
+            passed = nm.quick_access_check(client, rows)
+        finally:
+            release.set()
+        assert time.monotonic() - started < 5
+        assert passed is False
+        assert client.requests == []
+
     def test_nothing_to_check_does_not_pass(self, tmp_path):
         assert nm.quick_access_check(FakeClient(), [PathMapping(str(tmp_path / "none"), "/m")]) is False
 

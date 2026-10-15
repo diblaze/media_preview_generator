@@ -157,28 +157,35 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
             found.append({"path": entry.path, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
 
 
-def _sample_roots(roots: list[LibraryRoot], budget_s: float) -> dict[LibraryRoot, _Sampling]:
-    """Sample every library folder at once, giving up on the ones not done within ``budget_s``.
+def _sample_folders(folders: list[str], budget_s: float, *, limit: int) -> list[_Sampling]:
+    """Sample every folder at once, giving up on the ones not done within ``budget_s``; one result per folder.
 
     Daemon threads, not a pool: a thread stuck in a read on a stalled mount must neither hold up the answer nor the
     app's exit.
     """
     deadline = time.monotonic() + budget_s
-    samplings: dict[LibraryRoot, _Sampling] = {}
-    for root in roots:
-        sampling = samplings[root] = _Sampling()
+    samplings: list[_Sampling] = []
+    for folder in folders:
+        sampling = _Sampling()
+        samplings.append(sampling)
 
-        def run(sampling: _Sampling = sampling, folder: str = root.app_root) -> None:
+        def run(sampling: _Sampling = sampling, folder: str = folder) -> None:
             try:
-                _sample_into(sampling, folder, limit=SAMPLES_PER_ROOT, walk_limit=WALK_LIMIT, deadline=deadline)
+                _sample_into(sampling, folder, limit=limit, walk_limit=WALK_LIMIT, deadline=deadline)
             finally:
                 sampling.done.set()
 
         threading.Thread(target=run, name="test-access-sample", daemon=True).start()
-    for sampling in samplings.values():
+    for sampling in samplings:
         if not sampling.done.wait(max(0.0, deadline - time.monotonic())):
             sampling.timed_out = True
     return samplings
+
+
+def _sample_roots(roots: list[LibraryRoot], budget_s: float) -> dict[LibraryRoot, _Sampling]:
+    """:func:`_sample_folders` for every library folder."""
+    samplings = _sample_folders([root.app_root for root in roots], budget_s, limit=SAMPLES_PER_ROOT)
+    return dict(zip(roots, samplings, strict=True))
 
 
 def _covering_row(app_root: str, mappings: list[PathMapping]) -> PathMapping | None:
@@ -367,6 +374,9 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
 def quick_access_check(client: NodeClient, mappings: list[PathMapping]) -> bool:
     """One file per mapping row: True when the node sees every one (and there was at least one to check).
 
+    Reading this app's folders has the same budget as Test access, so a stalled mount fails the check instead of
+    holding up the node's check.
+
     Args:
         client: The node.
         mappings: Its saved rows.
@@ -374,7 +384,11 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping]) -> bool:
     Returns:
         Whether every sampled file was visible.
     """
-    files = [f for row in mappings for f in sample_files(row.app_prefix, limit=1)]
+    samplings = _sample_folders([row.app_prefix for row in mappings], SAMPLE_BUDGET_S, limit=1)
+    if any(sampling.timed_out for sampling in samplings):
+        logger.debug("Quick access check gave up: this app's own library folder didn't answer")
+        return False
+    files = [f for sampling in samplings for f in sampling.found]
     if not files:
         return False
     try:
