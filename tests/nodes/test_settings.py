@@ -308,6 +308,27 @@ class TestSettingsManagerNodes:
         other, _ = ns.validate_node(_post(name="other"), existing=None, others=sm.nodes)
         assert sm.update_nodes([*sm.nodes, other]) == 6
 
+    def test_a_node_copied_by_hand_with_the_same_id_gets_its_own_that_is_saved(self, tmp_path):
+        """The copy kept the first record's id: the registry listed only the first, and every save of the node list
+        was refused "Node id ... is used twice"."""
+        import json
+
+        first, _ = ns.validate_node(_post(), existing=None, others=[])
+        first["node_uid"] = "uid-of-nuc"
+        copied = {**first, "name": "nas", "url": "http://nas.lan:9494", "key": "k-456"}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [first, copied], "nodes_revision": 3}))
+
+        sm = SettingsManager(str(tmp_path))
+
+        kept, renamed = sm.nodes
+        assert kept == first
+        assert renamed["id"] != first["id"] and len(renamed["id"]) == 32 and renamed["name"] == "nas"
+        assert renamed["node_uid"] is None  # learnt at nuc's address, not at nas's
+        assert sm.nodes_revision == 4
+        assert SettingsManager(str(tmp_path)).nodes[1]["id"] == renamed["id"]  # the same id after a restart
+        other, _ = ns.validate_node(_post(name="other", url="http://other.lan:9494"), existing=None, others=sm.nodes)
+        assert sm.update_nodes([*sm.nodes, other]) == 5
+
     def test_a_bad_record_written_by_hand_holds_up_only_a_change_to_itself(self, tmp_path):
         import json
 
