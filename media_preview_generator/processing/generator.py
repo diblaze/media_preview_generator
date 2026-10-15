@@ -873,17 +873,9 @@ def _gpu_hand_off(
     )
     if should_fallback and reason == "codec error":
         return FALLBACK_CODEC, reason
-    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
-    # A decoder whose GPU set-up failed in the driver falls back to software and ends the same way, so this counts
-    # only without a driver error in any run. A run that asked for no GPU decoder decoded in software on purpose: the
-    # GPU filters refusing its frames is theirs, not a codec's.
-    if (
-        frames_refused
-        and hwaccel is not None
-        and _decoded_in_software(stderr_lines, hwaccel)
-        and not _detect_hwaccel_runtime_error(stderr_lines_all)
-    ):
+    if _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel, stderr_lines_all):
         return FALLBACK_CODEC, "codec error"
+    frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
     # Judged on the last run's own stderr: a GPU error in an earlier tier's run doesn't make this run's plain 251 one.
     if _io_cut_off(rc, stderr_lines):
         return FALLBACK_IO_ERROR, "I/O error"
@@ -899,6 +891,32 @@ def _gpu_hand_off(
     if stopped_part_way:
         return FALLBACK_STOPPED_PART_WAY, "GPU run stopped part-way"
     return None
+
+
+def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None, stderr_lines_all: list[str]) -> bool:
+    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software without a
+    word and the GPU scaler refused those frames (ProRes, WMV, DivX 3, H.263 or VP8 on NVIDIA, MPEG-2 4:2:2…).
+
+    A normal hand-off to the CPU, and the same on every run: full-frame decode asks the same decoder.
+
+    Args:
+        rc: The run's exit code.
+        stderr_lines: The run's stderr.
+        hwaccel: The GPU decoder the run asked for (``hwaccel_in``).
+        stderr_lines_all: Every run's stderr so far, this one's included.
+
+    Returns:
+        True for a codec the GPU lacks. False otherwise, and for a driver error in any run: a decoder whose GPU
+        set-up failed in the driver falls back to software and ends the same way. False too for a run that asked for
+        no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its frames is theirs.
+    """
+    return (
+        rc != 0
+        and hwaccel is not None
+        and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
+        and _decoded_in_software(stderr_lines, hwaccel)
+        and not _detect_hwaccel_runtime_error(stderr_lines_all)
+    )
 
 
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
@@ -2197,8 +2215,13 @@ def generate_images(
     retry_rc = rc
     retry_stderr_lines = stderr_lines
 
-    # Not after the decoder said it can't decode the file (on this GPU, or at all): full-frame decode asks the same one.
-    cant_decode = GPU_CANT_DECODE_LINE in stderr_lines or video_has_no_decoder(stderr_lines)
+    # Not after the decoder said it can't decode the file (on this GPU, or at all), nor after the GPU turned out to have
+    # no decoder for it: full-frame decode asks the same one.
+    cant_decode = (
+        GPU_CANT_DECODE_LINE in stderr_lines
+        or video_has_no_decoder(stderr_lines)
+        or _gpu_lacks_the_decoder(rc, stderr_lines, hwaccel_in(last_command), stderr_lines)
+    )
     # Nor after the stall watchdog: the mount is stuck and a rerun would wait out another full timeout.
     stalled = STALL_WATCHDOG_LINE in stderr_lines
     if rc != 0 and use_skip_initial and not cant_decode and not stalled:

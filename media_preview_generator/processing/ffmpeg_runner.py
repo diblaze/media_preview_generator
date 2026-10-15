@@ -164,11 +164,13 @@ def create_ffmpeg_runner(
         _crash_signal,
         _diagnose_ffmpeg_exit_code,
         _folder_write_errno,
+        _gpu_lacks_the_decoder,
         _io_cut_off,
         _is_signal_killed,
         _save_ffmpeg_failure_log,
         _without_metadata_tags,
         folder_write_fix,
+        hwaccel_in,
         parse_ffmpeg_progress_line,
     )
 
@@ -780,8 +782,24 @@ def create_ffmpeg_runner(
                 video_file,
                 proc.returncode,
             )
+        # A normal hand-off to the CPU, the same on every try: no error lines, stderr dump or failure log.
+        gpu_lacks_decoder = not stalled and _gpu_lacks_the_decoder(
+            proc.returncode, ffmpeg_output_lines, hwaccel_in(args), ffmpeg_output_lines
+        )
+        if gpu_lacks_decoder:
+            logger.info(
+                "The GPU can't decode the video of {} (FFmpeg exit code {}); the CPU makes its thumbnails instead.",
+                video_file,
+                proc.returncode,
+            )
         # Error logging (skip generic failure log when we stopped FFmpeg ourselves; already logged above)
-        if proc.returncode != 0 and not stalled and not gpu_cant_decode and not chapter_without_frame:
+        if (
+            proc.returncode != 0
+            and not stalled
+            and not gpu_cant_decode
+            and not gpu_lacks_decoder
+            and not chapter_without_frame
+        ):
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines)
             no_decoder = exit_diagnosis == "no_decoder"
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
