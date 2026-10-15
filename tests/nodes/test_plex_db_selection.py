@@ -96,7 +96,8 @@ def test_chapters_without_a_node_use_the_local_folder(monkeypatch, tmp_path):
 
 
 class TestLegacyHelperFields:
-    """v24 leaves the helper's own ``url``/``token`` in the block for a rollback; nothing new reads or changes them."""
+    """Earlier builds of v24 left the helper's own ``url``/``token`` beside ``node_id``: nothing reads them, and the
+    next save drops them."""
 
     LEGACY = {"enabled": True, "node_id": "n1", "url": "http://old-helper:9494", "token": "old-token"}
 
@@ -111,19 +112,21 @@ class TestLegacyHelperFields:
         db = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
         assert isinstance(db, RemotePlexDb) and db._client.url == ""
 
-    def test_a_save_keeps_the_stored_legacy_fields_and_ignores_posted_ones(self):
+    @pytest.mark.parametrize(
+        "posted",
+        [
+            {"enabled": False, "node_id": None},
+            {"enabled": False, "node_id": "n1", "url": "http://evil:1", "token": "****"},
+        ],
+        ids=["this-app", "posted-legacy-fields"],
+    )
+    def test_a_save_drops_the_retired_helper_key(self, posted):
         from media_preview_generator.markers.settings import validate_server
 
-        stored = _markers(dict(self.LEGACY))
-        posted = _markers({"enabled": False, "node_id": "n1", "url": "http://evil:1", "token": "****"})
-        block, err = validate_server(posted, "plex", stored)
+        block, err = validate_server(_markers(posted), "plex", _markers(dict(self.LEGACY)))
         assert err == ""
-        assert block["plex"]["agent"] == {
-            "enabled": False,
-            "node_id": "n1",
-            "url": "http://old-helper:9494",
-            "token": "old-token",
-        }
+        assert block["plex"]["agent"] == {"enabled": False, "node_id": posted["node_id"]}
+        assert "old-token" not in repr(block) and "evil" not in repr(block)
 
     def test_a_block_without_legacy_fields_gets_none(self):
         from media_preview_generator.markers.settings import validate_server
@@ -137,3 +140,60 @@ class TestLegacyHelperFields:
         masked = mask_server(_markers(dict(self.LEGACY)), "plex")
         assert masked["plex"]["agent"]["token"] == "****"
         assert "old-token" not in str(masked)
+
+
+class TestChoosingANode:
+    """``validate_server`` on a save that picks this server's Plex database node."""
+
+    @pytest.fixture
+    def roles(self, monkeypatch):
+        """``roles(("worker",))`` makes the registry report those roles for n1 (None: it hasn't answered yet)."""
+        from media_preview_generator.nodes import registry as reg
+
+        reported: dict[str, object] = {"roles": None, "legacy": False}
+
+        class StubRegistry:
+            def view(self, node_id):
+                if reported["roles"] is None:
+                    return None
+                return SimpleNamespace(name="Plex box", roles=reported["roles"], legacy=reported["legacy"])
+
+        monkeypatch.setattr(reg, "get_registry", lambda: StubRegistry())
+
+        def report(value, *, legacy=False):
+            reported.update(roles=value, legacy=legacy)
+
+        return report
+
+    def _save(self, agent: dict, stored_agent: dict | None = None):
+        from media_preview_generator.markers.settings import validate_server
+
+        stored = _markers(stored_agent) if stored_agent is not None else None
+        return validate_server(_markers(agent), "plex", stored)
+
+    def test_the_stored_choice_is_never_re_checked(self, roles):
+        roles(("worker",))
+        block, err = self._save({"enabled": True, "node_id": "n1"}, {"enabled": True, "node_id": "n1"})
+        assert err == "" and block is not None
+
+    def test_turning_it_on_without_a_node_is_refused(self, roles):
+        block, err = self._save({"enabled": True, "node_id": None}, {"enabled": False, "node_id": None})
+        assert block is None and "Choose the node" in err
+
+    def test_a_stored_switched_on_block_without_a_node_is_kept_and_refused_no_node(self, roles):
+        """A helper v24 couldn't move: it loads switched on with no node, so nothing opens this app's own copy."""
+        block, err = self._save({"enabled": True, "node_id": None}, {"enabled": True, "node_id": None})
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": None}
+        settings = load_server(_markers({"enabled": True, "node_id": None}), "plex")
+        db = plex_database(settings, path_provider=lambda: "/local/db", label="Plex")
+        assert isinstance(db, RemotePlexDb) and db._client.refusal().agent_state == "no_node"
+
+    def test_a_block_from_before_nodes_still_saves(self, roles):
+        """What the Intro & Credits tab posts back for a server still holding the old helper shape."""
+        from media_preview_generator.markers.settings import mask_server
+
+        stored = {"enabled": True, "url": "http://helper.lan:9494", "token": "helper-key"}
+        posted = mask_server(_markers(stored), "plex")["plex"]["agent"]
+        block, err = self._save(posted, stored)
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": None}
+        assert "helper-key" not in repr(block)

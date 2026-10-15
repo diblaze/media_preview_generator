@@ -198,9 +198,10 @@ def test_capability_refuses_changed_schema(guarded, monkeypatch):
 def test_a_helper_switched_on_without_an_address_never_falls_back_to_the_local_folder(guarded):
     _, cfg, server = guarded
     cfg.markers = {"plex": {"agent": {"enabled": True}}}
+    assert isinstance(create_loudness_db(cfg, server), guard.RemoteLoudnessDb)
     report = loudness_capability(server, cfg)
-    assert report.state is Capability.MISCONFIGURED and "no Plex database node" in report.message
-    server._connect.assert_not_called()
+    # Refused as a node that is gone is: nothing reaches a database, and the local folder is never opened.
+    assert report.state is Capability.AGENT_UNAVAILABLE and "no Plex database node" in report.message
 
 
 def test_a_helper_with_an_address_is_used_instead_of_the_local_folder(guarded, monkeypatch):

@@ -174,7 +174,8 @@ class TestLoudnessWithoutANode:
         cfg = _cfg(tmp_path)
         cfg.markers = {"plex": {"agent": {"enabled": True}}}
         report = loudness_capability(MagicMock(), cfg)
-        assert report.state is Capability.MISCONFIGURED
+        # Kept switched on with no node (as v24 leaves a helper it couldn't move): refused like a removed node.
+        assert report.state is Capability.AGENT_UNAVAILABLE
         assert report.message == (
             "This server has no Plex database node on the Nodes page. Choose one in Edit → Connection."
         )

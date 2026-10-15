@@ -39,7 +39,9 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
   - Test access results persist in `node_access_results.json` until that node's mappings change. A test of rows
     not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
-  - v24 keeps the old helper's `url`/`token` (unused) so a rollback to an older build still works.
+  - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
+    restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating): an older build
+    refuses a v24 file.
   - A node that answers with the saved key at the saved address is that node even when it reports a new id
     (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
     node beside the wrong Plex is caught by the Plex machine identifier check.
@@ -178,9 +180,12 @@ retry runs (on the **node's** CPU, see §6).
   saved node has, or where an added node answers. A legacy helper has no `node_uid`.
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.
-* Plex servers: `markers.plex.agent` gains `"node_id"`. Migration v24 turns every enabled helper (`url` + `token`)
-  into a `nodes` entry with the Plex database role and points the server's `agent.node_id` at it. The client resolves
-  url + key from the node, so one record holds the address and key.
+* Plex servers: `markers.plex.agent` becomes `{"enabled", "node_id"}`. Migration v24 turns every helper (`url` +
+  `token`) into a `nodes` entry with the Plex database role (turned on only when a server uses it: helper, Intro &
+  Credits and server all on) and points the server's `agent.node_id` at it. A switched-on helper it can't move
+  (no key, bad address) stays on with no node, so it is refused rather than opening this app's own copy. The
+  client resolves url + key from the node, so one record holds the address and key. A server with its node
+  switched off doesn't count as using it (Remove clears its remembered `node_id`).
 
 ## 5. Node states (app side)
 
@@ -360,7 +365,7 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 | `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key when `url` is its saved address (400 otherwise) |
 | `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
 | `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact); 409 like `POST` when another saved node has that address or answers there |
-| `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
+| `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or a Plex server with its node switched on uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
 | `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |

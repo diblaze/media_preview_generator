@@ -8,6 +8,7 @@ send stored keys out.
 
 from __future__ import annotations
 
+import copy
 import math
 from datetime import UTC, datetime
 from typing import Any
@@ -56,7 +57,22 @@ def _legacy_ping(url: str, key: str) -> tuple[str, str]:
     return _default_legacy_ping(url, key)
 
 
+def _server_agent(entry: object) -> dict | None:
+    """A Plex server entry's ``markers.plex.agent`` block, or None."""
+    if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        return None
+    markers = entry.get("markers")
+    plex = markers.get("plex") if isinstance(markers, dict) else None
+    agent = plex.get("agent") if isinstance(plex, dict) else None
+    return agent if isinstance(agent, dict) else None
+
+
 def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
+    """The worker groups with a member on the node, and the Plex servers whose database it opens.
+
+    A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
+    database), even though it remembers the node for when it is switched on again.
+    """
     sm = get_settings_manager()
     groups = []
     for group in sm.get("worker_groups") or []:
@@ -67,12 +83,8 @@ def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
             groups.append({"id": str(group.get("id") or ""), "name": str(group.get("name") or "")})
     servers = []
     for entry in sm.get("media_servers") or []:
-        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
-            continue
-        markers = entry.get("markers")
-        plex = markers.get("plex") if isinstance(markers, dict) else None
-        agent = plex.get("agent") if isinstance(plex, dict) else None
-        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+        agent = _server_agent(entry)
+        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
             servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
     return {"groups": groups, "servers": servers}
 
@@ -400,6 +412,20 @@ def update_node(node_id: str):
     return jsonify(_row_for(node_id))
 
 
+def _forget_switched_off_choice(sm: Any, node_id: str) -> None:
+    """Drop a removed node from the Plex servers that remembered it with their Plex database node switched off, so
+    switching one on again asks for a node instead of pointing at one that is gone."""
+    servers = copy.deepcopy(sm.get("media_servers") or [])
+    changed = False
+    for entry in servers:
+        agent = _server_agent(entry)
+        if agent is not None and agent.get("node_id") == node_id:
+            agent["node_id"] = None
+            changed = True
+    if changed:
+        sm.set("media_servers", servers)
+
+
 @api.route("/nodes/<node_id>", methods=["DELETE"])
 @api_token_required
 def delete_node(node_id: str):
@@ -419,6 +445,7 @@ def delete_node(node_id: str):
             sm.update_nodes([n for n in nodes if n is not existing])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        _forget_switched_off_choice(sm, node_id)
     logger.info("Removed node {}", existing.get("name"))
     return jsonify({"ok": True})
 

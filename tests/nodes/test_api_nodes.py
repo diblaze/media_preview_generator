@@ -604,6 +604,40 @@ def _plex_server(agent: dict) -> dict:
     return {"id": "p1", "type": "plex", "name": "Home", "markers": {"plex": {"agent": agent}}}
 
 
+class TestSwitchedOffPlexDatabaseNode:
+    """A server whose Plex database node is switched off says this app opens the database: it doesn't use the node."""
+
+    def test_it_doesnt_keep_the_node_from_being_removed(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        _sm().set("media_servers", [_plex_server({"enabled": False, "node_id": node_id})])
+        assert client.get("/api/nodes").get_json()["nodes"][0]["used_by"]["servers"] == []
+
+        resp = client.delete(f"/api/nodes/{node_id}")
+
+        assert resp.status_code == 200, resp.get_json()
+        assert _sm().nodes == []
+        # Switching it on again asks for a node instead of pointing at one that is gone.
+        assert _sm().get("media_servers")[0]["markers"]["plex"]["agent"] == {"enabled": False, "node_id": None}
+
+    def test_a_v24_migrated_switched_off_helper_can_be_removed(self, client, nodes):
+        from media_preview_generator.upgrade import _migrate_schema
+
+        agent = {"enabled": False, "url": "http://old-helper:9494", "token": "k"}
+        markers = {
+            "enabled": True,
+            "library_ids": None,
+            "plex": {"db_write_confirmed_at": "2026-01-01", "on_plex_redetect": "restore", "agent": agent},
+        }
+        _sm().apply_changes(
+            updates={"_schema_version": 23, "media_servers": [{**_plex_server({}), "markers": markers}]}
+        )
+        _migrate_schema(_sm())
+
+        resp = client.delete(f"/api/nodes/{_sm().nodes[0]['id']}")
+
+        assert resp.status_code == 200, resp.get_json()
+
+
 class TestReinstalledNode:
     """The saved key at the saved address is what makes a node this node; a new id means it was reinstalled."""
 

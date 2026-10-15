@@ -464,7 +464,7 @@ def _migrate_schema(sm) -> None:
                with one member ``m1`` (device, count, job types). The groups revision moves on by one.
         v23 -- Drops ``max_concurrent_jobs``: workers decide how much runs at once, and only job start-up is bounded.
         v24 -- Moves every Plex helper's address and key into a ``nodes`` record (Plex database role) and points the
-               server's ``markers.plex.agent.node_id`` at it; the old ``url``/``token`` stay as a rollback aid.
+               server's ``markers.plex.agent.node_id`` at it; the server keeps no copy of the old ``url``/``token``.
     """
     current = sm.get("_schema_version", 1)
     if current > _CURRENT_SCHEMA_VERSION:
@@ -1818,57 +1818,77 @@ def _migrate_to_v23(sm) -> list[str]:
 def _migrate_to_v24(sm) -> list[str]:
     """Move every Plex helper's address and key into a ``nodes`` record and point the server at it.
 
-    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it gains ``"node_id"``. Servers that
-    share one helper (same address and key) share one node, which is on when any of them had it on. A block without
-    both an address and a key had no helper to move, so it gets ``"enabled": False, "node_id": None``.
+    ``markers.plex.agent`` was ``{"enabled", "url", "token"}`` per Plex server; it becomes ``{"enabled", "node_id"}``
+    (the address and key now live only on the node record). Servers that share one helper (same address and key)
+    share one node. The node is on when a server uses it: the helper switched on, Intro & Credits on and the server
+    itself on. Otherwise it is added turned off, so a helper nothing uses is never checked or reported offline.
 
-    The old ``url`` and ``token`` are left in the block only as a rollback aid: a build from before nodes reads them,
-    so going back keeps writing through the helper instead of quietly opening this app's own copy of the database.
-    Nothing new reads them (the node record holds the address and key), nothing new writes them, and
-    ``markers.settings.mask_server`` keeps masking ``token``. A block that already has ``node_id`` is left alone, and
-    a helper already on the nodes list (same address and key) is reused, so a re-run changes nothing.
+    A helper that can't be moved keeps its own switch with ``"node_id": None``: an address with no key, or an address
+    that isn't a valid http(s) one (logged). Switched on, its server is refused with "no node" until one is chosen;
+    before the upgrade nothing was written through it either, and it never falls back to this app's own copy of the
+    Plex database. A block with no address used this app's own copy before, so it gets ``"enabled": False``.
+
+    Rolling back to a build from before nodes means restoring the settings it wrote: that build refuses a v24 file
+    (``SchemaDowngradeError``), and the copy :func:`_backup_settings_before_migrating` takes before migrating
+    (``settings.json.pre-v<N>.bak`` beside settings.json) still has the helper's address and key.
+
+    A re-run changes nothing: a block that already has ``node_id`` keeps it (earlier builds of this migration left the
+    old ``url``/``token`` beside it; they are dropped), and a helper already on the nodes list (same address and key)
+    is reused.
     """
-    from .nodes.settings import NAME_MAX_LEN, default_record
+    from .nodes.settings import NAME_MAX_LEN, default_record, normalise_url
 
     stored = sm.get_all()
     servers = stored.get("media_servers")
     if not isinstance(servers, list):
         return []
     nodes = copy.deepcopy([n for n in stored.get("nodes") or [] if isinstance(n, dict)])
-    by_address = {(str(n.get("url") or "").rstrip("/"), str(n.get("key") or "")): n for n in nodes}
+    by_address = {(normalise_url(n.get("url"))[0], str(n.get("key") or "")): n for n in nodes}
     names = {str(n.get("name") or "").casefold() for n in nodes}
     servers_out = copy.deepcopy(servers)
-    moved = created = 0
+    changed = created = 0
+    nodes_changed = False
     for entry in servers_out:
         if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
             continue
         markers = entry.get("markers")
         plex = markers.get("plex") if isinstance(markers, dict) else None
         agent = plex.get("agent") if isinstance(plex, dict) else None
-        if not isinstance(agent, dict) or "node_id" in agent or ("url" not in agent and "token" not in agent):
+        if not isinstance(agent, dict) or ("url" not in agent and "token" not in agent):
             continue
-        url = str(agent.get("url") or "").strip().rstrip("/")
-        token = str(agent.get("token") or "").strip()
+        changed += 1
+        raw_url = agent.pop("url", None)
+        token = str(agent.pop("token", None) or "").strip()
+        if "node_id" in agent:
+            continue
         enabled = bool(agent.get("enabled"))
-        moved += 1
+        has_address = bool(str(raw_url or "").strip())
+        url = normalise_url(raw_url)[0] if has_address else None
         if not (url and token):
-            agent.update({"enabled": False, "node_id": None})
+            if has_address and url is None:
+                logger.warning(
+                    "The Plex helper address of {} isn't a valid http(s) address, so it wasn't moved to the Nodes "
+                    "page. Add the helper there and choose it in that server's Intro & Credits settings.",
+                    str(entry.get("name") or "a Plex server"),
+                )
+            agent.update({"enabled": enabled and has_address, "node_id": None})
             continue
+        in_use = enabled and bool(markers.get("enabled")) and entry.get("enabled", True) is not False
         node = by_address.get((url, token))
         if node is None:
             name = _helper_node_name(str(entry.get("name") or "").strip() or "Plex", names, NAME_MAX_LEN)
             names.add(name.casefold())
-            node = default_record(name=name, url=url, key=token, enabled=enabled)
+            node = default_record(name=name, url=url, key=token, enabled=in_use)
             nodes.append(node)
             by_address[(url, token)] = node
             created += 1
-        elif enabled:
-            node["enabled"] = True
+        elif in_use and not node.get("enabled"):
+            node["enabled"] = nodes_changed = True
         agent.update({"enabled": enabled, "node_id": node["id"]})
-    if not moved:
+    if not changed:
         return []
     updates: dict[str, Any] = {"media_servers": servers_out}
-    if created:
+    if created or nodes_changed:
         updates["nodes"] = nodes
         updates["nodes_revision"] = int(stored.get("nodes_revision", 0)) + 1
     sm.apply_changes(updates=updates)

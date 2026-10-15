@@ -67,14 +67,19 @@
     // The select's values besides a node id: this app, and the entry that opens the Nodes page.
     const DB_LOCAL = '';
     const DB_ADD_NODE = '__add_node__';
-    // A helper stored as {url, token} with no node behind it (settings from before nodes): kept as it is on save.
+    // Switched on with no node behind it (a helper the upgrade couldn't move to the Nodes page): kept as it is on
+    // save, and refused with "no node" until a node is chosen, so this app never opens its own copy instead.
     const DB_OLD_HELPER = '__old_helper__';
 
     function storedDbChoice(server) {
         const agent = storedAgent(server);
         if (!agent.enabled) return DB_LOCAL;
-        if (agent.node_id) return String(agent.node_id);
-        return agent.url ? DB_OLD_HELPER : DB_LOCAL;
+        return agent.node_id ? String(agent.node_id) : DB_OLD_HELPER;
+    }
+
+    function oldHelperLabel(server) {
+        const url = storedAgent(server).url;
+        return url ? `Through the Plex helper at ${url}` : "Through a Plex helper that isn't on the Nodes page";
     }
 
     function isPlexDbNode(node) {
@@ -345,7 +350,7 @@
         });
         const stored = storedDbChoice(server);
         if (stored === DB_OLD_HELPER) {
-            html += dbOption(DB_OLD_HELPER, `Through the Plex helper at ${storedAgent(server).url}`);
+            html += dbOption(DB_OLD_HELPER, oldHelperLabel(server));
         } else if (stored !== DB_LOCAL && !nodes.some((n) => String(n.id) === stored)) {
             // A saved node that hasn't answered since this app started reports no roles yet, so the filter above
             // misses it: it is still on the Nodes page.
