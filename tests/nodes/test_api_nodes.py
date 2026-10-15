@@ -1530,7 +1530,7 @@ class TestTheGuide:
         labels = re.findall(r"\w+: \{ tone: '\w+', label: '([^']+)'", block)
         guide = (self.DOCS / "guides.md").read_text(encoding="utf-8")
         section = guide.split("## Remote nodes", 1)[1].split("\n## ", 1)[0]
-        assert "Temp folder problem" in labels and "Added twice" in labels
+        assert {"Temp folder problem", "Added twice", "Offline"} <= set(labels)
         assert [label for label in labels if f"**{label}**" not in section] == []
 
     @pytest.mark.parametrize(

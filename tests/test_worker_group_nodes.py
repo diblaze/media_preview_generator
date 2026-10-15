@@ -62,6 +62,7 @@ class FakeRegistry(NodeRegistry):
         reason: str = "",
         name=None,
         roles: tuple = ("worker",),
+        cause: str = "",
     ) -> None:
         self._views[node_id] = NodeView(
             id=node_id,
@@ -76,6 +77,7 @@ class FakeRegistry(NodeRegistry):
             cpu_cores=24,
             legacy=False,
             last_seen=None,
+            cause=cause,
         )
         ready = state == STATE_READY
         self._capacity[node_id] = NodeCapacity(cpu=ready or state == STATE_GPU_LOST, gpu=ready, reason=reason)

@@ -5,8 +5,10 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,7 @@ from media_preview_generator.nodes.access_results import AccessResultStore
 from media_preview_generator.nodes.client import (
     NodeAuthError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeTimeoutError,
     NodeUnreachableError,
 )
@@ -419,7 +422,7 @@ class TestStates:
 
         assert view.state == reg.STATE_OFFLINE
         assert view.reason == "nuc is restarting; it gets no files until it is back."
-        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node restarting")
 
     def test_a_restarting_node_is_checked_again_within_seconds_not_after_the_offline_back_off(self, h):
         # A docker restart is back in ~5 s; the offline back-off left it without files for a minute or more.
@@ -1476,6 +1479,31 @@ def test_a_node_asking_to_wait_and_something_that_isnt_a_node_say_why_they_are_o
     h.client().default_info = NodeProtocolError("not a node")
     h.legacy = ("unreachable", "")
     assert h.registry.check_now("n1").cause == reg.OFFLINE_NOT_A_NODE
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (_stopping_info, "node restarting"),
+        (lambda: NodeRateLimitedError("http://nuc:9494 asks this app to wait"), "node asks to wait"),
+        (lambda: NodeUnreachableError("http://nuc:9494 didn't answer"), "node offline"),
+        (lambda: NodeTimeoutError("http://nuc:9494 didn't answer in time"), "node offline"),
+    ],
+    ids=["restarting", "asks_to_wait", "unreachable", "stuck"],
+)
+def test_the_short_reason_a_node_gets_no_work_says_when_it_is_only_restarting_or_asks_to_wait(h, answer, reason):
+    """The wait banner and the Workers page's "0 now" chips said "node offline" for both, while Setup Health and the
+    bell said "rst is restarting" / "rl asks this app to wait": down in one place, nothing to do in the next."""
+    h.client().default_info = answer()
+    h.registry.check_now("n1")
+    assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, reason)
+
+
+def test_the_workers_page_says_the_same_words_for_each_offline_cause():
+    """The editor's chips judge from the node list (app.js NODE_STATES), the saved member rows from capacity()."""
+    js = (Path(reg.__file__).resolve().parents[1] / "web" / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    causes = re.search(r"offline: \{[^\n]*causes: \{([^}]*)\}", js).group(1)
+    assert dict(re.findall(r"(\w+): '([^']+)'", causes)) == reg._OFFLINE_CAPACITY_REASONS
 
 
 @pytest.mark.parametrize(

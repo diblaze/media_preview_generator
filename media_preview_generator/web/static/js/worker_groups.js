@@ -98,7 +98,9 @@
         const node = nodeFor(member);
         if (!node) return 'node removed';
         if (!runsWorkers(node)) return "node doesn't run workers";
-        const reason = nodeState(node.state)?.short || node.reason || `node ${nodeStateLabel(node).toLowerCase()}`;
+        const state = nodeState(node.state);
+        const reason = state?.causes?.[node.cause] || state?.short || node.reason
+            || `node ${nodeStateLabel(node).toLowerCase()}`;
         if (member.resource === 'cpu') return ['ready', 'gpu_lost'].includes(node.state) ? '' : reason;
         if (node.state !== 'ready') return reason;
         const gpu = (node.devices || []).find(item => item.device === member.device);

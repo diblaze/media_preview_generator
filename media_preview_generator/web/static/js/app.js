@@ -3193,7 +3193,8 @@ function updateWorkerStatuses(workers, options = {}) {
 
 // One name and colour per node state for every page that shows one (Nodes, Workers, the dashboard): red gets no
 // work (its Setup Health has a Must fix), amber still works in part, grey isn't checked yet or is switched off.
-// ``short`` is the "0 now" chip's text, the same words the server gives a member with no workers.
+// ``short`` is the "0 now" chip's text, the same words the server gives a member with no workers; ``causes`` the
+// ones for an offline node that answered (restarting, asking to wait), which has nothing to fix.
 window.NODE_STATES = Object.freeze({
     ready: { tone: 'ok', label: 'Ready', short: '' },
     update_needed: { tone: 'bad', label: 'Update needed', short: 'node needs an update' },
@@ -3202,7 +3203,7 @@ window.NODE_STATES = Object.freeze({
     no_ffmpeg: { tone: 'bad', label: 'FFmpeg missing', short: 'FFmpeg missing on node' },
     duplicate: { tone: 'bad', label: 'Added twice', short: 'node added twice' },
     temp_problem: { tone: 'bad', label: 'Temp folder problem', short: "node's temp folder can't be used" },
-    offline: { tone: 'bad', label: 'Offline', short: 'node offline' },
+    offline: { tone: 'bad', label: 'Offline', short: 'node offline', causes: { restarting: 'node restarting', rate_limited: 'node asks to wait' } },
     key_refused: { tone: 'bad', label: 'Key refused', short: 'key refused' },
     connecting: { tone: 'off', label: 'Connecting…', short: 'connecting to node' },
     disabled: { tone: 'off', label: 'Turned off', short: 'node turned off' },

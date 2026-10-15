@@ -156,6 +156,31 @@ def test_settings_row_and_editor_flag_an_offline_node_member(
     expect(page.locator('[data-member="m-laptop"] [data-pick]')).to_have_value("node:laptop:gpu:cuda:0")
 
 
+@pytest.mark.parametrize(
+    ("cause", "reason", "short"),
+    [
+        ("restarting", "old-laptop is restarting; it gets no files until it is back.", "node restarting"),
+        ("rate_limited", "old-laptop asks this app to wait.", "node asks to wait"),
+    ],
+    ids=["restarting", "asks_to_wait"],
+)
+def test_editor_says_a_node_member_is_only_restarting_or_asked_to_wait(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+    cause: str,
+    reason: str,
+    short: str,
+) -> None:
+    """Its chip said "node offline · 0 now" while its tooltip, Setup Health and the bell said it is restarting."""
+    offline_node_group(group_api)
+    laptop = next(node for node in group_api["state"]["nodes"] if node["id"] == "laptop")
+    laptop.update(cause=cause, reason=reason)
+    settings_page(authed_page, app_url)
+    authed_page.locator('[data-edit="gpu-video"]').click()
+    expect(authed_page.locator('[data-member="m-laptop"] [data-node-zero]')).to_have_text(f"{short} · 0 now")
+
+
 def test_dashboard_shows_node_chip_zero_reason_and_offline_worker_card(
     authed_page: Page,
     app_url: str,

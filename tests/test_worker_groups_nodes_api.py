@@ -92,7 +92,7 @@ class TestSave:
 class TestPayload:
     def test_nodes_list_gives_the_picker_state_devices_and_cores_without_secrets(self, client, registry):
         registry.put("storage", name="Storage box")
-        registry.put("nuc", state=STATE_OFFLINE, reason="node offline", gpus=())
+        registry.put("nuc", state=STATE_OFFLINE, reason="nuc is restarting", gpus=(), cause="restarting")
         nodes = client.get("/api/worker-groups").get_json()["nodes"]
         assert nodes == [
             {
@@ -100,6 +100,7 @@ class TestPayload:
                 "name": "Storage box",
                 "state": "ready",
                 "reason": "",
+                "cause": "",
                 "roles": ["worker"],
                 "devices": [NODE_GPU],
                 "cpu_cores": 24,
@@ -108,7 +109,9 @@ class TestPayload:
                 "id": "nuc",
                 "name": "nuc",
                 "state": "offline",
-                "reason": "node offline",
+                "reason": "nuc is restarting",
+                # The "0 now" chip reads it: a restarting node says so rather than "node offline".
+                "cause": "restarting",
                 "roles": ["worker"],
                 "devices": [],
                 "cpu_cores": 24,
