@@ -793,6 +793,42 @@ class TestNodeSentValues:
         text = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_data(as_text=True)
         assert json.loads(text, parse_constant=refuse)["info"]["worker"]["cpu"]["load1"] is None
 
+    def _good_and_bad(self, client, nodes):
+        nodes("http://good:9494").info_answer = _info(uid="uid-good")
+        nodes("http://bad:9494").info_answer = _info(uid="uid-bad")
+        good = _add(client, name="good", url="http://good:9494").get_json()["id"]
+        bad = _add(client, name="bad", url="http://bad:9494").get_json()["id"]
+        return good, bad
+
+    @pytest.mark.parametrize("field", ["cores", "busy"])
+    def test_an_out_of_range_number_from_one_node_keeps_every_node_listed(self, client, nodes, field):
+        import json
+
+        good, bad = self._good_and_bad(client, nodes)
+        answer = _info(uid="uid-bad")
+        # JSON's 1e400 parses to infinity, which int() refuses.
+        target = answer["worker"]["cpu"] if field == "cores" else answer["worker"]
+        target[field] = json.loads("1e400")
+        nodes("http://bad:9494").info_answer = answer
+        client.post(f"/api/nodes/{good}/check")
+        client.post(f"/api/nodes/{bad}/check")
+        resp = client.get("/api/nodes")
+        assert resp.status_code == 200
+        assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
+        assert {v.id for v in reg.get_registry().views()} == {good, bad}
+
+    def test_a_deeply_nested_answer_from_one_node_keeps_every_node_listed(self, client, nodes):
+        import json
+
+        good, bad = self._good_and_bad(client, nodes)
+        answer = _info(uid="uid-bad")
+        answer["extra"] = json.loads("[" * 600 + "]" * 600)
+        nodes("http://bad:9494").info_answer = answer
+        client.post(f"/api/nodes/{bad}/check")
+        resp = client.get("/api/nodes")
+        assert resp.status_code == 200
+        assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
+
 
 class TestATestOfRowsSavedLater:
     """Add node and the Media tab test the rows in the editor before saving them: a pass is kept once they are."""

@@ -10,6 +10,7 @@ answering, a file it couldn't see, a GPU that failed); every state change bumps 
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from collections import deque
@@ -57,6 +58,11 @@ NOT_VISIBLE_LIMIT = 3
 PENDING_ACCESS_TTL_S = 600.0
 GPU_LOST_RECHECK_S = 300.0
 MAX_PARALLEL_CHECKS = 8
+# Bounds on what a node's /v1/info and GPU rescan answers may hold once kept here (every reader copies them): far
+# above what a node sends (a few GPUs, short facts), low enough that a broken or hostile answer can't break readers.
+INFO_TEXT_MAX = 4096
+INFO_LIST_MAX = 256
+INFO_DEPTH_MAX = 8
 LEGACY_PING_TIMEOUT_S = 10.0
 LOOP_TICK_S = 1.0
 
@@ -292,8 +298,28 @@ def _clean_gpus(raw: object) -> tuple[dict, ...]:
 def _count(raw: object) -> int:
     try:
         return max(0, int(raw or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _bounded(value: object, depth: int = 0) -> Any:
+    """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
+
+    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, and a deeply nested answer breaks ``deepcopy``.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value[:INFO_TEXT_MAX]
+    if isinstance(value, int | float):
+        return value if math.isfinite(value) else None
+    if depth >= INFO_DEPTH_MAX:
+        return None
+    if isinstance(value, dict):
+        return {str(k)[:INFO_TEXT_MAX]: _bounded(v, depth + 1) for k, v in list(value.items())[:INFO_LIST_MAX]}
+    if isinstance(value, list | tuple):
+        return [_bounded(v, depth + 1) for v in value[:INFO_LIST_MAX]]
+    return None
 
 
 def _gpus_in(answer: object) -> tuple[dict, ...]:
@@ -829,10 +855,7 @@ class NodeRegistry:
         state, reason = self._state(live)
         worker = (live.info or {}).get("worker") or {}
         cpu = worker.get("cpu") or {}
-        try:
-            cores = int(cpu.get("cores") or 0)
-        except (TypeError, ValueError):
-            cores = 0
+        cores = _count(cpu.get("cores"))
         return NodeView(
             id=str(live.record.get("id") or ""),
             name=str(live.record.get("name") or ""),
@@ -993,7 +1016,7 @@ class NodeRegistry:
         timeouts = 0
         for attempt in range(CHECK_ATTEMPTS):
             try:
-                info = client.info()
+                info = _bounded(client.info())
                 break
             except NodeAuthError:
                 return _Outcome(
@@ -1002,7 +1025,7 @@ class NodeRegistry:
                 )
             except NodeProtocolError as exc:
                 if exc.node is not None:
-                    return self._other_protocol(name, exc.node)
+                    return self._other_protocol(name, _bounded(exc.node))
                 return self._probe_legacy(record)
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
@@ -1130,7 +1153,7 @@ class NodeRegistry:
                 return
             client, name = live.client, str(live.record.get("name") or "The node")
         try:
-            answer = client.rescan_gpus()
+            answer = _bounded(client.rescan_gpus())
             gpus = _gpus_in(answer)
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)
