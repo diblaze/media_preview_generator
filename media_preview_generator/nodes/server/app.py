@@ -67,6 +67,13 @@ def _resolve_roles(roles: list[str] | None) -> list[str]:
             chosen.append(role)
     if not chosen:
         raise SystemExit(f"NODE_ROLES must name at least one role: {', '.join(protocol.ROLES)}.")
+    # Set by the slim Plex database image, which carries no FFmpeg or GPU code: a worker role there would look healthy
+    # and fail every file sent to it.
+    image_roles = [r.strip() for r in os.environ.get("NODE_IMAGE_ROLES", "").split(",") if r.strip()]
+    if image_roles and protocol.ROLE_WORKER in chosen and protocol.ROLE_WORKER not in image_roles:
+        raise SystemExit(
+            "This image only has the Plex database role; use the main image (with MODE=node) for a worker node."
+        )
     return chosen
 
 

@@ -25,7 +25,7 @@ HEADERS = {"Authorization": f"Bearer {KEY}", protocol.PROTOCOL_HEADER: "1"}
 
 @pytest.fixture(autouse=True)
 def _node_env(tmp_path, monkeypatch):
-    for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_NAME", "NODE_ROLES", "PLEX_CONFIG_DIR"):
+    for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_NAME", "NODE_ROLES", "NODE_IMAGE_ROLES", "PLEX_CONFIG_DIR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
@@ -399,6 +399,15 @@ class TestRoles:
     def test_empty_roles_list_refuses_to_start(self, make_app):
         with pytest.raises(SystemExit):
             make_app(roles=[])
+
+    @pytest.mark.parametrize("value", ["worker", "plex_db,worker"])
+    def test_the_plex_database_image_refuses_the_worker_role(self, make_app, monkeypatch, value):
+        # The slim image sets NODE_IMAGE_ROLES: it has no FFmpeg, so a worker there would fail every file it got.
+        monkeypatch.setenv("NODE_IMAGE_ROLES", "plex_db")
+        monkeypatch.setenv("NODE_ROLES", value)
+
+        with pytest.raises(SystemExit, match="only has the Plex database role; use the main image"):
+            make_app(ops=None)
 
     def test_plex_db_without_plex_config_dir_refuses_to_start(self, make_app):
         with pytest.raises(SystemExit, match="PLEX_CONFIG_DIR"):
