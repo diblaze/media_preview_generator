@@ -100,8 +100,10 @@ returns, made JSON-safe.
 "device"} | null, "params": {...}, "client_task_id"?}` — `path` is the **app's** path; the node maps it.
 `client_task_id` (optional, 16-64 of `[A-Za-z0-9_-]`; the app sends a fresh uuid hex per task) becomes the task id. A
 repeated start with an id the node already has answers that task and starts nothing, so a start whose answer was lost
-can't run twice. When the app's start times out after reaching the node, it sends `DELETE /v1/tasks/<client_task_id>`
-(404 = it never started), so FFmpeg doesn't keep running there until the unpolled-task expiry.
+can't run twice. When the app's start times out after reaching the node, or the connection drops before its answer,
+it sends `DELETE /v1/tasks/<client_task_id>` (404 = it never started), so FFmpeg doesn't keep running there until the
+unpolled-task expiry. The node remembers an id it was asked to delete before knowing it (5 minutes, at most 1024 ids):
+a start arriving after that DELETE answers 409 `task_deleted` and runs nothing.
 
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.
@@ -109,7 +111,7 @@ can't run twice. When the app's start times out after reaching the node, it send
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
 `unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`.
+`unknown_task`, `request`, `task_deleted`.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll.

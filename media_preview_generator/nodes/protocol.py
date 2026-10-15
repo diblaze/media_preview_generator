@@ -66,6 +66,8 @@ KIND_AUTH = "auth"
 KIND_PROTOCOL = "protocol"
 KIND_UNKNOWN_TASK = "unknown_task"
 KIND_REQUEST = "request"
+# A start whose client_task_id the app already DELETEd (the DELETE overtook the start): nothing ran.
+KIND_TASK_DELETED = "task_deleted"
 
 # Why a node can't see a file (``error.reason`` / access-check ``kind``).
 NOT_VISIBLE_UNMAPPED = "unmapped"

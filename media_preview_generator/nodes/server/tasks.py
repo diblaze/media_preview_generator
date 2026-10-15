@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -48,6 +48,10 @@ from . import access, nodelog
 TASK_LOG_LINES = 2000
 TASK_DIR_PREFIX = "mpg-task-"
 REAP_INTERVAL_S = 5.0
+# A DELETE for a task id the node doesn't know yet can overtake its start (the app gave up waiting for the
+# start's answer): the id is refused for a start this long after, and this many such ids are remembered.
+DELETED_ID_KEEP_S = 300.0
+DELETED_IDS_MAX = 1024
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
 
 # The app's own "cancelled" exceptions, by module: an op that stops because cancel_check() fired raises one of these
@@ -63,6 +67,10 @@ _CANCELLATION_CLASSES = (
 
 class TaskSpecError(ValueError):
     """The task spec is malformed (answered 400, kind ``request``)."""
+
+
+class TaskDeletedError(Exception):
+    """The app deleted this task id before its start arrived (answered 409, kind ``task_deleted``): nothing runs."""
 
 
 def default_temp_root() -> str:
@@ -284,6 +292,8 @@ class TaskTable:
         self._finished_keep_s = finished_keep_s
         self._on_gpu_failed = on_gpu_failed
         self._tasks: dict[str, NodeTask] = {}
+        # Task id -> when a DELETE found no such task (oldest first), so a start arriving after it never runs.
+        self._deleted_unknown: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         os.makedirs(temp_root, exist_ok=True)
@@ -315,13 +325,15 @@ class TaskTable:
             spec: The request body.
 
         A spec carrying ``client_task_id`` gets that as its id; a repeated start with the same id answers the task
-        already there (running or finished) and starts nothing.
+        already there (running or finished) and starts nothing, and a start whose id was deleted before it arrived
+        starts nothing either.
 
         Returns:
             The task id (the op is still running).
 
         Raises:
             TaskSpecError: The spec is malformed or names an op this node doesn't have.
+            TaskDeletedError: The app deleted this id in the last ``DELETED_ID_KEEP_S``.
         """
         if not isinstance(spec, dict):
             raise TaskSpecError("the task spec must be an object")
@@ -338,11 +350,17 @@ class TaskTable:
         gpu = _parse_gpu(spec.get("gpu"))
         task_id = _client_task_id(spec) or uuid.uuid4().hex
         with self._lock:
+            self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
         temp_dir = tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
+            try:
+                self._refuse_deleted(task_id)  # its DELETE may have come while the temp dir was made
+            except TaskDeletedError:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
             if task_id in self._tasks:  # The same start, twice at once: the first one runs.
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 return task_id
@@ -444,10 +462,27 @@ class TaskTable:
         """The task (None: unknown), counting as contact."""
         return self._touch(task_id)
 
+    def _refuse_deleted(self, task_id: str) -> None:
+        # Under the lock. Ids past their time go first; the dict is in deletion order.
+        now = time.monotonic()
+        while self._deleted_unknown:
+            oldest, deleted_at = next(iter(self._deleted_unknown.items()))
+            if now - deleted_at < DELETED_ID_KEEP_S:
+                break
+            del self._deleted_unknown[oldest]
+        if task_id in self._deleted_unknown:
+            raise TaskDeletedError("The app deleted this task before its start arrived; nothing was started")
+
     def delete(self, task_id: str) -> bool:
-        """Drop the task now: cancel it if it runs, free its temp dir. False: unknown task."""
+        """Drop the task now: cancel it if it runs, free its temp dir. False: unknown task, whose id is then refused
+        for a start for ``DELETED_ID_KEEP_S`` (the DELETE overtook it)."""
         with self._lock:
             task = self._tasks.pop(task_id, None)
+            if task is None:
+                self._deleted_unknown.pop(task_id, None)
+                self._deleted_unknown[task_id] = time.monotonic()
+                while len(self._deleted_unknown) > DELETED_IDS_MAX:
+                    self._deleted_unknown.popitem(last=False)
         if task is None:
             return False
         self._discard(task)

@@ -289,6 +289,8 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             task_id = table.start(body)
         except tasks.TaskSpecError as exc:
             return refuse(protocol.KIND_REQUEST, 400, str(exc))
+        except tasks.TaskDeletedError as exc:
+            return refuse(protocol.KIND_TASK_DELETED, 409, str(exc))
         return answer({"id": task_id}, 202)
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")

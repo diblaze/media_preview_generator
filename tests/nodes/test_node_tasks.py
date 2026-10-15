@@ -263,6 +263,36 @@ class TestClientTaskId:
         _until(lambda: not os.path.exists(seen["temp"]))
         assert self.CLIENT_ID not in table
 
+    def test_a_start_that_arrives_after_its_delete_never_runs(self, make_table, media):
+        runs = []
+        table = make_table({"test.op": lambda *a: runs.append(1) or {}})
+
+        assert table.delete(self.CLIENT_ID) is False  # the DELETE overtook its start
+        with pytest.raises(tasks.TaskDeletedError):
+            table.start(_spec(media, client_task_id=self.CLIENT_ID))
+
+        assert self.CLIENT_ID not in table and runs == []
+        assert [n for n in os.listdir(table.temp_root) if n.startswith(tasks.TASK_DIR_PREFIX)] == []
+
+    def test_a_deleted_id_is_forgotten_after_its_time(self, make_table, media, monkeypatch):
+        table = make_table({"test.op": lambda *a: {}})
+        now = [1000.0]
+        monkeypatch.setattr(tasks.time, "monotonic", lambda: now[0])
+        table.delete(self.CLIENT_ID)
+        now[0] += tasks.DELETED_ID_KEEP_S + 1
+
+        assert table.start(_spec(media, client_task_id=self.CLIENT_ID)) == self.CLIENT_ID
+
+    def test_only_so_many_deleted_ids_are_kept(self, make_table, media):
+        table = make_table({"test.op": lambda *a: {}})
+        ids = [f"{n:032x}" for n in range(tasks.DELETED_IDS_MAX + 1)]
+        for task_id in ids:
+            table.delete(task_id)
+
+        assert table.start(_spec(media, client_task_id=ids[0])) == ids[0]  # the oldest made room
+        with pytest.raises(tasks.TaskDeletedError):
+            table.start(_spec(media, client_task_id=ids[-1]))
+
 
 class TestCancelAndPause:
     def test_cancel_stops_the_op_and_is_cancelled(self, make_table, media):

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+from urllib3.exceptions import ProtocolError
 
 from . import protocol
 
@@ -32,8 +33,8 @@ class NodeUnreachableError(NodeError):
 
 
 class NodeTimeoutError(NodeUnreachableError):
-    """The request reached the node but no answer came in time: unlike a refused connection, the node may have acted
-    on it."""
+    """The request reached the node but no answer came: it didn't come in time, or the connection dropped before it
+    did. Unlike a refused connection, the node may have acted on it."""
 
 
 class NodeAuthError(NodeError):
@@ -50,6 +51,17 @@ class NodeUnknownTaskError(NodeError):
 
 class NodeRequestError(NodeError):
     """The node refused the request as malformed (400). A bug on one side, never a user problem."""
+
+
+class NodeTaskDeletedError(NodeError):
+    """The node refused a start whose task id this app had already deleted (409 ``task_deleted``): nothing ran."""
+
+
+def _answer_lost(exc: requests.ConnectionError) -> bool:
+    """Whether the connection dropped after it was made (closed or reset mid-request), so the node may have the
+    request; a connection never made (refused, DNS) reaches requests as ``MaxRetryError`` instead."""
+    reason = exc.args[0] if exc.args else None
+    return any(isinstance(cause, ProtocolError | ConnectionResetError) for cause in (reason, exc.__context__))
 
 
 @dataclass(frozen=True)
@@ -110,6 +122,10 @@ class NodeClient:
             )
         except requests.ReadTimeout as exc:
             raise NodeTimeoutError(f"{self._address.base} didn't answer in time: {type(exc).__name__}") from exc
+        except requests.ConnectionError as exc:
+            if _answer_lost(exc):
+                raise NodeTimeoutError(f"{self._address.base} dropped the connection before answering") from exc
+            raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
         except requests.RequestException as exc:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
         if response.status_code == 401:
@@ -137,6 +153,8 @@ class NodeClient:
             raise NodeProtocolError(f"{self._address.base} doesn't know {path} (an older Plex helper?)")
         if response.status_code == 409 and kind == protocol.KIND_PROTOCOL:
             raise NodeProtocolError(message)
+        if response.status_code == 409 and kind == protocol.KIND_TASK_DELETED:
+            raise NodeTaskDeletedError(message)
         if response.status_code == 400:
             raise NodeRequestError(message)
         if response.status_code >= 400:

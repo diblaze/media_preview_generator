@@ -263,6 +263,20 @@ class TestTaskRoutes:
         assert (again.status_code, again.get_json()["id"]) == (202, client_id)
         assert runs == [1]
 
+    def test_a_start_after_its_delete_is_409_task_deleted(self, make_app, media):
+        runs = []
+        client = make_app(ops={"test.op": lambda *a: runs.append(1) or {}}).test_client()
+        client_id = "fedcba9876543210fedcba9876543210"
+        spec = {"op": "test.op", "path": "/data/a.mkv", "client_task_id": client_id,
+                "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}  # fmt: skip
+
+        deleted = client.delete(f"/v1/tasks/{client_id}", headers=HEADERS)
+        late = client.post("/v1/tasks", headers=HEADERS, json=spec)
+
+        assert deleted.status_code == 404
+        assert late.status_code == 409 and late.get_json()["error"]["kind"] == protocol.KIND_TASK_DELETED
+        assert runs == []
+
     def test_no_artifact_is_404_request(self, make_app, media):
         client = make_app(ops={"test.op": lambda *a: {}}).test_client()
         spec = {"op": "test.op", "path": "/data/a.mkv", "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}]}

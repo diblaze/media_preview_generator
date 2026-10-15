@@ -13,7 +13,12 @@ from loguru import logger
 
 from media_preview_generator.jobs.worker import is_job_thread_for, job_thread
 from media_preview_generator.nodes import executor, protocol
-from media_preview_generator.nodes.client import NodeAuthError, NodeTimeoutError, NodeUnknownTaskError
+from media_preview_generator.nodes.client import (
+    NodeAuthError,
+    NodeTaskDeletedError,
+    NodeTimeoutError,
+    NodeUnknownTaskError,
+)
 from media_preview_generator.nodes.executor import (
     FileNotVisibleError,
     NodeTaskCancelledError,
@@ -248,6 +253,17 @@ class TestNodeDrops:
         assert client.deleted == [client.started_with["client_task_id"]]
         assert client.named("poll") == []
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_a_start_the_node_refuses_as_already_deleted_never_ran(self, media):
+        client = ScriptedClient(
+            [running()], start_error=NodeTaskDeletedError("this task was deleted before it started")
+        )
+        _install(client)
+        with pytest.raises(NodeUnavailableError, match="couldn't start") as raised:
+            _run(media)
+        assert raised.value.started is False
+        assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_NOT_STARTED
+        assert client.deleted == [] and client.named("poll") == []
 
     def test_each_task_gets_its_own_client_id(self, media):
         ids = []
