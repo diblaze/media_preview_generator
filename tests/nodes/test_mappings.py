@@ -125,6 +125,29 @@ class TestSampleFiles:
     def test_a_missing_folder_gives_nothing(self, tmp_path):
         assert nm.sample_files(str(tmp_path / "nope")) == []
 
+    def test_symlinked_show_folders_are_walked(self, tmp_path):
+        _video(tmp_path / "disk3" / "tv" / "Show" / "s01e01.mkv")
+        library = tmp_path / "media" / "tv"
+        library.mkdir(parents=True)
+        os.symlink(tmp_path / "disk3" / "tv" / "Show", library / "Show")
+
+        found = nm.sample_files(str(library))
+
+        assert [f["path"] for f in found] == [str(library / "Show" / "s01e01.mkv")]
+
+    def test_a_symlink_loop_is_walked_once(self, tmp_path):
+        library = tmp_path / "media" / "tv"
+        _video(library / "Show" / "s01e01.mkv")
+        os.symlink(library, library / "Show" / "again")
+        os.symlink(library / "Show", library / "Show" / "self")
+
+        found = nm.sample_files(str(library), limit=10)
+
+        assert [f["path"] for f in found] == [
+            str(library / "Show" / "s01e01.mkv"),
+            str(library / "Show" / "self" / "s01e01.mkv"),
+        ]
+
 
 class TestRunTestAccess:
     def test_every_library_reports_its_files(self, tmp_path):

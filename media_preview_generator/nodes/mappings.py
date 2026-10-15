@@ -116,6 +116,9 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
     found = sampling.found
     seen = 0
     queue: deque[str] = deque([root])
+    # Libraries are often built from symlinked show folders, so links are followed; a link back into a folder already
+    # walked through a link is skipped, which ends a loop after one turn (walk_limit bounds the rest).
+    linked: set[str] = {os.path.realpath(root)}
     while queue and len(found) < limit and seen < walk_limit:
         if deadline is not None and time.monotonic() >= deadline:
             sampling.timed_out = True
@@ -132,9 +135,15 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
             if seen > walk_limit or len(found) >= limit:
                 break
             try:
-                if entry.is_dir(follow_symlinks=False):
-                    if not entry.name.startswith("."):
-                        queue.append(entry.path)
+                if entry.is_dir():
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_symlink():
+                        real = os.path.realpath(entry.path)
+                        if real in linked:
+                            continue
+                        linked.add(real)
+                    queue.append(entry.path)
                     continue
                 if os.path.splitext(entry.name)[1].lower() not in extensions:
                     continue
