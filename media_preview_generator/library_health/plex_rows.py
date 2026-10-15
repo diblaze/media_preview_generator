@@ -96,8 +96,8 @@ def query_rows(
 
 
 def read_rows(conn: sqlite3.Connection, section_ids: list[int], *, want_markers: bool, want_chapters: bool) -> dict:
-    """Run the queries for these sections, every row a list: the rows of a Plex database node's answer, which it sends
-    as it reads them instead of holding them all (``nodes.server.plex_db``).
+    """Run the queries for these sections, every row a list: the rows of a Plex database node's answer, which it
+    compresses as it reads them instead of holding them all as rows (``nodes.server.plex_db``).
 
     Args:
         conn: A read-only connection to Plex's database.

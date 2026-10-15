@@ -2497,6 +2497,17 @@ class TestSqliteErrors:
         # Busy and locked (and the transient WAL race) are waits that ran out: a job tries the file again soon.
         assert isinstance(err, DatabaseBusyError) is (state is Capability.UNREACHABLE)
 
+    @pytest.mark.parametrize("code", [11, None], ids=["sqlite-code", "message-only"])
+    def test_a_damaged_database_is_said_without_naming_one_feature(self, code):
+        # Library Health, loudness and chapters are refused with it too, not only marker writes.
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        if code is not None:
+            exc.sqlite_errorcode = code
+        assert str(plex_db.publish_error_from_sqlite(exc)) == (
+            "Database damaged: Plex's database needs repairing before this app can use it "
+            "(database disk image is malformed)"
+        )
+
 
 class TestSchemaGuards:
     def test_newest_parts_are_sampled_first(self, tmp_path):

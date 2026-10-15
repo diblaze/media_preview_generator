@@ -31,6 +31,7 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from loguru import logger
 
+from ...nodes.protocol import relayed_text
 from ..decide import FileLimits, unusable_server_marker
 from ..fs import filesystem_type, is_local_filesystem, is_network_filesystem
 from ..models import Candidate, Marker, MarkerType, Source
@@ -319,8 +320,10 @@ def node_wording(report: CapabilityReport) -> CapabilityReport:
         The same state and details with the node's wording; ``report`` itself when its wording names nobody.
     """
     details = report.details
+    # The facts below are whatever the node sent: each sentence stays one line of relayed length however many paths
+    # or characters came.
     if report.state is Capability.NEEDS_LOCAL_DB and "fs_type" in details:
-        fs_type = str(details.get("fs_type") or "")
+        fs_type = relayed_text(str(details.get("fs_type") or ""))
         where = (
             f"Plex's database is on a network share ({fs_type}) where the Plex database node runs."
             if is_network_filesystem(fs_type)
@@ -334,7 +337,7 @@ def node_wording(report: CapabilityReport) -> CapabilityReport:
             details,
         )
     if report.state is Capability.MISCONFIGURED and details.get("unwritable"):
-        return CapabilityReport(report.state, unwritable_message(details, node=True), details)
+        return CapabilityReport(report.state, relayed_text(unwritable_message(details, node=True)), details)
     if report.state is Capability.UNREACHABLE and details.get("lock_holder") is False:
         return CapabilityReport(
             report.state,
@@ -576,7 +579,7 @@ def publish_error_from_sqlite(exc: sqlite3.Error) -> PublishError:
         )
     if damaged:
         return PublishError(
-            f"Database damaged: Plex's database needs repairing before markers can be written ({text})",
+            f"Database damaged: Plex's database needs repairing before this app can use it ({text})",
             state=Capability.MISCONFIGURED,
         )
     if access:

@@ -428,3 +428,48 @@ def test_loudness_through_a_node_that_cant_write_plexs_database_talks_about_the_
     assert report.state is Capability.MISCONFIGURED
     assert report.message.startswith("The Plex database node (user 1000) can't write /plex/db")
     assert ("read-only" in report.message) is (owner == "1000")
+
+
+class _NodeSaying:
+    """A ``requests.Session`` for whatever answers at a node's address: every loudness request gets ``report``."""
+
+    def __init__(self, report: dict) -> None:
+        self.report = report
+
+    def post(self, *_args, **_kwargs):
+        import json
+
+        body = json.dumps(
+            {
+                "ok": True,
+                "agent": {"version": "1.2.0", "protocols": [1, 2], "capabilities": ["loudness_v1"]},
+                "result": {"report": self.report, "capability": "loudness_v1"},
+            }
+        ).encode()
+        return SimpleNamespace(
+            status_code=200, headers={}, iter_content=lambda chunk_size=1: iter([body]), close=lambda: None
+        )
+
+    get = post
+
+
+@pytest.mark.parametrize("check", ["file_checks", "capability"])
+def test_a_loudness_check_report_from_the_node_reaches_the_app_as_one_short_line(check):
+    # Loudness puts it in the job's rows and the log, as markers do.
+    from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
+    from media_preview_generator.nodes.protocol import RELAY_LINE_MAX
+
+    said = "Plex is fine\n2026-10-16 03:00:00 | ERROR | forged\x1b[31m " + "x" * 20_000
+    remote = RemotePlexDb(
+        "http://plex-host:9494", "k" * 32, session=_NodeSaying({"state": "misconfigured", "message": said})
+    )
+    server = MagicMock()
+    server._connect.return_value.query.return_value = Element(
+        "MediaContainer", machineIdentifier="plex-a", version="1.43.4.10903-e5521bd8c"
+    )
+
+    report = getattr(guard.RemoteLoudnessDb(server, remote), check)(deadline=time.monotonic() + 5)
+
+    assert report.state is Capability.MISCONFIGURED
+    assert report.message.startswith("Plex is fine\\n2026-10-16 03:00:00 | ERROR | forged\\x1b[31m xxx")
+    assert not any(c in report.message for c in "\n\x1b") and len(report.message) <= RELAY_LINE_MAX + 300

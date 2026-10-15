@@ -41,7 +41,8 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+import zlib
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from typing import Any
 
 from flask import Blueprint, Flask, Response, abort, current_app, g, jsonify, request
@@ -95,8 +96,14 @@ DEFAULT_PORT = 9494
 # longest-running has run under SLOT_WAIT_S (a burst of quick ones); past that they are stuck on the database, and it
 # is answered "full" at once (``plex_remote.NodeFullError``): the app waits and asks again, holding none of ours.
 SLOT_WAIT_S = 2.0
-# Library Health's rows go out in pieces of about this many characters, as they are read (``_streamed_rows``).
+# Library Health's rows are packed and sent in pieces of about this many characters (``_streamed_rows``).
 ROWS_CHUNK_CHARS = 64 * 1024
+# zlib's fastest level: the whole answer is read and packed while Plex's database is held, so speed beats size here.
+# A 100,000-episode answer (126 MB) packs to 22 MB.
+ROWS_PACK_LEVEL = 1
+# How often a space goes out while the rows are read (``_read_then_sent``): well inside the app's shortest wait for a
+# byte (``plex_remote.ANSWER_GRACE_S``).
+ROWS_KEEPALIVE_S = 1.0
 
 _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
@@ -303,7 +310,7 @@ def _bad_request(message: str) -> Any:
     return jsonify({"ok": False, "agent": agent_block(), "error": {"kind": "request", "message": message}}), 400
 
 
-def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Iterator[str]:
+def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Generator[str, None, None]:
     """Library Health's answer (``{"ok", "agent", "result": {"rows", "capability"}}``), in pieces as rows are read.
 
     The capability comes last: a read that fails partway, after the answer's status went out, ends the answer
@@ -338,21 +345,59 @@ def _streamed_rows(queries: Mapping[str, Iterator[Sequence[Any]]]) -> Iterator[s
     yield "".join(out)
 
 
-class _ClosingAnswer:
-    """A streamed answer that lets go of what it holds (``held``) once it is sent, or once it never will be."""
+def _read_then_sent(
+    queries: Mapping[str, Iterator[Sequence[Any]]], held: contextlib.ExitStack
+) -> Generator[bytes, None, None]:
+    """Library Health's answer: read whole while ``held`` (the database, the request's slot) is held, then sent.
 
-    def __init__(self, pieces: Iterator[str], held: contextlib.ExitStack) -> None:
+    Sent as it was read, the answer held Plex's database, its read transaction and the slot until the app had all but
+    the last 16 MB of it, which a slow or stalled app (gone from the network without hanging up) made minutes or for
+    good, and every check and write on the node waited. So it is kept compressed in memory, one block per piece, and
+    let go of ``held`` before its first byte: memory, not a temp file, because a node may run with a read-only
+    filesystem.
+    """
+    packer = zlib.compressobj(ROWS_PACK_LEVEL)
+    blocks = []
+    size = 0
+    keepalive = time.monotonic() + ROWS_KEEPALIVE_S
+    pieces = _streamed_rows(queries)
+    try:
+        for piece in pieces:
+            data = piece.encode()
+            # A sync flush per piece: each block unpacks to its own piece, never to more of the answer at once.
+            blocks.append(packer.compress(data) + packer.flush(zlib.Z_SYNC_FLUSH))
+            size += len(data)
+            if size > plex_remote.MAX_ANSWER_BYTES:
+                # No app reads further (it refuses the answer as too large), so the database read stops here.
+                break
+            if time.monotonic() >= keepalive:
+                # JSON may start with spaces: one now and then keeps the app's wait for the answer's first byte from
+                # running out while a big library is read on a slow machine.
+                yield b" "
+                keepalive = time.monotonic() + ROWS_KEEPALIVE_S
+    finally:
+        pieces.close()
+        held.close()
+    unpacker = zlib.decompressobj()
+    for block in blocks:
+        yield unpacker.decompress(block)
+
+
+class _ClosingAnswer:
+    """An answer that lets go of what it holds (``held``) once it is sent, or once it never will be."""
+
+    def __init__(self, pieces: Generator[bytes, None, None], held: contextlib.ExitStack) -> None:
         self._pieces = pieces
         self._held = held
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[bytes]:
         return self._pieces
 
     def close(self) -> None:
         # The server calls this on the thread that iterated, which is the one that opened the connection (its lock
-        # is per thread), whether or not the answer was sent.
+        # is per thread), whether or not the answer was sent; a generator never started runs no ``finally``.
         try:
-            self._pieces.close()  # type: ignore[attr-defined]
+            self._pieces.close()
         finally:
             self._held.close()
 
@@ -807,13 +852,13 @@ def register_plex_db(
             held.close()
             return _refused(publish_error_from_sqlite(exc))
         queries["parts"] = itertools.chain(first, queries["parts"])
-        # The rows go out as they are read, in one read of the database: a big library's rows held at once (and
-        # their JSON) took a node past its memory limit. The connection and this request's slot stay held until the
-        # answer is sent or the app hangs up.
+        # The rest is read in one read of the database once the 200 is out, kept compressed: a big library's rows
+        # (and their JSON) held as they are took a node past its memory limit. The connection and this request's
+        # slot are let go once the read is done, or when the app hangs up before.
         slot = g.pop("plex_db_slot", None)
         if slot is not None:
             held.callback(slots.give_back, slot)
-        return Response(_ClosingAnswer(_streamed_rows(queries), held), mimetype="application/json")
+        return Response(_ClosingAnswer(_read_then_sent(queries, held), held), mimetype="application/json")
 
     app.register_blueprint(bp)
     logger.info("Plex database role {} ready; Plex database: {}", AGENT_VERSION, plex_db_path(folder))

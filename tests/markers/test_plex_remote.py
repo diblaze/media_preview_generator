@@ -494,6 +494,52 @@ class TestFailuresLookLikeTodays:
         assert not any(c in message for c in "\n\x1b "), repr(message[:120])
         assert len(message) <= RELAY_LINE_MAX + 200
 
+    SAID = "Plex is fine\n2026-10-16 03:00:00 | ERROR | forged\x1b[31m " + "x" * 20_000
+
+    @staticmethod
+    def _one_short_line(text: str) -> None:
+        assert not any(c in text for c in "\n\x1b"), repr(text[:120])
+        assert len(text) <= RELAY_LINE_MAX + 300, len(text)
+
+    @pytest.mark.parametrize("check", ["file_checks", "db_checks"])
+    def test_a_check_report_the_node_sends_reaches_the_app_as_one_short_line(self, check):
+        # Markers put its message in the job's file rows and the log; Setup Health shows its paths.
+        details = {"db_path": self.SAID, "unwritable": [self.SAID, 7], "writer_uid": 1000, "lock_holder": True}
+        report = {"state": "misconfigured", "message": self.SAID, "details": details}
+        remote, _ = _remote(_envelope({"report": report}))
+
+        answer = getattr(remote, check)(deadline=_deadline())
+
+        assert answer.state is Capability.MISCONFIGURED
+        assert answer.message.startswith("Plex is fine\\n2026-10-16 03:00:00 | ERROR | forged\\x1b[31m xxx")
+        for text in (answer.message, answer.details["db_path"], answer.details["unwritable"][0]):
+            self._one_short_line(text)
+        assert (answer.details["unwritable"][1], answer.details["writer_uid"]) == (7, 1000)
+        assert answer.details["lock_holder"] is True
+
+    @pytest.mark.parametrize(
+        ("state", "details", "sentence"),
+        [
+            ("needs_local_db", {"fs_type": "nfs4\n" + SAID}, "Plex's database is on a filesystem the Plex database"),
+            ("needs_local_db", {"fs_type": {"type": SAID}}, "Plex's database is on a filesystem the Plex database"),
+            (
+                "misconfigured",
+                {"unwritable": [SAID] * 50, "writer_uid": SAID, "db_owner_uid": 0},
+                "The Plex database node (user Plex is fine\\n",
+            ),
+        ],
+        ids=["fs-type", "fs-type-not-text", "unwritable-paths"],
+    )
+    def test_the_sentence_the_app_words_from_the_node_s_facts_is_one_short_line(self, state, details, sentence):
+        from media_preview_generator.markers.publishers.plex_db import node_wording
+
+        remote, _ = _remote(_envelope({"report": {"state": state, "message": "x", "details": details}}))
+
+        answer = node_wording(remote.file_checks(deadline=_deadline()))
+
+        assert answer.message.startswith(sentence)
+        self._one_short_line(answer.message)
+
 
 class TestWhatIsSent:
     """The agent is told what to do and nothing else — no path, and a bounded deadline."""
