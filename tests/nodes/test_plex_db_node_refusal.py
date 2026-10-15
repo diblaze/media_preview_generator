@@ -6,6 +6,7 @@ Every path that resolves a server's Plex database node is covered: markers (``pl
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from xml.etree.ElementTree import Element
@@ -13,20 +14,23 @@ from xml.etree.ElementTree import Element
 import pytest
 
 from media_preview_generator.library_health import plex as health_plex
+from media_preview_generator.loudness import plex_db as loudness_db
 from media_preview_generator.loudness.guard import RemoteLoudnessDb, create_loudness_db, loudness_capability
 from media_preview_generator.markers.publishers import plex_chapters
-from media_preview_generator.markers.publishers.base import Capability
+from media_preview_generator.markers.publishers.base import Capability, PublishError
 from media_preview_generator.markers.publishers.plex_remote import (
     AGENT_DIFFERENT_NODE,
     AGENT_DISABLED,
     AGENT_NO_NODE,
     AgentClient,
+    AgentError,
     RemotePlexDb,
     plex_database,
 )
 from media_preview_generator.markers.settings import load_server
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.servers.base import ServerType
+from tests.loudness.test_plex_db import FIELDS
 
 NODE = {
     "id": "n1",
@@ -106,7 +110,7 @@ def test_markers(node, enabled, uid_ok, refused):
     db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session)
     assert isinstance(db, RemotePlexDb)
     if refused is None:
-        assert db._client._refusal is None
+        assert db._client.refusal() is None
         return
     report = db.file_checks(deadline=1e12)
     assert report.state is Capability.AGENT_UNAVAILABLE
@@ -145,7 +149,7 @@ def test_loudness(node, tmp_path, monkeypatch, enabled, uid_ok, refused):
     db = create_loudness_db(cfg, server)
     assert isinstance(db, RemoteLoudnessDb)
     if refused is None:
-        assert db._remote._client._refusal is None
+        assert db._remote._client.refusal() is None
         return
     report = loudness_capability(server, cfg)
     assert report.state is Capability.AGENT_UNAVAILABLE
@@ -162,7 +166,7 @@ def test_library_health(node, tmp_path, monkeypatch, enabled, uid_ok, refused):
     db = health_plex._open_db(_cfg(tmp_path))
     assert isinstance(db, RemotePlexDb)
     if refused is None:
-        assert db._client._refusal is None
+        assert db._client.refusal() is None
         return
     assert health_plex._node_refusal(db).startswith(MESSAGES[refused])
     sent.assert_not_called()
@@ -205,3 +209,71 @@ class TestLoudnessWithoutANode:
         report = loudness_capability(server, _cfg(tmp_path))
         assert report.state is Capability.AGENT_UNAVAILABLE
         assert report.message.startswith("This server has no Plex database node on the Nodes page.")
+
+
+class TestTurnedOffAfterTheDatabaseWasOpened:
+    """A job keeps its database for its whole run: turning the node off (or a different node turning up at its
+    address) mid-job has to stop the very next request, not the next job's."""
+
+    @pytest.fixture
+    def nothing_sent(self, monkeypatch):
+        sent = MagicMock(side_effect=AssertionError("nothing may be sent"))
+        monkeypatch.setattr("requests.Session.post", sent)
+        monkeypatch.setattr("requests.Session.get", sent)
+        return sent
+
+    TURNED = [
+        pytest.param({"enabled": False, "uid_ok": True}, AGENT_DISABLED, id="turned-off"),
+        pytest.param({"enabled": True, "uid_ok": False}, AGENT_DIFFERENT_NODE, id="different-node"),
+    ]
+
+    @pytest.mark.parametrize(("change", "refused"), TURNED)
+    def test_markers(self, node, nothing_sent, change, refused):
+        node(enabled=True, uid_ok=True)
+        db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home")
+        node(**change)
+        report = db.file_checks(deadline=1e12)
+        assert report.state is Capability.AGENT_UNAVAILABLE and report.message.startswith(MESSAGES[refused])
+        assert report.details["agent"]["state"] == refused
+        nothing_sent.assert_not_called()
+
+    @pytest.mark.parametrize(("change", "refused"), TURNED)
+    def test_chapters(self, node, nothing_sent, monkeypatch, change, refused):
+        node(enabled=True, uid_ok=True)
+        monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
+        backend, *_ = plex_chapters._context(MagicMock(), SimpleNamespace(markers=MARKERS, output={}))
+        node(**change)
+        with pytest.raises(AgentError) as caught:
+            backend.post("/v1/chapters/write", {}, timeout=1)
+        assert str(caught.value).startswith(MESSAGES[refused])
+        nothing_sent.assert_not_called()
+
+    @pytest.mark.parametrize(("change", "refused"), TURNED)
+    def test_loudness(self, node, nothing_sent, tmp_path, change, refused):
+        node(enabled=True, uid_ok=True)
+        server = MagicMock()
+        server._connect.return_value.query.return_value = Element(
+            "MediaContainer", machineIdentifier="plex-a", version="1.43.4.12345-abc123"
+        )
+        db = create_loudness_db(_cfg(tmp_path), server)
+        node(**change)
+        with pytest.raises(PublishError) as caught:
+            loudness_db.write_stream(db, 11, FIELDS, deadline=time.monotonic() + 5)
+        assert str(caught.value).startswith(MESSAGES[refused])
+        assert caught.value.state is Capability.AGENT_UNAVAILABLE
+        nothing_sent.assert_not_called()
+
+    @pytest.mark.parametrize(("change", "refused"), TURNED)
+    def test_library_health(self, node, nothing_sent, tmp_path, change, refused):
+        node(enabled=True, uid_ok=True)
+        db = health_plex._open_db(_cfg(tmp_path))
+        node(**change)
+        assert health_plex._node_refusal(db).startswith(MESSAGES[refused])
+        nothing_sent.assert_not_called()
+
+    def test_turned_back_on_it_is_used_again(self, node, nothing_sent):
+        node(enabled=False, uid_ok=True)
+        db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home")
+        assert db.file_checks(deadline=1e12).details["agent"]["state"] == AGENT_DISABLED
+        node(enabled=True, uid_ok=True)
+        assert db._client.refusal() is None

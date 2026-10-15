@@ -477,22 +477,32 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
 
     A node turned off on the Nodes page gets nothing, and neither does an address where the health check found a
     different node answering (two Plex database nodes that share a key and swapped addresses would otherwise each
-    write the other's Plex).
+    write the other's Plex). The node's record and the registry are read on every call, so a job that opened the
+    database before the node was turned off is refused from its next request on.
 
     Args:
         settings: That server's ``ServerMarkersSettings``.
     """
     if not getattr(settings, "agent_url", ""):
         return NO_NODE_REFUSAL
-    name = getattr(settings, "agent_node_name", "") or "This server's Plex database node"
-    if not getattr(settings, "agent_node_enabled", True):
+    name = getattr(settings, "agent_node_name", "")
+    enabled = getattr(settings, "agent_node_enabled", True)
+    node_id = getattr(settings, "agent_node_id", None)
+    if node_id:
+        from ...nodes.settings import node_record
+
+        record = node_record(str(node_id))
+        if record is None:
+            return NO_NODE_REFUSAL
+        name, enabled = str(record.get("name") or ""), bool(record.get("enabled", True))
+    name = name or "This server's Plex database node"
+    if not enabled:
         return NodeRefusal(
             f"{name} is turned off on the Nodes page, so this app doesn't read or write this Plex server's database "
             "through it. Turn it on there to continue.",
             Capability.AGENT_UNAVAILABLE,
             AGENT_DISABLED,
         )
-    node_id = getattr(settings, "agent_node_id", None)
     if node_id:
         from ...nodes.registry import get_registry
 
@@ -509,21 +519,30 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
 class AgentClient:
     """One agent's HTTP endpoint: the key, the protocol check and the error mapping, nothing about markers."""
 
-    def __init__(self, url: str, token: str, *, session: Any = None, refusal: NodeRefusal | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        *,
+        session: Any = None,
+        refusal: Callable[[], NodeRefusal | None] | None = None,
+    ) -> None:
         """Create the client.
 
         Args:
             url: The agent's base address, e.g. ``http://plex-host.lan:9494``.
             token: The key both sides share. Never logged, never in an error message.
             session: A ``requests.Session`` to use (tests pass their own).
-            refusal: Why nothing may be sent to this node (``node_refusal``); every request then fails with it.
+            refusal: Asked before every request why nothing may be sent to this node now (``node_refusal``); a
+                refusal fails that request.
         """
         self.url = str(url or "").strip().rstrip("/")
         self._token = str(token or "")
         self._session = session or requests.Session()
-        self._refusal = refusal
+        self._refusal_check = refusal
         self.version = ""
-        self.state = refusal.agent_state if refusal is not None else AGENT_UNREACHABLE
+        refused = refusal() if refusal is not None else None
+        self.state = refused.agent_state if refused is not None else AGENT_UNREACHABLE
         # Plex's own machine identifier, as the agent reads it beside the database it would write.
         self.machine_identifier = ""
         self.capabilities: list[str] = []
@@ -582,11 +601,16 @@ class AgentClient:
             ) from exc
         return self._read(response)
 
-    def _refuse_early(self) -> None:
-        """Raise the refusal the client was built with, or the one for a node with no address, before sending."""
-        refusal = self._refusal
+    def refusal(self) -> NodeRefusal | None:
+        """Why nothing may be sent to this node now, or None when requests may go out."""
+        refusal = self._refusal_check() if self._refusal_check is not None else None
         if refusal is None and not self.url:
             refusal = NO_NODE_REFUSAL
+        return refusal
+
+    def _refuse_early(self) -> None:
+        """Raise the node's current refusal (:meth:`refusal`) before sending."""
+        refusal = self.refusal()
         if refusal is not None:
             self.state = refusal.agent_state
             raise AgentError(refusal.message, state=refusal.state)
@@ -688,14 +712,21 @@ class RemotePlexDb(PlexDatabase):
     # what is ours after a failure is unknown — unlike the in-process writer, where one transaction settles it.
     atomic_writes = False
 
-    def __init__(self, url: str, token: str, *, session: Any = None, refusal: NodeRefusal | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        *,
+        session: Any = None,
+        refusal: Callable[[], NodeRefusal | None] | None = None,
+    ) -> None:
         """Create the transport.
 
         Args:
             url: The agent's base address.
             token: The key both sides share.
             session: A ``requests.Session`` (tests pass their own).
-            refusal: Why nothing may be sent to the node (``node_refusal``); every call then fails with it.
+            refusal: Asked before every call why nothing may be sent to the node now (``node_refusal``).
         """
         self._client = AgentClient(url, token, session=session, refusal=refusal)
 
@@ -975,6 +1006,6 @@ def plex_database(
             settings.agent_url,
             getattr(settings, "agent_token", ""),
             session=session,
-            refusal=node_refusal(settings),
+            refusal=lambda: node_refusal(settings),
         )
     return LocalPlexDb(path_provider, label=label, mountinfo_path=mountinfo_path)

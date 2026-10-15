@@ -565,7 +565,7 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
         refusal = node_refusal(settings)
         if refusal is not None:
             raise ChapterError(refusal.message, state=refusal.state)
-        backend = AgentClient(settings.agent_url, settings.agent_token)
+        backend = AgentClient(settings.agent_url, settings.agent_token, refusal=lambda: node_refusal(settings))
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
         if not folder:
