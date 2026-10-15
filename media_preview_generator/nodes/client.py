@@ -69,13 +69,15 @@ UNREACHABLE_TLS_CERTIFICATE = "tls_certificate"
 UNREACHABLE_RATE_LIMITED = "rate_limited"
 
 
-def unreachable_advice(reason: str, url: str, name: str = "It") -> str:
+def unreachable_advice(reason: str, url: str, name: str = "It", *, was_seen: bool = False) -> str:
     """What to check when a node didn't answer, in plain words: Add node and the node's card both say this.
 
     Args:
         reason: One of the ``UNREACHABLE_*`` codes, or "" when it isn't known.
         url: The address that was tried.
         name: Who starts a sentence about the node: "It" in Add node, the node's name on its card.
+        was_seen: The node answered at this address before, so a name that no longer resolves more likely means it
+            stopped or was renamed than that the name was typed wrong.
 
     Returns:
         One or two sentences.
@@ -83,6 +85,9 @@ def unreachable_advice(reason: str, url: str, name: str = "It") -> str:
     https = url.lower().startswith("https:")
     if reason == UNREACHABLE_DNS:
         host = urlsplit(url).hostname or "that machine"
+        if was_seen:
+            # Docker's DNS drops a stopped container's name from a shared network.
+            return f"Can't find {host}. {name} may be stopped or renamed. Check it is running, or use its IP address."
         return f"Can't find {host}. Check the name, or use the node's IP address."
     if reason == UNREACHABLE_TLS or (reason == UNREACHABLE_TIMEOUT and https):
         # A node without an https proxy in front never answers the TLS handshake: https to it times out.

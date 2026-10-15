@@ -205,6 +205,14 @@ class TestStates:
         assert (view.state, view.cause) == (reg.STATE_OFFLINE, reg.OFFLINE_UNREACHABLE)
         assert hint in view.reason, view.reason
 
+    def test_a_name_that_stops_resolving_after_the_node_was_ready_says_it_may_be_stopped(self, h):
+        # On a shared Docker network a stopped container's name stops resolving, which read as a typo in the name.
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+        h.client().default_info = NodeUnreachableError("http://nuc:9494 can't be found", reason=UNREACHABLE_DNS)
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_OFFLINE
+        assert view.reason.startswith("Can't find nuc.") and "may be stopped or renamed" in view.reason, view.reason
+
     def test_https_to_a_node_that_speaks_http_says_use_http_not_restart_it(self, h):
         # The node's server never answers a TLS handshake: every attempt times out, which read "stuck: restart it".
         h.change(url="https://nuc:9494")

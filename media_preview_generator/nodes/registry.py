@@ -1211,8 +1211,9 @@ class NodeRegistry:
                 with self._lock:
                     live.checks_begun += 1
                     number = live.checks_begun
+                    seen_before = live.last_seen is not None
                 try:
-                    outcome = self._probe(record, client)
+                    outcome = self._probe(record, client, seen_before=seen_before)
                 except Exception:
                     # Still a finished check: one that ended here would leave the node as it was (a ready node
                     # keeps getting work) whatever it answers now.
@@ -1433,7 +1434,7 @@ class NodeRegistry:
         elif not error and live.gpu_lost and not live.lost_device:
             live.gpu_lost = ""
 
-    def _probe(self, record: dict, client: NodeClient) -> _Outcome:
+    def _probe(self, record: dict, client: NodeClient, *, seen_before: bool = False) -> _Outcome:
         name = str(record.get("name") or "The node")
         url = str(record.get("url") or "")
         info: dict | None = None
@@ -1478,7 +1479,9 @@ class NodeRegistry:
                 cause=OFFLINE_STUCK,
             )
         if info is None:
-            return _Outcome(STATE_OFFLINE, unreachable_advice(why, url, name), cause=OFFLINE_UNREACHABLE)
+            return _Outcome(
+                STATE_OFFLINE, unreachable_advice(why, url, name, was_seen=seen_before), cause=OFFLINE_UNREACHABLE
+            )
         return self._read_info(record, info)
 
     def _other_protocol(self, name: str, block: dict) -> _Outcome:
