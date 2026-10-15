@@ -413,20 +413,38 @@ def _renamed(text: str, old: str, new: str) -> str:
     return new + text[len(old) :] if text.startswith(old) else text
 
 
+VULKAN_TEXT_MAX = 600
+
+
+def _clean_vulkan(raw: object) -> dict | None:
+    """A node's Vulkan check for one GPU, keeping only the known keys (text cut to one short line)."""
+    if not isinstance(raw, dict):
+        return None
+    cleaned: dict[str, Any] = {"ok": raw.get("ok") is True}
+    for key in ("cause", "title", "why", "fix"):
+        cleaned[key] = protocol.relayed_text(raw.get(key), VULKAN_TEXT_MAX)
+    return cleaned
+
+
 def _clean_gpus(raw: object) -> tuple[dict, ...]:
     if not isinstance(raw, list):
         return ()
-    return tuple(
-        {
+    gpus = []
+    for g in raw:
+        if not isinstance(g, dict):
+            continue
+        gpu = {
             "type": str(g.get("type") or ""),
             "device": str(g.get("device") or ""),
             "name": str(g.get("name") or ""),
             "status": str(g.get("status") or ""),
             "error": str(g.get("error") or ""),
         }
-        for g in raw
-        if isinstance(g, dict)
-    )
+        vulkan = _clean_vulkan(g.get("vulkan"))
+        if vulkan is not None:
+            gpu["vulkan"] = vulkan
+        gpus.append(gpu)
+    return tuple(gpus)
 
 
 def _count(raw: object) -> int:

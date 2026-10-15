@@ -964,14 +964,14 @@ class TestGpuListSurvivesARescan:
             resp = app.test_client().post("/api/system/rescan-gpus", headers={"X-Auth-Token": TOKEN})
 
         assert resp.status_code == 200
-        assert resp.get_json()["gpus"] == [self.DETECTED]
+        assert resp.get_json()["gpus"] == [{**self.DETECTED, "vulkan": None}]
 
     def test_system_status_lists_the_detected_gpus(self, app):
         with self._rescan_lands_after_the_warm_up("api_system"):
             resp = app.test_client().get("/api/system/status", headers={"X-Auth-Token": TOKEN})
 
         assert resp.status_code == 200
-        assert resp.get_json()["gpus"] == [self.DETECTED]
+        assert resp.get_json()["gpus"] == [{**self.DETECTED, "vulkan": None}]
 
     def test_idle_worker_list_keeps_the_saved_gpu_rows(self, app):
         # No pool exists yet, so the Workers panel is built from the saved counts and the detected GPUs.

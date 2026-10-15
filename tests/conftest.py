@@ -255,6 +255,21 @@ def _reset_textdet_cpu_limit_source():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_vulkan_check(monkeypatch):
+    """The per-GPU Vulkan check runs the Vulkan probe (FFmpeg) and reads /dev/dri; no test wants the host's answer.
+    Tests of the check itself call ``check_gpus`` or import ``get_vulkan_checks`` before this patch applies."""
+    from media_preview_generator.gpu import vulkan_check
+    from media_preview_generator.web.routes import api_vulkan
+
+    def no_checks(gpus, nvidia_diag=None):
+        return [None] * len(gpus)
+
+    monkeypatch.setattr(vulkan_check, "get_vulkan_checks", no_checks)
+    monkeypatch.setattr(api_vulkan, "get_vulkan_checks", no_checks)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_plex_partial_scan_throttle():
     """Forget which Plex folders were just scanned: the throttle is process-wide and tests reuse the same folders."""
     from media_preview_generator import plex_client

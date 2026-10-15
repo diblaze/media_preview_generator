@@ -454,13 +454,25 @@ class TestCpuFallbackOnTheWorkerRow:
         ids=["request-failed", "start-failed-then-cool-down", "boxes-differ", "no-webgpu-path"],
     )
     def test_a_gpu_workers_request_read_on_the_cpu_is_reported(self, envs, gpu, modes, requests, reason):
+        kept = th.CREDITS_KEPT_ON_CPU_PREFIX if reason in ("failed its accuracy check", "no WebGPU path") else None
         env = envs(modes=modes)
         reported: list[str] = []
         device = "cuda:0" if gpu == "NVIDIA" else "videotoolbox"
         for _ in range(requests):
             assert env.pool.detect_boxes(PLANES, gpu=gpu, gpu_device_path=device, on_cpu=reported.append) == ANSWER
         assert len(reported) == requests
-        assert all(r.startswith("Credits read on the CPU: ") and reason in r for r in reported)
+        assert all(r.startswith("Credits read on the CPU") and reason in r for r in reported)
+        # A standing verdict says "until restart"; a failure that is retried (crash, cool-down) must not.
+        assert all(
+            r.startswith(f"{kept}: ") if kept else not r.startswith(th.CREDITS_KEPT_ON_CPU_PREFIX) for r in reported
+        )
+
+    def test_a_gpu_with_software_vulkan_is_reported_as_kept_on_the_cpu(self, envs):
+        env = envs(vulkan=SOFTWARE)
+        reported: list[str] = []
+        env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128", on_cpu=reported.append)
+        assert len(reported) == 1
+        assert reported[0].startswith(f"{th.CREDITS_KEPT_ON_CPU_PREFIX}: Vulkan reports no hardware GPU")
 
     def test_a_request_read_on_the_gpu_or_by_a_cpu_worker_reports_nothing(self, envs):
         env = envs()
@@ -2290,7 +2302,9 @@ class TestWhatTheUserSees:
         env = envs(modes={"webgpu": "selftest-blank"})
         reasons: list[str] = []
         assert env.pool.detect_boxes(PLANES, gpu="NVIDIA", gpu_device_path="cuda:0", on_cpu=reasons.append) == ANSWER
-        assert reasons == ["Credits read on the CPU: this GPU failed its accuracy check. Previews still use the GPU."]
+        assert reasons == [
+            "Credits read on the CPU until restart: this GPU failed its accuracy check. Previews still use the GPU."
+        ]
         (warning,) = warnings_in(loguru_caplog)
         assert "read on the CPU until the app restarts" in warning
         assert "the GPU got 2 of 31 test pictures wrong (it found no text in both)" in warning
@@ -2338,3 +2352,17 @@ class TestWhatTheUserSees:
         assert th._pool is None
         monkeypatch.setattr(th, "_pool", SimpleNamespace(credits_on_cpu=lambda: [{"key": "cuda:0"}]))
         assert th.credits_on_cpu_devices() == [{"key": "cuda:0"}]
+
+
+class TestDeviceStatusForTheBundle:
+    def test_lists_backend_and_reason_per_device(self, envs):
+        env = envs(vulkan=SOFTWARE)
+        env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128")
+        assert env.pool.device_status() == [
+            {"key": "/dev/dri/renderD128", "backend": "cpu", "reason": "Vulkan reports no hardware GPU"}
+        ]
+
+    def test_the_module_function_reads_the_pool_without_creating_one(self, monkeypatch):
+        monkeypatch.setattr(th, "_pool", None)
+        assert th.credits_text_devices() == []
+        assert th._pool is None

@@ -2210,3 +2210,47 @@ def test_a_newly_typed_name_that_does_not_resolve_is_not_called_stopped(h):
     assert view.state == reg.STATE_OFFLINE
     assert "may be stopped or renamed" not in view.reason
     assert "Check the name" in view.reason
+
+
+class TestCleanGpusKeepsTheVulkanCheck:
+    def test_known_string_keys_survive_and_the_rest_is_dropped(self):
+        from media_preview_generator.nodes.registry import VULKAN_TEXT_MAX, _clean_gpus
+
+        raw = [
+            {
+                "type": "INTEL",
+                "device": "/dev/dri/renderD128",
+                "name": "UHD",
+                "vulkan": {
+                    "ok": False,
+                    "cause": "kernel_too_old",
+                    "title": "T",
+                    "why": "W" * (VULKAN_TEXT_MAX + 50),
+                    "fix": "line one\nline two",
+                    "facts": {"params": {"x": 1}},
+                    "evil": "<script>",
+                },
+            }
+        ]
+
+        (gpu,) = _clean_gpus(raw)
+
+        assert set(gpu["vulkan"]) == {"ok", "cause", "title", "why", "fix"}
+        assert len(gpu["vulkan"]["why"]) == VULKAN_TEXT_MAX
+        assert "\n" not in gpu["vulkan"]["fix"]
+        assert gpu["vulkan"]["ok"] is False
+
+    @pytest.mark.parametrize("junk", [None, "text", 5, ["x"]])
+    def test_a_vulkan_that_is_not_a_dict_is_left_out(self, junk):
+        from media_preview_generator.nodes.registry import _clean_gpus
+
+        (gpu,) = _clean_gpus([{"type": "INTEL", "vulkan": junk}])
+
+        assert "vulkan" not in gpu
+
+    def test_ok_must_be_literally_true(self):
+        from media_preview_generator.nodes.registry import _clean_gpus
+
+        (gpu,) = _clean_gpus([{"type": "INTEL", "vulkan": {"ok": "yes", "title": "x"}}])
+
+        assert gpu["vulkan"]["ok"] is False

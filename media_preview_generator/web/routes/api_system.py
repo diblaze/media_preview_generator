@@ -236,8 +236,12 @@ def rescan_gpus():
     try:
         with _gpu_cache_lock:
             _gpu_cache["result"] = None
+        from ...gpu.vulkan_check import clear_vulkan_check_cache
+        from .api_vulkan import gpus_with_vulkan
+
+        clear_vulkan_check_cache()
         gpus = _ensure_gpu_cache()
-        return jsonify({"gpus": gpus})
+        return jsonify({"gpus": gpus_with_vulkan(gpus)})
     except Exception:
         logger.exception(
             "GPU re-scan failed. "
@@ -257,7 +261,9 @@ def get_system_status():
     of the process. Call clear_gpu_cache() to force a re-scan.
     """
     try:
-        gpus = _ensure_gpu_cache()
+        from .api_vulkan import gpus_with_vulkan
+
+        gpus = gpus_with_vulkan(_ensure_gpu_cache())
 
         job_manager = get_job_manager()
         running_job = job_manager.get_running_job()

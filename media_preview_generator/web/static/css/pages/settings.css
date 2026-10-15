@@ -378,6 +378,7 @@ html[data-bs-theme="dark"] .settings-page .settings-header { background: var(--p
 /* ───────── GPU tuning ───────── */
 .gpu-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 0.625rem 0.875rem; align-items: center; margin-top: 0.5rem; padding: 0.625rem 0.875rem; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--panel-2); }
 .gpu-row.is-failed { border-color: var(--bad); }
+.gpu-row .gpu-ico { align-self: start; }
 .gpu-ico { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 10px; background: var(--inset); color: var(--muted); font-size: 1.25rem; }
 .gpu-row.is-failed .gpu-ico { background: var(--bad-soft); color: var(--bad); }
 .gpu-name { font-weight: 600; }

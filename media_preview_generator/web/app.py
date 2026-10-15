@@ -248,8 +248,12 @@ def _prewarm_caches() -> None:
         try:
             from .routes._helpers import _ensure_gpu_cache
 
-            _ensure_gpu_cache()
+            gpus = _ensure_gpu_cache()
             logger.debug("GPU cache pre-warmed")
+            from ..gpu.vulkan_check import log_vulkan_warnings
+            from .routes.api_vulkan import _diagnose_vulkan_environment
+
+            log_vulkan_warnings(gpus, _diagnose_vulkan_environment)
         except Exception as exc:
             logger.debug("GPU cache pre-warm failed (non-fatal): {}", exc)
 

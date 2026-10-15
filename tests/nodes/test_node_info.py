@@ -456,3 +456,62 @@ class TestCreditText:
         assert nvidia["credit_text"] == {"on_gpu": True, "reason": ""}
         assert amd["credit_text"] == {"on_gpu": False, "reason": "self-test found other boxes"}
         assert "credit_text" not in intel
+
+
+class TestVulkanCheck:
+    def test_each_gpu_carries_the_nodes_own_vulkan_check(self, tmp_path, monkeypatch):
+        check = {"ok": False, "cause": "kernel_too_old", "title": "T", "why": "W", "fix": "F", "facts": {}}
+        monkeypatch.setattr(info, "_vulkan_checks", lambda gpus: [check] + [None] * (len(gpus) - 1))
+        raw = [("INTEL", "/dev/dri/renderD128", {"name": "UHD"}), ("APPLE", "videotoolbox", {"name": "M2"})]
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=lambda: raw)
+
+        gpus = worker.gpus()
+
+        assert gpus[0]["vulkan"] == check
+        assert gpus[1]["vulkan"] is None
+
+    def test_the_first_answer_does_not_wait_for_a_slow_vulkan_check(self, tmp_path, monkeypatch):
+        started, release = threading.Event(), threading.Event()
+        check = {"ok": True, "cause": "ready", "title": "T", "why": "W", "fix": ""}
+
+        def slow_checks(gpus):
+            started.set()
+            release.wait(10)
+            return [check] * len(gpus)
+
+        monkeypatch.setattr(info, "_vulkan_checks", slow_checks)
+        monkeypatch.setattr(info, "log_vulkan_warnings", lambda gpus, diag=None: None)
+        worker = info.WorkerInfo(
+            temp_root=str(tmp_path), recheck_s=3600, detect=lambda: [("INTEL", "/dev/dri/renderD128", {})]
+        )
+        worker.start()
+        try:
+            assert started.wait(10)
+            gpus = worker.gpus()
+            assert len(gpus) == 1 and "vulkan" not in gpus[0]
+
+            release.set()
+
+            _until(lambda: worker.gpus()[0].get("vulkan") == check)
+        finally:
+            release.set()
+            worker.stop()
+
+    def test_the_startup_warning_is_logged_when_the_gpus_change_not_on_every_recheck(self, tmp_path, monkeypatch):
+        logged = []
+        monkeypatch.setattr(info, "log_vulkan_warnings", lambda gpus, diag=None: logged.append(len(gpus)))
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=lambda: [("INTEL", "/dev/dri/renderD128", {})])
+
+        worker.rescan()
+        worker.rescan(quiet=True)
+
+        assert logged == [1]
+
+    def test_a_broken_check_leaves_the_gpu_list_intact(self, tmp_path, monkeypatch):
+        from media_preview_generator.gpu import vulkan_check
+
+        def boom(gpus, diag=None):
+            raise RuntimeError("probe broke")
+
+        monkeypatch.setattr(vulkan_check, "get_vulkan_checks", boom)
+        assert info._vulkan_checks([{"type": "INTEL"}, {"type": "AMD"}]) == [None, None]

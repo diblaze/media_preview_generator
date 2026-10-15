@@ -175,9 +175,16 @@ class TestInfo:
         assert body["platform"]["python"] and body["platform"]["os"] and "arch" in body["platform"]
         worker = body["worker"]
         assert worker["gpus"] == [
-            {"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4090", "status": "ok", "error": None},
-            {"type": "INTEL", "device": "/dev/dri/renderD129", "name": "Arc", "status": "failed", "error": "no"},
-            {"type": "APPLE", "device": "videotoolbox", "name": "M2", "status": "ok", "error": None},
+            {"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4090", "status": "ok", "error": None, "vulkan": None},
+            {
+                "type": "INTEL",
+                "device": "/dev/dri/renderD129",
+                "name": "Arc",
+                "status": "failed",
+                "error": "no",
+                "vulkan": None,
+            },
+            {"type": "APPLE", "device": "videotoolbox", "name": "M2", "status": "ok", "error": None, "vulkan": None},
         ]
         assert worker["cpu"]["cores"] >= 1
         assert set(worker["cpu"]) == {"cores", "load1", "ram_total", "ram_available"}
