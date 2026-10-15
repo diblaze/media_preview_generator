@@ -189,7 +189,8 @@ that (200 at once, one more every 0.3 s), so a device with an old key holds back
 network. Past that, every request from it (the Plex database role's too) answers 429 `rate_limited` with
 `Retry-After`, whatever its key, which isn't compared: an app with the right key behind a shared address (NAT, a
 proxy, an old copy with an old key) reads it as a wait like no answer, never as a refused key, and the node logs the
-address once. Connections are capped the same two ways: 160 per address (one app's every worker plus its checks), 250
+address once. A running task's polls held back that way past the node's unpolled-task expiry (+12 s) give the file
+back to the queue without counting a drop: the node has dropped the task by then. Connections are capped the same two ways: 160 per address (one app's every worker plus its checks), 250
 per /64. Request bytes being read beyond each request's first 64 KB share a 64 MB budget, so connections that send
 large bodies before the key is checked can't fill a small node's memory.
 

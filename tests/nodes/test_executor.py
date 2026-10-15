@@ -86,6 +86,19 @@ def _run(media, **kwargs):
         return run_on_node(protocol.OP_INTRO_FINGERPRINT, media, {"duration_ms": 1000}, **kwargs)
 
 
+class _FakeTime:
+    """Stands in for the executor's ``time`` module: ``sleep`` moves ``monotonic`` on, at once."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, seconds)
+
+
 def _wait_until(check, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -364,6 +377,43 @@ class TestNodeDrops:
 
         assert _run(media) == {"ok": 1}
         assert registry.reports == []
+
+    def test_polls_held_back_past_the_nodes_unpolled_task_expiry_give_the_file_back(self, media, monkeypatch):
+        # A poll the node turns away (429) never reaches the task, so the node drops it once no poll has reached it for
+        # its unpolled-task expiry. Polls held back for good went on forever: the file never ended or went elsewhere.
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+
+        def held(client):
+            # Ends the run on a build that never gives up, so the test fails instead of hanging.
+            if len(client.named("poll")) < 1000:
+                return NodeRateLimitedError("http://n asks this app to wait")
+            return finished(protocol.STATUS_DONE, result={})
+
+        client = ScriptedClient([running(), held])
+        registry = _install(client)
+
+        started = clock.now
+        with pytest.raises(NodeUnavailableError, match="kept asking this app to wait") as raised:
+            _run(media)
+
+        assert protocol.TASK_UNPOLLED_EXPIRY_S < clock.now - started <= executor.RATE_LIMITED_GIVE_UP_S + 2.0
+        assert raised.value.started is False  # nothing the node or the file did: no drop counts against the file
+        assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_polls_held_back_now_and_then_keep_waiting_for_a_task_the_node_still_runs(self, media, monkeypatch):
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+        wait = NodeRateLimitedError("http://n asks this app to wait")
+        steps = ([wait] * 50 + [running()]) * 3
+        client = ScriptedClient([running(), *steps, finished(protocol.STATUS_DONE, result={"ok": 1})])
+        _install(client)
+        started = clock.now
+
+        assert _run(media) == {"ok": 1}
+        assert clock.now - started > executor.RATE_LIMITED_GIVE_UP_S
 
     def test_a_cancelled_task_held_back_by_the_wrong_key_limit_is_still_given_up_on(self, media, monkeypatch):
         monkeypatch.setattr(executor, "CANCEL_WAIT_S", 0.0)

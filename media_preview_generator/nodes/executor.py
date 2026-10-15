@@ -54,6 +54,10 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
+# Polls the node turns away (429: too many wrong keys from this app's address) never reach the task, so the node drops
+# it once none has for its unpolled-task expiry. Past that, with a margin for the node's own reaper, the file goes
+# back in the queue.
+RATE_LIMITED_GIVE_UP_S = protocol.TASK_UNPOLLED_EXPIRY_S + 12.0
 # The read timeout of a task's DELETE, sent from a thread of its own so the file (its result, or its next try) never
 # waits for it: a node that stops answering right after the result would hold the file for the full read timeout.
 GONE_DELETE_TIMEOUT_S = 3.0
@@ -467,6 +471,7 @@ class _TaskRun:
         name = self._placement.node_name
         failed_polls = 0
         failing_since = 0.0
+        reached_at = time.monotonic()
         while True:
             self._forward_controls()
             asked_at = time.monotonic()
@@ -480,10 +485,16 @@ class _TaskRun:
                 raise self._unavailable(f"{name} is restarting", started=False) from exc
             except NodeRateLimitedError as exc:
                 # The node answered: it holds back this app's address (wrong keys from something else there), not
-                # the task, which keeps running. One no poll reaches for the node's unpolled-task expiry is dropped
-                # there, and then reads here as a task the node no longer knows.
+                # the task, which keeps running until no poll has reached it for the node's unpolled-task expiry.
                 logger.debug("{}poll held back: {}", self._prefix, exc)
                 failed_polls = 0
+                if time.monotonic() - reached_at > RATE_LIMITED_GIVE_UP_S:
+                    # Neither the node's doing nor the file's, so no drop counts against the file.
+                    raise self._unavailable(
+                        f"{name} kept asking this app to wait (too many wrong keys came from this app's address), "
+                        "so it has dropped the task by now",
+                        started=False,
+                    ) from exc
             except NodeError as exc:
                 if failed_polls == 0:
                     failing_since = asked_at
@@ -494,6 +505,7 @@ class _TaskRun:
                 continue
             else:
                 failed_polls = 0
+                reached_at = asked_at
                 self._relay(state)
                 if state.get("status") in protocol.FINISHED_STATUSES:
                     return state
