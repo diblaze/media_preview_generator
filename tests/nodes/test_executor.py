@@ -77,6 +77,15 @@ def _run(media, **kwargs):
         return run_on_node(protocol.OP_INTRO_FINGERPRINT, media, {"duration_ms": 1000}, **kwargs)
 
 
+def _wait_until(check, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _tar(entries: list[tuple[str, bytes]], *, symlink: str | None = None) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -257,7 +266,7 @@ class TestNodeDrops:
         assert len(client.named("poll")) == 4
         assert registry.reports == [("unavailable", NODE_ID)]
         # Still asked to drop it: a node back from a blip stops the task now, not beside the file's next try.
-        assert client.named("delete") == [("delete",)]
+        assert _wait_until(lambda: client.named("delete") == [("delete",)])
 
     def test_a_blip_shorter_than_the_give_up_time_does_not_drop_a_task_the_node_still_runs(self, media, monkeypatch):
         # Refused connections fail at once: four failed polls in a row take a fraction of the give-up time.
@@ -284,7 +293,34 @@ class TestNodeDrops:
 
         assert time.monotonic() - started >= 0.3
         assert len(client.named("poll")) > executor.MAX_FAILED_POLLS + 1
-        assert client.named("delete") == [("delete",)]
+        assert _wait_until(lambda: client.named("delete") == [("delete",)])
+
+    def test_a_node_that_stopped_answering_doesnt_hold_the_requeue_for_its_delete(self, media, monkeypatch):
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.02)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.1)
+        release = threading.Event()
+        timeouts: list = []
+
+        class HungDelete(ScriptedClient):
+            def delete_task(self, task_id, *, read_timeout=None):
+                timeouts.append(read_timeout)
+                release.wait(10)
+                super().delete_task(task_id)
+
+        client = HungDelete([running(), unreachable()])
+        _install(client)
+
+        started = time.monotonic()
+        with pytest.raises(NodeUnavailableError, match="stopped answering"):
+            _run(media)
+        given_up_after = time.monotonic() - started
+
+        try:
+            assert given_up_after < 2.0
+            assert _wait_until(lambda: timeouts == [executor.GONE_DELETE_TIMEOUT_S])
+        finally:
+            release.set()
+        assert _wait_until(lambda: client.deleted == ["t1"])
 
     def test_a_node_that_forgot_the_task_is_not_asked_to_delete_it(self, media):
         client = ScriptedClient([running(), NodeUnknownTaskError("unknown_task")])

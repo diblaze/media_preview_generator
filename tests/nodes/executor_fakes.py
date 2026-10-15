@@ -98,7 +98,7 @@ class ScriptedClient:
         self.calls.append(("artifact",))
         return self.artifact
 
-    def delete_task(self, task_id: str) -> None:
+    def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
         self.calls.append(("delete",))
         self.deleted.append(task_id)
 
@@ -186,7 +186,7 @@ class LoopbackClient:
         with open(self.ctx.artifact, "rb") as fh:
             return fh.read()
 
-    def delete_task(self, task_id: str) -> None:
+    def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
         pass
 
 

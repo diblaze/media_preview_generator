@@ -253,9 +253,9 @@ class NodeClient:
             "GET", f"{protocol.ROUTE_TASKS}/{task_id}/artifact", read_timeout=ARTIFACT_TIMEOUT_S, raw=True
         )
 
-    def delete_task(self, task_id: str) -> None:
+    def delete_task(self, task_id: str, *, read_timeout: float = READ_TIMEOUT_S) -> None:
         """``DELETE /v1/tasks/<id>``: free the task's temp dir on the node."""
-        self._call("DELETE", f"{protocol.ROUTE_TASKS}/{task_id}")
+        self._call("DELETE", f"{protocol.ROUTE_TASKS}/{task_id}", read_timeout=read_timeout)
 
     def log(self, lines: int = 200) -> dict:
         """``GET /v1/log?lines=N``: the node's own recent log."""
