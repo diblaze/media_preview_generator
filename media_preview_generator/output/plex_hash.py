@@ -16,6 +16,9 @@ from functools import lru_cache
 
 SourceFingerprint = tuple[int, int, int, int, int]
 _BLOCK_SIZE = 65_536
+# Windows (Python 3.12+) fills os.stat's st_ctime with the file's creation time but os.fstat's with its last change,
+# so there an opened file is matched to a path's fingerprint on the other fields.
+_FSTAT_CTIME_DIFFERS = os.name == "nt"
 
 
 class SourceFileChangedError(OSError):
@@ -24,6 +27,13 @@ class SourceFileChangedError(OSError):
 
 def _fingerprint(info: os.stat_result) -> SourceFingerprint:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _opened_is(opened: SourceFingerprint, expected: SourceFingerprint) -> bool:
+    """Whether the file just opened (its ``os.fstat``) is the one ``expected`` (an ``os.stat``) describes."""
+    if _FSTAT_CTIME_DIFFERS:
+        return opened[:4] == expected[:4]
+    return opened == expected
 
 
 def get_source_fingerprint(path: str | os.PathLike[str]) -> SourceFingerprint:
@@ -47,7 +57,8 @@ def get_source_fingerprint(path: str | os.PathLike[str]) -> SourceFingerprint:
 @lru_cache(maxsize=1024)
 def _hash_stable_source(path: str, expected: SourceFingerprint) -> str:
     with open(path, "rb") as source:
-        if _fingerprint(os.fstat(source.fileno())) != expected:
+        opened = _fingerprint(os.fstat(source.fileno()))
+        if not _opened_is(opened, expected):
             raise SourceFileChangedError(f"Media source changed before hashing: {path}")
         size = expected[2]
         first = source.read(_BLOCK_SIZE)
@@ -60,7 +71,7 @@ def _hash_stable_source(path: str, expected: SourceFingerprint) -> str:
             if len(last) != _BLOCK_SIZE:
                 raise SourceFileChangedError(f"Media source changed while hashing: {path}")
             signature += hashlib.sha1(last, usedforsecurity=False).hexdigest()
-        if _fingerprint(os.fstat(source.fileno())) != expected:
+        if _fingerprint(os.fstat(source.fileno())) != opened:
             raise SourceFileChangedError(f"Media source changed while hashing: {path}")
     if size < _BLOCK_SIZE:
         return signature

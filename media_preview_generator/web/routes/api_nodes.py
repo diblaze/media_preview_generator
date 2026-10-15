@@ -519,7 +519,11 @@ def update_node(node_id: str):
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
     if reconnect:
+        from ...markers.inspect import forget_node_capability
+
         get_registry().report_unavailable(node_id)
+        # The servers' configs name only the node, so their cached Intro & Credits answers don't see the change.
+        forget_node_capability(node_id)
     return jsonify(_row_for(node_id))
 
 
