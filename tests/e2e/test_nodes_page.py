@@ -319,6 +319,19 @@ class TestNodeList:
         expect(authed_page.locator("#nodeModalName")).to_have_text("nuc")
         expect(authed_page.locator("#nodeModalState")).to_have_text("Access problem")
 
+    def test_a_hash_with_a_tab_opens_that_tab(self, authed_page: Page, app_url: str) -> None:
+        # The bell's "Fix key" links here.
+        _open_nodes(authed_page, app_url, _four_nodes(), path="/nodes#node-n-storage/settings")
+        expect(authed_page.locator("#node-tab-settings")).to_be_visible()
+        expect(authed_page.locator("#nodeModalName")).to_have_text("storage")
+
+    def test_the_bells_test_access_link_opens_media_and_runs_the_test(self, authed_page: Page, app_url: str) -> None:
+        api = NodesApi(authed_page, _four_nodes())
+        with authed_page.expect_response(lambda r: r.url.endswith("/test-access")):
+            authed_page.goto(f"{app_url}/nodes#node-n-nuc/media/test")
+        expect(authed_page.locator("#node-tab-media")).to_be_visible()
+        assert [path for method, path, _ in api.calls if method == "POST"] == ["/nodes/n-nuc/test-access"]
+
     def test_fix_opens_the_tab_with_the_fix(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         _open_node(authed_page, "n-nuc")

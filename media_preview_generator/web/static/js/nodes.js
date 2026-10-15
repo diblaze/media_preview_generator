@@ -73,6 +73,7 @@
     };
     // The row's button says Fix for these, and opens the tab where the fix is.
     const FIX_TAB = { access_problem: 'media', key_refused: 'settings', update_needed: 'health', gpu_lost: 'health', no_ffmpeg: 'health' };
+    const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];
 
     function stateOf(node) {
         return STATES[node.state] || ['off', node.state || 'Unknown'];
@@ -287,11 +288,13 @@
             return;
         }
         if (!hash.startsWith('node-')) return;
-        const id = hash.slice('node-'.length);
+        // "node-<id>", "node-<id>/<tab>", or "node-<id>/media/test" (the bell's Test access: open Media and run it).
+        const [id, tab, action] = hash.slice('node-'.length).split('/');
         if (!nodeById(id)) return;
         const row = document.getElementById(`node-${id}`);
         if (row) row.scrollIntoView({ block: 'center' });
-        openNode(id);
+        openNode(id, NODE_TABS.includes(tab) ? tab : undefined);
+        if (tab === 'media' && action === 'test' && isWorker(nodeById(id))) detail.editor.test();
     }
 
     // ---------- path mappings + Test access ------------------------------------------------------------------------

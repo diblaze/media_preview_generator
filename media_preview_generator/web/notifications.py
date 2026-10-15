@@ -522,24 +522,43 @@ def _build_library_health_check_failed_notification() -> dict[str, Any] | None:
 
 
 _NODE_CARD_TEXT = {
-    # state: (title, what to do, action label)
-    "offline": ("{name} is offline", "Check that the node is running and that this app can reach it.", "Open Nodes"),
-    "update_needed": ("{name} needs an update", "Update the node so its version matches this app.", "Open Nodes"),
-    "key_refused": ("{name} refused the key", "Copy the node's key into its settings on the Nodes page.", "Fix key"),
+    # state: (title, what to do when the node has no reason, action label, where on the node dialog the action lands)
+    "offline": (
+        "{name} is offline",
+        "Check that the node is running and that this app can reach it.",
+        "Open Nodes",
+        "",
+    ),
+    "update_needed": (
+        "{name} needs an update",
+        "Update the node so its version matches this app.",
+        "Open Nodes",
+        "health",
+    ),
+    "key_refused": (
+        "{name} refused the key",
+        "Copy the node's key into its settings on the Nodes page.",
+        "Fix key",
+        "settings",
+    ),
     "access_problem": (
         "{name} can't see your media",
         "Its workers are paused. Run Test access and fix its folder mappings.",
         "Test access",
+        # The Media tab, with Test access started.
+        "media/test",
     ),
     "gpu_lost": (
         "{name} lost its GPU",
         "Its CPU workers keep running. Check the GPU driver on the node.",
         "Open Nodes",
+        "health",
     ),
     "no_ffmpeg": (
         "{name} can't find FFmpeg",
         "Nothing is sent to it until FFmpeg is installed there.",
         "Open Nodes",
+        "health",
     ),
 }
 
@@ -573,19 +592,21 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         text = _NODE_CARD_TEXT.get(view.state)
         if text is None:
             continue
-        title, todo, label = text
+        title, todo, label, target = text
         name = view.name or "A node"
-        reason = f"{escape(view.reason)} " if view.reason else ""
+        # The node's reason already ends with what to do, so the card's own line is only for a node without one.
+        body = view.reason or todo
+        href = f"/nodes#node-{view.id}/{target}" if target else f"/nodes#node-{view.id}"
         cards.append(
             {
                 "id": node_notification_id(view.id, view.state),
                 "severity": "warning",
                 "title": title.format(name=name),
-                "body_html": f"<p class='mb-0'>{reason}{escape(todo)}</p>",
+                "body_html": f"<p class='mb-0'>{escape(body)}</p>",
                 "dismissable": True,
                 "permanent_dismissable": False,
                 "source": "nodes",
-                "action": {"href": f"/nodes#node-{view.id}", "label": label},
+                "action": {"href": href, "label": label},
             }
         )
     return cards

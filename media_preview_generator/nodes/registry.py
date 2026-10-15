@@ -419,8 +419,9 @@ class NodeRegistry:
             if len(distinct) >= NOT_VISIBLE_LIMIT and not live.access_problem:
                 name = live.record.get("name") or "The node"
                 live.access_problem = (
-                    f"{name} couldn't see {len(distinct)} different files in 10 minutes (last: {reason}). "
-                    "Its workers are paused: run Test access on the Nodes page and fix the folder mappings."
+                    f"{name} couldn't see {len(distinct)} different files in 10 minutes (the last one: "
+                    f"{protocol.not_visible_text(reason)}). Its workers are paused: run Test access and fix the folder "
+                    "mappings."
                 )
                 logger.warning(
                     "Node {} couldn't see {} different files in 10 minutes; pausing its workers until media access "
@@ -940,7 +941,10 @@ class NodeRegistry:
                 else:
                     if not live.gpu_lost:
                         logger.warning("Node {} lost its GPU {} ({}); its GPU workers are paused", name, device, why)
-                    live.gpu_lost = f"{name} lost its GPU {device} ({why}). Its CPU workers keep running."
+                    live.gpu_lost = (
+                        f"{name} lost its GPU {device} ({why}). Its CPU workers keep running. Check the GPU driver on "
+                        "the node."
+                    )
                     live.lost_device = device
                     live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
             self._touch()

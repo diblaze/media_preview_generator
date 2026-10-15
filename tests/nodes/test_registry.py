@@ -324,6 +324,15 @@ class TestAccessProblem:
         assert view.state == reg.STATE_ACCESS_PROBLEM
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "fix media access first")
 
+    def test_the_access_problem_reason_is_plain_words(self, h):
+        self._ready(h)
+        for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):
+            h.registry.report_not_visible("n1", path, "missing")
+        reason = h.registry.view("n1").reason
+        assert "(the last one: not found on the node)" in reason
+        # Shown on the Nodes page itself, and in the bell next to a "Test access" button.
+        assert "on the Nodes page" not in reason and "run Test access" in reason
+
     def test_the_same_file_three_times_is_not(self, h):
         self._ready(h)
         for _ in range(3):

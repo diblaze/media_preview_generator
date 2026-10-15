@@ -87,6 +87,20 @@ NOT_VISIBLE_OUTSIDE_ROOTS = "outside_roots"
 NOT_VISIBLE_MISSING = "missing"
 NOT_VISIBLE_DIFFERENT_FILE = "different_file"
 NOT_VISIBLE_UNREADABLE = "unreadable"
+# The same reasons in plain words, for job logs and the Nodes page.
+NOT_VISIBLE_TEXT = {
+    NOT_VISIBLE_UNMAPPED: "no folder mapping covers it",
+    NOT_VISIBLE_OUTSIDE_ROOTS: "it is outside the folders the node may read",
+    NOT_VISIBLE_MISSING: "not found on the node",
+    NOT_VISIBLE_DIFFERENT_FILE: "the node has a different file at that path",
+    NOT_VISIBLE_UNREADABLE: "the node can't read it",
+}
+
+
+def not_visible_text(reason: str) -> str:
+    """A node's reason code for a file it can't see, in plain words (an unknown code is shown as it is)."""
+    return NOT_VISIBLE_TEXT.get(reason, reason or NOT_VISIBLE_TEXT[NOT_VISIBLE_MISSING])
+
 
 # Ops: the heavy steps a worker node runs.
 OP_PREVIEW_FRAMES = "preview.frames"
