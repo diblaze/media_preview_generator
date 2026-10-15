@@ -240,6 +240,10 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
 
     @bp.post(protocol.ROUTE_ACCESS_CHECK)
     def access_check() -> Any:
+        # The roots come from the request, so on a node without the worker role (one beside Plex, maybe Windows with
+        # its user's own rights) the route would only list folders for whoever holds the Plex database key.
+        if state.worker_info is None:
+            return refuse(protocol.KIND_REQUEST, 400, "This node has no worker role")
         body = json_body()
         if body is None:
             return refuse(protocol.KIND_REQUEST, 400, "The request body must be a JSON object")

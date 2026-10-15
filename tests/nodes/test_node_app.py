@@ -399,6 +399,28 @@ class TestRoles:
         assert client.post("/v1/gpus/rescan", headers=HEADERS).status_code == 400
         assert client.post("/v1/tasks", headers=HEADERS, json={"op": "preview.frames", "path": "/a"}).status_code == 400
 
+    def test_plex_db_only_node_lists_no_folders(self, make_app, monkeypatch, tmp_path):
+        fake = types.ModuleType("media_preview_generator.nodes.server.plex_db")
+        fake.register_plex_db = lambda app, **kwargs: None
+        fake.agent_block = lambda: {}
+        monkeypatch.setitem(sys.modules, fake.__name__, fake)
+        monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
+        monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
+        private = tmp_path / "Users" / "steve" / "Documents"
+        private.mkdir(parents=True)
+        (private / "passwords.kdbx").write_bytes(b"secret")
+        body = {
+            "mapping": [{"app_prefix": "/x", "node_prefix": str(tmp_path)}],
+            "files": [{"path": "/x/Users/steve/Documents/nope/a.mkv"}],
+        }
+
+        response = make_app(roles=["plex_db"]).test_client().post("/v1/access-check", headers=HEADERS, json=body)
+
+        assert response.status_code == 400
+        answer = response.get_json()
+        assert answer["error"]["kind"] == protocol.KIND_REQUEST and "nearby" not in answer
+        assert "passwords" not in response.get_data(as_text=True)
+
     def test_plex_db_only_node_loads_no_worker_modules(self, tmp_path):
         script = f"""
 import sys, types
