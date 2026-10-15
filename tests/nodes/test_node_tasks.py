@@ -265,6 +265,41 @@ class TestTempFolder:
 
         assert "temp folder" in state["error"]["message"] and "is full" in state["error"]["message"]
 
+    @pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM], ids=["no-permission", "not-permitted"])
+    def test_ffmpeg_refused_the_temp_folder_by_permission_holds_the_node_with_the_puid_advice(
+        self, make_table, media, code
+    ):
+        from media_preview_generator.nodes.registry import _temp_folder_advice
+        from media_preview_generator.processing.generator import _FOLDER_WRITE_TEXT, WorkingFolderError
+
+        def op(ctx, node_path, params):
+            raise WorkingFolderError(code, _FOLDER_WRITE_TEXT[code][0], os.path.join(ctx.temp_dir, "frames"))
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED and state["error"]["kind"] == protocol.KIND_TEMP_FOLDER
+        message = state["error"]["message"]
+        assert message.startswith(f"The node can't write to its temp folder {table.temp_root} ("), message
+        assert "twice its frames' size" not in message
+        assert "check PUID and PGID" in _temp_folder_advice(message), message
+
+    @pytest.mark.parametrize(
+        "named", [lambda media: str(media / "a.mkv"), lambda media: None], ids=["the-video", "no-file-named"]
+    )
+    def test_a_permission_error_not_on_a_file_in_the_temp_folder_is_not_blamed_on_it(self, make_table, media, named):
+        # A video the node's user may not read fails with the same errno.
+        def op(ctx, node_path, params):
+            raise PermissionError(errno.EACCES, "Permission denied", named(media))
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["error"]["kind"] == protocol.KIND_FAILED
+        assert state["error"]["message"].startswith("PermissionError: [Errno 13]"), state["error"]
+
     def test_a_read_only_error_outside_the_temp_folder_is_not_blamed_on_it(self, make_table, media):
         def op(ctx, node_path, params):
             raise OSError(errno.EROFS, "Read-only file system", str(media / "a.mkv"))

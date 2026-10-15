@@ -5,6 +5,7 @@ Tests title formatting, path sanitization, Docker detection,
 and working directory setup.
 """
 
+import errno
 import os
 import signal
 import subprocess
@@ -406,6 +407,20 @@ class TestNodeHints:
         advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
 
         assert "the node's temp folder (NODE_TEMP_DIR) isn't full" in advice and "Settings" not in advice
+
+    def test_a_folder_its_user_may_not_write_names_whose_user_to_let_in(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        refused = generator.WorkingFolderError(errno.EACCES, "Permission denied", "/scratch/task/frames")
+        monkeypatch.setenv("MODE", "node")
+
+        assert generator.working_folder_failure(refused) == (
+            "Couldn't write the thumbnails: the node's temp folder /scratch/task/frames can't be written to "
+            "(Permission denied). Let the node's user write to it (in Docker, check PUID and PGID), or choose another "
+            "folder (NODE_TEMP_DIR)."
+        )
+        monkeypatch.delenv("MODE")
+        assert "Let the app's user write to it" in generator.working_folder_failure(refused)
 
     @pytest.mark.parametrize("kind", ["codec", "hwaccel", "signal", "stopped_part_way"])
     def test_a_nodes_gpu_to_cpu_retry_advice_names_no_screen_of_the_apps_own_devices(self, monkeypatch, kind):

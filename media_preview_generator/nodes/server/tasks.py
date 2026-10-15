@@ -95,6 +95,9 @@ class NodeStoppingError(Exception):
 # is opened read-only), so one of these from an op is the temp folder's.
 _TEMP_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
 _TEMP_WRITE_ERRNOS = _TEMP_FULL_ERRNOS | {errno.EROFS}
+# The node's user may not write there (PUID/PGID). Reading a video it may not read fails the same way, so one of these
+# is the temp folder's only when it names a file in it.
+_TEMP_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
 # After a task filled the temp folder, free space that comes back by less than this isn't room made: a new folder's
 # block, or other files on a shared disk, come and go by that much.
 TEMP_ROOM_MADE_BYTES = 1 << 20
@@ -485,12 +488,17 @@ class TaskTable:
             raise TaskStartError(message) from exc
 
     def _temp_folder_failure(self, exc: BaseException) -> tuple[str, bool] | None:
-        """Why an op stopped, when the temp folder filled up or went read-only, and whether it filled up; else None."""
+        """Why an op stopped, when the temp folder filled up, went read-only or can't be written by the node's user, and
+        whether it filled up; else None."""
         seen: BaseException | None = exc
         while seen is not None and self.temp_root is not None:
-            if isinstance(seen, OSError) and seen.errno in _TEMP_WRITE_ERRNOS:
+            if isinstance(seen, OSError) and seen.errno in _TEMP_WRITE_ERRNOS | _TEMP_PERMISSION_ERRNOS:
                 written = seen.filename if isinstance(seen.filename, str) else None
-                if written is None or _inside(written, self.temp_root):
+                if written is None:
+                    blamed = seen.errno in _TEMP_WRITE_ERRNOS
+                else:
+                    blamed = _inside(written, self.temp_root)
+                if blamed:
                     message = temp_folder_problem(self.temp_root, seen)
                     filled = seen.errno in _TEMP_FULL_ERRNOS
                     if filled:

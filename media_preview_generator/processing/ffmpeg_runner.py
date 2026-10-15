@@ -24,7 +24,6 @@ call sites in ``generate_images``' retry cascade don't need to change
 
 from __future__ import annotations
 
-import errno
 import os
 import re
 import signal
@@ -164,6 +163,7 @@ def create_ffmpeg_runner(
         _is_signal_killed,
         _save_ffmpeg_failure_log,
         _without_metadata_tags,
+        folder_write_fix,
         parse_ffmpeg_progress_line,
     )
 
@@ -781,7 +781,7 @@ def create_ffmpeg_runner(
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
                 folder, setting = working_folder_hint()
-                fix = "Make it writable" if refused == errno.EROFS else "Free up space there"
+                fix = folder_write_fix(refused)
                 logger.error(
                     "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
                     "{}, or choose another folder ({}). Other files in the queue will keep processing.",

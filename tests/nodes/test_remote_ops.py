@@ -162,6 +162,39 @@ class TestGenerateImages:
         assert (raised.value.errno, raised.value.filename) == (errno.ENOSPC, str(slot))
         assert list(slot.iterdir()) == []
 
+    def test_an_apps_folder_its_user_may_not_write_keeps_none_of_the_frames(self, media, tmp_path, monkeypatch):
+        _node()
+        slot = tmp_path / "slot"
+        slot.mkdir()
+
+        def fake(video, out, *args, **kwargs):
+            write_file(os.path.join(out, "0000000000.jpg"), b"frame")
+            return (True, 1, False, 1.0, "1x", "")
+
+        def unpack_refused(data, dest):
+            write_file(os.path.join(dest, "0000000000.jpg"), b"fr")
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.path.join(dest, "0000000005.jpg"))
+
+        monkeypatch.setattr(generator, "generate_images", fake)
+        monkeypatch.setattr(executor, "extract_artifact", unpack_refused)
+        with _on_node(), pytest.raises(WorkingFolderError) as raised:
+            remote_ops.generate_images(media, str(slot), None, None, _Config())
+
+        assert (raised.value.errno, raised.value.filename) == (errno.EACCES, str(slot))
+        assert list(slot.iterdir()) == []
+
+    def test_a_video_this_app_may_not_read_is_not_the_folders_failure(self, media, tmp_path, monkeypatch):
+        def unreadable(*args, **kwargs):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), media)
+
+        slot = tmp_path / "slot"
+        slot.mkdir()
+        monkeypatch.setattr(remote_ops, "run_on_node", unreadable)
+        with pytest.raises(PermissionError) as raised:
+            remote_ops.generate_images(media, str(slot), None, None, _Config())
+
+        assert not isinstance(raised.value, WorkingFolderError)
+
     def test_cancellation_raises_cancellation_error(self, media, tmp_path, monkeypatch):
         _node()
 

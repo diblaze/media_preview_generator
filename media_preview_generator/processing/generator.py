@@ -14,7 +14,8 @@ Public API consumed elsewhere:
 - :class:`CodecNotSupportedError`, :class:`CancellationError` — sentinel
   exceptions the worker catches to drive its in-place GPU→CPU fallback
 - :class:`WorkingFolderError` — FFmpeg couldn't write the thumbnails (a full
-  or read-only working folder); nothing of that run is published
+  or read-only working folder, or one this user may not write to); nothing of
+  that run is published
 - :func:`generate_images` — the per-item entry point
 - :func:`generate_bif` — pure JPG-folder → BIF packer used by output
   adapters that need a BIF without going through the FFmpeg pipeline
@@ -166,11 +167,15 @@ FFMPEG_SIGNALLED_EXIT = 255
 # AVERROR(EIO): a read or write failed. A GPU decoder or an OpenCL filter that fails exits with it too; only the stderr
 # tells the two apart (``_was_interrupted``).
 FFMPEG_IO_ERROR_EXIT = 251
-# The errors a thumbnail write fails with when the folder is the problem: full, over its quota, or read-only. Only a
-# write fails this way (the video is only read), so they are the working folder's, never the file's. FFmpeg exits with
-# AVERROR(errno), which the OS reports in 8 bits (Linux, macOS) or 32 (Windows): ENOSPC 228, EROFS 226. EDQUOT's 134 is
-# also a wrapper shell's SIGABRT, so only its text in the stderr counts.
-FOLDER_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS})
+# The errors a thumbnail write fails with when the folder is the problem: full, over its quota, read-only, or not
+# writable by the user this runs as (PUID/PGID). FFmpeg exits with AVERROR(errno), which the OS reports in 8 bits
+# (Linux, macOS) or 32 (Windows): ENOSPC 228, EROFS 226. Only a write fails with those two (the video is only read), so
+# their exit codes are the working folder's, never the file's. EDQUOT's 134 is also a wrapper shell's SIGABRT, so only
+# its text in the stderr counts. A video this user may not read exits EACCES's 243 too, so a permission error is the
+# folder's only on a line about the output, or when the folder itself refuses a new file.
+FOLDER_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES, errno.EPERM})
+# The ones that say this user may not write there, rather than that the folder can't take a write.
+FOLDER_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
 _FOLDER_WRITE_EXITS = {
     exit_code: code for code in (errno.ENOSPC, errno.EROFS) for exit_code in (256 - code, 2**32 - code)
 }
@@ -180,12 +185,15 @@ _FOLDER_WRITE_TEXT = {
     errno.ENOSPC: ("No space left on device",),
     errno.EROFS: ("Read-only file system",),
     errno.EDQUOT: ("Disk quota exceeded", "Disc quota exceeded"),
+    errno.EACCES: ("Permission denied",),
+    errno.EPERM: ("Operation not permitted",),
 }
 # A line about writing the output: FFmpeg 6.1+ prefixes them [out#N/image2] and [vost#N:M/mjpeg], older builds name
 # the call that failed.
 _OUTPUT_SIDE_RE = re.compile(r"^\[(?:out#|vost#|image2 )|av_interleaved_write_frame\(\)|Error writing trailer")
 # FFmpeg's image2 muxer couldn't create a frame file. It reports that as AVERROR(EIO), exit 251, whatever the real error:
-# a full btrfs, ZFS or XFS folder refuses the new file itself, and so does a read-only one.
+# a full btrfs, ZFS or XFS folder refuses the new file itself, and so do a read-only one and one this user may not write
+# to (stock FFmpeg 8.0.1 into a chmod 555 folder).
 _FRAME_FILE_NOT_CREATED_RE = re.compile(r"^\[image2 @ [^\]]*\] Could not open file")
 # What the check that asks the folder why writes: a few thumbnails' worth.
 _WRITE_CHECK_BYTES = 1 << 16
@@ -488,7 +496,8 @@ class CodecNotSupportedError(Exception):
 
 
 class WorkingFolderError(OSError):
-    """FFmpeg couldn't write the thumbnails: the folder they go to is full, over its quota, or read-only.
+    """FFmpeg couldn't write the thumbnails: the folder they go to is full, over its quota, read-only, or not writable
+    by the user this runs as.
 
     Not the file's failure, nor the device's: the run's frames are deleted and no other device or filter chain is
     tried. An ``OSError`` with the errno (``FOLDER_WRITE_ERRNOS``) and the folder, so a node reports it as its temp
@@ -508,8 +517,31 @@ def working_folder_failure(exc: OSError) -> str:
     folder, setting = working_folder_hint()
     where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
     why = exc.strerror or os.strerror(exc.errno or 0)
-    state, fix = ("read-only", "Make it writable") if exc.errno == errno.EROFS else ("full", "Free up space there")
-    return f"Couldn't write the thumbnails: {where} is {state} ({why}). {fix}, or choose another folder ({setting})."
+    if exc.errno == errno.EROFS:
+        state = "is read-only"
+    elif exc.errno in FOLDER_PERMISSION_ERRNOS:
+        state = "can't be written to"
+    else:
+        state = "is full"
+    fix = folder_write_fix(exc.errno)
+    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or choose another folder ({setting})."
+
+
+def folder_write_fix(code: int | None) -> str:
+    """What to do about a working folder that refused a thumbnail write, by why it refused.
+
+    Args:
+        code: The errno (``FOLDER_WRITE_ERRNOS``).
+
+    Returns:
+        The fix, worded to start a sentence.
+    """
+    if code == errno.EROFS:
+        return "Make it writable"
+    if code in FOLDER_PERMISSION_ERRNOS:
+        user = "the node's user" if is_node_mode() else "the app's user"
+        return f"Let {user} write to it (in Docker, check PUID and PGID)"
+    return "Free up space there"
 
 
 def gpu_fallback_announcement(kind: str, video_file: str) -> str:
@@ -704,8 +736,9 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder:
 
     Told by the exit code, or by the error's text on a line about the output: a full folder may cut off the stderr
     log too, and older FFmpeg builds exit 1 after a failed write. Not by the text alone on any line: Mesa says
-    "Read-only file system" about its shader cache on a read-only root, and the run is fine. When FFmpeg couldn't
-    create a frame file it says only "I/O error", so the folder itself is asked (:func:`_folder_refuses_new_files`).
+    "Read-only file system" about its shader cache on a read-only root, and the run is fine, and a video this user may
+    not read says "Permission denied" on an input line. When FFmpeg couldn't create a frame file it says only
+    "I/O error", so the folder itself is asked (:func:`_folder_refuses_new_files`).
 
     Args:
         returncode: FFmpeg exit code.
@@ -734,7 +767,8 @@ def _folder_write_errno(returncode: int, stderr_lines: list[str], output_folder:
 
 
 def _folder_refuses_new_files(folder: str) -> int | None:
-    """Whether ``folder`` is full, over its quota or read-only now, found by writing a small file there and removing it.
+    """Whether ``folder`` is full, over its quota, read-only or not writable by this user now, found by writing a small
+    file there and removing it.
 
     Args:
         folder: The folder FFmpeg couldn't create a frame file in, its frames not yet deleted.
@@ -1669,8 +1703,8 @@ def generate_images(
     Raises:
         CodecNotSupportedError: The GPU couldn't produce the preview (the worker reruns the file on the CPU).
         CancellationError: The job was cancelled.
-        WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota, or
-            read-only); none of them are kept.
+        WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota,
+            read-only, or not writable by this user); none of them are kept.
     """
     media_info = MediaInfo.parse(video_file)
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
@@ -1900,7 +1934,7 @@ def generate_images(
         writes to the same folder, and a short preview would be marked fresh, so later scans would skip it.
 
         Raises:
-            WorkingFolderError: The folder is full, over its quota, or read-only.
+            WorkingFolderError: The folder is full, over its quota, read-only, or not writable by this user.
         """
         rc, seconds, speed, run_stderr = run_ffmpeg_once(*args, **kwargs)
         refused = _folder_write_errno(rc, run_stderr, output_folder)

@@ -2269,8 +2269,16 @@ class TestAWorkingFolderThatRefusesTheThumbnails:
 
     @pytest.mark.parametrize(
         ("code", "said"),
-        [(errno.ENOSPC, "is full (No space left on device). Free up space there"), (errno.EROFS, "is read-only")],
-        ids=["full", "read-only"],
+        [
+            (errno.ENOSPC, "is full (No space left on device). Free up space there"),
+            (errno.EROFS, "is read-only"),
+            (
+                errno.EACCES,
+                "can't be written to (Permission denied). Let the app's user write to it (in Docker, check PUID and "
+                "PGID)",
+            ),
+        ],
+        ids=["full", "read-only", "no-permission"],
     )
     def test_the_file_fails_naming_the_folder_and_publishes_nothing(
         self, mock_config_for_processing, tmp_path, code, said

@@ -12,8 +12,8 @@ A run can stop part-way and leave frames on disk. The rule, per run and per tier
   interval) it is published with a warning on any tier, so decoders that only error at EOF keep their GPU offload
   instead of paying a second full decode on the CPU. With fewer, a GPU run hands the file to the CPU and a CPU run
   publishes the short preview with a warning (a truncated file fails the same way on every scan);
-* the folder refused a write: full, over its quota or read-only (ENOSPC exit 228, EROFS exit 226, or the error's text
-  on an output line). On any tier and device the frames are deleted and ``WorkingFolderError`` ends the file at
+* the folder refused a write: full, over its quota, read-only or not writable by this user (ENOSPC exit 228, EROFS
+  exit 226, the error's text on an output line, or the folder refusing a new file itself). On any tier and device the frames are deleted and ``WorkingFolderError`` ends the file at
   once: whatever the run wrote stops where the folder filled up, and the next tier or the CPU writes to the same folder;
 * exit 0: published.
 
@@ -128,6 +128,27 @@ OVER_QUOTA_LINE = (
     f"[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -{errno.EDQUOT} (Disk quota exceeded)"
 )
 OLD_FFMPEG_FULL_LINE = "av_interleaved_write_frame(): No space left on device"
+# The app image's FFmpeg 8.1.2, run as a user that may not write the folder (chmod 555): exit AVERROR(EACCES) & 0xff and
+# the errno's text on the output lines. A video that user may not read exits 243 too, saying so only about the input.
+PERMISSION_DENIED = 256 - errno.EACCES  # 243
+NOT_PERMITTED = 256 - errno.EPERM  # 255, also FFmpeg's own exit after a SIGTERM it handled
+FOLDER_PERMISSION_DENIED_STDERR = [
+    "[image2 @ 0x5c8427bd0480] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x5c8427bd0700] Error submitting a packet to the muxer: Permission denied",
+    "[out#0/image2 @ 0x5c8427b9ae40] Error muxing a packet",
+    "[out#0/image2 @ 0x5c8427b9ae40] Task finished with error code: -13 (Permission denied)",
+    "[out#0/image2 @ 0x5c8427b9ae40] Terminating thread with return code -13 (Permission denied)",
+    "Conversion failed!",
+]
+FOLDER_NOT_PERMITTED_STDERR = [
+    line.replace("Permission denied", "Operation not permitted").replace("-13", "-1")
+    for line in FOLDER_PERMISSION_DENIED_STDERR
+]
+VIDEO_PERMISSION_DENIED_STDERR = [
+    "[in#0 @ 0x5f186b621c40] Error opening input: Permission denied",
+    "Error opening input file /media/movie.mkv.",
+    "Error opening input files: Permission denied",
+]
 # Mesa on a read-only root: about its shader cache, not the thumbnails; the run goes on fine.
 MESA_SHADER_CACHE_LINE = "Failed to create //.cache for shader cache (Read-only file system)---disabling."
 
@@ -159,6 +180,17 @@ def _write_frames(output_folder: str, n_frames: int) -> None:
     for i in range(1, n_frames + 1):
         with open(os.path.join(output_folder, f"img-{i:06d}.jpg"), "wb") as fh:
             fh.write(b"\xff\xd8\xff\xdb" + str(i).encode())
+
+
+def _make_movie(ffmpeg: str, path: Path) -> None:
+    """A real 20-second video for the tests that run real FFmpeg."""
+    made = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=20:s=64x36:r=5"]
+        + ["-c:v", "mpeg4", str(path)],
+        capture_output=True,
+        timeout=60,
+    )
+    assert made.returncode == 0, made.stderr
 
 
 def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
@@ -489,8 +521,10 @@ class TestAFolderThatRefusesTheThumbnails:
             ((FOLDER_FULL, 2), errno.ENOSPC),
             ((FOLDER_READ_ONLY, 0, *FOLDER_READ_ONLY_STDERR), errno.EROFS),
             ((SHELL_SIGABRT, 40, OVER_QUOTA_LINE), errno.EDQUOT),
+            ((PERMISSION_DENIED, 0, *FOLDER_PERMISSION_DENIED_STDERR), errno.EACCES),
+            ((NOT_PERMITTED, 0, *FOLDER_NOT_PERMITTED_STDERR), errno.EPERM),
         ],
-        ids=["full", "full-stderr-cut-off", "read-only", "over-quota"],
+        ids=["full", "full-stderr-cut-off", "read-only", "over-quota", "no-permission", "not-permitted"],
     )
     def test_the_error_names_the_folder_and_why(self, run, tmp_path, attempt, code):
         # A node reads errno + filename to tell its temp folder's problem from the file's (nodes/server/tasks.py).
@@ -519,7 +553,11 @@ class TestAFolderThatRefusesTheThumbnails:
 
         return patch.object(os, "open", refusing_open)
 
-    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS], ids=["full", "read-only"])
+    @pytest.mark.parametrize(
+        "code",
+        [errno.ENOSPC, errno.EROFS, errno.EACCES, errno.EPERM],
+        ids=["full", "read-only", "no-permission", "not-permitted"],
+    )
     def test_a_frame_file_ffmpeg_could_not_create_is_the_folders_when_it_takes_no_new_file(self, run, tmp_path, code):
         with self._refusing_new_files(tmp_path / "frames", code):
             outcome = run([(IO_ERROR, 0, *CANT_OPEN_FRAME_STDERR)], gpu="NVIDIA")
@@ -547,13 +585,7 @@ class TestAFolderThatRefusesTheThumbnails:
         from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
 
         ffmpeg = shutil.which("ffmpeg")
-        made = subprocess.run(
-            [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=20:s=64x36:r=5"]
-            + ["-c:v", "mpeg4", str(tmp_path / "movie.mkv")],
-            capture_output=True,
-            timeout=60,
-        )
-        assert made.returncode == 0, made.stderr
+        _make_movie(ffmpeg, tmp_path / "movie.mkv")
         mock_config.ffmpeg_path = ffmpeg
         frames = tmp_path / "frames"
         frames.mkdir()
@@ -570,6 +602,61 @@ class TestAFolderThatRefusesTheThumbnails:
         assert len(refused) == 1 and "No space left on device (exit code 251)" in refused[0], outcome.warnings
         # Nor is it put down to the video's disk as well.
         assert not any("hit an I/O error" in line for line in outcome.warnings), outcome.warnings
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a folder without write permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_into_a_folder_this_user_may_not_write_ends_on_the_folder(self, run, tmp_path, mock_config):
+        """Real FFmpeg, runner and cascade, a folder left by another user (PUID/PGID): stock 8.0.1 says only "Could not
+        open file" (the check asks the folder), the app image's 8.1.2 says "Permission denied" itself."""
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        _make_movie(ffmpeg, tmp_path / "movie.mkv")
+        mock_config.ffmpeg_path = ffmpeg
+        frames = tmp_path / "frames"
+        frames.mkdir()
+        frames.chmod(0o555)
+        try:
+            outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            frames.chmod(0o755)
+
+        assert isinstance(outcome.result, WorkingFolderError), outcome.result
+        assert (outcome.result.errno, outcome.result.filename) == (errno.EACCES, str(frames))
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and "Permission denied (exit code" in refused[0], outcome.warnings
+        assert "check PUID and PGID" in refused[0] and "Free up space" not in refused[0], refused[0]
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="a file without read permission stops only a POSIX non-root user",
+    )
+    def test_real_ffmpeg_on_a_video_this_user_may_not_read_is_not_the_folders(self, run, tmp_path, mock_config):
+        from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+
+        ffmpeg = shutil.which("ffmpeg")
+        movie = tmp_path / "movie.mkv"
+        _make_movie(ffmpeg, movie)
+        mock_config.ffmpeg_path = ffmpeg
+        movie.chmod(0)
+        try:
+            outcome = run([], gpu=None, duration_s=20, runner_factory=create_ffmpeg_runner)
+        finally:
+            movie.chmod(0o644)
+
+        assert_failed(outcome, PERMISSION_DENIED)
+        assert not any("couldn't write thumbnails" in line for line in outcome.warnings), outcome.warnings
+
+    def test_a_video_this_user_may_not_read_is_the_files_failure(self, run):
+        outcome = run([(PERMISSION_DENIED, 0, *VIDEO_PERMISSION_DENIED_STDERR)] * 4, gpu=None)
+
+        assert_failed(outcome, PERMISSION_DENIED)
+        assert _folder_write_errno(PERMISSION_DENIED, VIDEO_PERMISSION_DENIED_STDERR) is None
+        assert _diagnose_ffmpeg_exit_code(PERMISSION_DENIED, VIDEO_PERMISSION_DENIED_STDERR) != "folder_write_error"
 
     def test_the_errors_text_is_read_as_ffmpeg_words_it_whatever_the_os_calls_the_errno(self, monkeypatch):
         # Windows has no EDQUOT: Python's is WSAEDQUOT, which os.strerror calls "Unknown error".
@@ -655,8 +742,13 @@ class TestTheRunnersFailureLines:
             (FOLDER_FULL, "\n".join(FOLDER_FULL_STDERR), "Free up space there"),
             (FOLDER_READ_ONLY, "\n".join(FOLDER_READ_ONLY_STDERR), "Make it writable"),
             (SHELL_SIGABRT, OVER_QUOTA_LINE, "Free up space there"),
+            (
+                PERMISSION_DENIED,
+                "\n".join(FOLDER_PERMISSION_DENIED_STDERR),
+                "Let the app's user write to it (in Docker, check PUID and PGID), or choose another folder",
+            ),
         ],
-        ids=["full", "read-only", "over-quota"],
+        ids=["full", "read-only", "over-quota", "no-permission"],
     )
     def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(self, run, tmp_path, rc, stderr, said):
         outcome = self._run_real(run, tmp_path, rc, stderr)

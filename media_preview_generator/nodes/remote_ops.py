@@ -93,6 +93,14 @@ def _remove_frames(folder: str) -> None:
             pass
 
 
+def _written_inside(exc: OSError, folder: str) -> bool:
+    """Whether ``exc`` names a file in ``folder``."""
+    if not isinstance(exc.filename, str):
+        return False
+    path, root = os.path.realpath(exc.filename), os.path.realpath(folder)
+    return os.path.commonpath([path, root]) == root
+
+
 def generate_images(
     video_file: str,
     output_folder: str,
@@ -109,9 +117,16 @@ def generate_images(
     Raises:
         CodecNotSupportedError: The node's GPU couldn't produce the preview (the worker reruns it on the node's CPU).
         CancellationError: The job was cancelled.
-        WorkingFolderError: The frames couldn't be unpacked into ``output_folder`` (full or read-only); none are kept.
+        WorkingFolderError: The frames couldn't be unpacked into ``output_folder`` (full, read-only, or not writable by
+            this app's user); none are kept.
     """
-    from ..processing.generator import FOLDER_WRITE_ERRNOS, CancellationError, WorkingFolderError, record_failure
+    from ..processing.generator import (
+        FOLDER_PERMISSION_ERRNOS,
+        FOLDER_WRITE_ERRNOS,
+        CancellationError,
+        WorkingFolderError,
+        record_failure,
+    )
 
     server_name = getattr(config, "server_display_name", None)
     params = {
@@ -146,9 +161,12 @@ def generate_images(
             lambda message=exc.message: CancellationError(message),
         ) from exc
     except OSError as exc:
-        # This app's own folder filled up (or is read-only) while the node's frames were unpacked into it: the frames
-        # already there are cut short, as a local run's would be.
-        if exc.errno not in FOLDER_WRITE_ERRNOS:
+        # This app's own folder filled up (or is read-only, or its user may not write there) while the node's frames
+        # were unpacked into it: the frames already there are cut short, as a local run's would be. A permission error
+        # counts only on a file in the folder: the video this app may not stat fails the same way.
+        if exc.errno not in FOLDER_WRITE_ERRNOS or (
+            exc.errno in FOLDER_PERMISSION_ERRNOS and not _written_inside(exc, output_folder)
+        ):
             raise
         _remove_frames(output_folder)
         raise WorkingFolderError(exc.errno, exc.strerror or os.strerror(exc.errno), output_folder) from exc
