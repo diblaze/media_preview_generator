@@ -1046,6 +1046,10 @@ class TestNodeDialog:
              "files": [], "error": f"This app can't open /media/synth{i}"}
             for i in range(3)
         ]  # fmt: skip
+        # A second folder of the same library is one more result, not one more library.
+        skipped.append(
+            {**skipped[0], "app_root": "/media/synth0-old", "error": "This app can't open /media/synth0-old"}
+        )
         api.test_answers = [
             {"libraries": [_library("Movies", "/data/Movies", False, "/mnt/nas/Movies"), *skipped]},
         ]
@@ -1057,6 +1061,7 @@ class TestNodeDialog:
         note = results.locator(".nd-skipped")
         expect(note).to_have_count(1)
         expect(note.locator("summary")).to_have_text("3 libraries skipped: this app can't open them.")
+        expect(note.locator("li")).to_have_count(3)
         expect(note.locator("a")).to_have_attribute("href", "/servers")
         expect(results).not_to_contain_text("Synth 0: no files to test")
 

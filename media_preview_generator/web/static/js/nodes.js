@@ -529,8 +529,14 @@
 
         function skippedNote(skipped) {
             if (!skipped.length) return '';
-            const count = skipped.length;
-            const items = skipped.map((lib) => `<li><b>${esc([lib.server, lib.library].filter(Boolean).join(' · '))}</b> <span class="nd-faint">${esc(lib.error)}</span></li>`).join('');
+            // A result is one folder: a library with two folders is still one library skipped.
+            const byLibrary = new Map();
+            skipped.forEach((lib) => {
+                const name = [lib.server, lib.library].filter(Boolean).join(' · ');
+                if (!byLibrary.has(name)) byLibrary.set(name, lib.error);
+            });
+            const count = byLibrary.size;
+            const items = Array.from(byLibrary, ([name, error]) => `<li><b>${esc(name)}</b> <span class="nd-faint">${esc(error)}</span></li>`).join('');
             return `<details class="nd-note nd-skipped"><summary><i class="bi bi-info-circle" aria-hidden="true"></i>`
                 + `${count} ${count === 1 ? 'library' : 'libraries'} skipped: this app can't open ${count === 1 ? 'it' : 'them'}.</summary>`
                 + `<ul>${items}</ul><a href="/servers">Fix on Media Servers</a></details>`;

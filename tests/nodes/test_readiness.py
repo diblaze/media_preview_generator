@@ -250,6 +250,17 @@ def test_libraries_this_app_cant_open_share_one_neutral_note():
     assert not [r for r in rows if r["ok"] is False and r["severity"] in ("critical", "recommended")]
 
 
+def test_a_skipped_library_with_two_folders_counts_once():
+    """Each result is one folder: a library with two folders this app can't open read as two libraries skipped."""
+    skipped = [
+        {"server": "Home", "library": "Kids", "app_root": root, "checked": 0, "ok": False, "files": [],
+         "error": f"This app can't open {root}", "suggestion": None}
+        for root in ("/media/kids", "/media/kids-old")
+    ]  # fmt: skip
+    row = _check(_envelope(_details(access={"libraries": skipped})), "node_access_skipped")
+    assert (row["label"], row["reason"]) == ("1 library skipped: this app can't open it", "Home · Kids")
+
+
 def test_an_empty_library_is_not_a_problem():
     access = {
         "libraries": [

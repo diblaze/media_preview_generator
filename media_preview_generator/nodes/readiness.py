@@ -306,8 +306,10 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
             continue
         if not lib.get("checked"):
             # Nothing was sampled: this app can't open the folder itself or timed out reading it, so the node was
-            # never asked. It isn't the node's problem, so all of them share one neutral line below.
-            skipped.append(label)
+            # never asked. It isn't the node's problem, so all of them share one neutral line below. A result is one
+            # folder, so a library with two folders is counted once.
+            if label not in skipped:
+                skipped.append(label)
             continue
         ok = bool(lib.get("ok"))
         missing = [f for f in lib.get("files") or [] if isinstance(f, dict) and not f.get("ok")]
