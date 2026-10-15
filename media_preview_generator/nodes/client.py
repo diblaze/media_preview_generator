@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from json import loads as parse_json
 from typing import Any
 
 import requests
@@ -25,6 +26,8 @@ ARTIFACT_TIMEOUT_S = 300.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
+# Every other answer is a small JSON object; the largest (a long film's audio fingerprint) is a few MB.
+MAX_ANSWER_BYTES = 64 * 1024 * 1024
 
 
 class NodeError(Exception):
@@ -115,13 +118,18 @@ class NodeClient:
         self, method: str, path: str, *, json: dict | None = None, read_timeout: float = READ_TIMEOUT_S,
         auth: bool = True, raw: bool = False,
     ) -> Any:  # fmt: skip
+        # A node never compresses its answers, and requests would inflate a compressed one in memory past any cap.
+        headers = {"Accept-Encoding": "identity", **(self._headers() if auth else {})}
         try:
             response = self._session.request(
                 method,
                 self._address.base + path,
                 json=json,
-                headers=self._headers() if auth else None,
+                headers=headers,
                 timeout=(CONNECT_TIMEOUT_S, read_timeout),
+                # A redirect would carry the task (paths, mappings) to a host that isn't the node.
+                allow_redirects=False,
+                stream=True,
             )
         except requests.ReadTimeout as exc:
             raise NodeTimeoutError(f"{self._address.base} didn't answer in time: {type(exc).__name__}") from exc
@@ -131,14 +139,37 @@ class NodeClient:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
         except requests.RequestException as exc:
             raise NodeUnreachableError(f"{self._address.base} didn't answer: {type(exc).__name__}") from exc
+        with response:
+            return self._answer(response, path, raw=raw)
+
+    def _read(self, response: requests.Response, limit: int) -> bytes:
+        """The body, refused once it passes ``limit`` bytes."""
+        body = bytearray()
+        try:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                body += chunk
+                if len(body) > limit:
+                    raise NodeProtocolError(f"{self._address.base} sent more than {limit // (1024 * 1024)} MB")
+        except requests.RequestException as exc:
+            # The answer had started, so the node may have acted on the request.
+            raise NodeTimeoutError(f"{self._address.base} dropped the connection while answering") from exc
+        return bytes(body)
+
+    def _answer(self, response: requests.Response, path: str, *, raw: bool) -> Any:
+        """The node's answer to ``path``: the JSON body, or the bytes when ``raw``; anything else raises."""
         if response.status_code == 401:
             raise NodeAuthError(f"{self._address.base} refused the key")
         if response.status_code >= 500:
             raise NodeUnreachableError(f"{self._address.base} answered HTTP {response.status_code}")
+        if 300 <= response.status_code < 400:
+            raise NodeProtocolError(f"{self._address.base} answered with a redirect (HTTP {response.status_code})")
+        encoding = str(response.headers.get("Content-Encoding") or "identity").strip().lower()
+        if encoding != "identity":
+            raise NodeProtocolError(f"{self._address.base} sent a {encoding}-compressed answer")
         if raw and response.status_code == 200:
-            return response.content
+            return self._read(response, MAX_ARTIFACT_BYTES)
         try:
-            body = response.json()
+            body = parse_json(self._read(response, MAX_ANSWER_BYTES))
         except ValueError as exc:
             raise NodeProtocolError(
                 f"{self._address.base} didn't answer as a node (HTTP {response.status_code})"
