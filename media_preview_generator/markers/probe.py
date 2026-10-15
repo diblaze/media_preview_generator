@@ -23,6 +23,8 @@ from typing import Any
 
 from loguru import logger
 
+from ..processing.filter_chain import display_matrix, rotation_filter
+
 KILL_WAIT_S = 5.0
 FFPROBE_REAPER = "ffprobe-reaper"
 # ffprobes left stuck on their files (after timing out) before no new one is started.
@@ -228,7 +230,7 @@ def _video_frame_rate(streams: object) -> float | None:
 @dataclass(frozen=True)
 class StreamStarts:
     """Where the container and its first audio stream start, whether it has a picture to decode, and that picture's
-    pixel format.
+    pixel format and turn.
 
     Attributes:
         container_s: The container's first timestamp (0.0 when it reports none).
@@ -236,12 +238,14 @@ class StreamStarts:
         has_video: Whether it has a video stream that isn't cover art.
         pix_fmt: ffprobe's ``pix_fmt`` for the first video stream that isn't cover art (``yuv420p``,
             ``yuv420p10le``), None when there is none or ffprobe names none.
+        turned: Whether FFmpeg shows that picture turned or mirrored from how it is stored (:func:`shown_turned`).
     """
 
     container_s: float
     audio_s: float | None
     has_video: bool = True
     pix_fmt: str | None = None
+    turned: bool = False
 
     @property
     def audio_offset_s(self) -> float:
@@ -304,7 +308,7 @@ def audio_streams(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> list[A
 
 def stream_starts(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> StreamStarts:
     """The container's and the first audio stream's start times, and whether there is a video stream and its pixel
-    format, from one ffprobe that reads only the headers.
+    format and turn, from one ffprobe that reads only the headers.
 
     Args:
         path: Media file.
@@ -320,7 +324,8 @@ def stream_starts(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> Stream
         ProbeError: ffprobe missing, failed or returned something other than its JSON.
     """
     cmd = [ffprobe, "-v", "error", "-show_entries",
-           "format=start_time:stream=codec_type,start_time,pix_fmt:stream_disposition=attached_pic", "-of", "json",
+           "format=start_time:stream=codec_type,start_time,pix_fmt:stream_disposition=attached_pic"
+           ":stream_side_data=displaymatrix", "-of", "json",
            path]  # fmt: skip
     stdout = _run_ffprobe(cmd, path, timeout_s)
     try:
@@ -350,7 +355,23 @@ def stream_starts(path: str, *, ffprobe: str, timeout_s: float = 60.0) -> Stream
         _seconds(audio.get("start_time")),
         picture is not None,
         pix_fmt if isinstance(pix_fmt, str) and pix_fmt else None,
+        picture is not None and shown_turned(picture),
     )
+
+
+def shown_turned(stream: dict[str, Any]) -> bool:
+    """Whether FFmpeg shows a video stream turned or mirrored from how it is stored, by its display matrix.
+
+    FFmpeg turns only frames in memory, never GPU surfaces, so a GPU's frames of such a stream are read the way the
+    CPU's are: downloaded by ffmpeg itself (``frames.surface_format``).
+
+    Args:
+        stream: One entry of ffprobe's ``streams``, read with ``stream_side_data=displaymatrix``.
+
+    Returns:
+        True for a stream FFmpeg turns or mirrors on the CPU.
+    """
+    return rotation_filter(display_matrix(stream)) is not None
 
 
 @dataclass(frozen=True)
@@ -368,22 +389,24 @@ class VideoPacket:
 
 @dataclass(frozen=True)
 class VideoPackets:
-    """The main video stream's codec, pixel format and first packet headers.
+    """The main video stream's codec, pixel format, turn and first packet headers.
 
     Attributes:
         codec: ffprobe's ``codec_name`` for the stream (``h264``, ``vp9``), None when the file has no video stream or
             ffprobe names none.
         packets: The packets in the file's order.
         pix_fmt: ffprobe's ``pix_fmt`` for the stream (``yuv420p``, ``yuv420p10le``), None when it names none.
+        turned: Whether FFmpeg shows the stream turned or mirrored from how it is stored (:func:`shown_turned`).
     """
 
     codec: str | None
     packets: tuple[VideoPacket, ...]
     pix_fmt: str | None = None
+    turned: bool = False
 
 
 def video_packets(path: str, *, ffprobe: str, packets: int, timeout_s: float = 60.0) -> VideoPackets:
-    """The codec, pixel format and first ``packets`` packet headers of the file's main video stream, from one
+    """The codec, pixel format, turn and first ``packets`` packet headers of the file's main video stream, from one
     ffprobe.
 
     Read from the start of the file up to those packets (not the whole file), and nothing is decoded. ``V`` leaves out
@@ -405,7 +428,8 @@ def video_packets(path: str, *, ffprobe: str, packets: int, timeout_s: float = 6
         ProbeError: ffprobe missing, failed or returned something other than its JSON packet and stream lists.
     """
     cmd = [ffprobe, "-v", "error", "-select_streams", "V:0", "-read_intervals", f"%+#{packets}",
-           "-show_entries", "packet=pts_time,flags:stream=codec_name,pix_fmt", "-of", "json", path]  # fmt: skip
+           "-show_entries", "packet=pts_time,flags:stream=codec_name,pix_fmt:stream_side_data=displaymatrix", "-of", "json",
+           path]  # fmt: skip
     stdout = _run_ffprobe(cmd, path, timeout_s)
     try:
         data = json.loads(stdout or "")
@@ -423,6 +447,7 @@ def video_packets(path: str, *, ffprobe: str, packets: int, timeout_s: float = 6
         codec if isinstance(codec, str) and codec else None,
         tuple(VideoPacket(_seconds(packet.get("pts_time")), "K" in str(packet.get("flags", ""))) for packet in raw),
         pix_fmt if isinstance(pix_fmt, str) and pix_fmt else None,
+        bool(streams) and shown_turned(streams[0]),
     )
 
 

@@ -192,12 +192,29 @@ class KeyframeThinning(NamedTuple):
     Attributes:
         keep_every: Decode one packet in this many (an intra-only stream), or None.
         drop_non_key: Drop every packet not flagged as a keyframe (a codec in ``SKIP_FRAME_IGNORED``).
-        download_format: The surfaces' format (``DOWNLOAD_FORMATS``), or None: ffmpeg downloads each frame itself.
+        download_format: The surfaces' format (:func:`surface_format`), or None: ffmpeg downloads each frame itself.
     """
 
     keep_every: int | None = None
     drop_non_key: bool = False
     download_format: str | None = None
+
+
+def surface_format(pix_fmt: str | None, *, turned: bool) -> str | None:
+    """The format a stream's decoded GPU surfaces are downloaded in by the filter graph, or None to let ffmpeg download
+    each frame itself.
+
+    A stream FFmpeg shows turned or mirrored is left to ffmpeg: it turns frames in memory but not surfaces, so the
+    GPU's frames would be read as stored and the CPU's as shown.
+
+    Args:
+        pix_fmt: ffprobe's ``pix_fmt`` for the stream.
+        turned: Whether FFmpeg shows the stream turned or mirrored (``probe.shown_turned``).
+
+    Returns:
+        ``nv12`` or ``p010le`` (``DOWNLOAD_FORMATS``), or None.
+    """
+    return None if turned else DOWNLOAD_FORMATS.get(pix_fmt or "")
 
 
 def tail_length_s(*, is_episode: bool, tv_s: int | None = None, movie_s: int | None = None) -> float:
@@ -465,7 +482,7 @@ def keyframe_thinning(path: str, ffmpeg: str, *, cancel_check: Callable[[], bool
     return KeyframeThinning(
         _intra_only_stride(probed.packets, name),
         probed.codec in SKIP_FRAME_IGNORED,
-        DOWNLOAD_FORMATS.get(probed.pix_fmt or ""),
+        surface_format(probed.pix_fmt, turned=probed.turned),
     )
 
 

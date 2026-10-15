@@ -71,7 +71,13 @@ PACKAGE_ROOT = Path(credits_package.__file__).parents[2]
 # The credit text detector and the package code outside it that shapes its answers: the tail decode's arguments and
 # the probe. tests/markers_eval pins that every package module these files import is listed here or changes no answer.
 # ``markers/decide.py`` is here for ``earliest_credits_start_ms``, which bounds the steps before the tail.
-DETECTOR_SOURCES = ("markers/credits/*.py", "markers/probe.py", "processing/hwaccel.py", "markers/decide.py")
+DETECTOR_SOURCES = (
+    "markers/credits/*.py",
+    "markers/probe.py",
+    "processing/hwaccel.py",
+    "processing/filter_chain.py",
+    "markers/decide.py",
+)
 # The detector files that choose which windows are decoded (so they are in the ffmpeg command, the decode cache's key)
 # but never what a decode of a given command returns: :func:`decode_digest` leaves them out.
 RULE_FILES = (

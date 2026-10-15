@@ -2069,6 +2069,7 @@ class TestKeyframeThinning:
         class Probed(list):
             codec: str | None = "h264"
             pix_fmt: str | None = None
+            turned: bool = False
             packets: list[VideoPacket] = []
             error: Exception | None = None
 
@@ -2078,7 +2079,7 @@ class TestKeyframeThinning:
             calls.append({"path": path, **kwargs})
             if calls.error:
                 raise calls.error
-            return VideoPackets(calls.codec, tuple(calls.packets), calls.pix_fmt)
+            return VideoPackets(calls.codec, tuple(calls.packets), calls.pix_fmt, calls.turned)
 
         monkeypatch.setattr(frames, "video_packets", video_packets)
         return calls
@@ -2147,6 +2148,13 @@ class TestKeyframeThinning:
         probed.pix_fmt, probed.packets = pix_fmt, self.NORMAL_GOP
         assert frames.keyframe_thinning(MOVIE, FF) == KeyframeThinning(None, False, download_format)
         assert len(probed) == 1
+
+    @pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuv420p10le"])
+    def test_a_stream_ffmpeg_shows_turned_is_downloaded_by_ffmpeg(self, probed, pix_fmt):
+        # FFmpeg turns and mirrors frames in memory but not GPU surfaces: downloaded by ffmpeg, a GPU's frames of a
+        # phone's portrait (or mirrored) video are read as the CPU reads them.
+        probed.pix_fmt, probed.packets, probed.turned = pix_fmt, self.NORMAL_GOP, True
+        assert frames.keyframe_thinning(MOVIE, FF) == KeyframeThinning(None, False, None)
 
     def test_a_short_vp9_stream_still_drops_its_non_key_packets(self, probed):
         # Too few packets to call it intra-only says nothing about its decoder.

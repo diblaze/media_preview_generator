@@ -272,6 +272,16 @@ class TestReader:
             reader.share("a", "b", 0.0, 30.0, 0.0)
         assert decoder.download_formats == {"a": "nv12", "b": download_format}
 
+    def test_a_file_ffmpeg_shows_turned_is_downloaded_by_ffmpeg(self):
+        # FFmpeg turns and mirrors frames in memory but not GPU surfaces (frames.surface_format).
+        decoder = _Decoder()
+        reader, patched = self._reader(
+            lambda path, **_kw: StreamStarts(0.0, None, True, "yuv420p", turned=path == "b"), decoder
+        )
+        with patched:
+            reader.share("a", "b", 0.0, 30.0, 0.0)
+        assert decoder.download_formats == {"a": "nv12", "b": None}
+
     def test_the_workers_pause_threads_and_fallback_flag_reach_every_decode(self):
         decoder = _Decoder()
 

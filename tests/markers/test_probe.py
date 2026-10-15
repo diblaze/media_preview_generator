@@ -26,6 +26,11 @@ from media_preview_generator.markers.probe import (
 )
 
 RUN = "media_preview_generator.markers.probe.subprocess.Popen"
+# Display matrices as ffprobe prints them (``-show_entries stream_side_data=displaymatrix``) for ``-display_rotation
+# 90``, for ``-display_hflip``, and for a stream shown as stored.
+TURNED_90 = "\n00000000:           0      -65536           0\n00000001:       65536           0           0\n00000002:           0           0  1073741824\n"
+MIRRORED = "\n00000000:      -65536           0           0\n00000001:           0       65536           0\n00000002:           0           0  1073741824\n"
+AS_STORED = "\n00000000:       65536           0           0\n00000001:           0       65536           0\n00000002:           0           0  1073741824\n"
 
 
 @pytest.fixture(autouse=True)
@@ -437,8 +442,8 @@ class TestVideoPackets:
         # V, not v: cover art is a single-picture video stream. From the start of the file, headers only; the codec
         # and pixel format come from the same ffprobe, so the keyframe pass costs no second process per file.
         assert args[0] == ["/usr/bin/ffprobe", "-v", "error", "-select_streams", "V:0", "-read_intervals", "%+#24",
-                           "-show_entries", "packet=pts_time,flags:stream=codec_name,pix_fmt", "-of", "json",
-                           "/m/a.webm"]  # fmt: skip
+                           "-show_entries", "packet=pts_time,flags:stream=codec_name,pix_fmt:stream_side_data=displaymatrix",
+                           "-of", "json", "/m/a.webm"]  # fmt: skip
         assert kwargs == {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
         assert proc.communicate.call_args.kwargs == {"timeout": 60.0}
         assert probed == VideoPackets("vp9", (VideoPacket(0.0, True), VideoPacket(0.041667, False),
@@ -458,6 +463,22 @@ class TestVideoPackets:
     def test_a_file_without_video_has_no_codec_and_no_packets(self, stdout):
         with patch(RUN, return_value=_proc(stdout=stdout)):
             assert video_packets("/m/a.m4a", ffprobe="ffprobe", packets=24) == VideoPackets(None, ())
+
+    @pytest.mark.parametrize(
+        ("side_data", "turned"),
+        [([{"displaymatrix": TURNED_90}], True), ([{"displaymatrix": MIRRORED}], True),
+         ([{"displaymatrix": AS_STORED}], False), ([], False), (None, False)],
+        ids=["turned", "mirrored", "identity", "empty", "none"],
+    )  # fmt: skip
+    def test_the_stream_says_whether_ffmpeg_shows_it_turned(self, side_data, turned):
+        payload = {
+            "packets": [],
+            "streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "side_data_list": side_data}],
+        }
+        with patch(RUN, return_value=_ok(payload)):
+            assert video_packets("/m/a.mkv", ffprobe="ffprobe", packets=1) == VideoPackets(
+                "h264", (), "yuv420p", turned
+            )
 
     @pytest.mark.parametrize("value", ["", None, 7, ["yuv420p"]], ids=["empty", "null", "number", "list"])
     def test_a_pixel_format_that_isnt_a_name_is_none(self, value):
@@ -580,8 +601,8 @@ class TestStreamStarts:
             starts = probe.stream_starts("/m/a.mkv", ffprobe="ffprobe", timeout_s=30.0)
         assert run.call_args.args[0] == [
             "ffprobe", "-v", "error", "-show_entries",
-            "format=start_time:stream=codec_type,start_time,pix_fmt:stream_disposition=attached_pic", "-of", "json",
-            "/m/a.mkv",
+            "format=start_time:stream=codec_type,start_time,pix_fmt:stream_disposition=attached_pic"
+            ":stream_side_data=displaymatrix", "-of", "json", "/m/a.mkv",
         ]  # fmt: skip
         assert proc.communicate.call_args.kwargs == {"timeout": 30.0}
         assert starts == probe.StreamStarts(0.0, 0.976, True, "yuv420p")
@@ -606,6 +627,20 @@ class TestStreamStarts:
     def test_the_pixel_format_is_the_first_pictures(self, streams, pix_fmt):
         with patch(RUN, return_value=_ok(self._payload("0.0", *streams))):
             assert probe.stream_starts("/m/a.mkv", ffprobe="ffprobe").pix_fmt == pix_fmt
+
+    @pytest.mark.parametrize(
+        ("streams", "turned"),
+        [([("video", "0.0", False, {"side_data_list": [{"displaymatrix": MIRRORED}]})], True),
+         ([("video", "0.0", False, {"side_data_list": [{"displaymatrix": AS_STORED}]})], False),
+         ([("video", "0.0", False)], False),
+         # The cover art's matrix isn't the picture's.
+         ([("video", "0.0", True, {"side_data_list": [{"displaymatrix": TURNED_90}]}), ("video", "0.0", False)], False),
+         ([("audio", "0.0", False)], False)],
+        ids=["mirrored", "identity", "no-matrix", "cover-art-turned", "audio-only"],
+    )  # fmt: skip
+    def test_the_picture_says_whether_ffmpeg_shows_it_turned(self, streams, turned):
+        with patch(RUN, return_value=_ok(self._payload("0.0", *streams))):
+            assert probe.stream_starts("/m/a.mkv", ffprobe="ffprobe").turned is turned
 
     @pytest.mark.parametrize(
         ("container", "audio", "offset"),

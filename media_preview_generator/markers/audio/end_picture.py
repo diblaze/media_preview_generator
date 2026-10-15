@@ -443,7 +443,7 @@ class Reader:
                         gpu_device_path=self._gpu_device_path,
                         container_start_s=starts.container_s,
                         cancel_check=self._cancel_check,
-                        download_format=frames.DOWNLOAD_FORMATS.get(starts.pix_fmt or ""),
+                        download_format=frames.surface_format(starts.pix_fmt, turned=starts.turned),
                         **self._worker,
                     )
             except frames.DecodeCancelledError as exc:
