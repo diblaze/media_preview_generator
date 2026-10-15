@@ -235,6 +235,10 @@ class _Live:
     # A new id a Plex database node reported that this app couldn't tie to the Plex it serves; its Plex database
     # writes are refused until the user types the node's key again (which clears the saved id).
     unconfirmed_uid: str = ""
+    # A new id ``_new_uid`` took in place of a saved one, until the node's first Plex database request compares it
+    # with the Plex of the servers using the node (``_tie_new_uid``): with none switched on when it was taken,
+    # nothing did, and nothing would once a server is switched back on.
+    untied_uid: str = ""
     # The id the last check that reached the node heard, when it is the saved id or a new one ``_new_uid`` accepted
     # ("" when it gives none, an old Plex helper); None for any other id (one held back, a twin's), until a check
     # since this app started reaches it, and again once a check doesn't, it is reported unavailable, it gets another
@@ -461,6 +465,14 @@ def _gpu_ok(gpus: tuple[dict, ...], device: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _beside_their_plex(served: list[str], info: dict | None) -> bool:
+    """Whether a node's ``/v1/info`` names the Plex machine identifier of every server in ``served``; an empty one on
+    either side (a Windows node with a custom Plex folder) proves nothing."""
+    plex_db = (info or {}).get("plex_db")
+    theirs = str(plex_db.get("machine_identifier") or "") if isinstance(plex_db, dict) else ""
+    return bool(theirs) and all(ours == theirs for ours in served)
+
+
 class NodeRegistry:
     """Configured nodes and their live state.
 
@@ -621,9 +633,11 @@ class NodeRegistry:
         the node last didn't answer, or got another address) a node with a saved id gets nothing either: its work
         waits, and a check starts now (within :data:`WAITING_RECHECK_S` of one that found it down). The node's first
         check is waited for, up to :data:`FIRST_CHECK_WAIT_S`, so work asked for just after a restart isn't held back
-        by a check that is about to answer.
+        by a check that is about to answer. A new id taken in place of a saved one is compared with the Plex of the
+        servers using the node here first (``_tie_new_uid``): none may have been switched on when it was taken.
         """
         self._sync()
+        tie_decided = self._tie_new_uid(node_id)
         deadline = time.monotonic() + FIRST_CHECK_WAIT_S
         waited = False
         with self._check_done:
@@ -634,11 +648,18 @@ class NodeRegistry:
                 if live.probe_state == STATE_DUPLICATE:
                     return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
                 name = str(live.record.get("name") or "The Plex database node")
+                checking = PlexDbHold(
+                    f"Checking {name} before sending it Plex database work. That work waits until the node answers; "
+                    "nothing is lost.",
+                    waits=True,
+                )
                 if live.unconfirmed_uid:
                     return PlexDbHold(
                         f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key "
                         "again on its Settings tab to confirm."
                     )
+                if not tie_decided:
+                    return checking
                 # ``heard_uid`` holds only the saved id or one ``_new_uid`` accepted; an answer with no id ("") says
                 # nothing about which Plex is there.
                 if not live.record.get("node_uid") or live.heard_uid:
@@ -662,11 +683,7 @@ class NodeRegistry:
                         live.next_check = min(live.next_check, now + WAITING_RECHECK_S)
                 left = deadline - time.monotonic()
                 if not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
-                    return PlexDbHold(
-                        f"Checking {name} before sending it Plex database work. That work waits until the node "
-                        "answers; nothing is lost.",
-                        waits=True,
-                    )
+                    return checking
                 waited = True
                 self._check_done.wait(left)
 
@@ -1197,9 +1214,10 @@ class NodeRegistry:
                         live.heard_uid = None
                     elif outcome.uid or outcome.state != STATE_OFFLINE:
                         live.heard_uid = outcome.uid
-                    if not new_uid and outcome.uid and record.get("node_uid"):
+                    if not new_uid and outcome.uid and record.get("node_uid") and outcome.uid != live.untied_uid:
                         # A twin's id is never recorded, so another machine stays unconfirmed: once the other node is
-                        # removed, the next check decides whether this one is the same Plex.
+                        # removed, the next check decides whether this one is the same Plex. An id still to be tied
+                        # keeps what ``_tie_new_uid`` decided: hearing it again says nothing about its Plex.
                         live.unconfirmed_uid = "" if outcome.uid == record.get("node_uid") else outcome.uid
                     has_access_problem = bool(live.access_problem)
                     access = access or live.access_wanted
@@ -1236,6 +1254,7 @@ class NodeRegistry:
             if confirmed:
                 live.unconfirmed_uid = ""
                 live.heard_uid = outcome.uid
+                live.untied_uid = outcome.uid if record.get("node_uid") else ""
             else:
                 # ``heard_uid`` stays None: it holds only the saved id or one accepted here.
                 if live.unconfirmed_uid != outcome.uid:
@@ -1268,10 +1287,46 @@ class NodeRegistry:
             logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
             return None
         if not served:
-            return True  # No server writes through it: nothing to protect.
-        plex_db = (outcome.info or {}).get("plex_db")
-        theirs = str(plex_db.get("machine_identifier") or "") if isinstance(plex_db, dict) else ""
-        return bool(theirs) and all(ours == theirs for ours in served)
+            return True  # No server writes through it now; one switched on later ties it first (``_tie_new_uid``).
+        return _beside_their_plex(served, outcome.info)
+
+    def _tie_new_uid(self, node_id: str) -> bool:
+        """Compare an id ``_new_uid`` took in place of a saved one (``_Live.untied_uid``) with the Plex of the
+        switched-on servers using the node now; one that isn't theirs is held as ``_new_uid`` holds it.
+
+        Returns:
+            False while the servers using the node can't be read (nothing is decided), else True.
+        """
+        with self._lock:
+            live = self._nodes.get(node_id)
+            uid = live.untied_uid if live is not None else ""
+            if live is None or not uid or live.record.get("node_uid") != uid:
+                return True
+            info = copy.deepcopy(live.info)
+        try:
+            served = self._served_plex_ids(node_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable settings can't tie anything
+            logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
+            return False
+        if not served:
+            return True  # Still nothing to protect: no switched-on server writes through it.
+        tied = _beside_their_plex(served, info)
+        with self._lock:
+            if self._nodes.get(node_id) is not live or live.untied_uid != uid or live.record.get("node_uid") != uid:
+                return True  # Settled meanwhile (the key typed again, another id).
+            if tied:
+                live.untied_uid = ""
+                if live.unconfirmed_uid == uid:
+                    live.unconfirmed_uid = ""
+                return True
+            if live.unconfirmed_uid != uid:
+                logger.warning(
+                    "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work "
+                    "waits until its key is typed again",
+                    live.record.get("name") or node_id,
+                )
+            live.unconfirmed_uid = uid
+        return True
 
     def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
         live.probe_state, live.probe_reason, live.probe_cause = outcome.state, outcome.reason, outcome.cause

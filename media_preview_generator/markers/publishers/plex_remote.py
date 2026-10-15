@@ -1277,7 +1277,8 @@ class RemotePlexDb(PlexDatabase):
             The rows, in ``read_rows``' shape.
 
         Raises:
-            PublishError: The helper refused, is too old for Library Health counts, or couldn't be used.
+            PublishError: The helper refused (the original exception, rebuilt, also for a read that failed partway),
+                is too old for Library Health counts, or couldn't be used.
         """
         from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY
 
@@ -1296,6 +1297,9 @@ class RemotePlexDb(PlexDatabase):
             timeout=remaining + ANSWER_GRACE_S,
             unreachable=LIBRARY_HEALTH_WAITS_FOR_THE_NODE,
         )
+        if isinstance(result.get("error"), dict):
+            # The node's read failed after its answer's status went out: the refusal comes in the answer instead.
+            raise error_from_json(result["error"])
         if result.get("capability") != LIBRARY_HEALTH_CAPABILITY or not isinstance(result.get("rows"), dict):
             raise self._unreadable(ValueError("no Library Health rows in the answer"))
         return result["rows"]

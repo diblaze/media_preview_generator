@@ -19,6 +19,7 @@ import pytest
 from media_preview_generator.library_health import plex, plex_rows
 from media_preview_generator.library_health.models import CellState, Feature
 from media_preview_generator.markers.publishers import plex_remote
+from media_preview_generator.markers.publishers.base import Capability, DatabaseBusyError, PublishError
 from media_preview_generator.markers.publishers.plex_chapters import CHAPTER_CAPABILITY
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, plex_db_path
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
@@ -138,6 +139,78 @@ class TestWhenTheNodeCantCount:
         monkeypatch.setattr(plex, "_open_db", lambda _cfg: node)
         result = _count(cfg)
         assert _cell(result, "1", Feature.PREVIEWS).state == CellState.ERROR
+
+
+class TestADatabaseThatCantBeReadIsRefusedAsItIs:
+    """Opening Plex's database read-only reads nothing, so a lock or damage shows at the first row. Read once the
+    answer's 200 had gone out, either reached the app as "an answer this app can't read" instead of what it is: a
+    busy database (tried again on the next run) or one that needs repairing."""
+
+    BODY = {"section_ids": [1], "want_markers": True, "want_chapters": True}
+
+    @pytest.fixture
+    def journal_folder(self, tmp_path) -> Path:
+        """A rollback-journal database: a writer holding it locks every reader out (a WAL one doesn't)."""
+        folder = tmp_path / "journal" / "Plex Media Server"
+        path = Path(plex_db_path(str(folder)))
+        path.parent.mkdir(parents=True)
+        build_plex_db(path, ITEMS)
+        return folder
+
+    def _rows(self, session: FlaskSession, wait_s: float = 5.0) -> dict:
+        return RemotePlexDb(NODE_URL, TOKEN, session=session).library_health_rows(
+            [1], want_markers=True, want_chapters=True, deadline=time.monotonic() + wait_s, needs="1.2.0"
+        )
+
+    def test_a_database_plex_is_writing_is_busy_and_lets_go_of_the_slot(self, journal_folder, tmp_path):
+        from media_preview_generator.markers.publishers import plex_db
+        from media_preview_generator.nodes.server import app as app_module
+
+        app = node_app(str(journal_folder), mountinfo_path=_mountinfo(tmp_path))
+        app.config[app_module.SERVER_THREADS] = 2  # one slot for the role
+        session = FlaskSession(app.test_client())
+        writer = sqlite3.connect(plex_db_path(str(journal_folder)), isolation_level=None)
+        try:
+            writer.execute("BEGIN EXCLUSIVE")
+            with pytest.raises(DatabaseBusyError) as busy:
+                self._rows(session, wait_s=0.3)
+        finally:
+            writer.close()
+
+        assert busy.value.state == Capability.UNREACHABLE
+        assert str(busy.value).startswith("Plex is busy writing its database; ")
+        assert not plex_db._db_lock(plex_db_path(str(journal_folder))).locked()
+        assert len(self._rows(session)["parts"]) == 4  # the slot was given back: the next run counts
+
+    @pytest.mark.parametrize(
+        ("damage", "message"),
+        [
+            ("not-a-database", "This app can't use Plex's database file (file is not a database)"),
+            (
+                "malformed",
+                "Database damaged: Plex's database needs repairing before markers can be written (database disk image "
+                "is malformed)",
+            ),
+        ],
+    )
+    def test_a_damaged_database_is_refused_with_what_is_wrong(self, journal_folder, tmp_path, damage, message):
+        path = Path(plex_db_path(str(journal_folder)))
+        data = bytearray(path.read_bytes())
+        if damage == "not-a-database":
+            data[:16] = b"x" * 16  # SQLite's own header string
+        else:
+            data[100:400] = b"\xff" * 300  # the schema, on the first page after the file header
+        path.write_bytes(bytes(data))
+        node = node_app(str(journal_folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+
+        answer = node.post("/v1/library-health/rows", json={**self.BODY, "deadline_s": 5}, headers=AUTH)
+
+        assert answer.status_code == 409
+        assert answer.get_json()["error"] == {"kind": "publish", "message": message, "state": "misconfigured"}
+        with pytest.raises(PublishError) as refused:
+            self._rows(FlaskSession(node))
+        assert type(refused.value) is PublishError
+        assert (str(refused.value), refused.value.state) == (message, Capability.MISCONFIGURED)
 
 
 class TestTheRouteRunsOnlyItsOwnQueries:
@@ -263,9 +336,9 @@ class TestABigLibraryIsSentAsItIsRead:
             conn.close()
         assert result == {"rows": expected, "capability": plex_rows.LIBRARY_HEALTH_CAPABILITY}
 
-    def test_a_read_that_stops_partway_is_an_answer_the_app_can_t_use_not_a_smaller_library(
-        self, big_folder, tmp_path, monkeypatch
-    ):
+    @staticmethod
+    def _failing_partway(monkeypatch, failure: Exception) -> None:
+        """The node's ``audio_counts`` read stops with ``failure`` after 10 rows, long after the 200 went out."""
         queries = plex_db_role.query_rows
 
         def failing_partway(*args, **kwargs):
@@ -273,16 +346,45 @@ class TestABigLibraryIsSentAsItIsRead:
 
             def audio_counts():
                 yield from list(rows["audio_counts"])[:10]
-                raise sqlite3.OperationalError("disk I/O error")
+                raise failure
 
             return {**rows, "audio_counts": audio_counts()}
 
         monkeypatch.setattr(plex_db_role, "query_rows", failing_partway)
+
+    @staticmethod
+    def _rows(big_folder, tmp_path) -> dict:
         session = FlaskSession(node_app(str(big_folder), mountinfo_path=_mountinfo(tmp_path)).test_client())
+        return RemotePlexDb(NODE_URL, TOKEN, session=session).library_health_rows(
+            [1], want_markers=True, want_chapters=True, deadline=time.monotonic() + 5, needs="1.2.0"
+        )
+
+    @pytest.mark.parametrize(
+        ("failure", "raised", "message"),
+        [
+            (sqlite3.OperationalError("database is locked"), DatabaseBusyError, "Plex is busy writing its database; "),
+            (sqlite3.DatabaseError("database disk image is malformed"), PublishError, "Database damaged: "),
+            (sqlite3.OperationalError("disk I/O error"), PublishError, "This app can't use Plex's database file "),
+        ],
+        ids=["busy", "damaged", "io-error"],
+    )
+    def test_a_read_that_stops_partway_is_the_database_s_refusal_not_a_smaller_library(
+        self, big_folder, tmp_path, monkeypatch, failure, raised, message
+    ):
+        self._failing_partway(monkeypatch, failure)
+        with pytest.raises(PublishError) as refused:
+            self._rows(big_folder, tmp_path)
+        assert type(refused.value) is raised
+        assert str(refused.value).startswith(message) and str(failure) in str(refused.value)
+        busy = raised is DatabaseBusyError
+        assert refused.value.state == (Capability.UNREACHABLE if busy else Capability.MISCONFIGURED)
+
+    def test_rows_the_node_can_t_send_partway_are_an_answer_the_app_can_t_use_not_a_smaller_library(
+        self, big_folder, tmp_path, monkeypatch
+    ):
+        self._failing_partway(monkeypatch, TypeError("Object of type bytes is not JSON serializable"))
         with pytest.raises(plex_remote.AgentError, match="can't read"):
-            RemotePlexDb(NODE_URL, TOKEN, session=session).library_health_rows(
-                [1], want_markers=True, want_chapters=True, deadline=time.monotonic() + 5, needs="1.2.0"
-            )
+            self._rows(big_folder, tmp_path)
 
     def test_an_answer_the_app_hung_up_on_lets_go_of_the_database_and_its_slot(self, big_folder, tmp_path):
         from media_preview_generator.markers.publishers import plex_db
