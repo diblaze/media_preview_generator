@@ -680,6 +680,33 @@ class TestLogsAndProgress:
             logger.remove(sink)
         assert ("INFO", "NAS/CPU · hi") in lines
 
+    def _relayed(self, media, message):
+        lines = []
+        state = running(log=[{"seq": 0, "level": "INFO", "message": message}], next_log=1)
+        _install(ScriptedClient([state, finished(protocol.STATUS_DONE, result={})]))
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+        try:
+            _run(media)
+        finally:
+            logger.remove(sink)
+        return lines
+
+    def test_a_node_line_with_a_line_break_stays_one_line_in_the_apps_log(self, media):
+        forged = "decode slow\n2026-10-15 03:00:00.000 | ERROR    | web.auth:login:88 - forged\r\x1b[31m"
+        lines = self._relayed(media, forged)
+        assert (
+            "NAS/CPU · decode slow\\n2026-10-15 03:00:00.000 | ERROR    | web.auth:login:88 - forged\\r\\x1b[31m"
+            in lines
+        )
+        assert not any("\n" in line or "\r" in line for line in lines)
+
+    def test_a_long_node_line_is_cut(self, media):
+        from media_preview_generator.nodes.executor import RELAY_LINE_MAX
+
+        lines = self._relayed(media, "x" * 5_000_000)
+        assert "NAS/CPU · " + "x" * RELAY_LINE_MAX in lines
+        assert max(len(line) for line in lines) < RELAY_LINE_MAX + 100
+
     def test_progress_is_handed_on_once_per_change(self, media):
         seen = []
         script = [
