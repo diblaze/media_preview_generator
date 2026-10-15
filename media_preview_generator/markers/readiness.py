@@ -118,13 +118,14 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
     "no_role": (
         "The chosen node doesn't have its Plex database role turned on",
         "role off",
-        "Turn the Plex database role on on that node, or choose another node in Edit → Connection.",
+        "Start that node with the Plex database role (NODE_ROLES=worker,plex_db), or choose another node in "
+        "Edit → Connection.",
     ),
     # This app refused to send anything (``plex_remote.node_refusal``).
     "disabled": (
         "The Plex database node is turned off",
         "turned off",
-        "Turn it on on the Nodes page, then run Intro & Credits again: nothing is written to Plex while it is off.",
+        "Turn it back on in the Nodes page, then run Intro & Credits again: nothing is written to Plex while it is off.",
     ),
     "no_node": (
         "This server's Plex database node isn't on the Nodes page",

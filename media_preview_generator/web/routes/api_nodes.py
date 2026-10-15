@@ -616,7 +616,9 @@ def node_log(node_id: str):
     except NodeError as exc:
         # What refuses without a node block is an older Plex helper (as for a check); it has no log to share.
         if isinstance(exc, NodeProtocolError) and exc.node is None:
-            message = "This node is an older Plex helper and can't share its log. Update it to see its log here."
+            message = (
+                "This Plex database node is an older release and can't share its log. Update it to see its log here."
+            )
         else:
             message = f"Couldn't read {record.get('name')}'s log: {exc}"
         return jsonify({"error": message}), 502

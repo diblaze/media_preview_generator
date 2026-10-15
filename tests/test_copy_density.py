@@ -36,3 +36,11 @@ def test_webhook_secret_detail_lives_in_info_template_when_hint_is_short() -> No
     body = " ".join(html.unescape(TAGS.sub("", detail.group(1))).split())
     assert "Leave empty to use the main API token instead." in body
     assert "re-registers any Plex Direct webhook" in body
+
+
+def test_no_message_says_on_on() -> None:
+    # "Turn that role on on the node" read as a typo; say which setting turns it on instead.
+    package = WEB.parent
+    sources = [*package.rglob("*.py"), *(WEB / "static" / "js").glob("*.js"), *(WEB / "templates").glob("*.html")]
+    doubled = [str(path.relative_to(package)) for path in sources if " on on " in path.read_text(encoding="utf-8")]
+    assert not doubled, f"' on on ' in: {doubled}"

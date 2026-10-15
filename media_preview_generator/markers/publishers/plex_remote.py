@@ -763,8 +763,8 @@ class AgentClient:
         if status_code == 404 and self._node_without_role():
             self.state = AGENT_NO_ROLE
             raise AgentError(
-                f"The node at {self.describe()} answers, but its Plex database role is off. Turn that role on on the "
-                "node, or choose another node in Edit → Connection.",
+                f"The node at {self.describe()} answers, but its Plex database role is off. Start it with that role "
+                "(NODE_ROLES=worker,plex_db), or choose another node in Edit → Connection.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         if status_code == 409 and isinstance(payload.get("error"), dict):

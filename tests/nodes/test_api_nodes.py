@@ -883,7 +883,7 @@ class TestHealthAndLog:
         resp = client.get(f"/api/nodes/{node_id}/log")
         assert resp.status_code == 502
         assert resp.get_json()["error"] == (
-            "This node is an older Plex helper and can't share its log. Update it to see its log here."
+            "This Plex database node is an older release and can't share its log. Update it to see its log here."
         )
 
 
