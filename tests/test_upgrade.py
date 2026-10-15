@@ -2727,28 +2727,27 @@ class TestMigrationNoticeBackupAndDismissal:
 
     @pytest.mark.parametrize("kind", ["version_move", "retry_boot"])
     @pytest.mark.parametrize("earlier_backup_on_disk", [True, False])
-    def test_merging_into_an_unread_notice_keeps_its_backup_only_while_that_file_exists(
+    def test_merging_into_an_unread_notice_names_this_boots_backup_not_the_notices_older_one(
         self, tmp_path, kind, earlier_backup_on_disk
     ):
-        """The card keeps the unread notice's "from", so it keeps the backup from that version when there is one."""
+        """The card keeps the unread notice's "from", but rolling back means restoring the settings as this build
+        found them: an unread notice's copy can be a fresh install's first-boot file, and restoring it wipes
+        every setting."""
         from media_preview_generator.upgrade import _migrate_schema
 
-        earlier = tmp_path / "settings.json.20260101-000000.bak"
+        earlier = tmp_path / "settings.json.pre-v1.bak"
         if earlier_backup_on_disk:
-            earlier.write_text('{"_schema_version": 11}')
-        unread = {"from": 11, "to": 13, "backup": str(earlier), "notes": ["An unread note."]}
+            earlier.write_text('{"_env_migrated": true}')
+        unread = {"from": 1, "to": 13, "backup": str(earlier), "notes": ["An unread note."]}
         seeded = self._seed(kind, _pending_migration_notice=unread)
         sm = self._boot(tmp_path, seeded)
 
         _migrate_schema(sm)
 
         notice = sm.get("_pending_migration_notice")
-        assert notice["from"] == 11
-        if earlier_backup_on_disk:
-            assert notice["backup"] == str(earlier)
-        else:
-            assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
-            assert json.loads(Path(notice["backup"]).read_text()) == seeded
+        assert notice["from"] == 1
+        assert notice["backup"] != str(earlier)
+        assert json.loads(Path(notice["backup"]).read_text()) == seeded
 
     def test_the_notice_backup_survives_fifteen_ordinary_saves(self, tmp_path, monkeypatch):
         """Saves rotate timestamped backups (keep 10); the pre-upgrade copy must not be one of them."""
@@ -2850,12 +2849,11 @@ class TestMigrationNoticeBackupAndDismissal:
         if earlier_notice == "unread":
             assert notice["notes"] == ["An earlier note.", *this_upgrades_notes]
             assert notice["from"] == 11
-            assert notice["backup"] == str(earlier_backup)
         else:
             assert notice["notes"] == this_upgrades_notes
             assert notice.get("from") == (13 if kind == "version_move" else None)
-            assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
-            assert notice["backup"] != str(earlier_backup)
+        assert Path(notice["backup"]).name.startswith("settings.json.pre-v")
+        assert notice["backup"] != str(earlier_backup)
         assert sm.dismissed_notifications == []
 
     def test_a_migration_that_writes_no_notice_leaves_stored_dismissals_alone(self, tmp_path):

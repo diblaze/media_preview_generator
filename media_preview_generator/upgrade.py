@@ -568,11 +568,9 @@ def _migrate_schema(sm) -> None:
         if isinstance(dismissed, list) and SCHEMA_MIGRATION_ID in dismissed:
             sm.set("dismissed_notifications", [n for n in dismissed if n != SCHEMA_MIGRATION_ID])
             existing = {}
-        # An unread notice's backup, while still on disk, is the copy that matches the "from" version the card
-        # keeps reporting; this boot's snapshot is from a later version.
-        earlier_backup = existing.get("backup")
-        if isinstance(earlier_backup, str) and os.path.isfile(earlier_backup):
-            bak_path = earlier_backup
+        # The card always names this boot's snapshot, never an unread notice's older one: rolling back means
+        # restoring the settings as this build found them (an older notice's copy can be from a fresh install's
+        # first boot, holding nothing), and only the build that wrote them reads them as they are.
         # An existing notice's notes are unread, so merge into it rather than overwrite it —
         # regardless of whether this boot is a real version move or a retry-only boot.
         merged_notes = list(existing.get("notes") or [])
