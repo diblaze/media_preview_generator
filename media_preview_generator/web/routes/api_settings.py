@@ -2006,7 +2006,11 @@ def restore_backup():
             return jsonify({"success": False, "error": f"No backup named {backup_filename!r} for {name}"}), 404
         bak_path = match["path"]
     else:
-        bak_path = available[0]["path"]
+        # The newest backup that can be read, as the Backups panel offers it.
+        readable = next((b for b in available if _read_backup(name, b["path"])[0]), None)
+        if readable is None:
+            return jsonify({"success": False, "error": f"No backup of {name} can be read"}), 409
+        bak_path = readable["path"]
     # Each file's owner keeps it in memory, so it must re-read the restored file (under its lock where it has one);
     # otherwise the next save would write the old in-memory content back over the restore.
     settings = get_settings_manager()

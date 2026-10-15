@@ -8391,3 +8391,28 @@ class TestCreateJobLibraryPairs:
             "/api/jobs", headers=_api_headers(), json={"libraries": [{"server_id": "nope", "library_id": "1"}]}
         )
         assert resp.status_code == 400
+
+
+def test_a_restore_without_a_name_takes_the_newest_backup_that_can_be_read(client, mock_auth_config):
+    import json
+    import os
+
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    client.application.config["WTF_CSRF_ENABLED"] = False
+    sm = get_settings_manager()
+    sm.complete_setup()
+    with client.session_transaction() as s:
+        s["authenticated"] = True
+    cfg = str(sm.config_dir)
+    good = os.path.join(cfg, "settings.json.20260101-100000.bak")
+    cut = os.path.join(cfg, "settings.json.20260102-100000.bak")
+    with open(good, "w") as f:
+        json.dump({"thumbnail_interval": 3, "setup_complete": True}, f)
+    with open(cut, "w") as f:
+        f.write('{"thumbnail_in')
+    os.utime(good, (1_900_000_000, 1_900_000_000))
+    os.utime(cut, (1_900_000_100, 1_900_000_100))
+    r = client.post("/api/settings/backups/restore", json={"file": "settings.json"})
+    assert r.status_code == 200, r.get_json()
+    assert get_settings_manager().get("thumbnail_interval") == 3

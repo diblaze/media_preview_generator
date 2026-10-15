@@ -4670,8 +4670,12 @@ async function refreshBackupsPanel() {
                 const origHtml = target.innerHTML;
                 target.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Restoring…';
                 try {
-                    await apiPost('/api/settings/backups/restore', { file, backup });
-                    showToast('Backup restored', `${file} restored from ${backup}. The server is already using it; reload the page to see the restored values.`, 'success');
+                    const result = await apiPost('/api/settings/backups/restore', { file, backup });
+                    if (result && result.warning) {
+                        showToast('Backup restored', `${file} restored from ${backup}. ${result.warning}`, 'warning');
+                    } else {
+                        showToast('Backup restored', `${file} restored from ${backup}. The server is already using it; reload the page to see the restored values.`, 'success');
+                    }
                     refreshBackupsPanel();
                 } catch (e) {
                     showToast('Restore failed', (e && e.message) || 'Unknown error', 'danger');
