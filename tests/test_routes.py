@@ -7553,6 +7553,77 @@ class TestBackupRestore:
         assert told == ([paused_backup] if paused_live != paused_backup else [])
         assert started == ([job.id] if paused_live and not paused_backup else [])
 
+    # Every minute of every week, in any time zone.
+    ALWAYS_QUIET = {
+        "enabled": True,
+        "day_basis": "start",
+        "windows": [{"start": "00:00", "end": "12:00"}, {"start": "12:00", "end": "00:00"}],
+    }
+
+    @staticmethod
+    def _quiet_an_hour_six_hours_from_now() -> dict:
+        from datetime import timedelta
+
+        from media_preview_generator.worker_groups import local_now
+
+        now = local_now()
+        start, end = now + timedelta(hours=6), now + timedelta(hours=7)
+        window = {"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")}
+        return {"enabled": True, "day_basis": "start", "windows": [window]}
+
+    @pytest.mark.parametrize(
+        "case",
+        ["restored-window-is-now", "restored-quiet-pause-has-ended", "restored-file-has-no-quiet-hours"],
+    )
+    def test_restored_quiet_hours_apply_at_once_as_at_start_up(self, client, monkeypatch, case):
+        """Quiet hours pause and resume processing from a once-a-minute recheck that only a start-up or a quiet-hours
+        save registered: restored quiet hours didn't pause processing, a restored quiet-hours pause never ended, and
+        quiet hours the restore dropped went on pausing until a restart."""
+        from media_preview_generator.web.jobs import get_job_manager
+        from media_preview_generator.web.routes import job_runner
+        from media_preview_generator.web.scheduler import (
+            _QUIET_HOURS_RECHECK,
+            get_schedule_manager,
+            is_now_in_any_quiet_window,
+        )
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        manager = get_schedule_manager()
+        restored = dict(sm.get_all())
+        if case == "restored-window-is-now":
+            restored["quiet_hours"] = self.ALWAYS_QUIET
+        elif case == "restored-quiet-pause-has-ended":
+            restored.update(
+                quiet_hours=self._quiet_an_hour_six_hours_from_now(),
+                processing_pause_reasons=["quiet_hours"],
+                processing_paused=True,
+            )
+        else:
+            sm.set("quiet_hours", self.ALWAYS_QUIET)
+            manager.apply_quiet_hours(self.ALWAYS_QUIET)
+            assert manager.scheduler.get_job(_QUIET_HOURS_RECHECK) is not None
+        sm.processing_paused = True  # what holds the pending job below
+        backup = "settings.json.20260101-100000.bak"
+        with open(os.path.join(sm.config_dir, backup), "w") as f:
+            json.dump(restored, f)
+        job = get_job_manager().create_job(library_name="Movies", config={})
+        started: list[str] = []
+        monkeypatch.setattr(job_runner, "_start_job_async", lambda job_id, cfg=None: started.append(job_id))
+
+        resp = client.post(
+            "/api/settings/backups/restore", headers=_api_headers(), json={"file": "settings.json", "backup": backup}
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        quiet_now = case == "restored-window-is-now"
+        assert is_now_in_any_quiet_window(sm.get("quiet_hours")) is quiet_now
+        assert sm.processing_paused is quiet_now
+        assert sm.processing_pause_reasons == (["quiet_hours"] if quiet_now else [])
+        has_quiet_hours = case != "restored-file-has-no-quiet-hours"
+        assert (manager.scheduler.get_job(_QUIET_HOURS_RECHECK) is not None) is has_quiet_hours
+        assert started == ([] if quiet_now else [job.id])
+
     def test_the_backups_list_marks_a_backup_that_cant_be_read(self, client):
         """A backup cut short is newer than the live file, so it was marked "backup is newer", inviting the restore."""
         from media_preview_generator.utils import timestamped_backups

@@ -1850,18 +1850,27 @@ def _settings_replaced(settings: Any) -> str | None:
 
 
 def _restored_pause_applied(settings: Any, paused_before: bool) -> None:
-    """Do what Pause or Resume does when the restored settings.json pauses processing, or stops pausing it.
+    """Apply the restored settings.json's quiet hours as a start-up does, then do what Pause or Resume does when the
+    restore pauses processing, or stops pausing it.
 
-    The pause is read from the settings, so the restore alone changes it, but nothing else: the jobs the old pause
-    held would stay pending until the next Resume, and the dashboard would go on showing the old state.
+    Quiet hours pause and resume processing from a once-a-minute recheck that only a start-up or a quiet-hours save
+    registers: without one, restored quiet hours wouldn't pause processing, and a restored quiet-hours pause wouldn't
+    end. The pause is read from the settings, so the restore alone changes it, but nothing else: the jobs the old
+    pause held would stay pending until the next Resume, and the dashboard would go on showing the old state.
 
     Args:
         settings: The settings manager, holding the restored file.
         paused_before: Whether processing was paused before the restore.
     """
     from ..jobs import get_job_manager
+    from ..scheduler import get_schedule_manager
     from .job_runner import resume_running_and_drain_pending
 
+    try:
+        # Without draining: the pending jobs are started below, once, whichever owner's pause changed.
+        get_schedule_manager().apply_quiet_hours(settings.get("quiet_hours") or {}, drain=False)
+    except Exception:
+        logger.exception("Could not apply the restored quiet hours; they apply from the next restart")
     paused = settings.processing_paused
     if paused == paused_before:
         return
