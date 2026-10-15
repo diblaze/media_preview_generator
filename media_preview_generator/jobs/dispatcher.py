@@ -21,7 +21,13 @@ from ..job_kinds import JOB_KIND_PREVIEWS, ItemOutcome, KindHandlers, normalize_
 from ..nodes.executor import REQUEUE_NODE_NOT_STARTED, REQUEUE_NODE_UNAVAILABLE, NodeRequeue
 from ..processing.generator import ProcessingResult
 from ..web.jobs import PRIORITY_NORMAL
-from .node_members import EMPTY_NODE_HARDWARE, NodeHardware, checked_ready_since_drop, worker_node_id
+from .node_members import (
+    EMPTY_NODE_HARDWARE,
+    NodeHardware,
+    checked_ready_since_drop,
+    note_waiting_for_nodes,
+    worker_node_id,
+)
 from .worker import JOB_LOG_SKIP, Worker, WorkerPool, logging_for_job
 
 _submission_counter_lock = threading.Lock()
@@ -1212,11 +1218,23 @@ class JobDispatcher:
     def _nodes_back_since_drop(self) -> frozenset[str]:
         """The nodes behind a queued file's drop that a registry check begun since found ready.
 
-        Asked of the registry before the dispatcher's and pool's locks are taken, like the pool's suspect hold.
+        The others are checked soon: queued files they dropped can wait for them, and an offline node's back-off (up to
+        five minutes) would hold those files up after it is back. Asked of the registry before the dispatcher's and
+        pool's locks are taken, like the pool's suspect hold.
         """
         with self._trackers_lock:
             dropped = {node for t in self._trackers.values() if t.item_queue for node in t.dropped_on.values()}
-        return frozenset(node for node in dropped if checked_ready_since_drop(node))
+            waiting = {
+                node
+                for t in self._trackers.values()
+                if t.dropped_on
+                for item in _queue_head(t.item_queue)
+                if (node := t.dropped_on.get(item.canonical_path)) is not None
+            }
+        back = frozenset(node for node in dropped if checked_ready_since_drop(node))
+        if waiting - back:
+            note_waiting_for_nodes(waiting - back)
+        return back
 
     def _claim_worker(
         self, tracker: JobTracker, stranded: list, back_nodes: Collection[str] = ()
@@ -1743,6 +1761,7 @@ class JobDispatcher:
         messages = []
         for excluded, dropped_on in dict.fromkeys(waits):
             if dropped_on is not None and not checked_ready_since_drop(dropped_on):
+                note_waiting_for_nodes({dropped_on})
                 nodes = getattr(self.worker_pool, "_node_hardware", None)
                 name = nodes.node_name(dropped_on) if isinstance(nodes, NodeHardware) else dropped_on
                 messages.append(f"Waiting for a node — {name}: checking it again")

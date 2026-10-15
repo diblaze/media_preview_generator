@@ -16,6 +16,8 @@ from media_preview_generator.jobs import dispatcher as dispatcher_mod
 from media_preview_generator.jobs.dispatcher import JobDispatcher, JobTracker, reset_dispatcher
 from media_preview_generator.jobs.node_members import NodeHardware
 from media_preview_generator.jobs.worker import Worker, WorkerPool
+from media_preview_generator.nodes import registry as reg
+from media_preview_generator.nodes.client import NodeUnreachableError
 from media_preview_generator.nodes.executor import FileNotVisibleError, NodeUnavailableError, current_placement
 from media_preview_generator.nodes.registry import (
     STATE_OFFLINE,
@@ -27,6 +29,7 @@ from media_preview_generator.nodes.registry import (
 )
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.web.settings_manager import reset_settings_manager
+from tests.nodes.test_registry import Harness
 
 KEYS = ("markers_published", "failed")
 
@@ -44,6 +47,9 @@ class _Registry(NodeRegistry):
 
     def checked_ready_since_unavailable(self, node_id: str) -> bool:
         return self.fresh or (node_id in self.vouched and self.states[node_id][0] == STATE_READY)
+
+    def work_waiting(self, node_ids) -> None:
+        pass
 
     def view(self, node_id: str) -> NodeView | None:
         if self.fresh:
@@ -130,6 +136,27 @@ def _run(pool: WorkerPool, process, *paths: str):
 def _node() -> str | None:
     placement = current_placement()
     return None if placement is None else placement.node_id
+
+
+def _offline_on_its_back_off() -> Harness:
+    """A real registry whose node "n1" dropped a file and then stayed down for minutes: next checked 300 s out."""
+    h = Harness()
+    h.registry.check_now("n1")
+    h.client().default_info = NodeUnreachableError("http://nuc:9494 didn't answer (no connection)")
+    h.registry._run_check = lambda *args, **kwargs: None  # keep the report's own check out of it
+    h.registry.report_unavailable("n1")
+    del h.registry._run_check
+    for _ in range(len(reg.OFFLINE_BACKOFF_S)):
+        h.registry.check_now("n1")
+        h.clock.now = h.registry._nodes["n1"].next_check
+    h.registry.check_now("n1")
+    assert h.registry._nodes["n1"].next_check - h.clock.now == reg.OFFLINE_BACKOFF_S[-1]
+    set_registry(h.registry)
+    return h
+
+
+def _next_check_in(h: Harness) -> float:
+    return h.registry._nodes["n1"].next_check - h.clock.now
 
 
 class TestNodeDrops:
@@ -397,6 +424,63 @@ class TestNodeDrops:
             dispatcher.shutdown()
         assert tries == ["a", "a"]
         assert tracker.progress_message() == "1/1 completed"
+
+    def test_a_dropped_file_waiting_for_its_offline_node_gets_that_node_checked_soon(self):
+        # The banner says the node is being checked; on its back-off, it wasn't for up to five more minutes.
+        h = _offline_on_its_back_off()
+        pool = _pool((None, "local"))
+        pool.workers[0].is_busy = True  # runs the kind, busy (another job's file, frozen by its schedule)
+        dispatcher = JobDispatcher(pool)
+        tracker = TestClaimWorker._tracker("/m/x.mkv")
+        tracker.kind = "intro_credits"
+        tracker.dropped_on = {"/m/x.mkv": "n1"}
+        try:
+            assert dispatcher._node_wait(tracker) == "Waiting for a node — n1: checking it again"
+        finally:
+            dispatcher.shutdown()
+            h.registry.stop()
+
+        assert _next_check_in(h) <= reg.WAITING_RECHECK_S
+
+    def test_a_dropped_file_passed_over_while_its_job_runs_others_gets_its_node_checked_soon(self):
+        # Something of the job runs, so no banner: the dispatcher passing the file over has to bring the check forward.
+        h = _offline_on_its_back_off()
+        pool = _pool((None, "local"))
+        pool.workers[0].is_busy = True
+        dispatcher = JobDispatcher(pool)
+        tracker = TestClaimWorker._tracker("/m/x.mkv")
+        tracker.kind = "intro_credits"
+        tracker.active_processing = 1
+        tracker.dropped_on = {"/m/x.mkv": "n1", "/m/done.mkv": "n2"}
+        dispatcher._trackers["j"] = tracker
+        try:
+            dispatcher._assign_tasks()
+        finally:
+            dispatcher._trackers.clear()
+            dispatcher.shutdown()
+            h.registry.stop()
+
+        assert [item.canonical_path for item in tracker.item_queue] == ["/m/x.mkv"]
+        assert _next_check_in(h) <= reg.WAITING_RECHECK_S
+
+    def test_a_node_whose_dropped_files_are_no_longer_queued_keeps_its_back_off(self):
+        h = _offline_on_its_back_off()
+        pool = _pool((None, "local"))
+        pool.workers[0].is_busy = True
+        dispatcher = JobDispatcher(pool)
+        tracker = TestClaimWorker._tracker("/m/y.mkv")
+        tracker.kind = "intro_credits"
+        tracker.active_processing = 1
+        tracker.dropped_on = {"/m/x.mkv": "n1"}  # ran elsewhere since
+        dispatcher._trackers["j"] = tracker
+        try:
+            dispatcher._assign_tasks()
+        finally:
+            dispatcher._trackers.clear()
+            dispatcher.shutdown()
+            h.registry.stop()
+
+        assert _next_check_in(h) == reg.OFFLINE_BACKOFF_S[-1]
 
     def test_a_dropped_file_no_other_worker_can_run_goes_back_to_the_node_that_dropped_it(self):
         calls: list[str | None] = []

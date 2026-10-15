@@ -189,6 +189,16 @@ def checked_ready_since_drop(node_id: str) -> bool:
         return False
 
 
+def note_waiting_for_nodes(node_ids: Iterable[str]) -> None:
+    """Have the registry check these nodes soon, not after their offline back-off: queued files wait for them."""
+    from ..nodes.registry import note_work_waiting
+
+    try:
+        note_work_waiting(node_ids)
+    except Exception as exc:
+        logger.debug("Could not bring the next check of nodes {} forward: {}", sorted(node_ids), exc)
+
+
 def worker_node_id(worker: object) -> str | None:
     """The node a worker runs on, or ``None`` for this app (also for stand-in workers without the attribute)."""
     node_id = getattr(worker, "node_id", None)
