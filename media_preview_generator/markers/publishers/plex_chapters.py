@@ -19,6 +19,7 @@ import time
 import weakref
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ from .plex_remote import (
     report_wrong_node,
     saved_node_address,
     saved_node_uid,
+    saved_server_node_id,
 )
 
 CHAPTER_CAPABILITY = "chapters_v1"
@@ -605,7 +607,9 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
     settings = load_server(getattr(config, "markers", None), "plex")
     backend: AgentClient | LocalChapters
     if settings.agent_enabled:
-        refusal = node_refusal(settings)
+        # The server's own config is the job's copy from when it started: compare its node with the saved one.
+        live = partial(saved_server_node_id, str(getattr(config, "id", "") or "")) if server_config is None else None
+        refusal = node_refusal(settings, live)
         if refusal is not None:
             raise ChapterError(refusal.message, state=refusal.state)
         wrong_folder = _another_plexs_folder(config, machine)
@@ -614,7 +618,7 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
         backend = AgentClient(
             settings.agent_url,
             settings.agent_token,
-            refusal=lambda: node_refusal(settings),
+            refusal=lambda: node_refusal(settings, live),
             node_uid=lambda: saved_node_uid(settings),
             wrong_node=lambda: report_wrong_node(settings),
             address=lambda: saved_node_address(settings),

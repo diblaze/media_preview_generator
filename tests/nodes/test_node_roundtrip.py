@@ -550,6 +550,7 @@ class TestAPlexDatabaseNodeSwappedAtItsAddress:
         from media_preview_generator.markers.publishers.plex_chapters import Chapter, ChapterTarget
         from media_preview_generator.markers.publishers.plex_remote import AgentUnreachableError
         from media_preview_generator.nodes.registry import get_registry
+        from media_preview_generator.web.settings_manager import get_settings_manager
 
         answering, machines = swapped
         registered = []
@@ -561,7 +562,9 @@ class TestAPlexDatabaseNodeSwappedAtItsAddress:
         monkeypatch.setattr(plex_chapters, "verify_chapters", lambda server, target, revisions: None)
         markers = {"enabled": True, "plex": {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": True,
                    "node_id": "n1"}}}  # fmt: skip
-        server = MagicMock(_server_config=SimpleNamespace(markers=markers, output={}))
+        # A job's server: its own config copy, and the same server saved, naming the same node.
+        get_settings_manager().set("media_servers", [{"id": "p1", "type": "plex", "markers": markers}])
+        server = MagicMock(_server_config=SimpleNamespace(id="p1", markers=markers, output={}))
         target = ChapterTarget(
             7, 8, 9, "a" * 40, "/data/tv/S01E01.mkv", 1_000_000, 100, (Chapter(1, 0, 1000, "", 10, 20),), "plex-a"
         )

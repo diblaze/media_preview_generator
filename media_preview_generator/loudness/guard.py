@@ -493,9 +493,17 @@ class RemoteLoudnessDb:
         _verify_streams(self.server, streams)
 
 
-def create_loudness_db(cfg: ServerConfig, server: Any) -> GuardedLoudnessDb | RemoteLoudnessDb:
+def create_loudness_db(
+    cfg: ServerConfig, server: Any, *, live_node_id: Callable[[], str | None] | None = None
+) -> GuardedLoudnessDb | RemoteLoudnessDb:
     """The server's loudness database, independently of Intro & Credits consent: through its Plex database node
-    when one is set up, else the guarded local file."""
+    when one is set up, else the guarded local file.
+
+    Args:
+        cfg: The server's config.
+        server: The live Plex client.
+        live_node_id: A job's: the node the saved server uses now (``plex_remote.node_refusal``).
+    """
     from ..markers.publishers.plex_db import PlexMarkerPublisher
     from ..markers.publishers.plex_remote import NO_NODE_REFUSAL, plex_database
     from ..markers.settings import load_server
@@ -509,6 +517,7 @@ def create_loudness_db(cfg: ServerConfig, server: Any) -> GuardedLoudnessDb | Re
             settings,
             path_provider=lambda: PlexMarkerPublisher.db_path_for(cfg),
             label=cfg.name or "",
+            live_node_id=live_node_id,
         )
         return RemoteLoudnessDb(server, db, server_name=cfg.name or "")
     plex = (cfg.markers or {}).get("plex") or {}

@@ -500,9 +500,43 @@ NO_NODE_REFUSAL = NodeRefusal(
     Capability.AGENT_UNAVAILABLE,
     AGENT_NO_NODE,
 )
+# Waits: the job's next run opens the database through the server's new choice.
+REPOINTED_REFUSAL = NodeRefusal(
+    "This server's Plex database node was changed in Edit → Connection after this job started, so this job sends "
+    "nothing more through the old one. The next run uses the new choice.",
+    Capability.AGENT_UNAVAILABLE,
+    AGENT_UNREACHABLE,
+    waits=True,
+)
 
 
-def node_refusal(settings: Any) -> NodeRefusal | None:
+def node_in_use(settings: Any) -> str | None:
+    """The id of the Plex database node these settings send the server's database work to, or None for none.
+
+    Args:
+        settings: That server's ``ServerMarkersSettings``.
+    """
+    if not getattr(settings, "agent_enabled", False):
+        return None
+    return str(getattr(settings, "agent_node_id", None) or "") or None
+
+
+def saved_server_node_id(server_id: str) -> str | None:
+    """The Plex database node a saved server uses now (``node_in_use``), or None when it uses none or is gone.
+
+    Args:
+        server_id: The server's id.
+    """
+    from ...web.settings_manager import get_settings_manager
+    from ..settings import load_server
+
+    for entry in get_settings_manager().get("media_servers") or []:
+        if isinstance(entry, dict) and str(entry.get("id") or "") == server_id:
+            return node_in_use(load_server(entry.get("markers"), str(entry.get("type") or "")))
+    return None
+
+
+def node_refusal(settings: Any, live_node_id: Callable[[], str | None] | None = None) -> NodeRefusal | None:
     """Why the server's Plex database node mustn't be used now, or None when it may.
 
     A node turned off on the Nodes page gets nothing, and neither does one that reports a new id this app can't tie
@@ -511,9 +545,17 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
     didn't answer (that work waits for the check). The node's record and the registry are read on every call, so a
     job that opened the database before the node was turned off is refused from its next request on.
 
+    ``settings`` are the ones the database was opened with, so they name the node the server used then. A job also
+    passes ``live_node_id``: a server re-pointed to another node, or to none, while the job runs gets a refusal that
+    waits, instead of its work going on through the old node until the job ends.
+
     Args:
         settings: That server's ``ServerMarkersSettings``.
+        live_node_id: The node the saved server uses now (``node_in_use``, ``saved_server_node_id``). None for a
+            check of settings not saved yet (the Edit tab's), which has nothing to compare with.
     """
+    if live_node_id is not None and live_node_id() != node_in_use(settings):
+        return REPOINTED_REFUSAL
     if not getattr(settings, "agent_url", ""):
         return NO_NODE_REFUSAL
     name = getattr(settings, "agent_node_name", "")
@@ -547,7 +589,8 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
 
 def saved_node_uid(settings: Any) -> str:
     """The id this app saved for the server's Plex database node, read now ("" before first contact, or for an old
-    Plex helper, which has none).
+    Plex helper, which has none). The node is the one ``settings`` name; ``node_refusal`` stops a job whose server was
+    re-pointed since.
 
     Args:
         settings: That server's ``ServerMarkersSettings``.
@@ -562,7 +605,8 @@ def saved_node_uid(settings: Any) -> str:
 
 
 def saved_node_address(settings: Any) -> tuple[str, str]:
-    """The address and key saved for the server's Plex database node, read now.
+    """The address and key saved for the server's Plex database node, read now. The node is the one ``settings`` name;
+    ``node_refusal`` stops a job whose server was re-pointed since.
 
     Args:
         settings: That server's ``ServerMarkersSettings``.
@@ -619,7 +663,8 @@ class AgentClient:
             wrong_node: Told when the node refused a request as another machine than that id
                 (``report_wrong_node``).
             address: Asked before every request for the node's address and key (``saved_node_address``), which then
-                replace ``url`` and ``token``: a node edited while a job runs gets that job's next request.
+                replace ``url`` and ``token``: a node edited while a job runs gets that job's next request. A server
+                re-pointed to another node is ``refusal``'s to stop.
         """
         self._set_address(url, token)
         self._session = session or requests.Session()
@@ -1192,6 +1237,7 @@ def plex_database(
     label: str,
     mountinfo_path: str = "/proc/self/mountinfo",
     session: Any = None,
+    live_node_id: Callable[[], str | None] | None = None,
 ) -> PlexDatabase:
     """The database half for one Plex server: the agent when one is set up, the local file otherwise.
 
@@ -1201,6 +1247,8 @@ def plex_database(
         label: The server's name, for log lines.
         mountinfo_path: For tests.
         session: A ``requests.Session`` for the agent (tests pass their own).
+        live_node_id: A job's: the node the saved server uses now, so a server re-pointed while the job runs sends
+            nothing more through the old node (``node_refusal``).
 
     Returns:
         A ``RemotePlexDb`` when the server has a Plex database node switched on, else a ``LocalPlexDb``. A node that
@@ -1213,7 +1261,7 @@ def plex_database(
             settings.agent_url,
             getattr(settings, "agent_token", ""),
             session=session,
-            refusal=lambda: node_refusal(settings),
+            refusal=lambda: node_refusal(settings, live_node_id),
             node_uid=lambda: saved_node_uid(settings),
             wrong_node=lambda: report_wrong_node(settings),
             address=lambda: saved_node_address(settings),

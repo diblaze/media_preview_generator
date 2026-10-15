@@ -823,7 +823,7 @@ class TestThroughANodeTheAppsFolderMustBeThisPlexs:
 
         settings = SimpleNamespace(agent_enabled=True, agent_url="http://plex-host:9494", agent_token="k" * 32)
         monkeypatch.setattr(plex_chapters, "load_server", lambda *_a: settings)
-        monkeypatch.setattr(plex_chapters, "node_refusal", lambda _s: None)
+        monkeypatch.setattr(plex_chapters, "node_refusal", lambda *_a: None)
         server = MagicMock()
         server._connect.return_value.query.return_value = {"machineIdentifier": MACHINE, "version": VERSION}
         config = SimpleNamespace(markers={}, output={"plex_config_folder": str(folder)})

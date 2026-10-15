@@ -14,6 +14,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, cast
 
 from loguru import logger
@@ -41,6 +42,7 @@ from ..markers.outcomes import FileOutcome
 from ..markers.ownership import owning_servers
 from ..markers.publishers.base import Capability, DatabaseBusyError, PublishError, cancellable_waits
 from ..markers.publishers.plex_db import BUSY_TIMEOUT_S, LocalPlexDb
+from ..markers.publishers.plex_remote import saved_server_node_id
 from ..nodes import remote_ops
 from ..nodes.executor import current_placement
 from ..output.plex_hash import calculate_plex_hash
@@ -171,7 +173,10 @@ class LoudnessContext:
         with lock:
             db = self._dbs.get(cfg.id)
             if db is None:
-                db = self._dbs[cfg.id] = create_loudness_db(cfg, self.registry.get(cfg.id))
+                # Kept for the job: the saved server's node is read per request, so a re-pointed server stops it.
+                db = self._dbs[cfg.id] = create_loudness_db(
+                    cfg, self.registry.get(cfg.id), live_node_id=partial(saved_server_node_id, cfg.id)
+                )
             known = self._ready.get(cfg.id)
             if known is None or (known[0] and time.monotonic() - known[1] > RECHECK_S):
                 report = db.file_checks(deadline=time.monotonic() + BUSY_TIMEOUT_S)

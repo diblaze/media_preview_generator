@@ -18,6 +18,7 @@ import pytest
 from media_preview_generator.library_health import plex as health_plex
 from media_preview_generator.loudness import plex_db as loudness_db
 from media_preview_generator.loudness.guard import RemoteLoudnessDb, create_loudness_db, loudness_capability
+from media_preview_generator.loudness.plex_db import LOUDNESS_CAPABILITY
 from media_preview_generator.markers.publishers import plex_chapters
 from media_preview_generator.markers.publishers.base import Capability, PublishError
 from media_preview_generator.markers.publishers.plex_remote import (
@@ -279,9 +280,10 @@ class TestTurnedOffAfterTheDatabaseWasOpened:
         assert db._client.refusal() is None
 
 
-def _ok_answer() -> MagicMock:
+def _ok_answer(capabilities: tuple[str, ...] = ()) -> MagicMock:
     answer = MagicMock(status_code=200, headers={})
-    body = {"ok": True, "agent": {"version": "1.2.0", "protocols": [1, 2]}, "result": {}}
+    agent = {"version": "1.2.0", "protocols": [1, 2], "capabilities": list(capabilities)}
+    body = {"ok": True, "agent": agent, "result": {}}
     answer.iter_content.return_value = [json.dumps(body).encode()]
     return answer
 
@@ -326,6 +328,132 @@ class TestNodeEditedAfterTheDatabaseWasOpened:
         self._edit()
         backend.post("/v1/chapters/check", {}, timeout=1)
         self._assert_sent_to_the_edited_node(session)
+
+
+OTHER_NODE = {
+    **NODE,
+    "id": "n2",
+    "node_uid": "uid-2",
+    "name": "Other box",
+    "url": "http://other-host.lan:9494",
+    "key": "other-key",
+}
+REPOINTED = "This server's Plex database node was changed in Edit → Connection after this job started"
+
+
+class TestServerRepointedAfterTheDatabaseWasOpened:
+    """A job opens a server's database through the node the server named when the job started. Choosing another node
+    (or none) in Edit → Connection while it runs sends nothing more through the old one: its work waits for a run that
+    opens the new choice. The old node's Plex identifier can't be relied on to refuse it, as a node beside a Plex in a
+    custom folder reports none."""
+
+    CHOICES = [
+        pytest.param({"enabled": True, "node_id": "n2"}, id="another-node"),
+        pytest.param({"enabled": False, "node_id": "n1"}, id="no-node"),
+    ]
+
+    @pytest.fixture
+    def repoint(self, node):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        node(enabled=True)
+        sm = get_settings_manager()
+        sm.set("nodes", [NODE, OTHER_NODE])
+
+        def save(agent: dict) -> None:
+            markers = {**MARKERS, "plex": {**MARKERS["plex"], "agent": agent}}
+            sm.set("media_servers", [{"id": "p1", "type": "plex", "name": "Home", "enabled": True, "markers": markers}])
+
+        save(MARKERS["plex"]["agent"])
+        return save
+
+    @staticmethod
+    def _saved_settings():
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        return load_server(get_settings_manager().get("media_servers")[0]["markers"], "plex")
+
+    @staticmethod
+    def _loudness_server() -> MagicMock:
+        server = MagicMock()
+        server._connect.return_value.query.return_value = Element(
+            "MediaContainer", machineIdentifier="plex-a", version="1.43.4.12345-abc123"
+        )
+        return server
+
+    @pytest.mark.parametrize("agent", CHOICES)
+    def test_markers(self, repoint, tmp_path, agent):
+        from media_preview_generator.markers.publishers.factory import publisher_for
+
+        publisher = publisher_for(MagicMock(), _cfg(tmp_path), settings_provider=self._saved_settings)
+        session = MagicMock()
+        session.post.return_value = _ok_answer()
+        publisher._db._client._session = session
+        publisher._db._client.post("/v1/item/read", {}, timeout=1)
+        assert session.post.call_args.args[0].startswith(NODE["url"])
+
+        repoint(agent)
+        with pytest.raises(AgentUnreachableError) as caught:
+            publisher._db._client.post("/v1/item/read", {}, timeout=1)
+        assert str(caught.value).startswith(REPOINTED)
+        assert session.post.call_count == 1
+
+    @pytest.mark.parametrize("agent", CHOICES)
+    def test_chapters(self, repoint, monkeypatch, agent):
+        monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
+        server = MagicMock()
+        server._server_config = SimpleNamespace(id="p1", markers=MARKERS, output={})
+        backend, *_ = plex_chapters._context(server)
+        session = MagicMock()
+        session.post.return_value = _ok_answer()
+        backend._session = session
+        backend.post("/v1/chapters/check", {}, timeout=1)
+        assert session.post.call_args.args[0].startswith(NODE["url"])
+
+        repoint(agent)
+        with pytest.raises(AgentUnreachableError) as caught:
+            backend.post("/v1/chapters/register", {}, timeout=1)
+        assert str(caught.value).startswith(REPOINTED)
+        assert session.post.call_count == 1
+        # The job's next file opens through the same (old) settings: refused before anything is sent.
+        with pytest.raises(plex_chapters.ChapterError) as caught:
+            plex_chapters._context(server)
+        assert str(caught.value).startswith(REPOINTED)
+
+    @pytest.mark.parametrize("agent", CHOICES)
+    def test_loudness(self, repoint, monkeypatch, tmp_path, agent):
+        from media_preview_generator.loudness.job import LoudnessContext
+
+        sent = MagicMock(return_value=_ok_answer(capabilities=(LOUDNESS_CAPABILITY,)))
+        monkeypatch.setattr("requests.Session.post", sent)
+        monkeypatch.setattr("requests.Session.get", sent)
+        registry = MagicMock()
+        registry.get.return_value = self._loudness_server()
+        db, _why = LoudnessContext(registry=registry, ffmpeg="ffmpeg").db(_cfg(tmp_path))
+        assert sent.call_args.args[0].startswith(NODE["url"])
+        before = sent.call_count
+
+        repoint(agent)
+        with pytest.raises(PublishError) as caught:
+            loudness_db.write_stream(db, 11, FIELDS, deadline=time.monotonic() + 5)
+        assert str(caught.value).startswith(REPOINTED)
+        assert sent.call_count == before
+
+    def test_the_same_node_kept_is_used(self, repoint, tmp_path):
+        from media_preview_generator.markers.publishers.factory import publisher_for
+
+        publisher = publisher_for(MagicMock(), _cfg(tmp_path), settings_provider=self._saved_settings)
+        repoint({"enabled": True, "node_id": "n1"})
+        assert publisher._db._client.refusal() is None
+
+    def test_a_check_of_settings_not_saved_yet_is_not_refused(self, repoint, tmp_path):
+        """The Edit tab checks the node the user just picked, before it is saved."""
+        from media_preview_generator.markers.publishers.factory import publisher_for
+
+        picked = {**MARKERS, "plex": {**MARKERS["plex"], "agent": {"enabled": True, "node_id": "n2"}}}
+        publisher = publisher_for(MagicMock(), _cfg(tmp_path), settings=load_server(picked, "plex"))
+        assert publisher._db._client.refusal() is None
+        assert publisher._db._client.url == OTHER_NODE["url"]
 
 
 def test_a_node_still_to_be_checked_is_refused_as_not_answering_so_the_work_waits(node):
