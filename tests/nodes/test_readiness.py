@@ -512,6 +512,38 @@ def test_a_failed_gpu_says_what_its_test_found_and_what_to_do():
     )
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "nuc lost its GPU cuda:0 (the node no longer finds it). Its CPU workers keep running. Check the GPU driver on "
+        "the node.",
+        "nuc couldn't check its GPUs yet (nvidia-smi failed). It tries again in a few minutes; its CPU workers keep "
+        "running.",
+    ],
+    ids=["gpu_vanished", "detection_pending"],
+)
+def test_a_node_whose_gpu_is_gone_from_its_list_has_a_must_fix_row_saying_so(reason):
+    """The card said "GPU lost" and its Fix opened Setup Health, which listed only the GPUs the node still reports:
+    none, so nothing there said its GPU workers were paused, and the card's count left it out."""
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=(), reason=reason))
+    row = _check(envelope, "node_gpu_lost")
+    assert (row["ok"], row["severity"], row["label"], row["reason"], row["fix_where"]) == (
+        False,
+        "critical",
+        "nuc's GPU workers are paused",
+        reason,
+        "node",
+    )
+    assert to_fix(envelope)["must_fix"] == 1
+
+
+def test_a_lost_gpu_the_node_still_lists_as_failed_is_one_row_not_two():
+    envelope = _envelope(_details(reg.STATE_GPU_LOST, gpus=({**GPU, "status": "failed"},), reason="why"))
+    assert all(c["id"] != "node_gpu_lost" for s in envelope["sections"] for c in s["checks"])
+    assert to_fix(envelope)["must_fix"] == 1
+    assert all(c["id"] != "node_gpu_lost" for s in _envelope(_details())["sections"] for c in s["checks"])
+
+
 def test_a_node_that_needs_an_update_links_the_steps():
     row = _check(_envelope(_details(reg.STATE_UPDATE_NEEDED)), "node_version")
     assert (row["docs_url"], row["help_label"]) == (UPDATE_DOCS_URL, "How to update a node")
