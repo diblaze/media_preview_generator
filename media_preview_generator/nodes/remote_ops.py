@@ -336,7 +336,9 @@ def _frame_errors() -> dict[str, Rebuild]:
     }
     known["GpuReadNothingError"] = lambda message, _extra: frames.GpuReadNothingError(message)
     known["GpuDecodeError"] = lambda message, extra: frames.GpuDecodeError(
-        message, stderr_tail=tuple(str(line) for line in extra.get("stderr_tail") or ())
+        message,
+        stderr_tail=tuple(str(line) for line in extra.get("stderr_tail") or ()),
+        fallback_kind=str(extra["fallback_kind"]) if extra.get("fallback_kind") else None,
     )
     return known
 

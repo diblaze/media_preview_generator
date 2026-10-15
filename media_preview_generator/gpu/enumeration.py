@@ -17,6 +17,7 @@ import subprocess
 
 from loguru import logger
 
+from ..utils import gpu_settings_hint
 from .vaapi_probe import _format_driver_label
 
 # Driver name → GPU vendor mapping.  Linux kernel drivers appear in
@@ -362,8 +363,9 @@ def _get_gpu_vendor_from_driver(driver_name: str) -> str:
                 "Only NVIDIA GPUs can be accelerated in WSL2 (via CUDA passthrough). "
                 "AMD and Intel GPUs are NOT usable under WSL2. "
                 "If you have an AMD or Intel GPU, disable GPU acceleration in "
-                "Settings → Processing Options → GPU Configuration "
-                "(CPU-only processing will still work, just slower)."
+                "{} "
+                "(CPU-only processing will still work, just slower).",
+                gpu_settings_hint(),
             )
             nvidia_vendor = _detect_nvidia_via_nvidia_smi()
             if nvidia_vendor == "NVIDIA":

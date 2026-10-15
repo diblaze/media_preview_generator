@@ -351,11 +351,21 @@ class TestFindCredits:
         assert phases == ["Reading the credits…"] and notes == ["read on the CPU"]
         assert client.specs[0]["params"]["gpu_worker"] is True
 
-    def test_a_gpu_decode_failure_keeps_ffmpegs_lines_and_is_reported(self, media, monkeypatch):
+    @pytest.mark.parametrize(
+        ("fallback_kind", "reports"),
+        [
+            ("hwaccel", [("gpu_error", NODE_ID, "cuda:0")]),
+            # A codec the GPU can't decode: the CPU rerun reads the file, and nobody re-checks a GPU that is fine.
+            ("codec", []),
+        ],
+    )
+    def test_a_gpu_decode_failure_keeps_ffmpegs_lines_and_only_a_gpu_fault_is_reported(
+        self, media, monkeypatch, fallback_kind, reports
+    ):
         _, registry = _node(GPU)
 
         def fake(path, **kwargs):
-            raise frames.GpuDecodeError("cuda failed", stderr_tail=("Error 1", "Error 2"))
+            raise frames.GpuDecodeError("cuda failed", stderr_tail=("Error 1", "Error 2"), fallback_kind=fallback_kind)
 
         monkeypatch.setattr(textdet_helper, "get_textdet_pool", lambda: None)
         monkeypatch.setattr(detector, "find_credits", fake)
@@ -364,9 +374,9 @@ class TestFindCredits:
                 media, duration_ms=1000, is_episode=True, ffmpeg="f", gpu="NVIDIA", gpu_device_path="cuda:0"
             )
         assert type(raised.value) is frames.GpuDecodeError
-        assert raised.value.stderr_tail == ("Error 1", "Error 2")
+        assert raised.value.stderr_tail == ("Error 1", "Error 2") and raised.value.fallback_kind == fallback_kind
         assert frames.gpu_failure_lines(raised.value) == ("Error 1", "Error 2")
-        assert registry.reports == [("gpu_error", NODE_ID, "cuda:0")]
+        assert registry.reports == reports
 
     def test_read_nothing_on_the_gpu_is_not_reported_as_a_gpu_failure(self, media, monkeypatch):
         _, registry = _node(GPU)

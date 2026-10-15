@@ -31,9 +31,11 @@ from . import protocol
 from .client import (
     MAX_ARTIFACT_BYTES,
     NodeAuthError,
+    NodeCantStartError,
     NodeClient,
     NodeError,
     NodeRequestError,
+    NodeStoppingError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnknownTaskError,
@@ -125,7 +127,8 @@ def placed_on(placement: Placement | None) -> Iterator[None]:
 
 
 class NodeUnavailableError(Exception):
-    """The node stopped answering mid-task, or no longer knows the task. Not the file's failure: it is queued again.
+    """The node stopped answering mid-task, no longer knows the task, or couldn't take its start (no answer, or a
+    temp folder it can't use). Not the file's failure: it is queued again.
 
     Attributes:
         node_id: The node.
@@ -297,10 +300,11 @@ def _start_may_have_reached(exc: NodeError) -> bool:
     """Whether a start that failed with ``exc`` may have reached the node, which may then run the task.
 
     Not when the connection was never made (the client names why: refused, no such machine, TLS, a connect timeout)
-    or the node answered that it took nothing (it refused the key, or the task id was already deleted). Anything else
-    may have: no answer in time, a dropped connection, a 5xx from a gateway in front of the node.
+    or the node answered that it took nothing (it refused the key, the task id was already deleted, its temp folder
+    can't be used, or it is stopping). Anything else may have: no answer in time, a dropped connection, a 5xx from a
+    gateway in front of the node.
     """
-    if isinstance(exc, NodeAuthError | NodeTaskDeletedError):
+    if isinstance(exc, NodeAuthError | NodeTaskDeletedError | NodeCantStartError | NodeStoppingError):
         return False
     return isinstance(exc, NodeTimeoutError) or not (isinstance(exc, NodeUnreachableError) and exc.reason)
 
@@ -363,6 +367,9 @@ class _TaskRun:
         except NodeRequestError as exc:
             raise NodeTaskError(protocol.KIND_REQUEST, f"{name} refused the task: {exc}") from exc
         except NodeError as exc:
+            # No answer, NodeCantStartError (its temp folder can't be used) or NodeStoppingError: the file goes back in
+            # the queue and the node is checked now, whose /v1/info then names the folder, or says it is stopping, and
+            # stops its work.
             if _start_may_have_reached(exc):
                 # The node may have started it without the answer reaching us: stop it now rather than leave FFmpeg
                 # running there beside the file's next try until the node's unpolled-task expiry.

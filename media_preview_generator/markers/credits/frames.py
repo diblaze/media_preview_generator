@@ -28,6 +28,7 @@ from loguru import logger
 
 from ...processing.ffmpeg_runner import GPU_CANT_DECODE_VERDICT
 from ...processing.hwaccel import hwaccel_decode_args
+from ...utils import kill_with_parent
 from ..freeze import Freeze
 from ..probe import (
     ProbeError,
@@ -126,11 +127,17 @@ class GpuDecodeError(FrameDecodeError):
     Attributes:
         stderr_tail: ffmpeg's last lines that say why (``STDERR_LINES`` of them), for the job log; empty when ffmpeg
             said nothing.
+        fallback_kind: Previews' name for the failure (``processing.generator.FALLBACK_*``: a codec the GPU can't
+            decode, a hardware accelerator error, an I/O error, a signal), or None when it names none. Only a hardware
+            accelerator error or a signal says the GPU itself is in trouble.
     """
 
-    def __init__(self, message: str = "", *, stderr_tail: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self, message: str = "", *, stderr_tail: tuple[str, ...] = (), fallback_kind: str | None = None
+    ) -> None:
         super().__init__(message)
         self.stderr_tail = stderr_tail
+        self.fallback_kind = fallback_kind
 
 
 def gpu_failure_lines(exc: BaseException) -> tuple[str, ...]:
@@ -698,7 +705,13 @@ def run_decode(
     with tempfile.TemporaryFile() as stderr_file:
         try:
             # Its own session, so a kill reaches everything ffmpeg started; the app's process group is never signalled.
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr_file, start_new_session=True)
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                start_new_session=True,
+                preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
+            )
         except OSError as exc:
             raise FrameDecodeError(f"could not run {command[0]} for {name}: {exc}") from exc
         reader = threading.Thread(
@@ -788,7 +801,9 @@ def run_decode(
         if hw_active:
             said = [line.strip()[:STDERR_LINE_CHARS] for line in lines if not _CLOSING_LINE_RE.search(line)]
             raise GpuDecodeError(
-                _gpu_failure(returncode, lines, name), stderr_tail=tuple(line for line in said if line)[-STDERR_LINES:]
+                _gpu_failure(returncode, lines, name),
+                stderr_tail=tuple(line for line in said if line)[-STDERR_LINES:],
+                fallback_kind=_gpu_failure_kind(returncode, lines),
             )
         raise FrameDecodeError(_with_ffmpegs_error(f"ffmpeg exited {returncode} decoding {name} on the CPU", lines))
     if not boxes and hw_active:
@@ -804,6 +819,19 @@ def run_decode(
     return rows
 
 
+def _gpu_failure_kind(returncode: int, stderr_lines: list[str]) -> str | None:
+    """Previews' name for a failed GPU decode (``FALLBACK_*`` of ``_gpu_hand_off``), or None when it names none.
+
+    The decoder's own "can't decode" verdict is a codec the GPU lacks, whatever else ffmpeg printed after it.
+    """
+    from ...processing.generator import FALLBACK_CODEC, _gpu_hand_off
+
+    if any(GPU_CANT_DECODE_VERDICT in line for line in stderr_lines):
+        return FALLBACK_CODEC
+    hand_off = _gpu_hand_off(returncode, stderr_lines, stderr_lines, stopped_part_way=False)
+    return hand_off[0] if hand_off else None
+
+
 def _gpu_failure(returncode: int, stderr_lines: list[str], name: str) -> str:
     """Why a GPU decode failed, as previews names the same failure before its CPU rerun (``_gpu_hand_off``).
 
@@ -811,18 +839,11 @@ def _gpu_failure(returncode: int, stderr_lines: list[str], name: str) -> str:
     stderr (an unsupported codec, a hardware accelerator error, an I/O error, a signal); a failure it names none of
     (a stall or a part-way stop can't come from here) quotes ffmpeg's error line.
     """
-    from ...processing.generator import (
-        FALLBACK_CODEC,
-        FALLBACK_HWACCEL,
-        FALLBACK_IO_ERROR,
-        FALLBACK_SIGNAL,
-        _gpu_hand_off,
-    )
+    from ...processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, FALLBACK_IO_ERROR, FALLBACK_SIGNAL
 
-    hand_off = _gpu_hand_off(returncode, stderr_lines, stderr_lines, stopped_part_way=False)
-    kind = hand_off[0] if hand_off else None
+    kind = _gpu_failure_kind(returncode, stderr_lines)
     said_cant_decode = any(GPU_CANT_DECODE_VERDICT in line for line in stderr_lines)
-    if said_cant_decode or kind == FALLBACK_CODEC:
+    if kind == FALLBACK_CODEC:
         codec = _video_codec(stderr_lines)
         video = f"{codec} video" if codec else "video"
         # No exit code after the decoder's verdict: a run stopped at it (``run_decode``) exits with the kill's.

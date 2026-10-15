@@ -566,6 +566,12 @@ _NODE_CARD_TEXT = {
         "Open Nodes",
         "",
     ),
+    "temp_problem": (
+        "{name} can't use its temp folder",
+        "Nothing is sent to it until it can write to its temp folder again.",
+        "Open Nodes",
+        "health",
+    ),
 }
 
 
@@ -575,8 +581,8 @@ def node_notification_id(node_id: str, state: str) -> str:
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
-    """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU or
-    has no FFmpeg.
+    """One card per node in use that is offline, needs an update, refused the key, can't see media, lost its GPU,
+    has no FFmpeg, is added twice or can't use its temp folder.
 
     A node nothing uses (no worker group member on it, no Plex server with its Plex database node switched on
     pointing at it) raises no card: whatever its state, no work waits on it.

@@ -599,20 +599,22 @@ class TestRunDecode:
     )
 
     @pytest.mark.parametrize(
-        ("exit_code", "stderr", "message"),
+        ("exit_code", "stderr", "message", "kind"),
         [
             # No exit code after the decoder's verdict: a run stopped at it would say the kill's.
-            (69, AV1_ON_A_GPU_WITHOUT_AV1, "the GPU can't decode this file's AV1 video"),
+            (69, AV1_ON_A_GPU_WITHOUT_AV1, "the GPU can't decode this file's AV1 video", "codec"),
             (
                 69,
                 "[h264 @ 0x1] Decode error rate 1 exceeds maximum 0.666667\nConversion failed!\n",
                 "the GPU can't decode this file's video (ffmpeg exited 69)",
+                "codec",
             ),
             (
                 251,
                 "[hevc @ 0x1] Failed to sync surface 0x5 (operation failed).\n"
                 "[vist#0:0/hevc @ 0x2] Decoding error: Input/output error\nConversion failed!\n",
                 "the GPU's decoder hit a hardware or driver error (ffmpeg exited 251)",
+                "hwaccel",
             ),
             (
                 251,
@@ -620,16 +622,18 @@ class TestRunDecode:
                 "[in#0/matroska,webm @ 0x2] Error during demuxing: Input/output error\nConversion failed!\n",
                 "ffmpeg couldn't read the file (an I/O error, ffmpeg exited 251); if this keeps happening, check the "
                 "disk or network share it is on",
+                "io_error",
             ),
             (
                 3,
                 "[Parsed_scale_0 @ 0x1] Error while filtering: Cannot allocate memory\nConversion failed!\n",
                 "ffmpeg exited 3 decoding Movie.mkv on the GPU: Error while filtering: Cannot allocate memory",
+                None,
             ),
         ],
         ids=["codec-av1", "codec-unnamed", "hwaccel", "io-error", "anything-else"],
     )
-    def test_a_gpu_failure_names_the_cause_previews_gives_it(self, exit_code, stderr, message):
+    def test_a_gpu_failure_names_the_cause_previews_gives_it(self, exit_code, stderr, message, kind):
         # The worker's CPU rerun shows this as its reason: the last 300 characters of stderr said "inating thread with
         # return code -22 ... Conversion failed!" for a GPU that can't decode AV1.
         with pytest.raises(GpuDecodeError) as excinfo:
@@ -641,6 +645,8 @@ class TestRunDecode:
                 name="Movie.mkv",
             )
         assert str(excinfo.value) == message
+        # A node reports only a hardware accelerator error or a signal as its GPU failing (nodes.server.ops).
+        assert excinfo.value.fallback_kind == kind
 
     def test_a_gpu_decode_killed_by_a_signal_says_so(self):
         # An OOM kill, say: the CPU rerun is previews' answer to it too.
@@ -648,7 +654,7 @@ class TestRunDecode:
         with pytest.raises(GpuDecodeError) as excinfo:
             frames.run_decode(command, hw_active=True, pts_offset_s=0.0, detect_boxes=lambda p: [()] * len(p))
         assert str(excinfo.value) == "ffmpeg was stopped by a signal (exit -9)"
-        assert excinfo.value.stderr_tail == ()
+        assert excinfo.value.stderr_tail == () and excinfo.value.fallback_kind == "signal"
 
     def test_a_gpu_failure_keeps_ffmpegs_last_lines_that_say_why(self):
         # Seen in production: 53 Intel reads fell back to the CPU with only the classified reason logged; ffmpeg's own lines

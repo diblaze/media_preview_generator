@@ -25,7 +25,7 @@ HEADERS = {"Authorization": f"Bearer {KEY}", protocol.PROTOCOL_HEADER: "1"}
 
 @pytest.fixture(autouse=True)
 def _node_env(tmp_path, monkeypatch):
-    for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_NAME", "NODE_ROLES", "PLEX_CONFIG_DIR"):
+    for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_NAME", "NODE_ROLES", "NODE_IMAGE_ROLES", "PLEX_CONFIG_DIR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
@@ -284,6 +284,24 @@ class TestTaskRoutes:
         assert deleted.status_code == 200 and deleted.get_json()["ok"] is True
         assert after.status_code == 404 and after.get_json()["error"]["kind"] == protocol.KIND_UNKNOWN_TASK
 
+    def test_a_stopping_node_answers_503_to_a_start_and_says_it_is_stopping(self, make_app, media):
+        # wsgi's stop cancels every task, then waits for their FFmpeg while the server still answers.
+        runs: list[int] = []
+        app = make_app(ops={"test.op": lambda *a: runs.append(1) or {}})
+        client = app.test_client()
+        assert client.get("/v1/health").get_json()["stopping"] is False
+        assert client.get("/v1/info", headers=HEADERS).get_json()["stopping"] is False
+        spec = {"op": "test.op", "path": "/data/a.mkv", "size": 10, "mtime_ns": None,
+                "mapping": [{"app_prefix": "/data", "node_prefix": str(media)}], "gpu": None, "params": {}}  # fmt: skip
+
+        app.extensions[node_app.EXTENSION].close()
+        started = client.post("/v1/tasks", headers=HEADERS, json=spec)
+
+        assert started.status_code == 503 and started.get_json()["error"]["kind"] == protocol.KIND_NODE_STOPPING
+        assert runs == []
+        assert client.get("/v1/health").get_json()["stopping"] is True
+        assert client.get("/v1/info", headers=HEADERS).get_json()["stopping"] is True
+
     def test_a_repeated_start_with_the_same_client_id_answers_the_same_task(self, make_app, media):
         runs = []
         client = make_app(ops={"test.op": lambda *a: runs.append(1) or {}}).test_client()
@@ -428,6 +446,15 @@ class TestRoles:
         with pytest.raises(SystemExit):
             make_app(roles=[])
 
+    @pytest.mark.parametrize("value", ["worker", "plex_db,worker"])
+    def test_the_plex_database_image_refuses_the_worker_role(self, make_app, monkeypatch, value):
+        # The slim image sets NODE_IMAGE_ROLES: it has no FFmpeg, so a worker there would fail every file it got.
+        monkeypatch.setenv("NODE_IMAGE_ROLES", "plex_db")
+        monkeypatch.setenv("NODE_ROLES", value)
+
+        with pytest.raises(SystemExit, match="only has the Plex database role; use the main image"):
+            make_app(ops=None)
+
     def test_plex_db_without_plex_config_dir_refuses_to_start(self, make_app):
         with pytest.raises(SystemExit, match="PLEX_CONFIG_DIR"):
             make_app(roles=["plex_db"])
@@ -506,3 +533,82 @@ print(heavy)
 
         assert done.returncode == 0, done.stderr
         assert done.stdout.strip().splitlines()[-1] == "[]"
+
+
+def _fake_plex_db(monkeypatch) -> None:
+    fake = types.ModuleType("media_preview_generator.nodes.server.plex_db")
+    fake.register_plex_db = lambda app, **kwargs: None
+    fake.agent_block = lambda: {}
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    # `from . import plex_db` reads the package attribute first once the real module has been imported.
+    monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
+    monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
+
+
+def _no_system_temp(monkeypatch) -> None:
+    import tempfile
+
+    def none() -> str:
+        # What `docker run --read-only` without a tmpfs at /tmp gets.
+        raise FileNotFoundError(2, "No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp']")
+
+    monkeypatch.delenv("NODE_TEMP_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", none)
+
+
+class TestTempFolderAtStart:
+    def test_a_worker_node_whose_temp_folder_cant_be_made_refuses_to_start(self, make_app, monkeypatch, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("x")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(blocker / "node-tmp"))
+
+        with pytest.raises(SystemExit, match=r"NODE_TEMP_DIR \(.*\) can't be made \(Not a directory\)"):
+            make_app(roles=["worker"])
+        # Refused before its identity: the one-time notice of a new key is still to come at the start that works.
+        assert not (tmp_path / "config" / "node.json").exists()
+
+    def test_a_worker_node_without_a_writable_system_temp_folder_refuses_to_start(self, make_app, monkeypatch):
+        _no_system_temp(monkeypatch)
+
+        with pytest.raises(SystemExit, match="no temp folder it can write to .* Set NODE_TEMP_DIR"):
+            make_app(roles=["worker"])
+
+    def test_a_plex_database_node_needs_no_temp_folder(self, make_app, monkeypatch):
+        _fake_plex_db(monkeypatch)
+        _no_system_temp(monkeypatch)
+
+        client = make_app(roles=["plex_db"]).test_client()
+
+        assert client.get("/v1/health").status_code == 200
+        response = client.post("/v1/tasks", headers=HEADERS, json={"op": "preview.frames", "path": "/a"})
+        assert response.status_code == 400 and response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
+
+
+class TestSecretFiles:
+    def test_a_key_in_the_file_file_node_key_names_is_the_key_the_node_expects(self, make_app, monkeypatch, tmp_path):
+        # linuxserver's FILE__ convention for Docker secrets was ignored: the node made a key of its own and every
+        # request from the app was refused.
+        secret = tmp_path / "node_key"
+        secret.write_text("a-key-from-a-docker-secret\n")
+        monkeypatch.setenv("NODE_KEY", "")  # so monkeypatch takes back the value the node sets
+        monkeypatch.setenv("FILE__NODE_KEY", str(secret))
+
+        client = make_app(key=None).test_client()
+
+        allowed = {"Authorization": "Bearer a-key-from-a-docker-secret", protocol.PROTOCOL_HEADER: "1"}
+        assert client.get("/v1/log", headers=allowed).status_code == 200
+        assert client.get("/v1/log", headers=HEADERS).status_code == 401
+
+    def test_any_setting_can_come_from_a_file(self, make_app, monkeypatch, tmp_path):
+        secret = tmp_path / "name"
+        secret.write_text("gpu-box\n")
+        monkeypatch.setenv("NODE_NAME", "")
+        monkeypatch.setenv("FILE__NODE_NAME", str(secret))
+
+        assert make_app().test_client().get("/v1/health").get_json()["node"]["name"] == "gpu-box"
+
+    def test_a_file_the_node_cant_read_refuses_to_start(self, make_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("FILE__NODE_KEY", str(tmp_path / "missing"))
+
+        with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names .*missing, which the node can't read \(No such"):
+            make_app(key=None)

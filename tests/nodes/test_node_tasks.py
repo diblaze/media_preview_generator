@@ -236,6 +236,63 @@ class TestTempFolder:
             table.start(_spec(media))
         assert table.busy() == 0
 
+    @pytest.mark.parametrize(("code", "said"), [(errno.ENOSPC, "is full"), (errno.EROFS, "can't write to")])
+    def test_a_temp_folder_that_fills_or_turns_read_only_mid_task_says_so(self, make_table, media, code, said):
+        def op(ctx, node_path, params):
+            tar = os.path.join(ctx.temp_dir, "frames.tar")
+            raise OSError(code, os.strerror(code), tar)
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED
+        message = state["error"]["message"]
+        assert message.startswith("The node") and said in message and table.temp_root in message, message
+        assert ("twice its frames' size" in message) == (code == errno.ENOSPC)
+
+    def test_a_temp_folder_error_raised_through_another_exception_still_says_so(self, make_table, media):
+        def op(ctx, node_path, params):
+            try:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            except OSError as exc:
+                raise RuntimeError("writing the frames failed") from exc
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert "temp folder" in state["error"]["message"] and "is full" in state["error"]["message"]
+
+    def test_a_read_only_error_outside_the_temp_folder_is_not_blamed_on_it(self, make_table, media):
+        def op(ctx, node_path, params):
+            raise OSError(errno.EROFS, "Read-only file system", str(media / "a.mkv"))
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["error"]["message"].startswith("OSError: [Errno 30]")
+
+    def test_the_probe_names_a_temp_folder_the_node_cant_write(self, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("x")
+
+        problem = tasks.probe_temp_folder(str(blocker / "node-tmp"))
+
+        assert problem is not None and problem.startswith("The node can't write to its temp folder")
+        assert tasks.probe_temp_folder(str(tmp_path / "fine")) is None
+        assert os.listdir(tmp_path / "fine") == []
+
+    def test_a_node_without_the_worker_role_makes_no_temp_folder(self, tmp_path):
+        table = tasks.TaskTable({}, temp_root=None)
+        try:
+            with pytest.raises(tasks.TaskSpecError):
+                table.start({"op": "preview.frames", "path": "/a", "mapping": []})
+        finally:
+            table.close()
+        assert os.listdir(tmp_path) == []
+
 
 class TestClientTaskId:
     CLIENT_ID = "0123456789abcdef0123456789abcdef"
@@ -595,6 +652,40 @@ class TestExpiry:
         tasks.TaskTable({}, temp_root=str(root)).close()
 
         assert sorted(os.listdir(root)) == ["someone-elses"]
+
+
+class TestStopping:
+    """SIGTERM closes the table first; the server answers until the cancelled tasks' FFmpeg has stopped."""
+
+    def test_a_closing_table_refuses_new_tasks_and_runs_none(self, make_table, media):
+        # A file requeued while the node stopped was started there again, never cancelled, and died with the node.
+        ran: list[int] = []
+        table = make_table({"test.op": lambda ctx, node_path, params: ran.append(1) or {}})
+        assert not table.stopping
+
+        table.close()
+
+        with pytest.raises(tasks.NodeStoppingError, match="This node is stopping"):
+            table.start(_spec(media))
+        assert table.stopping and table.busy() == 0 and ran == []
+        assert os.listdir(table.temp_root) == []
+
+    def test_a_start_whose_folder_was_made_as_the_stop_began_is_refused_and_leaves_nothing(
+        self, make_table, media, monkeypatch
+    ):
+        table = make_table({"test.op": lambda ctx, node_path, params: {}})
+        make_temp_dir = table._make_temp_dir
+
+        def stop_meanwhile(task_id: str) -> str:
+            path = make_temp_dir(task_id)
+            table.close()
+            return path
+
+        monkeypatch.setattr(table, "_make_temp_dir", stop_meanwhile)
+
+        with pytest.raises(tasks.NodeStoppingError):
+            table.start(_spec(media))
+        assert table.busy() == 0 and os.listdir(table.temp_root) == []
 
 
 class TestArtifact:

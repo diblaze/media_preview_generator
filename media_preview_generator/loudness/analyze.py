@@ -16,6 +16,7 @@ from loguru import logger
 from ..markers.freeze import Freeze
 from ..markers.probe import _count_stuck, kill_and_collect
 from ..markers.progress import read_progress
+from ..utils import kill_with_parent
 
 # The filter Plex Media Server 1.43 runs for each audio stream (``Plex Transcoder -i FILE -map 0:N -af ... -f null -``).
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1:LRA=9:print_format=json"
@@ -321,6 +322,7 @@ def _run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
         )
     except OSError as exc:
         raise LoudnessError(f"Could not start ffmpeg analysing {name}: {exc.strerror or type(exc).__name__}") from exc

@@ -22,6 +22,8 @@ from media_preview_generator.nodes.client import (
     UNREACHABLE_TIMEOUT,
     UNREACHABLE_TLS,
     NodeAuthError,
+    NodeCantStartError,
+    NodeStoppingError,
     NodeTaskDeletedError,
     NodeTimeoutError,
     NodeUnknownTaskError,
@@ -366,7 +368,18 @@ class TestNodeDrops:
             _run(media)
         assert registry.reports == [("unavailable", NODE_ID)]
 
-    @pytest.mark.parametrize("error", [unreachable(), NodeAuthError("refused the key")])
+    @pytest.mark.parametrize(
+        "error",
+        [
+            unreachable(),
+            NodeAuthError("refused the key"),
+            # Its temp folder can't be used: the file goes back in the queue and the node is checked now, rather than
+            # the file failing while the node stays ready for the next one.
+            NodeCantStartError("The node can't write to its temp folder /node-tmp (Permission denied)"),
+            # Stopping (SIGTERM): it goes elsewhere, with no drop counted against the file.
+            NodeStoppingError("http://n is restarting"),
+        ],
+    )
     def test_a_node_that_wont_start_the_task_is_unavailable_and_never_ran_it(self, media, error):
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})], start_error=error)
         registry = _install(client)
@@ -455,8 +468,11 @@ class TestNodeDrops:
             NodeUnreachableError("http://n didn't answer over https", reason=UNREACHABLE_TLS),
             unreachable(),
             NodeAuthError("http://n refused the key"),
+            # The node's own answers that it took nothing: a 503 node_stopping is the node, not a gateway.
+            NodeCantStartError("The node can't write to its temp folder /node-tmp (Permission denied)"),
+            NodeStoppingError("http://n is restarting"),
         ],
-        ids=["refused", "no-such-machine", "tls", "connect-timeout", "key-refused"],
+        ids=["refused", "no-such-machine", "tls", "connect-timeout", "key-refused", "temp-folder", "node-stopping"],
     )
     def test_a_start_that_never_reached_the_node_cancels_nothing(self, media, error):
         client = ScriptedClient([running()], start_error=error)

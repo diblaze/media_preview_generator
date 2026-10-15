@@ -124,8 +124,8 @@ an update, since pull request and local images all report one version; the Plex 
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /v1/health` | – | `{"ok": true, "node": …}` (no auth; container HEALTHCHECK) |
-| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
+| `GET /v1/health` | – | `{"ok": true, "node": …, "stopping"}` (no auth; container HEALTHCHECK) |
+| `GET /v1/info` | – | `node`, `stopping`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes, problem}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
 | `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |
@@ -156,13 +156,19 @@ a start arriving after that DELETE answers 409 `task_deleted` and runs nothing.
 A stopping app sends `DELETE /v1/tasks/<id>` for every task it still runs on a node, all at once and waiting 1 s at
 most, so none runs on until the unpolled-task expiry beside the tasks the job revived on the next start sends.
 
+Stopping (SIGTERM): the node cancels every task first, then waits up to 5 s for their FFmpeg while it still answers.
+Meanwhile `stopping` is true in `/v1/health` and `/v1/info` (the registry reads the node as offline, "<node> is
+restarting") and a start answers 503 `node_stopping` and runs nothing; the app gives the file to another worker with
+no drop counted and sends no DELETE for it. On Linux each FFmpeg a node starts gets `PR_SET_PDEATHSIG` (SIGKILL), so
+it dies with a node run outside Docker (`utils.kill_with_parent`).
+
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.
 
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
 `unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`, `task_deleted`.
+`unknown_task`, `request`, `task_deleted`, `node_stopping`.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is
@@ -205,7 +211,7 @@ retry runs (on the **node's** CPU, see §6).
 ## 5. Node states (app side)
 
 `connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `no_ffmpeg`,
-`disabled`.
+`temp_problem`, `disabled`.
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
@@ -213,6 +219,9 @@ retry runs (on the **node's** CPU, see §6).
   node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
+* `temp_problem`: a worker node whose `/v1/info` reports `worker.temp.problem` (it can't make a task folder in its
+  temp folder: full, read-only, no permission); it gets no work. A start the node refuses for that reason (400
+  `failed`) gives the file back as never started, and the node is checked at once.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.
@@ -327,6 +336,9 @@ so the slim Plex database builds (Linux image without the app's dependencies, Wi
 
 Env: `MODE=node` (wrapper.sh), `NODE_PORT` (default 9494), `NODE_ROLES`, `NODE_NAME` (default hostname),
 `NODE_KEY` (else `AGENT_TOKEN`, else generated once into `<CONFIG_DIR>/node.json`), `PLEX_CONFIG_DIR` (plex_db).
+`FILE__<NAME>=<path>` sets `<NAME>` to that file's contents (Docker secrets). The node does it itself (app.py): the main
+image keeps the container's own environment (`S6_KEEP_ENV=1`), so s6's copy never reaches it. A file it can't read
+stops the node.
 
 ### 10.2 Registry (Lane B) used by remote execution (Lane C)
 
@@ -411,7 +423,7 @@ reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `
 {"node": {id, name, version, roles},          # id null and name "" for an older Plex helper
  "legacy": bool,                              # an older Plex helper (no /v1/info; answered its /v1/ping)
  "platform": {os, arch, python},              # {} for a helper
- "worker": {gpus: [{type, device, name, status, error, credit_text?}], cpu: {...}, temp: {path, free_bytes},
+ "worker": {gpus: [{type, device, name, status, error, credit_text?}], cpu: {...}, temp: {path, free_bytes, problem},
             notes: [{title, chip, message}]} | null,   # null without the worker role; notes = credits text on CPU
  "plex_db": {config_dir, db_present, machine_identifier} | null,
  "version_match": bool | null,                # null without the worker role (only a worker must match exactly)

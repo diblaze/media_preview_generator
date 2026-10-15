@@ -104,8 +104,8 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
 
 | Setting | What it is |
 |---|---|
-| `NODE_KEY` | The key both sides share: at least 16 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. |
-| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (any length, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. |
+| `NODE_KEY` | The key both sides share: at least 16 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. To keep it in a file (a Docker secret), set `FILE__NODE_KEY` to that file's path instead. |
+| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (any length, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
 | `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
 | `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the helper binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |

@@ -3298,7 +3298,7 @@ function _patchWorkerCard(col, worker) {
     // Status badge: only the exceptional states get a pill; busy and idle show through the card style.
     // A node that stopped answering outranks pause and retirement: it is why the card's file is not progressing.
     const nodeDown = !!worker.node && !!worker.node_state && !['ready', 'gpu_lost'].includes(worker.node_state);
-    const nodeStateText = { offline: 'Offline', key_refused: 'Key refused', update_needed: 'Update needed', access_problem: 'Access problem', no_ffmpeg: 'FFmpeg missing', duplicate: 'Added twice', connecting: 'Connecting', disabled: 'Disabled' }[worker.node_state] || worker.node_state;
+    const nodeStateText = { offline: 'Offline', key_refused: 'Key refused', update_needed: 'Update needed', access_problem: 'Access problem', no_ffmpeg: 'FFmpeg missing', duplicate: 'Added twice', temp_problem: 'Temp folder problem', connecting: 'Connecting', disabled: 'Disabled' }[worker.node_state] || worker.node_state;
     const workerStatus = nodeDown ? `Node ${String(nodeStateText).toLowerCase()}` : paused ? (worker.retiring ? 'Paused · finishing after resume' : 'Paused') : worker.retiring ? 'Finishing current file' : isProcessing ? 'Processing' : 'Idle';
     if (statusEl.textContent !== workerStatus) {
         statusEl.textContent = workerStatus;

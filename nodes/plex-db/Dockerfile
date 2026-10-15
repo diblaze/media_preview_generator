@@ -43,10 +43,13 @@ LABEL org.opencontainers.image.title="Plex database node" \
       org.opencontainers.image.source="https://github.com/stevezau/media_preview_generator"
 # NODE_PORT is deliberately not set here: the port is ${NODE_PORT:-${AGENT_PORT:-9494}}, so a setup from the Plex
 # marker agent days that moved AGENT_PORT keeps listening where its published mapping expects.
+# NODE_IMAGE_ROLES: the roles this image carries code for. The node refuses to start with NODE_ROLES=worker here (no
+# FFmpeg, no GPU code) instead of looking healthy and failing every file sent to it.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     NODE_ROLES=plex_db \
+    NODE_IMAGE_ROLES=plex_db \
     CONFIG_DIR=/config \
     PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server"
 

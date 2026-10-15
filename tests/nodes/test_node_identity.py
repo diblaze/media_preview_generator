@@ -56,15 +56,36 @@ class TestNodeJson:
     def test_corrupt_file_refuses_to_start_instead_of_changing_the_id(self, tmp_path):
         (tmp_path / "node.json").write_text("{not json")
 
-        with pytest.raises(SystemExit, match="node.json"):
+        with pytest.raises(SystemExit, match="node.json") as refused:
             identity.load_identity(str(tmp_path))
         assert (tmp_path / "node.json").read_text() == "{not json"
+        assert "gives the node a new id and key, and every app that added it has to add it again" in str(refused.value)
 
     def test_wrong_shape_refuses_to_start(self, tmp_path):
         (tmp_path / "node.json").write_text('{"id": 3}')
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit, match="isn't a node identity file; restore it from a backup"):
             identity.load_identity(str(tmp_path))
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any file")
+    def test_a_node_json_made_under_another_puid_names_both_users_and_doesnt_suggest_deleting_it(
+        self, tmp_path, monkeypatch
+    ):
+        # A PUID/PGID change left node.json (0600) to the old user, and the advice to remove it re-keyed the node.
+        identity.load_identity(str(tmp_path))
+        path = tmp_path / "node.json"
+        owner = os.stat(path).st_uid
+        path.chmod(0)
+        monkeypatch.setattr(identity.os, "geteuid", lambda: 99)
+        try:
+            with pytest.raises(SystemExit) as refused:
+                identity.load_identity(str(tmp_path))
+        finally:
+            path.chmod(0o600)
+
+        message = str(refused.value)
+        assert f"it belongs to user {owner} and this node runs as user 99" in message
+        assert "Set PUID/PGID back to the user that made it" in message and "remove" not in message
 
     def test_repr_never_shows_the_key(self, tmp_path):
         me = identity.load_identity(str(tmp_path))

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import platform
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,8 @@ LOG_DEFAULT_LINES = 200
 # How much of a protocol header that isn't this node's the refusal repeats back.
 PROTOCOL_ECHO_MAX = 32
 EXTENSION = "mpg_node"
+# ``FILE__NODE_KEY=/run/secrets/node_key`` sets NODE_KEY to that file's contents (linuxserver's way to pass secrets).
+FILE_ENV_PREFIX = "FILE__"
 
 
 @dataclass
@@ -57,6 +59,38 @@ class NodeServerState:
             self.worker_info.stop()
 
 
+def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
+    """Set each ``FILE__<NAME>`` variable's ``<NAME>`` to the contents of the file it names (a Docker secret).
+
+    The main image's s6 init would do this, but the image keeps the container's own environment (``S6_KEEP_ENV``), so
+    its copy never reaches the node; the Plex database image has no such init. Trailing newlines (what
+    ``echo key > file`` leaves) are dropped.
+
+    Args:
+        environ: For tests; default ``os.environ``.
+
+    Raises:
+        SystemExit: A named file can't be read: the node would otherwise start with a key of its own, and the app's
+            every request would be refused.
+    """
+    environ = os.environ if environ is None else environ
+    for var, path in sorted(environ.items()):
+        name = var[len(FILE_ENV_PREFIX) :]
+        if not var.startswith(FILE_ENV_PREFIX) or not name:
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = handle.read()
+        except (OSError, ValueError) as exc:
+            reason = getattr(exc, "strerror", None) or type(exc).__name__
+            raise SystemExit(
+                f"{var} names {path}, which the node can't read ({reason}). Fix the path, or let this container's "
+                "user (PUID/PGID) read the file."
+            ) from exc
+        environ[name] = value.rstrip("\r\n")
+        logger.info("{} set from {}", name, var)
+
+
 def _resolve_roles(roles: list[str] | None) -> list[str]:
     raw = roles if roles is not None else (os.environ.get("NODE_ROLES", "").strip() or protocol.ROLE_WORKER).split(",")
     chosen: list[str] = []
@@ -69,7 +103,39 @@ def _resolve_roles(roles: list[str] | None) -> list[str]:
             chosen.append(role)
     if not chosen:
         raise SystemExit(f"NODE_ROLES must name at least one role: {', '.join(protocol.ROLES)}.")
+    # Set by the slim Plex database image, which carries no FFmpeg or GPU code: a worker role there would look healthy
+    # and fail every file sent to it.
+    image_roles = [r.strip() for r in os.environ.get("NODE_IMAGE_ROLES", "").split(",") if r.strip()]
+    if image_roles and protocol.ROLE_WORKER in chosen and protocol.ROLE_WORKER not in image_roles:
+        raise SystemExit(
+            "This image only has the Plex database role; use the main image (with MODE=node) for a worker node."
+        )
     return chosen
+
+
+def _worker_temp_root() -> str:
+    """The worker role's temp folder (``NODE_TEMP_DIR``, else the system temp folder's ``mpg-node``), made now.
+
+    Raises:
+        SystemExit: It can't be made: a path under a file, a parent the node can't write, or no writable system temp
+            folder (a container started with ``--read-only`` and no tmpfs).
+    """
+    chosen = os.environ.get("NODE_TEMP_DIR", "").strip()
+    try:
+        root = tasks.default_temp_root()
+    except OSError as exc:
+        raise SystemExit(
+            f"The node found no temp folder it can write to ({exc.strerror or exc}). Set NODE_TEMP_DIR to one "
+            "(a container started read-only needs a tmpfs or a volume for it)."
+        ) from exc
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as exc:
+        setting = f"NODE_TEMP_DIR ({root})" if chosen else f"The node's temp folder {root}"
+        raise SystemExit(
+            f"{setting} can't be made ({exc.strerror or exc}). Set NODE_TEMP_DIR to a folder the node can write to."
+        ) from exc
+    return root
 
 
 def create_node_app(
@@ -97,10 +163,16 @@ def create_node_app(
         The Flask app.
 
     Raises:
-        SystemExit: An unknown role, a bad key, an unreadable node.json, or the Plex database role without
+        SystemExit: A ``FILE__`` variable naming a file it can't read, an unknown role, a bad key, an unreadable
+            node.json, the worker role without a temp folder it can make, or the Plex database role without
             ``PLEX_CONFIG_DIR``.
     """
+    _env_from_files()
     chosen_roles = _resolve_roles(roles)
+    worker = protocol.ROLE_WORKER in chosen_roles
+    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only). Made
+    # before the identity, so a node that can't start hasn't spent the one-time notice of its new key.
+    temp_root = _worker_temp_root() if worker else None
     me = identity.load_identity(config_dir, key=key)
     node_block = {
         "id": me.id,
@@ -110,7 +182,6 @@ def create_node_app(
         "protocols": [protocol.NODE_PROTOCOL],
         "roles": list(chosen_roles),
     }
-    worker = protocol.ROLE_WORKER in chosen_roles
 
     # static_folder=None: a node serves its API only; Flask's default would add /static/<path:filename>.
     app = Flask(__name__, static_folder=None)
@@ -118,13 +189,12 @@ def create_node_app(
     app.json.sort_keys = False
 
     log_buffer = nodelog.install()
-    temp_root = tasks.default_temp_root()
     if worker and ops is None:
         from .ops import OPS
 
         ops = OPS
     worker_info = None
-    if worker:
+    if temp_root is not None:
         from .info import WorkerInfo
 
         worker_info = WorkerInfo(temp_root=temp_root)
@@ -229,7 +299,7 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
     @bp.get(protocol.ROUTE_HEALTH)
     def health() -> Any:
         """Liveness for the container's HEALTHCHECK: no key needed, nothing about the media."""
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = {"stopping": table.stopping}
         if state.plex_db_module is not None:
             body["agent"] = state.plex_db_module.agent_block()
         return answer(body)
@@ -237,7 +307,9 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
     @bp.get(protocol.ROUTE_INFO)
     def info() -> Any:
         body: dict[str, Any] = {
-            "platform": {"os": platform.system(), "arch": platform.machine(), "python": platform.python_version()}
+            "platform": {"os": platform.system(), "arch": platform.machine(), "python": platform.python_version()},
+            # Stopping (SIGTERM): it takes no new task, so the app's check reads it as not ready.
+            "stopping": table.stopping,
         }
         if state.worker_info is not None:
             body["worker"] = state.worker_info.block(busy=table.busy())
@@ -323,6 +395,8 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
             return refuse(protocol.KIND_TASK_DELETED, 409, str(exc))
         except tasks.TaskStartError as exc:
             return refuse(protocol.KIND_FAILED, 400, str(exc))
+        except tasks.NodeStoppingError as exc:
+            return refuse(protocol.KIND_NODE_STOPPING, 503, str(exc))
         return answer({"id": task_id}, 202)
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>")

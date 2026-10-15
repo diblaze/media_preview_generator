@@ -7,7 +7,10 @@ import threading
 import time
 import types
 
-from media_preview_generator.nodes.server import info
+import pytest
+from loguru import logger
+
+from media_preview_generator.nodes.server import info, nodelog
 
 
 def _until(check, timeout: float = 10.0) -> None:
@@ -137,6 +140,84 @@ class TestDetection:
             release.set()
             recheck.join(5)
 
+    def test_a_background_recheck_logs_at_debug_unless_the_gpus_changed(self, tmp_path):
+        # Every 5 minutes an idle node logged the same 3 lines per GPU (2 warnings per failed one) into its Log tab.
+        found = [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+
+        def detect():
+            logger.info("Checking NVIDIA GPU 0 (GPU 0)...")
+            logger.warning("card1: VAAPI test failed")
+            return list(found)
+
+        node_log = nodelog.install()
+        levels: list[str] = []
+        sink = logger.add(
+            lambda message: levels.append(message.record["level"].name),
+            level=0,
+            filter=lambda r: r["message"] == "card1: VAAPI test failed" and not r["extra"].get(nodelog.HELD_EXTRA),
+        )
+        try:
+            worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+            worker.rescan()  # the first pass, at start
+            worker.rescan(quiet=True)  # a re-check: the same GPUs
+            found.append(("INTEL", "/dev/dri/renderD128", {"name": "UHD 770"}))
+            worker.rescan(quiet=True)  # a re-check that found a GPU more
+        finally:
+            logger.remove(sink)
+
+        assert levels == ["WARNING", "DEBUG", "WARNING"]
+        shown = [line["message"] for line in node_log.lines(100)]
+        assert shown.count("Checking NVIDIA GPU 0 (GPU 0)...") == 2 and shown.count("card1: VAAPI test failed") == 2
+
+    def test_the_loop_rechecks_quietly_after_its_first_pass(self, tmp_path, monkeypatch):
+        passes = []
+        worker = info.WorkerInfo(temp_root=str(tmp_path), recheck_s=3600, detect=list)
+        monkeypatch.setattr(worker, "rescan", lambda quiet=False: passes.append(quiet) or [])
+        worker.start()
+        try:
+            _until(lambda: len(passes) == 1)
+            worker.note_gpu_error()
+            _until(lambda: len(passes) == 2)
+        finally:
+            worker.stop()
+
+        assert passes == [False, True]
+
+    def test_info_during_the_first_detection_waits_for_it_instead_of_detecting_again(self, tmp_path):
+        # A second detection right after the first doubled the first /v1/info's time and logged every GPU twice.
+        calls = []
+        first_started = threading.Event()
+
+        def detect():
+            calls.append(1)
+            first_started.set()
+            time.sleep(0.5)
+            return [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), recheck_s=3600, detect=detect)
+        worker.start()
+        try:
+            assert first_started.wait(5)
+
+            block = worker.block(busy=0)
+        finally:
+            worker.stop()
+
+        assert [g["device"] for g in block["gpus"]] == ["cuda:0"]
+        assert len(calls) == 1
+
+    def test_info_detects_itself_when_the_loop_ended_without_an_answer(self, tmp_path):
+        calls = []
+        worker = info.WorkerInfo(
+            temp_root=str(tmp_path), detect=lambda: calls.append(1) or [("NVIDIA", "cuda:0", {"name": "GPU 0"})]
+        )
+        # A loop thread that ended before its first pass stored anything: waiting for it would wait forever.
+        worker._thread = threading.Thread(target=lambda: None)
+        worker._thread.start()
+        worker._thread.join(5)
+
+        assert [g["device"] for g in worker.gpus()] == ["cuda:0"] and len(calls) == 1
+
     def test_entries_are_json_safe(self):
         entry = info._gpu_entry(("AMD", "/dev/dri/renderD128", {"status": "failed", "error": ValueError("x")}))
 
@@ -161,6 +242,31 @@ class TestHost:
 
     def test_meminfo_missing_is_none(self, tmp_path):
         assert info._meminfo(str(tmp_path / "nope")) == (None, None)
+
+    def test_cores_are_the_ones_the_node_may_use_not_the_hosts(self, tmp_path, monkeypatch):
+        # A node started with --cpus 0.5 (or pinned to one core) on a 20-core host said it had 20.
+        monkeypatch.setattr(info.os, "sched_getaffinity", lambda pid: {0}, raising=False)
+        monkeypatch.setattr(info.os, "cpu_count", lambda: 20)
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=list)
+
+        assert worker.block(busy=0)["cpu"]["cores"] == 1
+
+    @pytest.mark.parametrize(
+        ("cpu_max", "cores"),
+        [("50000 100000\n", 1), ("200000 100000\n", 2), ("250000 100000\n", 3), ("max 100000\n", 8), ("junk", 8)],
+    )
+    def test_cores_are_capped_by_the_containers_cpu_limit(self, tmp_path, monkeypatch, cpu_max, cores):
+        path = tmp_path / "cpu.max"
+        path.write_text(cpu_max)
+        monkeypatch.setattr(info.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+
+        assert info._cores(str(path)) == cores
+
+    def test_cores_without_an_affinity_call_are_the_cpu_count(self, tmp_path, monkeypatch):
+        monkeypatch.delattr(info.os, "sched_getaffinity", raising=False)  # macOS and Windows
+        monkeypatch.setattr(info.os, "cpu_count", lambda: 6)
+
+        assert info._cores(str(tmp_path / "no-cgroup")) == 6
 
     def test_load1_none_without_a_load_average(self, monkeypatch):
         def no_load():

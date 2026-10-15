@@ -19,9 +19,20 @@ from media_preview_generator.nodes.client import (
     NodeRequestError,
     NodeUnknownTaskError,
 )
+from media_preview_generator.nodes.executor import (
+    REQUEUE_NODE_NOT_STARTED,
+    NodeUnavailableError,
+    Placement,
+    placed_on,
+    requeue_for,
+    run_on_node,
+)
 from media_preview_generator.nodes.protocol import PathMapping
+from media_preview_generator.nodes.registry import set_registry
 from media_preview_generator.nodes.server import app as node_app
 from media_preview_generator.nodes.server import info
+
+from .executor_fakes import NODE_ID, identity_registry, write_file
 
 KEY = "round-trip-key"
 
@@ -245,3 +256,63 @@ class TestAppStop:
             assert executor.cancel_running_tasks() == 0
         finally:
             set_registry(None)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a 0500 folder")
+class TestATempFolderTheNodeCantWrite:
+    """A read-only mount (or a disk remounted read-only) under NODE_TEMP_DIR: the node refuses every start."""
+
+    @pytest.fixture
+    def read_only_temp(self, node, tmp_path):
+        temp_root = tmp_path / "node-tmp"
+        temp_root.chmod(0o500)
+        yield str(temp_root)
+        temp_root.chmod(0o700)
+
+    def test_the_node_says_so_in_its_info(self, node, read_only_temp):
+        problem = _client(node[0]).info()["worker"]["temp"]["problem"]
+
+        assert problem == f"The node can't write to its temp folder {read_only_temp} (Permission denied)"
+
+    def test_a_writable_temp_folder_has_no_problem(self, node):
+        assert _client(node[0]).info()["worker"]["temp"]["problem"] is None
+
+    def test_a_file_sent_there_goes_back_in_the_queue_and_the_node_is_checked(self, node, read_only_temp):
+        # Not a failed file: the node stays "ready" until checked, so each file sent to it would fail in turn.
+        media = write_file(os.path.join(os.path.dirname(read_only_temp), "data", "Movie.mkv"), b"0123456789")
+        registry = identity_registry(_client(node[0]))
+        set_registry(registry)
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError) as raised:
+                run_on_node(protocol.OP_PREVIEW_FRAMES, media, {"frames": 1}, gpu=None, cancel_check=None)
+        finally:
+            set_registry(None)
+
+        assert raised.value.started is False and f"temp folder {read_only_temp}" in str(raised.value)
+        assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
+        assert registry.reports == [("unavailable", NODE_ID)]
+
+
+class TestANodeThatIsStopping:
+    """SIGTERM: the node cancels its tasks and waits for their FFmpeg, and keeps answering meanwhile."""
+
+    def test_it_says_so_and_a_file_sent_there_goes_elsewhere_without_a_drop(self, node, tmp_path):
+        # A file requeued during that wait was started there again, never cancelled, and failed as "dropped twice".
+        url, app = node
+        client = _client(url)
+        assert client.info()["stopping"] is False and client.health()["stopping"] is False
+        app.extensions[node_app.EXTENSION].close()  # what the stop does first
+        media = write_file(str(tmp_path / "data" / "Movie.mkv"), b"0123456789")
+        registry = identity_registry(client)
+        set_registry(registry)
+        try:
+            with placed_on(Placement(NODE_ID, "NAS")), pytest.raises(NodeUnavailableError) as raised:
+                run_on_node(protocol.OP_PREVIEW_FRAMES, media, {"frames": 1}, gpu=None, cancel_check=None)
+        finally:
+            set_registry(None)
+
+        assert raised.value.started is False and "is restarting" in str(raised.value)
+        assert requeue_for(raised.value).reason == REQUEUE_NODE_NOT_STARTED
+        assert registry.reports == [("unavailable", NODE_ID)]
+        assert client.info()["stopping"] is True and client.health()["stopping"] is True
+        assert app.extensions[node_app.EXTENSION].tasks.busy() == 0

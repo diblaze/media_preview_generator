@@ -674,7 +674,7 @@ docker run -d --name media-preview-node -p 9494:9494 \
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").
 - The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
-  made by `openssl rand -hex 24`.
+  made by `openssl rand -hex 24`, or keep it in a file and set `FILE__NODE_KEY` to that file's path.
 - A compose file is in [`nodes/worker/`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/worker/docker-compose.yml).
 
 ### Adding it

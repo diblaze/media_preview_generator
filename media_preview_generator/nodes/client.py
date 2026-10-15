@@ -57,6 +57,10 @@ class NodeUnreachableError(NodeError):
         self.reason = reason
 
 
+class NodeStoppingError(NodeUnreachableError):
+    """The node is stopping (503 ``node_stopping``): it took nothing, and is back once it has restarted."""
+
+
 class NodeTimeoutError(NodeUnreachableError):
     """The request reached the node but no answer came: it didn't come in time, or the connection dropped before it
     did. Unlike a refused connection, the node may have acted on it."""
@@ -91,7 +95,13 @@ class NodeUnknownTaskError(NodeError):
 
 
 class NodeRequestError(NodeError):
-    """The node refused the request as malformed (400). A bug on one side, never a user problem."""
+    """The node refused the request (400, kind ``request``): it is malformed, or asks for a role the node wasn't
+    started with (a GPU rescan or an access check on a node without the worker role)."""
+
+
+class NodeCantStartError(NodeError):
+    """The node couldn't take the task (400, kind ``failed``: its temp folder is full or can't be written). Nothing
+    ran, so the file can go to another worker."""
 
 
 class NodeTaskDeletedError(NodeError):
@@ -210,6 +220,15 @@ class NodeClient:
             raise NodeTimeoutError(f"{self._address.base} dropped the connection while answering") from exc
         return body
 
+    def _error_kind(self, response: requests.Response) -> str:
+        """The ``error.kind`` of a node's JSON answer, or "" when the answer isn't one (a proxy's error page)."""
+        try:
+            body = parse_json(self._read(response, MAX_ANSWER_BYTES))
+        except (ValueError, NodeError):
+            return ""
+        error = body.get("error") if isinstance(body, dict) else None
+        return str(error.get("kind") or "") if isinstance(error, dict) else ""
+
     def _answer(self, response: requests.Response, path: str, *, raw: bool) -> Any:
         """The node's answer to ``path``: the JSON body, or the bytes when ``raw``; anything else raises."""
         app_instance = str(response.headers.get(protocol.APP_INSTANCE_HEADER) or "")
@@ -220,6 +239,8 @@ class NodeClient:
         if response.status_code == 401:
             raise NodeAuthError(f"{self._address.base} refused the key")
         if response.status_code >= 500:
+            if response.status_code == 503 and self._error_kind(response) == protocol.KIND_NODE_STOPPING:
+                raise NodeStoppingError(f"{self._address.base} is restarting")
             raise NodeUnreachableError(f"{self._address.base} answered HTTP {response.status_code}")
         if 300 <= response.status_code < 400:
             raise NodeProtocolError(f"{self._address.base} answered with a redirect (HTTP {response.status_code})")
@@ -251,6 +272,8 @@ class NodeClient:
             raise NodeProtocolError(message, node=node if isinstance(node, dict) else None)
         if response.status_code == 409 and kind == protocol.KIND_TASK_DELETED:
             raise NodeTaskDeletedError(message)
+        if response.status_code == 400 and kind == protocol.KIND_FAILED:
+            raise NodeCantStartError(message)
         if response.status_code == 400:
             raise NodeRequestError(message)
         if response.status_code >= 400:

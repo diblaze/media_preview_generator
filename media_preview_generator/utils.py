@@ -8,10 +8,13 @@ import json
 import os
 import re
 import shutil
+import signal
+import sys
 import tempfile
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -166,6 +169,75 @@ def is_macos() -> bool:
     import platform
 
     return platform.system() == "Darwin"
+
+
+# A node runs the same GPU, FFmpeg and logging code as the app but has no screens of its own: its log is read on the
+# app's Nodes page, so a hint in a line it logs must name the app's screen for it, or the node's own setting.
+def is_node_mode() -> bool:
+    """Whether this process is a remote node (``MODE=node``), not the app."""
+    return os.environ.get("MODE", "").strip().lower() == "node"
+
+
+def gpu_settings_hint() -> str:
+    """Where a GPU is turned off: the app's GPU settings, or for a node's GPUs, the app's worker groups."""
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU Configuration"
+
+
+def gpu_details_hint() -> str:
+    """Where each GPU's test result is shown."""
+    if is_node_mode():
+        return "this node's Overview tab on the app's Nodes page"
+    return "Settings → Processing Options → GPU Configuration"
+
+
+def log_viewer_hint() -> str:
+    """Where the live log is read."""
+    return "this node's Log tab on the app's Nodes page" if is_node_mode() else "the live web log viewer"
+
+
+def working_folder_hint() -> tuple[str, str]:
+    """The folder FFmpeg writes thumbnails to, and where it is set: ``(name, setting)``."""
+    if is_node_mode():
+        return "the node's temp folder", "NODE_TEMP_DIR"
+    return "the working folder", "Settings → Advanced"
+
+
+_PR_SET_PDEATHSIG = 1  # linux/prctl.h
+
+
+def kill_with_parent() -> Callable[[], None] | None:
+    """A ``preexec_fn`` that has a node's FFmpeg killed (SIGKILL) when the node dies, on Linux; None elsewhere.
+
+    In Docker the container's end takes every process with it; a node run outside Docker that exits or is killed
+    left its FFmpeg decoding. Linux sends the signal when the *thread* that started the child ends, so pass it only
+    for a child that thread waits for (each FFmpeg run, never a long-lived helper process).
+
+    Returns:
+        The function for ``subprocess.Popen(preexec_fn=...)``, or None (not Linux, not a node, no ``prctl``).
+    """
+    if not sys.platform.startswith("linux") or not is_node_mode():
+        return None
+    import ctypes
+
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl  # loaded here: the child only calls it
+    except (OSError, AttributeError):
+        return None
+    parent = os.getpid()
+
+    def set_parent_death_signal() -> None:
+        prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+        if os.getppid() != parent:  # the node died before the signal was set: nothing would send it
+            os._exit(1)
+
+    return set_parent_death_signal
+
+
+def debug_logging_hint() -> str:
+    """How to see FFmpeg's detailed output (a node keeps no DEBUG lines for the app to read; its console has them)."""
+    if is_node_mode():
+        return "set LOG_LEVEL=DEBUG on the node and read its docker logs"
+    return "enable Debug logging (Settings → Logging)"
 
 
 def sanitize_path(path: str) -> str:

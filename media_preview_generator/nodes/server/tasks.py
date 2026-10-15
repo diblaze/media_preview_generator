@@ -75,13 +75,66 @@ class TaskDeletedError(Exception):
 
 
 class TaskStartError(Exception):
-    """The node can't take the task (its temp folder is full or can't be written): answered 400, kind ``failed``,
-    so the app fails the file with this message instead of reading a 500 as a node that didn't answer."""
+    """The node can't take the task (its temp folder is full or can't be written): answered 400, kind ``failed``.
+    Nothing ran, so the app gives the file back to the queue and holds the node until its next check."""
+
+
+class NodeStoppingError(Exception):
+    """The node is stopping (answered 503, kind ``node_stopping``): nothing ran, and the app sends the file elsewhere.
+    A task started now would outlive the cancel that stopping already sent, and die with the process."""
+
+
+# What a write into the temp folder fails with when the folder itself is the problem. Ops write only there (the media
+# is opened read-only), so one of these from an op is the temp folder's.
+_TEMP_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
+_TEMP_WRITE_ERRNOS = _TEMP_FULL_ERRNOS | {errno.EROFS}
 
 
 def default_temp_root() -> str:
     """``NODE_TEMP_DIR``, or ``<system temp>/mpg-node``."""
     return os.environ.get("NODE_TEMP_DIR", "").strip() or os.path.join(tempfile.gettempdir(), "mpg-node")
+
+
+def temp_folder_problem(temp_root: str, exc: OSError) -> str:
+    """Why the node can't use its temp folder, from the error a write there raised.
+
+    Args:
+        temp_root: The node's temp folder.
+        exc: The error.
+
+    Returns:
+        A sentence naming the folder and the cause.
+    """
+    why = exc.strerror or str(exc) or type(exc).__name__
+    if exc.errno in _TEMP_FULL_ERRNOS:
+        return f"The node's temp folder {temp_root} is full ({why})"
+    return f"The node can't write to its temp folder {temp_root} ({why})"
+
+
+def probe_temp_folder(temp_root: str) -> str | None:
+    """Make and remove a folder in the temp root, as each task's start does.
+
+    Args:
+        temp_root: The node's temp folder (made first when it is missing, as a start does).
+
+    Returns:
+        None when that works, else why it doesn't (:func:`temp_folder_problem`).
+    """
+    try:
+        os.makedirs(temp_root, exist_ok=True)
+        probe = tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}probe-", dir=temp_root)
+    except OSError as exc:
+        return temp_folder_problem(temp_root, exc)
+    try:
+        os.rmdir(probe)
+    except OSError:
+        pass  # It has the task prefix, so the next start's leftover sweep removes it.
+    return None
+
+
+def _inside(path: str, folder: str) -> bool:
+    real, root = os.path.realpath(path), os.path.realpath(folder)
+    return os.path.commonpath([real, root]) == root
 
 
 def _is_cancellation(exc: BaseException) -> bool:
@@ -276,7 +329,7 @@ class TaskTable:
 
     Args:
         ops: Op name -> function.
-        temp_root: Each task's temp dir is made under it.
+        temp_root: Each task's temp dir is made under it; None on a node without the worker role (it runs no ops).
         unpolled_expiry_s: A running task nobody has contacted for this long is cancelled and dropped.
         finished_keep_s: A finished task is dropped this long after its last contact.
         reap_interval_s: How often the reaper looks.
@@ -287,7 +340,7 @@ class TaskTable:
         self,
         ops: Mapping[str, OpFn],
         *,
-        temp_root: str,
+        temp_root: str | None,
         unpolled_expiry_s: float = TASK_UNPOLLED_EXPIRY_S,
         finished_keep_s: float = TASK_FINISHED_KEEP_S,
         reap_interval_s: float = REAP_INTERVAL_S,
@@ -303,8 +356,9 @@ class TaskTable:
         self._deleted_unknown: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        os.makedirs(temp_root, exist_ok=True)
-        self._remove_leftovers()
+        if temp_root is not None:
+            os.makedirs(temp_root, exist_ok=True)
+            self._remove_leftovers()
         self._reaper = threading.Thread(
             target=self._reap_loop, args=(reap_interval_s,), name="node-task-reaper", daemon=True
         )
@@ -342,6 +396,7 @@ class TaskTable:
             TaskSpecError: The spec is malformed or names an op this node doesn't have.
             TaskDeletedError: The app deleted this id in the last ``DELETED_ID_KEEP_S``.
             TaskStartError: The task's temp folder can't be made.
+            NodeStoppingError: :meth:`close` has begun.
         """
         if not isinstance(spec, dict):
             raise TaskSpecError("the task spec must be an object")
@@ -358,6 +413,7 @@ class TaskTable:
         gpu = _parse_gpu(spec.get("gpu"))
         task_id = _client_task_id(spec) or uuid.uuid4().hex
         with self._lock:
+            self._refuse_stopping()
             self._refuse_deleted(task_id)
             if task_id in self._tasks:
                 return task_id
@@ -365,8 +421,11 @@ class TaskTable:
         task = NodeTask(task_id, spec, mappings, gpu, temp_dir)
         with self._lock:
             try:
+                # Checked again under the lock close() takes to collect the tasks: a task registered here is either
+                # in its list (and cancelled) or refused.
+                self._refuse_stopping()
                 self._refuse_deleted(task_id)  # its DELETE may have come while the temp dir was made
-            except TaskDeletedError:
+            except (NodeStoppingError, TaskDeletedError):
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise
             if task_id in self._tasks:  # The same start, twice at once: the first one runs.
@@ -383,19 +442,32 @@ class TaskTable:
         """The task's own temp dir, the temp root made again first (a host's tmp cleaner may have removed it).
 
         Raises:
-            TaskStartError: The folder can't be made (a full disk, no permission).
+            TaskStartError: The folder can't be made (a full disk, no permission), or the node has no temp folder.
         """
+        if self.temp_root is None:
+            raise TaskStartError("This node has no temp folder: it runs no tasks")
         try:
             os.makedirs(self.temp_root, exist_ok=True)
             return tempfile.mkdtemp(prefix=f"{TASK_DIR_PREFIX}{task_id[:8]}-", dir=self.temp_root)
         except OSError as exc:
-            why = exc.strerror or str(exc) or type(exc).__name__
-            if exc.errno == errno.ENOSPC:
-                message = f"The node's temp folder {self.temp_root} is full ({why})"
-            else:
-                message = f"The node couldn't make a folder for the task in its temp folder {self.temp_root} ({why})"
+            message = temp_folder_problem(self.temp_root, exc)
             logger.warning("Task {} not started: {}", task_id[:8], message)
             raise TaskStartError(message) from exc
+
+    def _temp_folder_failure(self, exc: BaseException) -> str | None:
+        """The message for an op that stopped because the temp folder filled up or went read-only, else None."""
+        seen: BaseException | None = exc
+        while seen is not None and self.temp_root is not None:
+            if isinstance(seen, OSError) and seen.errno in _TEMP_WRITE_ERRNOS:
+                written = seen.filename if isinstance(seen.filename, str) else None
+                if written is None or _inside(written, self.temp_root):
+                    message = temp_folder_problem(self.temp_root, seen)
+                    if seen.errno in _TEMP_FULL_ERRNOS:
+                        # The preview op holds its JPEGs and their tar there at once.
+                        message += "; a preview needs about twice its frames' size there"
+                    return message
+            seen = seen.__cause__
+        return None
 
     def _run(self, task: NodeTask) -> None:
         try:
@@ -441,6 +513,12 @@ class TaskTable:
         except Exception as exc:  # noqa: BLE001 - every failure must end as a task status the app can read
             if task.cancel_check() or _is_cancellation(exc):
                 task.finish(STATUS_CANCELLED, error={"kind": KIND_CANCELLED, "message": "Cancelled"})
+                return
+            temp_problem = self._temp_folder_failure(exc)
+            if temp_problem is not None:
+                # The node's condition, not a bug: no traceback.
+                quiet.warning("Task {} ({}) failed: {}", task.id[:8], task.op, temp_problem)
+                task.finish(STATUS_FAILED, error={"kind": KIND_FAILED, "message": temp_problem})
                 return
             quiet.opt(exception=exc).error("Task {} ({}) failed", task.id[:8], task.op)
             task.finish(STATUS_FAILED, error={"kind": KIND_FAILED, "message": f"{type(exc).__name__}: {exc}"})
@@ -490,6 +568,15 @@ class TaskTable:
     def get(self, task_id: str) -> NodeTask | None:
         """The task (None: unknown), counting as contact."""
         return self._touch(task_id)
+
+    @property
+    def stopping(self) -> bool:
+        """Whether :meth:`close` has begun: the node takes no new task."""
+        return self._stop.is_set()
+
+    def _refuse_stopping(self) -> None:
+        if self._stop.is_set():
+            raise NodeStoppingError("This node is stopping")
 
     def _refuse_deleted(self, task_id: str) -> None:
         # Under the lock. Ids past their time go first; the dict is in deletion order.

@@ -347,6 +347,7 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
         get_textdet_pool,
         set_cpu_limit_source,
     )
+    from ...processing.generator import FALLBACK_HWACCEL, FALLBACK_SIGNAL
 
     gpu, device = ctx.gpu or (None, None)
     set_cpu_limit_source(_cpu_credits_cap)
@@ -383,7 +384,15 @@ def credits_find(ctx: TaskContext, node_path: str, params: dict) -> dict:
             # Not the GPU's failure: the app reads the file again on the CPU to tell (detect_credits_text).
             raise _op_error(ctx, exc) from exc
         except frames.GpuDecodeError as exc:
-            raise _op_error(ctx, exc, gpu_failed=True, stderr_tail=list(exc.stderr_tail)) from exc
+            # As preview_frames tells them: only a hardware accelerator error or a signal is the GPU's (and re-checks
+            # it here and on the app); a codec it can't decode, an I/O error or an unnamed failure needs the CPU.
+            raise _op_error(
+                ctx,
+                exc,
+                gpu_failed=exc.fallback_kind in (FALLBACK_HWACCEL, FALLBACK_SIGNAL),
+                stderr_tail=list(exc.stderr_tail),
+                fallback_kind=exc.fallback_kind,
+            ) from exc
         except (
             frames.FrameDecodeError,
             frames.DecodeCancelledError,

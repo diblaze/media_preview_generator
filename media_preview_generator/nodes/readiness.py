@@ -25,6 +25,7 @@ from .registry import (
     STATE_KEY_REFUSED,
     STATE_NO_FFMPEG,
     STATE_OFFLINE,
+    STATE_TEMP_PROBLEM,
     STATE_UPDATE_NEEDED,
     NodeDetails,
 )
@@ -175,6 +176,19 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
                 ok=ffmpeg_ok,
                 explanation="A worker node runs FFmpeg for every file it is sent.",
                 reason=None if ffmpeg_ok else view.reason,
+                fix_where=FIX_ON_NODE,
+            )
+        )
+    if version_ok and protocol.ROLE_WORKER in view.roles and view.state != STATE_NO_FFMPEG:
+        temp_ok = view.state != STATE_TEMP_PROBLEM
+        rows.append(
+            _row(
+                "node_temp",
+                "The node can use its temp folder" if temp_ok else "The node can't use its temp folder",
+                severity=CRITICAL,
+                ok=temp_ok,
+                explanation="A worker node makes a folder there for every file it is sent (NODE_TEMP_DIR).",
+                reason=None if temp_ok else view.reason,
                 fix_where=FIX_ON_NODE,
             )
         )

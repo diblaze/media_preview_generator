@@ -35,6 +35,7 @@ STATE_KEY_REFUSED = "key_refused"
 STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
 STATE_NO_FFMPEG = "no_ffmpeg"
+STATE_TEMP_PROBLEM = "temp_problem"
 STATE_DISABLED = "disabled"
 # The machine is already added as another node (the same node id answers at both addresses).
 STATE_DUPLICATE = "duplicate"
@@ -48,6 +49,7 @@ ALERT_STATES = (
     STATE_GPU_LOST,
     STATE_NO_FFMPEG,
     STATE_DUPLICATE,
+    STATE_TEMP_PROBLEM,
 )
 
 HEALTH_INTERVAL_S = 30.0
@@ -68,6 +70,8 @@ INFO_LIST_MAX = 256
 INFO_DEPTH_MAX = 8
 LEGACY_PING_TIMEOUT_S = 10.0
 LOOP_TICK_S = 1.0
+# The node's own words for its temp folder's problem go into the reason; a node can't make it any longer than this.
+TEMP_PROBLEM_MAX = 300
 
 # The short reason a worker member shows when its node gives it no workers.
 _CAPACITY_REASONS = {
@@ -77,6 +81,7 @@ _CAPACITY_REASONS = {
     STATE_KEY_REFUSED: "key refused",
     STATE_ACCESS_PROBLEM: "fix media access first",
     STATE_NO_FFMPEG: "FFmpeg missing on node",
+    STATE_TEMP_PROBLEM: "node's temp folder can't be used",
     STATE_DISABLED: "node turned off",
     STATE_DUPLICATE: "node added twice",
 }
@@ -1133,6 +1138,9 @@ class NodeRegistry:
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
         version = protocol.node_version(info)
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
+        if info.get("stopping") is True:
+            # It refuses every start until it is back (SIGTERM: a restart or an image update).
+            return _Outcome(STATE_OFFLINE, f"{name} is restarting; it gets no files until it is back.", **outcome)
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
             return _Outcome(
@@ -1165,6 +1173,17 @@ class NodeRegistry:
                 STATE_NO_FFMPEG,
                 f"{name} found FFmpeg at {ffmpeg.get('path')}, but it doesn't run, so every file sent to it would "
                 "fail. Reinstall FFmpeg on that machine, then restart the node.",
+                **outcome,
+            )
+        temp = worker.get("temp") if isinstance(worker, dict) else None
+        temp_problem = temp.get("problem") if isinstance(temp, dict) else None
+        if protocol.ROLE_WORKER in roles and isinstance(temp_problem, str) and temp_problem.strip():
+            # The node refuses every start while it can't make a task folder there.
+            said = temp_problem.strip()[:TEMP_PROBLEM_MAX]
+            return _Outcome(
+                STATE_TEMP_PROBLEM,
+                f"{name}'s temp folder can't be used, so it gets no files: {said[:1].lower()}{said[1:]}. Free up "
+                "space there, or set NODE_TEMP_DIR on the node to a folder it can write to.",
                 **outcome,
             )
         agent = info.get("agent")

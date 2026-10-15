@@ -128,6 +128,8 @@ KIND_UNKNOWN_TASK = "unknown_task"
 KIND_REQUEST = "request"
 # A start whose client_task_id the app already DELETEd (the DELETE overtook the start): nothing ran.
 KIND_TASK_DELETED = "task_deleted"
+# A start that reached a node already stopping (503): nothing ran; /v1/health and /v1/info say ``"stopping": true``.
+KIND_NODE_STOPPING = "node_stopping"
 
 # Why a node can't see a file (``error.reason`` / access-check ``kind``).
 NOT_VISIBLE_UNMAPPED = "unmapped"

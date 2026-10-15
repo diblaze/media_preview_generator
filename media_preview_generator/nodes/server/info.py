@@ -8,6 +8,8 @@ re-checked in the background every :data:`GPU_RECHECK_S`, at once after a task r
 
 from __future__ import annotations
 
+import contextlib
+import math
 import os
 import shutil
 import subprocess
@@ -18,6 +20,9 @@ from collections.abc import Callable
 from typing import Any
 
 from loguru import logger
+
+from . import nodelog
+from .tasks import probe_temp_folder
 
 GPU_RECHECK_S = 300.0
 FFMPEG_VERSION_TIMEOUT_S = 30.0
@@ -80,6 +85,31 @@ def _meminfo(path: str = "/proc/meminfo") -> tuple[int | None, int | None]:
     return values.get("MemTotal"), values.get("MemAvailable")
 
 
+def _cores(cpu_max_path: str = "/sys/fs/cgroup/cpu.max") -> int:
+    """The CPU cores this node may use: the ones it may run on, capped by a container's CPU limit (``--cpus``).
+
+    ``os.cpu_count()`` is the host's: a node started with ``--cpus 0.5`` on a 20-core host said it had 20.
+
+    Args:
+        cpu_max_path: The cgroup v2 ``cpu.max`` file (``"<quota> <period>"``, or ``"max <period>"`` for no limit).
+
+    Returns:
+        At least 1.
+    """
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # macOS and Windows have no affinity call
+        cores = os.cpu_count() or 1
+    try:
+        with open(cpu_max_path, encoding="ascii") as handle:
+            quota, _, period = handle.read().strip().partition(" ")
+        if quota != "max":
+            cores = min(cores, math.ceil(int(quota) / int(period)))
+    except (OSError, ValueError, ZeroDivisionError):
+        pass  # no cgroup v2 limit to read: the affinity count stands
+    return max(1, cores)
+
+
 def _load1() -> float | None:
     try:
         return round(os.getloadavg()[0], 2)
@@ -139,6 +169,8 @@ class WorkerInfo:
         self._cache_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
+        # Set once any detection has stored its answer.
+        self._detected = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -152,8 +184,10 @@ class WorkerInfo:
         self._wake.set()
 
     def _loop(self) -> None:
+        first = True
         while not self._stop.is_set():
-            self.rescan()
+            self.rescan(quiet=not first)
+            first = False
             self._wake.wait(self._recheck_s)
             self._wake.clear()
 
@@ -161,12 +195,16 @@ class WorkerInfo:
         """A task's GPU failed: re-check the GPUs now rather than at the next interval."""
         self._wake.set()
 
-    def rescan(self) -> list[dict[str, Any]]:
+    def rescan(self, *, quiet: bool = False) -> list[dict[str, Any]]:
         """Run GPU detection now.
 
         A detection that raises keeps the last list it found, its error kept: one failed pass on a busy GPU must not
         read as a lost GPU. With no earlier list the node reports no GPUs and the error, which the app reads as a
         check still to come, not as a missing GPU.
+
+        Args:
+            quiet: A background re-check: detection's lines are logged at DEBUG unless the GPUs (or the error) changed,
+                so an idle node's log isn't the same few lines every few minutes.
 
         Returns:
             The JSON-safe GPU list now reported.
@@ -174,23 +212,38 @@ class WorkerInfo:
         with self._detect_lock:
             detect = self._detect
             error: str | None = None
+            held: list[tuple[str, str]] = []
             try:
                 if detect is None:
                     from ...gpu import detect as gpu_detect
 
                     detect = gpu_detect.detect_all_gpus
-                found = [_gpu_entry(raw) for raw in detect() or []]
+                with nodelog.held_lines(held) if quiet else contextlib.nullcontext():
+                    raw = detect()
+                found = [_gpu_entry(entry) for entry in raw or []]
             except Exception as exc:  # noqa: BLE001 - a broken probe must not take /v1/info down with it
                 logger.opt(exception=True).warning("GPU detection failed on this node; it keeps its last GPU list")
                 with self._cache_lock:
                     found = list(self._gpus) if self._gpus is not None else []
                 error = f"{type(exc).__name__}: {exc}"
             with self._cache_lock:
+                changed = (found, error) != (self._gpus, self._gpu_error)
                 self._gpus, self._checked_at, self._gpu_error = found, time.time(), error
+            self._detected.set()
+            for level, message in held:
+                logger.log(level if changed else "DEBUG", "{}", message)
             return [dict(entry) for entry in found]
 
     def gpus(self) -> list[dict[str, Any]]:
-        """The cached GPU list (detected now if nothing has detected yet), with ``credit_text`` where known."""
+        """The cached GPU list, with ``credit_text`` where known.
+
+        Before any detection has answered, it waits for the background loop's first pass (one detection, not a second
+        of its own after it), or detects now when no loop is running.
+        """
+        thread = self._thread
+        if thread is not None:
+            while not self._detected.wait(1.0) and thread.is_alive():
+                pass
         with self._cache_lock:
             cached = self._gpus
         found = cached if cached is not None else self.rescan()
@@ -226,6 +279,9 @@ class WorkerInfo:
         """
         gpus = self.gpus()
         ram_total, ram_available = _meminfo()
+        # Every start makes a folder there; one that can't would refuse each file the app sends, so the app reads
+        # this and sends none.
+        temp_problem = probe_temp_folder(self._temp_root)
         try:
             free_bytes: int | None = shutil.disk_usage(self._temp_root).free
         except OSError:
@@ -235,12 +291,12 @@ class WorkerInfo:
         return {
             "gpus": gpus,
             "cpu": {
-                "cores": os.cpu_count() or 1,
+                "cores": _cores(),
                 "load1": _load1(),
                 "ram_total": ram_total,
                 "ram_available": ram_available,
             },  # fmt: skip
-            "temp": {"path": self._temp_root, "free_bytes": free_bytes},
+            "temp": {"path": self._temp_root, "free_bytes": free_bytes, "problem": temp_problem},
             "busy": busy,
             "ffmpeg": dict(self._ffmpeg),
             "gpu_checked_at": self._checked_at,

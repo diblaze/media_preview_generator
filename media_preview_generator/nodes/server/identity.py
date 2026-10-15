@@ -143,23 +143,43 @@ def _write_private(path: str, data: dict[str, Any]) -> None:
         raise
 
 
+def _unreadable(path: str, exc: OSError) -> str:
+    """Why ``node.json`` can't be read, and the fix (a changed PUID/PGID is the usual cause)."""
+    if not isinstance(exc, PermissionError):
+        return f"Can't read {path} ({exc.strerror or type(exc).__name__}); fix it and restart."
+    running = getattr(os, "geteuid", lambda: None)()  # Windows has no uids
+    try:
+        owner: int | None = os.stat(path).st_uid
+    except OSError:
+        owner = None
+    whose = f"it belongs to user {owner} and this node runs as user {running}" if None not in (owner, running) else ""
+    return (
+        f"Can't read {path}{f' ({whose})' if whose else ''}. Set PUID/PGID back to the user that made it, or give it "
+        "to this container's user, and restart."
+    )
+
+
 def _load_or_create(config_dir: str) -> tuple[dict[str, Any], bool]:
     path = os.path.join(config_dir, IDENTITY_FILE)
+    # Regenerating would silently give the node a new id and key, and every app that added it would refuse it; so the
+    # node stops, and says what deleting the file costs.
+    rekeys = "Deleting it gives the node a new id and key, and every app that added it has to add it again."
     try:
         with open(path, encoding="utf-8") as handle:
             stored = json.load(handle)
     except FileNotFoundError:
         stored = None
-    except (OSError, ValueError) as exc:
-        # Regenerating would silently give the node a new id and key, and every app that added it would refuse it.
-        raise SystemExit(f"Can't read {path} ({type(exc).__name__}); fix or remove it and restart.") from exc
+    except OSError as exc:
+        raise SystemExit(_unreadable(path, exc)) from exc
+    except ValueError as exc:
+        raise SystemExit(f"{path} isn't valid JSON; restore it from a backup and restart. {rekeys}") from exc
     if stored is not None:
         if (
             not isinstance(stored, dict)
             or not isinstance(stored.get("id"), str)
             or not isinstance(stored.get("key"), str)
         ):
-            raise SystemExit(f"{path} isn't a node identity file; fix or remove it and restart.")
+            raise SystemExit(f"{path} isn't a node identity file; restore it from a backup and restart. {rekeys}")
         return {"id": stored["id"], "key": stored["key"], "announced": stored.get("announced") is True}, False
     data = {"id": uuid.uuid4().hex, "key": secrets.token_urlsafe(32), "announced": False}
     try:
