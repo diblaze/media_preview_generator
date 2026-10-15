@@ -8,7 +8,7 @@ Library Health's database counts.
 
 You need it when **Plex runs natively on Windows** (the normal Plex installer) and keeps its data on a **local disk of
 that PC** (NTFS or ReFS: the default `%LOCALAPPDATA%\Plex Media Server`), while the app runs somewhere else (a NAS, a
-Linux server, Docker).
+Linux server, Docker, including Docker Desktop on the same PC).
 
 Plex has no API for markers, so the app writes them into Plex's SQLite database itself. SQLite's locks only work
 between programs on the same machine; over a network share they can corrupt the database. The node is the part of the
@@ -17,7 +17,9 @@ with exactly the same checks the app runs when it sits beside Plex.
 
 You don't need it when:
 
-* the app runs on the same machine as Plex (it opens the database itself);
+* the app runs natively on the same machine as Plex (it opens the database itself). The app in **Docker Desktop**
+  on Plex's PC does need the node: Docker Desktop's mount of a Windows folder can't hold SQLite's locks, so the
+  app can't open Plex's database through it. Add the node as `http://host.docker.internal:9494`;
 * **Plex runs in Docker Desktop** (WSL 2) or any Linux container: use the Linux Plex database node
   (`nodes/plex-db/`) instead, inside the same Docker setup as Plex;
 * Plex's data folder is on a network drive: SQLite can't be shared safely there, and the node refuses it.

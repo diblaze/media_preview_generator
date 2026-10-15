@@ -1613,6 +1613,9 @@
     // ---------- wiring -------------------------------------------------------------------------------------------
 
     function wire() {
+        // The Settings phone picker: every entry but Nodes is a section of the Settings page.
+        const settingsPicker = $('#settingsMobileSection');
+        if (settingsPicker) settingsPicker.addEventListener('change', () => { window.location.href = settingsPicker.value; });
         add.editor = createMappingEditor($('#addNodeMappings'), { getNodeId: async () => add.node && add.node.id });
         detail.editor = createMappingEditor($('#nodeMediaEditor'), {
             getNodeId: async () => page.openId,

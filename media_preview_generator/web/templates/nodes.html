@@ -1,15 +1,21 @@
 {% extends "base.html" %}
+{% from "_settings_nav.html" import settings_mobile_nav, settings_sidebar %}
 
 {% block title %}Nodes · Media Preview Generator{% endblock %}
 
 {% block head %}
 {# server_modal.css carries the shared dialog parts (.sm-*) and the Setup Health buckets (.readiness-bucket, .rd-row). #}
 <link href="{{ url_for('static', filename='css/pages/server_modal.css') }}" rel="stylesheet">
+{# settings.css carries the Settings sidebar this page shares (it is listed under Workers there). #}
+<link href="{{ url_for('static', filename='css/pages/settings.css') }}" rel="stylesheet">
 <link href="{{ url_for('static', filename='css/pages/nodes.css') }}" rel="stylesheet">
 {% endblock %}
 
 {% block content %}
+<div class="settings-layout nodes-settings-layout">
+{{ settings_sidebar("nodes") }}
 <div class="nodes-page">
+    {{ settings_mobile_nav("nodes") }}
     <header class="page-header">
         <div>
             <h1 class="page-title"><i class="bi bi-pc-display-horizontal me-2"></i>Nodes</h1>
@@ -37,6 +43,7 @@
             <div class="mt-2">Loading nodes…</div>
         </div>
     </div>
+</div>
 </div>
 
 <!-- Add node: step 1 connects and shows what the node found (nothing is saved until "Next"); step 2, for a node with

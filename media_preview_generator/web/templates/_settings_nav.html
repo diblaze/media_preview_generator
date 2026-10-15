@@ -1,0 +1,39 @@
+{# The Settings sidebar and its phone picker, shared by the Settings page and the Nodes page, which is listed under
+   Workers in it. ``here`` is "settings" (links are this page's sections) or "nodes" (links go back to Settings). #}
+{% macro settings_mobile_nav(here) %}
+{# On Settings an option is a section id; elsewhere it is the Settings URL of that section. #}
+{% set base = '' if here == 'settings' else url_for('main.settings') ~ '#' %}
+<div class="settings-mobile-nav">
+    <select id="settingsMobileSection" class="form-select" aria-label="Settings section">
+        <option value="{{ base }}section-workers">Workers</option>
+        <option value="{{ url_for('main.nodes_page') }}"{% if here == 'nodes' %} selected{% endif %}>Nodes</option>
+        <option value="{{ base }}section-worker-quiet-hours">Global pause schedule</option>
+        <option value="{{ base }}section-processing">Processing options</option>
+        <option value="{{ base }}section-markers">Intro &amp; Credits</option>
+        <option value="{{ base }}section-logging">Logging</option>
+        <option value="{{ base }}section-auth">Authentication</option>
+        <option value="{{ base }}section-backups">Backups</option>
+        <option value="{{ base }}section-about">About</option>
+    </select>
+    <div id="settingsMobileSectionFeedback" class="visually-hidden" aria-live="polite">Showing {{ 'Nodes' if here == 'nodes' else 'Workers' }}</div>
+</div>
+{% endmacro %}
+
+{% macro settings_sidebar(here) %}
+{% set base = '' if here == 'settings' else url_for('main.settings') %}
+<nav id="settings-sidebar" class="settings-sidebar d-none d-lg-block" aria-label="Settings sections">
+    <div class="settings-nav-group">Run</div>
+    <a class="nav-link" href="{{ base }}#section-workers"><i class="bi bi-cpu" aria-hidden="true"></i>Workers</a>
+    {# The Nodes page, not a section of Settings: worker groups pick their node devices from it. #}
+    <a class="nav-link{% if here == 'nodes' %} active{% endif %}" href="{{ url_for('main.nodes_page') }}"{% if here == 'nodes' %} aria-current="page"{% endif %} title="Other machines that lend a GPU, CPU or Plex database"><i class="bi bi-pc-display-horizontal" aria-hidden="true"></i>Nodes</a>
+    <a class="nav-link" href="{{ base }}#section-worker-quiet-hours"><i class="bi bi-moon-stars" aria-hidden="true"></i>Pause schedule<span class="nav-state-dot" id="settingsNavPauseDot" title="Pause schedule is on" hidden></span></a>
+    <a class="nav-link" href="{{ base }}#section-processing"><i class="bi bi-speedometer2" aria-hidden="true"></i>Processing</a>
+    <a class="nav-link nav-violet" href="{{ base }}#section-markers"><i class="bi bi-skip-forward" aria-hidden="true"></i>Intro &amp; Credits</a>
+    <div class="settings-nav-group">System</div>
+    <a class="nav-link" href="{{ base }}#section-logging"><i class="bi bi-journal-text" aria-hidden="true"></i>Logging</a>
+    <a class="nav-link" href="{{ base }}#section-auth"><i class="bi bi-key" aria-hidden="true"></i>Authentication</a>
+    <a class="nav-link" href="{{ base }}#section-backups"><i class="bi bi-clock-history" aria-hidden="true"></i>Backups</a>
+    <div class="settings-nav-group">Info</div>
+    <a class="nav-link" href="{{ base }}#section-about"><i class="bi bi-info-circle" aria-hidden="true"></i>About</a>
+</nav>
+{% endmacro %}

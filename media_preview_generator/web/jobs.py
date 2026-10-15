@@ -2410,7 +2410,8 @@ class JobManager:
             if job:
                 if percent is not None:
                     job.progress.percent = percent
-                if current_item is not None:
+                # A cancelled job has no current step; a late update from its runner mustn't give it one.
+                if current_item is not None and job.status is not JobStatus.CANCELLED:
                     job.progress.current_item = current_item
                 if total_items is not None:
                     job.progress.total_items = total_items

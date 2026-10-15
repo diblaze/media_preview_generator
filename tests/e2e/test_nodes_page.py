@@ -296,6 +296,31 @@ def _node_tab(page: Page, tab: str) -> Locator:
 
 
 @pytest.mark.e2e
+class TestSettingsSidebar:
+    """The Nodes page is listed in Settings, so it keeps Settings' sidebar (and phone picker)."""
+
+    def test_the_settings_sidebar_shows_with_nodes_current(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        sidebar = authed_page.locator("#settings-sidebar")
+        expect(sidebar).to_be_visible()
+        expect(sidebar.locator("a.nav-link.active")).to_have_text("Nodes")
+        expect(sidebar.locator('a[aria-current="page"]')).to_have_attribute("href", "/nodes")
+        authed_page.screenshot(path=os.environ.get("NODES_SHOT", "/dev/null"), full_page=False)
+        sidebar.get_by_role("link", name="Logging").click()
+        expect(authed_page).to_have_url(re.compile(r"/settings#section-logging$"))
+
+    def test_the_phone_picker_goes_back_to_a_settings_section(self, authed_page: Page, app_url: str) -> None:
+        authed_page.set_viewport_size({"width": 390, "height": 844})
+        _open_nodes(authed_page, app_url, _four_nodes())
+        picker = authed_page.locator("#settingsMobileSection")
+        expect(picker).to_have_value("/nodes")
+        expect(authed_page.locator("#settings-sidebar")).to_be_hidden()
+        authed_page.screenshot(path=os.environ.get("NODES_SHOT_PHONE", "/dev/null"), full_page=False)
+        picker.select_option(label="Backups")
+        expect(authed_page).to_have_url(re.compile(r"/settings#section-backups$"))
+        expect(authed_page.locator("#settingsMobileSection")).to_have_value("section-backups")
+
+
 class TestNodeList:
     def test_each_state_gets_its_chip_colour_and_button(self, authed_page: Page, app_url: str) -> None:
         # Red is a node that gets no work (Setup Health's Must fix); every problem state's button says Fix.
