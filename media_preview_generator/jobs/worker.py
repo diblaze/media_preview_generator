@@ -328,10 +328,12 @@ class Worker:
     @property
     def log_tag(self) -> str:
         """How this worker's own progress lines start: ``[GPU 0]:`` / ``[CPU]:`` here; on a node ``lab-gpu/GPU0 ·``,
-        the prefix the node's own lines carry in the job log."""
+        the prefix the node's own lines carry in the job log. A GPU worker on its CPU fallback reads as the CPU, which
+        is what runs the file then."""
+        on_gpu = self.worker_type == "GPU" and not self.fallback_active
         if self.node_id is None:
-            return f"[GPU {self.gpu_index}]:" if self.worker_type == "GPU" else "[CPU]:"
-        return f"{self.node_device} ·"
+            return f"[GPU {self.gpu_index}]:" if on_gpu else "[CPU]:"
+        return f"{self.node_device} ·" if on_gpu else f"{self.node_name}/CPU ·"
 
     @property
     def placement(self) -> Placement | None:

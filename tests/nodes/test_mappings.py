@@ -436,27 +436,44 @@ class TestSuggestRow:
 
 
 class TestQuickAccessCheck:
-    def test_one_file_per_row(self, tmp_path):
+    """Check now's quick access check: one file per library, the libraries Test access samples."""
+
+    LIBRARIES = [
+        {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+        {"id": "2", "name": "Open Films", "remote_paths": ["/plexmedia/Open Films"]},
+    ]
+    ROWS = [PathMapping("/media-app", "/m")]  # what the node is told; the app's folders come from the servers
+
+    def _media(self, tmp_path):
         for name in ("a.mkv", "b.mkv"):
-            _video(tmp_path / "movies" / name)
-        _video(tmp_path / "tv" / "c.mkv")
-        rows = [PathMapping(str(tmp_path / "movies"), "/m"), PathMapping(str(tmp_path / "tv"), "/t")]
+            _video(tmp_path / "media" / "Movies" / name)
+        _video(tmp_path / "media" / "Open Films" / "c.mkv")
+        return [_server(tmp_path, self.LIBRARIES)]
+
+    def test_one_file_per_library(self, tmp_path):
+        servers = self._media(tmp_path)
         client = FakeClient()
-        assert nm.quick_access_check(client, rows) is True
+        assert nm.quick_access_check(client, self.ROWS, servers) is True
         assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv", "c.mkv"]
 
+    def test_a_library_the_node_cant_see_fails_it_though_another_under_the_same_row_passes(self, tmp_path):
+        # One row (/media) covers both libraries: one file under the row passed while Open Films was still out of
+        # the node's sight, so Check now un-paused a node Test access still failed.
+        servers = self._media(tmp_path)
+        rows = [PathMapping(str(tmp_path / "media"), "/media")]
+        client = FakeClient(visible=lambda p: "Open Films" not in p)
+        assert nm.quick_access_check(client, rows, servers) is False
+
     def test_a_file_the_node_cant_see_fails_it(self, tmp_path):
-        _video(tmp_path / "movies" / "a.mkv")
-        rows = [PathMapping(str(tmp_path / "movies"), "/m")]
-        assert nm.quick_access_check(FakeClient(visible=lambda p: False), rows) is False
+        servers = self._media(tmp_path)
+        assert nm.quick_access_check(FakeClient(visible=lambda p: False), self.ROWS, servers) is False
 
     def test_a_folder_that_hangs_fails_it_within_the_budget(self, tmp_path, monkeypatch):
         import threading
         import time
 
-        _video(tmp_path / "movies" / "a.mkv")
-        stalled = tmp_path / "tv"
-        stalled.mkdir()
+        servers = self._media(tmp_path)
+        stalled = tmp_path / "media" / "Open Films"
         release = threading.Event()
         real_scandir = os.scandir
 
@@ -467,11 +484,10 @@ class TestQuickAccessCheck:
 
         monkeypatch.setattr(nm.os, "scandir", scandir)
         monkeypatch.setattr(nm, "SAMPLE_BUDGET_S", 0.5)
-        rows = [PathMapping(str(tmp_path / "movies"), "/m"), PathMapping(str(stalled), "/t")]
         client = FakeClient()
         started = time.monotonic()
         try:
-            passed = nm.quick_access_check(client, rows)
+            passed = nm.quick_access_check(client, self.ROWS, servers)
         finally:
             release.set()
         assert time.monotonic() - started < 5
@@ -479,7 +495,8 @@ class TestQuickAccessCheck:
         assert client.requests == []
 
     def test_nothing_to_check_does_not_pass(self, tmp_path):
-        assert nm.quick_access_check(FakeClient(), [PathMapping(str(tmp_path / "none"), "/m")]) is False
+        servers = [_server(tmp_path, self.LIBRARIES)]
+        assert nm.quick_access_check(FakeClient(), self.ROWS, servers) is False
 
 
 def test_default_mappings_are_one_row_per_top_library_folder(tmp_path):

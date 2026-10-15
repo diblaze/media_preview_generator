@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import threading
 import time
 
@@ -377,6 +379,36 @@ class TestStates:
         assert "/node-tmp (Permission denied)" in view.reason and "NODE_TEMP_DIR" in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node's temp folder can't be used")
 
+    @pytest.mark.parametrize(
+        ("problem", "advice"),
+        [
+            (errno.EROFS, "Mount it writable (not read-only)"),
+            (errno.ENOSPC, "Free up space there"),
+            (errno.EDQUOT, "Free up space there"),
+            ("The node's temp folder /node-tmp filled up while working on a file (300 MB free)", "Free up space there"),
+            (errno.EACCES, "Let the node's user write to it (in Docker, check PUID and PGID)"),
+            (errno.EPERM, "Let the node's user write to it (in Docker, check PUID and PGID)"),
+            (errno.ENOENT, "Create or mount that folder"),
+            (errno.EIO, "Set NODE_TEMP_DIR on the node to a folder it can write to."),
+        ],
+        ids=["read-only", "full", "over-quota", "filled-by-a-task", "permission", "not-permitted", "missing", "other"],
+    )
+    def test_the_temp_folder_advice_fits_its_cause(self, h, problem, advice):
+        # "Free up space there" was the advice for every cause, a read-only or unwritable folder too.
+        from media_preview_generator.nodes.server.tasks import temp_folder_problem
+
+        if isinstance(problem, int):
+            problem = temp_folder_problem("/node-tmp", OSError(problem, os.strerror(problem)))
+        info = _info()
+        info["worker"]["temp"] = {"path": "/node-tmp", "free_bytes": 10**9, "problem": problem}
+        h.client().default_info = info
+
+        reason = h.registry.check_now("n1").reason
+
+        assert reason.endswith(advice) or f". {advice}" in reason, reason
+        assert "NODE_TEMP_DIR" in reason
+        assert ("Free up space" in reason) == (advice == "Free up space there")
+
     def test_a_node_that_is_stopping_gets_no_work_and_says_it_is_restarting(self, h):
         # It answers /v1/info while it waits for its cancelled tasks' FFmpeg: read as ready, it was sent files again.
         info = _info()
@@ -388,6 +420,38 @@ class TestStates:
         assert view.state == reg.STATE_OFFLINE
         assert view.reason == "nuc is restarting; it gets no files until it is back."
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+
+    def test_a_restarting_node_is_checked_again_within_seconds_not_after_the_offline_back_off(self, h):
+        # A docker restart is back in ~5 s; the offline back-off left it without files for a minute or more.
+        client = h.client()
+        stopping = _info()
+        stopping["stopping"] = True
+        not_answering = [NodeUnreachableError("starting")] * reg.CHECK_ATTEMPTS
+        client.infos = [stopping, stopping, *not_answering, *not_answering]
+        delays = []
+        for _ in range(4):
+            h.registry.check_now("n1")
+            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
+        assert delays == [reg.RESTART_RECHECK_S] * 4
+        assert h.registry._nodes["n1"].offline_streak == 0
+
+        h.registry.check_now("n1")
+        assert h.registry.view("n1").state == reg.STATE_READY
+        assert h.registry._nodes["n1"].next_check - h.clock.now == reg.HEALTH_INTERVAL_S
+
+    def test_a_node_that_never_comes_back_from_a_restart_goes_back_to_the_offline_back_off(self, h):
+        client = h.client()
+        stopping = _info()
+        stopping["stopping"] = True
+        client.infos = [stopping]
+        client.default_info = NodeUnreachableError("stopped for good")
+        h.registry.check_now("n1")
+        h.clock.now += reg.RESTART_WINDOW_S
+        delays = []
+        for _ in range(2):
+            h.registry.check_now("n1")
+            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
+        assert delays == [30.0, 60.0]
 
     @pytest.mark.parametrize("temp", [{"path": "/node-tmp", "problem": None}, {"path": "/node-tmp"}, None])
     def test_a_temp_folder_without_a_problem_leaves_the_node_ready(self, h, temp):
@@ -497,6 +561,22 @@ class TestAccessProblem:
         monkeypatch.setattr(settings_manager, "get_settings_manager", lambda: Settings())
         paths = ["/media/openfilms/Movies/a.mkv", "/media/openfilms/Movies/b.mkv", "/media/other/c.mkv", "/elsewhere"]
         assert reg._default_library_names(paths) == ["Open Films", "Media"]
+
+    def test_check_nows_quick_access_check_samples_the_stored_libraries(self, monkeypatch):
+        from media_preview_generator.nodes import mappings
+        from media_preview_generator.web import settings_manager
+
+        servers = [{"id": "p1", "type": "plex", "name": "Home", "libraries": []}]
+
+        class Settings:
+            def get(self, key, default=None):
+                return servers if key == "media_servers" else default
+
+        asked = []
+        monkeypatch.setattr(settings_manager, "get_settings_manager", lambda: Settings())
+        monkeypatch.setattr(mappings, "quick_access_check", lambda *args: asked.append(args) or True)
+        assert reg._default_quick_access("client", list(MAPPINGS)) is True
+        assert asked == [("client", list(MAPPINGS), servers)]
 
     def test_the_access_problem_reason_is_plain_words(self, h):
         self._ready(h)

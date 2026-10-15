@@ -13,6 +13,8 @@ Public API consumed elsewhere:
 - :class:`ProcessingResult` — outcome enum used by counters/UI badges
 - :class:`CodecNotSupportedError`, :class:`CancellationError` — sentinel
   exceptions the worker catches to drive its in-place GPU→CPU fallback
+- :class:`WorkingFolderError` — FFmpeg couldn't write the thumbnails (a full
+  or read-only working folder); nothing of that run is published
 - :func:`generate_images` — the per-item entry point
 - :func:`generate_bif` — pure JPG-folder → BIF packer used by output
   adapters that need a BIF without going through the FFmpeg pipeline
@@ -24,6 +26,7 @@ Public API consumed elsewhere:
 import array
 import contextlib
 import contextvars
+import errno
 import glob
 import hashlib
 import json
@@ -163,6 +166,17 @@ FFMPEG_SIGNALLED_EXIT = 255
 # AVERROR(EIO): a read or write failed. A GPU decoder or an OpenCL filter that fails exits with it too; only the stderr
 # tells the two apart (``_was_interrupted``).
 FFMPEG_IO_ERROR_EXIT = 251
+# The errors a thumbnail write fails with when the folder is the problem: full, over its quota, or read-only. Only a
+# write fails this way (the video is only read), so they are the working folder's, never the file's. FFmpeg exits with
+# AVERROR(errno), which the OS reports in 8 bits (Linux, macOS) or 32 (Windows): ENOSPC 228, EROFS 226. EDQUOT's 134 is
+# also a wrapper shell's SIGABRT, so only its text in the stderr counts.
+FOLDER_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS})
+_FOLDER_WRITE_EXITS = {
+    exit_code: code for code in (errno.ENOSPC, errno.EROFS) for exit_code in (256 - code, 2**32 - code)
+}
+# A line about writing the output: FFmpeg 6.1+ prefixes them [out#N/image2] and [vost#N:M/mjpeg], older builds name
+# the call that failed.
+_OUTPUT_SIDE_RE = re.compile(r"^\[(?:out#|vost#|image2 )|av_interleaved_write_frame\(\)|Error writing trailer")
 # The signals FFmpeg dies of on the file itself. A crash is deterministic: the same file crashes the same way on every
 # scan. Any other signal (SIGTERM, SIGINT, SIGHUP, the stall watchdog's or an OOM kill's SIGKILL) stopped it from
 # outside, wherever it was. Popen reports a signal as -n; a wrapper shell as 128+n.
@@ -461,6 +475,31 @@ class CodecNotSupportedError(Exception):
         self.kind = kind
 
 
+class WorkingFolderError(OSError):
+    """FFmpeg couldn't write the thumbnails: the folder they go to is full, over its quota, or read-only.
+
+    Not the file's failure, nor the device's: the run's frames are deleted and no other device or filter chain is
+    tried. An ``OSError`` with the errno (``FOLDER_WRITE_ERRNOS``) and the folder, so a node reports it as its temp
+    folder's problem.
+    """
+
+
+def working_folder_failure(exc: OSError) -> str:
+    """The sentence a file that couldn't be written to the working folder fails with: the folder, why, and the fix.
+
+    Args:
+        exc: The error, with the folder as its ``filename``.
+
+    Returns:
+        The sentence.
+    """
+    folder, setting = working_folder_hint()
+    where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
+    why = exc.strerror or os.strerror(exc.errno or 0)
+    state, fix = ("read-only", "Make it writable") if exc.errno == errno.EROFS else ("full", "Free up space there")
+    return f"Couldn't write the thumbnails: {where} is {state} ({why}). {fix}, or choose another folder ({setting})."
+
+
 def gpu_fallback_announcement(kind: str, video_file: str) -> str:
     """The INFO line saying a file is retried on the CPU, worded by why its GPU run was handed off.
 
@@ -558,7 +597,8 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
         returncode: FFmpeg process exit code
         stderr_lines: That run's stderr, when the caller has it. It tells a video no device can decode
             (``no_decoder``) from other failures, and exit 251 from a GPU error (``gpu_error``) from a disk's
-            (``io_error``).
+            (``io_error``). A thumbnail write the folder refused (``folder_write_error``) is told by the exit code
+            too.
 
     Returns:
         str: Diagnostic classification string
@@ -578,6 +618,9 @@ def _diagnose_ffmpeg_exit_code(returncode: int, stderr_lines: list[str] | None =
     }
     if returncode in known_signals:
         return f"signal:{known_signals[returncode]}"
+
+    if _folder_write_errno(returncode, stderr_lines or []) is not None:
+        return "folder_write_error"
 
     if stderr_lines and video_has_no_decoder(stderr_lines):
         return "no_decoder"
@@ -642,6 +685,33 @@ def _was_interrupted(returncode: int, stderr_lines: list[str]) -> bool:
     if returncode < 0:
         return _crash_signal(returncode) is None
     return returncode == FFMPEG_SIGNALLED_EXIT or _is_signal_killed(returncode)
+
+
+def _folder_write_errno(returncode: int, stderr_lines: list[str]) -> int | None:
+    """Why a run couldn't write its thumbnails, when the folder was the problem (``FOLDER_WRITE_ERRNOS``).
+
+    Told by the exit code, or by the error's text on a line about the output: a full folder may cut off the stderr
+    log too, and older FFmpeg builds exit 1 after a failed write. Not by the text alone on any line: Mesa says
+    "Read-only file system" about its shader cache on a read-only root, and the run is fine.
+
+    Args:
+        returncode: FFmpeg exit code.
+        stderr_lines: That run's stderr.
+
+    Returns:
+        The errno, or None when the run didn't fail on writing.
+    """
+    if returncode <= 0:
+        return None
+    code = _FOLDER_WRITE_EXITS.get(returncode)
+    if code is not None:
+        return code
+    output_lines = [line for line in _without_metadata_tags(stderr_lines) if _OUTPUT_SIDE_RE.search(line)]
+    for code in sorted(FOLDER_WRITE_ERRNOS):
+        text = os.strerror(code)
+        if any(text in line for line in output_lines):
+            return code
+    return None
 
 
 def _io_cut_off(returncode: int, stderr_lines: list[str]) -> bool:
@@ -1539,6 +1609,12 @@ def generate_images(
 
     Returns:
         Tuple of ``(success, image_count, hw_used, seconds, speed, error_summary)``.
+
+    Raises:
+        CodecNotSupportedError: The GPU couldn't produce the preview (the worker reruns the file on the CPU).
+        CancellationError: The job was cancelled.
+        WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota, or
+            read-only); none of them are kept.
     """
     media_info = MediaInfo.parse(video_file)
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
@@ -1742,7 +1818,7 @@ def generate_images(
     # _run_ffmpeg had, so the retry cascade below reads identically.
     from .ffmpeg_runner import create_ffmpeg_runner
 
-    _run_ffmpeg = create_ffmpeg_runner(
+    run_ffmpeg_once = create_ffmpeg_runner(
         video_file=video_file,
         output_folder=output_folder,
         gpu=gpu,
@@ -1760,6 +1836,22 @@ def generate_images(
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
     )
+
+    def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:
+        """One FFmpeg run, on any tier. A run the folder refused to write ends the file at once, frames deleted.
+
+        Whatever it wrote stops wherever the folder filled up, its last frame cut short. Another tier or the CPU
+        writes to the same folder, and a short preview would be marked fresh, so later scans would skip it.
+
+        Raises:
+            WorkingFolderError: The folder is full, over its quota, or read-only.
+        """
+        rc, seconds, speed, run_stderr = run_ffmpeg_once(*args, **kwargs)
+        refused = _folder_write_errno(rc, run_stderr)
+        if refused is not None:
+            _clean_output_images(output_folder)
+            raise WorkingFolderError(refused, os.strerror(refused), output_folder)
+        return rc, seconds, speed, run_stderr
 
     # DV Profile 5 paths cannot use -skip_frame (RPU side-data has
     # inter-frame dependencies). Everything else attempts skip_frame

@@ -7,6 +7,7 @@ real functions both ways on a small clip made with FFmpeg and compare the answer
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ from media_preview_generator.processing.generator import (
     FALLBACK_STALL,
     CancellationError,
     CodecNotSupportedError,
+    WorkingFolderError,
     failure_scope,
     get_failures,
 )
@@ -135,6 +137,30 @@ class TestGenerateImages:
             remote_ops.generate_images(media, str(tmp_path), "NVIDIA", "cuda:0", _Config())
         assert raised.value.kind == kind and str(raised.value) == "GPU processing failed (stall)"
         assert registry.reports == reported
+
+    def test_the_apps_own_folder_filling_up_while_the_frames_unpack_keeps_none_of_them(
+        self, media, tmp_path, monkeypatch
+    ):
+        _node()
+        slot = tmp_path / "slot"
+        slot.mkdir()
+
+        def fake(video, out, *args, **kwargs):
+            for second in (0, 5, 10):
+                write_file(os.path.join(out, f"{second:010d}.jpg"), b"frame")
+            return (True, 3, False, 1.0, "1x", "")
+
+        def unpack_until_full(data, dest):
+            write_file(os.path.join(dest, "0000000000.jpg"), b"fr")
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), os.path.join(dest, "0000000005.jpg"))
+
+        monkeypatch.setattr(generator, "generate_images", fake)
+        monkeypatch.setattr(executor, "extract_artifact", unpack_until_full)
+        with _on_node(), pytest.raises(WorkingFolderError) as raised:
+            remote_ops.generate_images(media, str(slot), None, None, _Config())
+
+        assert (raised.value.errno, raised.value.filename) == (errno.ENOSPC, str(slot))
+        assert list(slot.iterdir()) == []
 
     def test_cancellation_raises_cancellation_error(self, media, tmp_path, monkeypatch):
         _node()

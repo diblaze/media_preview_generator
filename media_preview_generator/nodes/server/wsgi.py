@@ -319,6 +319,8 @@ def _serve(argv: list[str] | None) -> int:
     logger.info("Stopping ({}): cancelling running tasks", stopping[0] if stopping else "the server ended")
     # Tasks first: their FFmpeg must stop even if Docker kills the process soon after.
     state.close(wait_s=SHUTDOWN_WAIT_S)
+    # Still serving, so the app hears the tasks were stopped by a restart rather than finding them gone afterwards.
+    state.tasks.wait_until_told()
     server.close()
     logger.info("Node stopped")
     return 0

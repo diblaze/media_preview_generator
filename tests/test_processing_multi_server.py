@@ -13,6 +13,7 @@ Verifies that:
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2261,6 +2262,39 @@ class TestSourceVanishesDuringGeneration:
         errors = [message for level, message in records if level == "ERROR"]
         assert len(errors) == 1
         assert errors[0].startswith(f"Could not extract preview frames from {source} ({type(exc).__name__}: {exc}).")
+
+
+class TestAWorkingFolderThatRefusesTheThumbnails:
+    """FFmpeg couldn't write the thumbnails: the folder's condition, not a corrupt video, and nothing is published."""
+
+    @pytest.mark.parametrize(
+        ("code", "said"),
+        [(errno.ENOSPC, "is full (No space left on device). Free up space there"), (errno.EROFS, "is read-only")],
+        ids=["full", "read-only"],
+    )
+    def test_the_file_fails_naming_the_folder_and_publishes_nothing(
+        self, mock_config_for_processing, tmp_path, code, said
+    ):
+        from media_preview_generator.processing.generator import WorkingFolderError
+
+        season = TestSourceVanishesDuringGeneration._season(tmp_path)
+        source = _video(season / TestSourceVanishesDuringGeneration.OLD)
+        folder = str(tmp_path / "cache" / "frame_cache" / "frames-x")
+
+        def generate(*_args, **_kwargs):
+            raise WorkingFolderError(code, os.strerror(code), folder)
+
+        result, records, _ = TestSourceVanishesDuringGeneration._run(
+            source, mock_config_for_processing, tmp_path, generate
+        )
+
+        assert result.status is MultiServerStatus.FAILED
+        assert result.message.startswith(f"Couldn't write the thumbnails: the working folder {folder} {said}")
+        assert "Settings → Advanced" in result.message
+        assert result.publishers == []
+        assert not list((tmp_path / "tv").rglob("*.bif"))
+        errors = [message for level, message in records if level == "ERROR"]
+        assert errors == [f"{source}: {result.message}"], "no 'corrupt video' traceback"
 
 
 class TestAdapterFactory:

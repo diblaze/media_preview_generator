@@ -362,6 +362,25 @@ class TestNodeDrops:
         assert _run(media) == {"ok": 1}
         assert registry.reports == []
 
+    def test_a_node_that_stopped_the_task_to_restart_gives_the_file_back_without_a_drop(self, media):
+        # Two routine restarts while a file ran there failed it: "it dropped the file twice".
+        client = ScriptedClient([running(), NodeStoppingError("http://n is restarting")])
+        registry = _install(client)
+        with pytest.raises(NodeUnavailableError, match=f"^{NODE_NAME} is restarting$") as raised:
+            _run(media)
+        assert raised.value.started is False
+        assert registry.reports == [("unavailable", NODE_ID)]
+
+    def test_a_node_that_restarts_before_sending_the_frames_gives_the_file_back_without_a_drop(self, media, tmp_path):
+        class Restarting(ScriptedClient):
+            def fetch_artifact(self, task_id):
+                raise NodeStoppingError("http://n is restarting")
+
+        _install(Restarting([finished(protocol.STATUS_DONE, result={})]))
+        with pytest.raises(NodeUnavailableError, match="didn't send the frames") as raised:
+            _run(media, artifact_to=str(tmp_path))
+        assert raised.value.started is False
+
     def test_a_node_that_forgot_the_task_is_unavailable_at_once(self, media):
         client = ScriptedClient([running(), NodeUnknownTaskError("unknown_task")])
         registry = _install(client)

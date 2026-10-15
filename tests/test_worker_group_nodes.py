@@ -439,6 +439,29 @@ class TestCapacityAndParking:
 
         assert registry.waiting == [["nuc", "storage"]]
 
+    @pytest.mark.parametrize(
+        ("opening", "until"),
+        [
+            ("2026-10-16T03:00:00+11:00", "03:00"),
+            ("2026-10-15T16:00:00+00:00", "03:00"),  # shown in the app's time zone, whatever zone it came in
+            ("2026-10-18T03:00:00+11:00", "Sun 03:00"),
+            ("2026-11-02T03:00:00+11:00", "2026-11-02 03:00"),
+            ("soon", "soon"),
+        ],
+        ids=["within-a-day", "another-zone", "within-a-week", "further", "unreadable"],
+    )
+    def test_the_off_hours_wait_says_when_in_the_apps_time_zone(self, monkeypatch, opening, until):
+        # The job's wait read "until 2026-10-16T03:00:00+11:00".
+        from media_preview_generator import worker_groups
+
+        monkeypatch.setenv("TZ", "Australia/Sydney")
+        now = datetime.fromisoformat("2026-10-15T22:00:00+11:00")
+        monkeypatch.setattr(worker_groups, "local_now", lambda now_=None: now)
+
+        message = capacity_wait_message({"reason": "off_hours", "next_opening": opening})
+
+        assert message == f"Waiting for worker availability until {until}"
+
     def test_mixed_local_and_offline_node_keeps_the_hardware_reason(self, registry):
         registry.put("storage", state=STATE_OFFLINE, reason="node offline")
         pool = WorkerPool(0, 0, [])

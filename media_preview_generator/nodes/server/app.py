@@ -420,7 +420,10 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
         log_from = protocol.whole_number(raw.lstrip("-"))
         if log_from is None:
             return refuse(protocol.KIND_REQUEST, 400, "log_from must be a whole number")
-        polled = table.poll(task_id, 0 if raw.startswith("-") else log_from)
+        try:
+            polled = table.poll(task_id, 0 if raw.startswith("-") else log_from)
+        except tasks.NodeStoppingError as exc:
+            return refuse(protocol.KIND_NODE_STOPPING, 503, str(exc))
         if polled is None:
             return unknown_task()
         return answer(polled)
@@ -439,7 +442,10 @@ def _node_blueprint(state: NodeServerState, wrong_keys: identity.WrongKeyLimit) 
 
     @bp.get(f"{protocol.ROUTE_TASKS}/<task_id>/artifact")
     def task_artifact(task_id: str) -> Any:
-        task = table.get(task_id)
+        try:
+            task = table.get(task_id)
+        except tasks.NodeStoppingError as exc:
+            return refuse(protocol.KIND_NODE_STOPPING, 503, str(exc))
         if task is None:
             return unknown_task()
         path = task.artifact

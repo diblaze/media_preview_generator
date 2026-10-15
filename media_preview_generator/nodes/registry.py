@@ -72,6 +72,10 @@ HEALTH_INTERVAL_S = 30.0
 OFFLINE_BACKOFF_S = (30.0, 60.0, 120.0, 300.0)
 # How soon an offline node is checked again while a job waits for it alone (``work_waiting``) instead of its back-off.
 WAITING_RECHECK_S = 15.0
+# A node that said it is stopping (a restart, an image update) is back in seconds: it is checked this often, with no
+# offline back-off, until it answers or for at most RESTART_WINDOW_S after it said so (one stopped for good).
+RESTART_RECHECK_S = 3.0
+RESTART_WINDOW_S = 120.0
 CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
@@ -169,6 +173,8 @@ class _Outcome:
     roles: tuple[str, ...] = ()
     uid: str = ""
     cause: str = ""
+    # The node said it is stopping (SIGTERM).
+    restarting: bool = False
 
 
 class PlexDbHold(NamedTuple):
@@ -205,6 +211,8 @@ class _Live:
     last_seen: float | None = None
     offline_streak: int = 0
     next_check: float = 0.0
+    # When (``clock``) the node last said it is stopping, until it answers again; None meanwhile.
+    restarting_since: float | None = None
     checking: bool = False
     # Check now asked for the quick access check too: the next check to finish runs it.
     access_wanted: bool = False
@@ -327,10 +335,35 @@ def _default_library_names(app_paths: list[str]) -> list[str]:
     return names
 
 
+def _temp_folder_advice(problem: str) -> str:
+    """What to do about a node's temp folder, by the cause in the node's words (its own, or the OS's error text).
+
+    Args:
+        problem: The node's sentence about its temp folder.
+
+    Returns:
+        One sentence of advice.
+    """
+    said = problem.lower()
+    if any(cause in said for cause in (" is full", "filled up", "no space left", "quota")):
+        return "Free up space there, or set NODE_TEMP_DIR on the node to a folder with more room."
+    if "read-only" in said:
+        return "Mount it writable (not read-only), or set NODE_TEMP_DIR on the node to a folder it can write to."
+    if any(cause in said for cause in ("permission denied", "access is denied", "not permitted")):
+        return (
+            "Let the node's user write to it (in Docker, check PUID and PGID), or set NODE_TEMP_DIR on the node to a "
+            "folder it can write to."
+        )
+    if any(cause in said for cause in ("no such file", "cannot find")):
+        return "Create or mount that folder, or set NODE_TEMP_DIR on the node to a folder it can write to."
+    return "Set NODE_TEMP_DIR on the node to a folder it can write to."
+
+
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
+    from ..web.settings_manager import get_settings_manager
     from .mappings import quick_access_check
 
-    return quick_access_check(client, mappings)
+    return quick_access_check(client, mappings, get_settings_manager().get("media_servers") or [])
 
 
 def _renamed(text: str, old: str, new: str) -> str:
@@ -427,7 +460,7 @@ class NodeRegistry:
         client_factory: Builds the client for one record.
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
         record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
-        quick_access: Checks one file per mapping row on a node; True when every one is visible.
+        quick_access: Checks one file per library on a node; True when every one is visible.
         served_plex_ids: The machine identifiers of the Plex servers that use a node as their Plex database node.
         app_version: This app's version (a worker node must match it exactly).
         app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
@@ -752,7 +785,7 @@ class NodeRegistry:
 
     def check_now(self, node_id: str) -> NodeView | None:
         """Run a health check now (blocking). When the node has an access problem, a passing quick access check
-        (one file per mapping row) clears it.
+        (one file per library) clears it.
 
         Returns:
             The view after the check, or None for an unknown node.
@@ -1183,16 +1216,26 @@ class NodeRegistry:
         if outcome.state == STATE_OFFLINE and not outcome.uid:
             # It didn't reach the node: whoever answers there next gives its id again first.
             live.heard_uid = None
-        if outcome.state == STATE_OFFLINE:
+        now = self._clock()
+        if outcome.restarting and live.restarting_since is None:
+            live.restarting_since = now
+        restarting = live.restarting_since is not None and now - live.restarting_since < RESTART_WINDOW_S
+        if outcome.state == STATE_OFFLINE and restarting:
+            # Saying it stops, then not answering while it starts again: neither is a node that went away.
+            live.offline_streak = 0
+            delay = RESTART_RECHECK_S
+        elif outcome.state == STATE_OFFLINE:
+            live.restarting_since = None
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
         else:
+            live.restarting_since = None
             live.offline_streak = 0
             delay = HEALTH_INTERVAL_S
             live.last_seen = self._wall_clock()
         if outcome.state == STATE_READY:
             live.ready_check = number
-        live.next_check = 0.0 if number <= live.reported_at_check else self._clock() + delay
+        live.next_check = 0.0 if number <= live.reported_at_check else now + delay
         if outcome.info is not None or outcome.legacy:
             live.info = outcome.info
             live.legacy = outcome.legacy
@@ -1298,6 +1341,7 @@ class NodeRegistry:
                 STATE_OFFLINE,
                 f"{name} is restarting; it gets no files until it is back.",
                 cause=OFFLINE_RESTARTING,
+                restarting=True,
                 **outcome,
             )
         app_version = self._app_version()
@@ -1341,8 +1385,8 @@ class NodeRegistry:
             said = temp_problem.strip()[:TEMP_PROBLEM_MAX]
             return _Outcome(
                 STATE_TEMP_PROBLEM,
-                f"{name}'s temp folder can't be used, so it gets no files: {said[:1].lower()}{said[1:]}. Free up "
-                "space there, or set NODE_TEMP_DIR on the node to a folder it can write to.",
+                f"{name}'s temp folder can't be used, so it gets no files: {said[:1].lower()}{said[1:]}. "
+                f"{_temp_folder_advice(said)}",
                 **outcome,
             )
         agent = info.get("agent")

@@ -12,6 +12,9 @@ A run can stop part-way and leave frames on disk. The rule, per run and per tier
   interval) it is published with a warning on any tier, so decoders that only error at EOF keep their GPU offload
   instead of paying a second full decode on the CPU. With fewer, a GPU run hands the file to the CPU and a CPU run
   publishes the short preview with a warning (a truncated file fails the same way on every scan);
+* the folder refused a write: full, over its quota or read-only (ENOSPC exit 228, EROFS exit 226, or the error's text
+  on an output line). On any tier and device the frames are deleted and ``WorkingFolderError`` ends the file at
+  once: whatever the run wrote stops where the folder filled up, and the next tier or the CPU writes to the same folder;
 * exit 0: published.
 
 The Dolby Vision ladder (hardware DV5 -> software libplacebo -> DV-safe chain -> CPU) follows the same table:
@@ -22,6 +25,7 @@ or fails (CPU).
 Only the FFmpeg boundary is mocked; counting, cleanup, renaming and the cascade run for real against ``tmp_path``.
 """
 
+import errno
 import itertools
 import os
 import signal
@@ -38,6 +42,8 @@ from media_preview_generator.processing.ffmpeg_runner import STALL_WATCHDOG_LINE
 from media_preview_generator.processing.generator import (
     FFMPEG_STALL_TIMEOUT_SEC,
     PUBLISH_MIN_FRAME_RATIO,
+    WorkingFolderError,
+    _diagnose_ffmpeg_exit_code,
     _was_interrupted,
     clear_failures,
     failure_scope,
@@ -85,6 +91,31 @@ OPENCL_DEBUG_CHATTER = [
     "[in#0/matroska @ 0x5617a0] Error during demuxing: Input/output error",
 ]
 SHELL_SIGHUP = 128 + signal.SIGHUP
+# The folder the thumbnails go to refused a write. Real FFmpeg 8.1 lines (jellyfin-ffmpeg, a full tmpfs and a read-only
+# mount); FFmpeg exits with AVERROR(errno) & 0xff.
+FOLDER_FULL = 256 - errno.ENOSPC  # 228
+FOLDER_READ_ONLY = 256 - errno.EROFS  # 226
+SHELL_SIGABRT = 128 + signal.SIGABRT  # 134: what EDQUOT exits with too
+FOLDER_FULL_STDERR = [
+    "[vost#0:0/mjpeg @ 0x5edfed19cbc0] Error submitting a packet to the muxer: No space left on device",
+    "[out#0/image2 @ 0x5edfed1ba180] Error muxing a packet",
+    "[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -28 (No space left on device)",
+    "[out#0/image2 @ 0x5edfed1ba180] Terminating thread with return code -28 (No space left on device)",
+    "frame=   22 fps=2.2 q=2.0 Lsize=N/A time=00:03:40.00 bitrate=N/A speed=21.7x elapsed=0:00:10.14",
+    "Conversion failed!",
+]
+FOLDER_READ_ONLY_STDERR = [
+    "[image2 @ 0x619ec303d300] Could not open file : /work/frames/img-000001.jpg",
+    "[vost#0:0/mjpeg @ 0x619ec3037bc0] Error submitting a packet to the muxer: Read-only file system",
+    "[out#0/image2 @ 0x619ec3055180] Task finished with error code: -30 (Read-only file system)",
+    "Conversion failed!",
+]
+OVER_QUOTA_LINE = (
+    f"[out#0/image2 @ 0x5edfed1ba180] Task finished with error code: -{errno.EDQUOT} ({os.strerror(errno.EDQUOT)})"
+)
+OLD_FFMPEG_FULL_LINE = f"av_interleaved_write_frame(): {os.strerror(errno.ENOSPC)}"
+# Mesa on a read-only root: about its shader cache, not the thumbnails; the run goes on fine.
+MESA_SHADER_CACHE_LINE = "Failed to create //.cache for shader cache (Read-only file system)---disabling."
 
 DEVICE_FOR = {None: None, "NVIDIA": "cuda:0", "AMD": "/dev/dri/renderD128", "INTEL": "/dev/dri/renderD128"}
 
@@ -168,7 +199,7 @@ def run(mock_config, tmp_path):
                 mock_mediainfo.parse.return_value = MagicMock(video_tracks=[track])
                 try:
                     result = generate_images(str(tmp_path / "movie.mkv"), out, gpu, DEVICE_FOR[gpu], mock_config)
-                except CodecNotSupportedError as exc:
+                except (CodecNotSupportedError, WorkingFolderError) as exc:
                     result = exc
                 failures = get_failures()
                 clear_failures()
@@ -202,6 +233,15 @@ def assert_handed_to_cpu(outcome: Outcome) -> None:
     assert isinstance(outcome.result, CodecNotSupportedError), f"expected a CPU hand-off, got {outcome.result!r}"
     assert outcome.frames_left == [], "frames left on disk would be counted by the publisher"
     # A hand-off isn't a failed item: the same worker retries it on the CPU.
+    assert outcome.failures == []
+
+
+def assert_refused(outcome: Outcome) -> None:
+    assert isinstance(outcome.result, WorkingFolderError), f"expected the folder's failure, got {outcome.result!r}"
+    assert os.path.basename(outcome.result.filename) == "frames"
+    assert outcome.frames_left == [], "frames left on disk would be counted by the publisher"
+    # Nothing to retry on another device or tier: they write to the same folder.
+    assert len(outcome.calls) == 1
     assert outcome.failures == []
 
 
@@ -317,6 +357,16 @@ OUTCOMES = [
     ("io-error-251-opencl-error-99pct", IO_ERROR, NEARLY_ALL, "publish-warn", "publish-warn", OPENCL_LINE),
     ("io-error-251-gpu-error-exactly-95pct", IO_ERROR, AT_RATIO, "publish-warn", "publish-warn", HWACCEL_LINE),
     ("io-error-251-gpu-error-94pct", IO_ERROR, BELOW_RATIO, "cpu", "publish-warn", HWACCEL_LINE),
+    # The folder refused a write: never published, on any device, however many frames it holds.
+    ("folder-full-228", FOLDER_FULL, 2, "refused", "refused", *FOLDER_FULL_STDERR),
+    ("folder-full-228-99pct", FOLDER_FULL, NEARLY_ALL, "refused", "refused", *FOLDER_FULL_STDERR),
+    ("folder-full-228-stderr-cut-off", FOLDER_FULL, 40, "refused", "refused"),
+    ("folder-full-windows-exit", 2**32 - errno.ENOSPC, 40, "refused", "refused"),
+    ("folder-full-old-ffmpeg-exit-1", SELF_EXIT, 40, "refused", "refused", OLD_FFMPEG_FULL_LINE),
+    ("folder-read-only-226", FOLDER_READ_ONLY, 0, "refused", "refused", *FOLDER_READ_ONLY_STDERR),
+    ("folder-over-quota-134", SHELL_SIGABRT, 40, "refused", "refused", OVER_QUOTA_LINE),
+    ("crash-shell-sigabrt-134-99pct", SHELL_SIGABRT, NEARLY_ALL, "publish-warn", "publish-warn"),
+    ("mesa-read-only-cache-99pct", SELF_EXIT, NEARLY_ALL, "publish-warn", "publish-warn", MESA_SHADER_CACHE_LINE),
 ]
 
 
@@ -333,6 +383,8 @@ def _check(outcome: Outcome, verdict: str, rc: int, n_frames: int) -> None:
         assert_published_with_warning(outcome, rc, n_frames)
     elif verdict == "cpu":
         assert_handed_to_cpu(outcome)
+    elif verdict == "refused":
+        assert_refused(outcome)
     else:
         assert_failed(outcome, rc)
 
@@ -413,6 +465,35 @@ class TestPublishOrDiscardMatrix:
         assert not _warned(outcome, "out of sync"), outcome.warnings
 
 
+class TestAFolderThatRefusesTheThumbnails:
+    """The working folder (a node's temp folder) fills up, runs out of quota or turns read-only mid-run."""
+
+    @pytest.mark.parametrize(
+        ("attempt", "code"),
+        [
+            ((FOLDER_FULL, 2, *FOLDER_FULL_STDERR), errno.ENOSPC),
+            ((FOLDER_FULL, 2), errno.ENOSPC),
+            ((FOLDER_READ_ONLY, 0, *FOLDER_READ_ONLY_STDERR), errno.EROFS),
+            ((SHELL_SIGABRT, 40, OVER_QUOTA_LINE), errno.EDQUOT),
+        ],
+        ids=["full", "full-stderr-cut-off", "read-only", "over-quota"],
+    )
+    def test_the_error_names_the_folder_and_why(self, run, tmp_path, attempt, code):
+        # A node reads errno + filename to tell its temp folder's problem from the file's (nodes/server/tasks.py).
+        outcome = run([attempt], gpu="NVIDIA")
+
+        assert_refused(outcome)
+        assert (outcome.result.errno, outcome.result.filename) == (code, str(tmp_path / "frames"))
+        assert _diagnose_ffmpeg_exit_code(attempt[0], list(attempt[2:])) == "folder_write_error"
+
+    @pytest.mark.parametrize("gpu", ["NVIDIA", None], ids=["gpu", "cpu"])
+    def test_a_keyframe_pass_that_fills_the_folder_is_not_retried_with_full_decode(self, run, gpu):
+        outcome = run([(FOLDER_FULL, 12, *FOLDER_FULL_STDERR), (0, EXPECTED)], gpu=gpu, keyframe_gap=1.0)
+
+        assert_refused(outcome)
+        assert [c["use_skip"] for c in outcome.calls] == [True]
+
+
 class TestStallWatchdogThroughTheRealRunner:
     """The stall cell end to end: the real runner's watchdog kills FFmpeg after it wrote nearly every frame."""
 
@@ -476,6 +557,25 @@ class TestTheRunnersFailureLines:
 
         assert _warned(outcome, "I/O error", "disk or network share", "working folder"), outcome.warnings
         assert outcome.result.kind == "io_error"
+
+    @pytest.mark.parametrize(
+        ("rc", "stderr", "said"),
+        [
+            (FOLDER_FULL, "\n".join(FOLDER_FULL_STDERR), "Free up space there"),
+            (FOLDER_READ_ONLY, "\n".join(FOLDER_READ_ONLY_STDERR), "Make it writable"),
+            (SHELL_SIGABRT, OVER_QUOTA_LINE, "Free up space there"),
+        ],
+        ids=["full", "read-only", "over-quota"],
+    )
+    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(self, run, tmp_path, rc, stderr, said):
+        outcome = self._run_real(run, tmp_path, rc, stderr)
+
+        assert isinstance(outcome.result, WorkingFolderError)
+        refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
+        assert len(refused) == 1 and str(tmp_path / "frames") in refused[0] and said in refused[0], outcome.warnings
+        assert not any(
+            "crashed" in line or "hardware acceleration" in line or "GPU" in line for line in outcome.warnings
+        ), outcome.warnings
 
     def test_a_251_with_a_gpu_error_blames_neither(self, run, tmp_path):
         outcome = self._run_real(run, tmp_path, IO_ERROR, HWACCEL_LINE)
