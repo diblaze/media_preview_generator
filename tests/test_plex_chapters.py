@@ -14,8 +14,8 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
-from media_preview_generator.markers.publishers import plex_db
-from media_preview_generator.markers.publishers.base import Capability
+from media_preview_generator.markers.publishers import plex_chapters, plex_db
+from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
 from media_preview_generator.markers.publishers.plex_chapters import (
     ChapterError,
     LocalChapters,
@@ -470,7 +470,7 @@ def test_error_retry_classification_roundtrips():
     assert isinstance(error, ChapterError) and error.code == "source_changed"
 
 
-@pytest.mark.parametrize("capabilities,machine", [([], MACHINE), (["chapters_v1"], "other"), (["chapters_v1"], "")])
+@pytest.mark.parametrize("capabilities,machine", [([], MACHINE), (["chapters_v1"], "other")])
 def test_remote_refuses_old_or_wrong_helper_before_sending_operation(capabilities, machine):
     class Client:
         def __init__(self):
@@ -485,6 +485,62 @@ def test_remote_refuses_old_or_wrong_helper_before_sending_operation(capabilitie
 
     with pytest.raises(ChapterError):
         _remote(Client(), "register", MACHINE, VERSION, target={})
+
+
+def test_a_node_that_cant_say_which_plex_it_is_beside_answers_for_itself():
+    """It can't read Plex's Preferences.xml (another user than Plex's): its own checks say what it can't read or write,
+    and it refuses every operation itself until it can prove which Plex it is beside."""
+    sent = []
+
+    class Client:
+        capabilities = ["chapters_v1"]
+
+        def ping(self, *, timeout):
+            return {"machine_identifier": ""}
+
+        def post(self, path, body, **kwargs):
+            sent.append(path)
+            return {"capability": "chapters_v1", "report": {"state": "misconfigured", "message": "can't write"}}
+
+    assert _remote(Client(), "check", MACHINE, VERSION)["report"]["message"] == "can't write"
+    assert sent == ["/v1/chapters/check"]
+
+
+class TestTheWriterNamesWhatItCantWriteBeforeWhichPlex:
+    """Plex's Preferences.xml is mode 0600: a writer running as another user can't read the identity either."""
+
+    CANT_WRITE = CapabilityReport(
+        Capability.MISCONFIGURED, "The Plex database node (user 1001) can't write com.plexapp.plugins.library.db."
+    )
+
+    @pytest.fixture
+    def wrong_user(self, backend, monkeypatch):
+        monkeypatch.setattr(backend.database, "file_checks", lambda *, deadline: self.CANT_WRITE)
+        return backend
+
+    def test_an_unreadable_identity_reports_the_write_problem(self, backend, monkeypatch):
+        target = read(backend)
+        _, revisions = images(backend)
+        before = rows(backend)
+        monkeypatch.setattr(backend.database, "file_checks", lambda *, deadline: self.CANT_WRITE)
+        monkeypatch.setattr(plex_chapters, "plex_machine_identifier", lambda folder: "")
+
+        report = backend.capability(MACHINE, VERSION, deadline=time.monotonic() + 3)
+
+        assert (report.state, report.message) == (self.CANT_WRITE.state, self.CANT_WRITE.message)
+        with pytest.raises(ChapterError, match="can't write"):
+            backend.register(target, revisions, VERSION, deadline=time.monotonic() + 3)
+        assert rows(backend) == before
+
+    def test_another_plexs_identity_still_comes_first(self, wrong_user, monkeypatch):
+        monkeypatch.setattr(plex_chapters, "plex_machine_identifier", lambda folder: "another-plex")
+        report = wrong_user.capability(MACHINE, VERSION, deadline=time.monotonic() + 3)
+        assert report.message == "Cannot prove this database belongs to the connected Plex server"
+
+    def test_an_unreadable_identity_on_a_writable_database_is_still_refused(self, backend, monkeypatch):
+        monkeypatch.setattr(plex_chapters, "plex_machine_identifier", lambda folder: "")
+        report = backend.capability(MACHINE, VERSION, deadline=time.monotonic() + 3)
+        assert report.message == "Cannot prove this database belongs to the connected Plex server"
 
 
 @pytest.mark.parametrize(
@@ -624,6 +680,36 @@ def test_agent_typed_requests_and_auth(backend, monkeypatch):
     assert client.post("/v1/chapters/register", json=body, headers=headers).status_code == 409
     body["revisions"][1]["index"] = body["revisions"][0]["index"]
     assert client.post("/v1/chapters/register", json=body, headers=headers).status_code == 400
+
+
+def test_a_snapshot_from_an_app_without_the_analysed_field_registers_through_the_role(backend, monkeypatch):
+    """5.1.0's snapshot has no ``analysed``: a node beside an analysed part must not read that as a changed source."""
+    mutate(backend, "UPDATE media_items SET duration=5000 WHERE id=10")
+    mutate(backend, "INSERT INTO media_streams VALUES(1,20,2)")
+    target = read(backend)
+    assert target.analysed is True
+    client = _role_client(backend, monkeypatch)
+    headers = {"Authorization": "Bearer synthetic-key", "X-Marker-Agent-Protocol": "1"}
+    snapshot = target_to_json(target)
+    del snapshot["analysed"]
+    _, revisions = images(backend)
+    before = rows(backend)
+
+    response = client.post(
+        "/v1/chapters/register",
+        json={
+            "machine_identifier": MACHINE,
+            "pms_version": VERSION,
+            "deadline_s": 3,
+            "target": snapshot,
+            "revisions": [{"index": i, "sha256": sha} for i, sha in revisions.items()],
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.json
+    assert response.json["result"]["registered"] is True
+    assert rows(backend) != before
 
 
 def test_register_subset_updates_only_revised_chapters(backend):

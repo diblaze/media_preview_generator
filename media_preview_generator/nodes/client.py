@@ -6,6 +6,7 @@ class, never on status codes or message text. The key is sent only in the Author
 
 from __future__ import annotations
 
+import ssl
 import threading
 from dataclasses import dataclass
 from json import loads as parse_json
@@ -42,6 +43,8 @@ UNREACHABLE_REFUSED = "refused"
 UNREACHABLE_TIMEOUT = "timeout"
 UNREACHABLE_DNS = "dns"
 UNREACHABLE_TLS = "tls"
+# It answered over https, but this app refused its certificate (self-signed, a private authority, another name).
+UNREACHABLE_TLS_CERTIFICATE = "tls_certificate"
 
 
 class NodeUnreachableError(NodeError):
@@ -116,6 +119,11 @@ class NodeTaskDeletedError(NodeError):
 def _unreachable(base: str, exc: requests.RequestException) -> NodeUnreachableError:
     """A request that got no answer, saying why in plain words (never the exception's class name)."""
     cause = getattr(exc.args[0], "reason", None) if exc.args else None
+    if isinstance(exc, requests.exceptions.SSLError) and _certificate_refused(cause):
+        return NodeUnreachableError(
+            f"{base} answered over https, but its certificate isn't trusted by this app",
+            reason=UNREACHABLE_TLS_CERTIFICATE,
+        )
     if isinstance(exc, requests.exceptions.SSLError):
         return NodeUnreachableError(f"{base} didn't answer over https", reason=UNREACHABLE_TLS)
     if isinstance(cause, NameResolutionError):
@@ -129,6 +137,14 @@ def _unreachable(base: str, exc: requests.RequestException) -> NodeUnreachableEr
     if isinstance(cause, NewConnectionError) and "refused" in str(cause).lower():
         return NodeUnreachableError(f"{base} didn't answer (connection refused)", reason=UNREACHABLE_REFUSED)
     return NodeUnreachableError(f"{base} didn't answer (no connection)")
+
+
+def _certificate_refused(cause: object) -> bool:
+    """Whether a TLS failure was this app refusing the certificate, so the address does speak https.
+
+    urllib3 wraps the handshake's ``ssl.SSLCertVerificationError`` in its own ``SSLError``.
+    """
+    return any(isinstance(error, ssl.SSLCertVerificationError) for error in (cause, *getattr(cause, "args", ())))
 
 
 def _answer_lost(exc: requests.ConnectionError) -> bool:
@@ -270,7 +286,7 @@ class NodeClient:
         raw_error = body.get("error")
         error: dict = raw_error if isinstance(raw_error, dict) else {}
         kind = error.get("kind")
-        message = str(error.get("message") or kind or f"HTTP {response.status_code}")
+        message = protocol.relayed_text(str(error.get("message") or kind or f"HTTP {response.status_code}"))
         if response.status_code == 404 and kind == protocol.KIND_UNKNOWN_TASK:
             raise NodeUnknownTaskError(message)
         if response.status_code == 404:

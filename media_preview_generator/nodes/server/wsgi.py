@@ -6,8 +6,8 @@ and the Plex database role's "one writer at a time" is a lock inside it. waitres
 event loop before a thread takes it, so connections that send a request slowly, or never finish one, hold no thread:
 ``/v1/health`` and the app's polls keep answering. Nothing here needs the key, so anyone who can reach the port could
 otherwise freeze the node with a few half-sent requests. Nor can they hold every connection the node takes: one
-address gets :data:`CONNECTIONS_PER_ADDRESS` at once, and each request must arrive whole within
-:data:`REQUEST_READ_S`.
+address gets :data:`CONNECTIONS_PER_ADDRESS` at once (past that, one of its idle keep-alives makes room), and each
+request must arrive whole within :data:`REQUEST_READ_S`.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import argparse
 import os
 import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -24,7 +25,8 @@ from typing import Any
 
 from loguru import logger
 
-from .app import EXTENSION, MAX_BODY_BYTES, create_node_app
+from ...worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
+from .app import CONTAINER_SETTINGS, EXTENSION, FILE_ENV_PREFIX, _env_from_files, create_node_app
 from .identity import caller_key
 
 # Every interface: the app on another machine is the whole point.
@@ -38,18 +40,25 @@ CHANNEL_TIMEOUT_S = 60
 CONNECTION_LIMIT = 1000
 # Windows has no poll(), and its select() takes at most 512 sockets: room is left for the listener and waitress's own.
 SELECT_CONNECTION_LIMIT = 500
-# Connections one address (an IPv6 caller's whole /64: ``identity.caller_key``) may hold at once. The app keeps a few
-# per running task on the node, far under this, and no single machine can take every connection the node has (waitress
-# has no per-address limit of its own).
-CONNECTIONS_PER_ADDRESS = 100
+# Connections one address (an IPv6 caller's whole /64: ``identity.caller_key``) may hold at once. Each of the app's
+# workers running a file here keeps one open (a keep-alive per worker thread), and one app can give a node up to
+# MAX_CPU_WORKERS + MAX_GPU_WORKERS of them, plus a few for its checks and clean-ups. Twice that leaves room for both
+# and for a second app on the same machine, and stays under SELECT_CONNECTION_LIMIT, so no single machine can take
+# every connection the node has (waitress has no per-address limit of its own).
+CONNECTIONS_PER_ADDRESS = 2 * (MAX_CPU_WORKERS + MAX_GPU_WORKERS)
 # A request (headers and body) must arrive whole within this long of its first byte. CHANNEL_TIMEOUT_S only closes a
 # connection that went quiet, so one header line every few seconds would otherwise hold a connection forever.
 REQUEST_READ_S = 30
 # A node refusing connections says so at most this often.
 REFUSED_WARNING_S = 60.0
-# Above the routes' own 2 MB limit, so they answer an oversized body in the node's JSON; anything far beyond it is
-# refused before waitress buffers it.
-MAX_REQUEST_BODY_BYTES = 2 * MAX_BODY_BYTES
+# waitress reads a request's whole body before the app (and its key check) sees it, so anyone who can reach the port
+# makes the node hold this much per connection. The app's largest requests are tens of KB (a Test access batch with
+# its mapping rows, a film's chapter rows), far under it; the routes' own 2 MB limit is never reached through here.
+MAX_REQUEST_BODY_BYTES = 512 * 1024
+# Bodies up to this size stay in memory; waitress writes a larger one to a temp file while it arrives (its default is
+# 512 KB: 4 MB bodies from a thousand connections held 4 GB of the node's temp disk for REQUEST_READ_S). Twice the
+# body limit, as a chunked body is cut off up to one read past it: no body is ever written out.
+INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
 # How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop: inside Docker's 10 s stop timeout.
 SHUTDOWN_WAIT_S = 5.0
 STOP_POLL_S = 0.2
@@ -67,9 +76,37 @@ def _setup_logging() -> None:
     setup_logging(log_level=level)
 
 
+def _quiet(channel: Any) -> bool:
+    """Whether a connection sits open with nothing on it: no request being read, run or answered, and none arriving.
+
+    Args:
+        channel: A waitress ``HTTPChannel``.
+
+    Returns:
+        True when closing it loses nothing (a client's keep-alive between requests, or one its peer closed).
+    """
+    if channel.requests or channel.request is not None or channel.total_outbufs_len:
+        return False
+    if channel.will_close or channel.close_when_flushed:
+        return False
+    try:
+        # A request already on its way, not yet read: closing now would drop it.
+        waiting = channel.socket.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return True  # a broken connection: nothing to lose either
+    return not waiting
+
+
 def _limited_channels(listen_map: dict) -> Any:
-    """A waitress ``channel_class`` that refuses an address's connection past :data:`CONNECTIONS_PER_ADDRESS` and
-    closes one whose request hasn't arrived whole within :data:`REQUEST_READ_S`.
+    """A waitress ``channel_class`` that holds an address to :data:`CONNECTIONS_PER_ADDRESS` connections and closes one
+    whose request hasn't arrived whole within :data:`REQUEST_READ_S`.
+
+    At the limit, one of the address's idle keep-alives is closed to make room, and only an address whose every
+    connection is busy (reading, running or answering a request) is refused: a client keeping more keep-alives than
+    the limit then only loses idle ones, which it opens again. The one closed is the one most recently busy: the
+    app's workers poll on a timer, so its owner is the furthest from sending on it again.
 
     Args:
         listen_map: The server's socket map: every open connection is in it.
@@ -101,8 +138,14 @@ def _limited_channels(listen_map: dict) -> Any:
 
     def accept(server: Any, sock: Any, addr: Any, adj: Any, map: dict | None = None) -> NodeChannel | None:
         peer = caller_key(addr[0] if isinstance(addr, tuple) else str(addr))
-        held = sum(1 for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.caller == peer)
-        if held < CONNECTIONS_PER_ADDRESS:
+        held = [d for d in list(listen_map.values()) if isinstance(d, NodeChannel) and d.caller == peer]
+        if len(held) >= CONNECTIONS_PER_ADDRESS:
+            quiet = next((d for d in sorted(held, key=lambda d: -d.last_activity) if _quiet(d)), None)
+            if quiet is not None:
+                # waitress's loop calls this, so the channel is closed here and now (it leaves the map at once).
+                quiet.handle_close()
+                held.remove(quiet)
+        if len(held) < CONNECTIONS_PER_ADDRESS:
             channel = NodeChannel(server, sock, addr, adj, map=map)
             channel.caller = peer
             return channel
@@ -149,6 +192,7 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
         connection_limit=CONNECTION_LIMIT if hasattr(select, "poll") else SELECT_CONNECTION_LIMIT,
         asyncore_use_poll=True,
         max_request_body_size=MAX_REQUEST_BODY_BYTES,
+        inbuf_overflow=INBUF_OVERFLOW_BYTES,
         ident=ident,
     )
     accept = _limited_channels(listen_map)
@@ -162,9 +206,29 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Media Preview Generator node")
     parser.add_argument("--host", default=os.environ.get("NODE_HOST", "").strip() or DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NODE_PORT", "").strip() or DEFAULT_PORT))
+    # AGENT_PORT: the Plex marker agent's name for it, still read when NODE_PORT isn't set. Checked in _serve, once
+    # logging is up: a bad NODE_PORT is one logged line, not argparse's usage or a traceback.
+    port = os.environ.get("NODE_PORT", "").strip() or os.environ.get("AGENT_PORT", "").strip() or str(DEFAULT_PORT)
+    parser.add_argument("--port", default=port)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="requests served at once")
     return parser.parse_args(argv)
+
+
+def _port(value: str) -> int | None:
+    """``value`` as a port to listen on, or None when it isn't one.
+
+    Args:
+        value: NODE_PORT or ``--port``; spaces and a Windows line ending (an env file saved with CRLF) around it are
+            ignored.
+
+    Returns:
+        The port (1-65535), or None.
+    """
+    text = value.strip()
+    if not (text.isascii() and text.isdigit()):
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,14 +244,42 @@ def main(argv: list[str] | None = None) -> int:
     # for it, and its FFmpeg dies with it (utils.is_node_mode).
     os.environ.setdefault("MODE", "node")
     try:
-        return _serve(_parse(argv))
+        return _serve(argv)
     finally:
         logger.complete()  # the console sinks are queued: their last lines must reach docker logs before the exit
 
 
-def _serve(args: argparse.Namespace) -> int:
+def _logging_settings() -> tuple[str | None, str | None]:
+    return os.environ.get("LOG_LEVEL"), os.environ.get("LOG_FORMAT")
+
+
+def _serve(argv: list[str] | None) -> int:
     # Logging first: setup_logging's first call removes every handler, and create_node_app adds the node's own.
     _setup_logging()
+    # The FILE__ values before any setting is read here (the log level, port and host), so each works like the rest.
+    logging_was = _logging_settings()
+    try:
+        _env_from_files()
+    except SystemExit as exc:
+        logger.error("The node didn't start: {}", exc)
+        return 1
+    if _logging_settings() != logging_was:
+        _setup_logging()
+    for name in CONTAINER_SETTINGS:
+        if os.environ.get(FILE_ENV_PREFIX + name):
+            logger.warning(
+                "{}{} is ignored: the container reads {} before the node starts. Set {} itself.",
+                FILE_ENV_PREFIX,
+                name,
+                name,
+                name,
+            )
+    args = _parse(argv)
+    port = _port(args.port)
+    if port is None:
+        logger.error("The node didn't start: NODE_PORT is {!r}, which isn't a port number from 1 to 65535", args.port)
+        return 1
+    args.port = port
     try:
         app = create_node_app()
     except SystemExit as exc:

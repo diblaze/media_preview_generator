@@ -351,6 +351,57 @@ class TestFindCredits:
         assert phases == ["Reading the credits…"] and notes == ["read on the CPU"]
         assert client.specs[0]["params"]["gpu_worker"] is True
 
+    def test_the_nodes_step_text_and_cpu_notes_stay_one_line_each(self, media, monkeypatch):
+        _node(GPU)
+        result = detector.CreditsTextResult(
+            start_s=None, end_s=None, key_rows=(), fine_rows=(), end_rows=(), overlays=(), scale=1
+        )
+
+        class Pool:
+            def detect_boxes(self, planes, **kwargs):
+                kwargs["on_cpu"]("read on the CPU\n12:00 | ERROR | forged")
+                return []
+
+        def fake(path, **kwargs):
+            kwargs["phase"]("Reading the credits\u2028forged")
+            kwargs["detect_boxes"](None)
+            return result
+
+        monkeypatch.setattr(textdet_helper, "get_textdet_pool", Pool)
+        monkeypatch.setattr(detector, "find_credits", fake)
+        phases, notes = [], []
+        with _on_node():
+            remote_ops.find_credits(
+                media,
+                duration_ms=200_000,
+                is_episode=False,
+                ffmpeg="/app/ffmpeg",
+                gpu="NVIDIA",
+                gpu_device_path="cuda:0",
+                phase=phases.append,
+                gpu_worker=True,
+                on_cpu=notes.append,
+            )
+        assert phases == ["Reading the credits\\u2028forged"]
+        assert notes == ["read on the CPU\\n12:00 | ERROR | forged"]
+
+    def test_ffmpegs_lines_from_a_node_are_as_many_as_the_job_log_shows_one_line_each(self, media, monkeypatch):
+        _node(GPU)
+        said = tuple(f"Error {n}\n12:00 | ERROR | forged" for n in range(50))
+
+        def fake(path, **kwargs):
+            raise frames.GpuDecodeError("cuda failed", stderr_tail=said, fallback_kind="hwaccel")
+
+        monkeypatch.setattr(textdet_helper, "get_textdet_pool", lambda: None)
+        monkeypatch.setattr(detector, "find_credits", fake)
+        with _on_node(), pytest.raises(frames.GpuDecodeError) as raised:
+            remote_ops.find_credits(
+                media, duration_ms=1000, is_episode=True, ffmpeg="f", gpu="NVIDIA", gpu_device_path="cuda:0"
+            )
+        assert raised.value.stderr_tail == tuple(
+            f"Error {n}\\n12:00 | ERROR | forged" for n in range(50 - frames.STDERR_LINES, 50)
+        )
+
     @pytest.mark.parametrize(
         ("fallback_kind", "reports"),
         [

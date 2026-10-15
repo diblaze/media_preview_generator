@@ -22,6 +22,7 @@ from ..markers.publishers.plex_db import (
     TESTED_PMS_LABEL,
     WAIT_SLICE_S,
     LocalPlexDb,
+    beside_another_plex,
     decode_extra_data,
     is_tested_pms_version,
     node_wording,
@@ -264,14 +265,16 @@ class RemoteLoudnessDb:
     lock-wait slices.
     """
 
-    def __init__(self, server: Any, remote: RemotePlexDb) -> None:
+    def __init__(self, server: Any, remote: RemotePlexDb, *, server_name: str = "") -> None:
         """Create the transport.
 
         Args:
             server: The connected Plex.
             remote: That server's Plex database node, as ``plex_database`` resolves it.
+            server_name: The server's name, for the refusal of a node beside a different Plex.
         """
         self.server = server
+        self.server_name = server_name
         self.machine_identifier = ""
         self._remote = remote
         self._identity_read_at: float | None = None
@@ -297,6 +300,30 @@ class RemoteLoudnessDb:
             return self._remote.loudness(operation, body, deadline=deadline, needs=LOUDNESS_AGENT_VERSION)
         except AgentUnreachableError as exc:
             raise PublishError(str(exc), state=Capability.UNREACHABLE) from exc
+        except PublishError as exc:
+            another = self._beside_another_plex(body.get("machine_identifier"), exc.state)
+            if another:
+                raise PublishError(another, state=Capability.MISCONFIGURED) from exc
+            raise
+
+    def _beside_another_plex(self, ours: object, state: Capability | None) -> str:
+        """The refusal of a node beside a Plex other than ``ours`` (this server's), or "" when it isn't (or can't
+        tell).
+
+        The node only says it can't prove its database is this Plex's (MISCONFIGURED); when it names another Plex
+        (a mistyped address), this says so the way Intro & Credits does, naming the node and the server.
+        """
+        if state is not Capability.MISCONFIGURED or not isinstance(ours, str) or not ours:
+            return ""
+        try:
+            theirs = self._remote.node_machine_identifier()
+        except PublishError:
+            return ""
+        if not theirs or theirs == ours:
+            return ""
+        return beside_another_plex(
+            self._remote.agent_details().get("url", ""), self.server_name, "loudness measurements"
+        )
 
     def _call(self, operation: str, body: dict, *, deadline: float, trust_recent: bool = True) -> dict:
         machine, version = self._identity(trust_recent=trust_recent)
@@ -316,6 +343,9 @@ class RemoteLoudnessDb:
             else:
                 result = self._loudness(operation, body, deadline=deadline)
             report = report_from_json(result.get("report"))
+            another = self._beside_another_plex(self._read[0], report.state) if identity else ""
+            if another:
+                report = CapabilityReport(Capability.MISCONFIGURED, another, report.details)
         except PublishError as exc:
             report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc))
         except ValueError as exc:
@@ -480,7 +510,7 @@ def create_loudness_db(cfg: ServerConfig, server: Any) -> GuardedLoudnessDb | Re
             path_provider=lambda: PlexMarkerPublisher.db_path_for(cfg),
             label=cfg.name or "",
         )
-        return RemoteLoudnessDb(server, db)
+        return RemoteLoudnessDb(server, db, server_name=cfg.name or "")
     plex = (cfg.markers or {}).get("plex") or {}
     agent = plex.get("agent") if isinstance(plex, dict) else None
     if isinstance(agent, dict) and agent.get("enabled"):

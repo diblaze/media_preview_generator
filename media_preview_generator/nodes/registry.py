@@ -87,6 +87,9 @@ INFO_LIST_MAX = 256
 INFO_DEPTH_MAX = 8
 LEGACY_PING_TIMEOUT_S = 10.0
 LOOP_TICK_S = 1.0
+# How long a Plex database request waits for a node's first check (just started, or its address changed) before it
+# is told to wait for it instead: a node that answers takes well under a second.
+FIRST_CHECK_WAIT_S = 5.0
 # The node's own words for its temp folder's problem go into the reason; a node can't make it any longer than this.
 TEMP_PROBLEM_MAX = 300
 
@@ -168,6 +171,15 @@ class _Outcome:
     cause: str = ""
 
 
+class PlexDbHold(NamedTuple):
+    """Why this app sends no Plex database work to a node now."""
+
+    message: str
+    # The node's id is still to be checked: the work waits for that check (as for a node that doesn't answer)
+    # instead of failing.
+    waits: bool = False
+
+
 class _PendingAccess(NamedTuple):
     """A Test access of rows not saved yet, kept until exactly those rows are saved at the same address."""
 
@@ -208,6 +220,10 @@ class _Live:
     # A new id a Plex database node reported that this app couldn't tie to the Plex it serves; its Plex database
     # writes are refused until the user types the node's key again (which clears the saved id).
     unconfirmed_uid: str = ""
+    # The id the node gave the last check that reached it and settled its id ("" when it gives none, an old Plex
+    # helper); None until a check since this app started reaches it, and again once a check doesn't, it is reported
+    # unavailable, or it gets another address. Until then another machine could be answering there.
+    heard_uid: str | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
     # Health checks begun so far, the number of the last one that came back ready, and how many had begun when job
     # code last reported the node unavailable: only a check begun after that report vouches for the node again.
@@ -346,16 +362,21 @@ def _count(raw: object) -> int:
 
 
 def _bounded(value: object, depth: int = 0) -> Any:
-    """A JSON value a node sent, cut to the ``INFO_*`` bounds; a number that isn't finite becomes null.
+    """A JSON value a node sent, cut to the ``INFO_*`` bounds, each text one line; a number that isn't finite becomes
+    null.
 
-    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, and a deeply nested answer breaks ``deepcopy``.
+    JSON's ``1e400`` parses to infinity, which ``int()`` refuses, a 400-digit whole number is too big for a float, and a
+    deeply nested answer breaks ``deepcopy``.
     """
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value[:INFO_TEXT_MAX]
+        return protocol.relayed_text(value, INFO_TEXT_MAX)
     if isinstance(value, int | float):
-        return value if math.isfinite(value) else None
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:  # isfinite turns a whole number into a float first
+            return None
     if depth >= INFO_DEPTH_MAX:
         return None
     if isinstance(value, dict):
@@ -449,6 +470,8 @@ class NodeRegistry:
         self._clock = clock
         self._wall_clock = wall_clock
         self._lock = threading.RLock()
+        # Notified whenever a check finishes (with ``_lock`` held), for :meth:`plex_db_hold`'s wait.
+        self._check_done = threading.Condition(self._lock)
         self._nodes: dict[str, _Live] = {}
         self._settings_key: object = object()
         self._revision = 0
@@ -537,26 +560,52 @@ class NodeRegistry:
             return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
 
     def plex_db_refusal(self, node_id: str) -> str:
-        """Why this app sends no Plex database work to the node now ("" when it may).
+        """Why this app sends no Plex database work to the node now ("" when it may); see :meth:`plex_db_hold`."""
+        hold = self.plex_db_hold(node_id)
+        return hold.message if hold is not None else ""
+
+    def plex_db_hold(self, node_id: str) -> PlexDbHold | None:
+        """Why this app sends no Plex database work to the node now, or None when it may.
 
         A Plex database node that reports a new id could be a different machine that was given the same key and
         address; unless its Plex is the one the server uses, the user confirms it by typing its key again. A node
         that answers as another saved node is refused too: its answer is that other machine's, not this one's.
+
+        Either is known only from a check that reached the node, so until one has since this app started (or since
+        the node last didn't answer, or got another address) a node with a saved id gets nothing either: its work
+        waits, and a check starts now. The node's first check is waited for, up to :data:`FIRST_CHECK_WAIT_S`, so
+        work asked for just after a restart isn't held back by a check that is about to answer.
         """
         self._sync()
-        with self._lock:
-            live = self._nodes.get(node_id)
-            if live is None:
-                return ""
-            if live.probe_state == STATE_DUPLICATE:
-                return f"{live.probe_reason} Until then this app doesn't use it for Plex's database."
-            if not live.unconfirmed_uid:
-                return ""
-            name = str(live.record.get("name") or "The Plex database node")
-        return (
-            f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key again on "
-            "its Settings tab to confirm."
-        )
+        deadline = time.monotonic() + FIRST_CHECK_WAIT_S
+        waited = False
+        with self._check_done:
+            while True:
+                live = self._nodes.get(node_id)
+                if live is None:
+                    return None
+                if live.probe_state == STATE_DUPLICATE:
+                    return PlexDbHold(f"{live.probe_reason} Until then this app doesn't use it for Plex's database.")
+                name = str(live.record.get("name") or "The Plex database node")
+                if live.unconfirmed_uid:
+                    return PlexDbHold(
+                        f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key "
+                        "again on its Settings tab to confirm."
+                    )
+                if not live.record.get("node_uid") or live.heard_uid is not None:
+                    return None
+                if not live.checking and not waited and live.record.get("enabled", True):
+                    live.checking = True
+                    self._submit(self._run_check, node_id, False, True)
+                left = deadline - time.monotonic()
+                if not live.checking or live.probe_state != STATE_CONNECTING or left <= 0:
+                    return PlexDbHold(
+                        f"Checking {name} before sending it Plex database work. That work waits until the node "
+                        "answers; nothing is lost.",
+                        waits=True,
+                    )
+                waited = True
+                self._check_done.wait(left)
 
     # ------------------------------------------------------------------ reports from job code
 
@@ -572,6 +621,7 @@ class NodeRegistry:
                 return
             live.next_check = 0.0
             live.reported_at_check = live.checks_begun
+            live.heard_uid = None
         if self._running():
             self._wake.set()
         else:
@@ -914,6 +964,14 @@ class NodeRegistry:
         if address_changed or old.get("node_uid") != record.get("node_uid"):
             # Another address or key, or the key typed again (which clears the saved id): nothing to confirm now.
             live.unconfirmed_uid = ""
+        restored_uid = old.get("node_uid") != record.get("node_uid") and record.get("node_uid") not in (
+            None,
+            "",
+            live.heard_uid,
+        )
+        if address_changed or restored_uid or (record.get("enabled", True) and not old.get("enabled", True)):
+            # Whoever answers there now (or the id a restored settings file names) is still to be checked.
+            live.heard_uid = None
         if address_changed:
             live.client = self._client_factory(record)
         if reconnect:
@@ -1021,7 +1079,18 @@ class NodeRegistry:
                 with self._lock:
                     live.checks_begun += 1
                     number = live.checks_begun
-                outcome = self._probe(record, client)
+                try:
+                    outcome = self._probe(record, client)
+                except Exception:
+                    # Still a finished check: one that ended here would leave the node as it was (a ready node
+                    # keeps getting work) whatever it answers now.
+                    name = record.get("name") or "The node"
+                    logger.opt(exception=True).warning("Health check of node {} couldn't read its answer", name)
+                    outcome = _Outcome(
+                        STATE_OFFLINE,
+                        f"{name} answered in a way this app couldn't read. Check that the address is the node's and "
+                        "that the node runs this app's version.",
+                    )
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.
@@ -1035,10 +1104,14 @@ class NodeRegistry:
                             "Remove one of them.",
                         )
                     self._apply(live, outcome, number)
+                    new_uid = bool(outcome.uid and not twin and outcome.uid != record.get("node_uid"))
+                    if not new_uid and (outcome.uid or outcome.state != STATE_OFFLINE):
+                        # A new id is settled by ``_new_uid`` first: until then nothing may reach the node.
+                        live.heard_uid = outcome.uid
                     has_access_problem = bool(live.access_problem)
                     access = access or live.access_wanted
                     live.access_wanted = False
-                if outcome.uid and not twin and outcome.uid != record.get("node_uid"):
+                if new_uid:
                     self._new_uid(node_id, live, record, outcome)
                 elif outcome.uid and outcome.uid == record.get("node_uid"):
                     with self._lock:
@@ -1055,6 +1128,7 @@ class NodeRegistry:
         finally:
             with self._lock:
                 live.checking = False
+                self._check_done.notify_all()
 
     def _twin_of(self, node_id: str, uid: str) -> str:
         """The name of another node already saved with id ``uid`` ("" when none; the caller holds the lock)."""
@@ -1068,11 +1142,13 @@ class NodeRegistry:
         if self._new_uid_confirmed(node_id, record, outcome):
             with self._lock:
                 live.unconfirmed_uid = ""
+                live.heard_uid = outcome.uid
             self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
             return
         with self._lock:
             if self._nodes.get(node_id) is not live or live.record.get("node_uid") != record.get("node_uid"):
                 return  # The id was cleared meanwhile (the key typed again): the next check records it.
+            live.heard_uid = outcome.uid
             if live.unconfirmed_uid != outcome.uid:
                 logger.warning(
                     "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work waits "
@@ -1104,6 +1180,9 @@ class NodeRegistry:
 
     def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
         live.probe_state, live.probe_reason, live.probe_cause = outcome.state, outcome.reason, outcome.cause
+        if outcome.state == STATE_OFFLINE and not outcome.uid:
+            # It didn't reach the node: whoever answers there next gives its id again first.
+            live.heard_uid = None
         if outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]

@@ -229,16 +229,18 @@ ENV PUID=1000 \
 # Tell s6-overlay to preserve environment variables
 ENV S6_KEEP_ENV=1
 
-# Web UI port, and the node port for MODE=node
-EXPOSE 8080 9494
+# Web UI port only. A node (MODE=node) is published with -p 9494:9494 instead: with a second exposed port, reverse
+# proxies that route to a container's only exposed port (nginx-proxy given just VIRTUAL_HOST) pick port 80 -> 502.
+EXPOSE 8080
 
 # Health check for the web UI (WEB_PORT), or for a node's /v1/health (NODE_PORT) when MODE=node
 # Uses python3 stdlib instead of curl (one fewer binary dependency).
 # exec replaces the shell so Docker kills the Python process on timeout (no orphans).
 # timeout=5 ensures the process exits if the server is unresponsive.
-# `or`, not get()'s default: an empty NODE_PORT/WEB_PORT is the default port to wrapper.sh (${NODE_PORT:-9494}).
+# `or`, not get()'s default: an empty NODE_PORT/WEB_PORT is the default port. A node reads its port as the node's
+# server does (nodes/server/wsgi.py): FILE__NODE_PORT's file, else NODE_PORT, else AGENT_PORT.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD exec python3 -c "import urllib.request, os; node = os.environ.get('MODE') == 'node'; urllib.request.urlopen('http://localhost:' + ((os.environ.get('NODE_PORT') or '9494') + '/v1/health' if node else (os.environ.get('WEB_PORT') or '8080') + '/api/health'), timeout=5)"
+    CMD exec python3 -c "import urllib.request, os; e = os.environ; node = (e.get('MODE') or '').strip().lower() == 'node'; f = e.get('FILE__NODE_PORT') if node else ''; port = (open(f, encoding='utf-8-sig').read().strip() if f else '') or e.get('NODE_PORT', '').strip() or e.get('AGENT_PORT', '').strip() or '9494'; urllib.request.urlopen('http://localhost:' + (port + '/v1/health' if node else (e.get('WEB_PORT') or '8080') + '/api/health'), timeout=5)"
 
 # Use LinuxServer's /init for PUID/PGID handling
 ENTRYPOINT ["/init", "/app/wrapper.sh"]

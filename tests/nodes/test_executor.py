@@ -656,6 +656,28 @@ class TestErrors:
         assert node_path not in text
         assert f"FFmpeg failed for {media} (exit code 218)" in text
 
+    def test_a_failed_tasks_message_is_one_line_of_bounded_length(self, media):
+        # The app logs it ("Could not extract preview frames ...") and shows it on the file's row in the job.
+        forged = "decode slow\n2026-10-15 03:00:00.000 | ERROR    | web.auth:login:88 - forged" + "x" * 5_000_000
+        error = {"kind": "failed", "message": forged, "error_type": "Runtime\nError"}
+        _install(ScriptedClient([finished(protocol.STATUS_FAILED, error=error)]))
+
+        with pytest.raises(NodeTaskError) as raised:
+            _run(media)
+
+        assert str(raised.value).startswith("decode slow\\n2026-10-15 03:00:00.000 | ERROR")
+        assert "\n" not in str(raised.value) and len(str(raised.value)) < protocol.RELAY_LINE_MAX + 100
+        assert raised.value.error_type == "Runtime\\nError"
+
+    def test_a_reason_the_app_doesnt_know_for_a_file_the_node_cant_see_is_one_line(self, media):
+        error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "x", "reason": "gone\n12:00 | ERROR | forged"}
+        _install(ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)]))
+
+        with pytest.raises(FileNotVisibleError) as raised:
+            _run(media)
+
+        assert str(raised.value) == f"{NODE_NAME} can't see the file: gone\\n12:00 | ERROR | forged"
+
     def test_failure_carries_the_nodes_message_type_and_extra(self, media):
         error = {"kind": "failed", "message": "boom", "error_type": "LoudnessError", "stderr_tail": ["a"]}
         _install(ScriptedClient([finished(protocol.STATUS_FAILED, error=error)]))
@@ -900,8 +922,18 @@ class TestLogsAndProgress:
         )
         assert not any("\n" in line or "\r" in line for line in lines)
 
+    @pytest.mark.parametrize(
+        ("char", "spelled"),
+        [("\u2028", "\\u2028"), ("\u2029", "\\u2029"), ("\x85", "\\x85"), ("\x9b", "\\x9b")],
+        ids=["line-separator", "paragraph-separator", "next-line", "8-bit-csi"],
+    )
+    def test_a_unicode_line_break_or_8_bit_control_in_a_node_line_is_escaped(self, media, char, spelled):
+        lines = self._relayed(media, f"decode slow{char}2026-10-15 03:00:00.000 | ERROR | forged")
+        assert f"NAS/CPU · decode slow{spelled}2026-10-15 03:00:00.000 | ERROR | forged" in lines
+        assert not any(char in line for line in lines)
+
     def test_a_long_node_line_is_cut(self, media):
-        from media_preview_generator.nodes.executor import RELAY_LINE_MAX
+        from media_preview_generator.nodes.protocol import RELAY_LINE_MAX
 
         lines = self._relayed(media, "x" * 5_000_000)
         assert "NAS/CPU · " + "x" * RELAY_LINE_MAX in lines

@@ -33,6 +33,7 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
 import time
 from typing import Any
 
@@ -85,6 +86,8 @@ _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
 _CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
 _IMAGE_ROOT_FS = frozenset({"overlay", "fuse.fuse-overlayfs"})
+# Filesystems in memory: gone at every restart of the container (or the machine).
+_MEMORY_FS = frozenset({"tmpfs", "ramfs"})
 # The volume Docker (and Podman) make for an image's ``VOLUME`` when no ``-v`` names one: 64 hex characters under the
 # engine's ``volumes`` folder. ``docker rm`` + ``docker run`` starts the new container on a new, empty one.
 _UNNAMED_VOLUME_ROOT = re.compile(r"(?:^|/)volumes/[0-9a-f]{64}/_data$")
@@ -126,12 +129,19 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
 
     The plex-db image declares ``VOLUME /config``, so a container started without a volume of its own gets an unnamed
     one there: it is a mount, but the next ``docker rm`` + ``docker run`` leaves it behind for a new, empty one, so it
-    is refused like the container's layer.
+    is refused like the container's layer. A folder in memory (``--tmpfs /config``) loses it at every restart. And a
+    folder the node can't write (a volume mounted read-only, another user's folder) would fail every write on it, so
+    that is refused too, before anything is measured.
 
     Args:
         mountinfo_path: For tests.
     """
-    folder = os.path.dirname(loudness_db.write_log_path())
+    path = loudness_db.write_log_path()
+    return _undo_record_lost(os.path.dirname(path), mountinfo_path) or _undo_record_unwritable(path)
+
+
+def _undo_record_lost(folder: str, mountinfo_path: str) -> str:
+    """Why an undo record in ``folder`` would be lost at an update or restart, or "" (see ``undo_record_problem``)."""
     if _ON_WINDOWS:
         if os.environ.get("CONFIG_DIR", "").strip():
             return ""
@@ -140,6 +150,12 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
     found = mount_of(real, mountinfo_path=mountinfo_path)
     if found is None:
         return ""
+    if found[1] in _MEMORY_FS:
+        return (
+            f"{folder} on this Plex database node is in memory ({found[1]}), so the loudness undo record (and the "
+            f"node's id) would be lost at every restart. Mount a volume there (-v <name>:{found[0]}). Loudness is not "
+            "written until then."
+        )
     if found[0] != "/":
         if not _UNNAMED_VOLUME_ROOT.search(mount_root(real, mountinfo_path=mountinfo_path) or ""):
             return ""
@@ -154,6 +170,29 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
         f"Mount a volume at {folder} on this Plex database node so the loudness undo record survives updates. "
         "Loudness is not written until then."
     )
+
+
+def _undo_record_unwritable(path: str) -> str:
+    """Why the undo record at ``path`` can't be added to, or "" when it can.
+
+    Opened for appending as each write does, without writing anything; while there is none yet, a file is made and
+    removed beside it instead, so a check leaves nothing behind.
+    """
+    folder = os.path.dirname(path)
+    try:
+        if os.path.exists(path):
+            with open(path, "a", encoding="utf-8"):
+                pass
+        else:
+            with tempfile.NamedTemporaryFile(dir=folder or None, prefix=".loudness-writes-check-"):
+                pass
+    except OSError as exc:
+        return (
+            f"This Plex database node can't write its loudness undo record in {folder} "
+            f"({exc.strerror or type(exc).__name__}). Make that folder writable for the user the node runs as (a "
+            "volume mounted read-only can't be). Loudness is not written until then."
+        )
+    return ""
 
 
 def agent_block() -> dict:

@@ -93,6 +93,73 @@ def test_a_worker_node_whose_temp_folder_cant_be_made_exits_once_without_a_trace
     assert output.count("The node didn't start: NODE_TEMP_DIR") == 1, output
 
 
+@pytest.fixture
+def node_env(tmp_path, monkeypatch):
+    from loguru import logger
+
+    from media_preview_generator.nodes.server import wsgi
+
+    for name in ("NODE_PORT", "NODE_HOST", "LOG_LEVEL", "AGENT_TOKEN", "NODE_ROLES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MODE", "node")  # main() setdefaults it; set here, it is undone after the test
+    monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "tmp"))
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("NODE_KEY", KEY)
+    monkeypatch.setattr(wsgi, "_setup_logging", lambda: None)
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(f"{m.record['level'].name} {m.record['message']}"), level="INFO")
+    yield wsgi, lines
+    logger.remove(sink)
+
+
+@pytest.mark.parametrize("port", ["abc", "9494x", "-1", "0", "65536", "9494 9495", "\u0663"])
+def test_a_node_port_that_isnt_a_port_is_one_line_and_exit_1(node_env, monkeypatch, port):
+    wsgi, lines = node_env
+    monkeypatch.setenv("NODE_PORT", port)
+
+    assert wsgi.main([]) == 1
+
+    assert lines == [f"ERROR The node didn't start: NODE_PORT is {port!r}, which isn't a port number from 1 to 65535"]
+
+
+def test_a_bad_port_on_the_command_line_is_one_line_and_exit_1(node_env):
+    wsgi, lines = node_env
+
+    assert wsgi.main(["--port", "abc"]) == 1
+
+    assert [line for line in lines if "NODE_PORT is 'abc'" in line] == lines and len(lines) == 1, lines
+
+
+@pytest.mark.parametrize("value", ["9500", " 9500 ", "9500\r", "9500\r\n", "1", "65535"])
+def test_a_port_with_spaces_or_a_windows_line_ending_around_it_is_that_port(value):
+    from media_preview_generator.nodes.server import wsgi
+
+    assert wsgi._port(value) == int(value)
+
+
+def test_a_crlf_node_port_serves_on_that_port(tmp_path):
+    # An env file saved on Windows: wrapper.sh hands the value on as it is (--port "${NODE_PORT:-9494}").
+    port = _free_port()
+    command = [*_command(port)[:-4], "--port", f"{port}\r", "--threads", "4"]
+    proc = subprocess.Popen(command, cwd=REPO, env=_env(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)  # fmt: skip
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                assert _health(port, 1) == 200
+                break
+            except OSError:
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    proc.kill()
+                    pytest.fail(f"the node never answered: {proc.communicate()[0]}")
+                time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
 def test_half_sent_requests_dont_stop_health_answering(node):
     proc, port = node
     held = []
@@ -141,6 +208,60 @@ def test_sigterm_stops_the_node_while_connections_are_busy(node):
     assert proc.returncode == 0, output
 
 
+def test_the_port_host_and_log_level_can_come_from_files_like_every_other_setting(tmp_path, monkeypatch):
+    # They were read before the FILE__ values were loaded, and both images passed --port from NODE_PORT themselves:
+    # a node given FILE__NODE_PORT listened on 9494 whatever its file said, and FILE__LOG_LEVEL changed nothing, both
+    # logged as "set from" their file.
+    from types import SimpleNamespace
+
+    from loguru import logger
+
+    from media_preview_generator.nodes.server import wsgi
+
+    for name, value in (("port", "9600"), ("host", "127.0.0.1"), ("level", "DEBUG"), ("puid", "99")):
+        (tmp_path / name).write_text(value + "\n")
+    for name in ("NODE_PORT", "NODE_HOST", "AGENT_PORT", "LOG_LEVEL", "PUID"):
+        monkeypatch.setenv(name, "")  # so monkeypatch takes back the values the node sets
+    monkeypatch.setenv("FILE__NODE_PORT", str(tmp_path / "port"))
+    monkeypatch.setenv("FILE__NODE_HOST", str(tmp_path / "host"))
+    monkeypatch.setenv("FILE__LOG_LEVEL", str(tmp_path / "level"))
+    monkeypatch.setenv("FILE__PUID", str(tmp_path / "puid"))
+    levels = []
+    monkeypatch.setattr(wsgi, "_setup_logging", lambda: levels.append(os.environ.get("LOG_LEVEL")))
+    built = SimpleNamespace(extensions={wsgi.EXTENSION: SimpleNamespace(close=lambda **_: None)})
+    monkeypatch.setattr(wsgi, "create_node_app", lambda: built)
+    listened = {}
+
+    def server(app, *, host, port, threads):
+        listened.update(host=host, port=port)
+        raise OSError("the test stops here")
+
+    monkeypatch.setattr(wsgi, "create_node_server", server)
+    warnings: list[str] = []
+    sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING", format="{message}")
+    try:
+        assert wsgi.main(["--threads", "2"]) == 1
+    finally:
+        logger.remove(sink)
+
+    assert listened == {"host": "127.0.0.1", "port": 9600}
+    assert levels == ["", "DEBUG"]  # set up again at the file's level
+    # Read by the container before the node starts: never set from a file, and the log says so.
+    assert os.environ["PUID"] == ""
+    assert any(w.startswith("FILE__PUID is ignored: the container reads PUID before the node starts") for w in warnings)
+
+
+def test_a_node_listens_on_agent_port_when_node_port_isnt_set(monkeypatch):
+    # The Plex database image passed ${NODE_PORT:-${AGENT_PORT:-9494}} itself; the node now reads both.
+    from media_preview_generator.nodes.server import wsgi
+
+    monkeypatch.setenv("NODE_PORT", "")
+    monkeypatch.setenv("AGENT_PORT", "9601")
+    assert wsgi._port(wsgi._parse([]).port) == 9601
+    monkeypatch.setenv("NODE_PORT", "9602")
+    assert wsgi._port(wsgi._parse([]).port) == 9602
+
+
 def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it():
     import threading
 
@@ -168,6 +289,42 @@ def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it()
         assert b" 413 " in status, status
     finally:
         server.close()
+
+
+def test_a_body_the_node_accepts_is_never_written_to_a_temp_file_before_the_app_sees_it(monkeypatch):
+    # waitress reads a body whole before the app checks the key, writing one past 512 KB to a temp file as it
+    # arrives: under the old 4 MB limit a thousand key-less connections held 4 GB of the node's temp disk.
+    import threading
+
+    from waitress import buffers
+
+    from media_preview_generator.nodes.server import wsgi
+
+    spooled = []
+    to_temp_file = buffers.OverflowableBuffer._set_large_buffer
+
+    def recorded(self):
+        spooled.append(len(self))
+        to_temp_file(self)
+
+    monkeypatch.setattr(buffers.OverflowableBuffer, "_set_large_buffer", recorded)
+
+    def app(environ, start_response):
+        environ["wsgi.input"].read()
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"read"]
+
+    server = wsgi.create_node_server(app, host="127.0.0.1", port=0, threads=1)
+    threading.Thread(target=server.run, daemon=True).start()
+    try:
+        body = b"x" * (wsgi.MAX_REQUEST_BODY_BYTES - 1)  # the largest it takes: waitress refuses the limit itself
+        head = b"POST /v1/tasks HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: %d\r\n\r\n" % len(body)
+        with socket.create_connection(("127.0.0.1", server.effective_port), timeout=10) as sock:
+            sock.sendall(head + body)
+            assert b" 200 " in sock.recv(64)
+    finally:
+        server.close()
+    assert spooled == []
 
 
 @pytest.fixture
@@ -242,6 +399,67 @@ def test_connections_are_counted_per_caller_network_not_per_address(served, monk
     finally:
         for conn in held:
             conn.close()
+
+
+def _keep_alive(port: int, source: str) -> socket.socket:
+    """A connection that had its answer and stays open, as each of the app's worker threads keeps one."""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0))
+    conn.sendall(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert b" 200 " in conn.recv(4096)
+    return conn
+
+
+def _closed_by_the_node(conn: socket.socket) -> bool:
+    conn.settimeout(1.0)
+    try:
+        while conn.recv(4096):
+            pass  # the rest of the last answer
+    except TimeoutError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def _answer_from(port: int, source: str) -> bytes:
+    try:
+        return _health_from(port, source)
+    except OSError:
+        return b""
+
+
+def test_an_address_at_its_limit_gives_up_an_idle_keep_alive_rather_than_refuse(served):
+    # One keep-alive per worker thread running a file here: 110 workers against a 100-connection limit left 10 polls
+    # refused every second, and each refused poll handed a file back.
+    port = served(CONNECTIONS_PER_ADDRESS=5)
+    idle = [_keep_alive(port, "127.0.0.1") for _ in range(5)]
+    try:
+        assert b" 200 " in _answer_from(port, "127.0.0.1")
+        assert sum(_closed_by_the_node(conn) for conn in idle) == 1
+    finally:
+        for conn in idle:
+            conn.close()
+
+
+def test_an_address_whose_every_connection_is_busy_is_still_refused(served):
+    port = served(CONNECTIONS_PER_ADDRESS=5)
+    held = [_half_sent(port, "127.0.0.2") for _ in range(5)]
+    try:
+        time.sleep(0.5)
+        assert _answer_from(port, "127.0.0.2") == b""
+        assert not any(_closed_by_the_node(conn) for conn in held)
+    finally:
+        for conn in held:
+            conn.close()
+
+
+def test_one_address_may_hold_a_connection_for_every_worker_one_app_can_give_a_node():
+    from media_preview_generator.nodes.server import wsgi
+    from media_preview_generator.worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
+
+    assert wsgi.CONNECTIONS_PER_ADDRESS > MAX_CPU_WORKERS + MAX_GPU_WORKERS
+    # And still no single machine takes every connection the node has, Windows' smaller limit included.
+    assert wsgi.CONNECTIONS_PER_ADDRESS < wsgi.SELECT_CONNECTION_LIMIT <= wsgi.CONNECTION_LIMIT
 
 
 def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):

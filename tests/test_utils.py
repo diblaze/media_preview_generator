@@ -22,6 +22,7 @@ from media_preview_generator.utils import (
     redact_secrets,
     redacted_traceback,
     sanitize_path,
+    scratch_dir,
     setup_working_directory,
 )
 
@@ -372,6 +373,7 @@ class TestNodeHints:
 
     APP = {
         "gpu_settings_hint": "Settings → Processing Options → GPU Configuration",
+        "cpu_workers_hint": "Settings → Workers",
         "gpu_details_hint": "Settings → Processing Options → GPU Configuration",
         "log_viewer_hint": "the live web log viewer",
         "working_folder_hint": ("the working folder", "Settings → Advanced"),
@@ -379,6 +381,7 @@ class TestNodeHints:
     }
     NODE = {
         "gpu_settings_hint": "the app's Settings → Workers",
+        "cpu_workers_hint": "the app's Settings → Workers",
         "gpu_details_hint": "this node's Overview tab on the app's Nodes page",
         "log_viewer_hint": "this node's Log tab on the app's Nodes page",
         "working_folder_hint": ("the node's temp folder", "NODE_TEMP_DIR"),
@@ -403,6 +406,28 @@ class TestNodeHints:
         advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
 
         assert "the node's temp folder (NODE_TEMP_DIR) isn't full" in advice and "Settings" not in advice
+
+    @pytest.mark.parametrize("kind", ["codec", "hwaccel", "signal", "stopped_part_way"])
+    def test_a_nodes_gpu_to_cpu_retry_advice_names_no_screen_of_the_apps_own_devices(self, monkeypatch, kind):
+        # A node's GPUs and CPU are worker-group members in the app; the app's GPU tuning doesn't list them.
+        from media_preview_generator.processing import generator
+
+        monkeypatch.setenv("MODE", "node")
+
+        advice = generator.gpu_fallback_advice(kind)
+
+        assert "Processing Options" not in advice and "Settings → CPU" not in advice, advice
+        assert "the app's" in advice or "this node's" in advice, advice
+
+    def test_the_apps_retry_advice_names_screens_it_has(self, monkeypatch):
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+
+        assert "under Settings → Workers." in generator.gpu_fallback_advice(generator.FALLBACK_CODEC)
+        assert "under Settings → Processing Options → GPU Configuration." in generator.gpu_fallback_advice(
+            generator.FALLBACK_HWACCEL
+        )
 
 
 def _running(pid: int) -> bool:
@@ -920,3 +945,21 @@ class TestAtomicJsonSaveWithBackup:
         # This should NOT raise — backup is best-effort.
         utils.atomic_json_save_with_backup(str(target), {"v": 2})
         assert _json.loads(target.read_text())["v"] == 2
+
+
+class TestScratchDir:
+    def test_a_node_uses_its_own_temp_folder(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", f"  {tmp_path}  ")
+        assert scratch_dir() == str(tmp_path)
+
+    def test_a_node_without_one_and_the_app_use_the_system_temp_folder(self, monkeypatch, tmp_path):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", "")
+        assert scratch_dir() == str(tmp_path)
+        monkeypatch.delenv("MODE")
+        monkeypatch.setenv("NODE_TEMP_DIR", "/elsewhere")  # a node's setting: the app has no use for it
+        assert scratch_dir() == str(tmp_path)

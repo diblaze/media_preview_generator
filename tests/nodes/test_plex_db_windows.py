@@ -385,6 +385,43 @@ class TestTheInstaller:
         # New-Item -Force on an existing registry key deletes it: every other program's logon entry with it.
         assert "New-Item -Path $RunKey -Force" not in self.SCRIPT
 
+    def test_it_installs_the_uninstaller_with_the_program(self):
+        # The unzipped download may be long gone when the node is removed.
+        assert "Copy-Item -Force $Uninstaller $InstallDir" in self.SCRIPT
+        readme = (REPO_ROOT / "nodes" / "windows" / "README.md").read_text()
+        assert r"$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1" in readme
+
+
+class TestTheUninstaller:
+    """uninstall.ps1 can't run here; ``windows-node.yml`` runs it. The loudness undo record is the only way to put
+    Plex's audio tracks back, so removing the node's data must not take it unless asked to by name."""
+
+    SCRIPT = (REPO_ROOT / "nodes" / "windows" / "uninstall.ps1").read_text()
+    README = (REPO_ROOT / "nodes" / "windows" / "README.md").read_text()
+
+    def test_it_names_the_record_the_node_writes(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+        assert f'$UndoRecord = "{os.path.basename(loudness_db.write_log_path())}"' in self.SCRIPT
+
+    def test_remove_data_keeps_the_undo_record_unless_it_is_asked_for(self):
+        assert "Remove-Item -Recurse -Force $NodeDir" not in self.SCRIPT
+        assert "if ($_.Name -eq $UndoRecord) { $RemoveUndoRecord } else { $RemoveData }" in self.SCRIPT
+
+    def test_the_help_and_the_readme_say_so(self):
+        help_text = self.SCRIPT.split("#>", 1)[0]
+        removal = next(line for line in self.README.split("\n\n") if "-RemoveData" in line)
+        for text in (help_text, removal):
+            assert "-RemoveUndoRecord" in text and "loudness undo record" in text
+
+    def test_it_steps_out_of_the_program_folder_before_deleting_it(self):
+        # Run from its installed copy, it deletes the folder it runs from; Windows can't delete a working folder.
+        left = self.SCRIPT.index("Set-Location $env:USERPROFILE")
+        assert left < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
+        assert "[Environment]::CurrentDirectory = $env:USERPROFILE" in self.SCRIPT
+
+    def test_it_says_where_the_kept_record_is(self):
+        assert '" Its loudness undo record stays: $record"' in self.SCRIPT
+
 
 def test_off_windows_the_preferences_file_beside_the_database_names_plex(tmp_path, monkeypatch):
     folder = tmp_path / "Plex Media Server"

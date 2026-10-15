@@ -195,6 +195,26 @@ Plex's database for a Plex on another machine or on Windows. Stored in `settings
 `nodes_revision` goes up by one on every change. A node that a worker group member or a Plex server uses can't be
 removed (`409`, naming what uses it).
 
+### A node's own settings
+
+Environment variables of the node's container (the app's image started with `MODE=node`, or the
+[Plex database node](#plex-marker-agent) image). See the [remote nodes guide](guides.md#remote-nodes).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MODE` | | `node` starts the app's image as a node instead of the app. |
+| `NODE_NAME` | the hostname | The name the node reports; Add node suggests it. |
+| `NODE_ROLES` | `worker` | `worker`, `plex_db`, or both: `worker,plex_db`. |
+| `NODE_KEY` | made on first start | The key the app sends, at least 16 characters. Without it the node makes one, keeps it in `/config/node.json` and prints it once in its log. |
+| `NODE_HOST` | `0.0.0.0` | The address the node listens on inside the container. |
+| `NODE_PORT` | `9494` | The port the node listens on inside the container; change the published port (`-p`) to match. |
+| `NODE_TEMP_DIR` | `/tmp/mpg-node` | Where a worker node makes a folder for each file it is sent. Point it at a bigger or faster disk, or at a volume in a read-only container. |
+| `FILE__<NAME>` | | Sets `<NAME>` to the contents of the file it names (a Docker secret), e.g. `FILE__NODE_KEY=/run/secrets/node_key`. |
+| `PUID` / `PGID` | `1000` | The user the node runs as: one that can read your media and, for the Plex database role, owns Plex's database. |
+| `PLEX_CONFIG_DIR` | | Plex database role: Plex's config folder as the container sees it. The database path is derived from it; the app never sends a path. |
+| `CONFIG_DIR` | `/config` | The node's own folder: its id, its key and the loudness undo record. Mount it so they survive an update. |
+| `LOG_LEVEL` | `INFO` | How much the node logs; `DEBUG` for more. |
+
 ### Per-GPU tuning (gpu_config)
 
 **Settings → Processing → GPU device tuning** sets **FFmpeg threads per worker** for each detected GPU. Worker
@@ -322,6 +342,7 @@ These are not migrated to settings.json and remain in effect:
 | `PLEX_DATA_ROOT` | `/` | Restricts where Plex config folders can be validated. Defaults to the whole filesystem; set it to e.g. `/plex` to refuse anything outside that root. |
 | `MEDIA_ROOT` | `/` | Same as `PLEX_DATA_ROOT` but for media paths (manual jobs, the inspector, the file picker). |
 | `RATELIMIT_STORAGE_URL` | `memory://` | Backend for rate-limit counters. The default in-memory store is fine for a single container. |
+| `REQUESTS_CA_BUNDLE` | Built-in list | A certificate file the app trusts for https instead of its built-in list, e.g. for a [node behind https](guides.md#a-node-behind-a-reverse-proxy) with your own certificate. Keep the public authorities in it: it applies to every https connection. |
 | `CONFIG_BACKUP_KEEP` | `10` | Snapshots kept per config file. Used only until you set it in **Settings → Backups**. 1–100. |
 | `CONFIG_BACKUP_MAX_AGE_DAYS` | `0` | Drop snapshots older than this many days (`0` = off). Used only until you set it in **Settings → Backups**. 0–365. |
 
@@ -507,18 +528,15 @@ An Emby server's block has `"emby": {"on_emby_redetect": "restore"}` in place of
 The small container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`),
 added on the Nodes page and chosen per server in `plex.agent`. Its setup, compose file, build steps and version rules
 are in its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md); the app
-side is `media_preview_generator/markers/publishers/plex_remote.py`. Its own settings:
+side is `media_preview_generator/markers/publishers/plex_remote.py`. Its settings are a node's own
+([A node's own settings](#a-nodes-own-settings)), plus:
 
 | Variable | Notes |
 |---|---|
-| `NODE_KEY` | The key the node's record on the Nodes page holds. At least 16 characters. Left unset (with no `AGENT_TOKEN`), the node makes a key and prints it once in its log. |
 | `AGENT_TOKEN` | The key's name from the Plex marker agent; still works when `NODE_KEY` isn't set. |
-| `PLEX_CONFIG_DIR` | Plex's config folder as the agent's container sees it. The database path is derived from it; the app never sends a path. |
-| `PLEX_CONFIG` | Compose only: Plex's config folder on the agent's host, mounted at `/plex`. Required. |
-| `NODE_PORT` | Port to listen on. Default `9494`; `AGENT_PORT` still works when `NODE_PORT` isn't set. |
+| `AGENT_PORT` | The port's name from the Plex marker agent; still works when `NODE_PORT` isn't set. |
+| `PLEX_CONFIG` | Compose only: Plex's config folder on the node's host, mounted at `/plex`. Required. |
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
-| `PUID` / `PGID` | The user that owns Plex's database. Default `1000`. |
-| `CONFIG_DIR` | The helper's own folder, `/config` (a volume in the compose file): its node id and the undo record of each loudness write. |
 
 Every request carries the key and the protocol the app speaks, and every answer carries the node's version and the
 protocols it speaks; a mismatch in either direction is refused before anything is written.
@@ -1345,7 +1363,7 @@ All endpoints use the normal session/API authentication and are also available d
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, current `capacity`, `warnings` and global pause state |
+| GET | `/api/worker-groups` | Saved groups, optimistic `revision`, app `timezone`, `limits`, detected `hardware`, `nodes` (each added node's id, name, state and reason, with its GPUs and CPU cores, for the device picker; never its address or key), current `capacity`, `warnings` and global pause state |
 | PUT | `/api/worker-groups` | Replace the complete group list with `{"groups":[...],"revision":N}`. `400` rejects invalid configuration; `409` means another change advanced the revision. Reload and reconcile before resubmitting. |
 | POST | `/api/worker-groups/{id}/scale` | Atomic saved adjustment: exactly `{"delta":1}`, `{"delta":-1}` or `{"enabled":true/false}`. `delta` works on single-member groups; on a group with several members it returns `409` (use the member route). `404` for an unknown group, `400` for an invalid action or capacity limit. |
 | POST | `/api/worker-groups/{id}/members/{member_id}/scale` | Add or remove one worker on one device: exactly `{"delta":1}` or `{"delta":-1}`. `404` for an unknown group or member, `409` when the group is disabled, `400` outside 1–64 workers or past a capacity limit. |

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import http.server
+import re
 import threading
 import time
 from pathlib import Path
@@ -12,6 +14,7 @@ from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.client import (
     NodeAuthError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
     NodeUnreachableError,
 )
@@ -254,6 +257,12 @@ class TestListAndProbe:
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "refused"
 
+    def test_probe_of_a_node_holding_this_address_back_says_so(self, client, nodes):
+        # It answered (429): Add node must not word it as "Nothing answered at this address".
+        nodes("http://nuc:9494").info_answer = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "unreachable" and body["error"]["reason"] == "rate_limited"
+
     def test_probe_of_this_apps_own_address_says_it_is_this_app(self, client, nodes):
         own = client.application.config["APP_INSTANCE_ID"]
         nodes("http://nuc:9494").info_answer = NodeProtocolError("app", app_instance=own)
@@ -274,6 +283,23 @@ class TestListAndProbe:
         nodes("http://nuc:9494").info_answer = NodeProtocolError("html", web_page=True)
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
         assert body["error"]["reason"] == "web_page"
+
+    def test_probe_of_something_else_that_answers_says_it_is_not_a_node(self, client, nodes, monkeypatch):
+        # An Emby or Jellyfin address: "update the node" would send the user the wrong way.
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("unreachable", ""))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"] == {
+            "kind": "protocol",
+            "message": "Something else answers at this address, not a node.",
+            "reason": "not_a_node",
+        }
+
+    def test_probe_of_a_plex_helper_on_another_protocol_stays_a_version_problem(self, client, nodes, monkeypatch):
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: ("incompatible", "0.3.0"))
+        nodes("http://nuc:9494").info_answer = NodeProtocolError("404")
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["error"]["kind"] == "protocol" and "reason" not in body["error"]
 
     def test_this_apps_answers_carry_its_instance_id(self, client, nodes):
         resp = client.get("/v1/info")
@@ -356,6 +382,33 @@ class TestListAndProbe:
         assert body["ok"] is False and body["error"]["kind"] == "protocol"
         assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
         assert pinged == []
+
+
+class _NotANode(http.server.BaseHTTPRequestHandler):
+    """What Emby or Jellyfin answers at a path it doesn't have: 404 in plain text."""
+
+    def _answer(self) -> None:
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = _answer  # noqa: N815
+    do_POST = _answer  # noqa: N815
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def test_probe_of_a_media_server_address_says_it_is_not_a_node(client):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NotANode)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with client.application.app_context():
+            answer = api_nodes._probe(f"http://127.0.0.1:{server.server_address[1]}", "k" * 32)
+    finally:
+        server.shutdown()
+    assert answer["error"]["reason"] == "not_a_node"
 
 
 class TestCreate:
@@ -624,6 +677,38 @@ class TestUpdate:
         client.put(f"/api/nodes/{row['id']}", json={"key": "another-key"})
         assert _row(client, row["id"])["edit_tag"] == row["edit_tag"]
 
+    @pytest.mark.parametrize(
+        ("change", "forgotten"),
+        [
+            ({"url": "http://nuc2:9494", "key": "node-key"}, True),
+            ({"key": "another-key"}, True),
+            ({"enabled": False}, True),
+            ({"name": "renamed"}, False),
+        ],
+        ids=["moved", "new-key", "turned-off", "renamed"],
+    )
+    def test_a_change_of_address_key_or_switch_forgets_its_servers_intro_and_credits_answers(
+        self, client, nodes, change, forgotten
+    ):
+        """A server names only its node: the node's address lives here, so the server's cached answer can't see it."""
+        from media_preview_generator.markers import inspect
+        from media_preview_generator.servers.registry import server_config_from_dict
+
+        nodes("http://nuc2:9494")
+        node_id = _add(client).get_json()["id"]
+        other = {**_plex_server({"enabled": True, "node_id": "another-node"}), "id": "p2"}
+        _sm().set("media_servers", [_plex_server({"enabled": True, "node_id": node_id}), other])
+        inspect.clear_capability_cache()
+        configs = [server_config_from_dict(entry) for entry in _sm().get("media_servers")]
+        for config in configs:
+            inspect._CAPABILITY_CACHE.get(config, "status", lambda: "old node's answer")
+
+        assert client.put(f"/api/nodes/{node_id}", json=change).status_code == 200
+
+        answers = [inspect._CAPABILITY_CACHE.get(config, "status", lambda: "asked again") for config in configs]
+        assert answers == ["asked again" if forgotten else "old node's answer", "old node's answer"]
+        inspect.clear_capability_cache()
+
 
 class TestDelete:
     def test_a_list_that_wont_save_is_a_400_not_a_500(self, client, nodes, monkeypatch):
@@ -886,6 +971,25 @@ class TestHealthAndLog:
             ]
         }
 
+    def test_a_log_line_with_a_time_outside_what_a_date_holds_keeps_the_log_tab_working(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        nodes("http://nuc:9494").log_answer = {
+            "lines": [
+                {"time": "", "ts": 1e20, "level": "INFO", "message": "far future"},
+                {"time": "", "ts": 253402300800, "level": "INFO", "message": "year 10000"},
+                {"time": "", "ts": 10**400, "level": "INFO", "message": "too big for a float"},
+                {"time": "0001-01-01T00:00:00-12:00", "level": "INFO", "message": "year 1 in the app's zone"},
+            ]
+        }
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 200
+        assert [line["message"] for line in resp.get_json()["lines"]] == [
+            "far future",
+            "year 10000",
+            "too big for a float",
+            "year 1 in the app's zone",
+        ]
+
     def test_log_errors(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         assert client.get(f"/api/nodes/{node_id}/log?lines=x").status_code == 400
@@ -902,7 +1006,8 @@ class TestHealthAndLog:
         assert resp.status_code == 200
         assert resp.get_json() == {
             "lines": [],
-            "message": "This node is an older Plex helper and can't share its log. Update it to see its log here.",
+            "message": "This Plex database node is an older release and can't share its log. Update it to see its "
+            "log here.",
         }
 
 
@@ -1180,6 +1285,30 @@ class TestNodeSentValues:
         assert {row["id"] for row in resp.get_json()["nodes"]} == {good, bad}
         assert {v.id for v in reg.get_registry().views()} == {good, bad}
 
+    def test_a_whole_number_too_big_for_a_float_still_updates_the_nodes_state(self, client, nodes):
+        # json.loads makes a 401-digit JSON integer a Python int, and math.isfinite raised OverflowError on it: every
+        # check failed "unexpectedly" and a node that had been ready stayed ready, whatever it answered now.
+        node = nodes("http://nuc:9494")
+        node_id = _add(client).get_json()["id"]
+        assert _checked(client, node_id)["state"] == "ready"
+        answer = _info(version="1.0.0")
+        answer["worker"]["cpu"]["cores"] = 10**400
+        node.info_answer = answer
+
+        row = _checked(client, node_id)
+
+        assert row["state"] == reg.STATE_UPDATE_NEEDED
+        assert row["cpu"]["cores"] is None
+
+    def test_add_nodes_connect_answers_for_a_whole_number_too_big_for_a_float(self, client, nodes):
+        answer = _info()
+        answer["worker"]["cpu"]["cores"] = 10**400
+        nodes("http://nuc:9494").info_answer = answer
+
+        resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "node-key"})
+
+        assert resp.status_code == 200 and resp.get_json()["info"]["worker"]["cpu"]["cores"] is None
+
     def test_a_deeply_nested_answer_from_one_node_keeps_every_node_listed(self, client, nodes):
         import json
 
@@ -1295,6 +1424,23 @@ class TestTheReference:
 
     REFERENCE = Path(__file__).resolve().parents[2] / "docs" / "reference.md"
 
+    def test_every_setting_a_node_reads_is_in_the_reference(self):
+        # A user moving the node's temp folder (named by its own Setup Health) must find NODE_TEMP_DIR somewhere.
+        server = Path(api_nodes.__file__).resolve().parents[2] / "nodes" / "server"
+        read = {"MODE", "FILE__"}
+        for module in ("app.py", "identity.py", "wsgi.py", "tasks.py"):
+            source = (server / module).read_text(encoding="utf-8")
+            read |= set(re.findall(r'environ(?:\.get\(|\[)"([A-Z][A-Z0-9_]*)"', source))
+        read.discard("NODE_IMAGE_ROLES")  # set by the Plex database image itself, never by a user
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        assert {"NODE_TEMP_DIR", "NODE_HOST", "NODE_NAME"} <= read
+        assert sorted(name for name in read if f"`{name}" not in text) == []
+
+    def test_the_worker_groups_snapshot_documents_its_nodes(self):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        row = next(line for line in text.splitlines() if "| GET | `/api/worker-groups` |" in line)
+        assert "`nodes`" in row
+
     def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
         text = self.REFERENCE.read_text(encoding="utf-8")
         missing = []
@@ -1312,3 +1458,25 @@ class TestTheReference:
         assert default_plex_agent() == {"enabled": False, "node_id": None}
         assert '"agent": {"enabled": false, "node_id": null}' in text and "`plex.agent.node_id`" in text
         assert "`plex.agent.url`" not in text and "`plex.agent.token`" not in text
+
+
+class TestTheGuide:
+    """The docs a user reads to understand a node card, and the pages that offer another machine's GPU."""
+
+    DOCS = Path(__file__).resolve().parents[2] / "docs"
+
+    def test_it_names_every_state_a_node_card_shows(self):
+        # Every page takes a node state's name from app.js's one map.
+        js = (Path(api_nodes.__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        block = js.split("window.NODE_STATES = Object.freeze({", 1)[1].split("});", 1)[0]
+        labels = re.findall(r"\w+: \{ tone: '\w+', label: '([^']+)'", block)
+        guide = (self.DOCS / "guides.md").read_text(encoding="utf-8")
+        section = guide.split("## Remote nodes", 1)[1].split("\n## ", 1)[0]
+        assert "Temp folder problem" in labels and "Added twice" in labels
+        assert [label for label in labels if f"**{label}**" not in section] == []
+
+    @pytest.mark.parametrize(
+        "page", ["multi-server.md", "faq.md", "jellyfin-trickplay-gpu.md", "plex-preview-thumbnails-slow.md"]
+    )
+    def test_every_page_offering_another_machine_links_remote_nodes(self, page):
+        assert "guides.md#remote-nodes" in (self.DOCS / page).read_text(encoding="utf-8")

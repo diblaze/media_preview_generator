@@ -51,6 +51,8 @@ UPDATE_DOCS_URL = "https://github.com/stevezau/media_preview_generator/blob/main
 # The last Plex database check of each (address, key hash), for the node list (cached_file_checks).
 _last_reports: dict[tuple[str, str], Any] = {}
 _last_reports_lock = threading.Lock()
+# The Linux Plex database node's image, still published under the Plex marker agent's name (nodes/plex-db/README.md).
+PLEX_DB_IMAGE = "ghcr.io/stevezau/plex-marker-agent"
 # Node-only row keys; the shared row builder doesn't know them.
 _NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label", "docs_url")
 # An offline node that answered at its address: (row label, where the fix is). A restart ends by itself, and a node
@@ -240,16 +242,20 @@ def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> 
             )
         )
     if view.legacy:
+        from .server.plex_db import AGENT_VERSION
+
         rows.append(
             _row(
                 "node_legacy_helper",
-                "This is an older Plex helper",
+                "This Plex database node is an older release",
                 severity=RECOMMENDED,
                 ok=False,
-                explanation="It keeps working for Plex's database. Updating it to a node adds health details and "
-                "the newer Plex database features.",
-                reason="Update it to the Plex database node image.",
+                explanation="It keeps working for Plex's database. Updating it adds health details and the newer "
+                "Plex database features.",
+                reason=f"Update its image to {PLEX_DB_IMAGE}:{AGENT_VERSION}.",
                 fix_where=FIX_ON_NODE,
+                docs_url=UPDATE_DOCS_URL,
+                help_label="How to update a node",
             )
         )
     return rows

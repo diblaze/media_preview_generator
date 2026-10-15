@@ -3,10 +3,11 @@
     Install the Plex database node for this Windows user, start it at every logon, and start it now.
 
 .DESCRIPTION
-    Copies the built PlexDbNode folder to %LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode, adds a
-    "run at logon" entry for this user only (HKCU\Software\Microsoft\Windows\CurrentVersion\Run: no admin, and the
-    node runs as the same user as Plex, which is what lets it open Plex's database), starts it, and prints the address
-    and key to paste into the app (Settings -> Nodes -> Add node).
+    Copies the built PlexDbNode folder and uninstall.ps1 to %LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode,
+    adds a "run at logon" entry for this user only (HKCU\Software\Microsoft\Windows\CurrentVersion\Run: no admin, and
+    the node runs as the same user as Plex, which is what lets it open Plex's database), starts it, and prints the
+    address and key to paste into the app (Settings -> Nodes -> Add node). Run it again to update the node: its key
+    stays.
 
     With NODE_KEY set in this session, the node uses that key, and the installer keeps it in the node's node.json: the
     logon entry starts the node without this session's environment.
@@ -69,6 +70,9 @@ if ($Source -ne $InstallDir) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Recurse -Force (Join-Path $Source "*") $InstallDir
 }
+# The uninstaller goes with the program, so removing the node later doesn't need this download kept.
+$Uninstaller = Join-Path $PSScriptRoot "uninstall.ps1"
+if ((Test-Path $Uninstaller) -and $PSScriptRoot -ne $InstallDir) { Copy-Item -Force $Uninstaller $InstallDir }
 $Exe = Join-Path $InstallDir "PlexDbNode.exe"
 
 $NodeArgs = @("--port", "$Port")

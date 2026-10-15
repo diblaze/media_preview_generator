@@ -179,6 +179,29 @@ class TestStates:
         assert view.state == reg.STATE_OFFLINE
         assert view.reason.startswith("nuc accepts connections but doesn't answer.")
 
+    @pytest.mark.parametrize("where", ["info", "older-helper-ping"])
+    def test_a_check_that_cant_read_the_answer_takes_a_ready_node_offline(self, h, where):
+        # The check used to end at the exception and leave the node's state alone: a ready node stayed ready, and
+        # kept getting work, whatever it answered now.
+        client = h.client()
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+        if where == "info":
+            client.default_info = RecursionError("maximum recursion depth exceeded")
+        else:
+            client.default_info = NodeProtocolError("404")
+
+            def ping(url, key):
+                raise RecursionError("maximum recursion depth exceeded")
+
+            h.registry._legacy_ping = ping
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_OFFLINE and view.reason.startswith(
+            "nuc answered in a way this app couldn't read"
+        )
+        assert h.registry.capacity("n1").cpu is False
+
     def test_one_failed_attempt_is_not_offline(self, h):
         client = h.client()
         client.infos = [NodeUnreachableError("x")]
@@ -638,6 +661,22 @@ class TestGpuLost:
         h.client().default_info = _info(gpus=[GPU_OK])
         assert h.registry.check_now("n1").state == reg.STATE_READY
 
+    def test_a_gpu_error_the_node_sends_is_logged_as_one_line(self, h):
+        from loguru import logger
+
+        failing = _info()
+        failing["worker"]["gpu_error"] = "GPU busy\n2026-10-15 03:00:00.000 | ERROR    | web.auth:login:88 - forged"
+        h.client().default_info = failing
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(m.record["message"]), format="{message}")
+        try:
+            h.registry.check_now("n1")
+        finally:
+            logger.remove(sink)
+
+        assert any("GPU busy\\n2026-10-15" in line for line in lines)
+        assert not any("\n" in line for line in lines)
+
     def test_the_health_loop_rescans_a_node_that_couldnt_detect_its_gpus(self, h):
         failing = _info()
         failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
@@ -1087,6 +1126,91 @@ class TestNewPlexDatabaseNodeId:
         self._answer(h, "uid-1", "")
         assert h.registry.plex_db_refusal("n1") == ""
         h.registry.stop()
+
+
+class TestPlexDatabaseNodeNotHeardSinceStart:
+    """Which machine answers at a Plex database node's address is known only from a check that reached it.
+
+    After a restart, or once a check found the node down, another machine (a new id, a Plex machine id it can't
+    read) could be answering there with the saved key: until a check hears the node, its Plex database work waits.
+    """
+
+    @pytest.fixture
+    def h(self):
+        harness = Harness(nodes=[_record(node_uid="uid-1")])
+        harness.registry._served_plex_ids = lambda node_id: ["plex-a"]
+        yield harness
+        harness.registry.stop()
+
+    @staticmethod
+    def _answer(uid):
+        info = _info(uid=uid, roles=(ROLE_PLEX_DB,))
+        info["plex_db"] = {"machine_identifier": ""}
+        return info
+
+    def test_work_asked_for_before_the_first_check_waits_for_it_and_a_swapped_machine_is_refused(self, h):
+        h.client().default_info = self._answer("uid-2")
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold is not None and not hold.waits
+        assert "reports a new id" in hold.message
+        assert h.client().info_calls == 1
+
+    def test_work_asked_for_before_the_first_check_goes_ahead_once_it_hears_the_saved_id(self, h):
+        h.client().default_info = self._answer("uid-1")
+
+        assert h.registry.plex_db_hold("n1") is None
+        assert h.client().info_calls == 1
+
+    def test_after_a_check_found_it_down_its_work_waits_and_a_check_starts_at_once(self, h):
+        client = h.client()
+        client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
+        client.default_info = self._answer("uid-2")
+        h.registry.check_now("n1")
+        assert h.registry.view("n1").state == reg.STATE_OFFLINE
+
+        hold = h.registry.plex_db_hold("n1")
+
+        assert hold == reg.PlexDbHold(
+            "Checking nuc before sending it Plex database work. That work waits until the node answers; nothing is "
+            "lost.",
+            waits=True,
+        )
+        assert _wait_for(lambda: "reports a new id" in h.registry.plex_db_refusal("n1"))
+
+    def test_a_node_heard_with_its_saved_id_that_goes_down_is_held_again(self, h):
+        client = h.client()
+        client.default_info = self._answer("uid-1")
+        h.registry.check_now("n1")
+        assert h.registry.plex_db_hold("n1") is None
+
+        client.infos = [NodeUnreachableError("down")] * reg.CHECK_ATTEMPTS
+        h.registry.check_now("n1")
+
+        assert h.registry.plex_db_hold("n1").waits
+
+    @pytest.mark.parametrize("how", ["reported-unavailable", "another-address"])
+    def test_a_node_heard_with_its_saved_id_is_held_again_when(self, h, how):
+        h.client().default_info = self._answer("uid-1")
+        h.registry.check_now("n1")
+        assert h.registry.plex_db_hold("n1") is None
+
+        if how == "reported-unavailable":
+            h.client().default_info = NodeUnreachableError("down")
+            h.registry.report_unavailable("n1")
+        else:
+            h.change(url="http://other:9494")
+            h.client().default_info = NodeUnreachableError("down")  # the new client: nothing answers there yet
+
+        assert h.registry.plex_db_hold("n1").waits
+
+    def test_a_node_without_a_saved_id_is_never_held(self, h):
+        h.change(node_uid=None)
+        h.client().default_info = NodeUnreachableError("down")
+
+        assert h.registry.plex_db_hold("n1") is None
+        assert h.client().info_calls == 0
 
 
 def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h):

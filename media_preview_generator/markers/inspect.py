@@ -218,6 +218,24 @@ def forget_capability(server_id: str) -> None:
     _CAPABILITY_CACHE.forget(server_id)
 
 
+def forget_node_capability(node_id: str) -> None:
+    """Forget the cached answers of every Plex server whose Plex database node is ``node_id``.
+
+    A server's config names only the node; the node's address, key and switch live in the nodes list, so a change
+    there doesn't change the server's fingerprint and its old node's answer would be served for up to a minute.
+
+    Args:
+        node_id: The node whose address, key or switch changed.
+    """
+    from ..nodes.settings import server_agent
+    from ..web.settings_manager import get_settings_manager
+
+    for entry in get_settings_manager().get("media_servers") or []:
+        agent = server_agent(entry)
+        if agent is not None and agent.get("node_id") == node_id and entry.get("id"):
+            _CAPABILITY_CACHE.forget(str(entry["id"]))
+
+
 def _marker_dict(marker: Any) -> dict:
     return {"type": marker.type.value, "start_ms": marker.start_ms, "end_ms": marker.end_ms}
 

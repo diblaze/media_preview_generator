@@ -294,6 +294,91 @@ class TestTempFolder:
         assert os.listdir(tmp_path) == []
 
 
+class TestATempFolderThatFilledUp:
+    """After a task fills the temp folder its folder is removed and a fresh check finds room, so the node keeps the
+    problem itself: until the folder has more room than that task started with, or a task started later finishes."""
+
+    MB = 1 << 20
+
+    @pytest.fixture
+    def free(self, monkeypatch):
+        space = {"bytes": 4 * self.MB}
+        monkeypatch.setattr(tasks, "_free_bytes", lambda path: space["bytes"])
+        return space
+
+    @staticmethod
+    def _table(make_table, gate: threading.Event | None = None):
+        def fills(ctx, node_path, params):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), os.path.join(ctx.temp_dir, "frames.tar"))
+
+        def fits(ctx, node_path, params):
+            if gate is not None:
+                gate.wait(WAIT_S)
+            return {}
+
+        def read_only(ctx, node_path, params):
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), os.path.join(ctx.temp_dir, "frames.tar"))
+
+        return make_table({"test.fills": fills, "test.fits": fits, "test.read_only": read_only})
+
+    def test_the_folder_reads_full_after_the_task_with_the_room_it_had(self, make_table, media, free):
+        table = self._table(make_table)
+        assert table.filled_problem() is None
+
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        assert table.filled_problem() == f"The node's temp folder {table.temp_root} filled up while working on a file " \
+            "(4 MB free)"  # fmt: skip
+
+    def test_it_reads_full_until_the_folder_has_more_room_than_the_task_had(self, make_table, media, free):
+        table = self._table(make_table)
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        free["bytes"] += self.MB  # the same room give or take a little: other files on a shared disk come and go
+        assert table.filled_problem() is not None
+
+        free["bytes"] = 64 * self.MB
+        assert table.filled_problem() is None
+        free["bytes"] = 4 * self.MB
+        assert table.filled_problem() is None, "once cleared it stays cleared until a task fills the folder again"
+
+    def test_a_task_started_after_it_filled_up_that_finishes_clears_it(self, make_table, media, free):
+        table = self._table(make_table)
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        assert _finished(table, table.start(_spec(media, "test.fits")))["status"] == protocol.STATUS_DONE
+
+        assert table.filled_problem() is None
+
+    def test_a_task_already_running_when_it_filled_up_doesnt_clear_it(self, make_table, media, free):
+        gate = threading.Event()
+        table = self._table(make_table, gate)
+        running = table.start(_spec(media, "test.fits"))
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        gate.set()
+
+        assert _finished(table, running)["status"] == protocol.STATUS_DONE
+        assert table.filled_problem() is not None
+
+    def test_a_read_only_folder_isnt_one_that_filled_up(self, make_table, media, free):
+        # The node's fresh check finds a read-only folder by itself.
+        table = self._table(make_table)
+
+        _finished(table, table.start(_spec(media, "test.read_only")))
+
+        assert table.filled_problem() is None
+
+    def test_without_its_free_space_it_reads_full_until_a_later_task_finishes(self, make_table, media, monkeypatch):
+        monkeypatch.setattr(tasks, "_free_bytes", lambda path: None)
+        table = self._table(make_table)
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        assert table.filled_problem() == f"The node's temp folder {table.temp_root} filled up while working on a file"
+        _finished(table, table.start(_spec(media, "test.fits")))
+        assert table.filled_problem() is None
+
+
 class TestClientTaskId:
     CLIENT_ID = "0123456789abcdef0123456789abcdef"
 

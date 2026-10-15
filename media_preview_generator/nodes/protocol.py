@@ -151,6 +151,32 @@ NOT_VISIBLE_TEXT = {
 }
 
 
+# Text a node sends that this app logs or shows (its log lines, a task's error message, step text) is cut to this many
+# characters (an FFmpeg line is well under it).
+RELAY_LINE_MAX = 4096
+# Control characters but tab, C1 controls (U+0085 is a line break; U+009B starts a terminal escape like ESC [) and the
+# Unicode line and paragraph separators: any of them would add lines to the app's log that read as its own.
+_LINE_BREAKING_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def relayed_text(raw: object, limit: int = RELAY_LINE_MAX) -> str:
+    """Text a node sent, as one line of at most ``limit`` characters with its control characters escaped.
+
+    Whatever answers at a node's address chooses this text, and the app writes it into its log, the job log and
+    the job's file rows, so it is kept to what a real node sends: single lines of reasonable length.
+
+    Args:
+        raw: What the node sent; anything that isn't text reads as "".
+        limit: The most characters kept.
+
+    Returns:
+        The text, cut and escaped.
+    """
+    text = raw[:limit] if isinstance(raw, str) else ""
+    # repr() spells "\n" as the two characters \n and "\x1b" as \x1b.
+    return _LINE_BREAKING_CHARS.sub(lambda match: repr(match.group())[1:-1], text)
+
+
 def not_visible_text(reason: str) -> str:
     """A node's reason code for a file it can't see, in plain words (an unknown code is shown as it is)."""
     return NOT_VISIBLE_TEXT.get(reason, reason or NOT_VISIBLE_TEXT[NOT_VISIBLE_MISSING])

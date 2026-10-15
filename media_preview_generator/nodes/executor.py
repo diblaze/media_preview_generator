@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import tarfile
 import threading
 import time
@@ -67,10 +66,6 @@ STOP_DELETE_BUDGET_S = 1.0
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_FRAMES = 100_000
 _LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
-# A relayed node log line is cut to this many characters (an FFmpeg line is well under it).
-RELAY_LINE_MAX = 4096
-# Control characters but tab: a line break in a relayed line would add lines to the app's log that read as its own.
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 REQUEUE_NODE_UNAVAILABLE = "node_unavailable"
 # The node never ran the task (it refused the connection or didn't answer the start): no drop counts against the file.
@@ -84,17 +79,6 @@ _OP_LABELS = {
     protocol.OP_INTRO_END_PICTURE: "end-picture frames",
     protocol.OP_CREDITS_FIND: "credit text",
 }
-
-
-def _relayed_text(raw: object) -> str:
-    """A node's log line as one line of at most :data:`RELAY_LINE_MAX` characters, control characters escaped.
-
-    Whatever answers at a node's address writes these into the app's log and the job log, so they are kept to what
-    a real node sends: single lines.
-    """
-    text = raw[:RELAY_LINE_MAX] if isinstance(raw, str) else ""
-    # repr() spells "\n" as the two characters \n and "\x1b" as \x1b.
-    return _CONTROL_CHARS.sub(lambda match: repr(match.group())[1:-1], text)
 
 
 @dataclass(frozen=True)
@@ -454,7 +438,7 @@ class _TaskRun:
             if not isinstance(line, dict):
                 continue
             level = str(line.get("level") or "INFO").upper()
-            message = _relayed_text(line.get("message"))
+            message = protocol.relayed_text(line.get("message"))
             if self._path_swap:
                 message = message.replace(*self._path_swap)
             logger.log(level if level in _LEVELS else "INFO", "{}{}", self._prefix, message)
@@ -507,7 +491,7 @@ class _TaskRun:
         raw_error = state.get("error")
         error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
         kind = str(error.get("kind") or "")
-        message = str(error.get("message") or kind or status or "failed")
+        message = protocol.relayed_text(str(error.get("message") or kind or status or "failed"))
         if self._path_swap:
             # Shown in the job log and on the worker card, which name the file by this app's path, as _relay does.
             message = message.replace(*self._path_swap)
@@ -518,16 +502,16 @@ class _TaskRun:
             result = state.get("result")
             return result if isinstance(result, dict) else {}
         if status == protocol.STATUS_FILE_NOT_VISIBLE or kind == protocol.KIND_FILE_NOT_VISIBLE:
-            reason = str(error.get("reason") or protocol.NOT_VISIBLE_MISSING)
+            reason = protocol.relayed_text(str(error.get("reason") or protocol.NOT_VISIBLE_MISSING))
             _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
             # The job log names the file by this app's path already; the node's message would add its own path.
             plain = protocol.not_visible_text(reason)
             raise FileNotVisibleError(node_id, name, reason, f"{name} can't see the file: {plain}")
-        error_type = str(error.get("error_type") or "")
+        error_type = protocol.relayed_text(str(error.get("error_type") or ""))
         extra = {k: v for k, v in error.items() if k not in ("kind", "message", "error_type")}
         if status == protocol.STATUS_CANCELLED or kind == protocol.KIND_CANCELLED:
             raise NodeTaskCancelledError(protocol.KIND_CANCELLED, message, error_type=error_type, extra=extra)
-        fallback_kind = str(error.get("fallback_kind") or "")
+        fallback_kind = protocol.relayed_text(str(error.get("fallback_kind") or ""))
         if kind == protocol.KIND_CODEC_NOT_SUPPORTED:
             raise CodecNotSupportedError(message, kind=fallback_kind or FALLBACK_CODEC)
         if kind == protocol.KIND_GPU_FAILED:

@@ -349,10 +349,29 @@ class TestNodeDrops:
         assert calls == ["n1", "n1", "n1"]
         assert (tracker.successful, tracker.failed) == (0, 1)
         (row,) = rows
-        assert row.args[2] == "node NAS unavailable (it couldn't start the file 3 times)"
+        assert (
+            row.args[2]
+            == "node NAS unavailable (it couldn't start the file 3 times). Last try: NAS couldn't start the task"
+        )
         assert tracker.node_failures == {"/m/a.mkv": row.args[2]}
         assert tracker.node_drops == {}
         assert tracker.active_processing == 0
+
+    def test_a_file_that_keeps_filling_a_nodes_temp_folder_fails_naming_it(self, monkeypatch):
+        # It failed as only "it couldn't start the file 5 times": nothing said the temp folder was too small for it.
+        monkeypatch.setattr(dispatcher_mod, "MAX_NODE_START_FAILURES", 2)
+        said = (
+            "NAS couldn't finish the task: The node's temp folder /scratch is full (No space left on device); a "
+            "preview needs about twice its frames' size there"
+        )
+
+        def process(item, **_kwargs):
+            raise NodeUnavailableError("n1", "NAS", said, started=False)
+
+        _tracker, rows = _run(_pool(("n1", "NAS")), process, "/m/a.mkv")
+
+        (row,) = rows
+        assert "temp folder /scratch is full" in row.args[2], row.args[2]
 
 
 class TestNotVisible:

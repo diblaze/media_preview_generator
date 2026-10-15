@@ -25,6 +25,7 @@ from ...nodes.client import (
     NodeClient,
     NodeError,
     NodeProtocolError,
+    NodeRateLimitedError,
     NodeRequestError,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
@@ -47,10 +48,13 @@ from . import api
 LOG_LINES_MAX = 2000
 # The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
+# The node answered, but holds this address back after too many wrong keys (``error.reason`` next to unreachable).
+PROBE_RATE_LIMITED = "rate_limited"
 # Why something that answered isn't a node (``error.reason`` next to the protocol kind).
 PROBE_THIS_APP = "this_app"
 PROBE_OTHER_APP = "other_app"
 PROBE_WEB_PAGE = "web_page"
+PROBE_NOT_A_NODE = "not_a_node"
 # Bounds on what a node sends that is passed on to the browser.
 NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
@@ -80,10 +84,14 @@ def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
 
 
 def _finite(value: object) -> int | float | None:
-    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON)."""
+    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON), or is
+    a whole number too big for a float."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return value if math.isfinite(value) else None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:  # isfinite turns a whole number into a float first
+        return None
 
 
 def _node_sent(value: object, depth: int = 0) -> Any:
@@ -257,7 +265,7 @@ def _probe_info(info: dict) -> dict[str, Any]:
 
 def _probe(url: str, key: str) -> dict[str, Any]:
     """Ask an address what it is, without saving anything: ``{"ok", "info"}`` or ``{"ok": False, "error"}``."""
-    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_REJECTED
+    from ...markers.publishers.plex_remote import AGENT_CONNECTED, AGENT_INCOMPATIBLE, AGENT_REJECTED
 
     try:
         info = _make_client(url, key).info()
@@ -280,10 +288,14 @@ def _probe(url: str, key: str) -> dict[str, Any]:
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
+        if state == AGENT_INCOMPATIBLE:
+            # A Plex database node from before /v1/info that doesn't speak this app's protocol: a version problem.
+            return _probe_error(
+                protocol.KIND_PROTOCOL, "Something answered at this address, but not as a node this app can use."
+            )
         if state != AGENT_CONNECTED:
             return _not_a_node(exc) or _probe_error(
-                protocol.KIND_PROTOCOL,
-                "Something answered at this address, but not as a node this app can use.",
+                protocol.KIND_PROTOCOL, "Something else answers at this address, not a node.", PROBE_NOT_A_NODE
             )
         return {
             "ok": True,
@@ -296,6 +308,8 @@ def _probe(url: str, key: str) -> dict[str, Any]:
                 "version_match": None,
             },
         }
+    except NodeRateLimitedError as exc:
+        return _probe_error(KIND_UNREACHABLE, str(exc), PROBE_RATE_LIMITED)
     except NodeError as exc:
         return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
     return {"ok": True, "info": _probe_info(info)}
@@ -313,19 +327,25 @@ def _in_app_time(ts: object, node_time: str) -> str:
     """A node log line's moment in this app's time zone (as the app's own log reads), ISO 8601 with its offset.
 
     ``ts`` is epoch seconds; a node older than ``ts`` sends only ``time`` with its own offset, read instead. A time
-    that can't be read is passed on as the node wrote it.
+    that can't be read, or lies outside the years a ``datetime`` holds, is passed on as the node wrote it.
     """
     when = None
-    if isinstance(ts, int | float) and not isinstance(ts, bool) and math.isfinite(ts):
-        when = datetime.fromtimestamp(ts, UTC)
-    else:
+    if isinstance(ts, int | float) and not isinstance(ts, bool):
+        try:
+            when = datetime.fromtimestamp(ts, UTC)
+        except (OverflowError, ValueError, OSError):  # NaN, infinity, or a moment outside the years 1-9999
+            when = None
+    if when is None:
         try:
             parsed = datetime.fromisoformat(node_time)
         except ValueError:
             parsed = None
         if parsed is not None and parsed.tzinfo is not None:
             when = parsed
-    return when.astimezone().isoformat(timespec="seconds") if when is not None else node_time
+    try:
+        return when.astimezone().isoformat(timespec="seconds") if when is not None else node_time
+    except (OverflowError, ValueError, OSError):  # year 1 or 9999 moved past the edge by this app's offset
+        return node_time
 
 
 def _json_body() -> dict:
@@ -499,7 +519,11 @@ def update_node(node_id: str):
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
     if reconnect:
+        from ...markers.inspect import forget_node_capability
+
         get_registry().report_unavailable(node_id)
+        # The servers' configs name only the node, so their cached Intro & Credits answers don't see the change.
+        forget_node_capability(node_id)
     return jsonify(_row_for(node_id))
 
 
@@ -629,7 +653,9 @@ def node_log(node_id: str):
         # What refuses without a node block is an older Plex helper (as for a check); it has no log to share, which
         # is how it is, not a failure (the page logged a 502 for it).
         if isinstance(exc, NodeProtocolError) and exc.node is None:
-            message = "This node is an older Plex helper and can't share its log. Update it to see its log here."
+            message = (
+                "This Plex database node is an older release and can't share its log. Update it to see its log here."
+            )
             return jsonify({"lines": [], "message": message})
         return jsonify({"error": f"Couldn't read {record.get('name')}'s log: {exc}"}), 502
     raw = answer.get("lines")

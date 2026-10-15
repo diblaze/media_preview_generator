@@ -18,7 +18,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -101,8 +101,10 @@ class ChapterTarget:
     chapters: tuple[Chapter, ...]
     machine_identifier: str
     # Plex has analysed this part (duration and audio/video streams recorded); chapters are written at that step, so
-    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False.
-    analysed: bool = False
+    # only then does an empty chapter list mean "no chapters". A backend that can't tell leaves it False. Derived, so
+    # not part of the snapshot's identity: an app older than this field sends none, and register's whole-snapshot
+    # comparison must not read that as Plex having changed the source.
+    analysed: bool = field(default=False, compare=False)
 
 
 def _target_changes(before: ChapterTarget, after: ChapterTarget) -> tuple[str, ...]:
@@ -269,8 +271,17 @@ class LocalChapters:
             )
 
     def _guard(self, machine_identifier: str, version: str, deadline: float) -> None:
+        # Plex keeps Preferences.xml readable by its own user only: a writer running as another user can't read the
+        # identity either, and "can't write Plex's database" is the problem to name, not "can't prove which Plex".
+        identity_readable = bool(plex_machine_identifier(str(self.folder)))
+        if not identity_readable:
+            self._file_checks(deadline)
         self._identity(machine_identifier, version)
         self._media_root()
+        if identity_readable:
+            self._file_checks(deadline)
+
+    def _file_checks(self, deadline: float) -> None:
         report = self.database.file_checks(deadline=deadline)
         if not report.ready:
             raise ChapterError(report.message, code="registration", state=report.state)
@@ -625,7 +636,11 @@ def _remote(client: AgentClient, operation: str, machine: str, version: str, **b
             f"Update the Plex database node to version {_AGENT_FOR_PMS_1_43_5} or newer for Plex 1.43.5",
             state=Capability.PLUGIN_OUTDATED,
         )
-    if not machine or identity.get("machine_identifier") != machine:
+    # A node that can't say (it can't read Plex's Preferences.xml: usually it runs as another user than Plex) is asked
+    # anyway: its own checks name what it can't read or write, and it refuses every operation until it can prove
+    # which Plex it is beside.
+    theirs = identity.get("machine_identifier")
+    if not machine or (theirs and theirs != machine):
         raise ChapterError(
             "The Plex database node is beside a different Plex server, or can't say which one",
             state=Capability.MISCONFIGURED,

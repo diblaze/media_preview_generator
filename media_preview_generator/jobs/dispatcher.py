@@ -1089,9 +1089,10 @@ class JobDispatcher:
             elif requeue.reason == REQUEUE_NODE_NOT_STARTED:
                 tracker.node_start_failures[path] = tracker.node_start_failures.get(path, 0) + 1
                 if tracker.node_start_failures[path] >= MAX_NODE_START_FAILURES:
+                    # The last try's reason: the node's own words (its temp folder filling up, say) say what to fix.
                     failure = (
                         f"node {requeue.node_name} unavailable "
-                        f"(it couldn't start the file {MAX_NODE_START_FAILURES} times)"
+                        f"(it couldn't start the file {MAX_NODE_START_FAILURES} times). Last try: {requeue.message}"
                     )
             else:
                 excluded = tracker.excluded_nodes.setdefault(path, {})

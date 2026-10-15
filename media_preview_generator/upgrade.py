@@ -106,7 +106,10 @@ def _v14_record_failure(sm) -> None:
 # backup; that's enough on its own.
 # -------------------------------------------------------------------------
 _USER_FACING_NOTES: dict[int, str] = {
-    24: "Your Plex helper now appears on the new Nodes page, which holds its address and key. It works as before.",
+    24: (
+        "Your Plex helper is now a Plex database node, on the new Nodes page, which holds its address and key. "
+        "It works as before."
+    ),
     23: "The Max concurrent jobs setting is gone — jobs now run as soon as a worker that handles them is free.",
     22: "Groups can now include several devices — your existing groups are unchanged.",
     21: "Your worker counts are now worker groups. Existing availability and pauses are preserved.",
@@ -218,10 +221,12 @@ def run_migrations(settings_manager) -> None:
 
     """
     # A brand-new install has no settings file yet: its schema steps build the defaults, they don't change anything
-    # the user set, so no "Settings migrated" card is shown for them.
+    # the user set, so no "Settings migrated" card is shown for them. An install set up with environment variables
+    # alone has no file either, but the steps rewrite the setup seeded from them, so that one still gets the card.
     settings_file = getattr(settings_manager, "settings_file", None)
-    fresh_install = bool(settings_file) and not os.path.exists(str(settings_file))
-    _migrate_env_vars(settings_manager)
+    no_settings_file = bool(settings_file) and not os.path.exists(str(settings_file))
+    seeded_from_env = _migrate_env_vars(settings_manager)
+    fresh_install = no_settings_file and not seeded_from_env
     _migrate_schema(settings_manager, announce=not fresh_install)
     _seed_last_seen_version_for_upgraders(settings_manager)
 
@@ -284,7 +289,7 @@ def _clamp_seeded_cpu_threads(value: int, source: str) -> int:
     return clamped
 
 
-def _migrate_env_vars(sm) -> None:
+def _migrate_env_vars(sm) -> bool:
     """Seed settings.json from environment variables.
 
     Only runs once.  After migration, settings.json is the sole source of
@@ -294,9 +299,12 @@ def _migrate_env_vars(sm) -> None:
     Also migrates legacy GPU env vars (GPU_THREADS, GPU_SELECTION,
     FFMPEG_THREADS) into the new ``gpu_config`` structure, and converts
     legacy path mapping env vars into the ``path_mappings`` list.
+
+    Returns:
+        True when at least one setting was seeded from the environment.
     """
     if sm.get("_env_migrated"):
-        return
+        return False
 
     updates: dict[str, Any] = {}
     migrated_keys: list[str] = []
@@ -358,6 +366,7 @@ def _migrate_env_vars(sm) -> None:
                 "Environment variable {} is deprecated and ignored. Use the Settings page in the web UI instead.",
                 env_name,
             )
+    return bool(migrated_keys)
 
 
 # =========================================================================
@@ -1974,7 +1983,7 @@ def _migrate_to_v24(sm) -> list[str]:
             if has_address and url is None:
                 logger.warning(
                     "The Plex helper address of {} isn't a valid http(s) address, so it wasn't moved to the Nodes "
-                    "page. Add the helper there and choose it in that server's Intro & Credits settings.",
+                    "page. Add it there as a Plex database node and choose it in that server's Edit → Connection.",
                     str(entry.get("name") or "a Plex server"),
                 )
             agent.update({"enabled": enabled and has_address, "node_id": None})
