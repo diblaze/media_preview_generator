@@ -3744,6 +3744,38 @@ class TestMigrateToV24:
         assert names[1].endswith("…) 2") and len({n.casefold() for n in names}) == 2
         assert validate_nodes(settings_manager.get("nodes"))[1] == ""
 
+    @pytest.mark.parametrize(
+        ("server_names", "node_names"),
+        [
+            (["Casa \U0001f468‍\U0001f469‍\U0001f467"], ["Plex helper (Casa \U0001f468\U0001f469\U0001f467)"]),
+            (["בית ‏Plex"], ["Plex helper (בית Plex)"]),
+            (["Home\nPlex\tTV"], ["Plex helper (Home Plex TV)"]),
+            (["​‎"], ["Plex helper (Plex)"]),
+            (["Café", "Café"], ["Plex helper (Café)", "Plex helper (Café) 2"]),
+            (["NUC", "ＮＵＣ"], ["Plex helper (NUC)", "Plex helper (ＮＵＣ) 2"]),
+        ],
+        ids=["zwj-emoji", "rtl-mark", "line-break-and-tab", "only-hidden", "cafe-two-ways", "full-width"],
+    )
+    def test_a_server_name_the_node_name_rules_refuse_still_makes_a_valid_node_name(
+        self, settings_manager, server_names, node_names
+    ):
+        """A server's name takes any text; a node name the rules refuse made every later save of the node fail,
+        the registry's record of the id the node reports included."""
+        from media_preview_generator.nodes.settings import validate_nodes
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        servers = [
+            _plex_entry(f"p{i}", name, {"enabled": True, "url": f"http://helper{i}.lan:9494", "token": "k"})
+            for i, name in enumerate(server_names)
+        ]
+        settings_manager.apply_changes(updates={"media_servers": servers})
+
+        _migrate_to_v24(settings_manager)
+
+        nodes = settings_manager.get("nodes")
+        assert [n["name"] for n in nodes] == node_names
+        assert validate_nodes(nodes)[1] == ""
+
     def test_a_migrated_long_name_leaves_the_nodes_list_editable(self, settings_manager):
         from media_preview_generator.upgrade import _migrate_to_v24
 

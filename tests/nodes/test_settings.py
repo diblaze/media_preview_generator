@@ -322,6 +322,21 @@ class TestSettingsManagerNodes:
             sm.update_nodes([{**bad, "enabled": False}, other])
         assert sm.nodes == [bad, other]
 
+    def test_the_id_the_node_reports_is_still_recorded_on_a_bad_record_written_by_hand(self, tmp_path):
+        """Without it a Plex database node's requests never name the saved id, so another machine at the address
+        isn't refused."""
+        import json
+
+        bad = {"id": "bad1", "node_uid": None, "name": "nas‏", "url": "http://nas:9494", "key": "k" * 24}
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes": [bad]}))
+        sm = SettingsManager(str(tmp_path))
+
+        sm.update_nodes([{**bad, "node_uid": "uid-from-node"}])
+
+        assert sm.nodes == [{**bad, "node_uid": "uid-from-node"}]
+        with pytest.raises(ValueError, match=r"^nas‏: "):
+            sm.update_nodes([{**bad, "node_uid": "uid-2", "url": "http://nas2:9494"}])
+
     def test_an_invalid_list_is_refused_and_nothing_is_saved(self, tmp_path):
         sm = SettingsManager(str(tmp_path))
         with pytest.raises(ValueError):

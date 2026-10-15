@@ -1608,6 +1608,15 @@ class TestRecordedNodeId:
         reg._default_record_uid("n1", "uid-reinstalled", "http://nuc:9494")
         assert sm.nodes[0]["node_uid"] == "uid-reinstalled"
 
+    def test_the_id_is_recorded_on_a_record_whose_name_breaks_the_rules(self, sm):
+        """A record "invalid as saved" (a v24 name made from a Plex server's) refused every check's write of the id,
+        so a Plex database node never got the saved id its requests name."""
+        sm.apply_changes(updates={"nodes": [{**sm.nodes[0], "name": "Plex helper (Casa ‍)"}]})
+
+        reg._default_record_uid("n1", "uid-first", "http://nuc:9494")
+
+        assert sm.nodes[0]["node_uid"] == "uid-first"
+
     def test_an_id_learnt_at_an_address_the_node_no_longer_has_is_not_recorded(self, sm):
         reg._default_record_uid("n1", "uid-old-machine", "http://old-nuc:9494")
         assert sm.nodes[0]["node_uid"] is None
