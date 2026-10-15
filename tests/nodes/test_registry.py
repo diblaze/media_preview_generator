@@ -1184,10 +1184,19 @@ class TestNewPlexDatabaseNodeId:
         assert (h.registry.plex_db_refusal("n1") == "") is recorded
         h.registry.stop()
 
-    def test_a_worker_node_with_a_new_id_is_recorded_whatever_its_plex(self):
-        h = self._harness(["plex-a"])
+    def test_a_worker_node_no_server_writes_through_is_recorded_with_its_new_id(self):
+        h = self._harness([])
         self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
         assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_a_new_id_without_the_role_is_held_while_a_server_writes_through_the_node(self):
+        # Taken because this answer named no Plex database role, the id would already match when the next answer
+        # does: the Plex check never ran for the machine that writes that server's database.
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+        assert h.uids == []
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
         h.registry.stop()
 
     def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):

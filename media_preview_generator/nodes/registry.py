@@ -1221,18 +1221,19 @@ class NodeRegistry:
     def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool:
         """Whether a node's new id may replace the saved one without asking.
 
-        A worker node (or one with no saved id yet) is this node by its saved key and address. A Plex database node
-        writes into a Plex's database, so its new id is taken only when it names the Plex machine identifier of
-        every server that uses it; an empty identifier on either side (a Windows node with a custom Plex folder)
-        proves nothing.
+        A worker node (or one with no saved id yet) is this node by its saved key and address. A node that a Plex
+        server uses as its Plex database node writes into that Plex's database, so its new id is taken only when it
+        names the Plex machine identifier of every server that uses it; an empty identifier on either side (a Windows
+        node with a custom Plex folder) proves nothing. That holds whether or not this answer names the role: an id
+        taken without it would already match once the node names it.
         """
-        if not record.get("node_uid") or protocol.ROLE_PLEX_DB not in outcome.roles:
+        if not record.get("node_uid"):
             return True
         try:
             served = self._served_plex_ids(node_id)
         except Exception as exc:  # noqa: BLE001 - unreadable settings can't confirm anything
             logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
-            return False
+            return protocol.ROLE_PLEX_DB not in outcome.roles
         if not served:
             return True  # No server writes through it: nothing to protect.
         plex_db = (outcome.info or {}).get("plex_db")
