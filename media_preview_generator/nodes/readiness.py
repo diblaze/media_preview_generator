@@ -6,6 +6,7 @@
 A failing row says where its fix is: ``fix_tab`` (``media`` / ``settings`` / ``overview``, the node dialog tab, with
 ``fix_label`` naming the button and, on media rows, the ``suggestion`` {from, to, app_root} the button applies),
 ``fix_where: "node"`` (only the node's own machine can fix it), or ``help_url`` + ``help_label`` (a page of this app).
+``docs_url`` + ``help_label`` point at the docs section with the steps.
 """
 
 from __future__ import annotations
@@ -38,8 +39,10 @@ INFO = "info"
 WORKERS_URL = "/settings#section-workers"
 # Where this app's own path mappings and library checks live.
 SERVERS_URL = "/servers"
+# The docs section with the steps to update a node to this app's version.
+UPDATE_DOCS_URL = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
 # Node-only row keys; the shared row builder doesn't know them.
-_NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label")
+_NODE_KEYS = ("fix_tab", "suggestion", "help_url", "help_label", "docs_url")
 
 
 def _row(
@@ -149,6 +152,8 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             recommended=app_version if protocol.ROLE_WORKER in view.roles else None,
             reason=None if version_ok else view.reason,
             fix_where=FIX_ON_NODE,
+            docs_url=UPDATE_DOCS_URL,
+            help_label="How to update a node",
         )
     )
     if version_ok and protocol.ROLE_WORKER in view.roles:
@@ -305,6 +310,8 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
             help_label="Open Workers",
         )
     ]
+    # The view drops each GPU's error; the details keep it, and it says what the test found.
+    errors = {g.get("device"): g.get("error") for g in details.gpus}
     for gpu in view.gpus:
         ok = gpu.get("status") == "ok"
         name = gpu.get("name") or gpu.get("device") or "GPU"
@@ -317,10 +324,17 @@ def _workers(details: NodeDetails, worker_groups: object) -> list[dict[str, Any]
                 explanation="The node tests each GPU when it starts, every 5 minutes, and after a GPU error.",
                 current=gpu.get("status") or "unknown",
                 recommended="ok",
+                reason=None if ok else _gpu_reason(errors.get(gpu.get("device"))),
                 fix_where=FIX_ON_NODE,
             )
         )
     return rows
+
+
+def _gpu_reason(error: object) -> str:
+    what = str(error or "").strip().rstrip(".")
+    found = f"{what}. " if what else ""
+    return f"{found}Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
 
 
 def _default_file_checks(url: str, key: str) -> Any:
@@ -411,7 +425,7 @@ def node_readiness(
     key: str,
     worker_groups: object,
     app_version: str,
-    file_checks: Callable[[str, str], Any] = _default_file_checks,
+    file_checks: Callable[[str, str], Any] | None = _default_file_checks,
 ) -> dict[str, Any]:
     """The Setup Health envelope for one node.
 
@@ -420,7 +434,8 @@ def node_readiness(
         key: The node's stored key (for the Plex database file checks).
         worker_groups: The stored ``worker_groups`` list.
         app_version: This app's version.
-        file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own).
+        file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own). None
+            leaves the Plex database section out: it asks the node, too slow for the node list's count.
 
     Returns:
         ``{"overall_ok", "sections"}``.
@@ -432,8 +447,29 @@ def node_readiness(
     if usable and worker and not view.legacy:
         sections.append(_section("node_media_access", "Media access", _media_access(details)))
         sections.append(_section("node_workers", "Workers", _workers(details, worker_groups)))
-    if usable and protocol.ROLE_PLEX_DB in view.roles:
+    if usable and protocol.ROLE_PLEX_DB in view.roles and file_checks is not None:
         sections.append(_section("node_plex_db", "Plex database", _plex_db(view.url, key, file_checks)))
     kept = [s for s in sections if s is not None]
     overall_ok = not any(c["severity"] == CRITICAL and c["ok"] is False for s in kept for c in s["checks"])
     return {"overall_ok": overall_ok, "sections": kept}
+
+
+def to_fix(envelope: dict[str, Any]) -> dict[str, int]:
+    """How many rows of a Setup Health envelope are in its Must fix and Recommended buckets.
+
+    Args:
+        envelope: What :func:`node_readiness` returns.
+
+    Returns:
+        ``{"must_fix": n, "recommended": n}``, counted as the Nodes page buckets them.
+    """
+    must_fix = recommended = 0
+    for section in envelope.get("sections") or []:
+        for check in section.get("checks") or []:
+            if check.get("ok") is not False:
+                continue
+            if check.get("severity") == CRITICAL:
+                must_fix += 1
+            elif check.get("severity") == RECOMMENDED and check.get("dismissed") is not True:
+                recommended += 1
+    return {"must_fix": must_fix, "recommended": recommended}

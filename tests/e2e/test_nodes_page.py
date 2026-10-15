@@ -242,12 +242,13 @@ def _node_tab(page: Page, tab: str) -> Locator:
 @pytest.mark.e2e
 class TestNodeList:
     def test_each_state_gets_its_chip_colour_and_button(self, authed_page: Page, app_url: str) -> None:
+        # Red is a node that gets no work (Setup Health's Must fix); every problem state's button says Fix.
         states = {
             "ready": ("✓ Ready", "ok", "Open"),
-            "update_needed": ("Update needed", "warn", "Fix"),
-            "access_problem": ("Access problem", "warn", "Fix"),
+            "update_needed": ("Update needed", "bad", "Fix"),
+            "access_problem": ("Access problem", "bad", "Fix"),
             "gpu_lost": ("GPU lost", "warn", "Fix"),
-            "offline": ("Offline", "bad", "Open"),
+            "offline": ("Offline", "bad", "Fix"),
             "key_refused": ("Key refused", "bad", "Fix"),
             "connecting": ("Connecting…", "off", "Open"),
             "disabled": ("Turned off", "off", "Open"),
@@ -266,6 +267,35 @@ class TestNodeList:
                 expect(pill).to_have_class(f"pill {tone}")
             expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
             expect(row.locator(".nd-open")).to_have_text(button)
+
+    def test_a_ready_card_says_how_many_setup_health_rows_to_fix(self, authed_page: Page, app_url: str) -> None:
+        nodes = [
+            _node("n-gpu", "gpu-box", to_fix={"must_fix": 1, "recommended": 2}),
+            _node("n-new", "new-box", to_fix={"must_fix": 0, "recommended": 1}),
+            _node("n-ok", "ok-box", to_fix={"must_fix": 0, "recommended": 0}),
+            _node("n-off", "off-box", "offline", to_fix={"must_fix": 1, "recommended": 0}),
+        ]
+        _open_nodes(authed_page, app_url, nodes)
+
+        gpu = authed_page.locator("#node-n-gpu")
+        expect(gpu.locator(".nd-to-fix")).to_have_text("1 to fix")
+        expect(gpu.locator(".nd-to-fix")).to_have_class("pill bad nd-to-fix")
+        expect(gpu.locator(".nd-open")).to_have_text("Fix")
+        expect(gpu.locator(".nd-open")).to_have_attribute("data-tab", "health")
+        new = authed_page.locator("#node-n-new")
+        expect(new.locator(".nd-to-fix")).to_have_text("1 to fix")
+        expect(new.locator(".nd-to-fix")).to_have_class("pill warn nd-to-fix")
+        expect(new.locator(".nd-open")).to_have_text("Open")
+        expect(new.locator(".nd-open")).to_have_attribute("data-tab", "health")
+        expect(authed_page.locator("#node-n-ok .nd-to-fix")).to_have_count(0)
+        expect(authed_page.locator("#node-n-ok .nd-open")).to_have_attribute("data-tab", "overview")
+        # The state chip already says what is wrong with a node that isn't ready.
+        expect(authed_page.locator("#node-n-off .nd-to-fix")).to_have_count(0)
+
+        watch_modal_shown(authed_page, "nodeModal")
+        gpu.locator(".nd-open").click()
+        expect_modal_shown(authed_page, "nodeModal")
+        expect(authed_page.locator("#node-tab-health")).to_be_visible()
 
     def test_rows_show_roles_hardware_busy_and_who_uses_them(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
@@ -899,6 +929,36 @@ class TestNodeDialog:
         )
         expect(body.locator('.readiness-bucket[data-tier="recommended"]')).to_have_count(0)
         expect(authed_page.locator("#nodeHealthSummary")).to_have_text("✓ All good")
+
+    def test_a_node_that_needs_an_update_links_the_steps(self, authed_page: Page, app_url: str) -> None:
+        docs = "https://github.com/stevezau/media_preview_generator/blob/main/docs/guides.md#updating-a-node"
+        api = _open_nodes(authed_page, app_url, [_node("n-old", "old", "update_needed")])
+        api.health_answer = {
+            "overall_ok": False,
+            "sections": [
+                {
+                    "id": "node_connection",
+                    "title": "Connection",
+                    "checks": [
+                        {
+                            "id": "node_version",
+                            "label": "The node needs an update",
+                            "ok": False,
+                            "severity": "critical",
+                            "fix_where": "node",
+                            "docs_url": docs,
+                            "help_label": "How to update a node",
+                        }
+                    ],
+                }
+            ],
+        }
+        _open_node(authed_page, "n-old")
+        pane = _node_tab(authed_page, "health")
+        link = pane.get_by_role("link", name="How to update a node")
+        expect(link).to_have_attribute("href", docs)
+        expect(link).to_have_attribute("target", "_blank")
+        expect(authed_page.locator("#node-n-old .nd-status .pill").first).to_have_class("pill bad")
 
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())

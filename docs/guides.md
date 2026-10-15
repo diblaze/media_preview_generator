@@ -691,6 +691,13 @@ The node card shows its state: **Ready**, **Offline**, **Key refused**, **Update
 If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
 at its mapped path runs elsewhere instead of failing.
 
+### Updating a node
+
+A worker node gets no work until it runs the same version as the app, and its card says **Update needed**. After you
+update the app, update each worker node to the same tag: pull the image, then remove and start the container again
+with the same `docker run` options (or `docker compose pull && docker compose up -d`). Its key and config folder stay.
+A Plex database node only has to be new enough; its card says **Update needed** when it isn't.
+
 ### Plex on another machine
 
 Run a Plex database node beside Plex: the [Linux image](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)

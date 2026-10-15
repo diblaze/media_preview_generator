@@ -386,7 +386,8 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 
 `NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform: {os, arch, python}, gpus:
 [{type, device, name, status, error}], cpu: {cores, load1, ram_total, ram_available}, busy, last_seen, path_mappings,
-used_by: {groups: [{id, name}], servers: [{id, name}]}}`. `busy` = how many tasks the node is running (int);
+used_by: {groups: [{id, name}], servers: [{id, name}]}, to_fix: {must_fix, recommended}}`. `to_fix` counts the
+node's Setup Health rows to fix (without the Plex database checks, which ask the node). `busy` = how many tasks the node is running (int);
 `last_seen` = epoch seconds of the last answer, or null; `error` is `""` for a working GPU. Facts the node hasn't
 reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `gpus: []`, `cpu` values null.
 

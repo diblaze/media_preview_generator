@@ -66,11 +66,12 @@
 
     // ---------- facts about a node ---------------------------------------------------------------------------
 
-    // [tone, chip text]. Green ready, amber needs attention, red down, grey not checked / switched off.
+    // [tone, chip text]. Green ready, amber still works in part, red gets no work (Setup Health's Must fix), grey not
+    // checked / switched off.
     const STATES = {
         ready: ['ok', '✓ Ready'],
-        update_needed: ['warn', 'Update needed'],
-        access_problem: ['warn', 'Access problem'],
+        update_needed: ['bad', 'Update needed'],
+        access_problem: ['bad', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
         no_ffmpeg: ['bad', 'FFmpeg missing'],
         offline: ['bad', 'Offline'],
@@ -79,7 +80,14 @@
         disabled: ['off', 'Turned off'],
     };
     // The row's button says Fix for these, and opens the tab where the fix is.
-    const FIX_TAB = { access_problem: 'media', key_refused: 'settings', update_needed: 'health', gpu_lost: 'health', no_ffmpeg: 'health' };
+    const FIX_TAB = {
+        access_problem: 'media',
+        key_refused: 'settings',
+        update_needed: 'health',
+        gpu_lost: 'health',
+        no_ffmpeg: 'health',
+        offline: 'health',
+    };
     const NODE_TABS = ['overview', 'media', 'health', 'log', 'settings'];
 
     function stateOf(node) {
@@ -197,9 +205,20 @@
         return 'bi-pc-display-horizontal';
     }
 
+    // A Ready card whose Setup Health still has rows to fix says how many, counted as the dialog's rail badge counts.
+    function toFixBadge(node) {
+        const counts = node.to_fix || {};
+        const mustFix = Number(counts.must_fix) || 0;
+        const recommended = Number(counts.recommended) || 0;
+        if (node.state !== 'ready' || (!mustFix && !recommended)) return null;
+        return mustFix ? { tone: 'bad', count: mustFix, fix: true } : { tone: 'warn', count: recommended, fix: false };
+    }
+
     function nodeRow(node) {
         const [tone, text] = stateOf(node);
-        const fixTab = FIX_TAB[node.state];
+        const badge = toFixBadge(node);
+        const fixTab = FIX_TAB[node.state] || (badge && badge.fix ? 'health' : '');
+        const openTab = fixTab || (badge ? 'health' : 'overview');
         const used = usedByParts(node.used_by);
         const busy = isWorker(node) ? busyText(node.busy) : '';
         const reason = node.reason ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
@@ -213,9 +232,9 @@
                     <div class="nd-url" title="${esc(node.url)}">${esc(node.url)}</div>
                 </div>
                 <div class="nd-chips">${roleChips(node)}${hardwareChips(node)}${busy ? `<span class="nd-faint nd-busy">${esc(busy)}</span>` : ''}${used.length ? `<span class="nd-faint">used by ${esc(used.join(', '))}</span>` : ''}</div>
-                <div class="nd-status">${pill(tone, text)}${reason}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
+                <div class="nd-status">${pill(tone, text)}${badge ? `<span class="pill ${badge.tone} nd-to-fix" title="Open Setup Health to see what to fix">${badge.count} to fix</span>` : ''}${reason}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
                 <div class="nd-acts">
-                    <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${fixTab || 'overview'}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
+                    <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${openTab}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
                 </div>
             </article>`;
     }
@@ -1260,6 +1279,15 @@
             link.className = 'btn btn-sm btn-outline-secondary';
             link.href = check.help_url;
             link.textContent = check.help_label || 'Open';
+            acts.appendChild(link);
+        }
+        if (!ok && typeof check.docs_url === 'string' && check.docs_url.startsWith('https://')) {
+            const link = document.createElement('a');
+            link.className = 'btn btn-sm btn-outline-secondary nd-health-docs';
+            link.href = check.docs_url;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            link.innerHTML = `${esc(check.help_label || 'How to fix this')} <i class="bi bi-box-arrow-up-right" aria-hidden="true"></i>`;
             acts.appendChild(link);
         }
         return row;

@@ -7,7 +7,7 @@ import pytest
 from media_preview_generator.markers.publishers.base import Capability, CapabilityReport
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
-from media_preview_generator.nodes.readiness import node_readiness
+from media_preview_generator.nodes.readiness import UPDATE_DOCS_URL, node_readiness, to_fix
 
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok"}
 
@@ -309,3 +309,29 @@ def test_a_plex_database_nodes_version_row_says_new_enough_not_matching(legacy):
 def test_a_worker_nodes_version_row_says_it_matches():
     row = _check(_envelope(_details()), "node_version")
     assert (row["ok"], row["label"]) == (True, "The node's version matches this app")
+
+
+def test_a_failed_gpu_says_what_its_test_found_and_what_to_do():
+    view_gpu = {**GPU, "status": "failed"}
+    details = _details(gpus=(view_gpu,))
+    details = reg.NodeDetails(**{**details.__dict__, "gpus": ({**view_gpu, "error": "CUDA acceleration test failed"},)})
+    row = _check(_envelope(details), "node_gpu_cuda:0")
+    assert row["reason"] == (
+        "CUDA acceleration test failed. Check the GPU driver on the node, then Rescan GPUs on its Overview tab."
+    )
+
+
+def test_a_node_that_needs_an_update_links_the_steps():
+    row = _check(_envelope(_details(reg.STATE_UPDATE_NEEDED)), "node_version")
+    assert (row["docs_url"], row["help_label"]) == (UPDATE_DOCS_URL, "How to update a node")
+    assert UPDATE_DOCS_URL.endswith("docs/guides.md#updating-a-node")
+    assert "docs_url" not in _check(_envelope(_details()), "node_version")
+
+
+def test_the_count_to_fix_matches_the_buckets_and_skips_the_plex_database_checks():
+    failed = _details(roles=(ROLE_WORKER, ROLE_PLEX_DB), gpus=({**GPU, "status": "failed"},))
+    envelope = node_readiness(failed, key="k", worker_groups=[], app_version="9.9.9", file_checks=None)
+    assert "node_plex_db" not in [s["id"] for s in envelope["sections"]]
+    # The failed GPU is a must fix; untested access and no worker group are recommended.
+    assert to_fix(envelope) == {"must_fix": 1, "recommended": 2}
+    assert to_fix(_envelope(_details(reg.STATE_DISABLED))) == {"must_fix": 0, "recommended": 0}

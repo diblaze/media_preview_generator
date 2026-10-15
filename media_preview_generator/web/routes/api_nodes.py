@@ -26,7 +26,7 @@ from ...nodes.client import (
     NodeRequestError,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
-from ...nodes.readiness import node_readiness
+from ...nodes.readiness import node_readiness, to_fix
 from ...nodes.registry import NodeDetails, _default_legacy_ping, get_registry
 from ...nodes.settings import KEY_MASK, find_node, normalise_key, normalise_mappings, normalise_url, validate_node
 from ..auth import api_token_required
@@ -142,7 +142,26 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "last_seen": view.last_seen if view else None,
         "path_mappings": list(record.get("path_mappings") or []),
         "used_by": _used_by(record["id"]),
+        "to_fix": _to_fix(record, details),
     }
+
+
+def _to_fix(record: dict, details: NodeDetails | None) -> dict[str, int]:
+    """The Setup Health counts the card shows, so a "Ready" card still says when its Setup Health has rows to fix.
+
+    The Plex database checks ask the node, so they are left out here; its Setup Health tab runs them.
+    """
+    if details is None:
+        return {"must_fix": 0, "recommended": 0}
+    sm = get_settings_manager()
+    envelope = node_readiness(
+        details,
+        key=str(record.get("key") or ""),
+        worker_groups=sm.get("worker_groups"),
+        app_version=_app_version(),
+        file_checks=None,
+    )
+    return to_fix(envelope)
 
 
 def _row_for(node_id: str) -> dict[str, Any] | None:

@@ -33,6 +33,7 @@ NODE_ROW_KEYS = {
     "last_seen",
     "path_mappings",
     "used_by",
+    "to_fix",
 }
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok", "error": None}
 GPU_ON_CPU_TEXT = {**GPU, "credit_text": {"on_gpu": False, "reason": "Vulkan reports no hardware GPU"}}
@@ -458,6 +459,14 @@ class TestDelete:
         resp = client.delete(f"/api/nodes/{node_id}")
         assert resp.status_code == 400
         assert resp.get_json() == {"error": "The node's name must be at most 80 characters"}
+
+    def test_each_row_counts_its_setup_health_rows_to_fix(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        reg.get_registry().check_now(node_id)
+        row = next(n for n in client.get("/api/nodes").get_json()["nodes"] if n["id"] == node_id)
+        assert row["state"] == "ready"
+        # Not tested and in no worker group: two recommendations, nothing that stops it working.
+        assert row["to_fix"] == {"must_fix": 0, "recommended": 2}
 
     def test_a_node_nothing_uses_is_removed(self, client, nodes):
         node_id = _add(client).get_json()["id"]
