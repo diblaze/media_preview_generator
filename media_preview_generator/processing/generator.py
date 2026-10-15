@@ -996,6 +996,9 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
         "hardware decoder unavailable",
         "hwaccel decoder not found",
         "hwaccel decoder unavailable",
+        # NVDEC's verdict that the GPU has no decoder for this profile (H.264 High 10 or 4:4:4). FFmpeg prints the
+        # generic "hwaccel initialisation returned error" right after it, so it has to win over that driver error.
+        "hardware is lacking required capabilities",
         # Generic codec errors (check these carefully - only in GPU context after failure)
         "unsupported codec",
         "codec not supported",
