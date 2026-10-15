@@ -26,6 +26,7 @@ from media_preview_generator.markers.publishers.base import Capability, PublishE
 from media_preview_generator.markers.publishers.plex_db import PlexMarkerPublisher
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.markers.settings import ServerMarkersSettings
+from media_preview_generator.nodes import protocol
 from media_preview_generator.nodes.server import plex_db as plex_db_role
 from media_preview_generator.nodes.server import winplatform
 from media_preview_generator.servers.base import ServerConfig, ServerType
@@ -224,7 +225,7 @@ class TestTheGuards:
 
     @pytest.mark.parametrize(
         "asked",
-        [None, "2", "0", "one", "", "¹", "1" * 5000],
+        [None, "3", "0", "one", "", "¹", "1" * 5000],
         ids=["none", "newer", "older", "text", "empty", "superscript", "past-the-int-digit-limit"],
     )
     def test_a_protocol_this_build_doesnt_speak_is_refused_with_both_versions(self, agent, asked):
@@ -295,6 +296,61 @@ class TestTheGuards:
     def test_more_items_than_one_read_back_may_carry_is_refused(self, agent):
         items = [{"rating_key": i, "ours": [], "kept_types": [], "item_files": None} for i in range(201)]
         assert agent.post("/v1/items/shown", json={"items": items}, headers=AUTH).status_code == 400
+
+
+class TestARequestMeantForAnotherNode:
+    """The app names the node it saved at the address: another machine answering there runs nothing."""
+
+    UID = "node-uid-a"
+
+    @pytest.fixture
+    def agent(self, plex_config, tmp_path):
+        return node_app(str(plex_config), node_uid=self.UID, mountinfo_path=_mountinfo(tmp_path)).test_client()
+
+    @staticmethod
+    def _naming(uid: str) -> dict:
+        return {
+            **AUTH,
+            plex_remote.PROTOCOL_HEADER: str(plex_remote.AGENT_PROTOCOL_NODE_UID),
+            protocol.NODE_UID_HEADER: uid,
+        }
+
+    @pytest.mark.parametrize(("method", "path", "body"), TestTheGuards.ENDPOINTS)
+    def test_every_endpoint_refuses_another_nodes_id(self, agent, method, path, body):
+        response = getattr(agent, method)(path, json=body, headers=self._naming("node-uid-b"))
+        assert response.status_code == 409
+        assert response.get_json()["error"]["kind"] == protocol.KIND_WRONG_NODE
+        assert response.get_json()["agent"] == plex_db_role.agent_block()
+
+    def test_a_write_meant_for_another_node_writes_nothing(self, agent, plex_config):
+        write = _write_body(rating_key=7, wanted=[INTRO])
+        assert agent.post("/v1/item/write", json=write, headers=self._naming("node-uid-b")).status_code == 409
+        assert _served(plex_config) == []
+
+    def test_a_write_naming_this_node_goes_through(self, agent, plex_config):
+        write = _write_body(rating_key=7, wanted=[INTRO])
+        assert agent.post("/v1/item/write", json=write, headers=self._naming(self.UID)).status_code == 200
+        assert _served(plex_config) == [("intro", 11_000, 37_000)]
+
+    def test_a_request_naming_no_node_goes_through_as_before(self, agent, plex_config):
+        # An app that hasn't saved the id yet (first contact), or one from before the check, speaking protocol 1.
+        write = _write_body(rating_key=7, wanted=[INTRO])
+        assert agent.post("/v1/item/write", json=write, headers=AUTH).status_code == 200
+        assert _served(plex_config) == [("intro", 11_000, 37_000)]
+
+    def test_it_speaks_the_protocol_that_carries_the_check_and_still_the_old_one(self):
+        assert plex_db_role.PROTOCOLS == [plex_remote.AGENT_PROTOCOL, plex_remote.AGENT_PROTOCOL_NODE_UID]
+
+    def test_the_node_server_starts_the_role_with_its_own_id(self, tmp_path, monkeypatch):
+        from media_preview_generator.nodes.server.app import EXTENSION, create_node_app
+
+        monkeypatch.delenv("AGENT_TOKEN", raising=False)
+        monkeypatch.setenv("PLEX_CONFIG_DIR", str(tmp_path / "plex"))
+        app = create_node_app(config_dir=str(tmp_path / "node"), roles=["plex_db"], key=TOKEN)
+        own = app.extensions[EXTENSION].identity.id
+        client = app.test_client()
+        assert client.get("/v1/ping", headers=self._naming("someone-else")).status_code == 409
+        assert client.get("/v1/ping", headers=self._naming(own)).status_code == 200
 
 
 class TestItOwnsThePath:
@@ -644,7 +700,7 @@ class TestTheAgentBlock:
     def test_it_names_the_version_the_protocol_and_every_optional_capability(self):
         assert plex_db_role.agent_block() == {
             "version": plex_db_role.AGENT_VERSION,
-            "protocols": [1],
+            "protocols": [1, 2],
             "capabilities": ["chapters_v1", "loudness_v1", "library_health_v1"],
         }
 
@@ -659,9 +715,9 @@ class TestTheAgentBlock:
     def test_a_caller_changing_its_copy_changes_nothing_here(self):
         block = plex_db_role.agent_block()
         block["capabilities"].append("anything")
-        block["protocols"].append(2)
+        block["protocols"].append(3)
         assert plex_db_role.agent_block()["capabilities"] == plex_db_role.CAPABILITIES
-        assert plex_db_role.agent_block()["protocols"] == [1]
+        assert plex_db_role.agent_block()["protocols"] == [1, 2]
 
     def test_the_version_is_the_one_the_apps_update_messages_name(self):
         from media_preview_generator.library_health.plex import LIBRARY_HEALTH_AGENT_VERSION

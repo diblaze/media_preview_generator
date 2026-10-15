@@ -13,7 +13,9 @@ TOKEN = "lab-shared-key-0123456789"
 NODE_URL = "http://plex-host.lan:9494"
 
 
-def node_app(config_dir: str, *, key: str = TOKEN, mountinfo_path: str = "/proc/self/mountinfo") -> Flask:
+def node_app(
+    config_dir: str, *, key: str = TOKEN, node_uid: str = "", mountinfo_path: str = "/proc/self/mountinfo"
+) -> Flask:
     """A bare node app with the Plex database role on, and a stand-in for the node server's own ``/v1/health``."""
     app = Flask(__name__)
 
@@ -21,7 +23,9 @@ def node_app(config_dir: str, *, key: str = TOKEN, mountinfo_path: str = "/proc/
     def health():
         return jsonify({"ok": True, "agent": plex_db_role.agent_block()})
 
-    plex_db_role.register_plex_db(app, plex_config_dir=config_dir, key=key, mountinfo_path=mountinfo_path)
+    plex_db_role.register_plex_db(
+        app, plex_config_dir=config_dir, key=key, node_uid=node_uid, mountinfo_path=mountinfo_path
+    )
     app.config["TESTING"] = True
     return app
 

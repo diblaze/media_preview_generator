@@ -4,8 +4,9 @@ A node is another machine that runs heavy steps for the app (the worker role) or
 runs (the Plex database role). Spec: ``docs/design/remote-nodes/README.md`` §3. Everything here is plain data: no
 Flask, no requests, nothing that touches media, so a node's slim builds can import it too.
 
-The Plex database role keeps the Plex marker agent's own protocol (``markers.publishers.plex_remote``) unchanged, so
-helpers already deployed keep working; the constants below cover the node routes only.
+The Plex database role keeps the Plex marker agent's own protocol (``markers.publishers.plex_remote``), so helpers
+already deployed keep working; the constants below cover the node routes, and the node id that protocol's version 2
+adds (``NODE_UID_HEADER``).
 """
 
 from __future__ import annotations
@@ -27,6 +28,10 @@ PROTOCOL_HEADER = "X-MPG-Node-Protocol"
 # Sent on every answer of the app's web side (never a node's), with an id per running app: an address entered in
 # Add node that answers with it is this app, or another copy of it, not a node.
 APP_INSTANCE_HEADER = "X-MPG-App-Instance"
+# Sent on each Plex database request once the app has saved the node's id (the node block's ``id``): a node with
+# another id refuses it (409 ``wrong_node``) before running anything, so another machine given the same key and
+# address never writes into its Plex what was meant for this node's (agent protocol 2, ``plex_remote``).
+NODE_UID_HEADER = "X-MPG-Node-Uid"
 
 DEFAULT_PORT = 9494
 
@@ -135,6 +140,9 @@ KIND_TASK_DELETED = "task_deleted"
 KIND_NODE_STOPPING = "node_stopping"
 # Too many wrong keys came from the caller's address (429, with Retry-After): its key wasn't compared, nothing ran.
 KIND_RATE_LIMITED = "rate_limited"
+# A Plex database request naming another node's id (``NODE_UID_HEADER``, 409): the machine at the address isn't the
+# one the app saved there; nothing ran.
+KIND_WRONG_NODE = "wrong_node"
 
 # Why a node can't see a file (``error.reason`` / access-check ``kind``).
 NOT_VISIBLE_UNMAPPED = "unmapped"

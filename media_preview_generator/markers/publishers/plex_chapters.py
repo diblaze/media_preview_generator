@@ -42,6 +42,8 @@ from .plex_remote import (
     agent_older_than,
     node_refusal,
     report_from_json,
+    report_wrong_node,
+    saved_node_uid,
 )
 
 CHAPTER_CAPABILITY = "chapters_v1"
@@ -608,7 +610,13 @@ def _context(server: Any, server_config: Any = None, *, reuse_recent: bool = Fal
         wrong_folder = _another_plexs_folder(config, machine)
         if wrong_folder:
             raise ChapterError(wrong_folder, code="unsupported", state=Capability.MISCONFIGURED)
-        backend = AgentClient(settings.agent_url, settings.agent_token, refusal=lambda: node_refusal(settings))
+        backend = AgentClient(
+            settings.agent_url,
+            settings.agent_token,
+            refusal=lambda: node_refusal(settings),
+            node_uid=lambda: saved_node_uid(settings),
+            wrong_node=lambda: report_wrong_node(settings),
+        )
     else:
         folder = str((getattr(config, "output", None) or {}).get("plex_config_folder") or "")
         if not folder:

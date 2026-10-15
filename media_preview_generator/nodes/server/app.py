@@ -234,7 +234,7 @@ def create_node_app(
             raise SystemExit("The Plex database role needs PLEX_CONFIG_DIR: Plex's config folder as this node sees it.")
         from . import plex_db
 
-        plex_db.register_plex_db(app, plex_config_dir=plex_config_dir, key=me.key)
+        plex_db.register_plex_db(app, plex_config_dir=plex_config_dir, key=me.key, node_uid=me.id)
         state.plex_db_module = plex_db
 
     logger.info(

@@ -662,7 +662,8 @@ class NodeRegistry:
     # ------------------------------------------------------------------ reports from job code
 
     def report_unavailable(self, node_id: str) -> None:
-        """A node stopped answering mid-task: check it now rather than at its next turn.
+        """A node stopped answering mid-task, or another machine refused its Plex database work: check it now rather
+        than at its next turn (its Plex database work waits for that check).
 
         A check already running began before the report, so another one follows it straight away.
         """
@@ -1356,7 +1357,7 @@ class NodeRegistry:
         )
 
     def _read_info(self, record: dict, info: dict) -> _Outcome:
-        from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_too_old
+        from ..markers.publishers.plex_remote import AGENT_PROTOCOL_NODE_UID, MIN_AGENT_VERSION, agent_too_old
 
         name = str(record.get("name") or "The node")
         block = info.get("node") if isinstance(info.get("node"), dict) else {}
@@ -1425,6 +1426,21 @@ class NodeRegistry:
                 STATE_UPDATE_NEEDED,
                 f"{name}'s Plex database role is version {agent_version}; this app needs {MIN_AGENT_VERSION} or "
                 "newer. Update the node.",
+                **outcome,
+            )
+        agent_protocols = agent.get("protocols") if isinstance(agent, dict) else None
+        if (
+            protocol.ROLE_PLEX_DB in roles
+            and uid
+            and isinstance(agent_protocols, list)
+            and AGENT_PROTOCOL_NODE_UID not in agent_protocols
+        ):
+            # Its role ignores the node id this app names, so this app sends it the protocol that carries the id,
+            # which it refuses: every Plex database request would fail while the node read as ready.
+            return _Outcome(
+                STATE_UPDATE_NEEDED,
+                f"{name}'s Plex database role is version {agent_version or 'unknown'}, too old for this app. Update "
+                "the node.",
                 **outcome,
             )
         return _Outcome(STATE_READY, **outcome)

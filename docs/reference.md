@@ -184,7 +184,7 @@ Plex's database for a Plex on another machine or on Windows. Stored in `settings
 | Field | Rules |
 |---|---|
 | `id` | Made by the app. Worker group members (`node`) and Plex servers (`markers.plex.agent.node_id`) use it. A record written into the file without one gets one when the app starts. |
-| `node_uid` | The id the machine reported last; recorded by the app, never posted. |
+| `node_uid` | The id the machine reported last; recorded by the app, never posted. Each request to a Plex database node names it, so another machine answering at that address refuses the request and writes nothing. |
 | `name` | 1–80 characters, no line breaks, tabs or hidden characters. Unique: names that look the same (`Café`, `CAFÉ`) count as one. |
 | `url` | `http` or `https` address, e.g. `http://nuc.lan:9494`. A trailing `/` is dropped and the scheme and host are lower-cased. 400 for a query string, fragment, username or password, or a host name that can't be used. |
 | `key` | The node's key: its `NODE_KEY`, or the key it printed in its log on first start. Up to 200 printable ASCII characters, no spaces. Never returned or logged; posting `****` (or leaving it out) keeps the stored key. |
@@ -539,7 +539,9 @@ side is `media_preview_generator/markers/publishers/plex_remote.py`. Its setting
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
 
 Every request carries the key and the protocol the app speaks, and every answer carries the node's version and the
-protocols it speaks; a mismatch in either direction is refused before anything is written.
+protocols it speaks; a mismatch in either direction is refused before anything is written. Once the app has recorded
+the node's id (`node_uid`), every request names it too (protocol 2): another machine given the same key and address
+refuses the request before anything is written, and the app checks the node again while that work waits.
 
 ### Job kind `intro_credits`
 

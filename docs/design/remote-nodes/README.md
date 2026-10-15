@@ -10,7 +10,8 @@ https://claude.ai/artifact/G5nBhYJVFBekqJMQ93NCHa
   runs (**Plex database** role). One node can hold both roles. The app stays the brain: queue, schedules, retries,
   tokens, mappings, every write. A node runs one heavy step it is handed and returns frames, numbers or timestamps.
 * The Plex database role **is** today's Plex helper (`plex-marker-agent`), folded in. Its wire protocol (agent
-  protocol 1, header `X-Marker-Agent-Protocol`) is unchanged so every helper already deployed keeps working.
+  protocol 1, header `X-Marker-Agent-Protocol`) is still spoken, so every helper already deployed keeps working;
+  agent protocol 2 adds the node's id to each request (§3).
 * Evidence that the design works (prototype runs, Windows CI results, the requeue spike) is in
   [`evidence/`](evidence/) and the throwaway prototype in [`prototype/`](prototype/). Read §9 before trusting any
   number.
@@ -49,6 +50,10 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     otherwise its Plex database work is refused ("Type the node's key again on its Settings tab to confirm") until
     the key is typed again, which clears the saved id. A Plex database node beside the wrong Plex is caught by the
     Plex machine identifier check.
+  - Each Plex database request names the node's saved id (agent protocol 2, §3), so another machine that starts
+    answering at the address between the app's check and its write refuses the write and runs nothing; the app
+    holds that node's Plex database work and checks it again at once. A Plex database node from before protocol 2
+    (agent version 1.2.0 builds of this branch only; never released) reads `update_needed`.
   - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
     refuses loudness writes.
 * **Still open:**
@@ -115,7 +120,12 @@ A node never receives a server token, never decides work, never receives a write
 
 Auth on every route except `GET /v1/health`: `Authorization: Bearer <key>`, compared with `secrets.compare_digest`
 on bytes. Node routes also require `X-MPG-Node-Protocol: 1`; a mismatch answers 409 `{"error":{"kind":"protocol"}}`.
-The Plex database routes keep the agent's header and protocol exactly.
+The Plex database routes keep the agent's header and its protocols 1 and 2. Once the app has saved a node's
+`node_uid` (§4) every Plex database request it sends is agent protocol 2 with `X-MPG-Node-Uid: <node_uid>`; a node
+with another id answers 409 `{"error":{"kind":"wrong_node"}}` before running anything, and the app treats that as
+the node not answering (the work waits, nothing fails) and checks it at once, which then holds the work as for any
+new id (§0.1). With no saved id (first contact, an old helper, which has none) the app sends protocol 1 and no id.
+A node from before protocol 2 refuses it (409 `protocol`), so it never runs a request meant for another machine.
 
 Every JSON answer: `{"ok": bool, "node": NODE_BLOCK, ...}` where
 `NODE_BLOCK = {"id", "name", "version", "build", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the
@@ -228,7 +238,8 @@ retry runs (on the **node's** CPU, see §6).
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
-  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block). A node that refuses the app's
+  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block), and a node whose `agent.protocols`
+  lacks 2 (it would refuse every Plex database request, §3). A node that refuses the app's
   node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.

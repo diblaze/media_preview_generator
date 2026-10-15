@@ -1384,6 +1384,25 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
         assert h.client().info_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("protocols", "state"),
+    [([1], reg.STATE_UPDATE_NEEDED), ([1, 2], reg.STATE_READY)],
+    ids=["from-before-the-id-check", "with-the-id-check"],
+)
+def test_a_plex_database_node_from_before_the_id_check_needs_an_update(h, protocols, state):
+    # Its role ignores the saved id the app sends, so it would run a request meant for another machine: the app sends
+    # it protocol 2, which it refuses, and the Nodes page says why instead of showing it ready.
+    info = _info(roles=(ROLE_PLEX_DB,))
+    info["agent"] = {"version": "1.2.0", "protocols": protocols, "capabilities": []}
+    h.client().default_info = info
+
+    view = h.registry.check_now("n1")
+
+    assert view.state == state
+    if state == reg.STATE_UPDATE_NEEDED:
+        assert view.reason == "nuc's Plex database role is version 1.2.0, too old for this app. Update the node."
+
+
 def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h):
     from media_preview_generator.nodes.client import NodeRateLimitedError
 

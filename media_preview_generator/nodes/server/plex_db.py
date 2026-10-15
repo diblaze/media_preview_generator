@@ -14,10 +14,12 @@ What it is not: it is not a remote-control API for Plex. Its routes are fixed op
 * it refuses exactly what the in-process writers refuse: a database that isn't on a local disk *here*, a schema they
   don't know, a missing or duplicated Plex marker tag row (it never creates one), a database that isn't the connected
   Plex's;
-* every request needs the shared key, and a caller speaking another agent protocol is refused by name.
+* every request needs the shared key, and a caller speaking another agent protocol is refused by name;
+* a request naming another node's id (protocol 2) is refused before it runs: the app saved another machine at this
+  address, and this one was given the same key and address.
 
-The wire protocol is the agent's (``markers.publishers.plex_remote``: header ``X-Marker-Agent-Protocol``, protocol 1)
-so every app that already talks to a Plex helper keeps working. ``/v1/health`` belongs to the node server
+The wire protocol is the agent's (``markers.publishers.plex_remote``: header ``X-Marker-Agent-Protocol``, protocol 1,
+and protocol 2, which adds the node id) so every app that already talks to a Plex helper keeps working. ``/v1/health`` belongs to the node server
 (``nodes.server.app``), which carries :func:`agent_block` on it while this role is on.
 
 Run it in one process (``nodes.server.wsgi`` serves one): the app's "one writer at a time" guarantee is a lock inside one
@@ -58,14 +60,14 @@ from ...markers.publishers.plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from ..protocol import KIND_RATE_LIMITED, sendable_key, whole_number
+from ..protocol import KIND_RATE_LIMITED, KIND_WRONG_NODE, NODE_UID_HEADER, sendable_key, whole_number
 from .identity import wrong_key_limit
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
 # numbers, so an image left behind on the Plex host is a message, never a wrong write.
 AGENT_VERSION = "1.2.0"
 # The wire contracts this build implements. Add to it (never replace) while older apps are still in the wild.
-PROTOCOLS = [plex_remote.AGENT_PROTOCOL]
+PROTOCOLS = [plex_remote.AGENT_PROTOCOL, plex_remote.AGENT_PROTOCOL_NODE_UID]
 # Optional operations beyond markers. The app asks for one (``AgentClient.require``) before sending its requests, so
 # an older helper is an "update the helper" message, never a request it can't answer.
 CAPABILITIES = [CHAPTER_CAPABILITY, loudness_db.LOUDNESS_CAPABILITY, LIBRARY_HEALTH_CAPABILITY]
@@ -334,19 +336,26 @@ def _check_key(key: str) -> bytes:
 
 
 def register_plex_db(
-    app: Flask, *, plex_config_dir: str, key: str, mountinfo_path: str = "/proc/self/mountinfo"
+    app: Flask,
+    *,
+    plex_config_dir: str,
+    key: str,
+    node_uid: str = "",
+    mountinfo_path: str = "/proc/self/mountinfo",
 ) -> None:
     """Add the Plex database role's routes to a node app.
 
-    Every route here sits behind its own guard (the shared key, then the agent protocol header, then a JSON object
-    body for a POST), scoped to these routes only: the node server's own routes keep theirs. ``/v1/health`` is not
-    added — the node server owns it.
+    Every route here sits behind its own guard (the shared key, then the agent protocol header, then the node id the
+    app names, then a JSON object body for a POST), scoped to these routes only: the node server's own routes keep
+    theirs. ``/v1/health`` is not added — the node server owns it.
 
     Args:
         app: The node's Flask app.
         plex_config_dir: Plex's config folder as this node sees it. The database path is derived from it and never
             taken from a request.
         key: The key both sides share.
+        node_uid: This node's id (its node block's ``id``). A request naming another id is refused; with none, any
+            request naming an id is.
         mountinfo_path: For tests.
 
     Raises:
@@ -355,6 +364,7 @@ def register_plex_db(
     global _registered_config_dir
     folder = (plex_config_dir or "").strip()
     shared_key_bytes = _check_key(key)
+    own_uid = (node_uid or "").strip()
     if not folder:
         raise SystemExit("Set PLEX_CONFIG_DIR to Plex's config folder as this container sees it.")
     _registered_config_dir = folder
@@ -405,6 +415,13 @@ def register_plex_db(
                     },
                 }
             ), 409
+        named = request.headers.get(NODE_UID_HEADER, "").strip()
+        if named and named != own_uid:
+            # The app saved another machine at this address (this one was given the same key and address): whatever
+            # it asks was meant for that one's Plex. The app checks which machine answers here before it asks again.
+            message = "This node isn't the one the app saved at this address: it has another id."
+            error = {"kind": KIND_WRONG_NODE, "message": message}
+            return jsonify({"ok": False, "agent": agent_block(), "error": error}), 409
         # The node app's own body limit is its business; these routes keep the agent's, before anything is parsed.
         if (request.content_length or 0) > MAX_BODY_BYTES:
             abort(413)
