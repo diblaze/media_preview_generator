@@ -541,3 +541,38 @@ class TestAPlexDatabaseNodeSwappedAtItsAddress:
             time.sleep(0.02)
         # It has another id, and nothing ties it to the server's Plex: held until its key is typed again.
         assert "reports a new id" in get_registry().plex_db_refusal("n1")
+
+    def test_the_other_machine_registers_no_chapters_and_the_app_holds_the_node(self, swapped, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from media_preview_generator.markers.publishers import plex_chapters
+        from media_preview_generator.markers.publishers.plex_chapters import Chapter, ChapterTarget
+        from media_preview_generator.markers.publishers.plex_remote import AgentUnreachableError
+        from media_preview_generator.nodes.registry import get_registry
+
+        answering, machines = swapped
+        registered = []
+        # Each machine's chapter route is real up to the write itself, which needs a Plex library to run against.
+        monkeypatch.setattr(
+            plex_chapters.LocalChapters, "register", lambda self, *args, **kwargs: registered.append(self.folder)
+        )
+        monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("plex-a", "1.43.4"))
+        monkeypatch.setattr(plex_chapters, "verify_chapters", lambda server, target, revisions: None)
+        markers = {"enabled": True, "plex": {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": True,
+                   "node_id": "n1"}}}  # fmt: skip
+        server = MagicMock(_server_config=SimpleNamespace(markers=markers, output={}))
+        target = ChapterTarget(
+            7, 8, 9, "a" * 40, "/data/tv/S01E01.mkv", 1_000_000, 100, (Chapter(1, 0, 1000, "", 10, 20),), "plex-a"
+        )
+
+        assert get_registry().plex_db_hold("n1") is None  # a check heard the saved id
+        plex_chapters.register_chapters(server, target, {1: "b" * 64})
+        assert registered == [machines["a"][1]]
+
+        answering["app"] = machines["b"][0]  # the same key, another machine
+        with pytest.raises(AgentUnreachableError, match="isn't the Plex database node saved there"):
+            plex_chapters.register_chapters(server, target, {1: "b" * 64})
+
+        assert registered == [machines["a"][1]]
+        assert get_registry().plex_db_hold("n1") is not None  # its work waits while it is checked again, at once
