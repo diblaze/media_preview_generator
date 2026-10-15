@@ -28,13 +28,12 @@ import glob
 import json
 import os
 import subprocess
-import tempfile
 import threading
 from dataclasses import dataclass
 
 from loguru import logger
 
-from ..utils import is_node_mode
+from ..utils import is_node_mode, scratch_dir
 from .ffmpeg_capabilities import _is_hwaccel_available, ffmpeg_binary
 
 _VULKAN_DEVICE_CACHE: str | None = None
@@ -483,8 +482,9 @@ def _probe_vulkan_device() -> str | None:
     #     {"file_format_version":"1.0.0",
     #      "ICD":{"library_path":"libEGL_nvidia.so.0"}}
     #
-    # We write that verbatim to ``{tempdir}/plex_previews_nvidia_egl_
-    # vendor.json`` and set ``__EGL_VENDOR_LIBRARY_FILENAMES`` at it.
+    # We write that verbatim to ``{scratch_dir()}/plex_previews_nvidia_egl_
+    # vendor.json`` (a node's NODE_TEMP_DIR: run read-only it may have no
+    # writable system temp) and set ``__EGL_VENDOR_LIBRARY_FILENAMES`` at it.
     # The library_path stays bare so the dynamic loader resolves it via
     # the standard search path (exactly what NVIDIA's own Dockerfile
     # does).  Gated on ``libEGL_nvidia.so*`` actually being present in
@@ -493,7 +493,7 @@ def _probe_vulkan_device() -> str | None:
     if nvidia_egl_vendor is None:
         libegl_nvidia = _find_libegl_nvidia()
         if libegl_nvidia:
-            synth_vendor_path = os.path.join(tempfile.gettempdir(), "plex_previews_nvidia_egl_vendor.json")
+            synth_vendor_path = os.path.join(scratch_dir(), "plex_previews_nvidia_egl_vendor.json")
             synth_payload = {
                 "file_format_version": "1.0.0",
                 "ICD": {"library_path": "libEGL_nvidia.so.0"},

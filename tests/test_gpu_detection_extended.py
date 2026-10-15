@@ -2105,7 +2105,7 @@ class TestProbeVulkanDevice:
 
         # Point the tempfile root at pytest's tmp_path for cleanliness.
         with patch(
-            "media_preview_generator.gpu.vulkan_probe.tempfile.gettempdir",
+            "media_preview_generator.utils.tempfile.gettempdir",
             return_value=str(tmp_path),
         ):
             device = _probe_vulkan_device()
@@ -2139,6 +2139,51 @@ class TestProbeVulkanDevice:
         assert get_vulkan_env_overrides() == {
             "__EGL_VENDOR_LIBRARY_FILENAMES": str(synth_path),
         }
+
+    @patch(
+        "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
+        return_value=True,
+    )
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json")
+    @patch("media_preview_generator.gpu.vulkan_probe.subprocess.run")
+    def test_strategy_2c_writes_vendor_json_to_a_nodes_temp_folder(
+        self,
+        mock_run,
+        mock_find_icd,
+        mock_find_egl,
+        mock_find_libegl,
+        _mock_vk,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A node run read-only has no writable system temp: the vendor JSON goes to its NODE_TEMP_DIR instead."""
+        from media_preview_generator.gpu import _probe_vulkan_device, get_vulkan_env_overrides
+
+        node_temp = tmp_path / "node-temp"
+        node_temp.mkdir()
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(node_temp))
+        mock_find_egl.return_value = None
+        mock_find_icd.return_value = "/etc/vulkan/icd.d/nvidia_icd.json"
+        mock_find_libegl.return_value = "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.119.02"
+        llvmpipe = MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)"))
+        quadro = MagicMock(returncode=0, stderr=self._stderr_with_device("Quadro P4000 (discrete) (0x1bb1)"))
+        # Strategy 1 lands on llvmpipe; only a probe that got the vendor JSON finds the Quadro.
+        mock_run.side_effect = lambda *_a, **kw: (
+            quadro
+            if (kw.get("env") or {}).get("__EGL_VENDOR_LIBRARY_FILENAMES", "").startswith(str(node_temp))
+            else llvmpipe
+        )
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path / "no-such-system-temp")):
+            device = _probe_vulkan_device()
+
+        synth_path = node_temp / "plex_previews_nvidia_egl_vendor.json"
+        assert device == "Quadro P4000 (discrete) (0x1bb1)"
+        assert synth_path.exists()
+        assert get_vulkan_env_overrides() == {"__EGL_VENDOR_LIBRARY_FILENAMES": str(synth_path)}
 
     @patch(
         "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
