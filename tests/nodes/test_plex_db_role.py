@@ -654,3 +654,63 @@ class TestTheInfoBlock:
             "db_present": False,
             "machine_identifier": "",
         }
+
+
+class TestTheNodeSaysWhetherItHasTheRole:
+    """The full node server (``create_node_app``): what the app learns about the role from its answers."""
+
+    KEY = "plex-db-node-key-0123456789"
+
+    def test_v1_info_carries_the_roles_version_so_an_older_role_needs_an_update(self, tmp_path, monkeypatch):
+        from media_preview_generator.nodes import registry as reg
+        from media_preview_generator.nodes.server import app as node_app_module
+
+        plex = tmp_path / "Plex Media Server"
+        plex.mkdir()
+        monkeypatch.setenv("PLEX_CONFIG_DIR", str(plex))
+        monkeypatch.setattr(plex_db_role, "AGENT_VERSION", "1.2.0")
+        monkeypatch.setattr(plex_remote, "MIN_AGENT_VERSION", "9.0.0")
+        app = node_app_module.create_node_app(config_dir=str(tmp_path / "cfg"), roles=["plex_db"], key=self.KEY)
+        try:
+            headers = {"Authorization": f"Bearer {self.KEY}", "X-MPG-Node-Protocol": "1"}
+            info = app.test_client().get("/v1/info", headers=headers).get_json()
+        finally:
+            app.extensions["mpg_node"].close()
+        assert info["agent"]["version"] == "1.2.0"
+        record = {"id": "n1", "name": "plex-box", "url": "http://plex:9494", "key": self.KEY, "enabled": True}
+        registry = reg.NodeRegistry(nodes_provider=lambda: [record], app_version=lambda: "5.2.0")
+        outcome = registry._read_info(record, info)
+        assert outcome.state == reg.STATE_UPDATE_NEEDED and "9.0.0" in outcome.reason
+
+    def test_a_worker_only_node_has_no_agent_block(self, tmp_path, monkeypatch):
+        import media_preview_generator.nodes.server.info as info_module
+        from media_preview_generator.nodes.server import app as node_app_module
+
+        monkeypatch.setattr(info_module, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "7.1"})
+        app = node_app_module.create_node_app(config_dir=str(tmp_path), roles=["worker"], ops={}, key=self.KEY)
+        app.extensions[node_app_module.EXTENSION].worker_info._detect = lambda: []
+        try:
+            headers = {"Authorization": f"Bearer {self.KEY}", "X-MPG-Node-Protocol": "1"}
+            assert "agent" not in app.test_client().get("/v1/info", headers=headers).get_json()
+        finally:
+            app.extensions["mpg_node"].close()
+
+    def test_a_node_without_the_role_is_named_as_such_not_as_unreachable(self, tmp_path, monkeypatch):
+        import time
+
+        import media_preview_generator.nodes.server.info as info_module
+        from media_preview_generator.markers import readiness
+        from media_preview_generator.nodes.server import app as node_app_module
+
+        monkeypatch.setattr(info_module, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "7.1"})
+        app = node_app_module.create_node_app(config_dir=str(tmp_path), roles=["worker"], ops={}, key=self.KEY)
+        app.extensions[node_app_module.EXTENSION].worker_info._detect = lambda: []
+        try:
+            db = RemotePlexDb("http://gpu-box:9494", self.KEY, session=FlaskSession(app.test_client()))
+            report = db.file_checks(deadline=time.monotonic() + 5)
+        finally:
+            app.extensions["mpg_node"].close()
+        assert report.state is Capability.AGENT_UNAVAILABLE
+        assert db._client.state == plex_remote.AGENT_NO_ROLE
+        assert "Plex database role is off" in report.message
+        assert readiness.AGENT_STATES[plex_remote.AGENT_NO_ROLE][1] == "role off"

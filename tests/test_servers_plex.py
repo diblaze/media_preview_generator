@@ -3071,7 +3071,6 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
         ("state", "label", "current"),
         [
             ("disabled", "The Plex database node is turned off", "turned off"),
-            ("different_node", "A different node answers at the Plex database node's address", "different node"),
             ("no_node", "This server's Plex database node isn't on the Nodes page", "no node"),
         ],
     )
@@ -3159,15 +3158,11 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
             plex_remote.AGENT_UNREACHABLE,
             plex_remote.AGENT_REJECTED,
             plex_remote.AGENT_INCOMPATIBLE,
+            plex_remote.AGENT_NO_ROLE,
             plex_remote.AGENT_DISABLED,
-            plex_remote.AGENT_DIFFERENT_NODE,
             plex_remote.AGENT_NO_NODE,
         }
-        assert readiness.AGENT_FIXED_IN_APP == {
-            plex_remote.AGENT_DISABLED,
-            plex_remote.AGENT_DIFFERENT_NODE,
-            plex_remote.AGENT_NO_NODE,
-        }
+        assert readiness.AGENT_FIXED_IN_APP == {plex_remote.AGENT_DISABLED, plex_remote.AGENT_NO_NODE}
         assert readiness.AGENT_RECOMMENDED == plex_remote.AGENT_CONNECTED
         assert readiness.AGENT_FALLBACK_STATE == plex_remote.AGENT_UNREACHABLE
 

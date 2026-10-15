@@ -8,6 +8,7 @@ send stored keys out.
 
 from __future__ import annotations
 
+import copy
 import math
 from datetime import UTC, datetime
 from typing import Any
@@ -33,9 +34,12 @@ from ..settings_manager import get_settings_manager
 from . import api
 
 LOG_LINES_MAX = 2000
-# Probe error kinds beyond the protocol's request-level ones: nothing answered, or another node than the one saved.
+# The probe error kind beyond the protocol's request-level ones: nothing answered.
 KIND_UNREACHABLE = "unreachable"
-KIND_DIFFERENT_NODE = "different_node"
+# Bounds on what a node sends that is passed on to the browser.
+NODE_TEXT_MAX = 500
+NODE_LIST_MAX = 64
+NODE_DEPTH_MAX = 4
 KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
 
 
@@ -53,7 +57,22 @@ def _legacy_ping(url: str, key: str) -> tuple[str, str]:
     return _default_legacy_ping(url, key)
 
 
+def _server_agent(entry: object) -> dict | None:
+    """A Plex server entry's ``markers.plex.agent`` block, or None."""
+    if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+        return None
+    markers = entry.get("markers")
+    plex = markers.get("plex") if isinstance(markers, dict) else None
+    agent = plex.get("agent") if isinstance(plex, dict) else None
+    return agent if isinstance(agent, dict) else None
+
+
 def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
+    """The worker groups with a member on the node, and the Plex servers whose database it opens.
+
+    A server whose Plex database node is switched off doesn't use it (its Intro & Credits tab says this app opens the
+    database), even though it remembers the node for when it is switched on again.
+    """
     sm = get_settings_manager()
     groups = []
     for group in sm.get("worker_groups") or []:
@@ -64,14 +83,38 @@ def _used_by(node_id: str) -> dict[str, list[dict[str, str]]]:
             groups.append({"id": str(group.get("id") or ""), "name": str(group.get("name") or "")})
     servers = []
     for entry in sm.get("media_servers") or []:
-        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
-            continue
-        markers = entry.get("markers")
-        plex = markers.get("plex") if isinstance(markers, dict) else None
-        agent = plex.get("agent") if isinstance(plex, dict) else None
-        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+        agent = _server_agent(entry)
+        if agent is not None and agent.get("enabled") and agent.get("node_id") == node_id:
             servers.append({"id": str(entry.get("id") or ""), "name": str(entry.get("name") or "")})
     return {"groups": groups, "servers": servers}
+
+
+def _finite(value: object) -> int | float | None:
+    """A number a node sent, or None when it isn't a finite one (a ``NaN`` would make the answer invalid JSON)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _node_sent(value: object, depth: int = 0) -> Any:
+    """A JSON value a node sent, made safe to pass on to the browser.
+
+    Text is cut to :data:`NODE_TEXT_MAX` characters, lists and objects to :data:`NODE_LIST_MAX` entries and
+    :data:`NODE_DEPTH_MAX` levels; anything that isn't text, a finite number, a bool or null becomes null.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return _finite(value)
+    if isinstance(value, str):
+        return value[:NODE_TEXT_MAX]
+    if depth >= NODE_DEPTH_MAX:
+        return None
+    if isinstance(value, dict):
+        return {str(k)[:NODE_TEXT_MAX]: _node_sent(v, depth + 1) for k, v in list(value.items())[:NODE_LIST_MAX]}
+    if isinstance(value, list | tuple):
+        return [_node_sent(v, depth + 1) for v in value[:NODE_LIST_MAX]]
+    return None
 
 
 def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
@@ -88,14 +131,9 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "version": view.version if view else "",
         "roles": list(view.roles) if view else [],
         "legacy": bool(view.legacy) if view else False,
-        "platform": details.platform if details else {},
-        "gpus": [dict(g) for g in details.gpus] if details else [],
-        "cpu": {
-            "cores": cpu.get("cores"),
-            "load1": cpu.get("load1"),
-            "ram_total": cpu.get("ram_total"),
-            "ram_available": cpu.get("ram_available"),
-        },
+        "platform": _node_sent(details.platform) if details else {},
+        "gpus": [_node_sent(dict(g)) for g in details.gpus] if details else [],
+        "cpu": {key: _finite(cpu.get(key)) for key in ("cores", "load1", "ram_total", "ram_available")},
         "busy": details.busy if details else 0,
         "last_seen": view.last_seen if view else None,
         "path_mappings": list(record.get("path_mappings") or []),
@@ -147,26 +185,28 @@ def _probe_info(info: dict) -> dict[str, Any]:
     worker = info.get("worker") if isinstance(info.get("worker"), dict) else None
     gpus = [g for g in (worker or {}).get("gpus") or [] if isinstance(g, dict)]
     plex_db = info.get("plex_db")
-    return {
-        "node": {
-            "id": str(block.get("id") or "") or None,
-            "name": str(block.get("name") or ""),
-            "version": version,
-            "roles": roles,
-        },
-        "legacy": False,
-        "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
-        "worker": None
-        if worker is None
-        else {
-            "gpus": gpus,
-            "cpu": worker.get("cpu") if isinstance(worker.get("cpu"), dict) else {},
-            "temp": worker.get("temp") if isinstance(worker.get("temp"), dict) else {},
-            "notes": _credit_notes(gpus),
-        },
-        "plex_db": plex_db if isinstance(plex_db, dict) else None,
-        "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
-    }
+    return _node_sent(
+        {
+            "node": {
+                "id": str(block.get("id") or "") or None,
+                "name": str(block.get("name") or ""),
+                "version": version,
+                "roles": roles,
+            },
+            "legacy": False,
+            "platform": info.get("platform") if isinstance(info.get("platform"), dict) else {},
+            "worker": None
+            if worker is None
+            else {
+                "gpus": gpus,
+                "cpu": worker.get("cpu") if isinstance(worker.get("cpu"), dict) else {},
+                "temp": worker.get("temp") if isinstance(worker.get("temp"), dict) else {},
+                "notes": _credit_notes(gpus),
+            },
+            "plex_db": plex_db if isinstance(plex_db, dict) else None,
+            "version_match": version == _app_version() if protocol.ROLE_WORKER in roles else None,
+        }
+    )
 
 
 def _probe(url: str, key: str) -> dict[str, Any]:
@@ -179,7 +219,16 @@ def _probe(url: str, key: str) -> dict[str, Any]:
         return _probe_error(protocol.KIND_AUTH, "The node refused this key.")
     except NodeRequestError as exc:
         return _probe_error(protocol.KIND_REQUEST, str(exc))
-    except NodeProtocolError:
+    except NodeProtocolError as exc:
+        if exc.node is not None:
+            node_version = str(exc.node.get("version") or "")[:NODE_TEXT_MAX] or "unknown"
+            answer = _probe_error(
+                protocol.KIND_PROTOCOL,
+                f"This node runs version {node_version} and this app runs {_app_version()}, and they don't speak the "
+                "same node protocol. Update the older one so both run the same version.",
+            )
+            answer["error"]["node_version"] = node_version
+            return answer
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")
@@ -269,10 +318,6 @@ def probe_node():
         return jsonify(result)
     info = result["info"]
     uid = info["node"]["id"]
-    if record is not None and record.get("node_uid") and uid and uid != record["node_uid"]:
-        return jsonify(
-            _probe_error(KIND_DIFFERENT_NODE, f"A different node answered at this address than {record.get('name')}.")
-        )
     own_id = record["id"] if record else None
     twin = next((n for n in sm.nodes if uid and n.get("node_uid") == uid and n["id"] != own_id), None)
     info["already_added"] = {"id": twin["id"], "name": twin.get("name", "")} if twin else None
@@ -280,6 +325,22 @@ def probe_node():
         default_mappings_for(sm.get("media_servers") or []) if protocol.ROLE_WORKER in info["node"]["roles"] else []
     )
     return jsonify(result)
+
+
+def _probed_uid(url: str, key: str) -> str | None:
+    """The id of the node answering at an address with this key, or None when none answers as a node."""
+    probe = _probe(url, key)
+    return probe["info"]["node"]["id"] if probe["ok"] else None
+
+
+def _twin(nodes: list[dict], url: str, uid: str | None) -> dict | None:
+    """The saved node at this address, or the one whose id the node answering there reported."""
+    return next((n for n in nodes if _same_address(url, n) or (uid and n.get("node_uid") == uid)), None)
+
+
+def _already_added(twin: dict) -> tuple[Any, int]:
+    answer = {"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}
+    return jsonify({**answer, "name": twin.get("name", "")}), 409
 
 
 @api.route("/nodes", methods=["POST"])
@@ -291,14 +352,12 @@ def create_node():
     record, err = validate_node({**data, "node_uid": None}, existing=None, others=sm.nodes)
     if record is None:
         return jsonify({"error": err}), 400
-    probe = _probe(record["url"], record["key"])
-    uid = probe["info"]["node"]["id"] if probe["ok"] else None
+    uid = _probed_uid(record["url"], record["key"])
     with sm.locked():
         nodes = sm.nodes
-        twin = next((n for n in nodes if uid and n.get("node_uid") == uid), None)
+        twin = _twin(nodes, record["url"], uid)
         if twin is not None:
-            answer = {"error": f"This node is already added as {twin.get('name')}", "node_id": twin["id"]}
-            return jsonify({**answer, "name": twin.get("name", "")}), 409
+            return _already_added(twin)
         others_err = validate_node(record, existing=None, others=nodes)[1]
         if others_err:
             return jsonify({"error": others_err}), 400
@@ -319,6 +378,12 @@ def update_node(node_id: str):
     """Change a node's name, address, key, on/off switch or mappings."""
     data = {k: v for k, v in _json_body().items() if k in ("name", "url", "key", "enabled", "path_mappings")}
     sm = get_settings_manager()
+    before = find_node(sm.nodes, node_id)
+    new_url = normalise_url(data["url"])[0] if "url" in data else None
+    moving = before is not None and new_url is not None and not _same_address(new_url, before)
+    typed_key = normalise_key(data.get("key"), "")[0] if data.get("key") not in (None, KEY_MASK) else None
+    # Asked before the lock (it waits on the network); a node at the new address may already be added.
+    uid = _probed_uid(new_url, typed_key) if moving and new_url and typed_key else None
     with sm.locked():
         nodes = sm.nodes
         existing = find_node(nodes, node_id)
@@ -332,6 +397,10 @@ def update_node(node_id: str):
         record, err = validate_node(data, existing=existing, others=others)
         if record is None:
             return jsonify({"error": err}), 400
+        if not _same_address(record["url"], existing):
+            twin = _twin(others, record["url"], uid)
+            if twin is not None:
+                return _already_added(twin)
         reconnect = any(record[k] != existing.get(k) for k in ("url", "key", "path_mappings", "enabled"))
         nodes[nodes.index(existing)] = record
         try:
@@ -341,6 +410,20 @@ def update_node(node_id: str):
     if reconnect:
         get_registry().report_unavailable(node_id)
     return jsonify(_row_for(node_id))
+
+
+def _forget_switched_off_choice(sm: Any, node_id: str) -> None:
+    """Drop a removed node from the Plex servers that remembered it with their Plex database node switched off, so
+    switching one on again asks for a node instead of pointing at one that is gone."""
+    servers = copy.deepcopy(sm.get("media_servers") or [])
+    changed = False
+    for entry in servers:
+        agent = _server_agent(entry)
+        if agent is not None and agent.get("node_id") == node_id:
+            agent["node_id"] = None
+            changed = True
+    if changed:
+        sm.set("media_servers", servers)
 
 
 @api.route("/nodes/<node_id>", methods=["DELETE"])
@@ -362,6 +445,7 @@ def delete_node(node_id: str):
             sm.update_nodes([n for n in nodes if n is not existing])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        _forget_switched_off_choice(sm, node_id)
     logger.info("Removed node {}", existing.get("name"))
     return jsonify({"ok": True})
 
@@ -393,9 +477,8 @@ def test_node_access(node_id: str):
         result = run_test_access(_make_client(record["url"], record["key"]), mappings, sm.get("media_servers") or [])
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
-    # Only a test of the saved mappings says anything about how the node runs work now.
-    if rows == stored:
-        get_registry().record_access_result(node_id, result, tested_mappings=rows)
+    # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.
+    get_registry().record_access_result(node_id, result, tested_mappings=rows)
     return jsonify(result)
 
 

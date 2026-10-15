@@ -233,6 +233,9 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
         info_block = getattr(state.plex_db_module, "info_block", None)
         if callable(info_block):
             body["plex_db"] = info_block()
+        if state.plex_db_module is not None:
+            # The app's health check reads the role's version here (its MIN_AGENT_VERSION rule).
+            body["agent"] = state.plex_db_module.agent_block()
         return answer(body)
 
     @bp.post(protocol.ROUTE_GPUS_RESCAN)

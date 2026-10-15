@@ -33,10 +33,18 @@ STATE_UPDATE_NEEDED = "update_needed"
 STATE_KEY_REFUSED = "key_refused"
 STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
+STATE_NO_FFMPEG = "no_ffmpeg"
 STATE_DISABLED = "disabled"
 
 # States that raise a bell notification (``web.notifications``).
-ALERT_STATES = (STATE_OFFLINE, STATE_UPDATE_NEEDED, STATE_KEY_REFUSED, STATE_ACCESS_PROBLEM, STATE_GPU_LOST)
+ALERT_STATES = (
+    STATE_OFFLINE,
+    STATE_UPDATE_NEEDED,
+    STATE_KEY_REFUSED,
+    STATE_ACCESS_PROBLEM,
+    STATE_GPU_LOST,
+    STATE_NO_FFMPEG,
+)
 
 HEALTH_INTERVAL_S = 30.0
 # Delay before the next check after the 1st, 2nd, 3rd and later offline checks in a row.
@@ -57,6 +65,7 @@ _CAPACITY_REASONS = {
     STATE_UPDATE_NEEDED: "node needs an update",
     STATE_KEY_REFUSED: "key refused",
     STATE_ACCESS_PROBLEM: "fix media access first",
+    STATE_NO_FFMPEG: "FFmpeg missing on node",
     STATE_DISABLED: "node turned off",
 }
 
@@ -116,7 +125,6 @@ class _Outcome:
     version: str = ""
     roles: tuple[str, ...] = ()
     uid: str = ""
-    different_node: bool = False
 
 
 @dataclass
@@ -141,7 +149,9 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
-    different_node: bool = False
+    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save): kept as
+    # ``(rows, result, checked_at)`` and adopted when exactly those rows are saved.
+    pending_access: tuple[list, dict, float] | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -182,7 +192,12 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
     return agent.state, agent.version
 
 
-def _default_record_uid(node_id: str, uid: str) -> None:
+def _default_record_uid(node_id: str, uid: str, url: str) -> None:
+    """Save the id a node reported, when the record still has the address it was learnt at.
+
+    The saved key at the saved address is what makes a node this node: one that answers with a new id (recreated
+    without its ``/config``, reinstalled) is the same node, so the new id replaces the old one.
+    """
     from ..web.settings_manager import get_settings_manager
 
     sm = get_settings_manager()
@@ -190,8 +205,10 @@ def _default_record_uid(node_id: str, uid: str) -> None:
         with sm.locked():
             nodes = sm.nodes
             node = find_node(nodes, node_id)
-            if node is None or node.get("node_uid"):
+            if node is None or node.get("node_uid") == uid or node.get("url") != url:
                 return
+            if node.get("node_uid"):
+                logger.info("{} reports a new id; it was probably reinstalled", node.get("name") or node_id)
             node["node_uid"] = uid
             sm.update_nodes(nodes)
     except (OSError, ValueError) as exc:
@@ -254,7 +271,7 @@ class NodeRegistry:
         nodes_provider: Returns the stored node records.
         client_factory: Builds the client for one record.
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
-        record_uid: Persists the ``node_uid`` a node reported on first contact.
+        record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
         quick_access: Checks one file per mapping row on a node; True when every one is visible.
         app_version: This app's version (a worker node must match it exactly).
         app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
@@ -270,7 +287,7 @@ class NodeRegistry:
         nodes_provider: Callable[[], list[dict]] = _default_nodes,
         client_factory: Callable[[dict], NodeClient] = _default_client,
         legacy_ping: Callable[[str, str], tuple[str, str]] = _default_legacy_ping,
-        record_uid: Callable[[str, str], None] = _default_record_uid,
+        record_uid: Callable[[str, str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
         app_version: Callable[[], str] = _app_version,
         app_build: Callable[[], str] = protocol.build_sha,
@@ -356,17 +373,6 @@ class NodeRegistry:
             live = self._nodes.get(node_id)
             return node_mappings(live.record) if live else []
 
-    def identity_ok(self, node_id: str) -> bool:
-        """False when the last check found a different node answering at this node's address.
-
-        True for a node no check has caught out (including an unknown node and an older Plex helper, which reports
-        no node id): the Plex database role refuses to send anything to an address that answers as another node.
-        """
-        self._sync()
-        with self._lock:
-            live = self._nodes.get(node_id)
-            return live is None or not live.different_node
-
     def capacity(self, node_id: str) -> NodeCapacity:
         """Whether the node's CPU / GPU members may take work now."""
         self._sync()
@@ -435,8 +441,9 @@ class NodeRegistry:
     def record_access_result(self, node_id: str, result: dict, *, tested_mappings: list[dict]) -> None:
         """Remember a Test access result; a passing one clears an access problem.
 
-        A test takes seconds; when the node's saved mappings changed meanwhile, the result says nothing about the
-        new ones and is dropped.
+        A result for rows other than the saved ones (rows still being edited, or mappings that changed during the
+        test) says nothing about how the node runs work now. It is held aside and adopted only if exactly those
+        rows are saved next.
 
         Args:
             node_id: The node.
@@ -448,18 +455,24 @@ class NodeRegistry:
             live = self._nodes.get(node_id)
             if live is None:
                 return
+            checked_at = self._wall_clock()
             if tested_mappings != (live.record.get("path_mappings") or []):
-                logger.info("Test access of node {}: its mappings changed during the test; result not kept", node_id)
+                live.pending_access = (copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at)
                 return
-            live.access_result = copy.deepcopy(result)
-            live.access_checked_at = checked_at = self._wall_clock()
-            mappings, keep = copy.deepcopy(live.record.get("path_mappings")), set(self._nodes)
-            if access_passed(result):
-                live.access_problem = ""
-                live.not_visible.clear()
+            live.pending_access = None
+            mappings, keep = self._adopt_access(live, result, checked_at), set(self._nodes)
             self._touch()
         if self._access_store is not None:
             self._access_store.save(node_id, mappings, result, checked_at, keep=keep)
+
+    def _adopt_access(self, live: _Live, result: dict, checked_at: float) -> list:
+        """Make ``result`` the node's Test access result (the caller holds the lock); answers the saved rows."""
+        live.access_result = copy.deepcopy(result)
+        live.access_checked_at = checked_at
+        if access_passed(result):
+            live.access_problem = ""
+            live.not_visible.clear()
+        return copy.deepcopy(live.record.get("path_mappings"))
 
     # ------------------------------------------------------------------ checks on demand
 
@@ -593,10 +606,17 @@ class NodeRegistry:
         store = self._access_store
         if store is None:
             return
-        for action, node_id, mappings in work:
+        for action, node_id, payload in work:
             if action == "forget":
-                store.forget(node_id, keep_mappings=mappings)
+                store.forget(node_id, keep_mappings=payload)
                 continue
+            if action == "save":
+                rows, result, checked_at = payload
+                with self._lock:
+                    keep = set(self._nodes)
+                store.save(node_id, rows, result, checked_at, keep=keep)
+                continue
+            mappings = payload
             stored = store.load(node_id, mappings)
             if stored is None:
                 continue
@@ -612,7 +632,8 @@ class NodeRegistry:
         Args:
             live: The node's live record, or None for a new node.
             record: Its stored record.
-            store_work: Collects ``("load" | "forget", node id, mappings)`` for :meth:`_run_store_work`.
+            store_work: Collects ``("load" | "forget", node id, mappings)`` and ``("save", node id, (mappings,
+                result, checked_at))`` for :meth:`_run_store_work`.
         """
         if live is None:
             live = _Live(record=copy.deepcopy(record), client=self._client_factory(record))
@@ -638,12 +659,17 @@ class NodeRegistry:
             live.not_visible.clear()
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
-                live.different_node = False
         if old.get("path_mappings") != record.get("path_mappings"):
-            # A test of other mappings says nothing about these.
-            live.access_result = live.access_checked_at = None
-            if self._access_store is not None:
-                store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
+            # A test of other mappings says nothing about these, unless it tested exactly the rows just saved.
+            pending, live.pending_access = live.pending_access, None
+            if pending is not None and pending[0] == (record.get("path_mappings") or []):
+                rows = self._adopt_access(live, pending[1], pending[2])
+                if self._access_store is not None:
+                    store_work.append(("save", str(record.get("id")), (rows, pending[1], pending[2])))
+            else:
+                live.access_result = live.access_checked_at = None
+                if self._access_store is not None:
+                    store_work.append(("forget", str(record.get("id")), copy.deepcopy(record.get("path_mappings"))))
         return live
 
     # ------------------------------------------------------------------ state
@@ -725,8 +751,8 @@ class NodeRegistry:
                         return  # Settings changed while it ran: this answer is about an old address.
                     self._apply(live, outcome)
                     has_access_problem = bool(live.access_problem)
-                if outcome.uid and not record.get("node_uid"):
-                    self._record_uid(node_id, outcome.uid)
+                if outcome.uid and outcome.uid != record.get("node_uid"):
+                    self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -737,12 +763,7 @@ class NodeRegistry:
 
     def _apply(self, live: _Live, outcome: _Outcome) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason
-        live.different_node = outcome.different_node
-        if outcome.different_node:
-            # Something answers; it just isn't this node. Waiting longer won't change that, so no offline backoff.
-            live.offline_streak = 0
-            delay = HEALTH_INTERVAL_S
-        elif outcome.state == STATE_OFFLINE:
+        if outcome.state == STATE_OFFLINE:
             live.offline_streak += 1
             delay = OFFLINE_BACKOFF_S[min(live.offline_streak, len(OFFLINE_BACKOFF_S)) - 1]
         else:
@@ -772,7 +793,9 @@ class NodeRegistry:
                     STATE_KEY_REFUSED,
                     f"{name} refused the key. Copy the key from the node's log or settings into this node's key field.",
                 )
-            except NodeProtocolError:
+            except NodeProtocolError as exc:
+                if exc.node is not None:
+                    return self._other_protocol(name, exc.node)
                 return self._probe_legacy(record)
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
@@ -785,6 +808,19 @@ class NodeRegistry:
             )
         return self._read_info(record, info)
 
+    def _other_protocol(self, name: str, block: dict) -> _Outcome:
+        """A node that refused this app's node protocol: one of the two needs an update (it is a node: no ping)."""
+        version = str(block.get("version") or "")
+        roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
+        return _Outcome(
+            STATE_UPDATE_NEEDED,
+            f"{name} runs version {version or 'unknown'} and this app runs {self._app_version()}, and they don't "
+            "speak the same node protocol. Update the older one so both run the same version.",
+            info={"node": dict(block)},
+            version=version,
+            roles=roles,
+        )
+
     def _read_info(self, record: dict, info: dict) -> _Outcome:
         from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_too_old
 
@@ -793,14 +829,6 @@ class NodeRegistry:
         uid = str(block.get("id") or "")
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
         version = str(block.get("version") or "")
-        stored_uid = str(record.get("node_uid") or "")
-        if stored_uid and uid and uid != stored_uid:
-            return _Outcome(
-                STATE_OFFLINE,
-                f"A different node answered at {name}'s address. Point {name} at its own address, or remove it and "
-                "add the new one.",
-                different_node=True,
-            )
         outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
         app_version = self._app_version()
         if protocol.ROLE_WORKER in roles and version != app_version:
@@ -816,6 +844,15 @@ class NodeRegistry:
                 STATE_UPDATE_NEEDED,
                 f"{name} runs another build of version {version} ({build[:7]}) than this app ({app_build[:7]}). "
                 "Update the node to the app's image.",
+                **outcome,
+            )
+        worker = info.get("worker")
+        ffmpeg = worker.get("ffmpeg") if isinstance(worker, dict) else None
+        if protocol.ROLE_WORKER in roles and isinstance(ffmpeg, dict) and not ffmpeg.get("path"):
+            return _Outcome(
+                STATE_NO_FFMPEG,
+                f"{name} can't find FFmpeg, so every file sent to it would fail. Install FFmpeg on that machine "
+                "(or put it on its PATH), then restart the node.",
                 **outcome,
             )
         agent = info.get("agent")

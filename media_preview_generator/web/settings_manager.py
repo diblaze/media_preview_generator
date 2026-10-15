@@ -329,13 +329,14 @@ class SettingsManager:
         """
         from ..worker_groups import validate_worker_groups
 
-        nodes = {
-            str(node["id"]): str(node.get("name") or node["id"])
-            for node in self.get("nodes") or []
-            if isinstance(node, dict) and node.get("id")
-        }
-        clean = validate_worker_groups(groups, nodes=nodes)
+        # Validated under the lock: a node removed between the check and the save would leave a member on it.
         with self._lock:
+            nodes = {
+                str(node["id"]): str(node.get("name") or node["id"])
+                for node in self.get("nodes") or []
+                if isinstance(node, dict) and node.get("id")
+            }
+            clean = validate_worker_groups(groups, nodes=nodes)
             revision = self.worker_groups_revision
             if expected_revision is not None and expected_revision != revision:
                 raise WorkerGroupsConflict("Worker groups changed elsewhere. Reload them before applying your edits.")

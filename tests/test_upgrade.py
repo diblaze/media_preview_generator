@@ -3291,8 +3291,8 @@ class TestMigrateToV24:
             True,
         )
         assert node["node_uid"] is None and node["path_mappings"] == [] and node["added_at"]
-        # The helper's own url/token stay beside node_id: a build from before nodes still finds its helper.
-        assert _agent_of(settings_manager, 0) == {**self.HELPER, "node_id": node["id"]}
+        # The address and key live only on the node now: the server keeps no copy of the old key.
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
         assert settings_manager.nodes_revision == 1
         assert notes and notes[0].startswith("v24:")
         assert "Nodes page" in _USER_FACING_NOTES[24]
@@ -3307,7 +3307,7 @@ class TestMigrateToV24:
 
         node = settings_manager.get("nodes")[0]
         assert node["enabled"] is False
-        assert _agent_of(settings_manager, 0) == {**agent, "node_id": node["id"]}
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": node["id"]}
 
     @pytest.mark.parametrize(
         "agent",
@@ -3321,7 +3321,78 @@ class TestMigrateToV24:
 
         assert _migrate_to_v24(settings_manager) == []
         assert settings_manager.get("nodes") is None
-        assert _agent_of(settings_manager, 0) == {**agent, "node_id": None}
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+
+    @pytest.mark.parametrize(
+        "agent",
+        [
+            {"enabled": True, "url": "http://helper.lan:9494", "token": ""},
+            {"enabled": True, "url": 9494, "token": "k"},
+            {"enabled": True, "url": "plex-host:9494", "token": "k"},
+        ],
+        ids=["no-key", "int-address", "no-scheme"],
+    )
+    def test_a_switched_on_helper_that_cant_be_moved_stays_on_with_no_node(self, settings_manager, agent, tmp_path):
+        """Before the upgrade nothing was written through it; after it the server is refused "no node", never sent
+        to this app's own copy of the Plex database, and a bad address can't lock the nodes list."""
+        from media_preview_generator.markers.publishers.plex_remote import AGENT_NO_NODE, RemotePlexDb, plex_database
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.nodes.settings import default_record
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        assert settings_manager.get("nodes") is None
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": None}
+        settings = load_server(settings_manager.get("media_servers")[0]["markers"], "plex")
+        db = plex_database(settings, path_provider=lambda: str(tmp_path / "plex.db"), label="Home")
+        assert isinstance(db, RemotePlexDb) and db._client.refusal().agent_state == AGENT_NO_NODE
+        settings_manager.update_nodes([default_record(name="NUC", url="http://nuc:9494", key="node-key")])
+        assert [n["name"] for n in settings_manager.nodes] == ["NUC"]
+
+    def test_a_switched_on_helper_with_no_address_keeps_using_this_apps_copy(self, settings_manager):
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {"enabled": True, "url": "", "token": "k"}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        _migrate_to_v24(settings_manager)
+
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": None}
+
+    @pytest.mark.parametrize("off", ["intro_credits", "server"])
+    def test_a_helper_nothing_uses_becomes_a_node_turned_off(self, settings_manager, off):
+        """A turned-off node is never checked, so a helper machine that is gone raises no offline card."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        entry = _plex_entry("p1", "Home", self.HELPER)
+        if off == "server":
+            entry["enabled"] = False
+        else:
+            entry["markers"]["enabled"] = False
+        settings_manager.apply_changes(updates={"media_servers": [entry]})
+
+        _migrate_to_v24(settings_manager)
+
+        node = settings_manager.get("nodes")[0]
+        assert node["enabled"] is False
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
+
+    def test_a_re_run_drops_the_old_address_and_key_an_earlier_build_kept(self, settings_manager):
+        """Earlier builds of v24 left url/token beside node_id; running it again drops them and keeps the node."""
+        from media_preview_generator.upgrade import _migrate_to_v24
+
+        agent = {**self.HELPER, "node_id": "n-earlier"}
+        settings_manager.apply_changes(updates={"media_servers": [_plex_entry("p1", "Home", agent)]})
+
+        assert _migrate_to_v24(settings_manager) == []
+        assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": "n-earlier"}
+        assert settings_manager.get("nodes") is None
+        before = settings_manager.get_all()
+        assert _migrate_to_v24(settings_manager) == []
+        assert settings_manager.get_all() == before
 
     def test_servers_without_a_markers_block_and_other_vendors_are_untouched(self, settings_manager):
         from media_preview_generator.upgrade import _migrate_to_v24
@@ -3349,9 +3420,9 @@ class TestMigrateToV24:
         assert [n["name"] for n in nodes] == ["Plex helper (Home)", "Plex helper (Home) 2"]
         # The shared node is on because one of its servers had it on.
         assert nodes[0]["enabled"] is True
-        assert _agent_of(settings_manager, 0) == {**servers[0]["markers"]["plex"]["agent"], "node_id": nodes[0]["id"]}
-        assert _agent_of(settings_manager, 1) == {**servers[1]["markers"]["plex"]["agent"], "node_id": nodes[0]["id"]}
-        assert _agent_of(settings_manager, 2) == {**servers[2]["markers"]["plex"]["agent"], "node_id": nodes[1]["id"]}
+        assert _agent_of(settings_manager, 0) == {"enabled": False, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 1) == {"enabled": True, "node_id": nodes[0]["id"]}
+        assert _agent_of(settings_manager, 2) == {"enabled": True, "node_id": nodes[1]["id"]}
 
     def test_a_second_run_changes_nothing(self, settings_manager):
         from media_preview_generator.upgrade import _migrate_to_v24

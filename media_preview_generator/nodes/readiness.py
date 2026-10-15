@@ -22,6 +22,7 @@ from .registry import (
     STATE_CONNECTING,
     STATE_DISABLED,
     STATE_KEY_REFUSED,
+    STATE_NO_FFMPEG,
     STATE_OFFLINE,
     STATE_UPDATE_NEEDED,
     NodeDetails,
@@ -148,6 +149,19 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             fix_where=FIX_ON_NODE,
         )
     )
+    if version_ok and protocol.ROLE_WORKER in view.roles:
+        ffmpeg_ok = view.state != STATE_NO_FFMPEG
+        rows.append(
+            _row(
+                "node_ffmpeg",
+                "The node has FFmpeg" if ffmpeg_ok else "FFmpeg isn't installed on this node",
+                severity=CRITICAL,
+                ok=ffmpeg_ok,
+                explanation="A worker node runs FFmpeg for every file it is sent.",
+                reason=None if ffmpeg_ok else view.reason,
+                fix_where=FIX_ON_NODE,
+            )
+        )
     if view.legacy:
         rows.append(
             _row(

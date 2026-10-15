@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import socket
 import struct
 import threading
@@ -204,3 +205,22 @@ class TestRedirects:
         with pytest.raises(NodeProtocolError, match="redirect"):
             _local(node).start_task({"op": "x", "path": "/media/a.mkv"})
         assert other_handler.seen == []
+
+
+class TestAProtocolRefusal:
+    def _client(self, serve, body: dict) -> NodeClient:
+        url, _ = serve(409, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        return _local(url)
+
+    def test_from_a_node_carries_its_node_block(self, serve):
+        node = {"id": "u1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": ["worker"]}
+        body = {"ok": False, "node": node, "error": {"kind": "protocol", "message": "speaks 2"}}
+        with pytest.raises(NodeProtocolError) as raised:
+            self._client(serve, body).info()
+        assert raised.value.node == node
+
+    def test_from_an_older_plex_helper_carries_none(self, serve):
+        body = {"ok": False, "agent": {"version": "1.2.0"}, "error": {"kind": "protocol", "message": "speaks 1"}}
+        with pytest.raises(NodeProtocolError) as raised:
+            self._client(serve, body).info()
+        assert raised.value.node is None

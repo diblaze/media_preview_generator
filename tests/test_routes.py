@@ -3106,6 +3106,37 @@ class TestSystemAPI:
         assert isinstance(data["cpu_threads"], int)
         assert "config_error" in data
 
+    @pytest.mark.parametrize("on_node", [True, False], ids=["on-a-node", "none-anywhere"])
+    def test_the_no_workers_warning_counts_workers_on_nodes(self, client, on_node):
+        from types import SimpleNamespace
+
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        member = {"id": "g", "resource": "gpu", "device": "cuda:0", "count": 2, "node": "nuc1"}
+        group = {
+            "id": "n",
+            "name": "NUC",
+            "enabled": True,
+            "availability": {"mode": "always", "windows": []},
+            "members": [{**member, "job_types": ["previews"]}],
+        }
+        node = {"id": "nuc1", "node_uid": None, "name": "NUC", "url": "http://nuc:9494", "key": "k", "enabled": True,
+                "path_mappings": [], "added_at": "2026-10-15T00:00:00+00:00"}  # fmt: skip
+        get_settings_manager().apply_changes(updates={"nodes": [node], "worker_groups": [group] if on_node else []})
+        # What load_config() returns for that setup: this app's own totals are 0.
+        loaded = SimpleNamespace(
+            plex_url="http://plex:32400", plex_token="t", plex_config_folder="/plex", plex_verify_ssl=True,
+            plex_local_videos_path_mapping="", plex_videos_path_mapping="", plex_bif_frame_interval=5,
+            thumbnail_quality=4, regenerate_thumbnails=False, gpu_config=[], gpu_threads=0, cpu_threads=0,
+            ffmpeg_threads=2, log_level="INFO",
+        )  # fmt: skip
+
+        with patch("media_preview_generator.config.get_cached_config", return_value=loaded):
+            body = client.get("/api/system/config", headers=_api_headers()).get_json()
+
+        assert "error" not in body
+        assert ("config_warning" in body) is not on_node
+
     def test_media_servers_status_empty_when_unconfigured(self, client):
         from media_preview_generator.web.routes import api_system as _api_system
 

@@ -27,15 +27,11 @@ def _view(state, *, node_id="abc123", name="old-laptop", reason="It went quiet."
 
 
 class StubRegistry:
-    def __init__(self, views, *, different=()):
+    def __init__(self, views):
         self._views = views
-        self._different = set(different)
 
     def views(self):
         return list(self._views)
-
-    def identity_ok(self, node_id):
-        return node_id not in self._different
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +55,7 @@ def _cards(*views):
         (reg.STATE_KEY_REFUSED, "nuc", "nuc refused the key"),
         (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media"),
         (reg.STATE_GPU_LOST, "storage", "storage lost its GPU"),
+        (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg"),
     ],
 )
 def test_each_alert_state_gets_a_plain_card(state, name, title):
@@ -70,16 +67,6 @@ def test_each_alert_state_gets_a_plain_card(state, name, title):
     assert card["action"]["href"] == "/nodes#node-abc123" and card["action"]["label"]
     assert "It went quiet." in card["body_html"]
     assert "secret-host" not in card["body_html"]
-
-
-def test_a_different_node_at_the_address_says_so_instead_of_offline():
-    reason = "A different node answered at nuc's address. Point nuc at its own address."
-    reg.set_registry(StubRegistry([_view(reg.STATE_OFFLINE, name="nuc", reason=reason)], different={"abc123"}))
-    (card,) = notif._build_node_notifications()
-    assert card["title"] == "A different node answered at nuc's address"
-    assert "offline" not in card["title"]
-    assert "Point nuc at its own address" in card["body_html"]
-    assert card["id"] == "node:abc123:offline"
 
 
 @pytest.mark.parametrize("state", [reg.STATE_READY, reg.STATE_CONNECTING, reg.STATE_DISABLED])

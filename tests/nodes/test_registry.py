@@ -83,7 +83,7 @@ class Harness:
             nodes_provider=lambda: [dict(n) for n in self.nodes],
             client_factory=self._client,
             legacy_ping=lambda url, key: self.legacy,
-            record_uid=lambda node_id, uid: self.uids.append((node_id, uid)),
+            record_uid=lambda node_id, uid, url: self.uids.append((node_id, uid)),
             quick_access=lambda client, mappings: self.quick,
             app_version=lambda: APP_VERSION,
             app_build=lambda: self.app_build,
@@ -228,48 +228,51 @@ class TestStates:
         h.client().default_info = _info(roles=(ROLE_PLEX_DB,), agent={"version": "0.1.0"})
         assert h.registry.check_now("n1").state == reg.STATE_UPDATE_NEEDED
 
-    def test_a_different_node_at_the_address_is_offline(self, h):
+    def test_a_reinstalled_node_with_a_new_id_stays_ready_and_its_new_id_is_recorded(self, h):
+        # The saved key at the saved address is what makes it this node: a recreated container's new id is no refusal.
         h.change(node_uid="uid-original")
-        h.client().default_info = _info(uid="uid-other")
+        h.client().default_info = _info(uid="uid-reinstalled")
         view = h.registry.check_now("n1")
-        assert view.state == reg.STATE_OFFLINE
-        assert view.reason.startswith("A different node answered at nuc's address.")
+        assert view.state == reg.STATE_READY and view.reason == ""
+        assert h.registry.capacity("n1") == reg.NodeCapacity(True, True, "")
+        assert h.uids == [("n1", "uid-reinstalled")]
+
+    def test_the_id_on_record_is_not_written_again(self, h):
+        h.change(node_uid="uid-1")
+        h.client().default_info = _info(uid="uid-1")
+        h.registry.check_now("n1")
         assert h.uids == []
-        assert h.registry.identity_ok("n1") is False
-        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
 
-    def test_a_different_node_is_checked_every_30_s_without_offline_backoff(self, h):
-        h.change(node_uid="uid-original")
-        h.client().default_info = _info(uid="uid-other")
-        delays = []
-        for _ in range(4):
-            h.registry.check_now("n1")
-            delays.append(h.registry._nodes["n1"].next_check - h.clock.now)
-        assert delays == [reg.HEALTH_INTERVAL_S] * 4
-        assert h.registry._nodes["n1"].offline_streak == 0
+    def test_a_worker_node_without_ffmpeg_is_not_ready_and_gets_no_work(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": None, "version": None}
+        h.client().default_info = info
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_NO_FFMPEG and "can't find FFmpeg" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
+        assert reg.STATE_NO_FFMPEG in reg.ALERT_STATES
 
-    def test_the_right_node_answering_again_clears_the_mismatch(self, h):
-        h.change(node_uid="uid-original")
-        client = h.client()
-        client.default_info = _info(uid="uid-other")
-        h.registry.check_now("n1")
-        client.default_info = _info(uid="uid-original")
+    def test_a_worker_node_with_ffmpeg_is_ready(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": "7.1"}
+        h.client().default_info = info
         assert h.registry.check_now("n1").state == reg.STATE_READY
-        assert h.registry.identity_ok("n1") is True
 
-    def test_re_pointing_the_node_clears_the_mismatch_before_its_next_check(self, h):
-        h.change(node_uid="uid-original")
-        h.client().default_info = _info(uid="uid-other")
-        h.registry.check_now("n1")
-        h.change(url="http://elsewhere:9494", node_uid=None)
-        assert h.registry.identity_ok("n1") is True
-        assert h.registry.view("n1").state == reg.STATE_CONNECTING
+    def test_a_node_on_another_node_protocol_needs_an_update_naming_both_versions(self, h):
+        node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": [ROLE_WORKER]}
+        legacy_asked = []
+        h.registry._legacy_ping = lambda url, key: legacy_asked.append(url) or ("connected", "1.2.0")
+        h.client().default_info = NodeProtocolError("another protocol", node=node)
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_UPDATE_NEEDED
+        assert "9.10.0" in view.reason and APP_VERSION in view.reason
+        assert (view.version, view.legacy) == ("9.10.0", False)
+        assert legacy_asked == []
 
-    def test_identity_is_ok_for_a_node_never_caught_out_and_an_unknown_node(self, h):
-        h.client().default_info = _info()
-        h.registry.check_now("n1")
-        assert h.registry.identity_ok("n1") is True
-        assert h.registry.identity_ok("nope") is True
+    def test_an_answer_without_a_node_block_is_tried_as_an_older_plex_helper(self, h):
+        h.client().default_info = NodeProtocolError("doesn't know /v1/info")
+        view = h.registry.check_now("n1")
+        assert (view.state, view.legacy) == (reg.STATE_READY, True)
 
     def test_a_turned_off_node_is_disabled_and_never_asked(self, h):
         h.change(enabled=False)
@@ -647,3 +650,105 @@ class TestAccessResultSurvivesRestart:
     def test_an_unreadable_file_reads_as_untested(self, store, tmp_path):
         (tmp_path / "node_access_results.json").write_text("{not json")
         assert Harness(access_store=store).registry.details("n1").access_result is None
+
+
+class TestRecordedNodeId:
+    """What ``_default_record_uid`` writes to settings.json."""
+
+    @pytest.fixture
+    def sm(self, tmp_path):
+        from media_preview_generator.web import settings_manager as sm_mod
+        from media_preview_generator.web.settings_manager import SettingsManager
+
+        manager = SettingsManager(config_dir=str(tmp_path))
+        sm_mod._settings_manager = manager
+        manager.update_nodes([{**_record(), "added_at": "2026-10-15T00:00:00+00:00"}])
+        yield manager
+        sm_mod.reset_settings_manager()
+
+    def test_a_new_id_replaces_the_one_on_record(self, sm):
+        reg._default_record_uid("n1", "uid-first", "http://nuc:9494")
+        reg._default_record_uid("n1", "uid-reinstalled", "http://nuc:9494")
+        assert sm.nodes[0]["node_uid"] == "uid-reinstalled"
+
+    def test_an_id_learnt_at_an_address_the_node_no_longer_has_is_not_recorded(self, sm):
+        reg._default_record_uid("n1", "uid-old-machine", "http://old-nuc:9494")
+        assert sm.nodes[0]["node_uid"] is None
+
+    def test_a_check_of_the_old_address_finishing_after_an_address_change_records_nothing(self, sm):
+        """The PUT saves the new address before the registry syncs, so the check's ``live.client`` guard can't see
+        the change: the address the id came from is what keeps the old machine's id off the new address."""
+        release, asked = threading.Event(), threading.Event()
+
+        class SlowOldMachine(FakeClient):
+            def info(self):
+                asked.set()
+                release.wait(5)
+                return _info(uid="old-machine")
+
+        registry = reg.NodeRegistry(client_factory=SlowOldMachine, app_version=lambda: APP_VERSION, attempt_gap_s=0.0)
+        registry.views()
+        check = threading.Thread(target=registry._run_check, args=("n1",))
+        check.start()
+        assert asked.wait(5)
+        with sm.locked():
+            sm.update_nodes([{**sm.nodes[0], "url": "http://new-nuc:9494", "node_uid": None}])
+        release.set()
+        check.join(5)
+
+        assert (sm.nodes[0]["url"], sm.nodes[0]["node_uid"]) == ("http://new-nuc:9494", None)
+
+
+class TestAgainstARealNode:
+    """The registry's check against the node's own server."""
+
+    KEY = "registry-real-node-key-0123456789"
+
+    @pytest.fixture
+    def node_url(self, tmp_path, monkeypatch):
+        from werkzeug.serving import make_server
+
+        from media_preview_generator.nodes.server import app as node_app
+        from media_preview_generator.nodes.server import info
+
+        for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_ROLES"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
+        monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+        app = node_app.create_node_app(config_dir=str(tmp_path / "config"), roles=["worker"], key=self.KEY, ops={})
+        app.extensions[node_app.EXTENSION].worker_info._detect = lambda: []
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_port}"
+        server.shutdown()
+        thread.join(5)
+        app.extensions[node_app.EXTENSION].close()
+
+    def test_a_worker_node_on_another_node_protocol_needs_an_update(self, node_url):
+        import requests
+
+        from media_preview_generator import __version__
+        from media_preview_generator.nodes import protocol
+        from media_preview_generator.nodes.client import NodeAddress, NodeClient
+
+        class NewerAppClient(NodeClient):
+            """The app after a protocol bump (it asks for protocol 2); the node is still on protocol 1."""
+
+            def _headers(self):
+                return {"Authorization": f"Bearer {TestAgainstARealNode.KEY}", protocol.PROTOCOL_HEADER: "2"}
+
+        record = _record(url=node_url, key=self.KEY, path_mappings=[])
+        session = requests.Session()
+        session.trust_env = False
+        registry = reg.NodeRegistry(
+            revision_provider=lambda: 1,
+            nodes_provider=lambda: [record],
+            record_uid=lambda *_: None,
+            legacy_ping=lambda url, key: pytest.fail("a node is never asked the old helper's ping"),
+            app_version=lambda: "0.0.1",
+            attempt_gap_s=0.0,
+        )
+        outcome = registry._probe(record, NewerAppClient(NodeAddress(node_url, self.KEY), session=session))
+        assert outcome.state == reg.STATE_UPDATE_NEEDED, outcome.reason
+        assert __version__ in outcome.reason and "0.0.1" in outcome.reason

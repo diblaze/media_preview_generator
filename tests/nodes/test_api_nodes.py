@@ -252,11 +252,26 @@ class TestListAndProbe:
         assert client.post("/api/nodes/probe", json=body).status_code == 200
         assert asked == [("http://moved:9494", "typed-key")]
 
-    def test_probe_of_a_saved_node_says_when_a_different_node_answers(self, client, nodes):
+    def test_probe_of_a_saved_node_that_was_reinstalled_with_a_new_id_answers_ok(self, client, nodes):
         node_id = _add(client).get_json()["id"]
-        nodes("http://nuc:9494").info_answer = _info(uid="uid-other")
+        nodes("http://nuc:9494").info_answer = _info(uid="uid-reinstalled")
         body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "****", "id": node_id}).get_json()
-        assert body["ok"] is False and body["error"]["kind"] == "different_node" and "nuc" in body["error"]["message"]
+        assert body["ok"] is True and body["info"]["already_added"] is None
+
+    def test_probe_of_a_node_on_another_node_protocol_names_both_versions(self, client, nodes, monkeypatch):
+        node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": ["worker"]}
+
+        class OtherProtocol:
+            def info(self):
+                raise NodeProtocolError("another protocol", node=node)
+
+        pinged = []
+        monkeypatch.setattr(api_nodes, "_make_client", lambda url, key: OtherProtocol())
+        monkeypatch.setattr(api_nodes, "_legacy_ping", lambda url, key: pinged.append(url) or ("connected", "1"))
+        body = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()
+        assert body["ok"] is False and body["error"]["kind"] == "protocol"
+        assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
+        assert pinged == []
 
 
 class TestCreate:
@@ -417,7 +432,7 @@ class TestDelete:
                     "id": "p1",
                     "type": "plex",
                     "name": "Home",
-                    "markers": {"plex": {"agent": {"enabled": False, "node_id": node_id}}},
+                    "markers": {"plex": {"agent": {"enabled": True, "node_id": node_id}}},
                 }
             ],
         )
@@ -583,3 +598,236 @@ class TestAuth:
         monkeypatch.setattr(type(_sm()), "is_setup_complete", lambda self: False)
         fresh = client.application.test_client()
         assert fresh.get("/api/nodes", headers=auth_headers).status_code == 200
+
+
+def _plex_server(agent: dict) -> dict:
+    return {"id": "p1", "type": "plex", "name": "Home", "markers": {"plex": {"agent": agent}}}
+
+
+class TestSwitchedOffPlexDatabaseNode:
+    """A server whose Plex database node is switched off says this app opens the database: it doesn't use the node."""
+
+    def test_it_doesnt_keep_the_node_from_being_removed(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        _sm().set("media_servers", [_plex_server({"enabled": False, "node_id": node_id})])
+        assert client.get("/api/nodes").get_json()["nodes"][0]["used_by"]["servers"] == []
+
+        resp = client.delete(f"/api/nodes/{node_id}")
+
+        assert resp.status_code == 200, resp.get_json()
+        assert _sm().nodes == []
+        # Switching it on again asks for a node instead of pointing at one that is gone.
+        assert _sm().get("media_servers")[0]["markers"]["plex"]["agent"] == {"enabled": False, "node_id": None}
+
+    def test_a_v24_migrated_switched_off_helper_can_be_removed(self, client, nodes):
+        from media_preview_generator.upgrade import _migrate_schema
+
+        agent = {"enabled": False, "url": "http://old-helper:9494", "token": "k"}
+        markers = {
+            "enabled": True,
+            "library_ids": None,
+            "plex": {"db_write_confirmed_at": "2026-01-01", "on_plex_redetect": "restore", "agent": agent},
+        }
+        _sm().apply_changes(
+            updates={"_schema_version": 23, "media_servers": [{**_plex_server({}), "markers": markers}]}
+        )
+        _migrate_schema(_sm())
+
+        resp = client.delete(f"/api/nodes/{_sm().nodes[0]['id']}")
+
+        assert resp.status_code == 200, resp.get_json()
+
+
+class TestReinstalledNode:
+    """The saved key at the saved address is what makes a node this node; a new id means it was reinstalled."""
+
+    def _plex_db_info(self, uid: str) -> dict:
+        answer = _info(uid=uid)
+        answer["node"]["roles"] = ["plex_db"]
+        del answer["worker"]
+        return answer
+
+    def test_a_recreated_plex_database_node_keeps_working_and_its_new_id_is_recorded(self, client, nodes):
+        from media_preview_generator.markers.publishers import plex_remote
+        from media_preview_generator.markers.settings import load_server
+
+        helper = nodes("http://plex-host:9494")
+        helper.info_answer = self._plex_db_info("first-container")
+        node_id = _add(client, url="http://plex-host:9494", name="Plex helper").get_json()["id"]
+        _sm().set("media_servers", [_plex_server({"enabled": True, "node_id": node_id})])
+        assert _sm().nodes[0]["node_uid"] == "first-container"
+
+        # docker pull + rm + run without a kept /config: a fresh node.json, so a new id.
+        helper.info_answer = self._plex_db_info("second-container")
+        row = client.post(f"/api/nodes/{node_id}/check").get_json()
+
+        assert row["state"] == "ready", row["reason"]
+        assert _sm().nodes[0]["node_uid"] == "second-container"
+        settings = load_server(_sm().get("media_servers")[0]["markers"], "plex")
+        assert plex_remote.node_refusal(settings) is None
+
+    def test_the_new_id_is_logged_once(self, client, nodes):
+        from loguru import logger
+
+        helper = nodes("http://nuc:9494")
+        node_id = _add(client).get_json()["id"]
+        helper.info_answer = _info(uid="uid-reinstalled")
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
+        try:
+            client.post(f"/api/nodes/{node_id}/check")
+            client.post(f"/api/nodes/{node_id}/check")
+        finally:
+            logger.remove(sink)
+        assert [line for line in lines if "new id" in line] == ["nuc reports a new id; it was probably reinstalled"]
+        assert _sm().nodes[0]["node_uid"] == "uid-reinstalled"
+
+
+class TestBadAddresses:
+    BAD = [
+        "http://[::1",
+        "http://nuc:99999",
+        "http://nuc:abc",
+        "http://nuc lan:9494",
+        "http://nuc:9494#",
+        "http://nuc:9494?",
+    ]
+
+    @pytest.mark.parametrize("url", BAD)
+    def test_probe_add_and_edit_refuse_it_with_a_400(self, client, nodes, url):
+        assert client.post("/api/nodes/probe", json={"url": url, "key": "k"}).status_code == 400
+        assert _add(client, url=url).status_code == 400
+        assert _sm().nodes == []
+        node_id = _add(client).get_json()["id"]
+        assert client.put(f"/api/nodes/{node_id}", json={"url": url, "key": "new-key"}).status_code == 400
+        assert _sm().nodes[0]["url"] == "http://nuc:9494"
+
+
+class TestNodeSentValues:
+    def test_a_nan_load_keeps_the_nodes_list_valid_json(self, client, nodes):
+        import json
+
+        answer = _info()
+        answer["worker"]["cpu"].update({"load1": float("nan"), "ram_total": float("inf")})
+        answer["platform"] = {"os": "L" * 5000, "arch": float("nan")}
+        nodes("http://nuc:9494").info_answer = answer
+        node_id = _add(client).get_json()["id"]
+        client.post(f"/api/nodes/{node_id}/check")
+
+        def refuse(constant):
+            raise ValueError(f"not JSON a browser can parse: {constant}")
+
+        body = json.loads(client.get("/api/nodes").get_data(as_text=True), parse_constant=refuse)
+        row = body["nodes"][0]
+        assert (row["cpu"]["load1"], row["cpu"]["ram_total"], row["cpu"]["cores"]) == (None, None, 8)
+        assert row["platform"]["arch"] is None and len(row["platform"]["os"]) == api_nodes.NODE_TEXT_MAX
+
+    def test_a_nan_in_the_probe_answer_keeps_it_valid_json(self, client, nodes):
+        import json
+
+        answer = _info()
+        answer["worker"]["cpu"]["load1"] = float("nan")
+        nodes("http://nuc:9494").info_answer = answer
+
+        def refuse(constant):
+            raise ValueError(constant)
+
+        text = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_data(as_text=True)
+        assert json.loads(text, parse_constant=refuse)["info"]["worker"]["cpu"]["load1"] is None
+
+
+class TestATestOfRowsSavedLater:
+    """Add node and the Media tab test the rows in the editor before saving them: a pass is kept once they are."""
+
+    def _library(self, tmp_path):
+        return TestTestAccess._library(self, tmp_path)
+
+    def test_a_pass_in_the_add_node_wizard_is_kept_once_its_rows_are_saved(self, client, nodes, tmp_path):
+        self._library(tmp_path)
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        node_id = _add(client).get_json()["id"]
+
+        tested = client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": rows}).get_json()
+        assert tested["libraries"][0]["ok"] is True
+        assert reg.get_registry().details(node_id).access_result is None
+        assert client.put(f"/api/nodes/{node_id}", json={"path_mappings": rows}).status_code == 200
+
+        assert reg.get_registry().details(node_id).access_result == tested
+        ids = [c["id"] for s in client.get(f"/api/nodes/{node_id}/health").get_json()["sections"] for c in s["checks"]]
+        assert "node_access_untested" not in ids
+
+    def test_a_pass_of_other_rows_is_not_kept(self, client, nodes, tmp_path):
+        self._library(tmp_path)
+        rows = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/mnt"}]
+        node_id = _add(client).get_json()["id"]
+        client.post(f"/api/nodes/{node_id}/test-access", json={"path_mappings": rows})
+
+        saved = [{"app_prefix": str(tmp_path / "media"), "node_prefix": "/volume1"}]
+        assert client.put(f"/api/nodes/{node_id}", json={"path_mappings": saved}).status_code == 200
+
+        assert reg.get_registry().details(node_id).access_result is None
+
+
+class TestMovingOntoAnotherNodesAddress:
+    def test_an_address_another_saved_node_uses_is_refused(self, client, nodes):
+        first = _add(client).get_json()
+        nodes("http://other:9494").info_answer = _info(uid="uid-2")
+        second = _add(client, name="other", url="http://other:9494").get_json()
+
+        resp = client.put(f"/api/nodes/{second['id']}", json={"url": "http://nuc:9494/", "key": "node-key"})
+
+        assert resp.status_code == 409
+        assert (resp.get_json()["node_id"], resp.get_json()["name"]) == (first["id"], "nuc")
+        assert _sm().nodes[1]["url"] == "http://other:9494"
+
+    def test_an_address_where_an_added_node_answers_is_refused(self, client, nodes):
+        first = _add(client).get_json()
+        nodes("http://other:9494").info_answer = _info(uid="uid-2")
+        second = _add(client, name="other", url="http://other:9494").get_json()
+        nodes("http://nuc.lan:9494").info_answer = _info(uid="uid-1")  # the first node, by another name
+
+        resp = client.put(f"/api/nodes/{second['id']}", json={"url": "http://nuc.lan:9494", "key": "node-key"})
+
+        assert resp.status_code == 409 and resp.get_json()["node_id"] == first["id"]
+        assert _sm().nodes[1]["url"] == "http://other:9494"
+
+    def test_adding_a_second_node_at_a_saved_address_is_refused_even_while_it_is_offline(self, client, nodes):
+        nodes("http://nuc:9494").info_answer = NodeUnreachableError("down")
+        first = _add(client).get_json()
+        resp = _add(client, name="again")
+        assert resp.status_code == 409 and resp.get_json()["node_id"] == first["id"]
+
+
+class TestRemovedDuringAGroupSave:
+    def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
+        """The group save checks its members against the nodes list under the settings lock, so a Remove that comes
+        in meanwhile waits, sees the new member and is refused."""
+        import threading
+
+        from media_preview_generator import worker_groups as wg
+
+        node_id = _add(client).get_json()["id"]
+        real_validate = wg.validate_worker_groups
+        checking, deleted = threading.Event(), []
+
+        def slow_validate(value, **kwargs):
+            clean = real_validate(value, **kwargs)
+            checking.set()
+            time.sleep(0.3)  # the other request's Remove arrives now
+            return clean
+
+        def remove():
+            checking.wait(5)
+            deleted.append(client.delete(f"/api/nodes/{node_id}").status_code)
+
+        monkeypatch.setattr(wg, "validate_worker_groups", slow_validate)
+        remover = threading.Thread(target=remove)
+        remover.start()
+        member = {"id": "m1", "resource": "cpu", "device": None, "count": 1, "job_types": ["previews"], "node": node_id}
+        group = {"id": "g1", "name": "NUC", "enabled": True, "availability": {"mode": "always", "windows": []},
+                 "members": [member]}  # fmt: skip
+        _sm().update_worker_groups([group])
+        remover.join(5)
+
+        assert deleted == [409]
+        assert [n["id"] for n in _sm().nodes] == [node_id]

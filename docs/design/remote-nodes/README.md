@@ -36,9 +36,15 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     count toward the two-drop limit (max 5 per file). Retries prefer another worker.
   - Each task carries a client id; a start whose answer was lost is cancelled by that id.
   - Node log lines carry an epoch `ts` so the app shows them in its own time zone.
-  - Test access results persist in `node_access_results.json` until that node's mappings change.
+  - Test access results persist in `node_access_results.json` until that node's mappings change. A test of rows
+    not saved yet (Add node, the Media tab) is kept once exactly those rows are saved.
   - `/api/nodes*` needs sign-in even before setup; a saved key is only ever sent to its saved address.
-  - v24 keeps the old helper's `url`/`token` (unused) so a rollback to an older build still works.
+  - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
+    restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating): an older build
+    refuses a v24 file.
+  - A node that answers with the saved key at the saved address is that node even when it reports a new id
+    (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
+    node beside the wrong Plex is caught by the Plex machine identifier check.
   - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
     refuses loudness writes.
 * **Still open:**
@@ -116,7 +122,7 @@ an update, since pull request and local images all report one version; the Plex 
 | Route | Body | Answer |
 |---|---|---|
 | `GET /v1/health` | – | `{"ok": true, "node": …}` (no auth; container HEALTHCHECK) |
-| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` (per role) |
+| `GET /v1/info` | – | `node`, `platform {os, arch, python}`, `worker {gpus[], cpu {cores, load1, ram_total, ram_available}, temp {path, free_bytes}, busy, ffmpeg {path, version}, gpu_checked_at, gpu_error}`, `plex_db {config_dir, db_present, machine_identifier}` and `agent {version, protocols, capabilities}` (per role) |
 | `POST /v1/gpus/rescan` | – | same `worker.gpus` after a fresh detection |
 | `POST /v1/access-check` | `{"mapping": [...], "files": [{"path", "size", "mtime_ns"}]}` | `{"results": [{"path", "ok", "node_path", "kind", "message"}], "nearby": {node_dir: [names…]}}` |
 | `POST /v1/tasks` | `TASK_SPEC` | 202 `{"id"}` (the spec's `client_task_id` when it has one) |
@@ -176,22 +182,29 @@ retry runs (on the **node's** CPU, see §6).
 
 * New top-level `nodes`: `[{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings": [{"app_prefix",
   "node_prefix"}], "added_at"}]`. `id` is assigned by the app (stable; members and Plex servers reference it).
-  `node_uid` is the id the node reports, recorded on first contact; a different `node_uid` answering at the same
-  address is refused ("a different node answered at this address"). A legacy helper has no `node_uid`.
+  `node_uid` is the id the node reports, recorded on contact; a node that reports a new one (reinstalled) is
+  still that node, and the new id replaces the old. Add node and an address change refuse an address another
+  saved node has, or where an added node answers. A legacy helper has no `node_uid`.
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.
-* Plex servers: `markers.plex.agent` gains `"node_id"`. Migration v24 turns every enabled helper (`url` + `token`)
-  into a `nodes` entry with the Plex database role and points the server's `agent.node_id` at it. The client resolves
-  url + key from the node, so one record holds the address and key.
+* Plex servers: `markers.plex.agent` becomes `{"enabled", "node_id"}`. Migration v24 turns every helper (`url` +
+  `token`) into a `nodes` entry with the Plex database role (turned on only when a server uses it: helper, Intro &
+  Credits and server all on) and points the server's `agent.node_id` at it. A switched-on helper it can't move
+  (no key, bad address) stays on with no node, so it is refused rather than opening this app's own copy. The
+  client resolves url + key from the node, so one record holds the address and key. A server with its node
+  switched off doesn't count as using it (Remove clears its remembered `node_id`).
 
 ## 5. Node states (app side)
 
-`connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `disabled`.
+`connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `no_ffmpeg`,
+`disabled`.
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
-  agent's existing `MIN_AGENT_VERSION` rule. An old helper that has no `/v1/info` is a Plex database node in
-  "legacy" mode — it keeps working and Setup Health recommends updating it.
+  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block). A node that refuses the app's
+  node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
+  `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
+* `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.
@@ -363,8 +376,8 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 | `GET /nodes` | – | `{"nodes": [NODE_ROW], "app_version"}` |
 | `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key when `url` is its saved address (400 otherwise) |
 | `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
-| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact) |
-| `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or Plex server uses it |
+| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact); 409 like `POST` when another saved node has that address or answers there |
+| `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or a Plex server with its node switched on uses it |
 | `POST /nodes/<id>/check` | – | `NODE_ROW` after a fresh health check |
 | `POST /nodes/<id>/test-access` | `{path_mappings?}` (default: the saved rows) | `{"libraries": [LIBRARY_ACCESS]}`; a test of the saved rows is remembered for Setup Health, across restarts, until the node's mappings change |
 | `GET /nodes/<id>/health` | – | Setup Health envelope `{overall_ok, sections}` (same shape as server Setup Health) |
@@ -392,8 +405,8 @@ reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `
 ```
 
 Probe error kinds: `auth` (key refused), `unreachable` (no answer), `protocol` (answered, but not as a node or Plex
-helper this app can use), `request` (the node refused the request as malformed), `different_node` (with `id`: another
-node than the saved one answers there).
+helper this app can use; a node on another node protocol adds `node_version`), `request` (the node refused the
+request as malformed).
 
 `LIBRARY_ACCESS = {server, library, app_root, checked, ok, files: [{path, ok, kind, message, node_path}], nearby:
 {node_dir: [names]}, suggestion: {from, to} | null, error: str | null, empty: bool}`. `kind` is a `NOT_VISIBLE_*` reason (`""` when

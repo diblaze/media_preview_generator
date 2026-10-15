@@ -536,14 +536,12 @@ _NODE_CARD_TEXT = {
         "Its CPU workers keep running. Check the GPU driver on the node.",
         "Open Nodes",
     ),
+    "no_ffmpeg": (
+        "{name} can't find FFmpeg",
+        "Nothing is sent to it until FFmpeg is installed there.",
+        "Open Nodes",
+    ),
 }
-
-
-_DIFFERENT_NODE_CARD_TEXT = (
-    "A different node answered at {name}'s address",
-    "Nothing is sent to it until that is fixed.",
-    "Open Nodes",
-)
 
 
 def node_notification_id(node_id: str, state: str) -> str:
@@ -552,7 +550,8 @@ def node_notification_id(node_id: str, state: str) -> str:
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
-    """One card per node that is offline, needs an update, refused the key, can't see media or lost its GPU.
+    """One card per node that is offline, needs an update, refused the key, can't see media, lost its GPU or has no
+    FFmpeg.
 
     The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
     dismissal of a state the node has left is lifted, so the next time it happens the card shows again.
@@ -562,8 +561,7 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     from ..nodes.registry import ALERT_STATES, get_registry
 
     try:
-        registry = get_registry()
-        views = registry.views()
+        views = get_registry().views()
     except Exception as exc:
         logger.debug("node notifications skipped: {}", exc)
         return []
@@ -575,8 +573,6 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         text = _NODE_CARD_TEXT.get(view.state)
         if text is None:
             continue
-        if view.state == "offline" and not registry.identity_ok(view.id):
-            text = _DIFFERENT_NODE_CARD_TEXT
         title, todo, label = text
         name = view.name or "A node"
         reason = f"{escape(view.reason)} " if view.reason else ""

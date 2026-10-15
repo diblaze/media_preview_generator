@@ -309,10 +309,6 @@ def _normalise_credits_window(raw: object) -> tuple[dict | None, str]:
     return out, ""
 
 
-# The helper's own address and key from before nodes (v24 leaves them as a rollback aid; nothing here reads them).
-_LEGACY_AGENT_KEYS = ("url", "token")
-
-
 def _stored_agent(existing: object) -> dict:
     """The stored ``markers.plex.agent`` block ({} when there is none)."""
     if not isinstance(existing, dict):
@@ -322,43 +318,55 @@ def _stored_agent(existing: object) -> dict:
     return agent if isinstance(agent, dict) else {}
 
 
-def _stored_agent_node_id(existing: object) -> str | None:
-    """The Plex database node already chosen for this server (None when there is none)."""
-    node_id = _stored_agent(existing).get("node_id")
-    return str(node_id) if node_id else None
-
-
-def _node_exists(node_id: str) -> bool:
+def _node_choice_error(node_id: str) -> str:
+    """Why a newly chosen node can't open a Plex server's database ("" when it can, or isn't known yet)."""
+    from ..nodes import protocol
+    from ..nodes.registry import get_registry
     from ..nodes.settings import find_node, stored_nodes
 
-    return find_node(stored_nodes(), node_id) is not None
+    if find_node(stored_nodes(), node_id) is None:
+        return "That node isn't on the Nodes page any more. Choose another node or add it again."
+    view = get_registry().view(node_id)
+    # Roles are known once the node has answered; an older Plex helper only has this role.
+    if view is not None and view.roles and not view.legacy and protocol.ROLE_PLEX_DB not in view.roles:
+        return (
+            f"{view.name or 'That node'} doesn't have its Plex database role turned on. Turn that role on on the "
+            "node, or choose another node."
+        )
+    return ""
 
 
-def _normalise_agent(raw: object, existing_node_id: str | None) -> tuple[dict | None, str]:
+def _normalise_agent(raw: object, stored: dict) -> tuple[dict | None, str]:
     """Validate a posted Plex database node choice (``{"enabled", "node_id"}``).
 
     The address and key live on the node's record (Nodes page); a server only says which node opens its database.
     Only a newly chosen node is looked up: a stored choice is never re-checked on load, so a hand-edited nodes list
-    can't make the server's whole Intro & Credits block fall back to its defaults.
+    can't make the server's whole Intro & Credits block fall back to its defaults. For the same reason a stored
+    block that is switched on with no node (a helper the v24 upgrade couldn't move) is kept: its server is refused
+    with "no node" rather than opening this app's own copy of the database.
 
     Args:
         raw: The posted ``markers.plex.agent`` value (None → the stored node, switched off).
-        existing_node_id: The node currently on record.
+        stored: The stored ``markers.plex.agent`` block ({} when there is none).
 
     Returns:
         ``(block, "")`` on success, ``(None, message)`` on error.
     """
+    stored_id = str(stored.get("node_id")) if stored.get("node_id") else None
     if raw is None:
-        return {"enabled": False, "node_id": existing_node_id}, ""
+        return {"enabled": False, "node_id": stored_id}, ""
     if not isinstance(raw, dict):
         return None, "markers.plex.agent must be an object"
-    node_raw = raw.get("node_id", existing_node_id)
+    node_raw = raw.get("node_id", stored_id)
     node_id = str(node_raw).strip() if node_raw else None
     enabled = bool(raw.get("enabled"))
-    if enabled and not node_id:
+    kept_without_node = bool(stored.get("enabled")) and stored_id is None
+    if enabled and not node_id and not kept_without_node:
         return None, "Choose the node that opens this Plex server's database before turning it on"
-    if node_id and node_id != existing_node_id and not _node_exists(node_id):
-        return None, "That node isn't on the Nodes page any more. Choose another node or add it again."
+    if node_id and node_id != stored_id:
+        err = _node_choice_error(node_id)
+        if err:
+            return None, err
     return {"enabled": enabled, "node_id": node_id}, ""
 
 
@@ -395,12 +403,9 @@ def validate_server(raw: object, server_type: str, existing: object = None) -> t
         confirmed = str(confirmed) if confirmed else None
         if block["enabled"] and not confirmed:
             return None, "Confirm the Plex database write before turning on Intro & Credits for this Plex server"
-        agent, err = _normalise_agent(plex_raw.get("agent"), _stored_agent_node_id(existing))
+        agent, err = _normalise_agent(plex_raw.get("agent"), _stored_agent(existing))
         if err or agent is None:
             return None, err
-        # Carried as stored, never taken from a client: only a build from before nodes reads them (upgrade v24).
-        stored_agent = _stored_agent(existing)
-        agent.update({k: stored_agent[k] for k in _LEGACY_AGENT_KEYS if k in stored_agent})
         block["plex"] = {"db_write_confirmed_at": confirmed, "on_plex_redetect": redetect, "agent": agent}
     if server_type == "emby":
         emby_raw = raw.get("emby") or {}
