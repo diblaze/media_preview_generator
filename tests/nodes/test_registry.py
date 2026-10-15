@@ -219,6 +219,21 @@ class TestStates:
         h.registry.check_now("n1")
         assert h.uids == []
 
+    def test_a_worker_node_without_ffmpeg_is_not_ready_and_gets_no_work(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": None, "version": None}
+        h.client().default_info = info
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_NO_FFMPEG and "can't find FFmpeg" in view.reason
+        assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "FFmpeg missing on node")
+        assert reg.STATE_NO_FFMPEG in reg.ALERT_STATES
+
+    def test_a_worker_node_with_ffmpeg_is_ready(self, h):
+        info = _info()
+        info["worker"]["ffmpeg"] = {"path": "/usr/bin/ffmpeg", "version": "7.1"}
+        h.client().default_info = info
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
     def test_a_node_on_another_node_protocol_needs_an_update_naming_both_versions(self, h):
         node = {"id": "uid-1", "name": "nuc", "version": "9.10.0", "protocols": [2], "roles": [ROLE_WORKER]}
         legacy_asked = []

@@ -536,6 +536,11 @@ _NODE_CARD_TEXT = {
         "Its CPU workers keep running. Check the GPU driver on the node.",
         "Open Nodes",
     ),
+    "no_ffmpeg": (
+        "{name} can't find FFmpeg",
+        "Nothing is sent to it until FFmpeg is installed there.",
+        "Open Nodes",
+    ),
 }
 
 
@@ -545,7 +550,8 @@ def node_notification_id(node_id: str, state: str) -> str:
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
-    """One card per node that is offline, needs an update, refused the key, can't see media or lost its GPU.
+    """One card per node that is offline, needs an update, refused the key, can't see media, lost its GPU or has no
+    FFmpeg.
 
     The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
     dismissal of a state the node has left is lifted, so the next time it happens the card shows again.

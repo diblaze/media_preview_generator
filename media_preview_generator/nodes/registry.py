@@ -33,10 +33,18 @@ STATE_UPDATE_NEEDED = "update_needed"
 STATE_KEY_REFUSED = "key_refused"
 STATE_ACCESS_PROBLEM = "access_problem"
 STATE_GPU_LOST = "gpu_lost"
+STATE_NO_FFMPEG = "no_ffmpeg"
 STATE_DISABLED = "disabled"
 
 # States that raise a bell notification (``web.notifications``).
-ALERT_STATES = (STATE_OFFLINE, STATE_UPDATE_NEEDED, STATE_KEY_REFUSED, STATE_ACCESS_PROBLEM, STATE_GPU_LOST)
+ALERT_STATES = (
+    STATE_OFFLINE,
+    STATE_UPDATE_NEEDED,
+    STATE_KEY_REFUSED,
+    STATE_ACCESS_PROBLEM,
+    STATE_GPU_LOST,
+    STATE_NO_FFMPEG,
+)
 
 HEALTH_INTERVAL_S = 30.0
 # Delay before the next check after the 1st, 2nd, 3rd and later offline checks in a row.
@@ -57,6 +65,7 @@ _CAPACITY_REASONS = {
     STATE_UPDATE_NEEDED: "node needs an update",
     STATE_KEY_REFUSED: "key refused",
     STATE_ACCESS_PROBLEM: "fix media access first",
+    STATE_NO_FFMPEG: "FFmpeg missing on node",
     STATE_DISABLED: "node turned off",
 }
 
@@ -800,6 +809,15 @@ class NodeRegistry:
                 STATE_UPDATE_NEEDED,
                 f"{name} runs version {version or 'unknown'} and this app runs {app_version}. Update the node to "
                 f"{app_version}.",
+                **outcome,
+            )
+        worker = info.get("worker")
+        ffmpeg = worker.get("ffmpeg") if isinstance(worker, dict) else None
+        if protocol.ROLE_WORKER in roles and isinstance(ffmpeg, dict) and not ffmpeg.get("path"):
+            return _Outcome(
+                STATE_NO_FFMPEG,
+                f"{name} can't find FFmpeg, so every file sent to it would fail. Install FFmpeg on that machine "
+                "(or put it on its PATH), then restart the node.",
                 **outcome,
             )
         agent = info.get("agent")

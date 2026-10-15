@@ -65,13 +65,14 @@
         update_needed: ['warn', 'Update needed'],
         access_problem: ['warn', 'Access problem'],
         gpu_lost: ['warn', 'GPU lost'],
+        no_ffmpeg: ['bad', 'FFmpeg missing'],
         offline: ['bad', 'Offline'],
         key_refused: ['bad', 'Key refused'],
         connecting: ['off', 'Connecting…'],
         disabled: ['off', 'Turned off'],
     };
     // The row's button says Fix for these, and opens the tab where the fix is.
-    const FIX_TAB = { access_problem: 'media', key_refused: 'settings', update_needed: 'health', gpu_lost: 'health' };
+    const FIX_TAB = { access_problem: 'media', key_refused: 'settings', update_needed: 'health', gpu_lost: 'health', no_ffmpeg: 'health' };
 
     function stateOf(node) {
         return STATES[node.state] || ['off', node.state || 'Unknown'];

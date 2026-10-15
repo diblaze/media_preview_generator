@@ -72,6 +72,7 @@ def test_a_ready_worker_that_is_untested_and_unused_has_only_recommendations():
         (reg.STATE_OFFLINE, "node_reachable"),
         (reg.STATE_KEY_REFUSED, "node_key"),
         (reg.STATE_UPDATE_NEEDED, "node_version"),
+        (reg.STATE_NO_FFMPEG, "node_ffmpeg"),
     ],
 )
 def test_connection_problems_are_must_fix(state, failing):
@@ -80,6 +81,14 @@ def test_connection_problems_are_must_fix(state, failing):
     assert (row["ok"], row["severity"], row["reason"]) == (False, "critical", "why")
     assert envelope["overall_ok"] is False
     assert _section(envelope, "node_connection")["severity"] == "critical"
+
+
+def test_a_worker_node_without_ffmpeg_says_so_and_the_fix_is_on_the_node():
+    row = _check(_envelope(_details(reg.STATE_NO_FFMPEG, reason="nuc can't find FFmpeg")), "node_ffmpeg")
+    assert (row["label"], row["fix_where"]) == ("FFmpeg isn't installed on this node", "node")
+    assert _check(_envelope(_details()), "node_ffmpeg")["ok"] is True
+    no_workers = _envelope(_details(roles=()))
+    assert all(c["id"] != "node_ffmpeg" for s in no_workers["sections"] for c in s["checks"])
 
 
 def test_an_offline_node_shows_only_its_connection():

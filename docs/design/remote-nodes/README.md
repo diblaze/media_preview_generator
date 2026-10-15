@@ -183,13 +183,15 @@ retry runs (on the **node's** CPU, see §6).
 
 ## 5. Node states (app side)
 
-`connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `disabled`.
+`connecting`, `ready`, `offline`, `update_needed`, `key_refused`, `access_problem`, `gpu_lost`, `no_ffmpeg`,
+`disabled`.
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
   agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block). A node that refuses the app's
   node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
+* `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
 * Capacity: only `ready` nodes give workers; `gpu_lost` keeps CPU members; every other state is zero capacity with
   the reason shown on the member.
 * Each state change raises or clears a bell notification naming the node and the one action.

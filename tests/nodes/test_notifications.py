@@ -55,6 +55,7 @@ def _cards(*views):
         (reg.STATE_KEY_REFUSED, "nuc", "nuc refused the key"),
         (reg.STATE_ACCESS_PROBLEM, "nuc", "nuc can't see your media"),
         (reg.STATE_GPU_LOST, "storage", "storage lost its GPU"),
+        (reg.STATE_NO_FFMPEG, "nuc", "nuc can't find FFmpeg"),
     ],
 )
 def test_each_alert_state_gets_a_plain_card(state, name, title):
