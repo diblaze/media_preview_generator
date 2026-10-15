@@ -49,6 +49,11 @@ class TestSettingsLayout:
         ):
             expect(settings_page.locator(f'a[href="{href}"]')).to_be_visible()
 
+    def test_the_sidebar_links_to_the_nodes_page_after_workers(self, settings_page: Page) -> None:
+        links = settings_page.locator("#settings-sidebar a.nav-link")
+        assert links.evaluate_all("els => els.map(e => e.textContent.trim())")[:2] == ["Workers", "Nodes"]
+        expect(settings_page.locator('#settings-sidebar a[href="/nodes"]')).to_be_visible()
+
     def test_per_gpu_panel_renders_cards(self, settings_page: Page) -> None:
         # mock_system_status renders 2 GPUs by default.
         expect(settings_page.locator("#gpuDetecting")).to_be_hidden(timeout=3000)

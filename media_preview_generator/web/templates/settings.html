@@ -37,6 +37,8 @@
         <nav id="settings-sidebar" class="settings-sidebar d-none d-lg-block" aria-label="Settings sections">
             <div class="settings-nav-group">Run</div>
             <a class="nav-link" href="#section-workers"><i class="bi bi-cpu" aria-hidden="true"></i>Workers</a>
+            {# The Nodes page, not a section here: worker groups pick their node devices from it. #}
+            <a class="nav-link" href="{{ url_for('main.nodes_page') }}" title="Other machines that lend a GPU, CPU or Plex database"><i class="bi bi-pc-display-horizontal" aria-hidden="true"></i>Nodes</a>
             <a class="nav-link" href="#section-worker-quiet-hours"><i class="bi bi-moon-stars" aria-hidden="true"></i>Pause schedule<span class="nav-state-dot" id="settingsNavPauseDot" title="Pause schedule is on" hidden></span></a>
             <a class="nav-link" href="#section-processing"><i class="bi bi-speedometer2" aria-hidden="true"></i>Processing</a>
             <a class="nav-link nav-violet" href="#section-markers"><i class="bi bi-skip-forward" aria-hidden="true"></i>Intro &amp; Credits</a>
