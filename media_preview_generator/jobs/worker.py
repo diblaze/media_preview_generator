@@ -908,6 +908,8 @@ class Worker:
         with failure_scope(self.current_job_id), placed_on(self.placement):
             self._log_pickup(item, display_name)
 
+            cpu_rerun = False
+
             def _phase_cb(text: str) -> None:
                 # A new phase is a new step with its own FFmpeg run (or none), so the row starts it over: the progress
                 # callback shows its percent, speed and ETA again once that run reports. Plain writes, not the pool's
@@ -919,6 +921,9 @@ class Worker:
                 self.progress_percent = 0
                 self.speed = "0.0x"
                 self.remaining_time = 0.0
+                # A step's own CPU decode ends with the step; a whole-item CPU rerun stays on the CPU throughout.
+                if not cpu_rerun:
+                    self.decoding_on_cpu = False
 
             def _fallback_cb(reason: str) -> None:
                 # A step that fell back to the CPU inside the kind's own run (the end-picture decode) shows on the row
@@ -967,6 +972,7 @@ class Worker:
                 if self.worker_type == "GPU" and not cancelled:
                     self.fallback_active = True
                     self.decoding_on_cpu = True
+                    cpu_rerun = True
                     self.fallback_reason = redact_secrets(str(exc)) or "GPU processing failed"
                     logger.warning(
                         "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}",

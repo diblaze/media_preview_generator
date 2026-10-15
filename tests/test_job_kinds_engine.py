@@ -626,6 +626,34 @@ def test_a_kinds_progress_lines_name_the_device_that_decodes_the_file(note, code
     assert w.fallback_active is True  # the row still says the worker used its CPU
 
 
+def test_a_later_gpu_decode_of_the_file_is_not_logged_as_cpu_after_a_step_fell_back():
+    # The end-picture decode fell back to the CPU; the next step's GPU decode of the same file logged "[CPU]" too.
+    from loguru import logger
+
+    from media_preview_generator.jobs.worker import Worker
+
+    w = Worker(1, "GPU", gpu="NVIDIA", gpu_device="cuda:0", gpu_index=0, ffmpeg_threads=2)
+    pool = WorkerPool(gpu_workers=0, cpu_workers=0, selected_gpus=[])
+
+    def process(item, **kwargs):
+        kwargs["phase_callback"]("End picture")
+        kwargs["fallback_callback"]("The end-picture check couldn't decode a.mkv on the GPU and decoded it on the CPU")
+        kwargs["phase_callback"]("Credits")
+        w.last_verbose_log_time = 0.0
+        pool._update_worker_progress(w, 16.9, 10.0, 60.0, speed="1.4x")
+        return ItemOutcome("markers_published")
+
+    lines: list[str] = []
+    handler = logger.add(lambda m: lines.append(m.record["message"]), level="INFO", format="{message}")
+    try:
+        _run_custom(w, process)
+    finally:
+        logger.remove(handler)
+
+    progress = [line for line in lines if "16.9%" in line]
+    assert progress and all(line.startswith("[GPU 0]: ") for line in progress), lines
+
+
 @pytest.mark.parametrize(
     ("worker_type", "cancel_requested", "effects", "expected_calls", "expected_message"),
     [
