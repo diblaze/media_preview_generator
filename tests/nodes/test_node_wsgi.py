@@ -170,6 +170,42 @@ def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it()
         server.close()
 
 
+def test_a_body_the_node_accepts_is_never_written_to_a_temp_file_before_the_app_sees_it(monkeypatch):
+    # waitress reads a body whole before the app checks the key, writing one past 512 KB to a temp file as it
+    # arrives: under the old 4 MB limit a thousand key-less connections held 4 GB of the node's temp disk.
+    import threading
+
+    from waitress import buffers
+
+    from media_preview_generator.nodes.server import wsgi
+
+    spooled = []
+    to_temp_file = buffers.OverflowableBuffer._set_large_buffer
+
+    def recorded(self):
+        spooled.append(len(self))
+        to_temp_file(self)
+
+    monkeypatch.setattr(buffers.OverflowableBuffer, "_set_large_buffer", recorded)
+
+    def app(environ, start_response):
+        environ["wsgi.input"].read()
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"read"]
+
+    server = wsgi.create_node_server(app, host="127.0.0.1", port=0, threads=1)
+    threading.Thread(target=server.run, daemon=True).start()
+    try:
+        body = b"x" * (wsgi.MAX_REQUEST_BODY_BYTES - 1)  # the largest it takes: waitress refuses the limit itself
+        head = b"POST /v1/tasks HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: %d\r\n\r\n" % len(body)
+        with socket.create_connection(("127.0.0.1", server.effective_port), timeout=10) as sock:
+            sock.sendall(head + body)
+            assert b" 200 " in sock.recv(64)
+    finally:
+        server.close()
+    assert spooled == []
+
+
 @pytest.fixture
 def served(monkeypatch):
     """A node server in this process for a tiny app; yields its port and lets a test shrink its limits first."""

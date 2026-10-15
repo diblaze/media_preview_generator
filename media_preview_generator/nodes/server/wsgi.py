@@ -26,7 +26,7 @@ from typing import Any
 from loguru import logger
 
 from ...worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
-from .app import EXTENSION, MAX_BODY_BYTES, create_node_app
+from .app import EXTENSION, create_node_app
 from .identity import caller_key
 
 # Every interface: the app on another machine is the whole point.
@@ -51,9 +51,14 @@ CONNECTIONS_PER_ADDRESS = 2 * (MAX_CPU_WORKERS + MAX_GPU_WORKERS)
 REQUEST_READ_S = 30
 # A node refusing connections says so at most this often.
 REFUSED_WARNING_S = 60.0
-# Above the routes' own 2 MB limit, so they answer an oversized body in the node's JSON; anything far beyond it is
-# refused before waitress buffers it.
-MAX_REQUEST_BODY_BYTES = 2 * MAX_BODY_BYTES
+# waitress reads a request's whole body before the app (and its key check) sees it, so anyone who can reach the port
+# makes the node hold this much per connection. The app's largest requests are tens of KB (a Test access batch with
+# its mapping rows, a film's chapter rows), far under it; the routes' own 2 MB limit is never reached through here.
+MAX_REQUEST_BODY_BYTES = 512 * 1024
+# Bodies up to this size stay in memory; waitress writes a larger one to a temp file while it arrives (its default is
+# 512 KB: 4 MB bodies from a thousand connections held 4 GB of the node's temp disk for REQUEST_READ_S). Twice the
+# body limit, as a chunked body is cut off up to one read past it: no body is ever written out.
+INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
 # How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop: inside Docker's 10 s stop timeout.
 SHUTDOWN_WAIT_S = 5.0
 STOP_POLL_S = 0.2
@@ -187,6 +192,7 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
         connection_limit=CONNECTION_LIMIT if hasattr(select, "poll") else SELECT_CONNECTION_LIMIT,
         asyncore_use_poll=True,
         max_request_body_size=MAX_REQUEST_BODY_BYTES,
+        inbuf_overflow=INBUF_OVERFLOW_BYTES,
         ident=ident,
     )
     accept = _limited_channels(listen_map)
