@@ -1100,6 +1100,29 @@
         };
         const btn = $('#nodeSettingsSave');
         btn.disabled = true;
+        // A new key or address is tried first: a key the node refuses is never saved (it used to show "Saved", then
+        // "Key refused" on the next check). A node that doesn't answer may just be down, so that still saves.
+        let unanswered = '';
+        if (body.key !== '****' || body.url !== (node.url || '')) {
+            result.className = 'sm-tres';
+            result.innerHTML = '<span class="sm-spin"></span>Asking the node…';
+            const probe = await api('POST', '/api/nodes/probe', { id: node.id, url: body.url, key: body.key });
+            const error = probe.data && typeof probe.data.error === 'object' ? probe.data.error : null;
+            if (probe.ok && probe.data && probe.data.ok === false && error && error.kind === 'auth') {
+                enable(btn);
+                keyEl.classList.add('is-invalid');
+                result.className = 'sm-tres bad';
+                result.textContent = `${probeErrorText(error, body.url)} Nothing was saved.`;
+                return;
+            }
+            if (!probe.ok) {
+                enable(btn);
+                result.className = 'sm-tres bad';
+                result.textContent = errorText(probe, "Couldn't check the key");
+                return;
+            }
+            if (probe.data && probe.data.ok === false) unanswered = probeErrorText(error || {}, body.url);
+        }
         const r = await api('PUT', `/api/nodes/${encodeURIComponent(node.id)}`, body);
         enable(btn);
         if (!r.ok) {
@@ -1112,8 +1135,8 @@
         detail.editor.setName(r.data.name || r.data.id);
         keyEl.value = '****';
         setSettingsDirty(false);
-        result.className = 'sm-tres ok';
-        result.textContent = 'Saved';
+        result.className = unanswered ? 'sm-tres warn' : 'sm-tres ok';
+        result.textContent = unanswered ? `Saved. ${unanswered}` : 'Saved';
     }
 
     async function removeNode() {
@@ -1121,6 +1144,13 @@
         if (!node) return;
         const out = $('#nodeRemoveResult');
         out.classList.add('d-none');
+        // A node still in use can't be removed: say by what before asking, not after.
+        const inUse = usedByParts(node.used_by);
+        if (inUse.length) {
+            out.textContent = `Still in use by ${inUse.join(', ')}. Take it out of those first.`;
+            out.classList.remove('d-none');
+            return;
+        }
         const ok = await window.appConfirm(
             `Remove node "${node.name || node.id}"? The node keeps running; this app stops using it.`,
             { title: 'Remove node', confirmText: 'Remove' },

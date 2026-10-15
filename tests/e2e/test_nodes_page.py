@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -1091,7 +1092,70 @@ class TestNodeDialog:
         expect(authed_page.locator("#nodeModalName")).to_have_text("storage-2")
         expect(authed_page.locator("#node-n-storage .nd-name")).to_have_text("storage-2")
 
+    def test_a_new_key_the_node_refuses_is_not_saved(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.probe_answer = {"ok": False, "error": {"kind": "auth", "message": "The node refused this key."}}
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetKey").fill("wrong-key")
+        authed_page.locator("#nodeSettingsSave").click()
+
+        result = authed_page.locator("#nodeSettingsResult")
+        expect(result).to_contain_text("Key refused.")
+        expect(result).to_contain_text("Nothing was saved.")
+        expect(result).to_have_class("sm-tres bad")
+        expect(authed_page.locator("#nodeSetKey")).to_have_class(re.compile(r"\bis-invalid\b"))
+        assert api.bodies("POST", "/nodes/probe") == [
+            {"id": "n-storage", "url": "http://storage.lan:9494", "key": "wrong-key"}
+        ]
+        assert not api.bodies("PUT", "/nodes/n-storage")
+
+    def test_a_new_key_the_node_accepts_is_saved(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetKey").fill("right-key")
+        authed_page.locator("#nodeSettingsSave").click()
+        expect(authed_page.locator("#nodeSettingsResult")).to_have_text("Saved")
+        assert [b["key"] for b in api.bodies("PUT", "/nodes/n-storage")] == ["right-key"]
+
+    def test_a_node_that_does_not_answer_still_saves_and_says_so(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.probe_answer = {
+            "ok": False,
+            "error": {"kind": "unreachable", "message": "down", "reason": "refused"},
+        }
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeSetUrl").fill("http://storage2.lan:9494")
+        authed_page.locator("#nodeSetKey").fill("right-key")
+        authed_page.locator("#nodeSettingsSave").click()
+        result = authed_page.locator("#nodeSettingsResult")
+        expect(result).to_contain_text("Saved. ")
+        expect(result).to_have_class("sm-tres warn")
+        assert len(api.bodies("PUT", "/nodes/n-storage")) == 1
+
+    def test_send_work_switch_and_its_label_have_room(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        switch = authed_page.locator("#nodeSetEnabled").bounding_box()
+        label = authed_page.locator("label[for='nodeSetEnabled']").bounding_box()
+        assert label["x"] - (switch["x"] + switch["width"]) >= 6
+
+    def test_remove_of_a_node_in_use_says_by_what_before_asking(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        _node_tab(authed_page, "settings")
+        authed_page.locator("#nodeRemove").click()
+        expect(authed_page.locator("#nodeRemoveResult")).to_have_text(
+            'Still in use by worker group "GPU box". Take it out of those first.'
+        )
+        expect(authed_page.locator("#appConfirmModal")).to_be_hidden()
+        assert not [c for c in api.calls if c[0] == "DELETE"]
+
     def test_remove_refused_while_in_use_names_the_users(self, authed_page: Page, app_url: str) -> None:
+        # The list said nothing used it; the server, which knows better, refuses.
         api = _open_nodes(authed_page, app_url, _four_nodes())
         api.delete_answer = (
             409,
@@ -1103,7 +1167,7 @@ class TestNodeDialog:
                 ],
             },
         )
-        _open_node(authed_page, "n-storage")
+        _open_node(authed_page, "n-nuc")
         _node_tab(authed_page, "settings")
         authed_page.locator("#nodeRemove").click()
         accept_app_confirm(authed_page)

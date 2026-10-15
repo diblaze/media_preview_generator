@@ -108,6 +108,9 @@ details.nd-note ul { margin: 8px 0; padding-left: 22px; display: grid; gap: 4px;
 .nd-diff s { color: var(--bad); }
 .nd-diff b { color: var(--ok); }
 
+/* The shared modal styles make the switch a flex row with no gap, so its label touched it. */
+#nodeModal .form-switch { gap: 8px; }
+
 @media (max-width: 700px) {
     .nd-row3 { grid-template-columns: 1fr; }
     .nd-add-body { padding: 18px 16px; }
