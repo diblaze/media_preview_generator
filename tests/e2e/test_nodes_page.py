@@ -1985,6 +1985,18 @@ class TestPlexDatabaseSelector:
         new_page.close()
         expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
 
+    def test_add_a_node_is_not_an_edit_of_the_server(self, authed_page: Page, app_url: str) -> None:
+        """The select's input event reached the dialog: Save turned on and closing asked to discard nothing."""
+        self._open(authed_page, app_url, None)
+        expect(authed_page.locator("#editServerSave")).to_be_disabled()
+        with authed_page.context.expect_page() as opened:
+            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+        opened.value.close()
+
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
+        expect(authed_page.locator("#editServerDirty")).to_be_hidden()
+        expect(authed_page.locator("#editServerSave")).to_be_disabled()
+
     def test_setup_health_link_lands_on_the_selector(self, authed_page: Page, app_url: str) -> None:
         server = _plex_server()
         _mock_server_page(authed_page, server, _status(server, "ready", "", _plex_ready_details()))
