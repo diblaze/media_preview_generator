@@ -23,6 +23,9 @@ from .worker import JOB_LOG_SKIP, Worker, WorkerPool
 
 _submission_counter_lock = threading.Lock()
 _submission_counter = 0
+# How long a GPU worker's file that fell back to the CPU stays shown as such once it ended (seconds): the UI polls every
+# second or two, so its "Switched to CPU" toast still names the file.
+FALLBACK_SHOWN_AFTER_S = 30.0
 # The "worker" a preview file finished by the checking stage (no FFmpeg) is credited to.
 CHECK_STAGE_WORKER_NAME = "Library scan"
 # What a submitted job shows until the first of its files is picked.
@@ -1448,6 +1451,10 @@ class JobDispatcher:
                 ffmpeg_started = bool(getattr(worker, "ffmpeg_started", False)) if has_task else False
                 current_phase = (getattr(worker, "current_phase", "") or "") if has_task else ""
                 group_id, group_name, group_resource = worker.group_id, worker.group_name, worker.group_resource
+                fallback_active = bool(getattr(worker, "fallback_active", False))
+                task_ended_at = getattr(worker, "task_ended_at", 0.0)
+                fallback_title = worker.media_title or ""
+                fallback_reason = getattr(worker, "fallback_reason", None)
                 member_id = worker.member_id
                 retiring = worker._pending_removal
 
@@ -1468,7 +1475,10 @@ class JobDispatcher:
             else:
                 display_name = cpu_worker_label(idx)
 
-            fallback_active = bool(getattr(worker, "fallback_active", False))
+            # Shown after the file ends only long enough for the next polls to see it (a quick CPU rerun ends
+            # inside one): an idle worker would otherwise say "CPU fallback" until its next file, however long.
+            shown_for = FALLBACK_SHOWN_AFTER_S - (time.monotonic() - task_ended_at)
+            fallback_active = fallback_active and (is_busy or shown_for > 0)
             statuses.append(
                 {
                     "worker_id": worker.worker_id,
@@ -1488,9 +1498,10 @@ class JobDispatcher:
                     "speed": progress_data["speed"] if has_task else "0.0x",
                     "remaining_time": (progress_data["remaining_time"] if has_task else 0.0),
                     "fallback_active": fallback_active,
-                    "fallback_reason": getattr(worker, "fallback_reason", None),
+                    "fallback_reason": fallback_reason,
                     # The fallback file's title outlives is_busy: a quick CPU rerun ends before the next poll.
-                    "fallback_title": (worker.media_title or "") if fallback_active else "",
+                    "fallback_title": fallback_title if fallback_active else "",
+                    "fallback_until": time.time() + shown_for if fallback_active and not is_busy else None,
                     # ffmpeg_started + current_phase drive the UI's pre-FFmpeg branch; without them
                     # the card renders "Working…" and hides the speed/ETA chips for the whole run.
                     "ffmpeg_started": ffmpeg_started,

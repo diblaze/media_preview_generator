@@ -428,6 +428,9 @@ class WorkerStatus:
     fallback_active: bool = False
     fallback_reason: str | None = None
     fallback_title: str = ""
+    # When an idle worker stops showing its last file's fallback (time.time()); None: while it runs. The saved
+    # statuses can go unrefreshed while no job feeds the workers, so the read ages it out too.
+    fallback_until: float | None = None
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""
@@ -3314,11 +3317,13 @@ class JobManager:
             for status in self._worker_statuses.values():
                 job = self._jobs.get(status.job_id) if status.job_id else None
                 # Resolve live pause ownership here, including between progress callbacks.
+                aged_out = status.fallback_until is not None and time.time() >= status.fallback_until
                 statuses.append(
                     replace(
                         status,
                         job_kind=job.kind if job else None,
                         paused=bool(job_pause_reasons(job)) if job else False,
+                        **({"fallback_active": False, "fallback_title": ""} if aged_out else {}),
                     )
                 )
             return statuses

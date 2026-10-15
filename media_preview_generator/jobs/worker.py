@@ -181,6 +181,8 @@ class Worker:
         self.is_busy = False
         self.current_thread: threading.Thread | None = None
         self.current_task = None
+        # When the last task's thread was seen finished (time.monotonic()); 0: never.
+        self.task_ended_at = 0.0
 
         # Progress tracking
         self.progress_percent = 0
@@ -910,6 +912,7 @@ class Worker:
 
         if self.current_thread and not self.current_thread.is_alive():
             # Thread finished, mark as completed
+            self.task_ended_at = time.monotonic()  # before is_busy: a poll then never sees idle with the old time
             self.is_busy = False
             self.current_task = None
             self.current_phase = ""
