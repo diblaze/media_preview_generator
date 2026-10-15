@@ -81,6 +81,7 @@ class Harness:
         self.uids: list[tuple[str, str]] = []
         self.legacy = ("connected", "1.2.0")
         self.quick = True
+        self.libraries: list[str] = []
         self.clock = Clock()
         self.app_build = ""
         self.registry = reg.NodeRegistry(
@@ -90,6 +91,7 @@ class Harness:
             legacy_ping=lambda url, key: self.legacy,
             record_uid=lambda node_id, uid, url: self.uids.append((node_id, uid)),
             quick_access=lambda client, mappings: self.quick,
+            library_names=lambda paths: list(self.libraries),
             app_version=lambda: APP_VERSION,
             app_build=lambda: self.app_build,
             attempt_gap_s=0.0,
@@ -335,6 +337,41 @@ class TestAccessProblem:
         view = h.registry.view("n1")
         assert view.state == reg.STATE_ACCESS_PROBLEM
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "fix media access first")
+
+    def test_it_names_the_libraries_of_the_files_the_node_couldnt_see(self, h):
+        self._ready(h)
+        h.libraries = ["Open Films"]
+        for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):
+            h.registry.report_not_visible("n1", path, "missing")
+        view = h.registry.view("n1")
+        assert view.state == reg.STATE_ACCESS_PROBLEM
+        assert view.reason.startswith("nuc couldn't see 3 different files in Open Films in 10 minutes")
+
+    def test_the_libraries_are_named_from_the_deepest_library_folder_above_each_file(self, monkeypatch):
+        from media_preview_generator.web import settings_manager
+
+        servers = [
+            {
+                "id": "p1",
+                "type": "plex",
+                "name": "Home",
+                "enabled": True,
+                "url": "http://p:32400",
+                "libraries": [
+                    {"id": "1", "name": "Media", "remote_paths": ["/media"]},
+                    {"id": "2", "name": "Open Films", "remote_paths": ["/media/openfilms/Movies"]},
+                    {"id": "3", "name": "TV", "remote_paths": ["/media/tv"]},
+                ],
+            }
+        ]
+
+        class Settings:
+            def get(self, key, default=None):
+                return servers if key == "media_servers" else default
+
+        monkeypatch.setattr(settings_manager, "get_settings_manager", lambda: Settings())
+        paths = ["/media/openfilms/Movies/a.mkv", "/media/openfilms/Movies/b.mkv", "/media/other/c.mkv", "/elsewhere"]
+        assert reg._default_library_names(paths) == ["Open Films", "Media"]
 
     def test_the_same_file_three_times_is_not(self, h):
         self._ready(h)

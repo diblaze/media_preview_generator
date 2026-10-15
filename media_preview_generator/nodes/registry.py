@@ -220,6 +220,22 @@ def _default_record_uid(node_id: str, uid: str, url: str) -> None:
         logger.warning("Couldn't record which node answers at a saved address: {}", exc)
 
 
+def _default_library_names(app_paths: list[str]) -> list[str]:
+    """The names of the libraries holding ``app_paths`` (by the deepest library folder above each), in path order."""
+    from ..web.settings_manager import get_settings_manager
+    from .mappings import library_roots
+
+    roots = library_roots(get_settings_manager().get("media_servers") or [])
+    names: list[str] = []
+    for path in app_paths:
+        covering = [r for r in roots if path == r.app_root or path.startswith(r.app_root.rstrip("/") + "/")]
+        if covering:
+            name = max(covering, key=lambda r: len(r.app_root)).library
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
     from .mappings import quick_access_check
 
@@ -294,6 +310,7 @@ class NodeRegistry:
         legacy_ping: Callable[[str, str], tuple[str, str]] = _default_legacy_ping,
         record_uid: Callable[[str, str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
+        library_names: Callable[[list[str]], list[str]] = _default_library_names,
         app_version: Callable[[], str] = _app_version,
         app_build: Callable[[], str] = protocol.build_sha,
         attempt_gap_s: float = ATTEMPT_GAP_S,
@@ -309,6 +326,7 @@ class NodeRegistry:
         self._legacy_ping = legacy_ping
         self._record_uid = record_uid
         self._quick_access = quick_access
+        self._library_names = library_names
         self._app_version = app_version
         self._app_build = app_build
         self._attempt_gap_s = attempt_gap_s
@@ -423,7 +441,12 @@ class NodeRegistry:
             return live.ready_check > live.reported_at_check
 
     def report_not_visible(self, node_id: str, app_path: str, reason: str) -> None:
-        """A node couldn't see a file; three different files within 10 minutes is an access problem."""
+        """A node couldn't see a file; three different files within 10 minutes is an access problem.
+
+        The problem pauses all of the node's workers, not only for the libraries it missed: one wrong mapping row
+        makes the others suspect too, and the files it can't see run elsewhere meanwhile. Its reason names the
+        libraries those files are in.
+        """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
@@ -433,19 +456,33 @@ class NodeRegistry:
             while live.not_visible and now - live.not_visible[0][0] > NOT_VISIBLE_WINDOW_S:
                 live.not_visible.popleft()
             live.not_visible.append((now, app_path))
-            distinct = {path for _, path in live.not_visible}
-            if len(distinct) >= NOT_VISIBLE_LIMIT and not live.access_problem:
-                name = live.record.get("name") or "The node"
-                live.access_problem = (
-                    f"{name} couldn't see {len(distinct)} different files in 10 minutes (last: {reason}). "
-                    "Its workers are paused: run Test access on the Nodes page and fix the folder mappings."
-                )
-                logger.warning(
-                    "Node {} couldn't see {} different files in 10 minutes; pausing its workers until media access "
-                    "is fixed",
-                    name,
-                    len(distinct),
-                )
+            distinct = sorted({path for _, path in live.not_visible})
+            if len(distinct) < NOT_VISIBLE_LIMIT or live.access_problem:
+                self._touch()
+                return
+        # Reads the settings, so outside the registry's lock.
+        try:
+            libraries = self._library_names(distinct)
+        except Exception as exc:
+            logger.debug("Couldn't name the libraries of the files node {} couldn't see: {}", node_id, exc)
+            libraries = []
+        where = f" in {', '.join(libraries)}" if libraries else ""
+        with self._lock:
+            # A passing Test access meanwhile cleared the files it couldn't see.
+            if self._nodes.get(node_id) is not live or live.access_problem or (now, app_path) not in live.not_visible:
+                return
+            name = live.record.get("name") or "The node"
+            live.access_problem = (
+                f"{name} couldn't see {len(distinct)} different files{where} in 10 minutes (last: {reason}). "
+                "Its workers are paused: run Test access on the Nodes page and fix the folder mappings."
+            )
+            logger.warning(
+                "Node {} couldn't see {} different files{} in 10 minutes; pausing its workers until media access "
+                "is fixed",
+                name,
+                len(distinct),
+                where,
+            )
             self._touch()
 
     def report_gpu_error(self, node_id: str, device: str) -> None:

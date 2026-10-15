@@ -232,7 +232,9 @@ retry runs (on the **node's** CPU, see §6).
   still count, since it comes back on its own; members that wait on someone (node turned off, update needed, key
   refused, access problem, no worker role, GPU not listed) don't, and the failure names them: "not visible on X; no
   other worker can take it: Z (node needs an update)". Three different files not visible on one node within 10
-  minutes → node state `access_problem` (workers paused, alert).
+  minutes → node state `access_problem` (workers paused, alert). It pauses every library on that node, not only the
+  ones it missed (one wrong row makes the others suspect; files it can't see run elsewhere anyway), and its reason
+  names the libraries those files are in. It lives in memory: an app restart clears it until three more misses.
 * **GPU failure / codec not supported** on a node: retry on the same node's CPU, never on the app's. GPU lost
   (detection fails after a GPU error) → state `gpu_lost`.
 * Cancel and pause act on the node task: the executor forwards the job's cancel and pause state to
