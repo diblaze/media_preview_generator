@@ -124,6 +124,14 @@ class TestSampleFiles:
         assert len(nm.sample_files(str(root))) == 3
         assert len(nm.sample_files(str(root), walk_limit=2)) == 2
 
+    def test_a_library_of_thousands_of_folders_still_gives_videos(self, tmp_path):
+        root = tmp_path / "Movies"
+        for i in range(nm.WALK_LIMIT + 100):
+            _video(root / f"Film {i:05d}" / f"Film {i:05d}.mkv")
+        found = nm.sample_files(str(root))
+        assert len(found) == 3
+        assert len({os.path.dirname(f["path"]) for f in found}) == 3
+
     def test_a_missing_folder_gives_nothing(self, tmp_path):
         assert nm.sample_files(str(tmp_path / "nope")) == []
 

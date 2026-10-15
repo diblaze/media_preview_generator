@@ -25,6 +25,9 @@ SAMPLES_PER_ROOT = 3
 # Directory entries looked at per library folder before giving up: a library whose first 500 entries hold no video
 # reports "no video files found" rather than walking a whole NAS.
 WALK_LIMIT = 500
+# Subfolders queued per folder: a library of thousands of film folders is sampled from its first ones instead of
+# spending the whole walk listing the top folder.
+SUBFOLDERS_PER_FOLDER = 16
 # Files per access-check request; the node checks each one on disk.
 CHECK_BATCH = 30
 # The longest Test access spends reading this app's own library folders. A stalled network mount blocks a directory
@@ -137,14 +140,22 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
         except OSError:
             continue
         sampling.opened = True
+        queued_here = 0
         for entry in entries:
-            seen += 1
-            if seen > walk_limit or len(found) >= limit:
+            if len(found) >= limit:
                 break
             try:
-                if entry.is_dir():
-                    if entry.name.startswith("."):
-                        continue
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            if is_dir and (entry.name.startswith(".") or queued_here >= SUBFOLDERS_PER_FOLDER):
+                continue
+            seen += 1
+            if seen > walk_limit:
+                break
+            try:
+                if is_dir:
+                    queued_here += 1
                     if entry.is_symlink():
                         real = os.path.realpath(entry.path)
                         if real in linked:
