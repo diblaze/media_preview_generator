@@ -183,6 +183,20 @@ class TestRoundTrip:
         with pytest.raises(NodeAuthError):
             _client(node[0], "wrong").info()
 
+    def test_the_right_key_from_an_address_a_stale_client_shares_is_a_wait_not_a_refused_key(self, node):
+        from media_preview_generator.nodes.client import NodeRateLimitedError, NodeUnreachableError
+        from media_preview_generator.nodes.server import identity
+
+        stale = _client(node[0], "an-old-key")
+        for _ in range(identity.WRONG_KEY_BURST):
+            with pytest.raises(NodeAuthError):
+                stale.info()
+
+        with pytest.raises(NodeRateLimitedError) as raised:
+            _client(node[0]).info()  # this app, behind the same address (NAT, a proxy)
+        assert isinstance(raised.value, NodeUnreachableError) and not isinstance(raised.value, NodeAuthError)
+        assert "too many wrong keys" in str(raised.value)
+
     def test_unknown_task_is_node_unknown_task_error(self, node):
         client = _client(node[0])
 

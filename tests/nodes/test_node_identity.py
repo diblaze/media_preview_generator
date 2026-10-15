@@ -293,21 +293,39 @@ class TestWrongKeyLimit:
     def test_an_address_is_blocked_after_its_burst_and_gets_one_more_try_per_refill(self):
         limit, now = self._limit()
         for _ in range(3):
-            assert not limit.blocked("10.0.0.66")
+            assert limit.blocked_for("10.0.0.66") == 0
             limit.note_wrong("10.0.0.66")
-        assert limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 10
+        now[0] = 5.0
+        assert limit.blocked_for("10.0.0.66") == 5
         now[0] = 10.0
-        assert not limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 0
         limit.note_wrong("10.0.0.66")
-        assert limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 10
 
     def test_other_addresses_and_an_address_that_stopped_guessing_are_not_blocked(self):
         limit, now = self._limit()
         for _ in range(3):
             limit.note_wrong("10.0.0.66")
-        assert not limit.blocked("10.0.0.5")
+        assert limit.blocked_for("10.0.0.5") == 0
         now[0] = 30.0
-        assert not limit.blocked("10.0.0.66")
+        assert limit.blocked_for("10.0.0.66") == 0
+
+    def test_an_address_held_back_is_named_in_the_log_once_per_run_of_wrong_keys(self):
+        limit, now = self._limit()
+        lines: list[str] = []
+        sink = identity.logger.add(lambda message: lines.append(str(message)), level="WARNING")
+        try:
+            for _ in range(10):  # an old copy that keeps sending its old key
+                limit.note_wrong("10.0.0.66")
+                now[0] += 1.0
+            now[0] += 100.0  # it stopped long enough to owe nothing...
+            for _ in range(3):  # ...then started again
+                limit.note_wrong("10.0.0.66")
+        finally:
+            identity.logger.remove(sink)
+        named = [line for line in lines if "10.0.0.66" in line]
+        assert len(named) == 2 and "wait, even with the right key" in named[0]
 
     def test_it_remembers_a_bounded_number_of_addresses(self, monkeypatch):
         monkeypatch.setattr(identity, "WRONG_KEY_ADDRESSES_MAX", 10)

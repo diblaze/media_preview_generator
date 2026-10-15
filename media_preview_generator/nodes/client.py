@@ -61,6 +61,11 @@ class NodeStoppingError(NodeUnreachableError):
     """The node is stopping (503 ``node_stopping``): it took nothing, and is back once it has restarted."""
 
 
+class NodeRateLimitedError(NodeUnreachableError):
+    """The node asks this app's address to wait (429): too many wrong keys came from it, maybe from something else
+    sharing it. The key wasn't compared and nothing ran, so this is a wait, not a refused key."""
+
+
 class NodeTimeoutError(NodeUnreachableError):
     """The request reached the node but no answer came: it didn't come in time, or the connection dropped before it
     did. Unlike a refused connection, the node may have acted on it."""
@@ -238,6 +243,10 @@ class NodeClient:
             )
         if response.status_code == 401:
             raise NodeAuthError(f"{self._address.base} refused the key")
+        if response.status_code == 429:
+            raise NodeRateLimitedError(
+                f"{self._address.base} asks this app to wait: too many wrong keys came from here"
+            )
         if response.status_code >= 500:
             if response.status_code == 503 and self._error_kind(response) == protocol.KIND_NODE_STOPPING:
                 raise NodeStoppingError(f"{self._address.base} is restarting")

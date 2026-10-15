@@ -57,7 +57,7 @@ from ...markers.publishers.plex_db import (
     plex_machine_identifier,
     publish_error_from_sqlite,
 )
-from ..protocol import sendable_key, whole_number
+from ..protocol import KIND_RATE_LIMITED, sendable_key, whole_number
 from .identity import wrong_key_limit
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
@@ -325,10 +325,7 @@ def register_plex_db(
     bp = Blueprint("plex_db", __name__)
     wrong_keys = wrong_key_limit(app)
 
-    def authorised() -> bool:
-        caller = request.remote_addr or ""
-        if wrong_keys.blocked(caller):
-            return False
+    def authorised(caller: str) -> bool:
         header = request.headers.get("Authorization", "")
         offered = header[7:].strip() if header.startswith("Bearer ") else ""
         # compare_digest: the same constant-time check the app's own API does for its token (web/auth.py). The
@@ -344,7 +341,12 @@ def register_plex_db(
 
     @bp.before_request
     def _guard() -> Any:
-        if not authorised():
+        caller = request.remote_addr or ""
+        wait_s = wrong_keys.blocked_for(caller)
+        if wait_s:
+            error = {"kind": KIND_RATE_LIMITED}
+            return jsonify({"ok": False, "agent": agent_block(), "error": error}), 429, {"Retry-After": str(wait_s)}
+        if not authorised(caller):
             # No detail: an unauthenticated caller learns nothing about this Plex.
             return jsonify({"ok": False, "agent": agent_block(), "error": {"kind": "auth"}}), 401
         # /v1/ping is exempt from the protocol check on purpose: when the two sides disagree about the protocol,

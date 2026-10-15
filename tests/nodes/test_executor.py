@@ -23,6 +23,7 @@ from media_preview_generator.nodes.client import (
     UNREACHABLE_TLS,
     NodeAuthError,
     NodeCantStartError,
+    NodeRateLimitedError,
     NodeStoppingError,
     NodeTaskDeletedError,
     NodeTimeoutError,
@@ -471,9 +472,12 @@ class TestNodeDrops:
             # The node's own answers that it took nothing: a 503 node_stopping is the node, not a gateway.
             NodeCantStartError("The node can't write to its temp folder /node-tmp (Permission denied)"),
             NodeStoppingError("http://n is restarting"),
+            # Too many wrong keys from this address: the node compared nothing and ran nothing.
+            NodeRateLimitedError("http://n asks this app to wait: too many wrong keys came from here"),
         ],
-        ids=["refused", "no-such-machine", "tls", "connect-timeout", "key-refused", "temp-folder", "node-stopping"],
-    )
+        ids=["refused", "no-such-machine", "tls", "connect-timeout", "key-refused", "temp-folder", "node-stopping",
+             "rate-limited"],
+    )  # fmt: skip
     def test_a_start_that_never_reached_the_node_cancels_nothing(self, media, error):
         client = ScriptedClient([running()], start_error=error)
         _install(client)

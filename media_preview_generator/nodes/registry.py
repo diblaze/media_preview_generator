@@ -23,7 +23,15 @@ from loguru import logger
 
 from . import protocol
 from .access_results import AccessResultStore
-from .client import NodeAddress, NodeAuthError, NodeClient, NodeError, NodeProtocolError, NodeTimeoutError
+from .client import (
+    NodeAddress,
+    NodeAuthError,
+    NodeClient,
+    NodeError,
+    NodeProtocolError,
+    NodeRateLimitedError,
+    NodeTimeoutError,
+)
 from .protocol import PathMapping
 from .settings import find_node, node_mappings
 
@@ -1109,6 +1117,12 @@ class NodeRegistry:
                 if exc.node is not None:
                     return self._other_protocol(name, _bounded(exc.node))
                 return self._probe_legacy(record)
+            except NodeRateLimitedError:
+                return _Outcome(
+                    STATE_OFFLINE,
+                    f"{name} asks this app to wait: too many wrong keys came from this app's address. Something else "
+                    "there (another app, an old copy) has an old key: give it the right one, or stop it.",
+                )
             except NodeError as exc:
                 logger.debug("Node {} check attempt {} failed: {}", name, attempt + 1, exc)
                 timeouts += isinstance(exc, NodeTimeoutError)

@@ -168,7 +168,12 @@ it dies with a node run outside Docker (`utils.kill_with_parent`).
 Statuses: `running`, `done`, `failed`, `cancelled`, `file_not_visible`.
 Error kinds: `file_not_visible` (with `reason`: `unmapped` | `outside_roots` | `missing` | `different_file` |
 `unreadable`), `codec_not_supported`, `gpu_failed`, `cancelled`, `failed`, plus request-level `auth`, `protocol`,
-`unknown_task`, `request`, `task_deleted`, `node_stopping`.
+`unknown_task`, `request`, `task_deleted`, `node_stopping`, `rate_limited`.
+
+Wrong keys: a caller address may send 20 at once, then one more every 3 s. Past that, every request from it (the Plex
+database role's too) answers 429 `rate_limited` with `Retry-After`, whatever its key, which isn't compared: an app
+with the right key behind a shared address (NAT, a proxy, an old copy with an old key) reads it as a wait like no
+answer, never as a refused key, and the node logs the address once.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is

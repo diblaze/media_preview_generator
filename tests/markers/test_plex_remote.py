@@ -389,6 +389,13 @@ class TestFailuresLookLikeTodays:
             )
         assert ei.value.state is Capability.AGENT_UNAVAILABLE and URL in str(ei.value)
 
+    def test_a_node_asking_this_apps_address_to_wait_is_a_wait_not_a_refused_key(self):
+        remote, _ = _remote(FakeResponse(429, {"ok": False, "error": {"kind": "rate_limited"}}))
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            remote.read_item(7, deadline=_deadline())
+        assert "too many wrong keys" in str(ei.value) and "Markers wait here until it answers again" in str(ei.value)
+        assert remote._client.state == "unreachable"
+
     def test_a_wrong_key_is_refused_and_named(self):
         remote, _ = _remote(FakeResponse(401, {"agent": {"version": "1.0.0", "protocols": [1]}, "error": {}}))
         report = remote.file_checks(deadline=_deadline())

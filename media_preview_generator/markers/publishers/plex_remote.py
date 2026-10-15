@@ -622,6 +622,15 @@ class AgentClient:
                 f"Can't reach the Plex database node at {self.describe()} ({type(exc).__name__}). {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             ) from exc
+        if response.status_code == 429:
+            # Too many wrong keys came from this app's address (maybe from something else sharing it): the node
+            # didn't compare this key, so it is a wait, not a refused key.
+            self.state = AGENT_UNREACHABLE
+            raise AgentUnreachableError(
+                f"The Plex database node at {self.describe()} asks this app to wait: too many wrong keys came from "
+                f"this app's address. {unreachable}".strip(),
+                state=Capability.AGENT_UNAVAILABLE,
+            )
         return self._read(response.status_code, payload)
 
     def _payload(self, response: Any) -> Any:

@@ -34,6 +34,7 @@ from .client import (
     NodeCantStartError,
     NodeClient,
     NodeError,
+    NodeRateLimitedError,
     NodeRequestError,
     NodeStoppingError,
     NodeTaskDeletedError,
@@ -300,11 +301,13 @@ def _start_may_have_reached(exc: NodeError) -> bool:
     """Whether a start that failed with ``exc`` may have reached the node, which may then run the task.
 
     Not when the connection was never made (the client names why: refused, no such machine, TLS, a connect timeout)
-    or the node answered that it took nothing (it refused the key, the task id was already deleted, its temp folder
-    can't be used, or it is stopping). Anything else may have: no answer in time, a dropped connection, a 5xx from a
-    gateway in front of the node.
+    or the node answered that it took nothing (it refused the key or asked this address to wait, the task id was
+    already deleted, its temp folder can't be used, or it is stopping). Anything else may have: no answer in time, a
+    dropped connection, a 5xx from a gateway in front of the node.
     """
-    if isinstance(exc, NodeAuthError | NodeTaskDeletedError | NodeCantStartError | NodeStoppingError):
+    if isinstance(
+        exc, NodeAuthError | NodeRateLimitedError | NodeTaskDeletedError | NodeCantStartError | NodeStoppingError
+    ):
         return False
     return isinstance(exc, NodeTimeoutError) or not (isinstance(exc, NodeUnreachableError) and exc.reason)
 

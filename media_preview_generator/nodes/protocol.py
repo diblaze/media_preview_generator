@@ -130,6 +130,8 @@ KIND_REQUEST = "request"
 KIND_TASK_DELETED = "task_deleted"
 # A start that reached a node already stopping (503): nothing ran; /v1/health and /v1/info say ``"stopping": true``.
 KIND_NODE_STOPPING = "node_stopping"
+# Too many wrong keys came from the caller's address (429, with Retry-After): its key wasn't compared, nothing ran.
+KIND_RATE_LIMITED = "rate_limited"
 
 # Why a node can't see a file (``error.reason`` / access-check ``kind``).
 NOT_VISIBLE_UNMAPPED = "unmapped"

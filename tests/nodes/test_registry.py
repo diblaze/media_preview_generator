@@ -1045,6 +1045,18 @@ class TestNewPlexDatabaseNodeId:
         h.registry.stop()
 
 
+def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h):
+    from media_preview_generator.nodes.client import NodeRateLimitedError
+
+    h.client().default_info = NodeRateLimitedError("http://nuc:9494 asks this app to wait")
+
+    view = h.registry.check_now("n1")
+
+    assert view.state == reg.STATE_OFFLINE
+    assert "too many wrong keys came from this app's address" in view.reason
+    assert h.client().info_calls == 1  # asking again at once only keeps the address held back
+
+
 class TestTwinOfAPlexDatabaseNode:
     """A Plex database node answered by the machine of another saved node must not take that machine's Plex writes.
 
