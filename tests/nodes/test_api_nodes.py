@@ -585,6 +585,26 @@ class TestAuth:
         assert fresh.get("/api/nodes", headers=auth_headers).status_code == 200
 
 
+class TestBadAddresses:
+    BAD = [
+        "http://[::1",
+        "http://nuc:99999",
+        "http://nuc:abc",
+        "http://nuc lan:9494",
+        "http://nuc:9494#",
+        "http://nuc:9494?",
+    ]
+
+    @pytest.mark.parametrize("url", BAD)
+    def test_probe_add_and_edit_refuse_it_with_a_400(self, client, nodes, url):
+        assert client.post("/api/nodes/probe", json={"url": url, "key": "k"}).status_code == 400
+        assert _add(client, url=url).status_code == 400
+        assert _sm().nodes == []
+        node_id = _add(client).get_json()["id"]
+        assert client.put(f"/api/nodes/{node_id}", json={"url": url, "key": "new-key"}).status_code == 400
+        assert _sm().nodes[0]["url"] == "http://nuc:9494"
+
+
 class TestRemovedDuringAGroupSave:
     def test_a_node_removed_while_a_group_save_checks_it_is_never_left_referenced(self, client, nodes, monkeypatch):
         """The group save checks its members against the nodes list under the settings lock, so a Remove that comes

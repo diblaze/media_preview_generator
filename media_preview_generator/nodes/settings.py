@@ -44,10 +44,16 @@ def normalise_url(raw: object) -> tuple[str | None, str]:
     url = str(raw or "").strip().rstrip("/")
     if not url:
         return None, "Enter the node's address, e.g. http://nuc.lan:9494"
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
-        return None, "The node's address must be an http(s) address, e.g. http://nuc.lan:9494"
-    if "@" in parsed.netloc or len(url) > URL_MAX_LEN:
+    shape_err = "The node's address must be an http(s) address, e.g. http://nuc.lan:9494"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port  # Raises ValueError for a port that isn't a number from 0 to 65535.
+    except ValueError:
+        return None, shape_err
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or port == 0 or any(c.isspace() for c in url):
+        return None, shape_err
+    # A bare "?" or "#" parses as an empty query or fragment, and would swallow every route path sent after it.
+    if "@" in parsed.netloc or "?" in url or "#" in url or len(url) > URL_MAX_LEN:
         return None, "The node's address must be a plain address with no username, password or query"
     return url, ""
 

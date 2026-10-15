@@ -35,6 +35,28 @@ class TestValidateNode:
         record, err = ns.validate_node(_post(url=url), existing=None, others=[])
         assert record is None and "address" in err
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://[::1",
+            "http://nuc:99999",
+            "http://nuc:abc",
+            "http://nuc:0",
+            "http://nuc lan:9494",
+            "http://nuc:9494#",
+            "http://nuc:9494?",
+            9494,
+            "plex-host:9494",
+        ],
+        ids=["open-bracket", "port-too-big", "port-not-a-number", "port-0", "space", "bare-#", "bare-?", "int", "host"],
+    )
+    def test_addresses_that_could_never_answer_are_refused_without_raising(self, url):
+        assert ns.normalise_url(url)[0] is None
+
+    @pytest.mark.parametrize("url", ["http://[::1]:9494", "https://nuc.lan", "http://10.0.0.5:65535"])
+    def test_plain_addresses_are_kept(self, url):
+        assert ns.normalise_url(url) == (url, "")
+
     def test_a_trailing_slash_is_dropped(self):
         record, _ = ns.validate_node(_post(url="https://nuc.lan:9494/"), existing=None, others=[])
         assert record["url"] == "https://nuc.lan:9494"
