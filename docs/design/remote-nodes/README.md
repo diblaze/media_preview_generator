@@ -160,7 +160,9 @@ Stopping (SIGTERM): the node cancels every task first, then waits up to 5 s for 
 Meanwhile `stopping` is true in `/v1/health` and `/v1/info` (the registry reads the node as offline, "<node> is
 restarting") and a start answers 503 `node_stopping` and runs nothing; the app gives the file to another worker with
 no drop counted and sends no DELETE for it. On Linux each FFmpeg a node starts gets `PR_SET_PDEATHSIG` (SIGKILL), so
-it dies with a node run outside Docker (`utils.kill_with_parent`).
+it dies with a node run outside Docker (`utils.dies_with_node`): through `setpriv --pdeathsig KILL` in front of the
+command (util-linux, in the image), else a `preexec_fn` where there is no such `setpriv`. The app's FFmpeg is
+started as before.
 
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.

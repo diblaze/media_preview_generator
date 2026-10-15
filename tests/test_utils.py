@@ -414,35 +414,102 @@ def _running(pid: int) -> bool:
         return False
 
 
-class TestKillWithParent:
-    def test_only_a_node_on_linux_gets_one(self, monkeypatch):
+def _cmdline(pid: int) -> bytes:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _is_the_child(pid: int) -> bool:
+    """The child has exec'd (past setpriv, or past the fork of the node's Python): its own command line."""
+    argv = _cmdline(pid).split(b"\0")
+    return argv[0] == sys.executable.encode() and argv[1:3] == [b"-c", b"import time; time.sleep(60)"]
+
+
+class TestDiesWithNode:
+    COMMAND = ["/usr/bin/ffmpeg", "-i", "/data/a.mkv"]
+
+    def test_the_apps_ffmpeg_and_a_node_off_linux_start_as_they_always_did(self, monkeypatch):
         from media_preview_generator import utils
 
         monkeypatch.delenv("MODE", raising=False)
-        assert utils.kill_with_parent() is None
+        assert utils.dies_with_node(self.COMMAND) == (self.COMMAND, None)
 
         monkeypatch.setenv("MODE", "node")
         monkeypatch.setattr(utils.sys, "platform", "darwin")
-        assert utils.kill_with_parent() is None
+        assert utils.dies_with_node(self.COMMAND) == (self.COMMAND, None)
 
     @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
-    def test_a_nodes_ffmpeg_dies_with_the_node(self):
+    def test_a_linux_node_puts_setpriv_in_front_and_needs_no_preexec_fn(self, monkeypatch):
+        # A preexec_fn makes every FFmpeg start a full fork running Python in the child, beside the node's threads.
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils, "_setpriv", lambda: "/usr/bin/setpriv")
+
+        assert utils.dies_with_node(self.COMMAND) == (
+            ["/usr/bin/setpriv", "--pdeathsig", "KILL", "--", *self.COMMAND],
+            None,
+        )
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_without_a_setpriv_that_can_it_falls_back_to_a_preexec_fn(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils, "_setpriv", lambda: None)
+
+        args, preexec = utils.dies_with_node(self.COMMAND)
+
+        assert args == self.COMMAND and callable(preexec)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    def test_a_setpriv_without_pdeathsig_is_not_used(self, monkeypatch, tmp_path):
+        from media_preview_generator import utils
+
+        old = tmp_path / "setpriv"
+        old.write_text("#!/bin/sh\necho 'setpriv: unrecognized option --pdeathsig' >&2\nexit 1\n")
+        old.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        utils._setpriv.cache_clear()
+        try:
+            assert utils._setpriv() is None
+        finally:
+            utils._setpriv.cache_clear()
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+    @pytest.mark.parametrize("way", ["setpriv", "preexec_fn"])
+    def test_a_nodes_ffmpeg_dies_with_the_node_killed_outside_docker(self, way):
         # Outside Docker (no PID namespace) a node that exited or was killed left its FFmpeg running.
+        if way == "setpriv" and not __import__("shutil").which("setpriv"):
+            pytest.skip("no setpriv on this machine")
         node = (
-            "import os, subprocess, sys\n"
-            "from media_preview_generator.utils import kill_with_parent\n"
-            "ffmpeg = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
-            "                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
-            "                          preexec_fn=kill_with_parent())\n"
+            "import subprocess, sys, time\n"
+            "from media_preview_generator import utils\n"
+            f"if {way == 'preexec_fn'!r}:\n"
+            "    utils._setpriv = lambda: None\n"
+            "args, preexec = utils.dies_with_node([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "ffmpeg = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=preexec)\n"
             "print(ffmpeg.pid, flush=True)\n"
-            "os._exit(0)\n"
+            "time.sleep(60)\n"
         )
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        done = subprocess.run(
+        started = subprocess.Popen(
             [sys.executable, "-c", node], cwd=repo, env={**os.environ, "MODE": "node"},
-            capture_output=True, text=True, timeout=30, check=True,
+            stdout=subprocess.PIPE, text=True,
         )  # fmt: skip
-        pid = int(done.stdout.strip())
+        try:
+            pid = int(started.stdout.readline().strip())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not _is_the_child(pid):
+                time.sleep(0.02)  # setpriv becomes the child (same pid) once it has set the signal
+            assert _is_the_child(pid)
+            started.kill()  # SIGKILL: the node gets no chance to stop its FFmpeg itself
+            started.wait(10)
+        finally:
+            started.stdout.close()
         deadline = time.monotonic() + 10
         while _running(pid) and time.monotonic() < deadline:
             time.sleep(0.05)

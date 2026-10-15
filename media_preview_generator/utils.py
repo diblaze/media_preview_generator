@@ -4,11 +4,13 @@ Contains general-purpose utility functions that can be reused across
 different modules in the application.
 """
 
+import functools
 import json
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -203,20 +205,56 @@ def working_folder_hint() -> tuple[str, str]:
 
 
 _PR_SET_PDEATHSIG = 1  # linux/prctl.h
+_PDEATHSIG_KILL = ("--pdeathsig", "KILL", "--")
 
 
-def kill_with_parent() -> Callable[[], None] | None:
-    """A ``preexec_fn`` that has a node's FFmpeg killed (SIGKILL) when the node dies, on Linux; None elsewhere.
+@functools.cache
+def _setpriv() -> str | None:
+    """The ``setpriv`` that sets a parent death signal (util-linux 2.33 and newer), or None.
+
+    Tried once: an older ``setpriv`` refuses ``--pdeathsig``, and putting it in front of every FFmpeg would fail them
+    all.
+    """
+    path = shutil.which("setpriv")
+    if path is None:
+        return None
+    try:
+        tried = subprocess.run([path, *_PDEATHSIG_KILL, "true"], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if tried.returncode == 0 else None
+
+
+def dies_with_node(args: list[str]) -> tuple[list[str], Callable[[], None] | None]:
+    """The command and ``preexec_fn`` that have a node's FFmpeg killed (SIGKILL) when the node dies, on Linux.
 
     In Docker the container's end takes every process with it; a node run outside Docker that exits or is killed
-    left its FFmpeg decoding. Linux sends the signal when the *thread* that started the child ends, so pass it only
+    left its FFmpeg decoding. Linux sends the signal when the *thread* that started the child ends, so use it only
     for a child that thread waits for (each FFmpeg run, never a long-lived helper process).
 
+    ``setpriv --pdeathsig KILL`` sets the signal and then becomes FFmpeg (same process), so Python can start it the
+    cheap way. A ``preexec_fn`` is only the fallback where there is no such ``setpriv``: it makes every start a full
+    fork that runs Python in the child, which isn't safe beside threads holding locks (loguru's handlers). Unlike
+    the fallback, ``setpriv`` can't tell a node that died before the signal was set: that FFmpeg runs on.
+
+    Args:
+        args: The command (FFmpeg's).
+
     Returns:
-        The function for ``subprocess.Popen(preexec_fn=...)``, or None (not Linux, not a node, no ``prctl``).
+        ``(args, preexec_fn)`` for ``subprocess.Popen``: on a Linux node, the command behind ``setpriv`` and None,
+        or without that ``setpriv`` the command and a function that sets the signal in the child; for the app and
+        off Linux, the command as it is and None.
     """
     if not sys.platform.startswith("linux") or not is_node_mode():
-        return None
+        return args, None
+    setpriv = _setpriv()
+    if setpriv is not None:
+        return [setpriv, *_PDEATHSIG_KILL, *args], None
+    return args, _set_parent_death_signal()
+
+
+def _set_parent_death_signal() -> Callable[[], None] | None:
+    """A ``preexec_fn`` that sets SIGKILL as the child's parent death signal; None without ``prctl``."""
     import ctypes
 
     try:

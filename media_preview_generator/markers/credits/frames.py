@@ -28,7 +28,7 @@ from loguru import logger
 
 from ...processing.ffmpeg_runner import GPU_CANT_DECODE_VERDICT
 from ...processing.hwaccel import hwaccel_decode_args
-from ...utils import kill_with_parent
+from ...utils import dies_with_node
 from ..freeze import Freeze
 from ..probe import (
     ProbeError,
@@ -704,13 +704,14 @@ def run_decode(
 
     with tempfile.TemporaryFile() as stderr_file:
         try:
+            run_args, preexec = dies_with_node(command)  # a node's FFmpeg dies with the node
             # Its own session, so a kill reaches everything ffmpeg started; the app's process group is never signalled.
             proc = subprocess.Popen(
-                command,
+                run_args,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
                 start_new_session=True,
-                preexec_fn=kill_with_parent(),  # a node's FFmpeg dies with the node
+                preexec_fn=preexec,
             )
         except OSError as exc:
             raise FrameDecodeError(f"could not run {command[0]} for {name}: {exc}") from exc
