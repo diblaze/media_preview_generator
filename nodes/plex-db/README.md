@@ -192,7 +192,10 @@ as before, and its "Keep Plex's" keeps stale markers even where the app has an a
 
 Everything is `POST` with a JSON body, except `/v1/health` and `/v1/ping`. Every request carries
 `Authorization: Bearer <key>` and `X-Marker-Agent-Protocol: 1`; every answer carries
-`{"agent": {"version", "protocols", "capabilities"}}`.
+`{"agent": {"version", "protocols", "capabilities"}}`. Protocol 2 is protocol 1 plus `X-MPG-Node-Uid: <the node's id>`,
+which the app sends once it has recorded the node's id: a node with another id answers 409
+`{"error": {"kind": "wrong_node"}}` and runs nothing, so a machine given another node's key and address never writes
+into its Plex what was meant for that node's.
 
 | Endpoint | What it does | Answers |
 |---|---|---|

@@ -38,6 +38,7 @@ from media_preview_generator.markers.publishers.plex_db import (
 )
 from media_preview_generator.markers.publishers.plex_remote import AgentError, RemotePlexDb, plex_database
 from media_preview_generator.markers.settings import ServerMarkersSettings
+from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
 from media_preview_generator.servers.base import ServerConfig, ServerType
 
 T = MarkerType
@@ -536,6 +537,67 @@ class TestWhatIsSent:
         )
         batch = remote.shown_many([ShownAsk(i, [INTRO], frozenset(), None) for i in range(10)], timeout_s=30.0)
         assert len(batch.answers) == 3 and batch.unreadable is False
+
+
+class TestTheNodesSavedId:
+    """Each request names the node this app saved at the address, so another machine answering there runs nothing."""
+
+    @staticmethod
+    def _remote(*answers, uid: str = "uid-a") -> tuple[RemotePlexDb, FakeSession, list]:
+        session = FakeSession(*answers)
+        told: list = []
+        remote = RemotePlexDb(URL, TOKEN, session=session, node_uid=lambda: uid, wrong_node=lambda: told.append(1))
+        return remote, session, told
+
+    @staticmethod
+    def _write() -> WriteRequest:
+        return WriteRequest(7, [PART], [INTRO], [], 1_320_000, [], (1,), frozenset(), False)
+
+    def test_a_request_names_the_saved_id_in_the_protocol_that_checks_it(self):
+        remote, session, _ = self._remote(_envelope({"exists": True}, protocols=(1, 2)))
+        assert remote.item_exists(7, deadline=_deadline()) is True
+        headers = session.calls[0]["headers"]
+        assert headers[NODE_UID_HEADER] == "uid-a"
+        assert headers[plex_remote.PROTOCOL_HEADER] == str(plex_remote.AGENT_PROTOCOL_NODE_UID)
+
+    def test_before_an_id_is_saved_none_is_named_and_an_old_helper_keeps_protocol_1(self):
+        remote, session, _ = self._remote(_envelope({"exists": True}), uid="")
+        assert remote.item_exists(7, deadline=_deadline()) is True
+        headers = session.calls[0]["headers"]
+        assert NODE_UID_HEADER not in headers
+        assert headers[plex_remote.PROTOCOL_HEADER] == str(plex_remote.AGENT_PROTOCOL)
+
+    def test_another_machine_at_the_address_is_a_wait_and_a_recheck_never_a_failed_write(self):
+        wrong = _refusal({"kind": KIND_WRONG_NODE, "message": "another id"}, version="1.2.0", protocols=(1, 2))
+        remote, _, told = self._remote(wrong)
+        with pytest.raises(plex_remote.AgentUnreachableError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        assert "isn't the Plex database node saved there" in str(ei.value)
+        assert plex_remote.MARKERS_WAIT_FOR_THE_NODE in str(ei.value)
+        assert ei.value.state is Capability.AGENT_UNAVAILABLE
+        assert remote.agent_details()["state"] == plex_remote.AGENT_UNREACHABLE
+        assert told == [1]
+
+    def test_a_node_from_before_the_check_refuses_the_request_and_is_to_be_updated(self):
+        # Its guard refuses protocol 2 before anything runs; the app says which side to update.
+        older = FakeResponse(409, {"agent": {"version": "1.2.0", "protocols": [1]}, "error": {"kind": "protocol"}})
+        remote, _, told = self._remote(older)
+        with pytest.raises(AgentError) as ei:
+            remote.write_item(self._write(), deadline=_deadline())
+        message = str(ei.value)
+        assert not isinstance(ei.value, plex_remote.AgentUnreachableError)
+        assert "protocol 1" in message and "needs 2" in message and "Update the node." in message
+        assert "Update this app" not in message
+        assert remote.agent_details()["state"] == plex_remote.AGENT_INCOMPATIBLE
+        assert told == []
+
+    def test_the_id_is_read_for_each_request(self):
+        uids = iter(["uid-a", ""])
+        session = FakeSession(_envelope({"exists": True}, protocols=(1, 2)), _envelope({"exists": True}))
+        remote = RemotePlexDb(URL, TOKEN, session=session, node_uid=lambda: next(uids))
+        remote.item_exists(7, deadline=_deadline())
+        remote.item_exists(7, deadline=_deadline())  # the key typed again cleared the saved id
+        assert [c["headers"].get(NODE_UID_HEADER) for c in session.calls] == ["uid-a", None]
 
 
 class FakeDatabase:

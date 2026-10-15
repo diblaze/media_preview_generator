@@ -1024,9 +1024,10 @@ def test_the_app_factory_starts_the_registry_and_as_it_stops_frees_the_tasks_on_
     stub = Stub()
     reg.set_registry(stub)
     registered = []
-    monkeypatch.setattr(app_mod, "on_shutdown", registered.append)
+    monkeypatch.setattr(app_mod, "on_shutdown", lambda callback, name=None: registered.append((name, callback)))
     app_mod._start_node_registry()
-    assert calls == ["start"] and registered == [cancel_running_tasks, stub.stop]
+    assert calls == ["start"]
+    assert registered == [("node tasks", cancel_running_tasks), ("node registry", stub.stop)]
 
 
 class _LockProbingStore(AccessResultStore):
@@ -1184,10 +1185,19 @@ class TestNewPlexDatabaseNodeId:
         assert (h.registry.plex_db_refusal("n1") == "") is recorded
         h.registry.stop()
 
-    def test_a_worker_node_with_a_new_id_is_recorded_whatever_its_plex(self):
-        h = self._harness(["plex-a"])
+    def test_a_worker_node_no_server_writes_through_is_recorded_with_its_new_id(self):
+        h = self._harness([])
         self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
         assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_a_new_id_without_the_role_is_held_while_a_server_writes_through_the_node(self):
+        # Taken because this answer named no Plex database role, the id would already match when the next answer
+        # does: the Plex check never ran for the machine that writes that server's database.
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+        assert h.uids == []
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
         h.registry.stop()
 
     def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):
@@ -1349,12 +1359,58 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
 
         assert seen == [None]
 
+    def test_a_check_begun_before_a_restore_doesnt_vouch_for_the_restored_id(self, h):
+        # A restore with the same address and key but another saved id: the check that began before it heard the
+        # old id and stored it as heard, cleared the hold and put the next check 30 s out, so the restored record's
+        # Plex database work went to the machine with the old id.
+        client = h.client()
+        asked, release = threading.Event(), threading.Event()
+
+        def slow_info():
+            asked.set()
+            release.wait(5)
+            return self._answer("uid-1")
+
+        client.info = slow_info
+        check = threading.Thread(target=h.registry.check_now, args=("n1",))
+        check.start()
+        assert asked.wait(5)
+        h.change(node_uid="uid-2")
+        h.registry.views()
+        release.set()
+        check.join(5)
+
+        live = h.registry._nodes["n1"]
+        assert live.heard_uid is None
+        assert live.next_check == 0.0
+        client.info = lambda: self._answer("uid-1")
+        assert h.registry.plex_db_hold("n1") is not None
+
     def test_a_node_without_a_saved_id_is_never_held(self, h):
         h.change(node_uid=None)
         h.client().default_info = NodeUnreachableError("down")
 
         assert h.registry.plex_db_hold("n1") is None
         assert h.client().info_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("protocols", "state"),
+    [([1], reg.STATE_UPDATE_NEEDED), ([1, 2], reg.STATE_READY)],
+    ids=["from-before-the-id-check", "with-the-id-check"],
+)
+def test_a_plex_database_node_from_before_the_id_check_needs_an_update(h, protocols, state):
+    # Its role ignores the saved id the app sends, so it would run a request meant for another machine: the app sends
+    # it protocol 2, which it refuses, and the Nodes page says why instead of showing it ready.
+    info = _info(roles=(ROLE_PLEX_DB,))
+    info["agent"] = {"version": "1.2.0", "protocols": protocols, "capabilities": []}
+    h.client().default_info = info
+
+    view = h.registry.check_now("n1")
+
+    assert view.state == state
+    if state == reg.STATE_UPDATE_NEEDED:
+        assert view.reason == "nuc's Plex database role is version 1.2.0, too old for this app. Update the node."
 
 
 def test_a_node_asking_this_apps_address_to_wait_reads_offline_not_key_refused(h):
@@ -1484,6 +1540,31 @@ class TestTwinOfAPlexDatabaseNode:
 
         # Still held once n1 is removed, until a check of B alone decides.
         assert h.registry._nodes["n2"].unconfirmed_uid == "uid-a"
+        h.registry.stop()
+
+    def test_a_twin_stays_held_after_a_mapping_edit_puts_it_back_to_checking(self):
+        # A restored settings file can hold two records with one id. The twin's check kept that id as the one it
+        # heard, so a mapping edit (the node back to "checking") let its Plex database work through to the other
+        # machine.
+        h = self._harness()
+        h.nodes[1] = {**h.nodes[1], "node_uid": "uid-a"}
+        h.revision += 1
+        self._answer(h, "n2", "uid-a")
+        assert h.registry.view("n2").state == reg.STATE_DUPLICATE
+
+        h.nodes[1] = {**h.nodes[1], "path_mappings": [{"app_prefix": "/media", "node_prefix": "/mnt"}]}
+        h.revision += 1
+
+        assert h.registry.view("n2").state == reg.STATE_CONNECTING
+        assert h.registry.plex_db_hold("n2") is not None
+        h.registry.stop()
+
+    def test_a_new_id_held_back_is_never_taken_for_the_one_heard(self):
+        h = self._harness()
+        self._answer(h, "n2", "uid-new")
+
+        assert h.registry._nodes["n2"].unconfirmed_uid == "uid-new"
+        assert h.registry._nodes["n2"].heard_uid is None
         h.registry.stop()
 
 

@@ -10,7 +10,8 @@ https://claude.ai/artifact/G5nBhYJVFBekqJMQ93NCHa
   runs (**Plex database** role). One node can hold both roles. The app stays the brain: queue, schedules, retries,
   tokens, mappings, every write. A node runs one heavy step it is handed and returns frames, numbers or timestamps.
 * The Plex database role **is** today's Plex helper (`plex-marker-agent`), folded in. Its wire protocol (agent
-  protocol 1, header `X-Marker-Agent-Protocol`) is unchanged so every helper already deployed keeps working.
+  protocol 1, header `X-Marker-Agent-Protocol`) is still spoken, so every helper already deployed keeps working;
+  agent protocol 2 adds the node's id to each request (§3).
 * Evidence that the design works (prototype runs, Windows CI results, the requeue spike) is in
   [`evidence/`](evidence/) and the throwaway prototype in [`prototype/`](prototype/). Read §9 before trusting any
   number.
@@ -49,6 +50,10 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
     otherwise its Plex database work is refused ("Type the node's key again on its Settings tab to confirm") until
     the key is typed again, which clears the saved id. A Plex database node beside the wrong Plex is caught by the
     Plex machine identifier check.
+  - Each Plex database request names the node's saved id (agent protocol 2, §3), so another machine that starts
+    answering at the address between the app's check and its write refuses the write and runs nothing; the app
+    holds that node's Plex database work and checks it again at once. A Plex database node from before protocol 2
+    (agent version 1.2.0 builds of this branch only; never released) reads `update_needed`.
   - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
     refuses loudness writes.
 * **Still open:**
@@ -115,7 +120,12 @@ A node never receives a server token, never decides work, never receives a write
 
 Auth on every route except `GET /v1/health`: `Authorization: Bearer <key>`, compared with `secrets.compare_digest`
 on bytes. Node routes also require `X-MPG-Node-Protocol: 1`; a mismatch answers 409 `{"error":{"kind":"protocol"}}`.
-The Plex database routes keep the agent's header and protocol exactly.
+The Plex database routes keep the agent's header and its protocols 1 and 2. Once the app has saved a node's
+`node_uid` (§4) every Plex database request it sends is agent protocol 2 with `X-MPG-Node-Uid: <node_uid>`; a node
+with another id answers 409 `{"error":{"kind":"wrong_node"}}` before running anything, and the app treats that as
+the node not answering (the work waits, nothing fails) and checks it at once, which then holds the work as for any
+new id (§0.1). With no saved id (first contact, an old helper, which has none) the app sends protocol 1 and no id.
+A node from before protocol 2 refuses it (409 `protocol`), so it never runs a request meant for another machine.
 
 Every JSON answer: `{"ok": bool, "node": NODE_BLOCK, ...}` where
 `NODE_BLOCK = {"id", "name", "version", "build", "protocols": [1], "roles": ["worker", "plex_db"]}` (`version` = the
@@ -179,9 +189,11 @@ that (200 at once, one more every 0.3 s), so a device with an old key holds back
 network. Past that, every request from it (the Plex database role's too) answers 429 `rate_limited` with
 `Retry-After`, whatever its key, which isn't compared: an app with the right key behind a shared address (NAT, a
 proxy, an old copy with an old key) reads it as a wait like no answer, never as a refused key, and the node logs the
-address once. Connections are capped the same two ways: 160 per address (one app's every worker plus its checks), 250
-per /64. Request bytes being read beyond each request's first 64 KB share a 64 MB budget, so connections that send
-large bodies before the key is checked can't fill a small node's memory.
+address once. A running task's polls held back that way past the node's unpolled-task expiry (+12 s) give the file
+back to the queue without counting a drop: the node has dropped the task by then. Connections are capped the same two
+ways: 160 per address (one app's every worker plus its checks), 250 per /64. Request bytes being read beyond each
+request's first 64 KB share a 64 MB budget, so connections that send large bodies before the key is checked can't fill
+a small node's memory; one address (or one /64) holds a quarter of it at most, so it can't shut out everyone else's.
 
 Task lifetime: a task nobody has polled for 60 s is cancelled and its temp dir removed (an app that restarted never
 leaves work running). A finished task's artifact is kept until `DELETE` or 10 minutes after its last poll; a `DELETE` nothing answered is
@@ -228,7 +240,8 @@ retry runs (on the **node's** CPU, see §6).
 
 * Health check every 30 s, backing off to 5 min while offline; "Check now" forces one.
 * `update_needed`: node version ≠ app version for the worker role (exact match); for the Plex database role, the
-  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block). A node that refuses the app's
+  agent's existing `MIN_AGENT_VERSION` rule (read from `/v1/info`'s `agent` block), and a node whose `agent.protocols`
+  lacks 2 (it would refuse every Plex database request, §3). A node that refuses the app's
   node protocol (409 with its `node` block) is `update_needed` naming both versions. An old helper that has no
   `/v1/info` is a Plex database node in "legacy" mode — it keeps working and Setup Health recommends updating it.
 * `no_ffmpeg`: a worker node whose `/v1/info` reports `worker.ffmpeg.path` null; it gets no work.
@@ -257,8 +270,10 @@ retry runs (on the **node's** CPU, see §6).
   ready (5 min at most). The item's retry takes a free worker on another node or this app first; until the node
   checks ready again it waits for one of those while one runs its kind now (busy or not), and once the node has
   checked ready it goes back there when none of those is free (a busy one can stay busy for hours: a long film, a
-  file its job's schedule froze). While it waits for the node, the job reads "Waiting for a node — <name>: checking
-  it again". Health checks
+  file its job's schedule froze). If it drops the file again there while one of those still runs its kind, that drop
+  isn't counted and the file waits for one of those from then on: a node that passes its idle checks but drops files
+  under load would otherwise fail every file handed back to it. While it waits for the node, the job reads "Waiting
+  for a node — <name>: checking it again". Health checks
   read `/v1/info` with a 10 s timeout, so a node that takes connections but never answers reads offline ("accepts
   connections but doesn't answer") within a minute.
 * **File not visible** (missing, or not the same file: another size, or an mtime 2 s or more from the app's): the

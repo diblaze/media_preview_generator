@@ -228,9 +228,10 @@ class _Live:
     # A new id a Plex database node reported that this app couldn't tie to the Plex it serves; its Plex database
     # writes are refused until the user types the node's key again (which clears the saved id).
     unconfirmed_uid: str = ""
-    # The id the node gave the last check that reached it and settled its id ("" when it gives none, an old Plex
-    # helper); None until a check since this app started reaches it, and again once a check doesn't, it is reported
-    # unavailable, or it gets another address. Until then another machine could be answering there.
+    # The id the last check that reached the node heard, when it is the saved id or a new one ``_new_uid`` accepted
+    # ("" when it gives none, an old Plex helper); None for any other id (one held back, a twin's), until a check
+    # since this app started reaches it, and again once a check doesn't, it is reported unavailable, it gets another
+    # address or its saved id changes. Until then another machine could be answering there.
     heard_uid: str | None = None
     check_lock: threading.Lock = field(default_factory=threading.Lock)
     # Health checks begun so far, the number of the last one that came back ready, and how many had begun when job
@@ -661,7 +662,8 @@ class NodeRegistry:
     # ------------------------------------------------------------------ reports from job code
 
     def report_unavailable(self, node_id: str) -> None:
-        """A node stopped answering mid-task: check it now rather than at its next turn.
+        """A node stopped answering mid-task, or another machine refused its Plex database work: check it now rather
+        than at its next turn (its Plex database work waits for that check).
 
         A check already running began before the report, so another one follows it straight away.
         """
@@ -1146,6 +1148,11 @@ class NodeRegistry:
                 with self._lock:
                     if self._nodes.get(node_id) is not live or live.client is not client:
                         return  # Settings changed while it ran: this answer is about an old address.
+                    if live.record.get("node_uid") != record.get("node_uid"):
+                        # The saved id changed while it ran (a restore, the key typed again): the id it heard was
+                        # weighed against the old one. The next check, now, weighs it against this one.
+                        live.next_check = 0.0
+                        return
                     twin = self._twin_of(node_id, outcome.uid)
                     if twin:
                         # Sent work as two nodes, one machine would get twice its workers' files.
@@ -1157,25 +1164,22 @@ class NodeRegistry:
                         )
                     self._apply(live, outcome, number)
                     new_uid = bool(outcome.uid and not twin and outcome.uid != record.get("node_uid"))
-                    if new_uid:
+                    if new_uid or twin:
                         # A new id is settled by ``_new_uid`` first: until then nothing may reach the node (the saved
-                        # id heard before is another machine's now).
+                        # id heard before is another machine's now). A twin's is the other node's machine, whatever
+                        # this record says.
                         live.heard_uid = None
                     elif outcome.uid or outcome.state != STATE_OFFLINE:
                         live.heard_uid = outcome.uid
+                    if not new_uid and outcome.uid and record.get("node_uid"):
+                        # A twin's id is never recorded, so another machine stays unconfirmed: once the other node is
+                        # removed, the next check decides whether this one is the same Plex.
+                        live.unconfirmed_uid = "" if outcome.uid == record.get("node_uid") else outcome.uid
                     has_access_problem = bool(live.access_problem)
                     access = access or live.access_wanted
                     live.access_wanted = False
                 if new_uid:
                     self._new_uid(node_id, live, record, outcome)
-                elif outcome.uid and outcome.uid == record.get("node_uid"):
-                    with self._lock:
-                        live.unconfirmed_uid = ""
-                elif outcome.uid and record.get("node_uid"):
-                    # A twin's id is never recorded, so another machine stays unconfirmed: once the other node is
-                    # removed, the next check decides whether this one is the same Plex.
-                    with self._lock:
-                        live.unconfirmed_uid = outcome.uid
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -1194,39 +1198,42 @@ class NodeRegistry:
 
     def _new_uid(self, node_id: str, live: _Live, record: dict, outcome: _Outcome) -> None:
         """Record a node's new id, or hold back a Plex database node's until it is tied to its Plex."""
-        if self._new_uid_confirmed(node_id, record, outcome):
-            with self._lock:
-                live.unconfirmed_uid = ""
-                live.heard_uid = outcome.uid
-            self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
-            return
+        confirmed = self._new_uid_confirmed(node_id, record, outcome)
         with self._lock:
             if self._nodes.get(node_id) is not live or live.record.get("node_uid") != record.get("node_uid"):
-                return  # The id was cleared meanwhile (the key typed again): the next check records it.
-            live.heard_uid = outcome.uid
-            if live.unconfirmed_uid != outcome.uid:
-                logger.warning(
-                    "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work waits "
-                    "until its key is typed again",
-                    record.get("name") or node_id,
-                )
-            live.unconfirmed_uid = outcome.uid
+                live.next_check = 0.0
+                return  # The saved id changed meanwhile (a restore, the key typed again): the next check settles it.
+            if confirmed:
+                live.unconfirmed_uid = ""
+                live.heard_uid = outcome.uid
+            else:
+                # ``heard_uid`` stays None: it holds only the saved id or one accepted here.
+                if live.unconfirmed_uid != outcome.uid:
+                    logger.warning(
+                        "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work "
+                        "waits until its key is typed again",
+                        record.get("name") or node_id,
+                    )
+                live.unconfirmed_uid = outcome.uid
+        if confirmed:
+            self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
 
     def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool:
         """Whether a node's new id may replace the saved one without asking.
 
-        A worker node (or one with no saved id yet) is this node by its saved key and address. A Plex database node
-        writes into a Plex's database, so its new id is taken only when it names the Plex machine identifier of
-        every server that uses it; an empty identifier on either side (a Windows node with a custom Plex folder)
-        proves nothing.
+        A worker node (or one with no saved id yet) is this node by its saved key and address. A node that a Plex
+        server uses as its Plex database node writes into that Plex's database, so its new id is taken only when it
+        names the Plex machine identifier of every server that uses it; an empty identifier on either side (a Windows
+        node with a custom Plex folder) proves nothing. That holds whether or not this answer names the role: an id
+        taken without it would already match once the node names it.
         """
-        if not record.get("node_uid") or protocol.ROLE_PLEX_DB not in outcome.roles:
+        if not record.get("node_uid"):
             return True
         try:
             served = self._served_plex_ids(node_id)
         except Exception as exc:  # noqa: BLE001 - unreadable settings can't confirm anything
             logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
-            return False
+            return protocol.ROLE_PLEX_DB not in outcome.roles
         if not served:
             return True  # No server writes through it: nothing to protect.
         plex_db = (outcome.info or {}).get("plex_db")
@@ -1351,7 +1358,7 @@ class NodeRegistry:
         )
 
     def _read_info(self, record: dict, info: dict) -> _Outcome:
-        from ..markers.publishers.plex_remote import MIN_AGENT_VERSION, agent_too_old
+        from ..markers.publishers.plex_remote import AGENT_PROTOCOL_NODE_UID, MIN_AGENT_VERSION, agent_too_old
 
         name = str(record.get("name") or "The node")
         block = info.get("node") if isinstance(info.get("node"), dict) else {}
@@ -1420,6 +1427,21 @@ class NodeRegistry:
                 STATE_UPDATE_NEEDED,
                 f"{name}'s Plex database role is version {agent_version}; this app needs {MIN_AGENT_VERSION} or "
                 "newer. Update the node.",
+                **outcome,
+            )
+        agent_protocols = agent.get("protocols") if isinstance(agent, dict) else None
+        if (
+            protocol.ROLE_PLEX_DB in roles
+            and uid
+            and isinstance(agent_protocols, list)
+            and AGENT_PROTOCOL_NODE_UID not in agent_protocols
+        ):
+            # Its role ignores the node id this app names, so this app sends it the protocol that carries the id,
+            # which it refuses: every Plex database request would fail while the node read as ready.
+            return _Outcome(
+                STATE_UPDATE_NEEDED,
+                f"{name}'s Plex database role is version {agent_version or 'unknown'}, too old for this app. Update "
+                "the node.",
                 **outcome,
             )
         return _Outcome(STATE_READY, **outcome)

@@ -22,6 +22,7 @@ from typing import Any
 import requests
 from loguru import logger
 
+from ...nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
 from .base import Capability, CapabilityReport, DatabaseBusyError, ItemNotFoundError, PublishError, Shown
@@ -40,6 +41,11 @@ from .plex_db import (
 # The wire contract. Bumped only when a request or answer changes shape; an agent says which protocols it implements
 # and refuses the others, so a skew in either direction is a refusal with both versions named, never a wrong write.
 AGENT_PROTOCOL = 1
+# Protocol 1 plus the node id: each request names the node this app saved at the address (``NODE_UID_HEADER``) and a
+# node with another id refuses it. Sent only once that id is saved, so an old Plex helper (it has none) keeps
+# protocol 1, and a node from before the check refuses protocol 2 outright instead of running a request meant for
+# another machine.
+AGENT_PROTOCOL_NODE_UID = 2
 PROTOCOL_HEADER = "X-Marker-Agent-Protocol"
 # The oldest agent build this app works with. The agent's version is its own (its image tag), not the app's.
 MIN_AGENT_VERSION = "1.0.0"
@@ -539,6 +545,35 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
     return None
 
 
+def saved_node_uid(settings: Any) -> str:
+    """The id this app saved for the server's Plex database node, read now ("" before first contact, or for an old
+    Plex helper, which has none).
+
+    Args:
+        settings: That server's ``ServerMarkersSettings``.
+    """
+    node_id = getattr(settings, "agent_node_id", None)
+    if not node_id:
+        return ""
+    from ...nodes.settings import node_record
+
+    record = node_record(str(node_id))
+    return str((record or {}).get("node_uid") or "")
+
+
+def report_wrong_node(settings: Any) -> None:
+    """Hold the server's Plex database node's work until a check hears which machine answers at its address now.
+
+    Args:
+        settings: That server's ``ServerMarkersSettings``.
+    """
+    node_id = getattr(settings, "agent_node_id", None)
+    if node_id:
+        from ...nodes.registry import get_registry
+
+        get_registry().report_unavailable(str(node_id))
+
+
 class AgentClient:
     """One agent's HTTP endpoint: the key, the protocol check and the error mapping, nothing about markers."""
 
@@ -549,6 +584,8 @@ class AgentClient:
         *,
         session: Any = None,
         refusal: Callable[[], NodeRefusal | None] | None = None,
+        node_uid: Callable[[], str] | None = None,
+        wrong_node: Callable[[], None] | None = None,
     ) -> None:
         """Create the client.
 
@@ -558,11 +595,17 @@ class AgentClient:
             session: A ``requests.Session`` to use (tests pass their own).
             refusal: Asked before every request why nothing may be sent to this node now (``node_refusal``); a
                 refusal fails that request.
+            node_uid: Asked before every request for the id this app saved for the node (``saved_node_uid``; ""
+                before first contact). Each request names it, so another machine at the address runs nothing.
+            wrong_node: Told when the node refused a request as another machine than that id
+                (``report_wrong_node``).
         """
         self.url = str(url or "").strip().rstrip("/")
         self._token = str(token or "")
         self._session = session or requests.Session()
         self._refusal_check = refusal
+        self._node_uid = node_uid
+        self._wrong_node = wrong_node
         self.version = ""
         refused = refusal() if refusal is not None else None
         self.state = refused.agent_state if refused is not None else AGENT_UNREACHABLE
@@ -602,14 +645,15 @@ class AgentClient:
     ) -> dict:
         """Send one request and read its answer: never a redirect followed, never more than ``MAX_ANSWER_BYTES``."""
         self._refuse_early()
+        uid = self._node_uid() if self._node_uid is not None else ""
+        sent = AGENT_PROTOCOL_NODE_UID if uid else AGENT_PROTOCOL
+        headers = {"Authorization": f"Bearer {self._token}", PROTOCOL_HEADER: str(sent), "Accept-Encoding": "identity"}
+        if uid:
+            headers[NODE_UID_HEADER] = uid
         try:
             response = method(
                 f"{self.url}{path}",
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    PROTOCOL_HEADER: str(AGENT_PROTOCOL),
-                    "Accept-Encoding": "identity",
-                },
+                headers=headers,
                 timeout=(CONNECT_TIMEOUT_S, max(1.0, timeout)),
                 # A redirect would carry the key and the request to wherever the node pointed.
                 allow_redirects=False,
@@ -636,7 +680,7 @@ class AgentClient:
                 f"this app's address. {unreachable}".strip(),
                 state=Capability.AGENT_UNAVAILABLE,
             )
-        return self._read(response.status_code, payload)
+        return self._read(response.status_code, payload, sent=sent, unreachable=unreachable)
 
     def _payload(self, response: Any) -> Any:
         """The answer's JSON body, read up to ``MAX_ANSWER_BYTES``; None when it isn't JSON.
@@ -732,7 +776,7 @@ class AgentClient:
             return False
         return isinstance(payload, dict) and isinstance(payload.get("node"), dict) and "agent" not in payload
 
-    def _read(self, status_code: int, payload: Any) -> dict:
+    def _read(self, status_code: int, payload: Any, *, sent: int = AGENT_PROTOCOL, unreachable: str = "") -> dict:
         if not isinstance(payload, dict):
             payload = {}
         advertised_agent = payload.get("agent")
@@ -748,21 +792,34 @@ class AgentClient:
                 f"The Plex database node at {self.describe()} refused this app's key. Set the same key on both sides.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
-        speaks_ours = AGENT_PROTOCOL in protocols if protocols else True
+        error = payload.get("error")
+        if status_code == 409 and isinstance(error, dict) and error.get("kind") == KIND_WRONG_NODE:
+            # Another machine answers at the address with the node's key. It ran nothing, so the work waits, as for a
+            # node that is down, while a check hears which machine it is.
+            self.state = AGENT_UNREACHABLE
+            logger.warning("The machine at {} isn't the Plex database node saved there; checking it again", self.url)
+            if self._wrong_node is not None:
+                self._wrong_node()
+            raise AgentUnreachableError(
+                f"The machine answering at {self.describe()} isn't the Plex database node saved there (it has another "
+                f"id), so it ran nothing. This app checks it again. {unreachable}".strip(),
+                state=Capability.AGENT_UNAVAILABLE,
+            )
+        speaks_ours = sent in protocols if protocols else True
         if not speaks_ours or (self.version and agent_too_old(self.version)):
             self.state = AGENT_INCOMPATIBLE
             named = self.version or "unknown"
-            # Which side has to move. An agent this app knows to be too old is updated; anything else that doesn't
-            # speak our protocol has moved past us, and telling the user to update it again would send them in a
-            # circle — including an agent that reports no version at all.
+            spoken = ", ".join(str(p) for p in protocols) or "another protocol"
+            # Which side has to move. An agent this app knows to be too old is updated, and so is one that speaks
+            # only older protocols than the one sent (from before the node id check); anything else that doesn't
+            # speak it has moved past us, and telling the user to update it again would send them in a circle --
+            # including an agent that reports no version at all.
             if agent_too_old(self.version):
                 advice = f"this app needs {MIN_AGENT_VERSION} or newer. Update the node."
+            elif protocols and all(type(p) is int and p < sent for p in protocols):
+                advice = f"it speaks protocol {spoken} and this app needs {sent}. Update the node."
             else:
-                spoken = ", ".join(str(p) for p in protocols) or "another protocol"
-                advice = (
-                    f"it speaks protocol {spoken} and this app speaks {AGENT_PROTOCOL}. Update this app to match "
-                    "the node."
-                )
+                advice = f"it speaks protocol {spoken} and this app speaks {sent}. Update this app to match the node."
             raise AgentError(
                 f"The Plex database node at {self.describe()} is version {named}; {advice}",
                 state=Capability.AGENT_UNAVAILABLE,
@@ -814,6 +871,8 @@ class RemotePlexDb(PlexDatabase):
         *,
         session: Any = None,
         refusal: Callable[[], NodeRefusal | None] | None = None,
+        node_uid: Callable[[], str] | None = None,
+        wrong_node: Callable[[], None] | None = None,
     ) -> None:
         """Create the transport.
 
@@ -822,8 +881,12 @@ class RemotePlexDb(PlexDatabase):
             token: The key both sides share.
             session: A ``requests.Session`` (tests pass their own).
             refusal: Asked before every call why nothing may be sent to the node now (``node_refusal``).
+            node_uid: The id this app saved for the node, named on every call (``AgentClient``).
+            wrong_node: Told when the node refused a call as another machine than that id.
         """
-        self._client = AgentClient(url, token, session=session, refusal=refusal)
+        self._client = AgentClient(
+            url, token, session=session, refusal=refusal, node_uid=node_uid, wrong_node=wrong_node
+        )
 
     def agent_details(self) -> dict:
         """The agent block for ``capability().details``."""
@@ -1120,5 +1183,7 @@ def plex_database(
             getattr(settings, "agent_token", ""),
             session=session,
             refusal=lambda: node_refusal(settings),
+            node_uid=lambda: saved_node_uid(settings),
+            wrong_node=lambda: report_wrong_node(settings),
         )
     return LocalPlexDb(path_provider, label=label, mountinfo_path=mountinfo_path)

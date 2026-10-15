@@ -479,7 +479,8 @@ class TestRoles:
         health = client.get("/v1/health").get_json()
         body = client.get("/v1/info", headers=HEADERS).get_json()
 
-        assert calls == [{"plex_config_dir": "/plex", "key": KEY}]
+        # Its own id too: the role refuses a request naming another node's.
+        assert calls == [{"plex_config_dir": "/plex", "key": KEY, "node_uid": body["node"]["id"]}]
         assert health["agent"]["version"] == "1.1.2" and health["node"]["roles"] == ["plex_db"]
         assert body["plex_db"] == {"config_dir": "/plex", "db_present": True, "machine_identifier": "abc"}
         assert "worker" not in body

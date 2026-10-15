@@ -282,8 +282,8 @@ def _start_node_registry() -> None:
 
     registry = get_registry()
     registry.start()
-    on_shutdown(cancel_running_tasks)
-    on_shutdown(registry.stop)
+    on_shutdown(cancel_running_tasks, name="node tasks")
+    on_shutdown(registry.stop, name="node registry")
 
 
 # Chains whose `retry_started_at` is older than this at boot time are
@@ -996,7 +996,7 @@ def create_app(config_dir: str | None = None) -> Flask:
         except Exception:
             logger.debug("Scheduler shutdown error during exit", exc_info=True)
 
-    on_shutdown(_shutdown_scheduler)
+    on_shutdown(_shutdown_scheduler, name="scheduler")
 
     _start_node_registry()
 

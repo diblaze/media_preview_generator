@@ -8,7 +8,8 @@ event loop before a thread takes it, so connections that send a request slowly, 
 otherwise freeze the node with a few half-sent requests. Nor can they hold every connection the node takes: one
 address gets :data:`CONNECTIONS_PER_ADDRESS` at once and an IPv6 /64 :data:`CONNECTIONS_PER_NETWORK` (past that, one of
 their idle keep-alives makes room), and each request must arrive whole within :data:`REQUEST_READ_S`. Nor fill its
-memory: requests being read hold :data:`REQUEST_BYTES_BUDGET` at most beyond their first :data:`REQUEST_BYTES_FREE`.
+memory: requests being read hold :data:`REQUEST_BYTES_BUDGET` at most beyond their first :data:`REQUEST_BYTES_FREE`, and
+one caller's :data:`REQUEST_BYTES_PER_CALLER` of it.
 """
 
 from __future__ import annotations
@@ -70,6 +71,10 @@ INBUF_OVERFLOW_BYTES = 2 * MAX_REQUEST_BODY_BYTES
 # while something else holds it.
 REQUEST_BYTES_FREE = 64 * 1024
 REQUEST_BYTES_BUDGET = 64 * 1024 * 1024
+# One caller's share of it, so one machine sending large bodies on many connections can't leave every other caller's
+# large request closed. A caller is an address, or an IPv6 /64 as a whole: a machine there can take an address per
+# connection.
+REQUEST_BYTES_PER_CALLER = REQUEST_BYTES_BUDGET // 4
 # How long a stopping node waits for its cancelled tasks (and their FFmpeg) to stop, inside Docker's 10 s stop timeout;
 # in the image s6 kills the node sooner, 3 s after the SIGTERM (see tasks.STOP_TELL_WAIT_S).
 SHUTDOWN_WAIT_S = 5.0
@@ -114,7 +119,8 @@ def _quiet(channel: Any) -> bool:
 def _limited_channels(listen_map: dict) -> Any:
     """A waitress ``channel_class`` that holds an address to :data:`CONNECTIONS_PER_ADDRESS` connections (an IPv6 /64
     to :data:`CONNECTIONS_PER_NETWORK`), closes one whose request hasn't arrived whole within :data:`REQUEST_READ_S`,
-    and one whose request would take more of :data:`REQUEST_BYTES_BUDGET` than is left.
+    and one whose request would take more of :data:`REQUEST_BYTES_BUDGET` than is left, or its caller past
+    :data:`REQUEST_BYTES_PER_CALLER`.
 
     At a limit, one of the address's (or the /64's) idle keep-alives is closed to make room, and only one whose every
     connection is busy (reading, running or answering a request) is refused: a client keeping more keep-alives than
@@ -131,6 +137,8 @@ def _limited_channels(listen_map: dict) -> Any:
 
     # Request bytes counted against the budget now (waitress's loop thread changes it; its service threads don't).
     budget_used = [0]
+    # The same bytes by caller (an address, or an IPv6 /64): only callers holding some are in it.
+    caller_used: dict[str, int] = {}
     warned_at: dict[str, float] = {}
 
     def warn(what: str, message: str, *args: Any) -> None:
@@ -148,8 +156,16 @@ def _limited_channels(listen_map: dict) -> Any:
         def _charge(self) -> int:
             return max(0, self.held_bytes - REQUEST_BYTES_FREE)
 
+        def _sender(self) -> str:
+            return self.network or self.caller
+
         def _release(self) -> None:
-            budget_used[0] -= self._charge()
+            charge = self._charge()
+            if charge:
+                budget_used[0] -= charge
+                left = caller_used.pop(self._sender(), 0) - charge
+                if left > 0:
+                    caller_used[self._sender()] = left
             self.held_bytes = 0
 
         def received(self, data: bytes) -> bool:
@@ -160,18 +176,30 @@ def _limited_channels(listen_map: dict) -> Any:
             before = self._charge()
             self.held_bytes += len(data)
             added = self._charge() - before
-            if budget_used[0] + added > REQUEST_BYTES_BUDGET:
+            full = budget_used[0] + added > REQUEST_BYTES_BUDGET
+            if full or caller_used.get(self._sender(), 0) + added > REQUEST_BYTES_PER_CALLER:
                 self.held_bytes -= len(data)
                 self._release()
                 self.will_close = True
-                warn(
-                    "budget",
-                    "Closed a connection from {}: requests being read already hold {} MB of the node's memory",
-                    self.caller,
-                    REQUEST_BYTES_BUDGET >> 20,
-                )
+                if full:
+                    warn(
+                        "budget",
+                        "Closed a connection from {}: requests being read already hold {} MB of the node's memory",
+                        self.caller,
+                        REQUEST_BYTES_BUDGET >> 20,
+                    )
+                else:
+                    warn(
+                        "caller budget",
+                        "Closed a connection from {}: requests being read from there already hold {} MB of the node's "
+                        "memory, the most one caller may",
+                        f"addresses in {self.network}" if self.network else self.caller,
+                        REQUEST_BYTES_PER_CALLER >> 20,
+                    )
                 return False
-            budget_used[0] += added
+            if added:
+                budget_used[0] += added
+                caller_used[self._sender()] = caller_used.get(self._sender(), 0) + added
             if self.request is None:
                 self.reading_since = time.monotonic()
             done = super().received(data)

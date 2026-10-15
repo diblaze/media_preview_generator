@@ -7,6 +7,7 @@ Every path that resolves a server's Plex database node is covered: markers (``pl
 
 from __future__ import annotations
 
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -31,7 +32,8 @@ from media_preview_generator.markers.publishers.plex_remote import (
     plex_database,
 )
 from media_preview_generator.markers.settings import load_server
-from media_preview_generator.nodes.registry import PlexDbHold, set_registry
+from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER
+from media_preview_generator.nodes.registry import PlexDbHold, get_registry, set_registry
 from media_preview_generator.servers.base import ServerType
 from tests.loudness.test_plex_db import FIELDS
 
@@ -287,3 +289,38 @@ def test_a_node_still_to_be_checked_is_refused_as_not_answering_so_the_work_wait
     assert str(caught.value).startswith(MESSAGES[AGENT_UNREACHABLE])
     assert db._client.state == AGENT_UNREACHABLE
     session.post.assert_not_called()
+
+
+def _wrong_node_answer() -> MagicMock:
+    answer = MagicMock(status_code=409, headers={})
+    body = {"ok": False, "agent": {"version": "1.2.0", "protocols": [1, 2]}, "error": {"kind": KIND_WRONG_NODE}}
+    answer.iter_content.return_value = [json.dumps(body).encode()]
+    return answer
+
+
+def test_markers_name_the_saved_id_and_another_machine_there_has_the_node_checked_again(node):
+    node(enabled=True)
+    session = MagicMock()
+    session.post.return_value = _wrong_node_answer()
+    db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session)
+
+    with pytest.raises(AgentUnreachableError):
+        db.item_exists(7, deadline=time.monotonic() + 5)
+
+    assert session.post.call_args.kwargs["headers"][NODE_UID_HEADER] == NODE["node_uid"]
+    get_registry().report_unavailable.assert_called_once_with(NODE["id"])
+
+
+def test_chapters_name_the_saved_id_and_another_machine_there_has_the_node_checked_again(node, monkeypatch):
+    node(enabled=True)
+    monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
+    backend, *_ = plex_chapters._context(MagicMock(), SimpleNamespace(markers=MARKERS, output={}))
+    session = MagicMock()
+    session.post.return_value = _wrong_node_answer()
+    backend._session = session
+
+    with pytest.raises(AgentUnreachableError):
+        backend.post("/v1/chapters/check", {}, timeout=1)
+
+    assert session.post.call_args.kwargs["headers"][NODE_UID_HEADER] == NODE["node_uid"]
+    get_registry().report_unavailable.assert_called_once_with(NODE["id"])

@@ -29,7 +29,7 @@ from media_preview_generator.nodes.executor import (
     run_on_node,
 )
 from media_preview_generator.nodes.protocol import PathMapping
-from media_preview_generator.nodes.registry import set_registry
+from media_preview_generator.nodes.registry import NodeRegistry, set_registry
 from media_preview_generator.nodes.server import app as node_app
 from media_preview_generator.nodes.server import info, tasks
 
@@ -453,3 +453,91 @@ class TestANodeThatIsStopping:
         assert ended[0].started is False and str(ended[0]) == "NAS is restarting"
         assert requeue_for(ended[0]).reason == REQUEUE_NODE_NOT_STARTED
         assert registry.reports == [("unavailable", NODE_ID)]
+
+
+class TestAPlexDatabaseNodeSwappedAtItsAddress:
+    """Another machine, given the same key, starts answering at a Plex database node's address between the app's
+    check of the node and its write: that machine writes nothing into its Plex, and the app checks the node again."""
+
+    @pytest.fixture
+    def swapped(self, tmp_path, monkeypatch):
+        from media_preview_generator.markers.publishers import plex_db
+        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+        from tests.markers.test_plex_db_publisher import _make_db
+
+        for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_ROLES"):
+            monkeypatch.delenv(name, raising=False)
+        # Stands in for Plex holding each database open (the role's lock proof).
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
+        machines = {}
+        for name in ("a", "b"):
+            folder = tmp_path / f"plex-{name}"
+            _make_db(folder, journal_mode="wal")
+            monkeypatch.setenv("PLEX_CONFIG_DIR", str(folder))
+            app = node_app.create_node_app(config_dir=str(tmp_path / f"node-{name}"), roles=["plex_db"], key=KEY)
+            machines[name] = (app, folder)
+        answering = {"app": machines["a"][0]}
+        server = make_server("127.0.0.1", 0, lambda env, start: answering["app"](env, start), threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+
+        reset_settings_manager()
+        uid_a = machines["a"][0].extensions[node_app.EXTENSION].identity.id
+        get_settings_manager(str(tmp_path / "app")).set(
+            "nodes",
+            [{"id": "n1", "node_uid": uid_a, "name": "Plex box", "url": url, "key": KEY, "enabled": True,
+              "path_mappings": [], "added_at": "2026-10-15T00:00:00+00:00"}],
+        )  # fmt: skip
+        registry = NodeRegistry(
+            client_factory=lambda record: _client(record["url"], record["key"]),
+            # The server's Plex machine id isn't known: nothing ties a new id to it.
+            served_plex_ids=lambda node_id: [""],
+            attempt_gap_s=0.0,
+        )
+        set_registry(registry)
+        yield answering, machines
+        set_registry(None)
+        reset_settings_manager()
+        server.shutdown()
+        thread.join(5)
+        for app, _folder in machines.values():
+            app.extensions[node_app.EXTENSION].close()
+
+    def test_the_other_machine_writes_nothing_and_the_app_holds_the_node_until_it_is_confirmed(self, swapped):
+        from media_preview_generator.markers.publishers.plex_remote import (
+            AgentUnreachableError,
+            plex_database,
+            write_request_from_json,
+        )
+        from media_preview_generator.markers.settings import load_server
+        from media_preview_generator.nodes.registry import get_registry
+
+        from .test_plex_db_role import INTRO, _served, _write_body
+
+        answering, machines = swapped
+        settings = load_server(
+            {"enabled": True, "plex": {"db_write_confirmed_at": "2026-01-01", "agent": {"enabled": True,
+             "node_id": "n1"}}},
+            "plex",
+        )  # fmt: skip
+        session = requests.Session()
+        session.trust_env = False
+        db = plex_database(settings, path_provider=lambda: "", label="Home", session=session)
+        write = write_request_from_json(_write_body(rating_key=7, wanted=[INTRO])["write"])
+
+        assert get_registry().plex_db_hold("n1") is None  # a check heard the saved id
+        db.write_item(write, deadline=time.monotonic() + 10)
+        assert _served(machines["a"][1]) == [("intro", 11_000, 37_000)]
+
+        answering["app"] = machines["b"][0]  # the same key, another machine
+        with pytest.raises(AgentUnreachableError, match="isn't the Plex database node saved there"):
+            db.write_item(write, deadline=time.monotonic() + 10)
+
+        assert _served(machines["b"][1]) == []
+        assert get_registry().plex_db_hold("n1") is not None  # its work waits while it is checked again, at once
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "reports a new id" not in get_registry().plex_db_refusal("n1"):
+            time.sleep(0.02)
+        # It has another id, and nothing ties it to the server's Plex: held until its key is typed again.
+        assert "reports a new id" in get_registry().plex_db_refusal("n1")

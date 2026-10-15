@@ -434,6 +434,16 @@ class TestATempFolderThatFilledUp:
 
         assert table.filled_problem() is None
 
+    def test_a_finished_task_waiting_for_its_delete_doesnt_make_the_fill_a_shared_one(self, make_table, media, free):
+        # Its files were there when the filling task started, so that task filled the room it had by itself and the
+        # next file that size fills it again. Counted as running beside it, the folder read fine again at once.
+        table = self._table(make_table)
+        assert _finished(table, table.start(_spec(media, "test.fits")))["status"] == protocol.STATUS_DONE
+
+        _finished(table, table.start(_spec(media, "test.fills")))
+
+        assert table.filled_problem() is not None
+
     def test_a_read_only_folder_isnt_one_that_filled_up(self, make_table, media, free):
         # The node's fresh check finds a read-only folder by itself.
         table = self._table(make_table)
@@ -831,6 +841,24 @@ class TestExpiry:
         tasks.TaskTable({}, temp_root=str(root)).close()
 
         assert sorted(os.listdir(root)) == ["ffmpeg_output_notes.txt"]
+
+    def test_without_node_temp_dir_ffmpeg_logs_go_where_the_start_sweep_looks(self, tmp_path, monkeypatch):
+        import tempfile
+
+        from media_preview_generator.utils import scratch_dir
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.delenv("NODE_TEMP_DIR", raising=False)
+        root = tasks.default_temp_root()
+        os.makedirs(root)
+        log = os.path.join(scratch_dir(), "ffmpeg_output_4150646_1_2.log")
+        with open(log, "w") as handle:
+            handle.write("frame=  120 fps= 60\n")
+
+        tasks.TaskTable({}, temp_root=root).close()
+
+        assert not os.path.exists(log)
 
 
 class TestStopping:
