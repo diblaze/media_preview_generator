@@ -32,7 +32,11 @@ def _healthcheck_code(dockerfile: Path) -> str:
 
 
 def _url(dockerfile: Path, **env: str) -> str:
-    clean = {k: v for k, v in os.environ.items() if k not in ("MODE", "NODE_PORT", "WEB_PORT", "AGENT_PORT")}
+    clean = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("MODE", "NODE_PORT", "WEB_PORT", "AGENT_PORT", "FILE__NODE_PORT")
+    }
     done = subprocess.run(
         [sys.executable, "-c", _RECORD_URL, _healthcheck_code(dockerfile)],
         env={**clean, **env},
@@ -70,6 +74,16 @@ def test_the_main_images_healthcheck_asks_the_port_the_server_listens_on(env, ur
 )
 def test_the_plex_database_images_healthcheck_asks_the_port_the_node_listens_on(env, url):
     assert _url(PLEX_DB, **env) == url
+
+
+@pytest.mark.parametrize("dockerfile", [MAIN, PLEX_DB], ids=["main", "plex-db"])
+def test_the_healthcheck_asks_the_port_a_file_names(dockerfile, tmp_path):
+    # The node reads FILE__NODE_PORT before NODE_PORT (nodes/server/wsgi.py); a check of NODE_PORT alone would call
+    # a node listening where its secret file says unhealthy.
+    port_file = tmp_path / "port"
+    port_file.write_bytes("\ufeff9700\r\n".encode())  # as Notepad saves it
+    url = _url(dockerfile, MODE="node", NODE_PORT="9500", FILE__NODE_PORT=str(port_file))
+    assert url.endswith(":9700/v1/health")
 
 
 def test_the_plex_database_image_names_the_only_role_it_carries():

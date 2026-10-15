@@ -141,6 +141,60 @@ def test_sigterm_stops_the_node_while_connections_are_busy(node):
     assert proc.returncode == 0, output
 
 
+def test_the_port_host_and_log_level_can_come_from_files_like_every_other_setting(tmp_path, monkeypatch):
+    # They were read before the FILE__ values were loaded, and both images passed --port from NODE_PORT themselves:
+    # a node given FILE__NODE_PORT listened on 9494 whatever its file said, and FILE__LOG_LEVEL changed nothing, both
+    # logged as "set from" their file.
+    from types import SimpleNamespace
+
+    from loguru import logger
+
+    from media_preview_generator.nodes.server import wsgi
+
+    for name, value in (("port", "9600"), ("host", "127.0.0.1"), ("level", "DEBUG"), ("puid", "99")):
+        (tmp_path / name).write_text(value + "\n")
+    for name in ("NODE_PORT", "NODE_HOST", "AGENT_PORT", "LOG_LEVEL", "PUID"):
+        monkeypatch.setenv(name, "")  # so monkeypatch takes back the values the node sets
+    monkeypatch.setenv("FILE__NODE_PORT", str(tmp_path / "port"))
+    monkeypatch.setenv("FILE__NODE_HOST", str(tmp_path / "host"))
+    monkeypatch.setenv("FILE__LOG_LEVEL", str(tmp_path / "level"))
+    monkeypatch.setenv("FILE__PUID", str(tmp_path / "puid"))
+    levels = []
+    monkeypatch.setattr(wsgi, "_setup_logging", lambda: levels.append(os.environ.get("LOG_LEVEL")))
+    built = SimpleNamespace(extensions={wsgi.EXTENSION: SimpleNamespace(close=lambda **_: None)})
+    monkeypatch.setattr(wsgi, "create_node_app", lambda: built)
+    listened = {}
+
+    def server(app, *, host, port, threads):
+        listened.update(host=host, port=port)
+        raise OSError("the test stops here")
+
+    monkeypatch.setattr(wsgi, "create_node_server", server)
+    warnings: list[str] = []
+    sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING", format="{message}")
+    try:
+        assert wsgi.main(["--threads", "2"]) == 1
+    finally:
+        logger.remove(sink)
+
+    assert listened == {"host": "127.0.0.1", "port": 9600}
+    assert levels == ["", "DEBUG"]  # set up again at the file's level
+    # Read by the container before the node starts: never set from a file, and the log says so.
+    assert os.environ["PUID"] == ""
+    assert any(w.startswith("FILE__PUID is ignored: the container reads PUID before the node starts") for w in warnings)
+
+
+def test_a_node_listens_on_agent_port_when_node_port_isnt_set(monkeypatch):
+    # The Plex database image passed ${NODE_PORT:-${AGENT_PORT:-9494}} itself; the node now reads both.
+    from media_preview_generator.nodes.server import wsgi
+
+    monkeypatch.setenv("NODE_PORT", "")
+    monkeypatch.setenv("AGENT_PORT", "9601")
+    assert wsgi._parse([]).port == 9601
+    monkeypatch.setenv("NODE_PORT", "9602")
+    assert wsgi._parse([]).port == 9602
+
+
 def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it():
     import threading
 

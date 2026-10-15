@@ -26,7 +26,7 @@ from typing import Any
 from loguru import logger
 
 from ...worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
-from .app import EXTENSION, create_node_app
+from .app import CONTAINER_SETTINGS, EXTENSION, FILE_ENV_PREFIX, _env_from_files, create_node_app
 from .identity import caller_key
 
 # Every interface: the app on another machine is the whole point.
@@ -206,7 +206,9 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Media Preview Generator node")
     parser.add_argument("--host", default=os.environ.get("NODE_HOST", "").strip() or DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NODE_PORT", "").strip() or DEFAULT_PORT))
+    # AGENT_PORT: the Plex marker agent's name for it, still read when NODE_PORT isn't set.
+    port = os.environ.get("NODE_PORT", "").strip() or os.environ.get("AGENT_PORT", "").strip() or str(DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=port)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="requests served at once")
     return parser.parse_args(argv)
 
@@ -224,14 +226,37 @@ def main(argv: list[str] | None = None) -> int:
     # for it, and its FFmpeg dies with it (utils.is_node_mode).
     os.environ.setdefault("MODE", "node")
     try:
-        return _serve(_parse(argv))
+        return _serve(argv)
     finally:
         logger.complete()  # the console sinks are queued: their last lines must reach docker logs before the exit
 
 
-def _serve(args: argparse.Namespace) -> int:
+def _logging_settings() -> tuple[str | None, str | None]:
+    return os.environ.get("LOG_LEVEL"), os.environ.get("LOG_FORMAT")
+
+
+def _serve(argv: list[str] | None) -> int:
     # Logging first: setup_logging's first call removes every handler, and create_node_app adds the node's own.
     _setup_logging()
+    # The FILE__ values before any setting is read here (the log level, port and host), so each works like the rest.
+    logging_was = _logging_settings()
+    try:
+        _env_from_files()
+    except SystemExit as exc:
+        logger.error("The node didn't start: {}", exc)
+        return 1
+    if _logging_settings() != logging_was:
+        _setup_logging()
+    for name in CONTAINER_SETTINGS:
+        if os.environ.get(FILE_ENV_PREFIX + name):
+            logger.warning(
+                "{}{} is ignored: the container reads {} before the node starts. Set {} itself.",
+                FILE_ENV_PREFIX,
+                name,
+                name,
+                name,
+            )
+    args = _parse(argv)
     try:
         app = create_node_app()
     except SystemExit as exc:

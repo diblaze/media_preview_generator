@@ -33,6 +33,9 @@ PROTOCOL_ECHO_MAX = 32
 EXTENSION = "mpg_node"
 # ``FILE__NODE_KEY=/run/secrets/node_key`` sets NODE_KEY to that file's contents (linuxserver's way to pass secrets).
 FILE_ENV_PREFIX = "FILE__"
+# Read before the node starts (the image's init and wrapper.sh; Python itself reads TZ), so a FILE__ file can't set
+# them: they are left alone, and the node's server says so.
+CONTAINER_SETTINGS = ("MODE", "PUID", "PGID", "TZ")
 
 
 @dataclass
@@ -64,7 +67,9 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
 
     The main image's s6 init would do this, but the image keeps the container's own environment (``S6_KEEP_ENV``), so
     its copy never reaches the node; the Plex database image has no such init. Whitespace around the value (the
-    newline ``echo key > file`` leaves) and a byte-order mark (Notepad's) are dropped.
+    newline ``echo key > file`` leaves) and a byte-order mark (Notepad's) are dropped. The node's server reads them
+    before its port and host (``wsgi``), and :func:`create_node_app` again for the other entry points: a value already
+    set from its file is left as it is.
 
     Args:
         environ: For tests; default ``os.environ``.
@@ -76,7 +81,7 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
     environ = os.environ if environ is None else environ
     for var, path in sorted(environ.items()):
         name = var[len(FILE_ENV_PREFIX) :]
-        if not var.startswith(FILE_ENV_PREFIX) or not name:
+        if not var.startswith(FILE_ENV_PREFIX) or not name or name in CONTAINER_SETTINGS:
             continue
         try:
             with open(path, encoding="utf-8-sig") as handle:
@@ -93,6 +98,8 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
             # A secret never filled in (``touch``, ``echo $UNSET > file``): NODE_KEY would be blank, which the node
             # skips for node.json's key without a word.
             raise SystemExit(f"{var} names {path}, which is empty. Put {name} in that file, or set {name} instead.")
+        if environ.get(name) == value:
+            continue
         environ[name] = value
         logger.info("{} set from {}", name, var)
 
