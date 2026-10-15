@@ -319,11 +319,20 @@ def _stored_agent(existing: object) -> dict:
 
 
 def _node_choice_error(node_id: str) -> str:
-    """Why a newly chosen node can't open a Plex server's database ("" when it can)."""
+    """Why a newly chosen node can't open a Plex server's database ("" when it can, or isn't known yet)."""
+    from ..nodes import protocol
+    from ..nodes.registry import get_registry
     from ..nodes.settings import find_node, stored_nodes
 
     if find_node(stored_nodes(), node_id) is None:
         return "That node isn't on the Nodes page any more. Choose another node or add it again."
+    view = get_registry().view(node_id)
+    # Roles are known once the node has answered; an older Plex helper only has this role.
+    if view is not None and view.roles and not view.legacy and protocol.ROLE_PLEX_DB not in view.roles:
+        return (
+            f"{view.name or 'That node'} doesn't have its Plex database role turned on. Turn that role on on the "
+            "node, or choose another node."
+        )
     return ""
 
 

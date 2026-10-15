@@ -171,6 +171,22 @@ class TestChoosingANode:
         stored = _markers(stored_agent) if stored_agent is not None else None
         return validate_server(_markers(agent), "plex", stored)
 
+    def test_a_node_without_the_plex_database_role_is_refused_with_the_fix(self, roles):
+        roles(("worker",))
+        block, err = self._save({"enabled": True, "node_id": "n1"}, {"enabled": False, "node_id": None})
+        assert block is None
+        assert err.startswith("Plex box doesn't have its Plex database role turned on")
+
+    @pytest.mark.parametrize(
+        ("reported", "legacy"),
+        [(None, False), (("plex_db",), False), (("plex_db",), True)],
+        ids=["unknown", "role", "old-helper"],
+    )
+    def test_a_node_with_the_role_or_not_heard_from_yet_is_accepted(self, roles, reported, legacy):
+        roles(reported, legacy=legacy)
+        block, err = self._save({"enabled": True, "node_id": "n1"}, {"enabled": False, "node_id": None})
+        assert err == "" and block["plex"]["agent"] == {"enabled": True, "node_id": "n1"}
+
     def test_the_stored_choice_is_never_re_checked(self, roles):
         roles(("worker",))
         block, err = self._save({"enabled": True, "node_id": "n1"}, {"enabled": True, "node_id": "n1"})

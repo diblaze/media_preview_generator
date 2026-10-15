@@ -103,6 +103,11 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
         "version mismatch",
         "The Intro & Credits tab says which of the two to update.",
     ),
+    "no_role": (
+        "The chosen node doesn't have its Plex database role turned on",
+        "role off",
+        "Turn the Plex database role on on that node, or choose another node in Edit → Connection.",
+    ),
     # This app refused to send anything (``plex_remote.node_refusal``).
     "disabled": (
         "The Plex database node is turned off",

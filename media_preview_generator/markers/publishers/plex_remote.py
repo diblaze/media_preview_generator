@@ -54,6 +54,8 @@ AGENT_CONNECTED = "connected"
 AGENT_UNREACHABLE = "unreachable"
 AGENT_REJECTED = "rejected"
 AGENT_INCOMPATIBLE = "incompatible"
+# A node answers, but it doesn't have the Plex database role turned on.
+AGENT_NO_ROLE = "no_role"
 # The app refuses to send anything (``node_refusal``): the node is turned off, or the server's node record is gone.
 AGENT_DISABLED = "disabled"
 AGENT_NO_NODE = "no_node"
@@ -628,6 +630,18 @@ class AgentClient:
                 state=Capability.PLUGIN_OUTDATED,
             )
 
+    def _node_without_role(self) -> bool:
+        """Whether a node answers at this address without the Plex database role (it 404s the role's routes).
+
+        Its ``/v1/health`` carries a ``node`` block and no ``agent`` block; the role adds the agent block there.
+        """
+        try:
+            response = self._session.get(f"{self.url}/v1/health", timeout=(CONNECT_TIMEOUT_S, CONNECT_TIMEOUT_S))
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return False
+        return isinstance(payload, dict) and isinstance(payload.get("node"), dict) and "agent" not in payload
+
     def _read(self, response: Any) -> dict:
         try:
             payload = response.json()
@@ -665,6 +679,13 @@ class AgentClient:
                 )
             raise AgentError(
                 f"The Plex database node at {self.describe()} is version {named}; {advice}",
+                state=Capability.AGENT_UNAVAILABLE,
+            )
+        if response.status_code == 404 and self._node_without_role():
+            self.state = AGENT_NO_ROLE
+            raise AgentError(
+                f"The node at {self.describe()} answers, but its Plex database role is off. Turn that role on on the "
+                "node, or choose another node in Edit → Connection.",
                 state=Capability.AGENT_UNAVAILABLE,
             )
         if response.status_code == 409 and isinstance(payload.get("error"), dict):

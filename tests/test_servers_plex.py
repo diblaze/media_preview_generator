@@ -3158,6 +3158,7 @@ class TestPlexMarkerAgentReadiness(_MarkerReadinessHarness):
             plex_remote.AGENT_UNREACHABLE,
             plex_remote.AGENT_REJECTED,
             plex_remote.AGENT_INCOMPATIBLE,
+            plex_remote.AGENT_NO_ROLE,
             plex_remote.AGENT_DISABLED,
             plex_remote.AGENT_NO_NODE,
         }

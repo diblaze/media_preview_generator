@@ -167,7 +167,7 @@
         rejected: ['bad', 'Key refused'],
         incompatible: ['warn', 'Update needed'],
         disabled: ['warn', 'Turned off'],
-        different_node: ['bad', 'Different node'],
+        no_role: ['bad', 'Role off'],
         no_node: ['bad', 'No node'],
     };
 
