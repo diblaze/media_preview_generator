@@ -373,6 +373,11 @@ def _temp_folder_advice(problem: str) -> str:
     return "Set NODE_TEMP_DIR on the node to a folder it can write to."
 
 
+def _restarting_reason(name: object) -> str:
+    """A restarting node's reason (``OFFLINE_RESTARTING``)."""
+    return f"{name or 'The node'} is restarting; it gets no files until it is back."
+
+
 def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bool:
     from ..web.settings_manager import get_settings_manager
     from .mappings import quick_access_check
@@ -1329,14 +1334,18 @@ class NodeRegistry:
         return True
 
     def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
-        live.probe_state, live.probe_reason, live.probe_cause = outcome.state, outcome.reason, outcome.cause
-        if outcome.state == STATE_OFFLINE and not outcome.uid:
-            # It didn't reach the node: whoever answers there next gives its id again first.
-            live.heard_uid = None
         now = self._clock()
         if outcome.restarting and live.restarting_since is None:
             live.restarting_since = now
         restarting = live.restarting_since is not None and now - live.restarting_since < RESTART_WINDOW_S
+        if restarting and outcome.cause in (OFFLINE_UNREACHABLE, OFFLINE_STUCK):
+            # Refused, or dropped before an answer, while it starts again: the restart it announced, so its card keeps
+            # saying so rather than sending someone to check its address or restart it.
+            outcome = replace(outcome, reason=_restarting_reason(live.record.get("name")), cause=OFFLINE_RESTARTING)
+        live.probe_state, live.probe_reason, live.probe_cause = outcome.state, outcome.reason, outcome.cause
+        if outcome.state == STATE_OFFLINE and not outcome.uid:
+            # It didn't reach the node: whoever answers there next gives its id again first.
+            live.heard_uid = None
         if outcome.state == STATE_OFFLINE and restarting:
             # Saying it stops, then not answering while it starts again: neither is a node that went away.
             live.offline_streak = 0
@@ -1463,7 +1472,7 @@ class NodeRegistry:
             # It refuses every start until it is back (SIGTERM: a restart or an image update).
             return _Outcome(
                 STATE_OFFLINE,
-                f"{name} is restarting; it gets no files until it is back.",
+                _restarting_reason(name),
                 cause=OFFLINE_RESTARTING,
                 restarting=True,
                 **outcome,
