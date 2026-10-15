@@ -33,7 +33,7 @@ from .node_members import (
     NODE_GPU_FFMPEG_THREADS,
     NodeHardware,
     NodeMemberHardware,
-    ready_seen_at,
+    checked_ready_since_drop,
 )
 from .worker_naming import friendly_device_label
 
@@ -1082,9 +1082,9 @@ class Worker:
                 )
 
 
-# A node that just dropped a file gets no new file until the registry's next check of it comes back ready, or this
-# long at most (a node that stays down loses its workers once the registry marks it offline).
-SUSPECT_NODE_S = 60.0
+# A node that just dropped a file gets no new file until a registry check begun after the drop comes back ready. This
+# cap only ends a hold the registry never answers (a node that stays down loses its workers once it reads offline).
+SUSPECT_NODE_S = 300.0
 
 
 def _group_display_name(group_name: str, worker: Worker) -> str:
@@ -1136,8 +1136,8 @@ class WorkerPool:
         # The node registry as read at the last reconcile; capacity and snapshots use it until the next one.
         self._node_hardware: NodeHardware = EMPTY_NODE_HARDWARE
         self._node_revision: int | None = None
-        # Node id -> (monotonic time it stops being suspect, the registry's ready ``last_seen`` when it was marked).
-        self._suspect_nodes: dict[str, tuple[float, float | None]] = {}
+        # Node id -> the monotonic time its hold ends at the latest.
+        self._suspect_nodes: dict[str, float] = {}
         self.add_workers("GPU", gpu_workers)
         self.add_workers("CPU", cpu_workers)
         # The "Created fresh worker pool" line comes from whoever made it, once its worker groups are applied:
@@ -1841,7 +1841,8 @@ class WorkerPool:
         return {"added": added, "removed": removed, "deferred": deferred, "retiring": retiring}
 
     def mark_node_suspect(self, node_id: str) -> None:
-        """Hold new files back from a node that just dropped one, until it checks ready again (spec §6).
+        """Hold new files back from a node that just dropped one, until a check begun after the drop finds it ready
+        (spec §6).
 
         Without this the file it gave back goes straight to another worker on the same dead node (GPU workers are
         picked first), and so does every other queued file, each one failing there within milliseconds.
@@ -1849,12 +1850,11 @@ class WorkerPool:
         Args:
             node_id: The node.
         """
-        seen = ready_seen_at(node_id)  # Read before the pool lock: the registry has its own.
         with self._workers_lock:
-            self._suspect_nodes[node_id] = (time.monotonic() + SUSPECT_NODE_S, seen)
+            self._suspect_nodes[node_id] = time.monotonic() + SUSPECT_NODE_S
 
     def refresh_suspect_nodes(self) -> None:
-        """Clear each suspect node the registry has heard from since (and calls ready), or whose hold ran out.
+        """Clear each suspect node a registry check begun since its drop found ready, or whose hold ran out.
 
         Call without the pool lock held; the dispatch loop calls it once per assignment pass.
         """
@@ -1864,9 +1864,8 @@ class WorkerPool:
             suspects = dict(self._suspect_nodes)
         now = time.monotonic()
         cleared = []
-        for node_id, (until, seen) in suspects.items():
-            ready_at = None if now >= until else ready_seen_at(node_id)
-            if now >= until or (ready_at is not None and (seen is None or ready_at > seen)):
+        for node_id, until in suspects.items():
+            if now >= until or checked_ready_since_drop(node_id):
                 cleared.append(node_id)
         with self._workers_lock:
             for node_id in cleared:
@@ -1878,8 +1877,8 @@ class WorkerPool:
         """Whether ``node_id``'s new files are held back. Caller holds ``_workers_lock``."""
         if node_id is None:
             return False
-        hold = self._suspect_nodes.get(node_id)
-        return hold is not None and now < hold[0]
+        until = self._suspect_nodes.get(node_id)
+        return until is not None and now < until
 
     def _find_available_worker(
         self,

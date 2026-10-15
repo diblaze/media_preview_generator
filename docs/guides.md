@@ -698,6 +698,25 @@ or the [Windows build](https://github.com/stevezau/media_preview_generator/blob/
 under **Settings → Nodes**, then pick it in **Servers → your Plex → Edit → Connection → Plex database**. A Plex
 marker agent you already set up is moved to the Nodes page on upgrade and keeps working.
 
+### One node with both roles
+
+On the machine that runs Plex, one container can be the worker and the Plex database node. Start the app's image
+as a worker node (above) and add `-e NODE_ROLES=worker,plex_db`, Plex's config folder and where it is inside the
+container:
+
+```bash
+docker run -d --name media-preview-node -p 9494:9494 \
+  -e MODE=node -e NODE_ROLES=worker,plex_db -e PUID=1000 -e PGID=1000 \
+  -e PLEX_CONFIG_DIR="/plex/Library/Application Support/Plex Media Server" \
+  --device /dev/dri:/dev/dri \
+  -v /path/to/media:/media:ro -v /path/to/plex/config:/plex -v /path/to/node/config:/config \
+  stevezzau/media_preview_generator:latest
+```
+
+- Set `PUID`/`PGID` to the user Plex runs as: the node has to write Plex's database as that user.
+- Don't mount Plex's config folder read-only.
+- Add it once under **Settings → Nodes**, then use it both in a worker group and as your Plex's **Plex database**.
+
 ---
 
 ## Webhook Integration

@@ -12,13 +12,14 @@ import threading
 import time
 import unicodedata
 from collections import deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
 from .client import NodeClient
-from .protocol import PathMapping, map_app_path
+from .protocol import NOT_VISIBLE_MISSING, PathMapping, map_app_path
 
 SAMPLES_PER_ROOT = 3
 # Directory entries looked at per library folder before giving up: a library whose first 500 entries hold no video
@@ -236,16 +237,34 @@ def _closest_name(wanted: str, names: list) -> str | None:
     return None
 
 
-def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> dict | None:
+def _same_node_path(a: str, b: str) -> bool:
+    """Whether two node paths name one folder (Windows ignores case)."""
+    sep = _node_sep(a)
+    a, b = a.rstrip("/\\") or a, b.rstrip("/\\") or b
+    return a.casefold() == b.casefold() if sep == "\\" else a == b
+
+
+def _node_root(app_root: str, mappings: list[PathMapping]) -> str | None:
+    """Where the rows put ``app_root`` on the node."""
+    row = _covering_row(app_root, mappings)
+    return None if row is None else map_app_path(app_root, mappings, node_sep=_node_sep(row.node_prefix))
+
+
+def suggest_row(
+    app_root: str, mappings: list[PathMapping], nearby: object, *, taken: Collection[str] = ()
+) -> dict | None:
     """A corrected ``node_prefix`` for the row covering ``app_root``, from the node's folder listings.
 
     When a listing on the node holds a folder named like the app root's last component (ignoring case and Unicode
-    form), that folder is where the node sees the root, so the row's ``node_prefix`` moves to match.
+    form), that folder is where the node sees the root, so the row's ``node_prefix`` moves to match. The moved row
+    must then put ``app_root`` exactly on that folder: when the root sits below the row's folder, the folders between
+    keep the app's names (and their case, except on Windows), or the row would point the library somewhere else.
 
     Args:
         app_root: The library folder as this app sees it.
         mappings: The rows tested.
         nearby: The node's ``{node_dir: [names]}`` listings.
+        taken: Other libraries' folders on the node; a library is never found in another one's folder.
 
     Returns:
         ``{"from", "to"}`` (the row's current and suggested ``node_prefix``), or None.
@@ -265,8 +284,15 @@ def suggest_row(app_root: str, mappings: list[PathMapping], nearby: object) -> d
         if match is None:
             continue
         seen_root = _join(node_dir, match)
+        if any(_same_node_path(seen_root, other) for other in taken):
+            continue
         # The row maps app_prefix, not app_root: step back up as many folders as app_root sits below app_prefix.
         new_prefix = _parent(seen_root, len(rest)) if rest else seen_root
+        mapped = new_prefix
+        for part in rest:
+            mapped = _join(mapped, part)
+        if not _same_node_path(mapped, seen_root):
+            continue
         if new_prefix.rstrip("/\\") != row.node_prefix.rstrip("/\\"):
             return {"from": row.node_prefix, "to": new_prefix}
     return None
@@ -297,19 +323,49 @@ def _check(client: NodeClient, mappings: list[PathMapping], files: list[dict]) -
     return results, nearby
 
 
-def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: list[dict]) -> dict:
+def _suggest_for(
+    library: dict, mappings: list[PathMapping], libraries: list[dict], node_name: str
+) -> tuple[dict | None, str | None]:
+    """The suggestion for a library the node can't see, or the plain reason when there is none to make.
+
+    A row that also maps a library that passed is right for that one, so changing it would break it: the node just
+    lacks this library's folder.
+    """
+    app_root = library["app_root"]
+    row = _covering_row(app_root, mappings)
+    passed_rows = {id(_covering_row(lib["app_root"], mappings)) for lib in libraries if lib["ok"]}
+    if row is not None and id(row) in passed_rows:
+        if all(f["kind"] == NOT_VISIBLE_MISSING for f in library["files"] if not f["ok"]):
+            return None, (
+                f"{node_name} doesn't have this library's folder. Mount it on the node, or leave this library to "
+                "other workers."
+            )
+        return None, None
+    taken = {
+        node_root
+        for lib in libraries
+        if lib["app_root"] != app_root and (node_root := _node_root(lib["app_root"], mappings)) is not None
+    }
+    return suggest_row(app_root, mappings, library["nearby"], taken=taken), None
+
+
+def run_test_access(
+    client: NodeClient, mappings: list[PathMapping], servers: list[dict], *, node_name: str = "This node"
+) -> dict:
     """Sample every enabled library and ask the node to find each file through ``mappings``.
 
     Args:
         client: The node.
         mappings: The rows to test (saved or just edited).
         servers: The stored ``media_servers`` list.
+        node_name: The node's name, for the reason given when it lacks a library's folder.
 
     Returns:
         ``{"libraries": [{"server", "library", "app_root", "checked", "ok", "files": [{"path", "ok", "kind",
         "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
         "error": str | None, "empty": bool}]}``. ``nearby`` lists what the node does see above the library's
-        missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library; ``empty`` says this app
+        missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library (never of a row
+        that also maps a library that passed); ``empty`` says this app
         opened the folder and found no video near its top. A disk of a multi-disk library that lacks the folder is
         left out while another disk holds it.
 
@@ -363,11 +419,15 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
                 "ok": ok,
                 "files": rows,
                 "nearby": seen_nearby,
-                "suggestion": None if ok or not rows else suggest_row(root.app_root, mappings, seen_nearby),
+                "suggestion": None,
                 "error": error,
                 "empty": empty,
             }
         )
+    for library in libraries:
+        if library["files"] and not library["ok"]:
+            library["suggestion"], reason = _suggest_for(library, mappings, libraries, node_name)
+            library["error"] = library["error"] or reason
     return {"libraries": libraries}
 
 

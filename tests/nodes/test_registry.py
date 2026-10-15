@@ -10,7 +10,12 @@ import pytest
 
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.access_results import AccessResultStore
-from media_preview_generator.nodes.client import NodeAuthError, NodeProtocolError, NodeUnreachableError
+from media_preview_generator.nodes.client import (
+    NodeAuthError,
+    NodeProtocolError,
+    NodeTimeoutError,
+    NodeUnreachableError,
+)
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
 
 APP_VERSION = "9.9.9"
@@ -76,6 +81,7 @@ class Harness:
         self.uids: list[tuple[str, str]] = []
         self.legacy = ("connected", "1.2.0")
         self.quick = True
+        self.libraries: list[str] = []
         self.clock = Clock()
         self.app_build = ""
         self.registry = reg.NodeRegistry(
@@ -85,6 +91,7 @@ class Harness:
             legacy_ping=lambda url, key: self.legacy,
             record_uid=lambda node_id, uid, url: self.uids.append((node_id, uid)),
             quick_access=lambda client, mappings: self.quick,
+            library_names=lambda paths: list(self.libraries),
             app_version=lambda: APP_VERSION,
             app_build=lambda: self.app_build,
             attempt_gap_s=0.0,
@@ -164,6 +171,13 @@ class TestStates:
         assert view.state == reg.STATE_OFFLINE and "didn't answer" in view.reason
         assert "http://" not in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node offline")
+
+    def test_a_node_that_takes_connections_but_never_answers_says_so(self, h):
+        client = h.client()
+        client.infos = [NodeTimeoutError("x")] * 3
+        view = h.registry.check_now("n1")
+        assert view.state == reg.STATE_OFFLINE
+        assert view.reason.startswith("nuc accepts connections but doesn't answer.")
 
     def test_one_failed_attempt_is_not_offline(self, h):
         client = h.client()
@@ -323,6 +337,41 @@ class TestAccessProblem:
         view = h.registry.view("n1")
         assert view.state == reg.STATE_ACCESS_PROBLEM
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "fix media access first")
+
+    def test_it_names_the_libraries_of_the_files_the_node_couldnt_see(self, h):
+        self._ready(h)
+        h.libraries = ["Open Films"]
+        for path in ("/data/a.mkv", "/data/b.mkv", "/data/c.mkv"):
+            h.registry.report_not_visible("n1", path, "missing")
+        view = h.registry.view("n1")
+        assert view.state == reg.STATE_ACCESS_PROBLEM
+        assert view.reason.startswith("nuc couldn't see 3 different files in Open Films in 10 minutes")
+
+    def test_the_libraries_are_named_from_the_deepest_library_folder_above_each_file(self, monkeypatch):
+        from media_preview_generator.web import settings_manager
+
+        servers = [
+            {
+                "id": "p1",
+                "type": "plex",
+                "name": "Home",
+                "enabled": True,
+                "url": "http://p:32400",
+                "libraries": [
+                    {"id": "1", "name": "Media", "remote_paths": ["/media"]},
+                    {"id": "2", "name": "Open Films", "remote_paths": ["/media/openfilms/Movies"]},
+                    {"id": "3", "name": "TV", "remote_paths": ["/media/tv"]},
+                ],
+            }
+        ]
+
+        class Settings:
+            def get(self, key, default=None):
+                return servers if key == "media_servers" else default
+
+        monkeypatch.setattr(settings_manager, "get_settings_manager", lambda: Settings())
+        paths = ["/media/openfilms/Movies/a.mkv", "/media/openfilms/Movies/b.mkv", "/media/other/c.mkv", "/elsewhere"]
+        assert reg._default_library_names(paths) == ["Open Films", "Media"]
 
     def test_the_same_file_three_times_is_not(self, h):
         self._ready(h)
@@ -490,6 +539,44 @@ class TestLoop:
         h.client().default_info = NodeUnreachableError("gone")
         h.registry.report_unavailable("n1")
         assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_OFFLINE)
+
+    def test_only_a_check_begun_after_a_drop_vouches_for_the_node(self, h):
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is True
+        client = h.client()
+        started, release = threading.Event(), threading.Event()
+
+        def slow_info():
+            started.set()
+            release.wait(5)
+            return _info()
+
+        client.info = slow_info
+        checking = threading.Thread(target=h.registry.check_now, args=("n1",))
+        checking.start()
+        assert started.wait(5)
+        h.registry._run_check = lambda *args, **kwargs: None  # keep the report's own check out of it
+        h.registry.report_unavailable("n1")
+        release.set()
+        checking.join(5)
+
+        # Ready, but that check began before the node dropped its file; the next one is due at once.
+        assert h.registry.view("n1").state == reg.STATE_READY
+        assert h.registry.checked_ready_since_unavailable("n1") is False
+        assert h.registry._nodes["n1"].next_check == 0.0
+        del h.registry._run_check
+        client.info = lambda: _info()
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is True
+
+    def test_a_check_begun_after_a_drop_that_finds_the_node_down_vouches_for_nothing(self, h):
+        h.registry.check_now("n1")
+        h.registry._run_check = lambda *args, **kwargs: None
+        h.registry.report_unavailable("n1")
+        del h.registry._run_check
+        h.client().infos = [NodeUnreachableError("x")] * 3
+        h.registry.check_now("n1")
+        assert h.registry.checked_ready_since_unavailable("n1") is False
 
     def test_unknown_nodes_are_ignored_by_every_report(self, h):
         h.registry.report_unavailable("nope")

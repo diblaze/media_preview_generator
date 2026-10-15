@@ -31,12 +31,17 @@ KEYS = ("markers_published", "failed")
 
 class _Registry(NodeRegistry):
     """Node views for the pool's suspect-node hold. ``fresh`` nodes answer every re-check at once (ready, just seen);
-    the others keep their last view until :meth:`back` (or :meth:`down`)."""
+    the others keep their last view, and no check vouches for them since a drop, until :meth:`back` (or
+    :meth:`down`)."""
 
     def __init__(self, *, fresh: bool = True) -> None:
         self.fresh = fresh
         self.states: dict[str, tuple[str, float]] = {}
+        self.vouched: set[str] = set()
         self._clock = itertools.count(1)
+
+    def checked_ready_since_unavailable(self, node_id: str) -> bool:
+        return self.fresh or (node_id in self.vouched and self.states[node_id][0] == STATE_READY)
 
     def view(self, node_id: str) -> NodeView | None:
         if self.fresh:
@@ -47,9 +52,11 @@ class _Registry(NodeRegistry):
 
     def down(self, node_id: str) -> None:
         self.states[node_id] = (STATE_OFFLINE, self.states.get(node_id, (STATE_READY, 0.0))[1])
+        self.vouched.discard(node_id)
 
     def back(self, node_id: str) -> None:
         self.states[node_id] = (STATE_READY, float(next(self._clock)))
+        self.vouched.add(node_id)
 
 
 @pytest.fixture(autouse=True)

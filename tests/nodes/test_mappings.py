@@ -276,13 +276,79 @@ class TestRunTestAccess:
     def test_a_root_below_the_mapped_folder_moves_the_rows_prefix_up_to_match(self, tmp_path, real_node):
         _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
         share = tmp_path / "volume1"
-        _video(share / "movies" / "a.mkv", b"x" * 10)
+        _video(share / "Movies" / "a.mkv", b"x" * 10)
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
         rows = [PathMapping(str(tmp_path / "media"), str(share / "old"))]
 
         lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
 
         assert lib["suggestion"] == {"from": str(share / "old"), "to": str(share)}, lib["nearby"]
+        fixed = [PathMapping(str(tmp_path / "media"), lib["suggestion"]["to"])]
+        assert nm.run_test_access(real_node, fixed, servers)["libraries"][0]["ok"] is True
+
+    def test_a_root_below_the_mapped_folder_is_not_matched_to_a_folder_named_in_another_case(self, tmp_path, real_node):
+        # Moving the row up would map the library to volume1/Movies, which a Linux node doesn't have.
+        _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
+        share = tmp_path / "volume1"
+        _video(share / "movies" / "a.mkv", b"x" * 10)
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media"), str(share / "old"))]
+
+        lib = nm.run_test_access(real_node, rows, servers)["libraries"][0]
+
+        assert (lib["ok"], lib["suggestion"]) == (False, None), lib["nearby"]
+
+    def test_a_library_the_node_doesnt_mount_leaves_the_row_the_others_pass_through_alone(self, tmp_path, real_node):
+        # Seen live: the missing Open Films library's last folder "Movies" matched the movies library's own folder, and
+        # the suggestion moved the shared row to "/", breaking both libraries that passed.
+        app, node = tmp_path / "media", tmp_path / "node"
+        for folder in (app, node):
+            _video(folder / "movies" / "a.mkv", b"x" * 10)
+            _video(folder / "tv" / "s01e01.mkv", b"x" * 10)
+        _video(app / "openfilms" / "Movies" / "b.mkv", b"x" * 10)
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/movies"]},
+                    {"id": "2", "name": "TV", "remote_paths": ["/plexmedia/tv"]},
+                    {"id": "3", "name": "Open Films", "remote_paths": ["/plexmedia/openfilms/Movies"]},
+                ],
+            )
+        ]
+        rows = [PathMapping(str(app), str(node))]
+
+        movies, tv, films = nm.run_test_access(real_node, rows, servers, node_name="lab-cpu")["libraries"]
+
+        assert (movies["ok"], tv["ok"], films["ok"]) == (True, True, False)
+        assert films["suggestion"] is None
+        assert films["error"] == (
+            "lab-cpu doesn't have this library's folder. Mount it on the node, or leave this library to other workers."
+        )
+
+    def test_a_folder_that_is_another_librarys_is_not_suggested(self, tmp_path, real_node):
+        _video(tmp_path / "media" / "Films" / "a.mkv", b"x" * 10)
+        _video(tmp_path / "media" / "Movies" / "b.mkv", b"x" * 10)
+        node = tmp_path / "node"
+        _video(node / "movies" / "a.mkv", b"x" * 10)
+        servers = [
+            _server(
+                tmp_path,
+                [
+                    {"id": "1", "name": "Films", "remote_paths": ["/plexmedia/Films"]},
+                    {"id": "2", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]},
+                ],
+            )
+        ]
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Films"), str(node / "movies")),
+            PathMapping(str(tmp_path / "media" / "Movies"), str(node / "gone")),
+        ]
+
+        films, movies = nm.run_test_access(real_node, rows, servers)["libraries"]
+
+        # The node's movies folder is where the Films row points, so it isn't where the node keeps Movies.
+        assert (films["ok"], movies["ok"], movies["suggestion"]) == (True, False, None), movies["nearby"]
 
     def test_nothing_is_listed_above_the_node_folders_parent(self, tmp_path, real_node):
         _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)
@@ -346,6 +412,14 @@ class TestSuggestRow:
     def test_an_exact_name_wins_over_one_in_another_case(self):
         rows = [PathMapping("/data/Movies", "/mnt/x")]
         assert nm.suggest_row("/data/Movies", rows, {"/mnt": ["MOVIES", "Movies"]})["to"] == "/mnt/Movies"
+
+    def test_a_folder_named_like_the_root_two_levels_down_is_not_the_root(self):
+        rows = [PathMapping("/media", "/media")]
+        assert nm.suggest_row("/media/openfilms/Movies", rows, {"/media": ["movies", "scratch", "tv"]}) is None
+
+    def test_another_librarys_folder_is_never_suggested(self):
+        rows = [PathMapping("/data/Movies", "/mnt/x")]
+        assert nm.suggest_row("/data/Movies", rows, {"/mnt": ["Movies"]}, taken={"/mnt/Movies"}) is None
 
     @pytest.mark.parametrize(
         ("rows", "nearby"),

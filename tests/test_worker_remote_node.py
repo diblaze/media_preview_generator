@@ -231,6 +231,8 @@ class _Registry(NodeRegistry):
         self.states: dict[str, tuple[str, float | None]] = {}
         self.capacities: dict[str, NodeCapacity] = {}
         self.gpus: dict[str, tuple[dict, ...]] = {}
+        # Nodes a check begun after their last drop found ready.
+        self.checked_since_drop: set[str] = set()
         self._clock = itertools.count(1)
 
     def set(self, node_id: str, state: str, *, seen_now: bool) -> None:
@@ -243,6 +245,9 @@ class _Registry(NodeRegistry):
         state, seen = self.states[node_id]
         gpus = self.gpus.get(node_id, ())
         return NodeView(node_id, node_id, "http://n", True, state, "", "1", ("worker",), gpus, 4, False, seen)
+
+    def checked_ready_since_unavailable(self, node_id: str) -> bool:
+        return node_id in self.checked_since_drop and self.states.get(node_id, (STATE_OFFLINE,))[0] == STATE_READY
 
     def capacity(self, node_id: str) -> NodeCapacity:
         if node_id in self.capacities:
@@ -407,20 +412,31 @@ class TestSuspectNodes:
         pool.workers.extend([on_a, local])
         return pool, on_a, local
 
-    def test_a_node_that_dropped_a_file_gets_none_until_its_next_check_comes_back_ready(self, registry):
+    def test_a_node_that_dropped_a_file_gets_none_until_a_check_begun_since_comes_back_ready(self, registry):
         pool, on_a, local = self._pool()
         assert pool._find_available_worker() is on_a  # an idle GPU wins
         pool.mark_node_suspect("a")
         assert pool._find_available_worker() is local
-        registry.set("a", STATE_OFFLINE, seen_now=False)  # the re-check: still down
+        registry.set("a", STATE_OFFLINE, seen_now=True)  # the re-check: still down
         pool.refresh_suspect_nodes()
         assert pool._find_available_worker() is local
-        registry.set("a", STATE_READY, seen_now=False)  # ready, but nobody has heard from it since the drop
+        registry.set("a", STATE_READY, seen_now=True)  # ready, from a check that began before the drop
         pool.refresh_suspect_nodes()
         assert pool._find_available_worker() is local
-        registry.set("a", STATE_READY, seen_now=True)
+        registry.checked_since_drop.add("a")
         pool.refresh_suspect_nodes()
         assert pool._find_available_worker() is on_a
+
+    def test_the_hold_outlasts_the_time_a_hung_node_takes_to_read_offline(self):
+        # Seen live: a paused node took up to 197 s to read offline but its hold ended after 60 s, so it got a new
+        # file whose start timed out.
+        from media_preview_generator.nodes import client, registry
+
+        worst_check_s = (
+            registry.CHECK_ATTEMPTS * (client.CONNECT_TIMEOUT_S + client.INFO_TIMEOUT_S)
+            + (registry.CHECK_ATTEMPTS - 1) * registry.ATTEMPT_GAP_S
+        )
+        assert worst_check_s <= 60.0 < worker_mod.SUSPECT_NODE_S
 
     def test_the_hold_ends_on_its_own_after_a_while(self, registry, monkeypatch):
         pool, on_a, local = self._pool()

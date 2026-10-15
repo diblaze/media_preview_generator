@@ -662,6 +662,28 @@ class TestNodeDialog:
         expect(pane.locator(".nd-map-results")).to_contain_text("The node sees every library, same files.")
         expect(pane.locator(".nd-fail")).to_have_count(0)
 
+    def test_a_library_the_node_doesnt_mount_says_so(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        pane = _node_tab(authed_page, "media")
+        reason = (
+            "storage doesn't have this library's folder. Mount it on the node, or leave this library to other workers."
+        )
+        api.test_answers = [
+            {
+                "libraries": [
+                    _library("Movies", "/data/Movies", True, "/mnt/nas/Movies"),
+                    _library("Open Films", "/data/Movies/Open", False, "/mnt/nas/Movies/Open", error=reason),
+                ]
+            }
+        ]
+
+        pane.locator(".nd-test").click()
+
+        card = pane.locator('.nd-fail[data-library="Open Films"]')
+        expect(card).to_contain_text(f"Open Films: {reason}")
+        expect(card.locator(".nd-use")).to_have_count(0)
+
     def test_setup_health_uses_the_three_buckets(self, authed_page: Page, app_url: str) -> None:
         api = NodesApi(authed_page, _four_nodes())
         api.health_answer = {
