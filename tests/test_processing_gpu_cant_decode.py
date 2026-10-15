@@ -21,6 +21,7 @@ from loguru import logger
 
 from media_preview_generator.processing import ffmpeg_runner
 from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
+from media_preview_generator.processing.filter_chain import DV5_PATH_LIBPLACEBO
 from media_preview_generator.processing.generator import _was_interrupted, gpu_fallback_announcement
 from tests.test_processing_partial_output import (
     EXPECTED,
@@ -563,3 +564,70 @@ class TestEachGpuDecoderHasItsOwnCodecs:
         from media_preview_generator.processing.generator import _decoded_in_software
 
         assert _decoded_in_software(_stream(codec), hwaccel) is in_software
+
+
+class TestTheHandOffJudgesTheDecoderTheRunAskedFor:
+    """A tier can decode with another ``-hwaccel`` than the worker's GPU: the software Dolby Vision tier asks for none.
+    The CPU hand-off reads the decoder from the command that ran, which the runner keeps."""
+
+    @pytest.mark.parametrize(
+        ("gpu", "device", "tier", "hwaccel"),
+        [
+            pytest.param("AMD", "/dev/dri/renderD128", {}, "vaapi", id="amd-primary"),
+            pytest.param(
+                "AMD",
+                "/dev/dri/renderD128",
+                {"init_vulkan": True, "disable_vaapi_dv5": True},
+                None,
+                id="amd-software-dv",
+            ),
+            pytest.param("NVIDIA", "cuda:0", {}, "cuda", id="nvidia-primary"),
+        ],
+    )
+    def test_the_runner_keeps_the_command_each_run_started(self, tmp_path, mock_config, gpu, device, tier, hwaccel):
+        from media_preview_generator.processing.generator import hwaccel_in
+
+        last_command: list[str] = []
+        runner = create_ffmpeg_runner(
+            video_file=str(tmp_path / "movie.mkv"),
+            output_folder=str(tmp_path / "frames"),
+            gpu=gpu,
+            gpu_device_path=device,
+            config=mock_config,
+            progress_callback=None,
+            ffmpeg_threads_override=None,
+            cancel_check=None,
+            path_kind=DV5_PATH_LIBPLACEBO if tier else "sdr",
+            libplacebo_vf="fps=fps=0.1,hwupload,libplacebo" if tier else None,
+            use_libplacebo=bool(tier),
+            dv5_software_fallback=False,
+            base_scale="scale=w=320:h=240:force_original_aspect_ratio=decrease",
+            fps_filter="fps=fps=0.1:round=up",
+            hdr10_zscale_chain="",
+            last_command=last_command,
+        )
+        started: list[list[str]] = []
+        popen = _fake_ffmpeg(INPUT_DUMP, [])
+        with patch(
+            "media_preview_generator.processing.ffmpeg_runner.subprocess.Popen",
+            side_effect=lambda args, **kwargs: started.append(list(args)) or popen(args, **kwargs),
+        ):
+            runner(use_skip=False, **tier)
+
+        # Any other Popen is an FFmpeg probe, not a decode of the file.
+        assert [args for args in started if "-i" in args] == [last_command]
+        assert hwaccel_in(last_command) == hwaccel
+
+    def test_frames_a_run_decoded_in_software_on_purpose_are_refused_by_the_gpu_filters(self):
+        """No GPU decoder was asked for, so the GPU can't have lacked one: the hand-off says to check the GPU, not that
+        it can't decode the codec."""
+        from media_preview_generator.processing.generator import _gpu_hand_off
+
+        stderr = [
+            *_stream("hevc (Main 10)", "yuv420p10le(tv, bt2020nc), 3840x2160, 23.98 fps"),
+            *_frames_refused("hwupload"),
+        ]
+        assert _gpu_hand_off(SOFTWARE_FRAMES_EXIT, stderr, stderr, stopped_part_way=False, hwaccel=None) == (
+            "hwaccel",
+            "the GPU's filters couldn't take the decoded frames",
+        )

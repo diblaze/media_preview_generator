@@ -138,6 +138,7 @@ def create_ffmpeg_runner(
     chapter_start_ms: int | None = None,
     chapter_output: str | None = None,
     active_timeout_s: float | None = None,
+    last_command: list[str] | None = None,
 ) -> Callable[..., tuple[int, float, str, list[str]]]:
     """Factory: return a configured ffmpeg-runner closure for one media item.
 
@@ -147,6 +148,10 @@ def create_ffmpeg_runner(
     original closure did.  Callers in :func:`generator.generate_images`
     replace ``def _run_ffmpeg(...)`` with a single assignment and then
     invoke the returned callable through the full retry cascade.
+
+    ``last_command``, when given, holds each run's FFmpeg command from the moment it starts: a tier can decode with
+    another ``-hwaccel`` than the worker's GPU (the software Dolby Vision tier has none), and the CPU hand-off judges
+    a run by the decoder it asked for.
     """
     # Import at factory-call time to avoid a circular dependency at module
     # load (orchestrator imports create_ffmpeg_runner from here). Runs
@@ -446,6 +451,8 @@ def create_ffmpeg_runner(
         if chapter_start_ms is not None:
             args += ["-map", "0:V:0", "-frames:v", "1", "-threads:v", str(max(1, effective_ffmpeg_threads))]
         args += [chapter_output or f"{output_folder}/img-%06d.jpg"]
+        if last_command is not None:
+            last_command[:] = args
 
         start_local = time.time()
         hw_label = "GPU" if gpu else "CPU"

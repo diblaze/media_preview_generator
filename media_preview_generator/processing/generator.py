@@ -64,7 +64,6 @@ from .hdr_detection import (
     is_dv_no_backward_compat,
     is_hdr_transfer,
 )
-from .hwaccel import hwaccel_decode_args
 from .retry_cascade import (
     classify_cpu_fallback_reason,
     classify_dv_safe_retry_reason,
@@ -869,9 +868,11 @@ def _gpu_hand_off(
         return FALLBACK_CODEC, reason
     frames_refused = rc != 0 and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
     # A decoder whose GPU set-up failed in the driver falls back to software and ends the same way, so this counts
-    # only without a driver error in any run.
+    # only without a driver error in any run. A run that asked for no GPU decoder decoded in software on purpose: the
+    # GPU filters refusing its frames is theirs, not a codec's.
     if (
         frames_refused
+        and hwaccel is not None
         and _decoded_in_software(stderr_lines, hwaccel)
         and not _detect_hwaccel_runtime_error(stderr_lines_all)
     ):
@@ -1976,6 +1977,7 @@ def generate_images(
     # _run_ffmpeg had, so the retry cascade below reads identically.
     from .ffmpeg_runner import create_ffmpeg_runner
 
+    last_command: list[str] = []
     run_ffmpeg_once = create_ffmpeg_runner(
         video_file=video_file,
         output_folder=output_folder,
@@ -1993,8 +1995,8 @@ def generate_images(
         base_scale=base_scale,
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
+        last_command=last_command,
     )
-    hwaccel = hwaccel_in(hwaccel_decode_args(gpu, gpu_device_path, keep_on_gpu=True).args)
 
     def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:
         """One FFmpeg run, on any tier. A run the folder refused to write ends the file at once, frames deleted.
@@ -2344,7 +2346,9 @@ def generate_images(
             image_count = _count_usable_frames(rc, stderr_lines)
 
             if rc != 0 and image_count == 0:
-                cut_off = _gpu_hand_off(rc, stderr_lines, stderr_lines_all, stopped_part_way=False, hwaccel=hwaccel)
+                cut_off = _gpu_hand_off(
+                    rc, stderr_lines, stderr_lines_all, stopped_part_way=False, hwaccel=hwaccel_in(last_command)
+                )
                 disk = cut_off if cut_off and cut_off[0] in (FALLBACK_STALL, FALLBACK_IO_ERROR) else None
                 if gpu is not None:
                     # Still failing on GPU even with DV-safe filter -> the same worker retries on the CPU.
@@ -2389,7 +2393,7 @@ def generate_images(
         if cancel_check and cancel_check():
             raise CancellationError(f"Processing cancelled for {video_file}")
         hand_off = _gpu_hand_off(
-            rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded, hwaccel=hwaccel
+            rc, stderr_lines, stderr_lines_all, stopped_part_way=partial_discarded, hwaccel=hwaccel_in(last_command)
         )
         if hand_off is not None:
             fallback_kind, fallback_reason = hand_off

@@ -55,6 +55,7 @@ from media_preview_generator.processing.generator import (
     get_failures,
     gpu_fallback_announcement,
 )
+from media_preview_generator.processing.hwaccel import hwaccel_decode_args
 
 INTERVAL_S = 10
 DURATION_S = 1000
@@ -197,10 +198,15 @@ def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
     """``create_ffmpeg_runner`` stand-in: attempt N writes ``attempts[N][1]`` distinct frames, exits ``[0]``
     and prints the optional ``[2]`` as stderr."""
 
-    def factory(**_kwargs):
+    def factory(*, gpu=None, gpu_device_path=None, last_command=None, **_kwargs):
         def _run(use_skip=False, init_vulkan=False, **kwargs):
             rc, n_frames, *stderr = attempts[len(calls)]
             calls.append({"use_skip": use_skip, "init_vulkan": init_vulkan, **kwargs})
+            if last_command is not None:
+                # The decoder the real runner asks for: the worker's GPU's, none on the software Dolby Vision tier.
+                software = kwargs.get("disable_vaapi_dv5", False)
+                decode = () if software else hwaccel_decode_args(gpu, gpu_device_path, keep_on_gpu=True).args
+                last_command[:] = ["ffmpeg", *decode]
             _write_frames(output_folder, n_frames)
             return rc, 1.0, "10x", list(stderr)
 
