@@ -315,6 +315,11 @@ def _default_quick_access(client: NodeClient, mappings: list[PathMapping]) -> bo
     return quick_access_check(client, mappings)
 
 
+def _renamed(text: str, old: str, new: str) -> str:
+    """A reason that starts with the node's old name, starting with its new one instead."""
+    return new + text[len(old) :] if text.startswith(old) else text
+
+
 def _clean_gpus(raw: object) -> tuple[dict, ...]:
     if not isinstance(raw, list):
         return ()
@@ -881,6 +886,16 @@ class NodeRegistry:
             or (record.get("enabled", True) and not old.get("enabled", True))
         )
         live.record = copy.deepcopy(record)
+        old_name, new_name = str(old.get("name") or ""), str(record.get("name") or "")
+        if old_name and new_name and old_name != new_name:
+            # Reasons are written with the name the node had when it was checked: a rename shows now, not after the
+            # next check (up to minutes for a node that is offline).
+            live.probe_reason, live.access_problem, live.gpu_lost = (
+                _renamed(text, old_name, new_name) for text in (live.probe_reason, live.access_problem, live.gpu_lost)
+            )
+            for other in self._nodes.values():
+                if other is not live and other.probe_state == STATE_DUPLICATE:
+                    other.probe_reason = other.probe_reason.replace(f" is {old_name} again,", f" is {new_name} again,")
         if address_changed or old.get("node_uid") != record.get("node_uid"):
             # Another address or key, or the key typed again (which clears the saved id): nothing to confirm now.
             live.unconfirmed_uid = ""

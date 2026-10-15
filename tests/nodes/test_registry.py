@@ -665,6 +665,27 @@ class TestRevisionAndSettings:
         assert h.registry.view("n1").state == reg.STATE_READY
         assert h.registry.revision > before
 
+    def test_a_renamed_nodes_reason_says_its_new_name_before_the_next_check(self, h):
+        """The card said "tmp's temp folder can't be used" for a node renamed tmp-x until its next check."""
+        h.client().default_info = NodeAuthError("no")
+        h.registry.check_now("n1")
+        assert h.registry.view("n1").reason.startswith("nuc refused the key")
+
+        h.change(name="nuc-x")
+
+        assert h.registry.view("n1").reason.startswith("nuc-x refused the key")
+
+    def test_a_renamed_nodes_lost_gpu_and_paused_workers_say_its_new_name(self, h):
+        h.registry.check_now("n1")
+        live = h.registry._nodes["n1"]
+        live.gpu_lost = "nuc lost its GPU cuda:0 (gone). Its CPU workers keep running."
+        live.access_problem = "nuc couldn't see 3 different files in 10 minutes. Its workers are paused."
+
+        h.change(name="nuc-x")
+
+        assert h.registry.view("n1").reason.startswith("nuc-x couldn't see 3 different files")
+        assert live.gpu_lost.startswith("nuc-x lost its GPU")
+
     @pytest.mark.parametrize(
         "fields",
         [{"url": "http://moved:9494"}, {"key": "new"}, {"path_mappings": []}],
@@ -1129,6 +1150,16 @@ class TestTwinOfAPlexDatabaseNode:
         refusal = h.registry.plex_db_refusal("n2")
         assert "nuc-b is nuc-a again" in refusal and "Plex's database" in refusal
         assert h.uids == []
+        h.registry.stop()
+
+    def test_renaming_the_first_of_the_two_shows_in_the_seconds_reason(self):
+        h = self._harness()
+        self._answer(h, "n2", "uid-a")
+
+        h.nodes[0] = {**h.nodes[0], "name": "nuc-a2"}
+        h.revision += 1
+
+        assert h.registry.view("n2").reason.startswith("nuc-b is nuc-a2 again, added at another address.")
         h.registry.stop()
 
     def test_a_twin_check_holds_the_other_machines_id_instead_of_clearing_the_hold(self):
