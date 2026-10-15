@@ -20,6 +20,7 @@ from loguru import logger
 
 from .client import NodeClient
 from .protocol import NOT_VISIBLE_MISSING, PathMapping, map_app_path
+from .settings import MAX_MAPPINGS
 
 SAMPLES_PER_ROOT = 3
 # Directory entries looked at per library folder before giving up: a library whose first 500 entries hold no video
@@ -148,7 +149,8 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
                 is_dir = entry.is_dir()
             except OSError:
                 continue
-            if is_dir and (entry.name.startswith(".") or queued_here >= SUBFOLDERS_PER_FOLDER):
+            # Hidden folders and the NAS housekeeping ones (Synology "#recycle" and "@eaDir") hold no library files.
+            if is_dir and (entry.name.startswith((".", "#", "@")) or queued_here >= SUBFOLDERS_PER_FOLDER):
                 continue
             seen += 1
             if seen > walk_limit:
@@ -539,4 +541,5 @@ def default_mappings_for(servers: list[dict], *, budget_s: float = SUGGEST_BUDGE
         if any(root == k or root.startswith(k.rstrip("/") + "/") for k in kept):
             continue
         kept.append(root)
-    return [{"app_prefix": root, "node_prefix": root} for root in sorted(kept)]
+    # Saving more rows than this is refused, so a pre-fill past it would fail the first save.
+    return [{"app_prefix": root, "node_prefix": root} for root in sorted(kept)[:MAX_MAPPINGS]]

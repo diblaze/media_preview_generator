@@ -13,6 +13,7 @@ from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.protocol import PathMapping, map_app_path
 from media_preview_generator.nodes.server import app as node_app
 from media_preview_generator.nodes.server import info
+from media_preview_generator.nodes.settings import MAX_MAPPINGS
 
 NODE_KEY = "test-access-key"
 
@@ -117,6 +118,14 @@ class TestSampleFiles:
         assert [os.path.basename(f["path"]) for f in found] == ["b.mkv", "a.MP4"]
         assert found[0]["size"] == 5
         assert found[0]["mtime_ns"] == (root / "b.mkv").stat().st_mtime_ns
+
+    def test_it_skips_nas_recycle_and_metadata_folders(self, tmp_path):
+        root = tmp_path / "Movies"
+        _video(root / "#recycle" / "deleted.mkv")
+        _video(root / "@eaDir" / "x.mkv")
+        _video(root / ".Trash-1000" / "t.mkv")
+        _video(root / "Film" / "real.mkv")
+        assert [os.path.basename(f["path"]) for f in nm.sample_files(str(root))] == ["real.mkv"]
 
     def test_it_stops_at_the_limit_and_the_walk_bound(self, tmp_path):
         root = tmp_path / "Movies"
@@ -570,6 +579,16 @@ def test_default_mappings_are_one_row_per_top_library_folder(tmp_path):
         {"app_prefix": movies, "node_prefix": movies},
         {"app_prefix": tv, "node_prefix": tv},
     ]
+
+
+def test_default_mappings_never_exceed_what_a_save_accepts(tmp_path):
+    names = [f"L{n:03}" for n in range(MAX_MAPPINGS + 5)]
+    servers = [
+        _server(tmp_path, [{"id": str(i), "name": n, "remote_paths": [f"/plexmedia/{n}"]} for i, n in enumerate(names)])
+    ]
+    for name in names:
+        os.makedirs(tmp_path / "media" / name)
+    assert len(nm.default_mappings_for(servers)) == MAX_MAPPINGS
 
 
 def test_default_mappings_leave_out_folders_this_app_cant_open(tmp_path):
