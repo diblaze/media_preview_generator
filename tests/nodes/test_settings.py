@@ -242,6 +242,18 @@ class TestSettingsManagerNodes:
             sm.update_nodes([record], expected_revision=0)
         assert sm.update_nodes([record], expected_revision=1) == 2
 
+    @pytest.mark.parametrize("hand_edited", [None, "3", 2.5, True, []])
+    def test_a_hand_edited_revision_that_isnt_a_whole_number_counts_as_zero(self, tmp_path, hand_edited):
+        import json
+
+        (tmp_path / "settings.json").write_text(json.dumps({"nodes_revision": hand_edited}))
+        sm = SettingsManager(str(tmp_path))
+        record, _ = ns.validate_node(_post(), existing=None, others=[])
+
+        assert sm.nodes_revision == 0
+        assert sm.update_nodes([record]) == 1
+        assert sm.update_nodes([record], expected_revision=1) == 2
+
     def test_an_invalid_list_is_refused_and_nothing_is_saved(self, tmp_path):
         sm = SettingsManager(str(tmp_path))
         with pytest.raises(ValueError):

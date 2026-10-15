@@ -357,8 +357,12 @@ class SettingsManager:
 
     @property
     def nodes_revision(self) -> int:
-        """Revision of the ``nodes`` list; the node registry re-reads it when this moves."""
-        return int(self.get("nodes_revision", 0))
+        """Revision of the ``nodes`` list; the node registry re-reads it when this moves.
+
+        A value edited by hand into something other than a whole number (``null``, ``"3"``) counts as 0.
+        """
+        revision = self.get("nodes_revision", 0)
+        return revision if type(revision) is int else 0
 
     def update_nodes(self, nodes: list[dict], expected_revision: int | None = None) -> int:
         """Validate and persist the whole node list atomically.
