@@ -135,9 +135,10 @@ def test_a_restarting_node_is_called_restarting_not_offline():
     )
     (card,) = _cards(view)
     assert card["title"] == "old-laptop is restarting"
-    assert card["id"] == "node:abc123:offline"
+    assert card["id"] == "node:abc123:restarting"
     (other,) = _cards(dataclasses.replace(view, cause=reg.OFFLINE_UNREACHABLE))
     assert other["title"] == "old-laptop is offline"
+    assert other["id"] == "node:abc123:offline"
 
 
 def test_a_node_that_asks_this_app_to_wait_is_not_called_offline():
@@ -149,7 +150,58 @@ def test_a_node_that_asks_this_app_to_wait_is_not_called_offline():
     view = dataclasses.replace(_view(reg.STATE_OFFLINE, name="rl", reason=reason), cause=reg.OFFLINE_RATE_LIMITED)
     (card,) = _cards(view)
     assert card["title"] == "rl asks this app to wait"
-    assert card["id"] == "node:abc123:offline"
+    assert card["id"] == "node:abc123:rate_limited"
+
+
+def _offline(cause, *, reason="old-laptop didn't answer. Check that it is running and reachable."):
+    return dataclasses.replace(_view(reg.STATE_OFFLINE, reason=reason), cause=cause)
+
+
+@pytest.mark.parametrize(
+    ("answered", "title"),
+    [
+        (reg.OFFLINE_RESTARTING, "old-laptop is restarting"),
+        (reg.OFFLINE_RATE_LIMITED, "old-laptop asks this app to wait"),
+    ],
+)
+@pytest.mark.parametrize("then", [reg.OFFLINE_UNREACHABLE, reg.OFFLINE_STUCK, reg.OFFLINE_NOT_A_NODE])
+def test_a_dismissed_card_for_a_node_that_answered_does_not_hide_it_going_offline(answered, title, then):
+    """Lab: a node whose image update never started again. Its "is restarting" card was dismissed (it was expected
+    back), the restart window ran out, and the bell stayed quiet: all three cards shared the id node:<id>:offline."""
+    reg.set_registry(StubRegistry([_offline(answered)]))
+    (card,) = notif.build_active_notifications([])
+    assert card["title"] == title
+    notif.dismiss_session(card["id"])
+    assert notif.build_active_notifications([]) == []
+
+    reg.set_registry(StubRegistry([_offline(then)]))
+    assert [c["title"] for c in notif.build_active_notifications([])] == ["old-laptop is offline"]
+
+    # It answers again with the same problem: the dismissal of the card it left is lifted.
+    reg.set_registry(StubRegistry([_offline(answered)]))
+    assert [c["title"] for c in notif.build_active_notifications([])] == [title]
+
+
+@pytest.mark.parametrize("cause", [reg.OFFLINE_RESTARTING, reg.OFFLINE_RATE_LIMITED, reg.OFFLINE_UNREACHABLE])
+def test_a_dismissed_node_card_stays_dismissed_while_the_node_stays_that_way(cause):
+    reg.set_registry(StubRegistry([_offline(cause)]))
+    (card,) = notif.build_active_notifications([])
+    notif.dismiss_session(card["id"])
+    for _ in range(3):
+        assert notif.build_active_notifications([]) == []
+
+
+def test_an_offline_node_that_stops_answering_another_way_keeps_its_dismissed_offline_card_hidden():
+    """Both read "<name> is offline": the user already said they know."""
+    reg.set_registry(StubRegistry([_offline(reg.OFFLINE_UNREACHABLE)]))
+    (card,) = notif.build_active_notifications([])
+    notif.dismiss_session(card["id"])
+    reg.set_registry(StubRegistry([_offline(reg.OFFLINE_STUCK, reason="old-laptop accepts connections but ...")]))
+    assert notif.build_active_notifications([]) == []
+
+
+def test_the_node_card_kinds_are_the_alert_states_and_the_two_ways_a_node_answers_while_offline():
+    assert set(notif.NODE_CARD_KINDS) == {*reg.ALERT_STATES, reg.OFFLINE_RESTARTING, reg.OFFLINE_RATE_LIMITED}
 
 
 def test_a_node_without_a_reason_still_gets_what_to_do():
@@ -189,9 +241,12 @@ def test_a_permanent_dismissal_never_hides_a_node_card():
     ("notification_id", "known"),
     [
         ("node:abc123:offline", True),
+        ("node:abc123:restarting", True),
+        ("node:abc123:rate_limited", True),
         ("node:abc123:gpu_lost", True),
         ("node:abc123:unconfirmed", True),
         ("node:abc123:ready", False),
+        ("node:abc123:stuck", False),
         ("node:../../x:offline", False),
         ("node:abc123", False),
     ],

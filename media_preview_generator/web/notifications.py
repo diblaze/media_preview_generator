@@ -43,7 +43,7 @@ LIBRARY_HEALTH_NOT_SHOWING_ID = "library_health_not_showing"
 LIBRARY_HEALTH_CHECK_FAILED_ID = "library_health_check_failed"
 
 CREDITS_ON_CPU_ID_PREFIX = "credits_on_cpu_"
-# ``node:<node id>:<state>``, one per node in an alert state.
+# ``node:<node id>:<kind>``, one per node in an alert state; the kind is a key of ``_NODE_CARD_TEXT``.
 NODE_ID_PREFIX = "node:"
 # The ``<state>`` of a Plex database node's card when it reports a new id its key must confirm.
 NODE_UNCONFIRMED = "unconfirmed"
@@ -524,10 +524,25 @@ def _build_library_health_check_failed_notification() -> dict[str, Any] | None:
 
 
 _NODE_CARD_TEXT = {
-    # state: (title, what to do when the node has no reason, action label, where on the node dialog the action lands)
+    # kind (the node's state, or how an offline node that answered is offline):
+    # (title, what to do when the node has no reason, action label, where on the node dialog the action lands)
     "offline": (
         "{name} is offline",
         "Check that the node is running and that this app can reach it.",
+        "Open Nodes",
+        "",
+    ),
+    # It answered: offline only until its restart is done.
+    "restarting": (
+        "{name} is restarting",
+        "It gets no files until it is back.",
+        "Open Nodes",
+        "",
+    ),
+    # It answered too: it only holds this app back for a while (too many wrong keys from here).
+    "rate_limited": (
+        "{name} asks this app to wait",
+        "Something else at this app's address has an old key: give it the right one, or stop it.",
         "Open Nodes",
         "",
     ),
@@ -578,9 +593,26 @@ _NODE_CARD_TEXT = {
 }
 
 
-def node_notification_id(node_id: str, state: str) -> str:
-    """The bell card id for one node in one state."""
-    return f"{NODE_ID_PREFIX}{node_id}:{state}"
+# Every ``<kind>`` a node card id can end in (``_is_known_notification_id`` accepts these).
+NODE_CARD_KINDS = tuple(_NODE_CARD_TEXT)
+
+
+def node_notification_id(node_id: str, kind: str) -> str:
+    """The bell card id for one node in one state (``_node_card_kind``)."""
+    return f"{NODE_ID_PREFIX}{node_id}:{kind}"
+
+
+def _node_card_kind(state: str, cause: str) -> str:
+    """Which card a node gets: its state, except an offline node that answered (restarting, asks this app to wait).
+
+    Those two get their own card and id, so dismissing "is restarting" doesn't hide the "is offline" that follows when
+    the node never comes back.
+    """
+    from ..nodes.registry import OFFLINE_RATE_LIMITED, OFFLINE_RESTARTING, STATE_OFFLINE
+
+    if state == STATE_OFFLINE and cause in (OFFLINE_RESTARTING, OFFLINE_RATE_LIMITED):
+        return cause
+    return state
 
 
 def _build_node_notifications() -> list[dict[str, Any]]:
@@ -591,12 +623,13 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     A node nothing uses (no switched-on worker group with a member on it, no switched-on Plex server with its Plex
     database node switched on pointing at it) raises no card: whatever its state, no work waits on it.
 
-    The id carries the state, so a dismissed "offline" card doesn't hide a later "refused the key" one; the session
-    dismissal of a state the node has left is lifted, so the next time it happens the card shows again.
+    The id carries the card's kind (``_node_card_kind``), so a dismissed "offline" card doesn't hide a later "refused
+    the key" one; the session dismissal of a kind the node has left is lifted, so the next time it happens the card
+    shows again.
     """
     from markupsafe import escape
 
-    from ..nodes.registry import ALERT_STATES, OFFLINE_RATE_LIMITED, OFFLINE_RESTARTING, STATE_OFFLINE, get_registry
+    from ..nodes.registry import get_registry
     from ..nodes.settings import node_users
     from .settings_manager import get_settings_manager
 
@@ -609,31 +642,26 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         return []
     cards = []
     for view in views:
-        for state in ALERT_STATES:
-            if state != view.state:
-                undismiss_session(node_notification_id(view.id, state))
+        kind = _node_card_kind(view.state, view.cause)
+        for other in NODE_CARD_KINDS:
+            if other != kind:
+                undismiss_session(node_notification_id(view.id, other))
         users = node_users(view.id, groups, servers, switched_on_only=True)
         if not view.plex_db_unconfirmed:
             undismiss_session(node_notification_id(view.id, NODE_UNCONFIRMED))
         elif users["servers"]:
             cards.append(_unconfirmed_node_card(view.id, view.name or "A node"))
-        text = _NODE_CARD_TEXT.get(view.state)
+        text = _NODE_CARD_TEXT.get(kind)
         if text is None or not any(users.values()):
             continue
         title, todo, label, target = text
-        if view.state == STATE_OFFLINE and view.cause == OFFLINE_RESTARTING:
-            # It answered: offline only until its restart is done.
-            title = "{name} is restarting"
-        elif view.state == STATE_OFFLINE and view.cause == OFFLINE_RATE_LIMITED:
-            # It answered too: it only holds this app back for a while (too many wrong keys from here).
-            title = "{name} asks this app to wait"
         name = view.name or "A node"
         # The node's reason already ends with what to do, so the card's own line is only for a node without one.
         body = view.reason or todo
         href = f"/nodes#node-{view.id}/{target}" if target else f"/nodes#node-{view.id}"
         cards.append(
             {
-                "id": node_notification_id(view.id, view.state),
+                "id": node_notification_id(view.id, kind),
                 "severity": "warning",
                 "title": title.format(name=name),
                 "body_html": f"<p class='mb-0'>{escape(body)}</p>",
