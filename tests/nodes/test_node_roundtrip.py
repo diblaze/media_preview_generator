@@ -455,6 +455,79 @@ class TestANodeThatIsStopping:
         assert registry.reports == [("unavailable", NODE_ID)]
 
 
+class TestANodeRecreatedWithANewKeyMidJob:
+    """The node's container is recreated without its /config (a new key) while two files run there. Their polls,
+    sent again with the old key, reached the node's wrong-key limit: the node held this app's own address back for
+    ~72 s, and the card blamed "something else at this app's address" instead of saying the key was refused."""
+
+    @pytest.fixture
+    def recreated(self, tmp_path, monkeypatch):
+        for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_ROLES"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NODE_NAME", "gpu-box")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(tmp_path / "node-tmp"))
+        monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
+        apps = {
+            which: node_app.create_node_app(
+                config_dir=str(tmp_path / f"config-{which}"), roles=["worker"], key=key, ops={"test.slow": _slow_op}
+            )
+            for which, key in (("old", KEY), ("new", "the-key-the-recreated-node-made"))
+        }
+        answering = {"app": apps["old"]}
+        server = make_server("127.0.0.1", 0, lambda env, start: answering["app"](env, start), threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_port}", answering, apps
+        set_registry(None)
+        server.shutdown()
+        thread.join(5)
+        for app in apps.values():
+            app.extensions[node_app.EXTENSION].close()
+
+    def test_the_files_go_elsewhere_at_once_and_the_check_says_the_key_was_refused(self, recreated, tmp_path):
+        from media_preview_generator.nodes.registry import STATE_KEY_REFUSED
+        from media_preview_generator.nodes.server import identity
+
+        url, answering, apps = recreated
+        media = write_file(str(tmp_path / "media" / "a.mkv"), b"x" * 10)
+        registry = identity_registry(_client(url))
+        set_registry(registry)
+        ended: list[BaseException] = []
+
+        def work() -> None:
+            try:
+                with placed_on(Placement(NODE_ID, "gpu-box")):
+                    run_on_node("test.slow", media, {}, gpu=None, cancel_check=None)
+            except BaseException as exc:  # noqa: BLE001 - the test reads how each file ended
+                ended.append(exc)
+
+        workers = [threading.Thread(target=work, daemon=True) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        assert _wait_until_running(apps["old"], 2)
+        answering["app"] = apps["new"]  # recreated: the same address, a new key, none of the old tasks
+        for worker in workers:
+            worker.join(10)
+
+        assert [type(exc) for exc in ended] == [NodeUnavailableError] * 2
+        assert all(exc.started is False and str(exc) == "gpu-box refused the key" for exc in ended)
+        assert [requeue_for(exc).reason for exc in ended] == [REQUEUE_NODE_NOT_STARTED] * 2
+        assert registry.reports == [("unavailable", NODE_ID)] * 2
+        assert identity.wrong_key_limit(apps["new"]).blocked_for("127.0.0.1") == 0
+        check = NodeRegistry(client_factory=lambda record: _client(record["url"], record["key"]), attempt_gap_s=0.0)
+        record = {"id": NODE_ID, "name": "gpu-box", "url": url, "key": KEY, "enabled": True, "path_mappings": []}
+        assert check._probe(record, _client(url)).state == STATE_KEY_REFUSED
+
+
+def _wait_until_running(app, count: int) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if app.extensions[node_app.EXTENSION].tasks.busy() >= count:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 class TestAPlexDatabaseNodeSwappedAtItsAddress:
     """Another machine, given the same key, starts answering at a Plex database node's address between the app's
     check of the node and its write: that machine writes nothing into its Plex, and the app checks the node again."""

@@ -727,6 +727,88 @@ class TestFreeingTheTask:
         assert len(client.named("delete")) == 1
 
 
+class _KeyChanged(ScriptedClient):
+    """A node recreated with a new key: from the first ``refused_from`` request on, every request is refused (401)."""
+
+    def __init__(self, script: list, refused_from: str) -> None:
+        super().__init__(script)
+        self.refused_from = refused_from
+        self.refused: list[str] = []
+
+    def _gate(self, name: str) -> None:
+        if self.refused or name == self.refused_from:
+            self.refused.append(name)
+            raise NodeAuthError("http://n refused the key")
+
+    def start_task(self, spec: dict) -> str:
+        self._gate("start")
+        return super().start_task(spec)
+
+    def poll_task(self, task_id: str, *, log_from: int = 0) -> dict:
+        self._gate("poll")
+        return super().poll_task(task_id, log_from=log_from)
+
+    def cancel_task(self, task_id: str) -> None:
+        self._gate("cancel")
+        super().cancel_task(task_id)
+
+    def pause_task(self, task_id: str) -> None:
+        self._gate("pause")
+        super().pause_task(task_id)
+
+    def fetch_artifact(self, task_id: str) -> bytes:
+        self._gate("artifact")
+        return super().fetch_artifact(task_id)
+
+    def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
+        self._gate("delete")
+        super().delete_task(task_id, read_timeout=read_timeout)
+
+
+class TestARefusedKeyMidTask:
+    """A node recreated with a new key (or its NODE_KEY changed) while a file runs there: each wrong key from this
+    app's address brings the node closer to holding the address back, the app's own check and the right key included,
+    so the first refusal ends the file there and nothing more is sent."""
+
+    @pytest.mark.parametrize(
+        ("refused_from", "script", "ends_with", "says"),
+        [
+            pytest.param("start", [running()], NodeUnavailableError, "couldn't start the task", id="start"),
+            pytest.param("poll", [running()], NodeUnavailableError, "NAS refused the key", id="poll"),
+            pytest.param("pause", [running()], NodeUnavailableError, "NAS refused the key", id="pause"),
+            # The job's cancel was refused: the file ends as cancelled, as the job asked.
+            pytest.param("cancel", [running()], NodeTaskCancelledError, "NAS refused the key", id="cancel"),
+            pytest.param(
+                "artifact", [finished(protocol.STATUS_DONE, result={})], NodeUnavailableError, "NAS refused the key",
+                id="artifact",
+            ),
+        ],
+    )  # fmt: skip
+    def test_the_first_refusal_ends_the_file_there_and_nothing_more_is_sent(
+        self, media, tmp_path, refused_from, script, ends_with, says
+    ):
+        client = _KeyChanged(script, refused_from)
+        registry = _install(client)
+        polled = lambda: bool(client.named("poll"))  # noqa: E731 - the job's cancel or pause comes after one poll
+
+        with pytest.raises(ends_with, match=says) as raised:
+            _run(
+                media,
+                artifact_to=str(tmp_path),
+                cancel_check=polled if refused_from == "cancel" else None,
+                pause_check=polled if refused_from == "pause" else None,
+            )
+
+        time.sleep(0.1)  # a DELETE would be sent from a thread of its own
+        assert client.refused == [refused_from]
+        # The check this starts reads the refused key for the node's card.
+        assert registry.reports == [("unavailable", NODE_ID)]
+        if ends_with is NodeUnavailableError:
+            # Not the file's doing: it goes elsewhere with no drop counted.
+            assert raised.value.started is False
+            assert executor.requeue_for(raised.value).reason == executor.REQUEUE_NODE_NOT_STARTED
+
+
 class TestErrors:
     def test_file_not_visible_is_reported_and_raised_with_the_reason(self, media):
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file", "reason": "missing"}
