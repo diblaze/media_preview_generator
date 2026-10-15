@@ -433,7 +433,7 @@ def _clean_gpus(raw: object) -> tuple[dict, ...]:
     for g in raw:
         if not isinstance(g, dict):
             continue
-        gpu = {
+        gpu: dict[str, Any] = {
             "type": str(g.get("type") or ""),
             "device": str(g.get("device") or ""),
             "name": str(g.get("name") or ""),
