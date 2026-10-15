@@ -536,6 +536,8 @@ class TestTempFolderAtStart:
 
         with pytest.raises(SystemExit, match=r"NODE_TEMP_DIR \(.*\) can't be made \(Not a directory\)"):
             make_app(roles=["worker"])
+        # Refused before its identity: the one-time notice of a new key is still to come at the start that works.
+        assert not (tmp_path / "config" / "node.json").exists()
 
     def test_a_worker_node_without_a_writable_system_temp_folder_refuses_to_start(self, make_app, monkeypatch):
         _no_system_temp(monkeypatch)

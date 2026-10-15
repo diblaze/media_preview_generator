@@ -167,6 +167,10 @@ def create_node_app(
     """
     _env_from_files()
     chosen_roles = _resolve_roles(roles)
+    worker = protocol.ROLE_WORKER in chosen_roles
+    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only). Made
+    # before the identity, so a node that can't start hasn't spent the one-time notice of its new key.
+    temp_root = _worker_temp_root() if worker else None
     me = identity.load_identity(config_dir, key=key)
     node_block = {
         "id": me.id,
@@ -176,7 +180,6 @@ def create_node_app(
         "protocols": [protocol.NODE_PROTOCOL],
         "roles": list(chosen_roles),
     }
-    worker = protocol.ROLE_WORKER in chosen_roles
 
     # static_folder=None: a node serves its API only; Flask's default would add /static/<path:filename>.
     app = Flask(__name__, static_folder=None)
@@ -184,8 +187,6 @@ def create_node_app(
     app.json.sort_keys = False
 
     log_buffer = nodelog.install()
-    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only).
-    temp_root = _worker_temp_root() if worker else None
     if worker and ops is None:
         from .ops import OPS
 
