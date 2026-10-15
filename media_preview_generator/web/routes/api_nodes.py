@@ -20,6 +20,7 @@ from loguru import logger
 
 from ...nodes import protocol
 from ...nodes.client import (
+    UNREACHABLE_RATE_LIMITED,
     NodeAddress,
     NodeAuthError,
     NodeClient,
@@ -27,6 +28,7 @@ from ...nodes.client import (
     NodeProtocolError,
     NodeRateLimitedError,
     NodeRequestError,
+    unreachable_advice,
 )
 from ...nodes.mappings import default_mappings_for, library_roots, run_test_access
 from ...nodes.readiness import cached_file_checks, node_readiness, to_fix
@@ -46,10 +48,8 @@ from ..settings_manager import get_settings_manager
 from . import api
 
 LOG_LINES_MAX = 2000
-# The probe error kind beyond the protocol's request-level ones: nothing answered.
+# The probe error kind beyond the protocol's request-level ones: nothing answered (or a node held this address back).
 KIND_UNREACHABLE = "unreachable"
-# The node answered, but holds this address back after too many wrong keys (``error.reason`` next to unreachable).
-PROBE_RATE_LIMITED = "rate_limited"
 # Why something that answered isn't a node (``error.reason`` next to the protocol kind).
 PROBE_THIS_APP = "this_app"
 PROBE_OTHER_APP = "other_app"
@@ -309,10 +309,11 @@ def _probe(url: str, key: str) -> dict[str, Any]:
                 "version_match": None,
             },
         }
-    except NodeRateLimitedError as exc:
-        return _probe_error(KIND_UNREACHABLE, str(exc), PROBE_RATE_LIMITED)
     except NodeError as exc:
-        return _probe_error(KIND_UNREACHABLE, str(exc), getattr(exc, "reason", ""))
+        reason = UNREACHABLE_RATE_LIMITED if isinstance(exc, NodeRateLimitedError) else getattr(exc, "reason", "")
+        answer = _probe_error(KIND_UNREACHABLE, str(exc), reason)
+        answer["error"]["advice"] = unreachable_advice(reason, url)
+        return answer
     return {"ok": True, "info": _probe_info(info)}
 
 

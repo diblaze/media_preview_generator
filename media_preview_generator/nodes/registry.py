@@ -31,6 +31,7 @@ from .client import (
     NodeProtocolError,
     NodeRateLimitedError,
     NodeTimeoutError,
+    unreachable_advice,
 )
 from .protocol import PathMapping
 from .settings import find_node, node_mappings
@@ -1305,9 +1306,11 @@ class NodeRegistry:
 
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
+        url = str(record.get("url") or "")
         info: dict | None = None
         timeouts = 0
         rate_limited = False
+        why = ""
         for attempt in range(CHECK_ATTEMPTS):
             try:
                 info = _bounded(client.info())
@@ -1328,6 +1331,7 @@ class NodeRegistry:
                 timeouts += isinstance(exc, NodeTimeoutError)
                 # Only the last attempt's: a wait that passed, then refused connections, is a node that's down.
                 rate_limited = isinstance(exc, NodeRateLimitedError)
+                why = str(getattr(exc, "reason", "") or "")
                 if attempt + 1 < CHECK_ATTEMPTS and self._stop.wait(self._attempt_gap_s):
                     break
         if info is None and rate_limited:
@@ -1337,18 +1341,15 @@ class NodeRegistry:
                 "there (another app, an old copy) has an old key: give it the right one, or stop it.",
                 cause=OFFLINE_RATE_LIMITED,
             )
-        if info is None and timeouts == CHECK_ATTEMPTS:
+        # Over https, timeouts are what a node without an https proxy in front looks like: the address is wrong.
+        if info is None and timeouts == CHECK_ATTEMPTS and not url.lower().startswith("https:"):
             return _Outcome(
                 STATE_OFFLINE,
                 f"{name} accepts connections but doesn't answer. It may be stuck or overloaded: restart it.",
                 cause=OFFLINE_STUCK,
             )
         if info is None:
-            return _Outcome(
-                STATE_OFFLINE,
-                f"{name} didn't answer. Check that it is running and reachable from this app.",
-                cause=OFFLINE_UNREACHABLE,
-            )
+            return _Outcome(STATE_OFFLINE, unreachable_advice(why, url, name), cause=OFFLINE_UNREACHABLE)
         return self._read_info(record, info)
 
     def _other_protocol(self, name: str, block: dict) -> _Outcome:

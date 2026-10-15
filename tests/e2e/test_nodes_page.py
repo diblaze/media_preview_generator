@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from media_preview_generator.nodes.client import unreachable_advice
+
 from .conftest import accept_app_confirm, expect_modal_shown, watch_modal_shown
 from .test_info_icons import _AUDIT_JS, MORE
 from .test_intro_credits_server_tab import (
@@ -793,7 +795,10 @@ class TestAddNode:
     def test_probe_errors_are_plain_words(self, authed_page: Page, app_url: str, kind: str, text: str) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)
-        api.probe_answer = {"ok": False, "error": {"kind": kind, "message": "raw detail"}}
+        error = {"kind": kind, "message": "raw detail"}
+        if kind == "unreachable":
+            error["advice"] = unreachable_advice("", "http://nas:9494")
+        api.probe_answer = {"ok": False, "error": error}
         authed_page.locator("#addNodeUrl").fill("http://nas:9494")
         authed_page.locator("#addNodeKey").fill("k")
         authed_page.locator("#addNodeConnect").click()
@@ -842,7 +847,11 @@ class TestAddNode:
     ) -> None:
         api = _open_nodes(authed_page, app_url, [])
         _open_add(authed_page)
-        api.probe_answer = {"ok": False, "error": {"kind": kind, "message": "raw detail", "reason": reason}}
+        error = {"kind": kind, "message": "raw detail", "reason": reason}
+        if kind == "unreachable":
+            # The app sends what to check with the error; the page shows it as sent.
+            error["advice"] = unreachable_advice(reason, url)
+        api.probe_answer = {"ok": False, "error": error}
         authed_page.locator("#addNodeUrl").fill(url)
         authed_page.locator("#addNodeKey").fill("k")
         authed_page.locator("#addNodeConnect").click()
