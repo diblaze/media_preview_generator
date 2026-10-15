@@ -236,6 +236,63 @@ class TestTempFolder:
             table.start(_spec(media))
         assert table.busy() == 0
 
+    @pytest.mark.parametrize(("code", "said"), [(errno.ENOSPC, "is full"), (errno.EROFS, "can't write to")])
+    def test_a_temp_folder_that_fills_or_turns_read_only_mid_task_says_so(self, make_table, media, code, said):
+        def op(ctx, node_path, params):
+            tar = os.path.join(ctx.temp_dir, "frames.tar")
+            raise OSError(code, os.strerror(code), tar)
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["status"] == protocol.STATUS_FAILED
+        message = state["error"]["message"]
+        assert message.startswith("The node") and said in message and table.temp_root in message, message
+        assert ("twice its frames' size" in message) == (code == errno.ENOSPC)
+
+    def test_a_temp_folder_error_raised_through_another_exception_still_says_so(self, make_table, media):
+        def op(ctx, node_path, params):
+            try:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            except OSError as exc:
+                raise RuntimeError("writing the frames failed") from exc
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert "temp folder" in state["error"]["message"] and "is full" in state["error"]["message"]
+
+    def test_a_read_only_error_outside_the_temp_folder_is_not_blamed_on_it(self, make_table, media):
+        def op(ctx, node_path, params):
+            raise OSError(errno.EROFS, "Read-only file system", str(media / "a.mkv"))
+
+        table = make_table({"test.op": op})
+
+        state = _finished(table, table.start(_spec(media)))
+
+        assert state["error"]["message"].startswith("OSError: [Errno 30]")
+
+    def test_the_probe_names_a_temp_folder_the_node_cant_write(self, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("x")
+
+        problem = tasks.probe_temp_folder(str(blocker / "node-tmp"))
+
+        assert problem is not None and problem.startswith("The node can't write to its temp folder")
+        assert tasks.probe_temp_folder(str(tmp_path / "fine")) is None
+        assert os.listdir(tmp_path / "fine") == []
+
+    def test_a_node_without_the_worker_role_makes_no_temp_folder(self, tmp_path):
+        table = tasks.TaskTable({}, temp_root=None)
+        try:
+            with pytest.raises(tasks.TaskSpecError):
+                table.start({"op": "preview.frames", "path": "/a", "mapping": []})
+        finally:
+            table.close()
+        assert os.listdir(tmp_path) == []
+
 
 class TestClientTaskId:
     CLIENT_ID = "0123456789abcdef0123456789abcdef"

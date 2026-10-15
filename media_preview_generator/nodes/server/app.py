@@ -70,6 +70,31 @@ def _resolve_roles(roles: list[str] | None) -> list[str]:
     return chosen
 
 
+def _worker_temp_root() -> str:
+    """The worker role's temp folder (``NODE_TEMP_DIR``, else the system temp folder's ``mpg-node``), made now.
+
+    Raises:
+        SystemExit: It can't be made: a path under a file, a parent the node can't write, or no writable system temp
+            folder (a container started with ``--read-only`` and no tmpfs).
+    """
+    chosen = os.environ.get("NODE_TEMP_DIR", "").strip()
+    try:
+        root = tasks.default_temp_root()
+    except OSError as exc:
+        raise SystemExit(
+            f"The node found no temp folder it can write to ({exc.strerror or exc}). Set NODE_TEMP_DIR to one "
+            "(a container started read-only needs a tmpfs or a volume for it)."
+        ) from exc
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as exc:
+        setting = f"NODE_TEMP_DIR ({root})" if chosen else f"The node's temp folder {root}"
+        raise SystemExit(
+            f"{setting} can't be made ({exc.strerror or exc}). Set NODE_TEMP_DIR to a folder the node can write to."
+        ) from exc
+    return root
+
+
 def create_node_app(
     *,
     config_dir: str | None = None,
@@ -95,8 +120,8 @@ def create_node_app(
         The Flask app.
 
     Raises:
-        SystemExit: An unknown role, a bad key, an unreadable node.json, or the Plex database role without
-            ``PLEX_CONFIG_DIR``.
+        SystemExit: An unknown role, a bad key, an unreadable node.json, the worker role without a temp folder it can
+            make, or the Plex database role without ``PLEX_CONFIG_DIR``.
     """
     chosen_roles = _resolve_roles(roles)
     me = identity.load_identity(config_dir, key=key)
@@ -116,13 +141,14 @@ def create_node_app(
     app.json.sort_keys = False
 
     log_buffer = nodelog.install()
-    temp_root = tasks.default_temp_root()
+    # Only the worker role runs tasks: a Plex database node needs no temp folder (it may run with --read-only).
+    temp_root = _worker_temp_root() if worker else None
     if worker and ops is None:
         from .ops import OPS
 
         ops = OPS
     worker_info = None
-    if worker:
+    if temp_root is not None:
         from .info import WorkerInfo
 
         worker_info = WorkerInfo(temp_root=temp_root)

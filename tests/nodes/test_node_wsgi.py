@@ -80,6 +80,19 @@ def test_a_node_that_refuses_to_start_exits_once_with_its_reason(tmp_path):
     assert output.count("example key from the docs") == 1, output
 
 
+def test_a_worker_node_whose_temp_folder_cant_be_made_exits_once_without_a_traceback(tmp_path):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("x")
+    env = _env(tmp_path, NODE_ROLES="worker", NODE_TEMP_DIR=str(blocker / "node-tmp"))
+
+    done = subprocess.run(_command(_free_port()), cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
+
+    assert done.returncode == 1
+    output = done.stdout + done.stderr
+    assert "Traceback" not in output, output
+    assert output.count("The node didn't start: NODE_TEMP_DIR") == 1, output
+
+
 def test_half_sent_requests_dont_stop_health_answering(node):
     proc, port = node
     held = []

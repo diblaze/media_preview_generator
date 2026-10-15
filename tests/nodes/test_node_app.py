@@ -478,3 +478,50 @@ print(heavy)
 
         assert done.returncode == 0, done.stderr
         assert done.stdout.strip().splitlines()[-1] == "[]"
+
+
+def _fake_plex_db(monkeypatch) -> None:
+    fake = types.ModuleType("media_preview_generator.nodes.server.plex_db")
+    fake.register_plex_db = lambda app, **kwargs: None
+    fake.agent_block = lambda: {}
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    # `from . import plex_db` reads the package attribute first once the real module has been imported.
+    monkeypatch.setattr(server_package, "plex_db", fake, raising=False)
+    monkeypatch.setenv("PLEX_CONFIG_DIR", "/plex")
+
+
+def _no_system_temp(monkeypatch) -> None:
+    import tempfile
+
+    def none() -> str:
+        # What `docker run --read-only` without a tmpfs at /tmp gets.
+        raise FileNotFoundError(2, "No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp']")
+
+    monkeypatch.delenv("NODE_TEMP_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", none)
+
+
+class TestTempFolderAtStart:
+    def test_a_worker_node_whose_temp_folder_cant_be_made_refuses_to_start(self, make_app, monkeypatch, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("x")
+        monkeypatch.setenv("NODE_TEMP_DIR", str(blocker / "node-tmp"))
+
+        with pytest.raises(SystemExit, match=r"NODE_TEMP_DIR \(.*\) can't be made \(Not a directory\)"):
+            make_app(roles=["worker"])
+
+    def test_a_worker_node_without_a_writable_system_temp_folder_refuses_to_start(self, make_app, monkeypatch):
+        _no_system_temp(monkeypatch)
+
+        with pytest.raises(SystemExit, match="no temp folder it can write to .* Set NODE_TEMP_DIR"):
+            make_app(roles=["worker"])
+
+    def test_a_plex_database_node_needs_no_temp_folder(self, make_app, monkeypatch):
+        _fake_plex_db(monkeypatch)
+        _no_system_temp(monkeypatch)
+
+        client = make_app(roles=["plex_db"]).test_client()
+
+        assert client.get("/v1/health").status_code == 200
+        response = client.post("/v1/tasks", headers=HEADERS, json={"op": "preview.frames", "path": "/a"})
+        assert response.status_code == 400 and response.get_json()["error"]["kind"] == protocol.KIND_REQUEST
