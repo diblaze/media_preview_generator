@@ -134,6 +134,9 @@ class SettingsManager:
         An address that isn't text (a number, ``null``, or none at all) is cleared to ``""``, a node with no address:
         read as it was, asking the node anything (its log, a Test access) failed with an error page. A key that isn't
         text is cleared the same way, to be entered again.
+
+        Folder mappings that aren't a list are cleared to none, to be entered again: read as they were, the Nodes page
+        showed text as one mapping per character, and no save of the node was accepted.
         """
         raw = self._settings.get("nodes")
         if not isinstance(raw, list):
@@ -144,6 +147,7 @@ class SettingsManager:
         switched_off: list[str] = []
         unaddressed: list[str] = []
         unkeyed: list[str] = []
+        unmapped: list[str] = []
         seen: set[str] = set()
         for node in raw:
             if not isinstance(node, dict):
@@ -164,7 +168,10 @@ class SettingsManager:
             if not isinstance(node.get("key"), str):
                 node["key"] = ""
                 unkeyed.append(str(node.get("name") or node["id"]))
-        if not (named or switched_off or unaddressed or unkeyed):
+            if node.get("path_mappings") is not None and not isinstance(node["path_mappings"], list):
+                node["path_mappings"] = []
+                unmapped.append(str(node.get("name") or node["id"]))
+        if not (named or switched_off or unaddressed or unkeyed or unmapped):
             return
         self._settings["nodes_revision"] = self.nodes_revision + 1
         if named:
@@ -188,6 +195,12 @@ class SettingsManager:
             logger.warning(
                 "The key of {} in settings.json isn't text, so it is cleared. Enter it again on the Nodes page.",
                 ", ".join(unkeyed),
+            )
+        if unmapped:
+            logger.warning(
+                "The folder mappings of {} in settings.json aren't a list, so they are cleared. Enter them again on the "
+                "Nodes page.",
+                ", ".join(unmapped),
             )
         try:
             self._save()
