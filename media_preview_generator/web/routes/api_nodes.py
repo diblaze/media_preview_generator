@@ -474,7 +474,12 @@ def test_node_access(node_id: str):
         return jsonify({"error": err}), 400
     mappings = [protocol.PathMapping.from_json(r) for r in rows]
     try:
-        result = run_test_access(_make_client(record["url"], record["key"]), mappings, sm.get("media_servers") or [])
+        result = run_test_access(
+            _make_client(record["url"], record["key"]),
+            mappings,
+            sm.get("media_servers") or [],
+            node_name=str(record.get("name") or "This node"),
+        )
     except NodeError as exc:
         return jsonify({"error": f"Couldn't ask {record.get('name')}: {exc}"}), 502
     # The registry keeps a test of rows not saved yet aside, for when exactly those rows are saved.

@@ -440,8 +440,9 @@
         function failureCard(lib, index) {
             const files = Array.isArray(lib.files) ? lib.files : [];
             const bad = files.find((f) => !f.ok) || {};
-            // A library with no files sampled failed on this app's side; its error says why.
-            const why = (!files.length && lib.error) || NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
+            // A library with no files sampled failed on this app's side, and one the node lacks entirely is said
+            // so plainly; either way its error says why.
+            const why = lib.error || NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
             const tried = bad.node_path || bad.path || '';
             let html = `<div class="nd-fail" data-library="${esc(lib.library)}">`
                 + `<div><span class="nd-fail-h">${esc(lib.library)}: ${esc(String(why).replace(/\.$/, ''))}.</span>`
