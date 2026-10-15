@@ -388,6 +388,26 @@ class TestNodeList:
         expect(pc.locator(".nd-chips")).not_to_contain_text("Worker")
         expect(pc.locator(".nd-ico i")).to_have_class("bi bi-windows")
 
+    def test_a_node_that_isnt_answering_shows_when_it_was_seen_not_its_old_hardware_or_idle(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """An offline card said "idle" beside the GPU and cores of its last answer, as if it were up and waiting."""
+        _open_nodes(authed_page, app_url, _four_nodes())
+
+        old = authed_page.locator("#node-n-old")
+        expect(old.locator(".nd-status")).to_contain_text("seen 10 min ago")
+        expect(old.locator(".nd-chips")).to_have_text("Worker")
+        nuc = authed_page.locator("#node-n-nuc .nd-chips")
+        expect(nuc).to_contain_text("8 CPU")
+        expect(nuc).to_contain_text("idle")
+
+        _open_node(authed_page, "n-old")
+        overview = authed_page.locator("#nodeOverview")
+        expect(overview).to_contain_text("Last answered10 min ago")
+        expect(overview).not_to_contain_text("idle")
+        expect(overview).not_to_contain_text("load")
+        expect(overview).not_to_contain_text("free of")
+
     def test_empty_list_explains_nodes_and_links_the_docs(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, [])
         empty = authed_page.locator(".nd-empty")

@@ -92,6 +92,20 @@
         return [state.tone, node.state === 'ready' ? `✓ ${state.label}` : state.label];
     }
 
+    // In these the node didn't just answer as itself, so its cores, GPUs, load and files running are an old answer
+    // (or another machine's): the card says when it was seen instead.
+    const OLD_FACTS = ['offline', 'connecting', 'disabled', 'key_refused', 'duplicate'];
+    // Only these can have files running on them.
+    const TAKES_FILES = ['ready', 'gpu_lost', 'access_problem'];
+
+    function factsAreCurrent(node) {
+        return !OLD_FACTS.includes(node.state);
+    }
+
+    function filesRunningText(node) {
+        return isWorker(node) && TAKES_FILES.includes(node.state) ? busyText(node.busy) : '';
+    }
+
     function roles(node) {
         return Array.isArray(node.roles) ? node.roles : [];
     }
@@ -218,7 +232,8 @@
         const fixTab = FIX_TAB[node.state] || (badge && badge.fix ? 'health' : '');
         const openTab = fixTab || (badge ? 'health' : 'overview');
         const used = usedByParts(node.used_by);
-        const busy = isWorker(node) ? busyText(node.busy) : '';
+        const busy = filesRunningText(node);
+        const hardware = factsAreCurrent(node) ? hardwareChips(node) : '';
         // A turned-off node's reason ("Turned off on the Nodes page") only repeats its chip.
         const reason = node.reason && node.state !== 'disabled' ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
         const version = versionLine(node);
@@ -230,7 +245,7 @@
                     <h2 class="nd-name" title="${name}">${name}</h2>
                     <div class="nd-url" title="${esc(node.url)}">${esc(node.url)}</div>
                 </div>
-                <div class="nd-chips">${roleChips(node)}${hardwareChips(node)}${busy ? `<span class="nd-faint nd-busy">${esc(busy)}</span>` : ''}${used.length ? `<span class="nd-faint">used by ${esc(used.join(', '))}</span>` : ''}</div>
+                <div class="nd-chips">${roleChips(node)}${hardware}${busy ? `<span class="nd-faint nd-busy">${esc(busy)}</span>` : ''}${used.length ? `<span class="nd-faint">used by ${esc(used.join(', '))}</span>` : ''}</div>
                 <div class="nd-status">${pill(tone, text)}${badge ? `<span class="pill ${badge.tone} nd-to-fix" title="Open Setup Health to see what to fix">${badge.count} to fix</span>` : ''}${reason}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
                 <div class="nd-acts">
                     <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${openTab}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
@@ -968,17 +983,17 @@
         if (seen) rows.push(kv('Last answered', esc(seen)));
         const platform = node.platform || {};
         if (platform.os) rows.push(kv('System', esc([platform.os, platform.arch].filter(Boolean).join(' · '))));
+        // Load and free memory are only worth showing from a node that just answered as itself.
+        const current = factsAreCurrent(node);
         if (cpu.cores) {
-            const load = Number.isFinite(Number(cpu.load1)) && cpu.load1 !== null ? ` · load ${Number(cpu.load1).toFixed(1)}` : '';
-            rows.push(kv('CPU', `${esc(cpu.cores)} cores${esc(load)}${infoIcon('Load is the average number of busy cores over the last minute.')}`));
+            const load = current && Number.isFinite(Number(cpu.load1)) && cpu.load1 !== null ? ` · load ${Number(cpu.load1).toFixed(1)}` : '';
+            rows.push(kv('CPU', `${esc(cpu.cores)} cores${esc(load)}${load ? infoIcon('Load is the average number of busy cores over the last minute.') : ''}`));
         }
-        if (cpu.ram_total) {
+        if (cpu.ram_total && current) {
             rows.push(kv('Memory', esc(`${formatBytes(cpu.ram_available)} free of ${formatBytes(cpu.ram_total)}`)));
         }
-        if (isWorker(node)) {
-            const busy = busyText(node.busy);
-            if (busy) rows.push(kv('Busy', esc(busy)));
-        }
+        const busy = filesRunningText(node);
+        if (busy) rows.push(kv('Busy', esc(busy)));
         const used = usedByParts(node.used_by);
         rows.push(kv('Used by', used.length ? esc(used.join(', ')) : `<span class="text-muted">nothing yet</span>${isWorker(node) ? ` · <a href="/settings#section-workers">Add it to a worker group</a>` : ''}`));
         const overview = $('#nodeOverview');
