@@ -227,6 +227,8 @@ class _Live:
     roles: tuple[str, ...] = ()
     gpus: tuple[dict, ...] = ()
     last_seen: float | None = None
+    # The address it answered at: a name that stops resolving there may be a stopped node, a new address a typo.
+    seen_url: str = ""
     offline_streak: int = 0
     next_check: float = 0.0
     # When (``clock``) the node last said it is stopping, until it answers again; None meanwhile.
@@ -1218,7 +1220,7 @@ class NodeRegistry:
                 with self._lock:
                     live.checks_begun += 1
                     number = live.checks_begun
-                    seen_before = live.last_seen is not None
+                    seen_before = live.last_seen is not None and live.seen_url == str(record.get("url") or "")
                 try:
                     outcome = self._probe(record, client, seen_before=seen_before)
                 except Exception:
@@ -1403,6 +1405,7 @@ class NodeRegistry:
             live.offline_streak = 0
             delay = HEALTH_INTERVAL_S
             live.last_seen = self._wall_clock()
+            live.seen_url = str(live.record.get("url") or "")
         if outcome.state == STATE_READY:
             live.ready_check = number
         if outcome.state == STATE_KEY_REFUSED:

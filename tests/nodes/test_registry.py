@@ -2200,3 +2200,13 @@ def test_a_saved_address_urllib3_refuses_reads_offline_not_connecting_forever():
     )
     view = registry.check_now("n1")
     assert view is not None and view.state == reg.STATE_OFFLINE
+
+
+def test_a_newly_typed_name_that_does_not_resolve_is_not_called_stopped(h):
+    assert h.registry.check_now("n1").state == reg.STATE_READY
+    h.change(url="http://nuc-typo:9494")
+    h.client().default_info = NodeUnreachableError("http://nuc-typo:9494 can't be found", reason=UNREACHABLE_DNS)
+    view = h.registry.check_now("n1")
+    assert view.state == reg.STATE_OFFLINE
+    assert "may be stopped or renamed" not in view.reason
+    assert "Check the name" in view.reason
