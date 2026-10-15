@@ -189,13 +189,14 @@ svg .bx-vm { fill: none; stroke: var(--fg-2); stroke-width: 1.2; stroke-dasharra
 </style>
 
 <div class="wrap">
-  <div class="eyebrow">Media Preview Generator · design v4 · built · 15 Oct 2026</div>
+  <div class="eyebrow">Media Preview Generator · design v4 · live on sflix · 16 Oct 2026</div>
   <h1>Remote Worker Nodes</h1>
   <p class="lede">Add other machines to the app. A <b>worker node</b> lends its GPU or CPU to the same queue. A <b>Plex database node</b> does Plex-database work on the machine where Plex runs, which is the fix for Plex on Windows (#407). The main app stays in charge of everything. Nodes only do the work they're handed.</p>
   <div class="built"><b>Status: built and proven, waiting for your review</b>
     <ul>
-      <li>Everything below is built on the <code>stevezau/extra_node</code> branch. Nothing is pushed to dev, deployed or released. I built it before you reviewed this design, so ask for any change.</li>
-      <li>Every architecture review finding is fixed. The full test suite passes: 20,398 tests, 92% coverage. The Windows Plex database tests pass on a Windows machine (1,052 tests), and the Windows build starts and answers.</li>
+      <li>Everything below is merged into dev (PR #409) and running on sflix: plex is the main app and storage runs a worker node with its GPU and CPU. Nothing is released. I built it before you reviewed this design, so ask for any change.</li>
+      <li>Ten rounds of bug hunts ran, each followed by fixes. The full test suite passes: 22,222 tests. The Windows Plex database tests pass on a Windows machine (1,052 tests), and the Windows build starts and answers.</li>
+      <li>On sflix, storage runs previews and loudness for plex's jobs, and Test access passes on all nine libraries.</li>
       <li>In a real lab run, a GPU node, a CPU node and a Plex database node ran previews, intros/credits and loudness on real files. A node restarted or stopped mid-job and no file failed. See <a href="#built">"The real build in the lab"</a> and <a href="#shots">"Screenshots"</a>.</li>
     </ul>
   </div>

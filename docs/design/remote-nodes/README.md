@@ -20,13 +20,17 @@ https://claude.ai/artifact/G5nBhYJVFBekqJMQ93NCHa
 
 ## 0.1 Build status (2026-10-16)
 
-Built on `stevezau/extra_node` **before the owner reviewed this design** (owner: "build everything, test it, prove it,
-I'll review the design later and may ask for changes"). Opened as a PR to `dev` and deployed to sflix with a worker
-node on storage (2026-10-16); not released.
+Built **before the owner reviewed this design** (owner: "build everything, test it, prove it, I'll review the design
+later and may ask for changes"). Merged into `dev` as PR #409 (2026-10-16); later fixes go straight to `dev`. Live on
+sflix (plex) with a worker node on storage (`media-preview-node`, GPU + CPU, the four media disks read-only); not
+released.
 
-* **Bug hunts:** seven rounds of hunters (lab, UI in a browser, config, scheduling, security, Plex database, FFmpeg,
-  docs, no-node regressions), each followed by fix lanes. Round 7 found one MED (cancel during a frames download),
-  fixed; the rest LOW.
+* **Bug hunts:** ten rounds of hunters (lab at real-library scale, UI in a browser, config, scheduling, security, Plex
+  database, FFmpeg, docs, no-node regressions), each followed by fixes. Rounds 8 and 9 found MEDs (a node paused for
+  every library when it lacked one; a job cancelled during a long folder walk came back and queued retries; a node
+  mapped to part of a library was reported unmapped), all fixed.
+* **Live on sflix:** storage runs previews and loudness for plex's jobs (loudness at about 24x on its CPU); Test access
+  passes 3/3 on all nine libraries; a big manual job cancelled mid-walk stays cancelled with nothing run.
 
 * **Built:** every lane in §8: node server + `MODE=node`, Nodes page and API, node devices in worker groups, remote
   execution for previews / Intro & Credits / loudness, the Plex database role (old helper folded in, plus loudness
@@ -34,7 +38,7 @@ node on storage (2026-10-16); not released.
   (`docs/guides.md#remote-nodes`).
 * **Reviewed:** an Architecture Review per area (jobs, settings/auth, Plex database role), then one over all the fixes;
   every HIGH/MED/LOW from those is fixed.
-* **Proven:** the full unit suite (20,398 passed, 92% coverage), node + worker-group e2e, Windows CI (1,052 Plex
+* **Proven:** the full unit suite (22,222 passed; 91.8% coverage at the last coverage run), node + worker-group e2e, Windows CI (1,052 Plex
   database tests on `windows-latest`, PyInstaller build started and called), and a real lab run with GPU, CPU and
   Plex database nodes (all scenarios passed: [`evidence/lab-final/`](evidence/lab-final/README.md)).
 * **Changes from the design as written:**

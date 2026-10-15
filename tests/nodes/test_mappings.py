@@ -399,6 +399,33 @@ class TestRunTestAccess:
 
         assert (movies["mapped"], movies["ok"], movies["suggestion"]) == (True, False, None)
 
+    def test_every_row_inside_a_library_is_tested(self, tmp_path):
+        for disk in ("A", "B"):
+            for n in range(3):
+                _video(tmp_path / "media" / "Movies" / disk / f"{disk}{n}.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A"),
+            PathMapping(str(tmp_path / "media" / "Movies" / "B"), "/mnt/B"),
+        ]
+
+        (movies,) = nm.run_test_access(FakeClient(visible=lambda p: "/B/" not in p), rows, servers)["libraries"]
+
+        assert movies["ok"] is False
+        assert {os.path.basename(f["path"])[0] for f in movies["files"]} == {"A", "B"}
+
+    def test_overlapping_rows_inside_a_library_test_each_file_once(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "A" / "sub" / "s.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A"),
+            PathMapping(str(tmp_path / "media" / "Movies" / "A" / "sub"), "/mnt/sub"),
+        ]
+
+        (movies,) = nm.run_test_access(FakeClient(), rows, servers)["libraries"]
+
+        assert movies["checked"] == 1
+
     def test_a_covered_library_the_node_lacks_still_fails(self, tmp_path):
         _video(tmp_path / "media" / "Movies" / "a.mkv")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]

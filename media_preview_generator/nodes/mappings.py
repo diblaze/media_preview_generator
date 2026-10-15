@@ -221,6 +221,16 @@ def _rows_inside(app_root: str, mappings: list[PathMapping]) -> list[str]:
     return sorted({row.app_prefix.rstrip("/") for row in mappings if row.app_prefix.rstrip("/").startswith(base)})
 
 
+def _interleave(lists: list[list[dict]], limit: int) -> list[dict]:
+    """Files taken from each list in turn, each path once, up to ``limit``: every row inside a library gets tested."""
+    picked: dict[str, dict] = {}
+    for rank in range(max((len(files) for files in lists), default=0)):
+        for files in lists:
+            if rank < len(files) and len(picked) < limit:
+                picked.setdefault(files[rank]["path"], files[rank])
+    return list(picked.values())
+
+
 def _covering_row(app_root: str, mappings: list[PathMapping]) -> PathMapping | None:
     best: PathMapping | None = None
     for row in mappings:
@@ -414,7 +424,7 @@ def run_test_access(
     for root, folders in inside.items():
         parts = [by_folder[folder] for folder in folders]
         samplings[root] = _Sampling(
-            found=[f for part in parts for f in list(part.found)][:SAMPLES_PER_ROOT],
+            found=_interleave([list(part.found) for part in parts], max(SAMPLES_PER_ROOT, len(parts))),
             folder=next((part.folder for part in parts if part.folder), ""),
             timed_out=any(part.timed_out for part in parts),
             opened=any(part.opened for part in parts),
