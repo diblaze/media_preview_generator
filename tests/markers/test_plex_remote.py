@@ -41,7 +41,7 @@ from media_preview_generator.markers.publishers.plex_remote import AgentError, R
 from media_preview_generator.markers.settings import ServerMarkersSettings
 from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, RELAY_LINE_MAX
 from media_preview_generator.servers.base import ServerConfig, ServerType
-from tests.nodes.slow_answers import dripping_server
+from tests.nodes.slow_answers import answering_late, dripping_server
 
 T = MarkerType
 TOKEN = "s3cret-key-nobody-should-see"
@@ -608,6 +608,19 @@ class TestFailuresLookLikeTodays:
             took = time.monotonic() - started
         assert remote._client.state == plex_remote.AGENT_UNREACHABLE
         assert deadline_s - 0.1 <= took < deadline_s + 1.0
+
+    def test_a_slow_start_leaves_the_body_its_whole_time(self, monkeypatch):
+        # The default deadline counted from the request, so an answer whose headers took 0.9 s had 0.6 s for its body.
+        monkeypatch.setattr(plex_remote, "CONNECT_TIMEOUT_S", 0.5)
+        agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+        body = json.dumps({"ok": True, "agent": agent, "result": {"machine_identifier": "m1"}}).encode()
+        pieces = [b" ", b" ", b" ", body]
+        session = requests.Session()
+        session.trust_env = False
+        url = answering_late(wait_s=0.9, pieces=pieces, gap_s=0.3)
+        remote = RemotePlexDb(url, TOKEN, session=session)
+        remote._client.capabilities = list(_CAPABILITIES)
+        assert remote.node_machine_identifier(timeout=1.0) == "m1"
 
     def test_a_connection_cut_mid_answer_is_unreachable(self):
         class _Cut(FakeResponse):

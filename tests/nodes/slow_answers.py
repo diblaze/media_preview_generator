@@ -64,3 +64,32 @@ def dripping_server(body: bytes, *, drip_s: float, gap_s: float, sent_at_once: i
         except OSError:
             pass
         server.close()
+
+
+def answering_late(*, wait_s: float, pieces: list[bytes], gap_s: float = 0.0) -> str:
+    """A listener that answers one GET only after ``wait_s`` (a busy node), then sends ``pieces`` ``gap_s`` apart."""
+    server = socket.create_server(("127.0.0.1", 0))
+
+    def serve() -> None:
+        conn, _ = server.accept()
+        with conn:
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                received += chunk
+            time.sleep(wait_s)
+            length = sum(len(piece) for piece in pieces)
+            head = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+            try:
+                conn.sendall(head.encode())
+                for piece in pieces:
+                    conn.sendall(piece)
+                    time.sleep(gap_s)
+            except OSError:
+                pass  # the app gave up
+        server.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{server.getsockname()[1]}"

@@ -472,6 +472,7 @@ class TestAStalledFramesDownload:
         self, media, tmp_path, monkeypatch, stalling_node, stall_at, cancelled
     ):
         monkeypatch.setattr(client_mod, "ARTIFACT_TIMEOUT_S", 1.0)  # only how long each wait is
+        monkeypatch.setattr(client_mod, "ARTIFACT_HEADERS_TIMEOUT_S", 1.0)
         start, gets = stalling_node
         session = requests.Session()
         session.trust_env = False  # a proxy from the environment must not sit between the test and 127.0.0.1

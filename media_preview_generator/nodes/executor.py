@@ -617,7 +617,7 @@ class _TaskRun:
         The node keeps a finished task for minutes, so a fetch lost to an error that came back at once (a 429, a
         dropped connection, a 5xx, a refused connection) is tried again, up to MAX_FAILED_POLLS fetches over
         NODE_GONE_AFTER_S, rather than throwing the finished work away. A fetch that waited out its whole timeout
-        (``ARTIFACT_TIMEOUT_S`` with no byte, before the answer or partway through it) isn't tried again (each try
+        (``ARTIFACT_HEADERS_TIMEOUT_S`` with no answer, or ``ARTIFACT_TIMEOUT_S`` with no byte partway through it) isn't tried again (each try
         would wait as long again), nor is one the job's cancel or the app's stop is waiting on. A 429
         given up on is no drop (neither the node's doing nor the file's).
         """

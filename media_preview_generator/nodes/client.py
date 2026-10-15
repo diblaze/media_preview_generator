@@ -26,8 +26,8 @@ from . import protocol
 CONNECT_TIMEOUT_S = 3.0
 READ_TIMEOUT_S = 10.0
 # The read timeout is the longest wait for the next byte, so an answer sent a byte at a time never ran out of it. Each
-# answer must arrive whole within the connect and read timeouts together, counted from the request on: what a node that
-# sends nothing gets. Its largest real answer (a poll's 1.3 MB) takes 0.1 s on a 100 Mbit link.
+# answer must arrive whole within the connect and read timeouts together, counted from when its headers arrive (a slow
+# start doesn't take the body's time): what a node that sends nothing gets. Its largest real answer (a poll's 1.3 MB) takes 0.1 s on a 100 Mbit link.
 # /v1/info never waits on GPU detection, so a node that doesn't answer it this fast is stuck; three tries of it then
 # call a hung node offline within a minute, however slowly it sends, while the files it dropped are held back from it.
 INFO_TIMEOUT_S = 10.0
@@ -37,10 +37,13 @@ GPU_RESCAN_TIMEOUT_S = 60.0
 # once and keep coming however slow the link: this long with none is a stalled link. A job's cancel, or the app's
 # stop, waits for a stalled download no longer than this (a stalled poll is given up on within ~30 s too).
 ARTIFACT_TIMEOUT_S = 30.0
+# The longest wait for the artifact's headers: a busy node answers a queued request once the earlier ones finish, and
+# the finished work isn't redone if this gives up first.
+ARTIFACT_HEADERS_TIMEOUT_S = 120.0
 # The longest plausible preview (a 4-hour film at the 1 s interval: 14,400 frames of tens of KB each) is well under
 # this; a node sending more is refused rather than held in memory.
 MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
-# The whole artifact must arrive within this, from the request on: MAX_ARTIFACT_BYTES does at 1.2 MB/s (10 Mbit/s).
+# The whole artifact must arrive within this, from its headers on: MAX_ARTIFACT_BYTES does at 1.2 MB/s (10 Mbit/s).
 ARTIFACT_DEADLINE_S = 15 * 60.0
 # JSON parses into ~25x its size here (each 3-byte ``[],`` is a 64-byte list), so each answer gets a cap that fits it.
 # Most answers are one small object: health 164 bytes and info under 1 KB measured, a few KB with many GPUs.
@@ -217,6 +220,16 @@ def _answer_lost(exc: requests.ConnectionError) -> bool:
     return any(isinstance(cause, ProtocolError | ConnectionResetError) for cause in (reason, exc.__context__))
 
 
+def _set_body_timeout(response: Any, seconds: float) -> None:
+    """Make the wait for the next byte of the body ``seconds`` (the request's timeout covered the headers).
+
+    urllib3 keeps the connection of a streamed answer on ``raw``; a stand-in answer has none, and keeps its timeout.
+    """
+    sock = getattr(getattr(getattr(response, "raw", None), "_connection", None), "sock", None)
+    if sock is not None:
+        sock.settimeout(seconds)
+
+
 class AnswerTooSlowError(requests.Timeout):
     """An answer that didn't arrive whole by its deadline (``answer_pieces``)."""
 
@@ -307,11 +320,12 @@ class NodeClient:
     ) -> Any:  # fmt: skip
         if read_timeout is None:
             read_timeout = READ_TIMEOUT_S
-        # The whole answer's time, from the request on: by default the connect and read timeouts together, or
+        # The whole body's time, from when the headers arrive: by default the connect and read timeouts together, or
         # ARTIFACT_DEADLINE_S for a raw answer (the artifact).
         if deadline_s is None:
             deadline_s = ARTIFACT_DEADLINE_S if raw else CONNECT_TIMEOUT_S + read_timeout
-        deadline = time.monotonic() + deadline_s
+        # An artifact's headers wait for a busy node's queue; once its bytes flow, a stall is read_timeout long.
+        headers_timeout = ARTIFACT_HEADERS_TIMEOUT_S if raw else read_timeout
         # A node never compresses its answers, and requests would inflate a compressed one in memory past any cap.
         headers = {"Accept-Encoding": "identity", **(self._headers() if auth else {})}
         try:
@@ -320,7 +334,7 @@ class NodeClient:
                 self._address.base + path,
                 json=json,
                 headers=headers,
-                timeout=(CONNECT_TIMEOUT_S, read_timeout),
+                timeout=(CONNECT_TIMEOUT_S, headers_timeout),
                 # A redirect would carry the task (paths, mappings) to a host that isn't the node.
                 allow_redirects=False,
                 stream=True,
@@ -336,7 +350,9 @@ class NodeClient:
             # connects; such a node can never answer.
             raise NodeUnreachableError(f"{self._address.base} can't be reached: {type(exc).__name__}") from exc
         with response:
-            return self._answer(response, path, raw=raw, limit=limit, deadline=deadline)
+            if headers_timeout != read_timeout:
+                _set_body_timeout(response, read_timeout)
+            return self._answer(response, path, raw=raw, limit=limit, deadline=time.monotonic() + deadline_s)
 
     def _read(self, response: requests.Response, limit: int, deadline: float) -> bytearray:
         """The body, refused once it passes ``limit`` bytes (returned as read: a copy of an artifact is ~1 GB), or

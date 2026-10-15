@@ -967,7 +967,7 @@ class AgentClient:
             unreachable: What happens to the feature's work while the node doesn't answer, for that message.
             limit: The most bytes of the answer read; a larger one is refused unparsed.
             deadline_s: Seconds the whole answer may take, from the request on (None: the connect timeout and
-                ``timeout`` together).
+                ``timeout`` together, from when the headers arrive).
             rows: The answer is Library Health's rows (``_RowsReader``).
 
         Returns:
@@ -1031,7 +1031,7 @@ class AgentClient:
         if uid:
             headers[NODE_UID_HEADER] = uid
         timeout = max(1.0, timeout)
-        deadline = time.monotonic() + (CONNECT_TIMEOUT_S + timeout if deadline_s is None else deadline_s)
+        sent_at = time.monotonic()
         try:
             response = method(
                 f"{self.url}{path}",
@@ -1041,6 +1041,11 @@ class AgentClient:
                 allow_redirects=False,
                 stream=True,
                 **extra,
+            )
+            # An explicit deadline counts from the request; the default one from the headers, so a slow start doesn't
+            # take the body's time.
+            deadline = (
+                sent_at + deadline_s if deadline_s is not None else time.monotonic() + CONNECT_TIMEOUT_S + timeout
             )
             try:
                 payload = self._payload(response, deadline, limit, rows=rows)

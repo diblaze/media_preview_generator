@@ -37,7 +37,7 @@ from media_preview_generator.nodes.client import (
     NodeTimeoutError,
     NodeUnreachableError,
 )
-from tests.nodes.slow_answers import dripping_server
+from tests.nodes.slow_answers import answering_late, dripping_server
 
 
 def _client(error: Exception) -> NodeClient:
@@ -133,6 +133,35 @@ def _node_that_stops_partway(*, then: str) -> tuple[str, threading.Event]:
     return f"http://127.0.0.1:{server.getsockname()[1]}", release
 
 
+class TestAnAnswerThatStartsLate:
+    """A busy node answers after a wait; the finished work and the body's time must not be spent on that wait."""
+
+    def test_an_artifact_queued_behind_other_requests_is_still_fetched(self, monkeypatch):
+        """The headers shared the 30 s between-bytes wait, so a queued request's answer was given up on and the
+        finished frames were thrown away."""
+        monkeypatch.setattr(client_mod, "ARTIFACT_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(client_mod, "ARTIFACT_HEADERS_TIMEOUT_S", 3.0)
+        url = answering_late(wait_s=0.8, pieces=[b"tar bytes"])
+        assert bytes(_plain_client(url).fetch_artifact("t1")) == b"tar bytes"
+
+    def test_an_artifact_stalled_after_its_headers_is_still_given_up_on_at_the_between_bytes_wait(self, monkeypatch):
+        monkeypatch.setattr(client_mod, "ARTIFACT_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(client_mod, "ARTIFACT_HEADERS_TIMEOUT_S", 5.0)
+        url = answering_late(wait_s=0.0, pieces=[b"a", b"b"], gap_s=2.0)
+        started = time.monotonic()
+        with pytest.raises(NodeTimeoutError):
+            _plain_client(url).fetch_artifact("t1")
+        assert time.monotonic() - started < 1.5
+
+    def test_a_slow_start_leaves_the_body_its_whole_time(self, monkeypatch):
+        """The body's deadline counted from the request, so an answer that took 0.9 s to start had 0.6 s left."""
+        monkeypatch.setattr(client_mod, "CONNECT_TIMEOUT_S", 0.5)
+        monkeypatch.setattr(client_mod, "INFO_TIMEOUT_S", 1.0)
+        body = json.dumps(NODE_INFO).encode()
+        url = answering_late(wait_s=0.9, pieces=[b" ", b" ", body[:5], body[5:]], gap_s=0.3)
+        assert _plain_client(url).info()["node"]["id"] == "uid-1"
+
+
 class TestAFramesDownloadThatStopsPartway:
     """A stall after the headers (a cable pulled, the node machine asleep mid-transfer) read as a dropped connection,
     which the executor fetches again: three fetches each waited out the whole read timeout."""
@@ -162,7 +191,7 @@ class TestAFramesDownloadThatStopsPartway:
 
         assert session.request.call_args.kwargs["timeout"] == (
             client_mod.CONNECT_TIMEOUT_S,
-            client_mod.ARTIFACT_TIMEOUT_S,
+            client_mod.ARTIFACT_HEADERS_TIMEOUT_S,
         )
         stalled_poll_s = executor.NODE_GONE_AFTER_S + executor.MAX_FAILED_POLLS * client_mod.READ_TIMEOUT_S
         assert client_mod.ARTIFACT_TIMEOUT_S <= stalled_poll_s
