@@ -25,7 +25,7 @@ from typing import Any
 import requests
 from loguru import logger
 
-from ...nodes.client import answer_pieces
+from ...nodes.client import answer_pieces, new_session
 from ...nodes.protocol import KIND_PROTOCOL, KIND_WRONG_NODE, NODE_UID_HEADER, relayed_text
 from ..decide import FileLimits
 from ..models import Marker, MarkerType
@@ -950,7 +950,7 @@ class AgentClient:
         """
         self._set_address(url, token)
         self.name = str(name or "").strip()
-        self._session = session or requests.Session()
+        self._session = session or new_session()
         self._refusal_check = refusal
         self._node_uid = node_uid
         self._wrong_node = wrong_node

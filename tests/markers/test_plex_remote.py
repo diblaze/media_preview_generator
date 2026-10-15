@@ -41,7 +41,7 @@ from media_preview_generator.markers.publishers.plex_remote import AgentError, R
 from media_preview_generator.markers.settings import ServerMarkersSettings
 from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, RELAY_LINE_MAX
 from media_preview_generator.servers.base import ServerConfig, ServerType
-from tests.nodes.slow_answers import answering_late, dripping_server
+from tests.nodes.slow_answers import answering_late, dripping_server, headers_dripping_server
 
 T = MarkerType
 TOKEN = "s3cret-key-nobody-should-see"
@@ -633,6 +633,34 @@ class TestFailuresLookLikeTodays:
             took = time.monotonic() - started
         assert remote._client.state == plex_remote.AGENT_UNREACHABLE
         assert deadline_s - 0.1 <= took < deadline_s + 1.0
+
+    @pytest.mark.parametrize(
+        ("call", "deadline_s"),
+        [
+            (lambda r: r.read_item(7, deadline=_deadline(0.5)), 0.5 + 0.5 + 0.5),
+            (lambda r: r.node_machine_identifier(timeout=1.0), 0.5 + 1.0),
+        ],
+        ids=["item-read", "ping"],
+    )
+    def test_headers_dripped_a_byte_at_a_time_are_given_up_on_by_the_deadline(self, monkeypatch, call, deadline_s):
+        # Only the body had a deadline: headers sent a byte at a time, each inside the read timeout, held the call.
+        monkeypatch.setattr(plex_remote, "CONNECT_TIMEOUT_S", 0.5)
+        monkeypatch.setattr(plex_remote, "ANSWER_GRACE_S", 0.5)
+        # The client's own session, as the app uses it, with no proxy between it and 127.0.0.1.
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        agent = {"version": "1.2.0", "protocols": [1], "capabilities": _CAPABILITIES}
+        body = json.dumps({"ok": True, "agent": agent, "result": {}}).encode()
+        with headers_dripping_server(body, drip_s=10, gap_s=0.05) as url:
+            remote = RemotePlexDb(url, TOKEN)
+            remote._client.capabilities = list(_CAPABILITIES)
+            started = time.monotonic()
+            with pytest.raises(plex_remote.AgentUnreachableError, match="Can't reach the Plex database node"):
+                call(remote)
+            took = time.monotonic() - started
+        assert remote._client.state == plex_remote.AGENT_UNREACHABLE
+        assert took < deadline_s + 0.5
 
     def test_a_slow_start_leaves_the_body_its_whole_time(self, monkeypatch):
         # The default deadline counted from the request, so an answer whose headers took 0.9 s had 0.6 s for its body.
