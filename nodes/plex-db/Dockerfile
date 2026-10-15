@@ -81,4 +81,4 @@ EXPOSE 9494
 CMD ["sh", "-c", "exec python -m media_preview_generator.nodes.server.wsgi --port ${NODE_PORT:-${AGENT_PORT:-9494}} --threads 8"]
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD exec python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + (os.environ.get('NODE_PORT') or os.environ.get('AGENT_PORT') or '9494') + '/v1/health', timeout=5)"
+    CMD exec python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + ((os.environ.get('NODE_PORT') or os.environ.get('AGENT_PORT') or '').strip() or '9494') + '/v1/health', timeout=5)"
