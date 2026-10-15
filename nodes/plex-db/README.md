@@ -190,8 +190,9 @@ as before, and its "Keep Plex's" keeps stale markers even where the app has an a
 
 ## The contract
 
-Everything is `POST` with a JSON body, except `/v1/health` and `/v1/ping`. Every request carries
-`Authorization: Bearer <key>` and `X-Marker-Agent-Protocol: 1`; every answer carries
+Everything is `POST` with a JSON body, except `/v1/health`, `/v1/ping`, `/v1/info` and `/v1/log`. Every request carries
+`Authorization: Bearer <key>` and `X-Marker-Agent-Protocol: 1` (`/v1/info` and `/v1/log` take
+`X-MPG-Node-Protocol: 1` instead, or answer 409); every answer but `/v1/log`'s carries
 `{"agent": {"version", "protocols", "capabilities"}}`. Protocol 2 is protocol 1 plus `X-MPG-Node-Uid: <the node's id>`,
 which the app sends once it has recorded the node's id: a node with another id answers 409
 `{"error": {"kind": "wrong_node"}}` and runs nothing, so a machine given another node's key and address never writes
@@ -201,6 +202,8 @@ into its Plex what was meant for that node's.
 |---|---|---|
 | `GET /v1/health` | Liveness for the container's health check. No key, nothing about your library. | `{"ok": true, "agent": …}` |
 | `GET /v1/ping` | The version, advertised capabilities, which Plex this node serves, and whether the database file is there. Needs the key but no protocol header, so it still answers when the two sides disagree. The app checks it before chapter operations; marker "Check again" runs the two checks below. | `agent.capabilities`, `result.db_present`, `result.machine_identifier` |
+| `GET /v1/info` | What the app's node checks read: the node's version and roles, its platform, which Plex it serves and whether the database file is there. | `node`, `platform`, `plex_db`, `agent` |
+| `GET /v1/log?lines=N` | The node's recent log lines for its card in the app (200 by default, 2000 at most). | `lines` |
 | `POST /v1/checks/file` | Is the database found, on a local disk, writable, and open in Plex's process? Also which Plex this is. | `result.report` (a capability report), `result.machine_identifier` |
 | `POST /v1/checks/db` | Is it the tested schema, is its marker data readable, is Plex's marker tag row there? | `result.report` |
 | `POST /v1/item/read` | One item's live parts (schema and tag row checked first). | `result.item` |

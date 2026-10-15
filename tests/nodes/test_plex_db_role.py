@@ -927,6 +927,28 @@ class TestTheNodeSaysWhetherItHasTheRole:
         outcome = registry._read_info(record, info)
         assert outcome.state == reg.STATE_UPDATE_NEEDED and "9.0.0" in outcome.reason
 
+    def test_the_readmes_contract_names_the_routes_the_app_reads_and_their_header(self, tmp_path, monkeypatch):
+        # A proxy allowlist built from the README's table must let the app's node checks and log reads through.
+        from media_preview_generator.nodes.server import app as node_app_module
+
+        plex = tmp_path / "Plex Media Server"
+        plex.mkdir()
+        monkeypatch.setenv("PLEX_CONFIG_DIR", str(plex))
+        app = node_app_module.create_node_app(config_dir=str(tmp_path / "cfg"), roles=["plex_db"], key=self.KEY)
+        routes = (protocol.ROUTE_INFO, f"{protocol.ROUTE_LOG}?lines=1")
+        auth = {"Authorization": f"Bearer {self.KEY}"}
+        try:
+            client = app.test_client()
+            assert [client.get(route, headers=auth).status_code for route in routes] == [409, 409]
+            headers = {**auth, protocol.PROTOCOL_HEADER: str(protocol.NODE_PROTOCOL)}
+            assert [client.get(route, headers=headers).status_code for route in routes] == [200, 200]
+        finally:
+            app.extensions["mpg_node"].close()
+        readme = (AGENT_DIR / "README.md").read_text(encoding="utf-8")
+        contract = readme.split("## The contract", 1)[1].split("\n## ", 1)[0]
+        assert [r for r in (protocol.ROUTE_INFO, protocol.ROUTE_LOG) if f"`GET {r}" not in contract] == []
+        assert f"`{protocol.PROTOCOL_HEADER}: {protocol.NODE_PROTOCOL}`" in contract
+
     def test_a_worker_only_node_has_no_agent_block(self, tmp_path, monkeypatch):
         import media_preview_generator.nodes.server.info as info_module
         from media_preview_generator.nodes.server import app as node_app_module
