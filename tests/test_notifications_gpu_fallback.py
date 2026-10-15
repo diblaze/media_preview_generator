@@ -214,19 +214,32 @@ class TestCreditsOnCpuNotification:
         dismiss_session(card_id)
         assert card_id not in [n["id"] for n in build_active_notifications()]
 
-    def test_the_streak_card_for_the_same_gpu_is_suppressed_but_another_gpu_still_shows(self, credits_devices):
-        credits_devices.append(CREDITS_DEVICE)
-        credits = "Credits read on the CPU: this GPU failed its accuracy check. Previews still use the GPU."
-        _flag(KEY, "GPU A", reason=credits)
-        _flag("/dev/dri/renderD129", "GPU B", reason=credits)
+    def test_the_streak_card_for_a_kept_on_cpu_gpu_is_suppressed_but_another_gpu_still_shows(self):
+        _flag(KEY, "GPU A", reason="Credits read on the CPU until restart: this GPU failed its accuracy check.")
+        _flag("/dev/dri/renderD129", "GPU B", reason="Credits read on the CPU: the GPU crashed. It's tried again.")
         assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == ["/dev/dri/renderD129"]
 
     def test_a_preview_streak_on_the_same_gpu_still_shows_its_card(self, credits_devices):
         # The credits card says previews still use the GPU; a streak last fed by a preview decode failing says
         # otherwise, so its own card must not be hidden.
         credits_devices.append(CREDITS_DEVICE)
-        _flag(KEY, "GPU A", reason="Credits read on the CPU: this GPU failed its accuracy check.", n=4)
+        _flag(KEY, "GPU A", reason="Credits read on the CPU until restart: this GPU failed its accuracy check.", n=4)
         _flag(KEY, "GPU A", reason="hevc not supported", n=1)
+        assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == [KEY]
+
+    def test_software_vulkan_streak_gets_no_card_for_a_local_or_node_gpu(self):
+        # Issue #408: Vulkan offered only llvmpipe, so every credits file is read on the CPU by design.
+        reason = "Credits read on the CPU until restart: Vulkan reports no hardware GPU"
+        _flag(KEY, "Intel UHD Graphics 600", reason=reason)
+        _flag("node:n1:/dev/dri/renderD128", "Node GPU", reason=reason)
+        assert _build_gpu_keeps_failing_notifications() == []
+
+    def test_a_crashing_credits_helper_still_gets_the_streak_card(self):
+        # A crash is retried, so five in a row is the GPU failing.
+        reason = (
+            "Credits read on the CPU: the GPU crashed (exit code 9) while reading credits. It's tried again shortly."
+        )
+        _flag(KEY, "GPU A", reason=reason)
         assert [c["device"] for c in _build_gpu_keeps_failing_notifications()] == [KEY]
 
     def test_a_failing_read_gives_no_cards(self, monkeypatch):

@@ -104,13 +104,69 @@ def reset_session() -> None:
         _SESSION_DISMISSED.clear()
 
 
+def _vulkan_failures() -> list[tuple[dict[str, Any], Any]]:
+    """The detected GPUs that can't use Vulkan, each with its check; empty when none is known to fail."""
+    from ..gpu.vulkan_check import get_vulkan_checks
+    from .routes._helpers import _ensure_gpu_cache
+    from .routes.api_vulkan import _diagnose_vulkan_environment
+
+    try:
+        gpus = list(_ensure_gpu_cache())
+        checks = get_vulkan_checks(gpus, _diagnose_vulkan_environment)
+    except Exception as exc:  # noqa: BLE001 - the card still shows, with the general text
+        logger.debug("Couldn't check why Vulkan is unavailable for the notification: {}", exc)
+        return []
+    return [(gpu, check) for gpu, check in zip(gpus, checks, strict=True) if check is not None and not check.ok]
+
+
+def _vulkan_card_body(failures: list[tuple[dict[str, Any], Any]]) -> str:
+    """The bell card's body: what this means, why, what to do (plain text escaped; NVIDIA keeps its detailed HTML)."""
+    from markupsafe import escape
+
+    from ..markers.credits.textdet_helper import _WEBGPU_VENDORS
+    from .routes.api_vulkan import _diagnose_vulkan_environment, _nvidia_body_html
+
+    several = len(failures) > 1
+    effects = []
+    if any(gpu.get("type") in _WEBGPU_VENDORS for gpu, _ in failures):
+        effects.append("Credits text is read on the CPU: just as accurate, slower.")
+    effects.append("Dolby Vision Profile 5 thumbnails get a green and purple tint.")
+    effects.append("Previews and intros still use the GPU.")
+    html = "<strong>What this means</strong><ul>" + "".join(f"<li>{escape(e)}</li>" for e in effects) + "</ul>"
+
+    why_items, fix_items = [], []
+    for gpu, check in failures:
+        name = escape(gpu.get("name") or gpu.get("type") or "GPU")
+        if check.cause.startswith("nvidia_"):
+            detail = _nvidia_body_html(check.cause, _diagnose_vulkan_environment(), gpu.get("name") or "NVIDIA GPU")
+            why_items.append(detail)
+            continue
+        fix = (
+            "Nothing, if the CPU keeps up. A host OS update with a newer kernel fixes it."
+            if (check.cause == "kernel_too_old")
+            else check.fix
+        )
+        why_items.append(f"{f'<strong>{name}:</strong> ' if several else ''}{escape(check.why)}")
+        fix_items.append(f"{f'<strong>{name}:</strong> ' if several else ''}{escape(fix)}")
+    html += "<strong>Why</strong>" + _paragraph_or_list(why_items)
+    if fix_items:
+        html += "<strong>What to do</strong>" + _paragraph_or_list(fix_items)
+    return html
+
+
+def _paragraph_or_list(items: list[str]) -> str:
+    """One item as a paragraph, several as a list: a one-bullet list reads as if something is missing."""
+    if len(items) == 1:
+        return f"<p class='mb-2'>{items[0]}</p>"
+    return "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
+
+
 def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
     """Return a notification dict when the Vulkan probe fell back to software.
 
-    Returns ``None`` when Vulkan is healthy (no warning needed).  When
-    the warning fires, reuses the existing GPU-aware HTML body from
-    ``api_vulkan._get_vulkan_info`` so there is a single source of
-    truth for the remediation text.
+    Returns ``None`` when Vulkan is healthy (no warning needed).  When a GPU's check says why it can't use Vulkan, the
+    card names that GPU and the cause. Otherwise (no GPU known to fail) it keeps the general Dolby Vision text from
+    ``api_vulkan._get_vulkan_info``.
     """
     # Deferred import to avoid circular import (api_vulkan imports from
     # gpu_detection which imports loguru which... keep it lazy).
@@ -121,7 +177,7 @@ def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
     if not warning_html:
         return None
 
-    return {
+    card = {
         "id": VULKAN_SOFTWARE_FALLBACK_ID,
         "severity": "warning",
         "title": "Dolby Vision Profile 5 thumbnails will have the wrong colours",
@@ -130,6 +186,19 @@ def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
         "source": "vulkan_probe",
         "device": info.get("device"),
     }
+    failures = _vulkan_failures()
+    if not failures:
+        return card
+    if len(failures) == 1:
+        gpu, check = failures[0]
+        card["title"] = (
+            f"{gpu.get('name') or gpu.get('type')} can't use Vulkan: {check.title[:1].lower()}{check.title[1:]}"
+        )
+    else:
+        card["title"] = f"Vulkan isn't working on {len(failures)} GPUs"
+    card["body_html"] = _vulkan_card_body(failures)
+    card["action"] = {"href": "/settings#section-processing", "label": "Open GPU check"}
+    return card
 
 
 def _build_timezone_misconfigured_notification() -> dict[str, Any] | None:
@@ -383,14 +452,14 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     """
     from markupsafe import escape
 
-    from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
+    from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX
 
     cards = []
-    credits_keys = {device["key"] for device in _credits_on_cpu_devices()}
     for state in get_gpu_fallback_tracker().flagged():
-        # The credits card already explains a streak of credits fallbacks, and "check the GPU driver" is wrong for
-        # them; a streak whose last file fell back for another reason (a preview decode) still gets this card.
-        if state.key in credits_keys and (state.last_reason or "").startswith(CREDITS_ON_CPU_PREFIX):
+        # A GPU whose credits stay on the CPU for the process sends every credits file there by design, and its own
+        # card (self-test) or the Vulkan card says why; "check the GPU driver" is wrong for that. A streak whose last
+        # file fell back for another reason (a preview decode, a crashed helper that is retried) still gets this card.
+        if (state.last_reason or "").startswith(CREDITS_KEPT_ON_CPU_PREFIX):
             continue
         node_id = _gpu_streak_node_id(state.key)
         if node_id is None:

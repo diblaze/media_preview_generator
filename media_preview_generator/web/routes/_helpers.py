@@ -163,5 +163,8 @@ def clear_gpu_cache() -> None:
 
     Useful for tests and when the user explicitly requests a re-scan.
     """
+    from ...gpu.vulkan_check import clear_vulkan_check_cache
+
     with _gpu_cache_lock:
         _gpu_cache["result"] = None
+    clear_vulkan_check_cache()

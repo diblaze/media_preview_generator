@@ -1079,7 +1079,7 @@
         const list = $('#nodeGpuList');
         const items = gpus(node);
         // An old answer (or another machine's) says nothing about whether a GPU works now.
-        list.innerHTML = items.length
+        redrawKeepingFocus(list, items.length
             ? items.map((gpu) => {
                 const okGpu = !gpu.status || gpu.status === 'ok';
                 const status = okGpu ? pill('ok', '✓ Working') : pill('bad', '✗ Not working');
@@ -1087,9 +1087,10 @@
                     + pill('off', [gpu.type, gpu.device].filter(Boolean).join(' · '), { mono: true })
                     + (current ? status : '')
                     + (current && gpu.error ? `<span class="nd-faint">${esc(gpu.error)}</span>` : '')
+                    + (current && gpu.vulkan ? `<div class="w-100">${window.MPGShared.vulkanLine(gpu.vulkan)}</div>` : '')
                     + '</div>';
             }).join('')
-            : `<div class="sm-hint">No GPU found.${GIVES_WORKERS.includes(node.state) ? ' CPU work still runs on this node.' : ''}</div>`;
+            : `<div class="sm-hint">No GPU found.${GIVES_WORKERS.includes(node.state) ? ' CPU work still runs on this node.' : ''}</div>`);
         // A node that isn't answering as itself can't rescan its GPUs. Focus moves to the dialog first: disabling the
         // focused button would drop it to the page, where Esc no longer closes the dialog.
         const rescan = $('#nodeRescanGpus');

@@ -274,15 +274,14 @@ class TestDashboardWarning:
         assert notification is not None
         _assert_describes_wrong_colours(notification["title"])
 
-    def test_debug_bundle_intro_says_wrong_colours(self) -> None:
-        from media_preview_generator.web.routes.api_vulkan import get_vulkan_debug
-
+    def test_debug_bundle_intro_says_wrong_colours(self, client, auth_headers) -> None:
         with (
             patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device", return_value=SOFTWARE_DEVICE),
             patch("media_preview_generator.web.routes.api_vulkan._diagnose_vulkan_environment", return_value=_diag()),
         ):
-            body, status, _headers = get_vulkan_debug()
+            response = client.get("/api/system/vulkan/debug", headers=auth_headers)
 
-        assert status == 200
+        body = response.get_data(as_text=True)
+        assert response.status_code == 200
         intro = body.split("--- Probe result ---", 1)[0]
         _assert_describes_wrong_colours(intro)

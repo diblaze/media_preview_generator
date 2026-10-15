@@ -21,6 +21,7 @@ from typing import Any
 
 from loguru import logger
 
+from ...gpu.vulkan_check import clear_vulkan_check_cache, diagnose_nvidia_environment, log_vulkan_warnings
 from . import nodelog
 from .tasks import probe_temp_folder
 
@@ -46,6 +47,21 @@ def _gpu_entry(raw: object) -> dict[str, Any]:
         "status": str(details.get("status") or "ok"),
         "error": str(error) if error else None,
     }
+
+
+def _vulkan_checks(gpus: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+    """Each GPU's Vulkan check (``VulkanCheck.to_dict()``) from this node's own probe, None where unknown.
+
+    Never raises: the check is a detail on the GPU list, which must still answer.
+    """
+    from ...gpu.vulkan_check import diagnose_nvidia_environment, get_vulkan_checks
+
+    try:
+        checks = get_vulkan_checks(gpus, diagnose_nvidia_environment)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.debug("Couldn't check why Vulkan is unavailable on this node: {}", exc)
+        return [None] * len(gpus)
+    return [check.to_dict() if check else None for check in checks]
 
 
 def _credit_text(gpu_type: str, device: str) -> dict[str, Any] | None:
@@ -285,6 +301,7 @@ class WorkerInfo:
         with self._detect_lock:
             detect = self._detect
             error: str | None = None
+            detected_ok = False
             held: list[tuple[str, str]] = []
             try:
                 if detect is None:
@@ -294,6 +311,15 @@ class WorkerInfo:
                 with nodelog.held_lines(held) if quiet else contextlib.nullcontext():
                     raw = detect()
                 found = [_gpu_entry(entry) for entry in raw or []]
+                if not quiet:
+                    clear_vulkan_check_cache()
+                with self._cache_lock:
+                    # A re-check keeps the Vulkan checks already known, until the new ones are worked out below.
+                    known = {(g["type"], g["device"]): g["vulkan"] for g in self._gpus or [] if "vulkan" in g}
+                for entry in found:
+                    if (entry["type"], entry["device"]) in known:
+                        entry["vulkan"] = known[(entry["type"], entry["device"])]
+                detected_ok = True
             except Exception as exc:  # noqa: BLE001 - a broken probe must not take /v1/info down with it
                 logger.opt(exception=True).warning("GPU detection failed on this node; it keeps its last GPU list")
                 with self._cache_lock:
@@ -305,7 +331,29 @@ class WorkerInfo:
             self._detected.set()
             for level, message in held:
                 logger.log(level if changed else "DEBUG", "{}", message)
+            if detected_ok:
+                found = self._attach_vulkan(found)
+            if changed:
+                log_vulkan_warnings(found, diagnose_nvidia_environment)
             return [dict(entry) for entry in found]
+
+    def _attach_vulkan(self, found: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Work out each GPU's Vulkan check and store it on the cached list.
+
+        Runs after the list is published: the check may run FFmpeg's Vulkan probe for several seconds, which the first
+        /v1/info must not wait for. Called with the detect lock held.
+
+        Args:
+            found: The list just published.
+
+        Returns:
+            The list with each GPU's ``vulkan``.
+        """
+        with_vulkan = [{**entry, "vulkan": vulkan} for entry, vulkan in zip(found, _vulkan_checks(found), strict=True)]
+        with self._cache_lock:
+            if self._gpus is found:
+                self._gpus = with_vulkan
+        return with_vulkan
 
     def gpus(self) -> list[dict[str, Any]]:
         """The cached GPU list, with ``credit_text`` where known.

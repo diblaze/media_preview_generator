@@ -76,6 +76,11 @@ def dv5_no_vulkan_fix() -> str:
 # A node has no dashboard and its diagnostic bundle isn't shown anywhere; its console has the loader's lines at DEBUG.
 _NODE_VULKAN_HELP = "If that doesn't help, file a GitHub issue with this node's docker logs taken at LOG_LEVEL=DEBUG."
 
+_DASHBOARD_VULKAN_HELP = (
+    "If that doesn't help, open Settings → Processing Options → GPU device tuning in the dashboard: it says why "
+    "each GPU can't use Vulkan and has a 'Copy diagnostic bundle' button ({size} bytes captured) for a GitHub issue."
+)
+
 # Candidate paths the Vulkan loader searches for the NVIDIA ICD JSON. The
 # nvidia-container-toolkit mounts it at /etc/vulkan/icd.d/, but older
 # loaders and some distributions only look under /usr/share/vulkan/icd.d/
@@ -587,14 +592,11 @@ def _probe_vulkan_device() -> str | None:
     if is_node_mode():
         more_help = _NODE_VULKAN_HELP
     else:
-        more_help = (
-            "If that doesn't help, open Settings → System in the dashboard and click "
-            f"'Copy Vulkan diagnostic bundle' ({len(_VULKAN_DEBUG_BUFFER)} bytes captured), or include it when "
-            "filing a GitHub issue."
-        )
+        more_help = _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
+    tried = " even after trying NVIDIA-specific fixes" if nvidia_icd or nvidia_egl_vendor else ""
     logger.warning(
-        "Vulkan hardware setup couldn't be detected on this container, even after trying NVIDIA-specific fixes. "
-        "{} {} {}",
+        "Vulkan hardware setup couldn't be detected on this container{}. {} {} {}",
+        tried,
         DV5_NO_VULKAN_EFFECT,
         dv5_no_vulkan_fix(),
         more_help,
@@ -635,10 +637,7 @@ def _run_first_vulkan_probe() -> None:
         )
     elif _is_software_vulkan_device(probe_device):
         more_help = (
-            _NODE_VULKAN_HELP
-            if is_node_mode()
-            else "Settings → System in the dashboard has GPU-specific steps and a diagnostic bundle "
-            "you can attach to a GitHub issue."
+            _NODE_VULKAN_HELP if is_node_mode() else _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
         )
         logger.warning(
             "Vulkan picked a software rasterizer ({}) instead of your GPU. {} {} {}",

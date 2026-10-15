@@ -201,10 +201,12 @@ function renderGpuTuningPanel(detectedGpus, savedConfig) {
     const rows = detectedGpus.map((gpu, index) => {
         const config = saved.get(gpu.device) || {};
         const failed = gpu.status === 'failed';
+        const decoding = failed ? '' : `<div class="vk-line"><span class="vk-ok" aria-hidden="true">✓</span> Video decoding (previews) <span class="vk-detail">${escapeHtml(gpu.acceleration || '')}</span></div>`;
+        const vulkan = failed ? '' : window.MPGShared.vulkanLine(gpu.vulkan, { bundle: true });
         const failure = failed ? `<div class="hint-line hint-bad"><i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i><span><strong>${escapeHtml(gpu.error || 'Acceleration test failed')}</strong>${gpu.error_detail ? ' ' + escapeHtml(gpu.error_detail) : ''} Fix the issue and click Re-scan GPUs.</span></div>` : '';
         return `<div class="gpu-row${failed ? ' is-failed' : ''}">
             <span class="gpu-ico" aria-hidden="true"><i class="bi bi-gpu-card"></i></span>
-            <div class="gpu-main"><strong class="gpu-name">${escapeHtml(gpu.name || 'GPU')}</strong><div class="gpu-id">${_gpuPanelVendorMark(gpu.type)}${escapeHtml(gpu.device || '')}</div>${failure}</div>
+            <div class="gpu-main"><strong class="gpu-name">${escapeHtml(gpu.name || 'GPU')}</strong><div class="gpu-id">${_gpuPanelVendorMark(gpu.type)}${escapeHtml(gpu.device || '')}</div>${decoding}${vulkan}${failure}</div>
             <div class="gpu-control"><label for="gpuTuning${index}">FFmpeg threads per worker</label>
             <input id="gpuTuning${index}" type="number" min="0" max="32" class="form-control gpu-tuning-threads has-stepper"
                 data-device="${escapeHtml(gpu.device)}" data-name="${escapeHtml(gpu.name)}" data-type="${escapeHtml(gpu.type)}" value="${config.ffmpeg_threads ?? 2}"></div></div>`;

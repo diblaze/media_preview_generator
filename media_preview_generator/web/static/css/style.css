@@ -2589,3 +2589,10 @@ nav.navbar { min-height: 57px; }
 .automation-page .pill.ok { background: var(--ok-soft); color: var(--ok); }
 .dashboard-layout .pill.warn,
 .automation-page .pill.warn { background: var(--warn-soft); color: var(--warn); }
+
+/* Capability lines under a GPU (Settings GPU tuning, Nodes GPU list): "✓ Vulkan device" / "✕ Vulkan cause  Why?" */
+.vk-line { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 0.375rem; margin-top: 0.25rem; font-size: 0.8125rem; color: var(--muted); }
+.vk-line .vk-ok { color: var(--ok); font-weight: 700; }
+.vk-line .vk-bad { color: var(--bad); font-weight: 700; }
+.vk-line .vk-detail { color: var(--faint); }
+.vk-why { margin-top: 0.25rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-ctl); background: var(--inset); color: var(--muted); font-size: 0.8125rem; }

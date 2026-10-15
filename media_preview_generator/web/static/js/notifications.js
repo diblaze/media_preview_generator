@@ -128,7 +128,7 @@ function renderNotifications(notifications) {
         var action = notif.action;
         if (action && typeof action.href === 'string' && action.href.charAt(0) === '/' && action.href.charAt(1) !== '/') {
             var go = document.createElement('a');
-            go.className = 'btn btn-sm btn-outline-warning';
+            go.className = 'btn btn-sm btn-outline-warning text-nowrap';
             go.href = action.href;
             go.textContent = action.label || 'Open';
             actions.appendChild(go);
