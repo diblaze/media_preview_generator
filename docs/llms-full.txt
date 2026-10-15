@@ -1601,7 +1601,7 @@ docker exec -it media-preview-generator python -m media_preview_generator.loudne
 
 On the Windows Plex database node there is no container: stop Plex and run
 `PlexDbNode-debug.exe --undo-loudness` from `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode` (add
-`--dry-run` first). It finds its own record and Plex's database by itself.
+`--dry-run` first). It finds its own record, and Plex's database from that record.
 
 Use the original database at the same mounted location: undo refuses a copied, replaced or different database. Logs
 without database identity are refused. Records for other servers and changed audio sources are

@@ -295,6 +295,43 @@ class TestTheWindowsEntryPoint:
             ]
         ]
 
+    @staticmethod
+    def _undo_with_record(tmp_path, monkeypatch, databases: list[str], *extra: str) -> tuple[int, list[list[str]]]:
+        from media_preview_generator.loudness import undo
+
+        node_dir = tmp_path / "node"
+        node_dir.mkdir()
+        lines = [
+            json.dumps({"format": 2, "kind": "intent", "database": {"path": db, "device": 1, "inode": 2}})
+            for db in databases
+        ]
+        (node_dir / "loudness-writes.jsonl").write_text("\n".join([*lines, '{"cut short']) + "\n")
+        calls: list[list[str]] = []
+        monkeypatch.setattr(undo, "main", lambda argv: calls.append(argv) or 0)
+        monkeypatch.delenv("CONFIG_DIR", raising=False)
+        monkeypatch.delenv("PLEX_CONFIG_DIR", raising=False)
+        code = _entry_point().main(["--config-dir", str(node_dir), "--undo-loudness", *extra])
+        return code, calls
+
+    def test_undo_loudness_finds_the_database_its_record_names(self, tmp_path, monkeypatch):
+        """A node installed with -PlexConfigDir: the undo needs no folder, because every record names its database."""
+        moved = r"D:\PlexData\Plex Media Server\Plug-in Support\Databases\com.plexapp.plugins.library.db"
+        code, calls = self._undo_with_record(tmp_path, monkeypatch, [moved, moved])
+        assert code == 0
+        assert calls == [["--db", moved, "--log", str(tmp_path / "node" / "loudness-writes.jsonl")]]
+
+    def test_an_explicit_plex_folder_still_wins(self, tmp_path, monkeypatch):
+        plex_dir = tmp_path / "Plex Media Server"
+        code, calls = self._undo_with_record(
+            tmp_path, monkeypatch, ["/recorded.db"], "--plex-config-dir", str(plex_dir)
+        )
+        assert code == 0 and calls[0][:2] == ["--db", plex_db.plex_db_path(str(plex_dir))]
+
+    def test_a_record_of_two_databases_asks_which_one(self, tmp_path, monkeypatch, capsys):
+        code, calls = self._undo_with_record(tmp_path, monkeypatch, ["/a.db", "/b.db"])
+        assert (code, calls) == (2, [])
+        assert "--plex-config-dir" in capsys.readouterr().err
+
     def test_undo_loudness_without_a_record_says_so(self, tmp_path, capsys, monkeypatch):
         monkeypatch.delenv("CONFIG_DIR", raising=False)
         entry = _entry_point()

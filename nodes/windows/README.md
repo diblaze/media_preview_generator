@@ -58,8 +58,8 @@ Stop Plex, then in PowerShell:
 & "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\PlexDbNode-debug.exe" --undo-loudness --dry-run
 ```
 
-`--dry-run` only counts what would be put back; run it again without `--dry-run` to restore. If you installed with
-`-PlexConfigDir`, add the same `--plex-config-dir "..."` here. What it restores and what it leaves alone is in
+`--dry-run` only counts what would be put back; run it again without `--dry-run` to restore. It finds Plex's database
+from its own record, also when you installed with `-PlexConfigDir`. What it restores and what it leaves alone is in
 [Undoing it](../../docs/plex-loudness-normalization.md#undoing-it).
 
 ## Why it starts at logon instead of as a Windows service
