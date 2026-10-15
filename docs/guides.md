@@ -689,8 +689,9 @@ docker run -d --name media-preview-node -p 9494:9494 \
    then under each node's name. Hours, job types and worker counts work as for this app's devices.
 
 The node card shows its state: **Ready**, **Connecting…** (not checked yet), **Offline**, **Key refused**,
-**Update needed**, **FFmpeg missing**, **Access problem**, **GPU lost** or **Turned off**. Only a ready node gets work;
-a node that lost its GPU keeps its CPU workers. Each node also has its own **Setup Health** and **Log** tabs.
+**Update needed**, **FFmpeg missing**, **Temp folder problem**, **Access problem**, **GPU lost**, **Added twice** (the
+same machine at two addresses) or **Turned off**. Only a ready node gets work; a node that lost its GPU keeps its CPU
+workers. Each node also has its own **Setup Health** and **Log** tabs.
 
 If a node goes away mid-file, the file goes back to the queue and runs on another worker. A file the node can't see
 at its mapped path runs elsewhere instead of failing.
@@ -699,13 +700,25 @@ at its mapped path runs elsewhere instead of failing.
 
 When you update this app, update every **worker node** to the same image tag: until then its card says **Update
 needed** and it gets no work. Pull the new image and recreate the container with the same settings, keeping its
-`/config` (`docker compose pull && docker compose up -d`, or `docker pull` and the same `docker run` again). Watchtower
-can update nodes too, like the app.
+`/config`: `docker compose pull && docker compose up -d`, or `docker pull`, then
+`docker stop media-preview-node && docker rm media-preview-node` and the same `docker run` again. Watchtower can update
+nodes too, like the app.
 
 A **Plex database node** only has to be new enough: its Setup Health says when it isn't. On Linux, set its image tag
 to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
 and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays. On
 Windows, download the newest release and run its `install.ps1` again: the key stays.
+
+### Removing a node
+
+Open the node and click **Remove** on its **Settings** tab. A node that a worker group or a Plex server still uses
+can't be removed until you take it out of them. The node itself keeps running: stop and delete its container
+(`docker compose down` in its folder, or `docker rm -f media-preview-node`) and, if you won't add it again, its
+`/config` folder.
+
+A Plex database node keeps the undo record of its loudness writes in that `/config` (`loudness-writes.jsonl`; on
+Windows, in `%LOCALAPPDATA%\MediaPreviewGenerator\node`). Keep it, or [undo](plex-loudness-normalization.md#undoing-it)
+those writes first. On Windows, remove the node with its `uninstall.ps1`, which keeps the record.
 
 ### Plex on another machine
 

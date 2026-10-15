@@ -37,7 +37,7 @@ If that is fast enough, stop here. The built-in needs no extra software.
 - **It uses the GPU.** Decoding and downscaling happen on the GPU. If a file won't decode there, the same worker redoes it on the CPU ([CPU fallback](guides.md#automatic-gpu--cpu-fallback)).
 - **It works on several files at once.** You set up worker groups: a group holds the GPUs and CPU you choose, each with its own worker count and allowed jobs, and the group has its hours.
 - **It works per file, when the file arrives.** Triggers include Sonarr and Radarr webhooks, Plex's own webhook (Plex Pass), a "Recently Added" poll (no Plex Pass), schedules, or a manual pick. See [Previews as soon as Sonarr or Radarr imports a file](sonarr-radarr-preview-thumbnails.md).
-- **It can run on another machine.** It needs network access to Plex, and the Plex data folder mounted read-write.
+- **It can use another machine's GPU.** Add that machine as a [worker node](guides.md#remote-nodes), or run the app there with network access to Plex and the Plex data folder mounted read-write.
 
 Once it is running, set Plex's **Settings → Library → Generate video preview thumbnails** to **Never**, so Plex doesn't do the same work again. Setup steps are in [Generate Plex preview thumbnails with a GPU](plex-preview-thumbnails-gpu.md).
 

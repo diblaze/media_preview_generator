@@ -36,7 +36,7 @@ Hardware decoding is not a guaranteed win. A Jellyfin core team member [has said
 ## When to move it off Jellyfin
 
 - A large backlog still takes days after tuning.
-- You want the decoding done on another machine or a different GPU.
+- You want the decoding done on another machine ([remote nodes](guides.md#remote-nodes)) or a different GPU.
 - You want trickplay made per file as soon as Sonarr or Radarr imports it ([how](sonarr-radarr-preview-thumbnails.md)).
 - You also run Plex or Emby on the same files. Media Preview Generator decodes each file once and writes each server's format.
 

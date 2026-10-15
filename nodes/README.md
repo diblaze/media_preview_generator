@@ -39,8 +39,9 @@ docker run -d --name media-preview-node -p 9494:9494 \
 ### Updating it
 
 Update every worker node to the app's tag whenever you update the app: until then it says **Update needed** and gets
-no work. `docker compose pull && docker compose up -d` (or `docker pull` and the same `docker run` again) keeps its
-`/config`, so its id and key stay. Watchtower can update nodes too.
+no work. `docker compose pull && docker compose up -d` (or `docker pull`, then
+`docker stop media-preview-node && docker rm media-preview-node` and the same `docker run` again) keeps its `/config`,
+so its id and key stay. Watchtower can update nodes too.
 
 ## Plex database node
 

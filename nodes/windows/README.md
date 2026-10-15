@@ -43,9 +43,11 @@ Options:
 * `-AddFirewallRule` asks for administrator rights once to let other machines on private and domain networks reach
   the node (port 9494). Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
 * `-Port 9500` listens on another port.
-* `-PlexConfigDir "D:\PlexData\Plex Media Server"` when Plex's data folder isn't found by itself. By default the node
-  uses Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
-  `%LOCALAPPDATA%\Plex Media Server`.
+* `-PlexConfigDir "D:\PlexData\Plex Media Server"` names Plex's data folder. You rarely need it: the node finds the
+  folder from Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
+  `%LOCALAPPDATA%\Plex Media Server`. Name only that folder: Plex on Windows keeps its server id in the registry, not
+  in the folder, so for any other folder the node can't tell which Plex it belongs to and refuses loudness and
+  chapter thumbnails.
 
 The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\MediaPreviewGenerator\node`
 (`node.json`, `logs\node.log`, `loudness-writes.jsonl`). To use a key of your own, set it before installing

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.server
+import re
 import threading
 import time
 from pathlib import Path
@@ -1276,6 +1277,23 @@ class TestTheReference:
 
     REFERENCE = Path(__file__).resolve().parents[2] / "docs" / "reference.md"
 
+    def test_every_setting_a_node_reads_is_in_the_reference(self):
+        # A user moving the node's temp folder (named by its own Setup Health) must find NODE_TEMP_DIR somewhere.
+        server = Path(api_nodes.__file__).resolve().parents[2] / "nodes" / "server"
+        read = {"MODE", "FILE__"}
+        for module in ("app.py", "identity.py", "wsgi.py", "tasks.py"):
+            source = (server / module).read_text(encoding="utf-8")
+            read |= set(re.findall(r'environ(?:\.get\(|\[)"([A-Z][A-Z0-9_]*)"', source))
+        read.discard("NODE_IMAGE_ROLES")  # set by the Plex database image itself, never by a user
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        assert {"NODE_TEMP_DIR", "NODE_HOST", "NODE_NAME"} <= read
+        assert sorted(name for name in read if f"`{name}" not in text) == []
+
+    def test_the_worker_groups_snapshot_documents_its_nodes(self):
+        text = self.REFERENCE.read_text(encoding="utf-8")
+        row = next(line for line in text.splitlines() if "| GET | `/api/worker-groups` |" in line)
+        assert "`nodes`" in row
+
     def test_every_nodes_route_the_app_serves_is_in_the_reference(self, client):
         text = self.REFERENCE.read_text(encoding="utf-8")
         missing = []
@@ -1293,3 +1311,24 @@ class TestTheReference:
         assert default_plex_agent() == {"enabled": False, "node_id": None}
         assert '"agent": {"enabled": false, "node_id": null}' in text and "`plex.agent.node_id`" in text
         assert "`plex.agent.url`" not in text and "`plex.agent.token`" not in text
+
+
+class TestTheGuide:
+    """The docs a user reads to understand a node card, and the pages that offer another machine's GPU."""
+
+    DOCS = Path(__file__).resolve().parents[2] / "docs"
+
+    def test_it_names_every_state_a_node_card_shows(self):
+        js = (Path(api_nodes.__file__).resolve().parents[1] / "static" / "js" / "nodes.js").read_text(encoding="utf-8")
+        block = js.split("const STATES = {", 1)[1].split("};", 1)[0]
+        labels = [label.removeprefix("✓ ") for label in re.findall(r"\w+: \['\w+', '([^']+)'\]", block)]
+        guide = (self.DOCS / "guides.md").read_text(encoding="utf-8")
+        section = guide.split("## Remote nodes", 1)[1].split("\n## ", 1)[0]
+        assert "Temp folder problem" in labels and "Added twice" in labels
+        assert [label for label in labels if f"**{label}**" not in section] == []
+
+    @pytest.mark.parametrize(
+        "page", ["multi-server.md", "faq.md", "jellyfin-trickplay-gpu.md", "plex-preview-thumbnails-slow.md"]
+    )
+    def test_every_page_offering_another_machine_links_remote_nodes(self, page):
+        assert "guides.md#remote-nodes" in (self.DOCS / page).read_text(encoding="utf-8")
