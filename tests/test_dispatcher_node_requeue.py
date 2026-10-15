@@ -24,6 +24,7 @@ from media_preview_generator.nodes.registry import (
     set_registry,
 )
 from media_preview_generator.processing.types import ProcessableItem
+from media_preview_generator.web.settings_manager import reset_settings_manager
 
 KEYS = ("markers_published", "failed")
 
@@ -53,8 +54,11 @@ class _Registry(NodeRegistry):
 
 @pytest.fixture(autouse=True)
 def _reset():
+    # A settings manager another test left behind would hand the dispatch loop its saved groups, replacing the pool's.
+    reset_settings_manager()
     reset_dispatcher()
     yield
+    reset_settings_manager()
     reset_dispatcher()
     set_registry(None)
 
