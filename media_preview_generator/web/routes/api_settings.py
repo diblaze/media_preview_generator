@@ -1745,20 +1745,21 @@ def list_backups():
     return jsonify({"files": _backup_inventory()})
 
 
-def _bring_restored_settings_up_to_date(settings: Any, live_groups_revision: int) -> None:
+def _bring_restored_settings_up_to_date(settings: Any, live_revisions: tuple[int, int]) -> None:
     """Run the start-up migrations on a restored settings.json from before this build's schema, and move its worker
-    groups revision past the live one.
+    groups and nodes revisions past the live ones.
 
     A backup taken before an upgrade holds settings this build no longer reads as they are (a Plex helper's address
     on its server instead of on a node). Run on them until the next restart, any save would store them half-moved
     and lose what the migration would have moved.
 
     The running worker pool ignores groups older than the last revision it applied, so an older backup's groups (and
-    every Workers save after it, until one passed the old number) would wait for a restart.
+    every Workers save after it, until one passed the old number) would wait for a restart. And an editor still open
+    on the old groups or nodes must get "changed elsewhere", not save over the restored ones at a matching number.
 
     Args:
         settings: The settings manager, holding the restored file.
-        live_groups_revision: ``worker_groups_revision`` before the restore.
+        live_revisions: ``worker_groups_revision`` and ``nodes_revision`` before the restore.
     """
     from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
 
@@ -1767,8 +1768,13 @@ def _bring_restored_settings_up_to_date(settings: Any, live_groups_revision: int
             run_migrations(settings)
     finally:
         # Even when a migration failed: the restored file is in place either way, and the pool must follow it.
-        revision = max(settings.worker_groups_revision, live_groups_revision) + 1
-        settings.apply_changes(updates={"worker_groups_revision": revision})
+        live_groups, live_nodes = live_revisions
+        settings.apply_changes(
+            updates={
+                "worker_groups_revision": max(settings.worker_groups_revision, live_groups) + 1,
+                "nodes_revision": max(settings.nodes_revision, live_nodes) + 1,
+            }
+        )
 
 
 def _settings_replaced(settings: Any) -> str | None:
@@ -1886,13 +1892,13 @@ def restore_backup():
     failure = None
     try:
         with settings.locked():
-            live_groups_revision = settings.worker_groups_revision
+            live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
             shutil.copy2(bak_path, tmp_path)
             os.replace(tmp_path, live)
             replaced = True
             if name == "settings.json":
                 settings.reload()
-                _bring_restored_settings_up_to_date(settings, live_groups_revision)
+                _bring_restored_settings_up_to_date(settings, live_revisions)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
     except Exception as exc:
