@@ -3,6 +3,7 @@ container starts a node or the app, the exposed port, the Plex database image's 
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import shlex
@@ -31,12 +32,14 @@ def _healthcheck_code(dockerfile: Path) -> str:
     return command[3]
 
 
+# Every setting the node's port and host come from (nodes/server/wsgi.py), with the file form of each.
+_NODE_ADDRESS_SETTINGS = (
+    "NODE_PORT", "FILE__NODE_PORT", "AGENT_PORT", "FILE__AGENT_PORT", "NODE_HOST", "FILE__NODE_HOST",
+)  # fmt: skip
+
+
 def _url(dockerfile: Path, **env: str) -> str:
-    clean = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("MODE", "NODE_PORT", "WEB_PORT", "AGENT_PORT", "FILE__NODE_PORT", "NODE_HOST", "FILE__NODE_HOST")
-    }
+    clean = {k: v for k, v in os.environ.items() if k not in ("MODE", "WEB_PORT", *_NODE_ADDRESS_SETTINGS)}
     done = subprocess.run(
         [sys.executable, "-c", _RECORD_URL, _healthcheck_code(dockerfile)],
         env={**clean, **env},
@@ -148,6 +151,47 @@ def test_the_healthcheck_asks_the_port_a_file_names(dockerfile, tmp_path):
     port_file.write_bytes("\ufeff9700\r\n".encode())  # as Notepad saves it
     url = _url(dockerfile, MODE="node", NODE_PORT="9500", FILE__NODE_PORT=str(port_file))
     assert url.endswith(":9700/v1/health")
+
+
+_PORT_SETTINGS = ("FILE__NODE_PORT", "NODE_PORT", "FILE__AGENT_PORT", "AGENT_PORT")
+
+
+def _node_listens_on(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> int | None:
+    """The port the node's own server picks with ``env``: its FILE__ files first, then its port settings."""
+    from media_preview_generator.nodes.server import wsgi
+    from media_preview_generator.nodes.server.app import _env_from_files
+
+    for name in _NODE_ADDRESS_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    node_env = dict(env)
+    _env_from_files(node_env)
+    for name, value in node_env.items():
+        monkeypatch.setenv(name, value)
+    return wsgi._port(wsgi._parse([]).port)
+
+
+@pytest.mark.parametrize("dockerfile", [MAIN, PLEX_DB], ids=["main", "plex-db"])
+@pytest.mark.parametrize(
+    "given",
+    [mix for size in range(len(_PORT_SETTINGS) + 1) for mix in itertools.combinations(_PORT_SETTINGS, size)],
+    ids=lambda mix: "+".join(mix) or "none",
+)
+def test_the_healthcheck_asks_the_port_the_node_picks_from_every_mix_of_its_settings(
+    dockerfile, given, tmp_path, monkeypatch
+):
+    # The node takes FILE__NODE_PORT, NODE_PORT, FILE__AGENT_PORT, AGENT_PORT in that order; a check that skipped
+    # FILE__AGENT_PORT called a node listening on its file's port unhealthy forever.
+    env = {"MODE": "node"}
+    for port, name in enumerate(given, start=9601):
+        if name.startswith("FILE__"):
+            port_file = tmp_path / name
+            port_file.write_text(f"{port}\n")
+            env[name] = str(port_file)
+        else:
+            env[name] = str(port)
+    listens_on = _node_listens_on(monkeypatch, env)
+    assert listens_on == (9601 if given else 9494)
+    assert _url(dockerfile, **env) == f"http://127.0.0.1:{listens_on}/v1/health"
 
 
 @pytest.mark.parametrize("dockerfile", [MAIN, PLEX_DB], ids=["main", "plex-db"])

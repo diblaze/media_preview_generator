@@ -78,10 +78,10 @@ EXPOSE 9494
 # One process: the app's "one writer at a time" guarantee is a lock inside it (see nodes/server/plex_db.py). Threads
 # let a read-back and the Edit tab's checks overlap without a second process touching the database; waitress reads
 # each request whole before a thread takes it, so half-sent requests can't hold them (nodes/server/wsgi.py).
-# No --port: the node reads NODE_PORT (or AGENT_PORT) itself, after FILE__NODE_PORT (a Docker secret) has had its say.
+# No --port: the node reads NODE_PORT (or AGENT_PORT) itself, after their FILE__ files (Docker secrets) have a say.
 CMD ["python", "-m", "media_preview_generator.nodes.server.wsgi", "--threads", "8"]
 
 # It asks where the node listens: with --network host, NODE_HOST may be one address only. Waitress takes :: as IPv6
 # only, so that one is asked on ::1. Each setting is read as the node reads it: its FILE__ file first.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD exec python3 -c "import os, urllib.request; e = os.environ; read = lambda n: (open(e['FILE__' + n], encoding='utf-8-sig').read().strip() if e.get('FILE__' + n) else '') or e.get(n, '').strip(); port = read('NODE_PORT') or e.get('AGENT_PORT', '').strip() or '9494'; host = read('NODE_HOST'); host = {'': '127.0.0.1', '0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host); urllib.request.urlopen('http://' + ('[' + host + ']' if ':' in host else host) + ':' + port + '/v1/health', timeout=5)"
+    CMD exec python3 -c "import os, urllib.request; e = os.environ; read = lambda n: (open(e['FILE__' + n], encoding='utf-8-sig').read().strip() if e.get('FILE__' + n) else '') or e.get(n, '').strip(); port = read('NODE_PORT') or read('AGENT_PORT') or '9494'; host = read('NODE_HOST'); host = {'': '127.0.0.1', '0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host); urllib.request.urlopen('http://' + ('[' + host + ']' if ':' in host else host) + ':' + port + '/v1/health', timeout=5)"
