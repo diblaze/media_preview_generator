@@ -897,9 +897,13 @@
         }
         replaceNode(r.data);
         refreshOpenNode();
-        const count = gpus(r.data).length;
-        result.className = 'sm-tres ok';
-        result.textContent = count ? `Found ${count} ${count === 1 ? 'GPU' : 'GPUs'}` : 'No GPU found';
+        // A GPU that failed its test can't take work, so it isn't counted as found.
+        const all = gpus(r.data);
+        const working = all.filter((gpu) => !gpu.status || gpu.status === 'ok').length;
+        const broken = all.length - working;
+        result.className = `sm-tres ${working ? 'ok' : 'warn'}`;
+        result.textContent = (working ? `Found ${working} working ${working === 1 ? 'GPU' : 'GPUs'}` : 'No working GPU found')
+            + (broken ? ` · ${broken} not working` : '');
     }
 
     async function saveMappings() {

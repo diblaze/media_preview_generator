@@ -402,6 +402,12 @@ class TestGpuLost:
         self.test_a_gpu_error_whose_rescan_fails_is_gpu_lost_and_cpu_keeps_running(h)
         assert h.registry.rescan_gpus("n1").state == reg.STATE_READY
 
+    def test_a_rescan_the_node_does_not_answer_raises_instead_of_answering_the_old_gpus(self, h):
+        self._ready_with_gpu(h)
+        h.client().rescans = [NodeUnreachableError("gone")]
+        with pytest.raises(NodeUnreachableError):
+            h.registry.rescan_gpus("n1")
+
     def test_the_health_loop_rechecks_a_lost_gpu_every_five_minutes(self, h):
         self.test_a_gpu_error_whose_rescan_fails_is_gpu_lost_and_cpu_keeps_running(h)
         client = h.client()

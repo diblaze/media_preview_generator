@@ -522,7 +522,12 @@ def node_log(node_id: str):
 @api.route("/nodes/<node_id>/rescan-gpus", methods=["POST"])
 @api_token_required
 def rescan_node_gpus(node_id: str):
-    """Ask the node to detect its GPUs again and answer with the fresh ``NODE_ROW``."""
-    if get_registry().rescan_gpus(node_id) is None:
+    """Ask the node to detect its GPUs again and answer with the fresh ``NODE_ROW`` (502 when it can't be asked)."""
+    try:
+        view = get_registry().rescan_gpus(node_id)
+    except NodeError as exc:
+        record = find_node(get_settings_manager().nodes, node_id) or {}
+        return jsonify({"error": f"Couldn't ask {record.get('name') or 'the node'}: {exc}"}), 502
+    if view is None:
         return _not_found(node_id)
     return jsonify(_row_for(node_id))

@@ -336,6 +336,20 @@ class TestRowState:
         resp = client.post(f"/api/nodes/{node_id}/rescan-gpus")
         assert resp.status_code == 200 and resp.get_json()["gpus"][0]["device"] == "cuda:0"
 
+    def test_rescan_gpus_on_a_node_that_does_not_answer_is_a_502_not_the_old_gpus(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        assert client.post(f"/api/nodes/{node_id}/check").get_json()["state"] == "ready"
+        fake = nodes("http://nuc:9494")
+
+        def down():
+            raise NodeUnreachableError("http://nuc:9494 didn't answer (connection refused)")
+
+        fake.rescan_gpus = down
+        fake.info_answer = NodeUnreachableError("http://nuc:9494 didn't answer (connection refused)")
+        resp = client.post(f"/api/nodes/{node_id}/rescan-gpus")
+        assert resp.status_code == 502
+        assert resp.get_json()["error"].startswith("Couldn't ask nuc:")
+
     @pytest.mark.parametrize(
         ("method", "path"),
         [

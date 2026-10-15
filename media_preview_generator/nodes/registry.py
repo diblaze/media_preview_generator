@@ -494,14 +494,18 @@ class NodeRegistry:
         return self.view(node_id)
 
     def rescan_gpus(self, node_id: str) -> NodeView | None:
-        """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back."""
+        """Ask a node to detect its GPUs again (blocking); clears ``gpu_lost`` when the lost GPU is back.
+
+        Raises:
+            NodeError: The node couldn't be asked, so the GPUs it reported before are all there is.
+        """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return None
             device = live.lost_device
-        self._gpu_check(node_id, device or None)
+        self._gpu_check(node_id, device or None, raise_unreachable=True)
         return self.view(node_id)
 
     # ------------------------------------------------------------------ lifecycle
@@ -910,7 +914,7 @@ class NodeRegistry:
                 live.not_visible.clear()
                 self._touch()
 
-    def _gpu_check(self, node_id: str, device: str | None) -> None:
+    def _gpu_check(self, node_id: str, device: str | None, raise_unreachable: bool = False) -> None:
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
@@ -921,6 +925,8 @@ class NodeRegistry:
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)
             self.report_unavailable(node_id)
+            if raise_unreachable:
+                raise
             return
         with self._lock:
             if self._nodes.get(node_id) is not live or live.client is not client:

@@ -114,6 +114,7 @@ class NodesApi:
         self.health_answer: dict = {"overall_ok": True, "sections": []}
         self.log_answer: dict = {"lines": [_log("14:01:02", "node started"), _log("14:01:03", "1 GPU found")]}
         self.delete_answer: tuple[int, dict] = (200, {"ok": True})
+        self.rescan_answer: tuple[int, dict] | None = None
         page.route("**/api/nodes**", self._handle)
 
     def bodies(self, method: str, suffix: str) -> list:
@@ -156,6 +157,9 @@ class NodesApi:
         if action == "check":
             return _fulfill(route, node)
         if action == "rescan-gpus":
+            if self.rescan_answer:
+                status, answer = self.rescan_answer
+                return _fulfill(route, answer, status)
             node["gpus"] = [{"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4070", "status": "ok"}]
             return _fulfill(route, node)
         if action == "test-access":
@@ -578,9 +582,29 @@ class TestNodeDialog:
 
         authed_page.locator("#nodeRescanGpus").click()
 
-        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 GPU")
+        expect(authed_page.locator("#nodeRescanResult")).to_have_text("Found 1 working GPU")
         expect(authed_page.locator("#nodeGpuList")).to_contain_text("RTX 4070")
         assert api.bodies("POST", "/nodes/n-storage/rescan-gpus") == [None]
+
+    def test_rescan_of_a_node_that_does_not_answer_says_so_in_red(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        api.rescan_answer = (502, {"error": "Couldn't ask storage: http://storage.lan:9494 didn't answer"})
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        result = authed_page.locator("#nodeRescanResult")
+        expect(result).to_have_text("Couldn't ask storage: http://storage.lan:9494 didn't answer")
+        expect(result).to_have_class("sm-tres bad")
+
+    def test_rescan_does_not_count_a_gpu_that_failed_its_test(self, authed_page: Page, app_url: str) -> None:
+        nodes = _four_nodes()
+        api = _open_nodes(authed_page, app_url, nodes)
+        failed = {"type": "NVIDIA", "device": "cuda:0", "name": "Quadro P5000", "status": "failed"}
+        api.rescan_answer = (200, {**nodes[0], "gpus": [failed]})
+        _open_node(authed_page, "n-storage")
+        authed_page.locator("#nodeRescanGpus").click()
+        result = authed_page.locator("#nodeRescanResult")
+        expect(result).to_have_text("No working GPU found · 1 not working")
+        expect(result).to_have_class("sm-tres warn")
 
     def test_plex_database_node_has_no_media_tab(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
