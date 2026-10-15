@@ -1066,7 +1066,7 @@ class JobDispatcher:
                 excluded = tracker.excluded_nodes.setdefault(path, {})
                 excluded[requeue.node_id] = requeue.node_name
                 if not self.worker_pool.can_run_outside(tracker.kind, excluded):
-                    failure = f"not visible on {', '.join(excluded.values())}"
+                    failure = self._not_visible_failure(tracker.kind, excluded)
             if failure is None:
                 tracker.item_queue.appendleft(item)
                 tracker.active_processing = max(0, tracker.active_processing - 1)
@@ -1086,6 +1086,17 @@ class JobDispatcher:
         finally:
             with self._trackers_lock:
                 tracker.active_processing = max(0, tracker.active_processing - 1)
+
+    def _not_visible_failure(self, kind: str, excluded: dict[str, str]) -> str:
+        """Why a file fails that no node left can see: the nodes that can't, and any that need someone to act first.
+
+        Args:
+            kind: The job kind.
+            excluded: Node id -> name of the nodes that can't see the file.
+        """
+        failure = f"not visible on {', '.join(excluded.values())}"
+        stuck = self.worker_pool.stuck_node_members(kind, excluded)
+        return f"{failure}; no other worker can take it: {', '.join(stuck)}" if stuck else failure
 
     def _merge_worker_outcome(self, worker: Worker, tracker: JobTracker) -> None:
         """Merge the latest outcome delta from a worker into the tracker.
@@ -1195,7 +1206,7 @@ class JobDispatcher:
                 if _take_queued(tracker, index, item) is None:
                     return None
                 tracker.active_processing += 1
-                stranded.append((tracker, item, f"not visible on {', '.join(excluded.values())}"))
+                stranded.append((tracker, item, self._not_visible_failure(tracker.kind, excluded)))
                 return None
         return None
 

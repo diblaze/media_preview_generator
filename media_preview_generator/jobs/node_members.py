@@ -68,21 +68,29 @@ class NodeHardware:
         view = self.views.get(node_id)
         return getattr(view, "state", None) if view is not None else None
 
-    def node_can_come_back(self, node_id: str) -> bool:
-        """Whether a node may give its members capacity again without a settings change.
+    def member_can_come_back(self, policy: dict) -> bool:
+        """Whether a node member has workers now, or may get them again without anyone changing anything.
 
-        A node that is offline or still being checked comes back on its own, and so may one the registry couldn't
-        answer for; a node turned off on the Nodes page, or no longer configured, doesn't.
+        A node that is offline, still being checked or rechecking a lost GPU comes back on its own, and so may one
+        the registry couldn't answer for. Every other member without capacity waits on someone: a node turned off,
+        removed, needing an update, refusing the key or with a media access problem, a ready node that doesn't run
+        workers, or one that doesn't list the member's GPU.
+
+        Args:
+            policy: A member policy whose ``node`` is set.
         """
-        from ..nodes.registry import STATE_DISABLED
+        from ..nodes.registry import STATE_CONNECTING, STATE_GPU_LOST, STATE_OFFLINE
 
+        node_id = policy["node"]
         if node_id not in self.views:
             return False
         view = self.views[node_id]
         if view is None:
             capacity = self.capacities.get(node_id)
             return capacity is not None and capacity.reason == _REASON_NODE_UNKNOWN
-        return getattr(view, "state", None) != STATE_DISABLED
+        if self.member(policy).available:
+            return True
+        return getattr(view, "state", None) in (STATE_OFFLINE, STATE_CONNECTING, STATE_GPU_LOST)
 
     def node_ref(self, node_id: str | None) -> dict | None:
         """``{"id", "name"}`` for a worker status row; ``None`` for this app."""

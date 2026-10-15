@@ -205,8 +205,11 @@ retry runs (on the **node's** CPU, see §6).
   then it fails). After either, the node gets no new file until the registry's next check of it comes back
   ready (60 s at most), and the item's retry goes to another node or this app when one is free.
 * **File not visible**: the item goes to the next eligible worker on a different node (or this app); when every
-  eligible worker has failed it, the item fails "not visible on X, Y". Three different files not visible on one node
-  within 10 minutes → node state `access_problem` (workers paused, alert).
+  eligible worker has failed it, the item fails "not visible on X, Y". Members on a node that is offline or
+  connecting (or rechecking a lost GPU) still count, since it comes back on its own; members that wait on someone
+  (node turned off, update needed, key refused, access problem, no worker role, GPU not listed) don't, and the
+  failure names them: "not visible on X; no other worker can take it: Z (node needs an update)". Three different
+  files not visible on one node within 10 minutes → node state `access_problem` (workers paused, alert).
 * **GPU failure / codec not supported** on a node: retry on the same node's CPU, never on the app's. GPU lost
   (detection fails after a GPU error) → state `gpu_lost`.
 * Cancel and pause act on the node task: the executor forwards the job's cancel and pause state to
