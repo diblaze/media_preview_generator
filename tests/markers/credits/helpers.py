@@ -109,8 +109,10 @@ def fake_ffmpeg(
     stderr_tail: str = "",
     stderr_head: str = "",
     head_wait_s: float = 0.0,
+    chroma: int = 128,
 ) -> list[str]:
-    """A child that writes NV12 frames (Y plane filled with each value) to stdout and showinfo lines to stderr.
+    """A child that writes NV12 frames (Y plane filled with each value, chroma with ``chroma``) to stdout and showinfo
+    lines to stderr.
 
     ``pts`` entries past the frames become showinfo lines with no whole frame behind them (ffmpeg dying mid-write);
     ``child_pid_file`` spawns a grandchild in the same process group, so the group kill can be asserted;
@@ -145,7 +147,7 @@ def fake_ffmpeg(
         for i, value in enumerate({frame_values!r}):
             if i < len(pts):
                 line(i)
-            out.write(bytes([value]) * ({width} * {height}) + bytes([128]) * ({width} * {height} // 2))
+            out.write(bytes([value]) * ({width} * {height}) + bytes([{chroma}]) * ({width} * {height} // 2))
             out.flush()
             progress(i + 1)
             time.sleep({sleep_s})

@@ -219,7 +219,16 @@ def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
 def run(mock_config, tmp_path):
     mock_config.plex_bif_frame_interval = INTERVAL_S
 
-    def _generate(attempts, *, gpu=None, keyframe_gap=None, dv5=False, duration_s=DURATION_S, runner_factory=None):
+    def _generate(
+        attempts,
+        *,
+        gpu=None,
+        keyframe_gap=None,
+        dv5=False,
+        duration_s=DURATION_S,
+        runner_factory=None,
+        track_fields=None,
+    ):
         calls: list = []
         out = str(tmp_path / "frames")
         os.makedirs(out, exist_ok=True)
@@ -228,6 +237,7 @@ def run(mock_config, tmp_path):
             hdr_format="Dolby Vision" if dv5 else None,
             transfer_characteristics=None,
             duration=duration_s * 1000 if duration_s else None,
+            **(track_fields or {}),
         )
         warnings: list[str] = []
         sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{level}|{message}")
@@ -779,12 +789,15 @@ class TestTheRunnersFailureLines:
         ],
         ids=["full", "read-only", "over-quota", "no-permission"],
     )
-    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(self, run, tmp_path, rc, stderr, said):
+    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(
+        self, run, tmp_path, mock_config, rc, stderr, said
+    ):
         outcome = self._run_real(run, tmp_path, rc, stderr)
 
         assert isinstance(outcome.result, WorkingFolderError)
         refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
         assert len(refused) == 1 and str(tmp_path / "frames") in refused[0] and said in refused[0], outcome.warnings
+        assert f"mount a bigger, writable disk at {mock_config.tmp_folder}." in refused[0], refused
         assert not any(
             "crashed" in line or "hardware acceleration" in line or "GPU" in line for line in outcome.warnings
         ), outcome.warnings

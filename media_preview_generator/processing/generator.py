@@ -218,6 +218,18 @@ _VIDEO_STREAM_LISTED_RE = re.compile(r"^\s*Stream #\S+ Video: ")
 # The filter graph refusing the frames it was given: the GPU scaler (scale_vaapi, scale_cuda) can't take frames decoded
 # in software, nor GPU frames in a format the chain wasn't built for.
 _FRAMES_REFUSED_PHRASE = "Impossible to convert between the formats"
+# A GPU decoder's own verdict that the GPU lacks the video's codec or profile, after which FFmpeg decodes it in software:
+# NVDEC's for a profile it can't decode (VP8 on Pascal, H.264 High 10 / 4:2:2 / 4:4:4, HEVC 4:2:2) and for H.263,
+# VAAPI's for a codec or profile the driver lacks (MPEG-4 part 2, H.263, VP8 on a UHD 770; H.264 High 10 only at
+# -loglevel debug). Lowercase, as matched.
+_GPU_LACKS_CODEC_VERDICTS = (
+    "hardware is lacking required capabilities",
+    "unsupported codec id",
+    "no support for codec",
+    "not supported for hardware decode",
+)
+# FFmpeg's line after any GPU decoder set-up that failed, the decoder's own verdict that it lacks the codec included.
+_HWACCEL_INIT_FAILED = "hwaccel initialisation returned error"
 # The input's video codec and pixel format as FFmpeg lists them:
 # "Stream #0:0(eng): Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), ...".
 _INPUT_VIDEO_STREAM_RE = re.compile(r"^\s*Stream #0:\S+ Video: (\w+)(?:[^,]*, (\w+))?")
@@ -533,16 +545,17 @@ class WorkingFolderError(OSError):
     """
 
 
-def working_folder_failure(exc: OSError) -> str:
+def working_folder_failure(exc: OSError, tmp_folder: str | None = None) -> str:
     """The sentence a file that couldn't be written to the working folder fails with: the folder, why, and the fix.
 
     Args:
         exc: The error, with the folder as its ``filename``.
+        tmp_folder: The app's working folder (``Config.tmp_folder``), where a bigger disk goes (``working_folder_hint``).
 
     Returns:
         The sentence.
     """
-    folder, move = working_folder_hint()
+    folder, move = working_folder_hint(tmp_folder)
     where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
     why = exc.strerror or os.strerror(exc.errno or 0)
     if exc.errno == errno.EROFS:
@@ -901,8 +914,10 @@ def _gpu_hand_off(
 
 
 def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None, stderr_lines_all: list[str]) -> bool:
-    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software without a
-    word and the GPU scaler refused those frames (ProRes, WMV, DivX 3, H.263 or VP8 on NVIDIA, MPEG-2 4:2:2…).
+    """Whether a GPU run failed because the GPU has no decoder for the video: FFmpeg decoded it in software, without a
+    word (ProRes, WMV, DivX 3 on NVIDIA, MPEG-2 4:2:2…) or after the decoder said the GPU lacks the codec or profile
+    (``_GPU_LACKS_CODEC_VERDICTS``: VP8, H.264 High 10 or H.263 on NVIDIA, MPEG-4 part 2 on VAAPI…), and the GPU
+    scaler refused those frames.
 
     A normal hand-off to the CPU, and the same on every run: full-frame decode asks the same decoder.
 
@@ -914,16 +929,19 @@ def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None
 
     Returns:
         True for a codec the GPU lacks. False otherwise, and for a driver error in any run: a decoder whose GPU
-        set-up failed in the driver falls back to software and ends the same way. False too for a run that asked for
-        no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its frames is theirs.
+        set-up failed in the driver falls back to software and ends the same way. FFmpeg's generic set-up failure line
+        after the decoder's own verdict isn't one: the verdict says why, as in ``classify_cpu_fallback_reason``. False
+        too for a run that asked for no GPU decoder: it decoded in software on purpose, so the GPU filters refusing its
+        frames is theirs.
     """
-    return (
-        rc != 0
-        and hwaccel is not None
-        and any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines)
-        and _decoded_in_software(stderr_lines, hwaccel)
-        and not _detect_hwaccel_runtime_error(stderr_lines_all)
-    )
+    if rc == 0 or hwaccel is None or not any(_FRAMES_REFUSED_PHRASE in line for line in stderr_lines):
+        return False
+    stderr_text = " ".join(stderr_lines).lower()
+    if any(verdict in stderr_text for verdict in _GPU_LACKS_CODEC_VERDICTS):
+        return not _detect_hwaccel_runtime_error(
+            [line for line in stderr_lines_all if _HWACCEL_INIT_FAILED not in line.lower()]
+        )
+    return _decoded_in_software(stderr_lines, hwaccel) and not _detect_hwaccel_runtime_error(stderr_lines_all)
 
 
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
@@ -1248,19 +1266,14 @@ def _detect_codec_error(returncode: int, stderr_lines: list[str]) -> bool:
         "unknown decoder",
         "decoder not found",
         "could not find codec",
-        "unsupported codec id",
         # Hardware decoder specific errors (clearly indicate hardware decoder limitations)
         "hardware decoder not found",
         "hardware decoder unavailable",
         "hwaccel decoder not found",
         "hwaccel decoder unavailable",
-        # NVDEC's verdict that the GPU has no decoder for this profile (H.264 High 10 or 4:4:4). FFmpeg prints the
-        # generic "hwaccel initialisation returned error" right after it, so it has to win over that driver error.
-        "hardware is lacking required capabilities",
-        # VAAPI's verdicts: the driver has no profile for the codec (MPEG-4 part 2), or not this one (H.264 High 10,
-        # printed only at -loglevel debug).
-        "no support for codec",
-        "not supported for hardware decode",
+        # The GPU decoder's own verdicts. FFmpeg prints the generic "hwaccel initialisation returned error" right after
+        # them, so they have to win over that driver error.
+        *_GPU_LACKS_CODEC_VERDICTS,
         # Generic codec errors (check these carefully - only in GPU context after failure)
         "unsupported codec",
         "codec not supported",
@@ -1771,6 +1784,64 @@ def _has_duplicate_thumbnails(output_folder: str, threshold: float = KEYFRAME_DU
     return dup_pairs > len(paths) * threshold
 
 
+# NVDEC on a Pascal card (a Quadro P5000, driver 580) hands VP9 Profile 2 (10/12-bit) frames back at a quarter of their
+# values and FFmpeg reports success, so every thumbnail is green with no red or blue: SDR comes out 0,130,0 and after
+# HDR tone mapping red and blue stay under 50 while green never drops below 59. A pixel counts as green-only when red
+# and blue are both at most _GREEN_ONLY_MAX_RED_BLUE and green leads them by _GREEN_ONLY_MIN_LEAD; such frames are 99.9%
+# green-only. Of 7,900 real thumbnails (lab films, Green Lantern, Avatar, The Matrix, Wicked...) one came to 98.8% and
+# seven more passed 50%, all far apart, so the first, middle and last all have to be; a false alarm costs a CPU rerun.
+_GREEN_ONLY_MAX_RED_BLUE = 64
+_GREEN_ONLY_MIN_LEAD = 40
+_GREEN_ONLY_SHARE = 0.98
+
+
+def _thumbnails_lost_their_colour(output_folder: str) -> bool:
+    """Whether a run's thumbnails came out green-only, as a GPU decoder that lost the colours leaves them.
+
+    Only the first, middle and last thumbnails are read, each at a quarter of its size: all three have to be, so real
+    green footage (a forest, a green screen) never counts. A thumbnail that can't be read counts as not green-only.
+
+    Args:
+        output_folder: The run's folder of ``img-*.jpg`` thumbnails.
+
+    Returns:
+        True when every one read is green-only.
+    """
+    # Local: only this check needs them, and only once a GPU run has made thumbnails.
+    import numpy as np
+    from PIL import Image
+
+    paths = sorted(glob.glob(os.path.join(glob.escape(output_folder), "img-*.jpg")))
+    if not paths:
+        return False
+    for path in {paths[0], paths[len(paths) // 2], paths[-1]}:
+        try:
+            with Image.open(path) as image:
+                image.draft("RGB", (image.width // 4, image.height // 4))
+                rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+        except (OSError, ValueError):
+            return False
+        red_or_blue = np.maximum(rgb[..., 0], rgb[..., 2])
+        green_only = (red_or_blue <= _GREEN_ONLY_MAX_RED_BLUE) & (rgb[..., 1] >= red_or_blue + _GREEN_ONLY_MIN_LEAD)
+        if green_only.mean() < _GREEN_ONLY_SHARE:
+            return False
+    return True
+
+
+def is_greyscale_h264(media_info: MediaInfo) -> bool:
+    """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
+    4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        True for an AVC video track whose colour space is luma only.
+    """
+    tracks = media_info.video_tracks
+    return bool(tracks) and tracks[0].format == "AVC" and tracks[0].color_space == "Y"
+
+
 def generate_images(
     video_file: str,
     output_folder: str,
@@ -1809,6 +1880,17 @@ def generate_images(
             read-only, or not writable by this user); none of them are kept.
     """
     media_info = MediaInfo.parse(video_file)
+    if gpu == "NVIDIA" and is_greyscale_h264(media_info):
+        # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
+        # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.
+        logger.info(
+            "{} is greyscale H.264, which this GPU decodes into the wrong colours; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        raise CodecNotSupportedError(
+            f"GPU processing skipped (the GPU decodes greyscale H.264 into the wrong colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
 
     # Filter primitives.  The final vf chain is assembled inside
@@ -2463,6 +2545,18 @@ def generate_images(
                 video_file,
                 rc,
             )
+
+    if image_count > 0 and gpu is not None and _thumbnails_lost_their_colour(output_folder):
+        logger.info(
+            "The GPU decoded {} without its colours (every thumbnail came out green), so its decoder can't handle this "
+            "video; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        _clean_output_images(output_folder)
+        raise CodecNotSupportedError(
+            f"GPU processing failed (the GPU decoded the video without its colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
 
     # Rename images only after all retries and error checks are complete
     if image_count > 0:

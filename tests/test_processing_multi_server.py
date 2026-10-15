@@ -2318,7 +2318,8 @@ class TestAWorkingFolderThatRefusesTheThumbnails:
 
         assert result.status is MultiServerStatus.FAILED
         assert result.message.startswith(f"Couldn't write the thumbnails: the working folder {folder} {said}")
-        assert result.message.endswith(", or mount a bigger, writable disk at the container's temp folder.")
+        # The working folder is the one TMP_FOLDER seeded, so a bigger disk goes there, not at the system's temp folder.
+        assert result.message.endswith(f", or mount a bigger, writable disk at {tmp_path / 'cache'}.")
         assert result.publishers == []
         assert not list((tmp_path / "tv").rglob("*.bif"))
         errors = [message for level, message in records if level == "ERROR"]

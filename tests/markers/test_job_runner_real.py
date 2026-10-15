@@ -1268,7 +1268,8 @@ with open(os.path.join(here, "started.log"), "a") as log:
 if os.path.exists(os.path.join(here, "stop")):
     sys.exit(1)
 if "rawvideo" in sys.argv:
-    frame = bytes({frame_bytes})
+    # Black NV12 frames: luma 0, chroma 128 (all-zero chroma is a GPU decode that lost the colours).
+    frame = bytes({frame_bytes}) + bytes([128]) * ({frame_bytes} // 2)
     while True:
         sys.stdout.buffer.write(frame)
         sys.stdout.buffer.flush()

@@ -805,7 +805,7 @@ def create_ffmpeg_runner(
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
-                folder, move = working_folder_hint()
+                folder, move = working_folder_hint(getattr(config, "tmp_folder", None))
                 fix = folder_write_fix(refused)
                 logger.error(
                     "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
