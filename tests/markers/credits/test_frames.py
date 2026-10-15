@@ -15,10 +15,12 @@ import sys
 import textwrap
 import threading
 import time
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 from loguru import logger
+from pymediainfo import MediaInfo
 
 from media_preview_generator.markers.credits import frames
 from media_preview_generator.markers.credits.frames import (
@@ -1467,6 +1469,127 @@ class TestAGpuThatCantDecodeTheFile:
                 name="Movie.mkv",
             )
         assert type(excinfo.value) is raised
+
+
+# What ffmpeg lists greyscale H.264 as (jellyfin-ffmpeg 8.1.3): 4:2:0, so only MediaInfo tells it is greyscale.
+GREY_H264_LISTING = (
+    "  Stream #0:0: Video: h264 (High), yuvj420p(pc, progressive), 640x360 [SAR 1:1 DAR 16:9], 24 fps, 24 tbr, 1k tbn\n"
+)
+HEVC_LISTING = "  Stream #0:0: Video: hevc (Rext), gray(pc, progressive), 640x360, 24 fps, 24 tbr, 1k tbn\n"
+
+
+def _mediainfo(monkeypatch, answer: tuple[str, str] | Exception) -> MagicMock:
+    """MediaInfo reading the input's video track as ``(format, colour space)``, or failing with ``answer``."""
+    fake = MagicMock()
+    if isinstance(answer, Exception):
+        fake.parse.side_effect = answer
+    else:
+        fake.parse.return_value = MagicMock(video_tracks=[MagicMock(format=answer[0], color_space=answer[1])])
+    monkeypatch.setattr(MediaInfo, "parse", fake.parse)
+    return fake
+
+
+class TestAFirstFrameTheGpuDecodedWrong:
+    """Frames a GPU decoded wrong although ffmpeg reports success are the GPU's codec failure, so the worker reruns the
+    file on the CPU: NVDEC on a Pascal card (a Quadro P5000) returns VP9 Profile 2 at a quarter of its values (12-bit:
+    a sixteenth), chroma 32 where it is 128, and decodes greyscale H.264 into coloured stripes. Previews hand both to the
+    CPU too (``processing.generator``)."""
+
+    @pytest.mark.parametrize("chroma", [64, 32, 8], ids=["most-a-quarter-leaves", "10-bit", "12-bit"])
+    @pytest.mark.parametrize(("gpu", "device", "hwaccel"), VENDORS, ids=[v[0] for v in VENDORS])
+    def test_frames_without_their_colours_stop_the_gpu_decode_at_the_first(
+        self, gpu, device, hwaccel, chroma, tmp_path
+    ):
+        pid_file = tmp_path / "ffmpeg.pid"
+        calls: list[np.ndarray] = []
+        started = time.monotonic()
+        with pytest.raises(GpuDecodeError) as excinfo:
+            frames.run_decode(
+                fake_ffmpeg([30] * 40, [str(i) for i in range(40)], chroma=chroma, sleep_s=0.5, pid_file=str(pid_file)),
+                hw_active=_hw(gpu, device),
+                pts_offset_s=0.0,
+                detect_boxes=_detector(calls),
+                name="Movie.mkv",
+            )
+        assert time.monotonic() - started < 5, "the rest of the window would be read in vain"
+        assert type(excinfo.value) is GpuDecodeError
+        assert excinfo.value.fallback_kind == "codec"
+        assert str(excinfo.value) == "the GPU decoded this file's video without its colours"
+        assert calls == []
+        _assert_gone(pid_file)
+
+    @pytest.mark.parametrize("chroma", [32, 65, 128, 240])
+    def test_a_cpu_decode_reads_every_frame_whatever_its_colours(self, chroma):
+        rows = frames.run_decode(
+            fake_ffmpeg([10, 250], ["1", "2"], chroma=chroma),
+            hw_active=False,
+            pts_offset_s=0.0,
+            detect_boxes=_detector([]),
+        )
+        assert [row[0] for row in rows] == [1.0, 2.0]
+
+    @pytest.mark.parametrize("chroma", [65, 128, 240])
+    @pytest.mark.parametrize("scale", [1, 2])
+    def test_a_gpu_decode_with_its_colours_reads_every_frame(self, chroma, scale):
+        calls: list[np.ndarray] = []
+        rows = frames.run_decode(
+            fake_ffmpeg([10, 250], ["1", "2"], chroma=chroma, width=320 * scale, height=180 * scale),
+            hw_active=True,
+            pts_offset_s=0.0,
+            detect_boxes=_detector(calls),
+            scale=scale,
+        )
+        assert [row[0] for row in rows] == [1.0, 2.0]
+        assert [plane.shape for plane in np.concatenate(calls)] == [(180 * scale, 320 * scale)] * 2
+
+    def test_the_colour_check_reads_a_scaled_frames_own_chroma(self):
+        with pytest.raises(GpuDecodeError, match="without its colours"):
+            frames.run_decode(
+                fake_ffmpeg([10, 250], ["1", "2"], chroma=32, width=640, height=360),
+                hw_active=True,
+                pts_offset_s=0.0,
+                detect_boxes=_detector([]),
+                scale=2,
+            )
+
+    def test_greyscale_h264_on_nvdec_is_stopped_at_the_first_frame(self, monkeypatch, tmp_path):
+        mediainfo = _mediainfo(monkeypatch, ("AVC", "Y"))
+        pid_file = tmp_path / "ffmpeg.pid"
+        with pytest.raises(GpuDecodeError) as excinfo:
+            frames.run_decode(
+                fake_ffmpeg([30] * 40, [str(i) for i in range(40)], stderr_head=GREY_H264_LISTING, sleep_s=0.5,
+                            pid_file=str(pid_file)) + ["-hwaccel", "cuda", "-i", MOVIE],
+                hw_active=True,
+                pts_offset_s=0.0,
+                detect_boxes=_detector([]),
+                name="Movie.mkv",
+            )  # fmt: skip
+        assert excinfo.value.fallback_kind == "codec"
+        assert str(excinfo.value) == "the GPU decodes greyscale H.264 into the wrong colours"
+        mediainfo.parse.assert_called_once_with(MOVIE, parse_speed=0)
+        _assert_gone(pid_file)
+
+    # MediaInfo is read only for an input ffmpeg lists as H.264 decoded by NVDEC.
+    @pytest.mark.parametrize(
+        ("hwaccel", "hw", "listing", "answer", "asked"),
+        [
+            pytest.param("vaapi", True, GREY_H264_LISTING, ("AVC", "Y"), False, id="vaapi-decodes-grey-right"),
+            pytest.param("cuda", False, GREY_H264_LISTING, ("AVC", "Y"), False, id="the-cpu-rerun"),
+            pytest.param("cuda", True, HEVC_LISTING, ("HEVC", "Y"), False, id="grey-hevc-nvdec-refuses-by-itself"),
+            pytest.param("cuda", True, GREY_H264_LISTING, ("AVC", "YUV"), True, id="colour-h264"),
+            pytest.param("cuda", True, GREY_H264_LISTING, OSError("unreadable"), True, id="mediainfo-cant-read-it"),
+        ],
+    )
+    def test_everything_else_reads_every_frame(self, monkeypatch, hwaccel, hw, listing, answer, asked):
+        mediainfo = _mediainfo(monkeypatch, answer)
+        rows = frames.run_decode(
+            fake_ffmpeg([10, 250], ["1", "2"], stderr_head=listing) + ["-hwaccel", hwaccel, "-i", MOVIE],
+            hw_active=hw,
+            pts_offset_s=0.0,
+            detect_boxes=_detector([]),
+        )
+        assert [row[0] for row in rows] == [1.0, 2.0]
+        assert mediainfo.parse.called is asked
 
 
 @pytest.fixture

@@ -1784,6 +1784,64 @@ def _has_duplicate_thumbnails(output_folder: str, threshold: float = KEYFRAME_DU
     return dup_pairs > len(paths) * threshold
 
 
+# NVDEC on a Pascal card (a Quadro P5000, driver 580) hands VP9 Profile 2 (10/12-bit) frames back at a quarter of their
+# values and FFmpeg reports success, so every thumbnail is green with no red or blue: SDR comes out 0,130,0 and after
+# HDR tone mapping red and blue stay under 50 while green never drops below 59. A pixel counts as green-only when red
+# and blue are both at most _GREEN_ONLY_MAX_RED_BLUE and green leads them by _GREEN_ONLY_MIN_LEAD; such frames are 99.9%
+# green-only. Of 7,900 real thumbnails (lab films, Green Lantern, Avatar, The Matrix, Wicked...) one came to 98.8% and
+# seven more passed 50%, all far apart, so the first, middle and last all have to be; a false alarm costs a CPU rerun.
+_GREEN_ONLY_MAX_RED_BLUE = 64
+_GREEN_ONLY_MIN_LEAD = 40
+_GREEN_ONLY_SHARE = 0.98
+
+
+def _thumbnails_lost_their_colour(output_folder: str) -> bool:
+    """Whether a run's thumbnails came out green-only, as a GPU decoder that lost the colours leaves them.
+
+    Only the first, middle and last thumbnails are read, each at a quarter of its size: all three have to be, so real
+    green footage (a forest, a green screen) never counts. A thumbnail that can't be read counts as not green-only.
+
+    Args:
+        output_folder: The run's folder of ``img-*.jpg`` thumbnails.
+
+    Returns:
+        True when every one read is green-only.
+    """
+    # Local: only this check needs them, and only once a GPU run has made thumbnails.
+    import numpy as np
+    from PIL import Image
+
+    paths = sorted(glob.glob(os.path.join(glob.escape(output_folder), "img-*.jpg")))
+    if not paths:
+        return False
+    for path in {paths[0], paths[len(paths) // 2], paths[-1]}:
+        try:
+            with Image.open(path) as image:
+                image.draft("RGB", (image.width // 4, image.height // 4))
+                rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+        except (OSError, ValueError):
+            return False
+        red_or_blue = np.maximum(rgb[..., 0], rgb[..., 2])
+        green_only = (red_or_blue <= _GREEN_ONLY_MAX_RED_BLUE) & (rgb[..., 1] >= red_or_blue + _GREEN_ONLY_MIN_LEAD)
+        if green_only.mean() < _GREEN_ONLY_SHARE:
+            return False
+    return True
+
+
+def is_greyscale_h264(media_info: MediaInfo) -> bool:
+    """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
+    4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        True for an AVC video track whose colour space is luma only.
+    """
+    tracks = media_info.video_tracks
+    return bool(tracks) and tracks[0].format == "AVC" and tracks[0].color_space == "Y"
+
+
 def generate_images(
     video_file: str,
     output_folder: str,
@@ -1822,6 +1880,17 @@ def generate_images(
             read-only, or not writable by this user); none of them are kept.
     """
     media_info = MediaInfo.parse(video_file)
+    if gpu == "NVIDIA" and is_greyscale_h264(media_info):
+        # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
+        # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.
+        logger.info(
+            "{} is greyscale H.264, which this GPU decodes into the wrong colours; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        raise CodecNotSupportedError(
+            f"GPU processing skipped (the GPU decodes greyscale H.264 into the wrong colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
 
     # Filter primitives.  The final vf chain is assembled inside
@@ -2476,6 +2545,18 @@ def generate_images(
                 video_file,
                 rc,
             )
+
+    if image_count > 0 and gpu is not None and _thumbnails_lost_their_colour(output_folder):
+        logger.info(
+            "The GPU decoded {} without its colours (every thumbnail came out green), so its decoder can't handle this "
+            "video; the CPU makes its thumbnails instead.",
+            video_file,
+        )
+        _clean_output_images(output_folder)
+        raise CodecNotSupportedError(
+            f"GPU processing failed (the GPU decoded the video without its colours) for {video_file}",
+            kind=FALLBACK_CODEC,
+        )
 
     # Rename images only after all retries and error checks are complete
     if image_count > 0:

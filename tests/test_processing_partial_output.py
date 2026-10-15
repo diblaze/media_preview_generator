@@ -219,7 +219,16 @@ def _ffmpeg_script(attempts: list[tuple], output_folder: str, calls: list):
 def run(mock_config, tmp_path):
     mock_config.plex_bif_frame_interval = INTERVAL_S
 
-    def _generate(attempts, *, gpu=None, keyframe_gap=None, dv5=False, duration_s=DURATION_S, runner_factory=None):
+    def _generate(
+        attempts,
+        *,
+        gpu=None,
+        keyframe_gap=None,
+        dv5=False,
+        duration_s=DURATION_S,
+        runner_factory=None,
+        track_fields=None,
+    ):
         calls: list = []
         out = str(tmp_path / "frames")
         os.makedirs(out, exist_ok=True)
@@ -228,6 +237,7 @@ def run(mock_config, tmp_path):
             hdr_format="Dolby Vision" if dv5 else None,
             transfer_characteristics=None,
             duration=duration_s * 1000 if duration_s else None,
+            **(track_fields or {}),
         )
         warnings: list[str] = []
         sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{level}|{message}")

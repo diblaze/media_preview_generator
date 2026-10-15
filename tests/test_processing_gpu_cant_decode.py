@@ -13,16 +13,20 @@ twice in runs that had already written 328-414 frames, and FFmpeg ends those run
 Only the FFmpeg process is mocked; the runner's poll loop and the retry cascade run for real.
 """
 
+import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from loguru import logger
+from PIL import Image
 
 from media_preview_generator.processing import ffmpeg_runner
 from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
 from media_preview_generator.processing.filter_chain import DV5_PATH_LIBPLACEBO
 from media_preview_generator.processing.generator import _was_interrupted, gpu_fallback_announcement
+from media_preview_generator.processing.hwaccel import hwaccel_decode_args
 from tests.test_processing_partial_output import (
     EXPECTED,
     FFMPEG_SIGNALLED,
@@ -902,3 +906,120 @@ class TestTheHandOffJudgesTheDecoderTheRunAskedFor:
             "hwaccel",
             "the GPU's filters couldn't take the decoded frames",
         )
+
+
+def _logged(run, *args, **kwargs):  # noqa: F811
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="INFO", format="{level}|{message}")
+    try:
+        outcome = run(*args, **kwargs)
+    finally:
+        logger.remove(sink)
+    return outcome, records
+
+
+GREY_H264 = {"format": "AVC", "color_space": "Y"}
+
+
+class TestGreyscaleH264OnNvdecGoesToTheCpu:
+    """NVDEC decodes H.264 greyscale (4:0:0) into coloured stripes and FFmpeg reports success (a Quadro P5000 and a
+    TITAN RTX). MediaInfo reads the format before FFmpeg runs, so the file goes to the CPU without a GPU run."""
+
+    def test_the_cpu_makes_its_thumbnails_and_the_gpu_never_runs(self, run):  # noqa: F811
+        outcome, records = _logged(run, [(0, EXPECTED)], gpu="NVIDIA", track_fields=GREY_H264)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert outcome.calls == [], "the GPU run would publish stripes"
+        assert any(line.startswith("INFO|") and "greyscale H.264" in line for line in records), records
+        assert not outcome.warnings, outcome.warnings
+
+    @pytest.mark.parametrize(
+        ("gpu", "fields"),
+        [
+            pytest.param("INTEL", GREY_H264, id="vaapi-decodes-grey-right"),
+            pytest.param("AMD", GREY_H264, id="amd-vaapi"),
+            pytest.param(None, GREY_H264, id="the-cpu-run"),
+            pytest.param("NVIDIA", {"format": "HEVC", "color_space": "Y"}, id="hevc-grey-hands-off-by-itself"),
+            pytest.param("NVIDIA", {"format": "AVC", "color_space": "YUV"}, id="colour-h264"),
+        ],
+    )
+    def test_everything_else_keeps_its_run(self, run, gpu, fields):  # noqa: F811
+        outcome = run([(0, EXPECTED)], gpu=gpu, track_fields=fields)
+
+        assert_published(outcome, EXPECTED)
+        assert len(outcome.calls) == 1
+
+
+def _picture(red, green, blue) -> np.ndarray:
+    return np.dstack([np.broadcast_to(np.asarray(c), (180, 320)) for c in (red, green, blue)]).astype(np.uint8)
+
+
+_RAMP = np.tile(np.linspace(80, 200, 320), (180, 1))  # the luma detail a quarter-value frame keeps
+_NOISE = np.random.default_rng(7).integers(0, 14, size=(180, 320))
+# Measured on a Quadro P5000 from VP9 Profile 2: SDR comes out 0,~130,0; after HDR tone mapping red ~12 and blue ~7.
+SDR_LOST_COLOUR = _picture(0, _RAMP, 0)
+HDR_LOST_COLOUR = _picture(6 + _NOISE, _RAMP - 10, _NOISE)
+# Two thirds of it green-only (grass) under a sky.
+GRASS_UNDER_SKY = np.vstack([_picture(100, 150, 220)[:60], _picture(30 + _NOISE, 140, 20 + _NOISE)[60:]])
+NIGHT_FOREST = _picture(5, 40, 5)
+GREEN_SCREEN = _picture(40 + _NOISE, 200, 70 + _NOISE)
+
+
+def _thumbnail_runner(pictures: list[np.ndarray]):
+    """``create_ffmpeg_runner`` stand-in whose GPU run writes these pictures as its JPEG thumbnails."""
+
+    def factory(*, output_folder, gpu=None, gpu_device_path=None, last_command=None, **_kwargs):
+        def _run(use_skip=False, **_run_kwargs):
+            if last_command is not None:
+                last_command[:] = ["ffmpeg", *hwaccel_decode_args(gpu, gpu_device_path, keep_on_gpu=True).args]
+            for i, picture in enumerate(pictures, 1):
+                Image.fromarray(picture).save(os.path.join(output_folder, f"img-{i:06d}.jpg"), quality=85)
+            return 0, 1.0, "10x", []
+
+        return _run
+
+    return factory
+
+
+class TestThumbnailsTheGpuDecodedWithoutColour:
+    """NVDEC on a Pascal card (a Quadro P5000) returns VP9 Profile 2 frames at a quarter of their values and FFmpeg
+    reports success: every thumbnail is green with no red or blue. The GPU lacks that profile, so the CPU makes them."""
+
+    @pytest.mark.parametrize(
+        ("gpu", "picture"),
+        [
+            pytest.param("NVIDIA", SDR_LOST_COLOUR, id="sdr-on-pascal"),
+            pytest.param("NVIDIA", HDR_LOST_COLOUR, id="hdr10-tone-mapped-on-pascal"),
+            pytest.param("INTEL", SDR_LOST_COLOUR, id="any-gpu-decoder"),
+        ],
+    )
+    def test_green_only_thumbnails_go_to_the_cpu(self, run, gpu, picture):  # noqa: F811
+        outcome, records = _logged(run, [], gpu=gpu, duration_s=50, runner_factory=_thumbnail_runner([picture] * 5))
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert any(line.startswith("INFO|") and "without its colours" in line for line in records), records
+        assert not [line for line in records if line.startswith(("WARNING|", "ERROR|"))], records
+
+    @pytest.mark.parametrize(
+        "pictures",
+        [
+            pytest.param([GRASS_UNDER_SKY] * 5, id="grass-under-a-sky"),
+            pytest.param([NIGHT_FOREST] * 5, id="dark-green-night"),
+            pytest.param([GREEN_SCREEN] * 5, id="green-screen"),
+            pytest.param(
+                [GRASS_UNDER_SKY, SDR_LOST_COLOUR, SDR_LOST_COLOUR, SDR_LOST_COLOUR, GRASS_UNDER_SKY],
+                id="green-only-in-the-middle",
+            ),
+        ],
+    )
+    def test_real_green_footage_is_published(self, run, pictures):  # noqa: F811
+        outcome = run([], gpu="NVIDIA", duration_s=50, runner_factory=_thumbnail_runner(pictures))
+
+        assert_published(outcome, 5)
+
+    def test_the_cpu_run_publishes_what_it_decoded(self, run):  # noqa: F811
+        outcome = run([], gpu=None, duration_s=50, runner_factory=_thumbnail_runner([SDR_LOST_COLOUR] * 5))
+
+        assert_published(outcome, 5)
