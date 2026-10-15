@@ -6914,6 +6914,55 @@ class TestBackupRestore:
         assert live.read_text() == '{"label": "from-february"}'
         assert (tmp_path / "settings.json.20260901-120000.bak").read_text() == '{"label": "current"}'
 
+    @pytest.mark.parametrize("trimmed_by", ["count", "age"])
+    def test_the_backup_the_pre_restore_snapshot_trims_is_still_restored(self, client, trimmed_by):
+        """The snapshot of the live file trims the backups past the number kept, or older than the age kept: the
+        oldest of a full list, or one past that age, is the backup trimmed, and it is the one being restored."""
+        from media_preview_generator.utils import timestamped_backups
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        sm = get_settings_manager()
+        keep = 3
+        sm.apply_changes(
+            updates={
+                "config_backup_keep": keep,
+                "config_backup_max_age_days": 1 if trimmed_by == "age" else 0,
+                "log_retention_count": 7,
+            }
+        )
+        live = os.path.join(str(sm.config_dir), "settings.json")
+        for path in timestamped_backups(live):
+            os.remove(path)
+        now = time.time()
+        names = []
+        for i in range(keep if trimmed_by == "count" else 2):
+            name = f"settings.json.202601{i + 1:02d}-100000.bak"
+            path = os.path.join(str(sm.config_dir), name)
+            with open(path, "w") as f:
+                json.dump({**sm.get_all(), "log_retention_count": 100 + i}, f)
+            # The oldest is two days old: past the age kept in the "age" case, merely the oldest in the other.
+            made = now - 2 * 86400 if i == 0 else now - 60 + i
+            os.utime(path, (made, made))
+            names.append(name)
+
+        resp = client.post(
+            "/api/settings/backups/restore",
+            headers=_api_headers(),
+            json={"file": "settings.json", "backup": names[0]},
+        )
+
+        assert resp.status_code == 200, resp.get_json()
+        assert sm.get("log_retention_count") == 100
+        with open(live) as f:
+            assert json.load(f)["log_retention_count"] == 100
+        backups = timestamped_backups(live)
+        assert len(backups) <= keep
+        contents = []
+        for path in backups:
+            with open(path) as f:
+                contents.append(json.load(f)["log_retention_count"])
+        assert 7 in contents  # The snapshot to undo the restore with.
+
     HELPER_URL = "http://plex-host.lan:9494"
     HELPER_KEY = "helper-key-123456"
 

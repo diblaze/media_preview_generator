@@ -1829,6 +1829,25 @@ def _newer_settings_refusal(path: str) -> str:
     return ""
 
 
+def _snapshot_before_restore(live: str) -> None:
+    """Save the live file as a fresh timestamped backup, so a restore can be undone by restoring that one in turn.
+
+    Best-effort: a failed snapshot never blocks the restore.
+
+    Args:
+        live: The live file about to be replaced.
+    """
+    if not os.path.exists(live):
+        return
+    try:
+        from ...utils import _backup_max_age_days, _backup_retention, _prune_old_backups, backup_file
+
+        backup_file(live)
+        _prune_old_backups(live, _backup_retention(), _backup_max_age_days())
+    except OSError as exc:
+        logger.debug("Pre-restore snapshot of {} failed: {}", live, exc)
+
+
 @api.route("/settings/backups/restore", methods=["POST"])
 @api_token_required
 def restore_backup():
@@ -1838,7 +1857,9 @@ def restore_backup():
     The named backup is COPIED over the live file (the backup itself is
     preserved so the user can restore the same point-in-time again).
     Before overwriting, the current live contents are saved as a fresh
-    timestamped backup so a misclick is recoverable via a second restore.
+    timestamped backup so a misclick is recoverable via a second restore;
+    like any save, that trims the oldest backups past the number kept, so
+    the oldest of a full list is copied first and then trimmed.
     A settings.json from an older schema is then migrated, as at start-up.
 
     For backwards compatibility, ``backup`` is optional — if omitted, the
@@ -1875,18 +1896,6 @@ def restore_backup():
     if refusal:
         return jsonify({"success": False, "error": refusal}), 409
 
-    # Snapshot the current live contents into a fresh timestamped backup
-    # before overwriting. Lets the user undo a restore by restoring this
-    # snapshot in turn. Best-effort — never blocks the primary restore.
-    if os.path.exists(live):
-        try:
-            from ...utils import _backup_max_age_days, _backup_retention, _prune_old_backups, backup_file
-
-            backup_file(live)
-            _prune_old_backups(live, _backup_retention(), _backup_max_age_days())
-        except OSError as exc:
-            logger.debug("Pre-restore snapshot of {} failed: {}", live, exc)
-
     # The manager keeps its settings in memory, so it must re-read the restored file under its lock; otherwise
     # the next save of anything would write the old in-memory content back over the restore.
     settings = get_settings_manager()
@@ -1896,7 +1905,9 @@ def restore_backup():
     try:
         with settings.locked():
             live_revisions = (settings.worker_groups_revision, settings.nodes_revision)
+            # Copied before the snapshot: trimming the backups to the number kept (or by age) can delete this one.
             shutil.copy2(bak_path, tmp_path)
+            _snapshot_before_restore(live)
             os.replace(tmp_path, live)
             replaced = True
             if name == "settings.json":
