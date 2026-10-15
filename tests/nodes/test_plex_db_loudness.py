@@ -546,6 +546,33 @@ class TestTheUndoRecordSurvivesAnUpdate:
             plex_db_role.undo_record_problem(mountinfo_path=_mountinfo(tmp_path, fs="overlay", extra_lines=extra)) == ""
         )
 
+    @pytest.mark.parametrize(
+        ("root", "refused"),
+        [
+            ("/var/lib/docker/volumes/b509fb586500cb94a68b2e4ab70beb28099ab221825361d2d1b7eebd6be6fd62/_data", True),
+            # Docker's data folder on a disk of its own, and rootless Podman: the same unnamed volume.
+            ("/volumes/b509fb586500cb94a68b2e4ab70beb28099ab221825361d2d1b7eebd6be6fd62/_data", True),
+            (
+                "/data/containers/storage/volumes/2d25dcb5c80f4d95ac7043e00fd7e1962d25dcb5c80f4d95ac7043e00fd7e196/_data",
+                True,
+            ),
+            ("/var/lib/docker/volumes/plex-db-node-config/_data", False),
+            ("/srv/appdata/plex-db-node", False),
+        ],
+        ids=["unnamed-volume", "unnamed-volume-own-disk", "unnamed-podman-volume", "named-volume", "bind-mount"],
+    )
+    @linux_mount_table
+    def test_an_unnamed_volume_is_refused_like_the_containers_layer(self, folder, tmp_path, monkeypatch, root, refused):
+        """The image's ``VOLUME /config`` gives a container started without ``-v`` an unnamed volume, and an update by
+        ``docker rm`` + ``docker run`` starts on a new, empty one: the undo record would be left behind in the old."""
+        config_dir = Path(loudness_db.write_log_path()).parent
+        extra = f"40 22 252:1 {root} {config_dir} rw,relatime master:1 - ext4 /dev/mapper/vg-root rw\n"
+        problem = plex_db_role.undo_record_problem(mountinfo_path=_mountinfo(tmp_path, fs="overlay", extra_lines=extra))
+        assert bool(problem) is refused, problem
+        if refused:
+            assert problem.startswith(f"Mount a volume at {config_dir} on this Plex database node")
+            assert "has no name" in problem and f"-v <name>:{config_dir}" in problem
+
     def test_windows_keeps_it_under_localappdata_and_is_never_asked_for_a_volume(self, folder, tmp_path, monkeypatch):
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
         assert self._check(folder, tmp_path, root_fs="overlay", config_mounted=False).state is Capability.READY

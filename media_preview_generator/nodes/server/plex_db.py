@@ -30,6 +30,7 @@ Import-light on purpose: Flask, loguru and the app's ``markers/publishers``, ``l
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -41,7 +42,7 @@ from loguru import logger
 from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY, read_rows, section_ids_from_json
 from ...loudness import plex_db as loudness_db
 from ...loudness.guard import LoudnessPlexDb
-from ...markers.fs import filesystem_type, is_network_filesystem, mount_of
+from ...markers.fs import filesystem_type, is_network_filesystem, mount_of, mount_root
 from ...markers.publishers import plex_remote
 from ...markers.publishers.base import Capability, PublishError
 from ...markers.publishers.plex_chapters import (
@@ -83,6 +84,9 @@ _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
 _CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
 _IMAGE_ROOT_FS = frozenset({"overlay", "fuse.fuse-overlayfs"})
+# The volume Docker (and Podman) make for an image's ``VOLUME`` when no ``-v`` names one: 64 hex characters under the
+# engine's ``volumes`` folder. ``docker rm`` + ``docker run`` starts the new container on a new, empty one.
+_UNNAMED_VOLUME_ROOT = re.compile(r"(?:^|/)volumes/[0-9a-f]{64}/_data$")
 # The folder the last register_plex_db call serves, for info_block() (one node process serves one Plex).
 _registered_config_dir = ""
 
@@ -119,6 +123,10 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
     ``%LOCALAPPDATA%`` (its entry point sets ``CONFIG_DIR`` to it), and a Linux node outside a container keeps it on
     the machine's own disk; neither needs a volume.
 
+    The plex-db image declares ``VOLUME /config``, so a container started without a volume of its own gets an unnamed
+    one there: it is a mount, but the next ``docker rm`` + ``docker run`` leaves it behind for a new, empty one, so it
+    is refused like the container's layer.
+
     Args:
         mountinfo_path: For tests.
     """
@@ -127,8 +135,19 @@ def undo_record_problem(*, mountinfo_path: str = "/proc/self/mountinfo") -> str:
         if os.environ.get("CONFIG_DIR", "").strip():
             return ""
         return f"Set CONFIG_DIR to this node's own folder: the loudness undo record would go to {folder}."
-    found = mount_of(os.path.realpath(folder), mountinfo_path=mountinfo_path)
-    if found is None or found[0] != "/" or not _in_container(found[1]):
+    real = os.path.realpath(folder)
+    found = mount_of(real, mountinfo_path=mountinfo_path)
+    if found is None:
+        return ""
+    if found[0] != "/":
+        if not _UNNAMED_VOLUME_ROOT.search(mount_root(real, mountinfo_path=mountinfo_path) or ""):
+            return ""
+        return (
+            f"Mount a volume at {folder} on this Plex database node so the loudness undo record survives updates: the "
+            f"one there has no name, so an update starts on a new, empty one. Name it (-v <name>:{found[0]}). "
+            "Loudness is not written until then."
+        )
+    if not _in_container(found[1]):
         return ""
     return (
         f"Mount a volume at {folder} on this Plex database node so the loudness undo record survives updates. "
