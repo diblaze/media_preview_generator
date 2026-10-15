@@ -797,6 +797,14 @@ class TestAccessProblem:
         h.quick = True
         assert h.registry.check_now("n1").state == reg.STATE_READY
 
+    def test_a_library_no_row_covers_is_not_judged_but_a_covered_one_that_is_missing_still_fails(self):
+        movies = {"library": "Movies", "checked": 3, "ok": True}
+        unmapped = {"library": "Anime", "mapped": False, "checked": 0, "ok": False}
+        missing = {"library": "Anime", "mapped": True, "checked": 3, "ok": False}
+        assert reg.access_passed({"libraries": [movies, unmapped]}) is True
+        assert reg.access_passed({"libraries": [movies, missing]}) is False
+        assert reg.access_passed({"libraries": [unmapped]}) is False
+
     def test_a_test_access_that_checked_nothing_does_not_pass(self):
         assert reg.access_passed({"libraries": [{"checked": 0, "ok": False}]}) is False
         assert reg.access_passed(None) is False

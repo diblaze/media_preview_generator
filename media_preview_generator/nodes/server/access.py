@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import stat
+import unicodedata
 
 from ..protocol import (
     NOT_VISIBLE_DIFFERENT_FILE,
@@ -37,6 +38,20 @@ class NotVisible(Exception):
         self.reason = reason
         self.message = message
         self.node_path = node_path
+
+
+def _closest_first(names: list[str], node_path: str) -> list[str]:
+    """``names`` sorted, those named like a folder in ``node_path`` first, cut to :data:`NEARBY_MAX_NAMES`.
+
+    The app suggests a node folder named like one it asked for, so a long listing (Unraid's ``/mnt/user``) must not
+    cut that folder off just because it sorts late.
+    """
+
+    def key(name: str) -> str:
+        return unicodedata.normalize("NFD", name).casefold()
+
+    wanted = {key(part) for part in node_path.replace("\\", "/").split("/") if part}
+    return sorted(names, key=lambda name: (key(name) not in wanted, name))[:NEARBY_MAX_NAMES]
 
 
 def _within(path: str, root: str) -> bool:
@@ -136,7 +151,7 @@ def nearby(node_path: str, mappings: list[PathMapping]) -> tuple[str, list[str]]
             if not any(_within(os.path.realpath(folder), root) for root in roots):
                 break
             try:
-                names = sorted(os.listdir(folder))[:NEARBY_MAX_NAMES]
+                names = _closest_first(os.listdir(folder), node_path)
             except OSError:
                 return None
             return folder, names
@@ -163,10 +178,10 @@ def _beside_missing_root(node_path: str, mappings: list[PathMapping]) -> tuple[s
         return None
     try:
         with os.scandir(parent) as entries:
-            names = sorted(entry.name for entry in entries if _is_dir(entry))
+            names = [entry.name for entry in entries if _is_dir(entry)]
     except OSError:
         return None
-    return parent, names[:NEARBY_MAX_NAMES]
+    return parent, _closest_first(names, node_path)
 
 
 def _is_dir(entry: os.DirEntry) -> bool:

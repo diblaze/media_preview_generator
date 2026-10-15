@@ -483,6 +483,21 @@ def test_saving_window_union_and_add_duplicate_remove(authed_page: Page, app_url
     assert len(group_api["writes"][-1][2]["groups"]) == 2
 
 
+def test_a_duplicated_group_has_its_own_member_ids_so_notes_stay_with_the_original(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    settings_page(authed_page, app_url)
+    page = authed_page
+    page.locator('[data-edit="cpu-night"]').click()
+    page.locator('[data-member="m-cpu"] [data-pick]').select_option("nvidia0")
+    expect(page.locator('[data-member="m-cpu"]')).to_contain_text("Loudness removed")
+
+    page.locator("#workerGroupDuplicate").click()
+
+    expect(page.locator('[data-member="m-cpu"]')).to_have_count(0)
+    expect(page.locator("#workerGroupEditor")).not_to_contain_text("Loudness removed")
+
+
 def test_api_failure_keeps_configuration_uneditable(authed_page: Page, app_url: str) -> None:
     authed_page.route("**/api/worker-groups", lambda route: route.fulfill(status=503, json={"error": "Unavailable"}))
     mock_settings_get(authed_page)

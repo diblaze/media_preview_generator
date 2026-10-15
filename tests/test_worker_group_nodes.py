@@ -675,3 +675,29 @@ class TestWorkerStatuses:
         pool.reconcile_groups(groups, [])
         (status,) = JobDispatcher(pool)._build_worker_statuses()
         assert (status["node_state"], status["node_cause"]) == ("offline", cause)
+
+
+def test_a_renamed_node_shows_its_new_name_on_workers_already_running(registry):
+    registry.put("storage", name="Old name")
+    pool = WorkerPool(0, 0, LOCAL_GPU)
+    groups = [group("g", member("ncpu", count=1, node="storage"))]
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    registry.put("storage", name="New name")
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    assert pool.workers[0].node_name == "New name"
+    assert pool.workers[0].placement.node_name == "New name"
+
+
+def test_a_node_gpu_list_reordered_updates_the_running_workers_gpu_index(registry):
+    other = {"type": "intel", "device": "/dev/dri/renderD128", "name": "UHD", "status": "ok"}
+    registry.put("storage", gpus=(NODE_GPU, other))
+    pool = WorkerPool(0, 0, LOCAL_GPU)
+    groups = [group("g", member("ngpu", "gpu", "cuda:0", count=1, node="storage", kinds=["previews"]))]
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    registry.put("storage", gpus=(other, NODE_GPU))
+    pool.reconcile_groups(groups, LOCAL_GPU)
+
+    assert pool.workers[0].gpu_index == 1

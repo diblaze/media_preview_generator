@@ -170,6 +170,16 @@ class TestNearby:
 
         assert len(names) == access.NEARBY_MAX_NAMES
 
+    def test_a_folder_named_like_the_path_survives_the_cap_though_it_sorts_late(self, tmp_path):
+        rows = [PathMapping("/data", str(tmp_path / "share" / "not-there"))]
+        for n in range(60):
+            (tmp_path / "share" / f"A{n:02}").mkdir(parents=True)
+        (tmp_path / "share" / "Movies").mkdir()
+
+        _, names = access.nearby(str(tmp_path / "share" / "not-there" / "movies" / "a.mkv"), rows)
+
+        assert len(names) == access.NEARBY_MAX_NAMES and names[0] == "Movies"
+
     def test_beside_a_missing_node_folder_only_folder_names_are_listed(self, tmp_path):
         rows = [PathMapping("/data", str(tmp_path / "media" / "not-there"))]
         (tmp_path / "media" / "Movies" / "private").mkdir(parents=True)
