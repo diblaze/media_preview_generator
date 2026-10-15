@@ -1,8 +1,9 @@
 """Who this node is: a stable id, a display name, and the key the app must send.
 
-``<CONFIG_DIR>/node.json`` holds ``{"id", "key"}``, written once with mode 0600. The id never changes, so the app
-can tell this node from another one answering at the same address. The key the node expects is, in order: the one
-passed in, ``NODE_KEY``, ``AGENT_TOKEN`` (what a Plex helper was set up with), else the generated one in node.json.
+``<CONFIG_DIR>/node.json`` holds ``{"id", "key", "announced"}``, written with mode 0600. The id never changes, so the
+app can tell this node from another one answering at the same address. The key the node expects is, in order: the one
+passed in, ``NODE_KEY``, ``AGENT_TOKEN`` (what a Plex helper was set up with), else the generated one in node.json,
+shown once in the console the first time it is the one in use (``announced`` records that it was).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import secrets
 import socket
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from loguru import logger
 
@@ -67,7 +69,7 @@ def _check_key(key: str, source: str, *, min_length: int = 0) -> str:
     return key
 
 
-def _write_private(path: str, data: dict[str, str]) -> None:
+def _write_private(path: str, data: dict[str, Any]) -> None:
     tmp = f"{path}.tmp-{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -85,7 +87,7 @@ def _write_private(path: str, data: dict[str, str]) -> None:
         raise
 
 
-def _load_or_create(config_dir: str) -> tuple[dict[str, str], bool]:
+def _load_or_create(config_dir: str) -> tuple[dict[str, Any], bool]:
     path = os.path.join(config_dir, IDENTITY_FILE)
     try:
         with open(path, encoding="utf-8") as handle:
@@ -102,8 +104,8 @@ def _load_or_create(config_dir: str) -> tuple[dict[str, str], bool]:
             or not isinstance(stored.get("key"), str)
         ):
             raise SystemExit(f"{path} isn't a node identity file; fix or remove it and restart.")
-        return {"id": stored["id"], "key": stored["key"]}, False
-    data = {"id": uuid.uuid4().hex, "key": secrets.token_urlsafe(32)}
+        return {"id": stored["id"], "key": stored["key"], "announced": stored.get("announced") is True}, False
+    data = {"id": uuid.uuid4().hex, "key": secrets.token_urlsafe(32), "announced": False}
     try:
         os.makedirs(config_dir, exist_ok=True)
         _write_private(path, data)
@@ -126,6 +128,15 @@ def _announce_key(key: str, config_dir: str) -> None:
     width = max(len(line) for line in lines) + 2
     box = ["+" + "-" * width + "+", *(f"| {line.ljust(width - 2)} |" for line in lines), "+" + "-" * width + "+"]
     logger.bind(**{SECRET_EXTRA: True}).warning("\n" + "\n".join(box))
+
+
+def _mark_announced(config_dir: str, stored: dict[str, Any]) -> None:
+    path = os.path.join(config_dir, IDENTITY_FILE)
+    try:
+        _write_private(path, {**stored, "announced": True})
+    except OSError as exc:
+        # The key still works; it is only shown again at the next start.
+        logger.warning("Couldn't note in {} that its key was shown ({}); it is shown again next start", path, exc)
 
 
 def load_identity(config_dir: str | None = None, *, key: str | None = None) -> NodeIdentity:
@@ -161,8 +172,10 @@ def load_identity(config_dir: str | None = None, *, key: str | None = None) -> N
             )
     else:
         chosen, source = _check_key(stored["key"], os.path.join(folder, IDENTITY_FILE) + "'s key"), IDENTITY_FILE
-        if created:
+        # Not "when created": a node first started with NODE_KEY and later without it runs on this key from then on.
+        if not stored["announced"]:
             _announce_key(chosen, folder)
+            _mark_announced(folder, stored)
     return NodeIdentity(
         id=stored["id"], name=name, key=chosen, key_source=source, key_generated=created and source == IDENTITY_FILE
     )

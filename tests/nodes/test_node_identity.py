@@ -33,7 +33,7 @@ class TestNodeJson:
         path = tmp_path / "node.json"
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
         stored = json.loads(path.read_text())
-        assert stored == {"id": me.id, "key": me.key}
+        assert stored == {"id": me.id, "key": me.key, "announced": True}
         assert len(me.id) == 32 and me.key_generated and me.key_source == "node.json"
 
     def test_same_id_and_key_on_the_next_start(self, tmp_path):
@@ -178,6 +178,41 @@ class TestKeyNotice:
 
         stored_key = json.loads((tmp_path / "node.json").read_text())["key"]
         assert not [m for m in warnings_seen if stored_key in m or "mine-0123456789abcdef" in m]
+
+    def test_a_stored_key_is_announced_the_first_time_it_is_used(self, tmp_path, monkeypatch, warnings_seen):
+        monkeypatch.setenv("NODE_KEY", "a-key-the-user-chose-0123456789")
+        identity.load_identity(str(tmp_path))  # first start (or install.ps1) with NODE_KEY: node.json made, unused
+        monkeypatch.delenv("NODE_KEY")
+
+        later = identity.load_identity(str(tmp_path))  # the next start without it runs on node.json's key
+        identity.load_identity(str(tmp_path))
+
+        assert later.key_source == "node.json"
+        assert len([m for m in warnings_seen if later.key in m]) == 1
+        assert json.loads((tmp_path / "node.json").read_text())["announced"] is True
+
+    def test_a_node_json_from_before_the_flag_is_announced_once(self, tmp_path, warnings_seen):
+        (tmp_path / "node.json").write_text(json.dumps({"id": "a" * 32, "key": "k" * 43}))
+
+        identity.load_identity(str(tmp_path))
+        identity.load_identity(str(tmp_path))
+
+        assert len([m for m in warnings_seen if "k" * 43 in m]) == 1
+
+    def test_a_read_only_node_json_still_starts_and_shows_the_key_again(self, tmp_path, monkeypatch, warnings_seen):
+        identity.load_identity(str(tmp_path), key="from-arg")  # made, unused
+
+        def read_only(*_args):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(identity, "_write_private", read_only)
+
+        first = identity.load_identity(str(tmp_path))
+        second = identity.load_identity(str(tmp_path))
+
+        assert first.key == second.key
+        assert len([m for m in warnings_seen if first.key in m]) == 2
+        assert [m for m in warnings_seen if "shown again next start" in m]
 
     def test_notice_never_reaches_the_readable_node_log(self, tmp_path):
         buffer = nodelog.install()
