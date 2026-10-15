@@ -45,6 +45,8 @@ dependencies = [
     "flask-limiter>=3.5.0,<4",
     "apscheduler>=3.10.0,<4",
     "gunicorn>=22.0.0,<24",
+    # Serves a node (MODE=node, nodes/server/wsgi.py): it reads each request whole before a thread takes it.
+    "waitress==3.0.2",
     "sqlalchemy>=2.0.0,<3",
     # Pillow is used by JellyfinTrickplayAdapter to pack frame JPGs into
     # 10x10 tile sheets (Jellyfin 10.9+ native trickplay format).

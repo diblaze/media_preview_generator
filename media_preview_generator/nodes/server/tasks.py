@@ -1,6 +1,6 @@
 """The node's task table: each task is one op run on one file, in its own thread, polled by the app.
 
-A task lives only in this process's memory (gunicorn runs one worker for that reason). The app polls it about once a
+A task lives only in this process's memory (the node is served by one process for that reason). The app polls it about once a
 second; one nobody has polled for ``unpolled_expiry_s`` is cancelled and its temp dir removed, so an app that
 restarted mid-task never leaves FFmpeg running here. A finished task is kept ``finished_keep_s`` after its last poll
 so the app can still fetch the artifact, unless the app deletes it first.
@@ -181,6 +181,7 @@ class NodeTask:
         self._cancel = threading.Event()
         self._paused = threading.Event()
         self._lock = threading.Lock()
+        self.thread: threading.Thread | None = None
 
     # TaskContext ------------------------------------------------------------------------------------------------
 
@@ -372,7 +373,10 @@ class TaskTable:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 return task_id
             self._tasks[task_id] = task
-        threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True).start()
+            # Daemon: a hung op must not keep the process alive; close() waits for the rest so their FFmpeg is killed.
+            # Started under the lock, so close() never finds a thread it can't join yet.
+            task.thread = threading.Thread(target=self._run, args=(task,), name=f"node-task-{task_id[:8]}", daemon=True)
+            task.thread.start()
         return task_id
 
     def _make_temp_dir(self, task_id: str) -> str:
@@ -554,10 +558,30 @@ class TaskTable:
             except Exception:  # noqa: BLE001 - the reaper must outlive one bad pass
                 logger.opt(exception=True).warning("The node's task reaper failed one pass")
 
-    def close(self) -> None:
-        """Stop the reaper and drop every task (tests; a node process just exits)."""
+    def close(self, wait_s: float = 0.0) -> None:
+        """Stop the reaper and drop every task: running ones are cancelled, which stops their FFmpeg.
+
+        Args:
+            wait_s: How long to wait, in all, for the cancelled ops to return (a node shutting down waits, so no FFmpeg
+                outlives it and no task dir is left behind; tests don't).
+        """
         self._stop.set()
         with self._lock:
             tasks, self._tasks = list(self._tasks.values()), {}
         for task in tasks:
             self._discard(task)
+        deadline = time.monotonic() + wait_s
+        for task in tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if task.thread is not None and task.thread is not threading.current_thread():
+                task.thread.join(remaining)
+        running = [task for task in tasks if task.thread is not None and task.thread.is_alive()]
+        if wait_s > 0 and running:
+            logger.warning(
+                "{} task(s) still running after {:.0f} s of stopping: {}",
+                len(running),
+                wait_s,
+                ", ".join(f"{task.id[:8]} ({task.op})" for task in running),
+            )

@@ -68,13 +68,14 @@ WORKDIR /app
 # Non-root by default. Plex's database is owned by the user Plex runs as, so run the container as that user
 # (compose: `user: "${PUID}:${PGID}"`); the image itself needs no privileges of its own.
 USER 1000:1000
-# The default port only. NODE_PORT (or AGENT_PORT) moves what gunicorn binds, and EXPOSE can't follow an environment
+# The default port only. NODE_PORT (or AGENT_PORT) moves what the node binds, and EXPOSE can't follow an environment
 # variable — so a changed port also needs the published mapping changed (docker-compose.yml derives both from it).
 EXPOSE 9494
 
-# One worker: the app's "one writer at a time" guarantee is a lock inside one process (see nodes/server/plex_db.py).
-# Threads let a read-back and the Edit tab's checks overlap without a second process touching the database.
-CMD ["sh", "-c", "exec gunicorn media_preview_generator.nodes.server.wsgi:app --bind 0.0.0.0:${NODE_PORT:-${AGENT_PORT:-9494}} --workers 1 --threads 4 --timeout 180 --access-logfile -"]
+# One process: the app's "one writer at a time" guarantee is a lock inside it (see nodes/server/plex_db.py). Threads
+# let a read-back and the Edit tab's checks overlap without a second process touching the database; waitress reads
+# each request whole before a thread takes it, so half-sent requests can't hold them (nodes/server/wsgi.py).
+CMD ["sh", "-c", "exec python -m media_preview_generator.nodes.server.wsgi --port ${NODE_PORT:-${AGENT_PORT:-9494}} --threads 8"]
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD exec python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + (os.environ.get('NODE_PORT') or os.environ.get('AGENT_PORT') or '9494') + '/v1/health', timeout=5)"

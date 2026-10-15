@@ -688,7 +688,7 @@ jobs:
             -p 127.0.0.1:9494:9494 \
             "$CHECK_IMAGE"
 
-          # The image's own HEALTHCHECK hits /v1/health, so "healthy" already means gunicorn imported the app —
+          # The image's own HEALTHCHECK hits /v1/health, so "healthy" already means the node server imported the app —
           # which is the --no-deps claim under test.
           for _ in $(seq 1 60); do
             status="$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo gone)"

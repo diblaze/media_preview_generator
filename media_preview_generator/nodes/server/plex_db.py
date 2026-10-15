@@ -20,7 +20,7 @@ The wire protocol is the agent's (``markers.publishers.plex_remote``: header ``X
 so every app that already talks to a Plex helper keeps working. ``/v1/health`` belongs to the node server
 (``nodes.server.app``), which carries :func:`agent_block` on it while this role is on.
 
-Run it with one worker (``gunicorn --workers 1``): the app's "one writer at a time" guarantee is a lock inside one
+Run it in one process (``nodes.server.wsgi`` serves one): the app's "one writer at a time" guarantee is a lock inside one
 process, and the database's own lock proof assumes this process is the only one of ours holding it.
 
 Import-light on purpose: Flask, loguru and the app's ``markers/publishers``, ``loudness`` database and

@@ -67,7 +67,7 @@ media_preview_generator/nodes/
     ops.py           op registry: the app's own heavy functions, called with node paths
     plex_db.py       the Plex database role (today's agent routes, moved; same protocol, same tests)
     winplatform.py   Windows replacements for the Linux-only bits the Plex database role needs
-    wsgi.py          gunicorn entry point
+    wsgi.py          entry point (waitress)
   client.py          NodeClient: the app's HTTP client for one node
   registry.py        NodeRegistry: configured nodes, their live state, the health loop, alerts
   mappings.py        app path <-> node path rules, Test access sampling and suggestions

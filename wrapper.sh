@@ -40,20 +40,11 @@ run_as_user() {
 }
 
 # MODE=node: run as a remote node (lends this machine's GPU/CPU, or opens Plex's database here) instead of the app.
-# Exactly one gunicorn worker: the node's task table lives in that process's memory, so a second worker would answer
-# polls for tasks it never started.
+# One process (its task table lives in its memory), served by waitress: it reads each request whole before a thread
+# takes it, so a few half-sent requests from anyone on the network can't freeze the node (nodes/server/wsgi.py).
 if [[ "${MODE:-}" == "node" ]]; then
     echo "Starting node on port ${NODE_PORT:-9494}..."
-    run_as_user gunicorn \
-        --bind "0.0.0.0:${NODE_PORT:-9494}" \
-        --worker-class gthread \
-        --threads 16 \
-        --workers 1 \
-        --timeout 300 \
-        --graceful-timeout 30 \
-        --error-logfile - \
-        --log-level info \
-        "media_preview_generator.nodes.server.wsgi:app"
+    run_as_user python3 -m media_preview_generator.nodes.server.wsgi --port "${NODE_PORT:-9494}" --threads 16
 fi
 
 # Start gunicorn web server

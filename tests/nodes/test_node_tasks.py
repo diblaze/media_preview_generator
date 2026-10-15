@@ -547,6 +547,46 @@ class TestExpiry:
 
         _until(lambda: not os.path.exists(seen["temp"]))
 
+    def test_closing_cancels_running_ops_and_waits_for_them(self, make_table, media):
+        """A node that stops (SIGTERM) waits for its cancelled ops, so their FFmpeg is stopped, not orphaned."""
+        seen, stopped = {}, threading.Event()
+
+        def op(ctx, node_path, params):
+            seen["temp"] = ctx.temp_dir
+            _until(ctx.cancel_check)
+            time.sleep(0.3)  # stopping FFmpeg takes a moment
+            stopped.set()
+            return {}
+
+        table = make_table({"test.op": op})
+        table.start(_spec(media))
+        _until(lambda: "temp" in seen)
+
+        table.close(wait_s=5)
+
+        assert stopped.is_set() and not os.path.exists(seen["temp"])
+
+    def test_closing_waits_no_longer_than_asked_for_an_op_that_never_stops(self, make_table, media, monkeypatch):
+        release = threading.Event()
+        warned: list[str] = []
+        monkeypatch.setattr(tasks.logger, "warning", lambda message, *args: warned.append(message.format(*args)))
+
+        def op(ctx, node_path, params):
+            release.wait(10)
+            return {}
+
+        table = make_table({"test.op": op})
+        task_id = table.start(_spec(media))
+        start = time.monotonic()
+        try:
+            table.close(wait_s=0.3)
+            waited = time.monotonic() - start
+        finally:
+            release.set()
+
+        assert 0.25 <= waited < 2
+        assert [line for line in warned if task_id[:8] in line and "still running" in line]
+
     def test_leftover_task_dirs_from_a_dead_process_are_removed_at_start(self, tmp_path):
         root = tmp_path / "node-tmp"
         (root / f"{tasks.TASK_DIR_PREFIX}old").mkdir(parents=True)

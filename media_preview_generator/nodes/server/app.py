@@ -43,9 +43,14 @@ class NodeServerState:
     worker_info: Any = None
     plex_db_module: Any = None
 
-    def close(self) -> None:
-        """Stop the background threads (tests; a node process just exits)."""
-        self.tasks.close()
+    def close(self, wait_s: float = 0.0) -> None:
+        """Stop the background threads and cancel every task.
+
+        Args:
+            wait_s: How long to wait for the cancelled tasks' ops (and their FFmpeg) to stop; a node shutting down
+                waits, tests don't.
+        """
+        self.tasks.close(wait_s)
         if self.worker_info is not None:
             self.worker_info.stop()
 
