@@ -32,6 +32,28 @@ ROLE_PLEX_DB = "plex_db"
 ROLES = (ROLE_WORKER, ROLE_PLEX_DB)
 
 
+def node_version(info: dict) -> str:
+    """The version a node is shown and judged by, from its ``/v1/info``.
+
+    A worker runs this app's own code, so its package version is the one that has to match. A node with only the Plex
+    database role is held to that role's version (``info["agent"]["version"]``, the Plex helper's numbering that the
+    docs and the minimum version use); its package version is the app release it was built from, or ``0.0.0.dev0`` for
+    a local build, and says nothing about what it can do.
+
+    Args:
+        info: The node's ``/v1/info`` answer.
+
+    Returns:
+        The version, or "" when the node sent none.
+    """
+    block = info.get("node") if isinstance(info.get("node"), dict) else {}
+    roles = block.get("roles") if isinstance(block.get("roles"), list) else []
+    agent = info.get("agent") if isinstance(info.get("agent"), dict) else {}
+    if ROLE_PLEX_DB in roles and ROLE_WORKER not in roles and agent.get("version"):
+        return str(agent["version"])
+    return str(block.get("version") or "")
+
+
 def build_sha() -> str:
     """This build's git commit: the image's ``GIT_SHA``, or "" when the build wasn't given one.
 

@@ -793,8 +793,10 @@
         rows.push(kv('Roles', roleChips(node) || '<span class="text-muted">none reported yet</span>'));
         if (node.version) {
             const same = !page.appVersion || node.version === page.appVersion;
-            rows.push(kv('Version', `<span class="nd-mono">${esc(node.version)}</span>`
-                + (same ? '<span class="text-muted">same as this app</span>' : `<span class="text-muted">this app is ${esc(page.appVersion)}</span>`)));
+            // Only a worker runs this app's code; a Plex database node shows its Plex database role's own version.
+            const compared = !isWorker(node) ? ''
+                : (same ? '<span class="text-muted">same as this app</span>' : `<span class="text-muted">this app is ${esc(page.appVersion)}</span>`);
+            rows.push(kv('Version', `<span class="nd-mono">${esc(node.version)}</span>${compared}`));
         }
         const seen = ago(node.last_seen);
         if (seen) rows.push(kv('Last answered', esc(seen)));

@@ -181,7 +181,7 @@ def _probe_info(info: dict) -> dict[str, Any]:
     """The probe's ``info``: ``/v1/info`` projected to what Add node shows, plus whether the versions match."""
     block = info.get("node") if isinstance(info.get("node"), dict) else {}
     roles = [r for r in block.get("roles") or [] if r in protocol.ROLES]
-    version = str(block.get("version") or "")
+    version = protocol.node_version(info)
     worker = info.get("worker") if isinstance(info.get("worker"), dict) else None
     gpus = [g for g in (worker or {}).get("gpus") or [] if isinstance(g, dict)]
     plex_db = info.get("plex_db")

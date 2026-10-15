@@ -333,6 +333,22 @@ def test_a_plex_database_refusal_talks_about_the_node_not_this_app(report, row_i
     assert "this app" not in row["reason"].lower() and "The app must" not in row["reason"]
 
 
+def test_a_plex_database_nodes_version_row_shows_its_plex_database_version():
+    """The row explains the Plex database role's minimum, so it shows that role's version, not the package's."""
+    details = _details(roles=(ROLE_PLEX_DB,), gpus=())
+    info = {
+        "node": {"id": "x", "name": "plex-box", "version": "0.0.0.dev0", "build": "", "roles": [ROLE_PLEX_DB]},
+        "agent": {"version": "1.2.0", "protocols": [1], "capabilities": ["chapters_v1", "loudness_v1"]},
+    }
+    envelope = _envelope(
+        dataclasses.replace(details, view=dataclasses.replace(details.view, version="0.0.0.dev0"), info=info),
+        file_checks=_report(Capability.READY, "", db_path="/d", fs_type="ext4", lock_holder=True),
+    )
+    row = next(c for s in envelope["sections"] for c in s["checks"] if c["id"] == "node_version")
+    assert "of its Plex database role" in row["explanation"]
+    assert row["current"] == "1.2.0"
+
+
 def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_rows():
     envelope = _envelope(
         _details(roles=(ROLE_PLEX_DB,), gpus=(), legacy=True),

@@ -171,6 +171,15 @@ class TestListAndProbe:
         assert (info["worker"], info["plex_db"], info["version_match"]) == (None, answer["plex_db"], None)
         assert info["suggested_path_mappings"] == []
 
+    def test_probe_of_a_plex_database_node_shows_its_plex_database_roles_version(self, client, nodes):
+        answer = _info(version="0.0.0.dev0")
+        answer["node"]["roles"] = ["plex_db"]
+        del answer["worker"]
+        answer["agent"] = {"version": "1.2.0", "protocols": [1], "capabilities": []}
+        nodes("http://nuc:9494").info_answer = answer
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert info["node"]["version"] == "1.2.0"
+
     def test_probe_suggests_one_row_per_library_folder(self, client, nodes, tmp_path):
         movies = TestTestAccess()._library(tmp_path)
         info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
