@@ -496,12 +496,20 @@ _ERROR_KINDS: dict[type[PublishError], str] = {ItemNotFoundError: "item_not_foun
 
 def error_to_json(exc: PublishError) -> dict:
     """Serialise a refusal so the app can raise the very same exception."""
-    from ...loudness.plex_db import SourceChangedError
+    from ...loudness.plex_db import NotAnalysedError, SourceChangedError
     from .plex_chapters import ChapterError
 
     if isinstance(exc, SourceChangedError):
         # Loudness retries a changed source later instead of failing it, so the type has to survive the trip.
         return {"kind": "source_changed", "message": str(exc), "state": exc.state.value if exc.state else None}
+    if isinstance(exc, NotAnalysedError):
+        # Loudness skips an item Plex lists as an extra instead of failing it: its type has to survive the trip too.
+        return {
+            "kind": "not_analysed",
+            "plex_type": exc.plex_type,
+            "message": str(exc),
+            "state": exc.state.value if exc.state else None,
+        }
     if isinstance(exc, ChapterError):
         return {
             "kind": "chapter",
@@ -546,6 +554,11 @@ def error_from_json(raw: Any) -> PublishError:
         from ...loudness.plex_db import SourceChangedError
 
         return SourceChangedError(message, state=state)
+    plex_type = raw.get("plex_type")
+    if raw.get("kind") == "not_analysed" and type(plex_type) is int:
+        from ...loudness.plex_db import NotAnalysedError
+
+        return NotAnalysedError(message, plex_type=plex_type, state=state)
     if raw.get("kind") == "busy" and raw.get("node_full") is True:
         return NodeFullError(message, state=state)
     kind = next((cls for cls, name in _ERROR_KINDS.items() if raw.get("kind") == name), PublishError)

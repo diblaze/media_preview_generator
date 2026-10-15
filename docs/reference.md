@@ -969,7 +969,7 @@ loudness worker is free. File outcomes:
 | `loudness_no_owners` | No Plex server with loudness on has the file in a chosen library. |
 | `loudness_not_in_library` | Plex hasn't added the file yet; a hidden retry attempt checks it again using the global retry count and backoff settings. The original job row shows the countdown. |
 | `loudness_waiting` | Plex's database couldn't be written just then (Plex restarting or busy); the retry job checks it again. |
-| `loudness_skipped` | The file is a trailer or other extra (the same rule as Intro & Credits). Plex doesn't take loudness for extras. |
+| `loudness_skipped` | Plex lists the file as a trailer or other extra. Plex doesn't take loudness for extras. |
 | `skipped_file_not_found` | The file isn't on disk. A webhook's file is checked again by the retry job. |
 | `skipped_source_gone` | The file isn't on disk because a newer file replaced it, or an import webhook said it was deleted. No retry. |
 | `failed` | A track couldn't be analysed or written (the reason names the track). |

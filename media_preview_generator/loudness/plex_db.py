@@ -65,6 +65,20 @@ class SourceChangedError(PublishError):
     """The analyzed source no longer matches Plex; retry from a fresh snapshot."""
 
 
+class NotAnalysedError(PublishError):
+    """Plex lists the file as an item loudness isn't read for (music, a trailer or other extra).
+
+    Args:
+        message: What Plex calls it, in plain words.
+        plex_type: The item's ``metadata_type`` (``PLEX_TYPE_EXTRA`` for a trailer or other extra).
+        state: The capability problem, if any.
+    """
+
+    def __init__(self, message: str, *, plex_type: int, state: Capability | None = None) -> None:
+        super().__init__(message, state=state)
+        self.plex_type = plex_type
+
+
 class SourceFingerprint(NamedTuple):
     """Local source identity, including replacement and in-place modification."""
 
@@ -271,14 +285,16 @@ _STREAM_SELECT = (
 )
 
 
+# Plex's metadata_type of a trailer, featurette or other extra.
+PLEX_TYPE_EXTRA = 12
 # What Plex calls an item loudness isn't read for, by its metadata_type (1 movie and 4 episode are).
-_NOT_ANALYSED = {10: "music isn't analysed", 12: "trailers and other extras aren't analysed"}
+_NOT_ANALYSED = {10: "music isn't analysed", PLEX_TYPE_EXTRA: "trailers and other extras aren't analysed"}
 
 
 def _audio_stream(row: tuple) -> AudioStream:
     if row[-1] not in (1, 4):
         what = _NOT_ANALYSED.get(row[-1], f"this item is neither (Plex type {row[-1]})")
-        raise PublishError(f"Loudness analysis supports Plex movies and TV episodes; {what}")
+        raise NotAnalysedError(f"Loudness analysis supports Plex movies and TV episodes; {what}", plex_type=row[-1])
     return AudioStream(
         row[0], int(row[1]), str(row[2] or ""), row[3], row[4], row[5], row[6], _marked(row[7]), *row[8:-1]
     )

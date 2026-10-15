@@ -65,7 +65,9 @@ from .deleted_sources import confirmed_deleted_paths
 from .guard import GuardedLoudnessDb, RemoteLoudnessDb, create_loudness_db
 from .inputs import load_file_input
 from .plex_db import (
+    PLEX_TYPE_EXTRA,
     AudioStream,
+    NotAnalysedError,
     SourceChangedError,
     SourceFingerprint,
     mark_item,
@@ -84,7 +86,8 @@ NO_OWNERS = "loudness_no_owners"
 NOT_IN_LIBRARY = "loudness_not_in_library"
 # Plex's database couldn't be written just then (Plex restarting, its lock busy): tried again later, like NOT_IN_LIBRARY.
 WAITING = "loudness_waiting"
-# A trailer or other extra (``external_ids.is_extra``): Plex reads no loudness for one, as markers check none.
+# A trailer or other extra, as Plex lists it (``plex_db.PLEX_TYPE_EXTRA``), or by its path (``external_ids.is_extra``)
+# when Plex doesn't list the file: Plex reads no loudness for one, as markers check none.
 SKIPPED = "loudness_skipped"
 EXTRAS_NOT_ANALYSED = "Extras aren't analysed for loudness"
 FILE_NOT_FOUND = FileOutcome.FILE_NOT_FOUND.value
@@ -102,7 +105,7 @@ OUTCOME_KEYS = (
     FAILED,
 )
 # A file's outcome from its per-server rows: the first of these any server has.
-_PRECEDENCE = (FAILED, WAITING, NOT_IN_LIBRARY, WRITTEN, UP_TO_DATE)
+_PRECEDENCE = (FAILED, WAITING, NOT_IN_LIBRARY, WRITTEN, UP_TO_DATE, SKIPPED)
 # Read-only lookups share the dispatcher's checking threads with preview checks: half of them at most.
 CHECK_SHARE = 0.5
 # A database that wasn't writable (Plex restarting, its lock busy) is checked again after this long.
@@ -296,9 +299,16 @@ def _lookup(
             cast(SourceFingerprint, source).verify()
     except (DatabaseBusyError, SourceChangedError, OSError) as exc:
         return _row(cfg, WAITING, str(exc)), [], []
+    except NotAnalysedError as exc:
+        if exc.plex_type == PLEX_TYPE_EXTRA:
+            return _row(cfg, SKIPPED, EXTRAS_NOT_ANALYSED), [], []
+        return _row(cfg, FAILED, f"Couldn't read the file's audio streams in Plex: {exc}"), [], []
     except PublishError as exc:
         status = WAITING if exc.state is Capability.UNREACHABLE else FAILED
         return _row(cfg, status, f"Couldn't read the file's audio streams in Plex: {exc}"), [], []
+    if not in_plex and is_extra(path):
+        # Plex ignores some extras (samples) and lists the rest as extras: waiting for it to add one would only retry.
+        return _row(cfg, SKIPPED, EXTRAS_NOT_ANALYSED), [], []
     if not in_plex:
         return _row(cfg, NOT_IN_LIBRARY, "Plex hasn't added this file yet"), [], []
     if not streams:
@@ -346,10 +356,6 @@ def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
 def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | None:
     """Check stage: settle a file with nothing to analyse; None sends it to a worker."""
     path = item.canonical_path
-    if is_extra(path):
-        # Plex refuses loudness for an extra's item, so asking it would only count the file as failed.
-        write_line(f"{display_name(path)}: extras aren't analysed for loudness")
-        return ItemOutcome(SKIPPED, EXTRAS_NOT_ANALYSED)
     source = _read_source(path)
     if source is None:
         if os.path.normpath(path) in ctx.deleted_paths:
@@ -372,7 +378,10 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
             return None
         else:
             rows.append(_row(cfg, UP_TO_DATE))
-    return _settle(rows)
+    outcome = _settle(rows)
+    if outcome.outcome_key == SKIPPED:
+        write_line(f"{display_name(path)}: extras aren't analysed for loudness")
+    return outcome
 
 
 def _stream_progress_reporter(
@@ -641,7 +650,8 @@ def _settle(rows: list[dict]) -> ItemOutcome:
     try again keeps it for the retry, else written beats up to date."""
     statuses = {r["status"] for r in rows}
     key = next(k for k in _PRECEDENCE if k in statuses)
-    message = "; ".join(r["message"] for r in rows if r["status"] == key and r["message"])
+    # Two servers saying the same thing ("Extras aren't analysed for loudness") say it once.
+    message = "; ".join(dict.fromkeys(r["message"] for r in rows if r["status"] == key and r["message"]))
     return ItemOutcome(key, message, publisher_rows=rows)
 
 
