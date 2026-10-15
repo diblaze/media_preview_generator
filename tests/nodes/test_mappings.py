@@ -127,6 +127,13 @@ class TestSampleFiles:
         _video(root / "Film" / "real.mkv")
         assert [os.path.basename(f["path"]) for f in nm.sample_files(str(root))] == ["real.mkv"]
 
+    def test_film_folders_named_with_hash_or_at_are_sampled(self, tmp_path):
+        root = tmp_path / "Movies"
+        _video(root / "#Alive (2020)" / "a.mkv")
+        _video(root / "@midnight (2013)" / "m.mkv")
+        _video(root / "#Recycle" / "deleted.mkv")
+        assert sorted(os.path.basename(f["path"]) for f in nm.sample_files(str(root))) == ["a.mkv", "m.mkv"]
+
     def test_it_stops_at_the_limit_and_the_walk_bound(self, tmp_path):
         root = tmp_path / "Movies"
         for i in range(6):
@@ -370,6 +377,28 @@ class TestRunTestAccess:
         assert anime["error"] == "Not mapped on nuc. Other workers take its files."
         assert reg.access_passed({"libraries": [movies, anime]}) is True
 
+    def test_a_library_only_some_of_whose_folders_are_mapped_tests_the_files_under_those_rows(self, tmp_path):
+        # The node has disk A of the library: it runs A's files, so A's files are the ones to test.
+        _video(tmp_path / "media" / "Movies" / "0-first.mkv")
+        _video(tmp_path / "media" / "Movies" / "A" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A")]
+        client = FakeClient()
+
+        (movies,) = nm.run_test_access(client, rows, servers, node_name="nuc")["libraries"]
+
+        assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
+        assert (movies["mapped"], movies["checked"], movies["ok"]) == (True, 1, True)
+
+    def test_a_partly_mapped_library_the_node_cant_see_fails_without_a_suggestion(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "A" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        rows = [PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A")]
+
+        (movies,) = nm.run_test_access(FakeClient(visible=lambda p: False), rows, servers)["libraries"]
+
+        assert (movies["mapped"], movies["ok"], movies["suggestion"]) == (True, False, None)
+
     def test_a_covered_library_the_node_lacks_still_fails(self, tmp_path):
         _video(tmp_path / "media" / "Movies" / "a.mkv")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
@@ -524,6 +553,15 @@ class TestQuickAccessCheck:
         servers = self._media(tmp_path)
         client = FakeClient()
         rows = [PathMapping(str(tmp_path / "media" / "Movies"), "/m")]
+        assert nm.quick_access_check(client, rows, servers) is True
+        assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
+
+    def test_a_row_inside_a_library_is_checked_through_its_own_files(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "0-first.mkv")
+        _video(tmp_path / "media" / "Movies" / "A" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        client = FakeClient()
+        rows = [PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A")]
         assert nm.quick_access_check(client, rows, servers) is True
         assert [os.path.basename(f["path"]) for f in client.requests[0][1]] == ["a.mkv"]
 

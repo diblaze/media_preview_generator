@@ -29,6 +29,8 @@ WALK_LIMIT = 500
 # Subfolders queued per folder: a library of thousands of film folders is sampled from its first ones instead of
 # spending the whole walk listing the top folder.
 SUBFOLDERS_PER_FOLDER = 16
+# NAS housekeeping folders (Synology, QNAP, Windows), compared casefolded; they hold no library files.
+NAS_FOLDERS = frozenset({"#recycle", "#snapshot", "@eadir", "@recycle", "@recently-snapshot", "$recycle.bin"})
 # Files per access-check request; the node checks each one on disk.
 CHECK_BATCH = 30
 # The longest Test access spends reading this app's own library folders. A stalled network mount blocks a directory
@@ -149,8 +151,12 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
                 is_dir = entry.is_dir()
             except OSError:
                 continue
-            # Hidden folders and the NAS housekeeping ones (Synology "#recycle" and "@eaDir") hold no library files.
-            if is_dir and (entry.name.startswith((".", "#", "@")) or queued_here >= SUBFOLDERS_PER_FOLDER):
+            # Hidden folders and the NAS housekeeping ones hold no library files; "#Alive (2020)" is a film.
+            if is_dir and (
+                entry.name.startswith(".")
+                or entry.name.casefold() in NAS_FOLDERS
+                or queued_here >= SUBFOLDERS_PER_FOLDER
+            ):
                 continue
             seen += 1
             if seen > walk_limit:
@@ -202,6 +208,17 @@ def _sample_roots(roots: list[LibraryRoot], budget_s: float) -> dict[LibraryRoot
     """:func:`_sample_folders` for every library folder."""
     samplings = _sample_folders([root.app_root for root in roots], budget_s, limit=SAMPLES_PER_ROOT)
     return dict(zip(roots, samplings, strict=True))
+
+
+def _rows_inside(app_root: str, mappings: list[PathMapping]) -> list[str]:
+    """The folders of rows inside ``app_root`` but not covering it: a node with only some of a library's folders.
+
+    The node runs those folders' files (a file is matched by its own path), so they are the ones to test.
+    """
+    if _covering_row(app_root, mappings):
+        return []
+    base = app_root.rstrip("/") + "/"
+    return sorted({row.app_prefix.rstrip("/") for row in mappings if row.app_prefix.rstrip("/").startswith(base)})
 
 
 def _covering_row(app_root: str, mappings: list[PathMapping]) -> PathMapping | None:
@@ -389,11 +406,27 @@ def run_test_access(
         NodeError: The node couldn't be asked.
     """
     roots = library_roots(servers)
-    samplings = _sample_roots(roots, SAMPLE_BUDGET_S)
+    inside = {root: folders for root in roots if (folders := _rows_inside(root.app_root, mappings))}
+    nested = [folder for folders in inside.values() for folder in folders]
+    sampled = _sample_folders([root.app_root for root in roots] + nested, SAMPLE_BUDGET_S, limit=SAMPLES_PER_ROOT)
+    samplings = dict(zip(roots, sampled[: len(roots)], strict=True))
+    by_folder = dict(zip(nested, sampled[len(roots) :], strict=True))
+    for root, folders in inside.items():
+        parts = [by_folder[folder] for folder in folders]
+        samplings[root] = _Sampling(
+            found=[f for part in parts for f in list(part.found)][:SAMPLES_PER_ROOT],
+            folder=next((part.folder for part in parts if part.folder), ""),
+            timed_out=any(part.timed_out for part in parts),
+            opened=any(part.opened for part in parts),
+        )
+
+    def covered(root: LibraryRoot) -> bool:
+        return root in inside or _covering_row(root.app_root, mappings) is not None
+
     # A copy: a thread that timed out may still be adding to its list.
     samples = {root: list(samplings[root].found) for root in roots}
     # A library no row covers is never asked about: the node doesn't run its files, so it can't fail on them.
-    files = [f for root, picked in samples.items() if _covering_row(root.app_root, mappings) for f in picked]
+    files = [f for root, picked in samples.items() if covered(root) for f in picked]
     results, nearby = _check(client, mappings, files) if files else ({}, {})
     # One server folder mapped to several disks: a disk without it is normal while another disk holds it.
     held = {(r.server_id, r.library_id, r.remote) for r in roots if samplings[r].opened}
@@ -401,7 +434,7 @@ def run_test_access(
     for root in roots:
         picked = samples[root]
         sampling = samplings[root]
-        if _covering_row(root.app_root, mappings) is None:
+        if not covered(root):
             libraries.append(
                 {
                     "server": root.server,
@@ -459,8 +492,10 @@ def run_test_access(
                 "empty": empty,
             }
         )
+    partial = {root.app_root for root in inside}
     for library in libraries:
-        if library["files"] and not library["ok"]:
+        # A row inside a library isn't the library's own row, so there is no corrected folder to offer for it.
+        if library["files"] and not library["ok"] and library["app_root"] not in partial:
             library["suggestion"], reason = _suggest_for(library, mappings, libraries, node_name)
             library["error"] = library["error"] or reason
     return {"libraries": libraries}
@@ -482,7 +517,13 @@ def quick_access_check(client: NodeClient, mappings: list[PathMapping], servers:
         Whether every sampled file was visible.
     """
     folders = list(
-        dict.fromkeys(root.app_root for root in library_roots(servers) if _covering_row(root.app_root, mappings))
+        dict.fromkeys(
+            folder
+            for root in library_roots(servers)
+            for folder in (
+                [root.app_root] if _covering_row(root.app_root, mappings) else _rows_inside(root.app_root, mappings)
+            )
+        )
     )
     samplings = _sample_folders(folders, SAMPLE_BUDGET_S, limit=1)
     if any(sampling.timed_out for sampling in samplings):

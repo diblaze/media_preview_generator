@@ -59,7 +59,9 @@ class TestWebhookPhaseRetriesTheFailedPaths:
         registry = MagicMock()
         registry.configs.return_value = []
         with (
-            patch("media_preview_generator.plex_client._expand_directory_to_media_files", side_effect=lambda p, m: p),
+            patch(
+                "media_preview_generator.plex_client._expand_directory_to_media_files", side_effect=lambda p, m, **_: p
+            ),
             patch(f"{MODULE}._log_webhook_owning_servers"),
             patch(
                 f"{MODULE}._resolve_webhook_path_to_canonical",
