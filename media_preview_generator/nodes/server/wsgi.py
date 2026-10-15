@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
 import sys
 import threading
 from types import FrameType
+from typing import Any
 
 from loguru import logger
 
@@ -30,6 +32,8 @@ CHANNEL_TIMEOUT_S = 60
 # Far above what the apps that use a node keep open (a few per running task), and what bounds a flood of idle
 # connections; poll() instead of select() so it isn't capped at 1024 file descriptors.
 CONNECTION_LIMIT = 1000
+# Windows has no poll(), and its select() takes at most 512 sockets: room is left for the listener and waitress's own.
+SELECT_CONNECTION_LIMIT = 500
 # Above the routes' own 2 MB limit, so they answer an oversized body in the node's JSON; anything far beyond it is
 # refused before waitress buffers it.
 MAX_REQUEST_BODY_BYTES = 2 * MAX_BODY_BYTES
@@ -48,6 +52,39 @@ def _setup_logging() -> None:
         logger.add(sys.stderr, level=level, diagnose=False)
         return
     setup_logging(log_level=level)
+
+
+def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: str = "mpg-node") -> Any:
+    """The waitress server for a node app, with the limits that keep slow or oversized requests from tying it up.
+
+    Both entry points use it: this module and the Windows Plex database node.
+
+    Args:
+        app: The node's WSGI app.
+        host: The interface to listen on.
+        port: The port to listen on.
+        threads: How many requests are served at once.
+        ident: The ``Server`` header.
+
+    Returns:
+        The server, listening; ``run()`` serves until it is closed.
+
+    Raises:
+        OSError: When it can't listen there (most often: the port is taken).
+    """
+    from waitress import create_server
+
+    return create_server(
+        app,
+        host=host,
+        port=port,
+        threads=threads,
+        channel_timeout=CHANNEL_TIMEOUT_S,
+        connection_limit=CONNECTION_LIMIT if hasattr(select, "poll") else SELECT_CONNECTION_LIMIT,
+        asyncore_use_poll=True,
+        max_request_body_size=MAX_REQUEST_BODY_BYTES,
+        ident=ident,
+    )
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -83,20 +120,8 @@ def _serve(args: argparse.Namespace) -> int:
         return 1
     state = app.extensions[EXTENSION]
 
-    from waitress import create_server
-
     try:
-        server = create_server(
-            app,
-            host=args.host,
-            port=args.port,
-            threads=args.threads,
-            channel_timeout=CHANNEL_TIMEOUT_S,
-            connection_limit=CONNECTION_LIMIT,
-            asyncore_use_poll=True,
-            max_request_body_size=MAX_REQUEST_BODY_BYTES,
-            ident="mpg-node",
-        )
+        server = create_node_server(app, host=args.host, port=args.port, threads=args.threads)
     except OSError as exc:
         logger.error("The node couldn't listen on {}:{}: {}", args.host, args.port, exc)
         state.close()

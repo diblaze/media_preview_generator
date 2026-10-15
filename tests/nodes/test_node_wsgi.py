@@ -126,3 +126,32 @@ def test_sigterm_stops_the_node_while_connections_are_busy(node):
             conn.close()
 
     assert proc.returncode == 0, output
+
+
+def test_the_node_server_refuses_an_oversized_chunked_body_before_buffering_it():
+    import threading
+
+    from media_preview_generator.nodes.server import wsgi
+
+    def app(environ, start_response):
+        environ["wsgi.input"].read()
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"read"]
+
+    server = wsgi.create_node_server(app, host="127.0.0.1", port=0, threads=1)
+    serving = threading.Thread(target=server.run, daemon=True)
+    serving.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.effective_port), timeout=10) as sock:
+            sock.sendall(b"POST /v1/tasks HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+            chunk = b"x" * 65536
+            try:
+                for _ in range(wsgi.MAX_REQUEST_BODY_BYTES // len(chunk) + 8):
+                    sock.sendall(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                sock.sendall(b"0\r\n\r\n")
+            except OSError:
+                pass  # the server may close the connection as soon as the body is too big
+            status = sock.recv(64).split(b"\r\n")[0]
+        assert b" 413 " in status, status
+    finally:
+        server.close()
