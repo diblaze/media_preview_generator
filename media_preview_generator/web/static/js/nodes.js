@@ -264,12 +264,49 @@
             </div>`;
     }
 
+    // A poll redraws only the rows that changed, and a redrawn row hands keyboard focus to its own new button:
+    // replacing every row every poll dropped the focus of a keyboard user to the page.
+    function renderRows(list) {
+        const old = new Map($$(':scope > .nd-row', list).map((el) => [el.dataset.id, el]));
+        $$(':scope > :not(.nd-row)', list).forEach((el) => el.remove());
+        let before = list.firstElementChild;
+        page.nodes.forEach((node) => {
+            const html = nodeRow(node);
+            let el = old.get(String(node.id));
+            old.delete(String(node.id));
+            if (!el || el._markup !== html) {
+                const tpl = document.createElement('template');
+                tpl.innerHTML = html.trim();
+                const fresh = tpl.content.firstElementChild;
+                fresh._markup = html;
+                const hadFocus = el && el.contains(document.activeElement);
+                if (el) {
+                    disposeTooltips(el);
+                    if (before === el) before = fresh;
+                    el.replaceWith(fresh);
+                }
+                initTooltips(fresh);
+                if (hadFocus) $('.nd-open', fresh).focus();
+                el = fresh;
+            }
+            if (el !== before) list.insertBefore(el, before);
+            before = el.nextElementSibling;
+        });
+        old.forEach((el) => {
+            disposeTooltips(el);
+            el.remove();
+        });
+    }
+
     function renderList() {
         const list = $('#nodeList');
         if (!list) return;
-        disposeTooltips(list);
-        list.innerHTML = page.nodes.length ? page.nodes.map(nodeRow).join('') : emptyState();
-        initTooltips(list);
+        if (page.nodes.length) {
+            renderRows(list);
+        } else {
+            disposeTooltips(list);
+            list.innerHTML = emptyState();
+        }
         const checkNow = $('#nodesCheckNow');
         // With no node there is nothing to check: the button is hidden, not left greyed out.
         if (checkNow) {
@@ -1509,10 +1546,15 @@
             if (event.target.matches('#nodeSetName, #nodeSetUrl, #nodeSetKey, #nodeSetEnabled')) setSettingsDirty(true);
         }));
         $('#nodeModal').addEventListener('hidden.bs.modal', () => {
+            const closed = page.openId;
             detail.mapDirty = detail.setDirty = detail.discardOk = false;
             hideDiscard();
             page.openId = null;
             if (window.location.hash.startsWith('#node-')) history.replaceState(null, '', window.location.pathname);
+            // Opened from code, the dialog gives focus back to nothing: back to the node's own button (found by id, as
+            // a poll may have redrawn its row), or Add node once the node was removed.
+            const back = closed && document.querySelector(`#node-${CSS.escape(closed)} .nd-open`);
+            (back || $('#nodesAddBtn')).focus();
         });
         $$('#nodeModal .sm-rail [data-bs-toggle="tab"]').forEach((trigger) => {
             trigger.addEventListener('shown.bs.tab', () => {

@@ -894,6 +894,42 @@ class TestNodeDialog:
             "href", "/servers"
         )
 
+    def test_closing_the_dialog_gives_focus_back_to_the_nodes_button_even_after_a_poll(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        """Focus went to the page itself, and a poll replaced the button while the dialog was open."""
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        _open_node(authed_page, "n-storage")
+        api.nodes[0] = {**api.nodes[0], "busy": 1}
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+        expect(authed_page.locator("#node-n-storage .nd-chips")).to_contain_text("1 file running")
+
+        authed_page.keyboard.press("Escape")
+
+        expect(authed_page.locator("#nodeModal")).to_be_hidden(timeout=5000)
+        expect(authed_page.locator("#node-n-storage .nd-open")).to_be_focused()
+
+    def test_a_poll_keeps_rows_that_didnt_change_and_the_focus_of_one_that_did(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        authed_page.evaluate("document.querySelector('#node-n-old')._kept = true")
+        authed_page.locator("#node-n-storage .nd-open").focus()
+        api.nodes[0] = {**api.nodes[0], "busy": 1}
+        api.nodes[2] = {**api.nodes[2], "reason": "Movies not found at /media/movies"}
+        api.nodes.append(_node("n-new", "new-box"))
+
+        authed_page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+        expect(authed_page.locator("#node-n-storage .nd-chips")).to_contain_text("1 file running")
+        expect(authed_page.locator("#node-n-nuc .nd-status")).to_contain_text("Movies not found at /media/movies")
+        expect(authed_page.locator("#node-n-new")).to_be_visible()
+        expect(authed_page.locator("#node-n-storage .nd-open")).to_be_focused()
+        # Seen 10 minutes ago both times: nothing on its row changed, so it is the same element.
+        assert authed_page.evaluate("document.querySelector('#node-n-old')._kept") is True
+        ids = authed_page.locator("#nodeList > .nd-row").evaluate_all("rows => rows.map((r) => r.dataset.id)")
+        assert ids == ["n-storage", "n-pc", "n-nuc", "n-old", "n-new"]
+
     def test_closing_with_unsaved_mappings_asks_first(self, authed_page: Page, app_url: str) -> None:
         _open_nodes(authed_page, app_url, _four_nodes())
         _open_node(authed_page, "n-storage")
