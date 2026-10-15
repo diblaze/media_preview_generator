@@ -139,6 +139,18 @@ def test_a_restarting_node_is_called_restarting_not_offline():
     assert other["title"] == "old-laptop is offline"
 
 
+def test_a_node_that_asks_this_app_to_wait_is_not_called_offline():
+    """Its own reason, right under the title, says it answered and only asks this app to wait."""
+    reason = (
+        "rl asks this app to wait: too many wrong keys came from this app's address. Something else there (another "
+        "app, an old copy) has an old key: give it the right one, or stop it."
+    )
+    view = dataclasses.replace(_view(reg.STATE_OFFLINE, name="rl", reason=reason), cause=reg.OFFLINE_RATE_LIMITED)
+    (card,) = _cards(view)
+    assert card["title"] == "rl asks this app to wait"
+    assert card["id"] == "node:abc123:offline"
+
+
 def test_a_node_without_a_reason_still_gets_what_to_do():
     (card,) = _cards(_view(reg.STATE_OFFLINE, reason=""))
     assert "Check that the node is running" in card["body_html"]

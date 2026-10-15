@@ -596,7 +596,7 @@ def _build_node_notifications() -> list[dict[str, Any]]:
     """
     from markupsafe import escape
 
-    from ..nodes.registry import ALERT_STATES, OFFLINE_RESTARTING, STATE_OFFLINE, get_registry
+    from ..nodes.registry import ALERT_STATES, OFFLINE_RATE_LIMITED, OFFLINE_RESTARTING, STATE_OFFLINE, get_registry
     from ..nodes.settings import node_users
     from .settings_manager import get_settings_manager
 
@@ -624,6 +624,9 @@ def _build_node_notifications() -> list[dict[str, Any]]:
         if view.state == STATE_OFFLINE and view.cause == OFFLINE_RESTARTING:
             # It answered: offline only until its restart is done.
             title = "{name} is restarting"
+        elif view.state == STATE_OFFLINE and view.cause == OFFLINE_RATE_LIMITED:
+            # It answered too: it only holds this app back for a while (too many wrong keys from here).
+            title = "{name} asks this app to wait"
         name = view.name or "A node"
         # The node's reason already ends with what to do, so the card's own line is only for a node without one.
         body = view.reason or todo
