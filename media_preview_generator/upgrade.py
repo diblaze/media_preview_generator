@@ -430,10 +430,12 @@ def _migrate_schema(sm, *, announce: bool = True) -> None:
         v7 -- Synthesizes a ``media_servers`` array from the legacy
               flat ``plex_*`` settings as part of the multi-media-server
               refactor.  Existing single-Plex deployments get one
-              entry with id ``"plex-default"`` so the new dispatcher
-              has a server to route to.  Legacy ``plex_*`` keys are
-              kept (read-path compatibility) and removed in a later
-              migration once all callers have been updated.
+              entry with a generated id so the new dispatcher has a
+              server to route to.  The Plex Direct webhook keys
+              (``plex_webhook_enabled`` / ``plex_webhook_public_url``)
+              move onto that server's ``output`` and are dropped; the
+              other legacy ``plex_*`` keys are kept (read-path
+              compatibility).
         v8 -- Moves global ``path_mappings`` / ``exclude_paths`` into ``media_servers[0]``.
         v9 -- Dedupes per-server ``path_mappings`` and ``exclude_paths`` that v7 + v8 doubled.
         v10 -- Rewrites the Plex Direct webhook URL ``/plex`` to ``/incoming`` and drops per-server
@@ -932,12 +934,11 @@ def _migrate_to_v7(sm) -> list:
     """Add a ``media_servers`` array synthesised from legacy ``plex_*`` keys.
 
     No-op when ``media_servers`` already exists. Legacy ``plex_*`` keys
-    are *not* removed yet — the read path continues to honour them so
-    Phase 1 ships the schema change without breaking existing single-Plex
-    deployments. A later migration removes them once all callers have
-    been routed through the server registry. The Plex Direct webhook keys
-    (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto the
-    synthesised server's ``output``.
+    are *not* removed — the read path continues to honour them so
+    existing single-Plex deployments keep working. The Plex Direct webhook
+    keys (``plex_webhook_enabled`` / ``plex_webhook_public_url``) move onto
+    the synthesised server's ``output`` and are dropped from the top level
+    (also on a fresh install, which gets an empty ``media_servers``).
     """
     notes: list[str] = []
     if sm.get("media_servers") is not None:
