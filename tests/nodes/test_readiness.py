@@ -10,6 +10,7 @@ from media_preview_generator.markers.publishers.base import Capability, Capabili
 from media_preview_generator.nodes import registry as reg
 from media_preview_generator.nodes.protocol import ROLE_PLEX_DB, ROLE_WORKER
 from media_preview_generator.nodes.readiness import UPDATE_DOCS_URL, node_readiness, to_fix
+from media_preview_generator.nodes.server.plex_db import AGENT_VERSION
 
 GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX", "status": "ok"}
 
@@ -393,6 +394,9 @@ def test_a_legacy_helper_is_recommended_an_update_and_gets_the_plex_database_row
     )
     legacy = _check(envelope, "node_legacy_helper")
     assert (legacy["ok"], legacy["severity"], legacy["fix_where"]) == (False, "recommended", "node")
+    # The exact image and tag to update to, and where the steps are.
+    assert legacy["reason"] == f"Update its image to ghcr.io/stevezau/plex-marker-agent:{AGENT_VERSION}."
+    assert legacy["docs_url"] == UPDATE_DOCS_URL
     assert [s["id"] for s in envelope["sections"]] == ["node_connection", "node_plex_db"]
     assert envelope["overall_ok"] is True
 

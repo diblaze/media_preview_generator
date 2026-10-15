@@ -699,7 +699,12 @@ at its mapped path runs elsewhere instead of failing.
 When you update this app, update every **worker node** to the same image tag: until then its card says **Update
 needed** and it gets no work. Pull the new image and recreate the container with the same settings, keeping its
 `/config` (`docker compose pull && docker compose up -d`, or `docker pull` and the same `docker run` again). Watchtower
-can update nodes too, like the app. A **Plex database node** only has to be new enough: its card says when it isn't.
+can update nodes too, like the app.
+
+A **Plex database node** only has to be new enough: its Setup Health says when it isn't. On Linux, set its image tag
+to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
+and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays. On
+Windows, download the newest release and run its `install.ps1` again: the key stays.
 
 ### Plex on another machine
 
