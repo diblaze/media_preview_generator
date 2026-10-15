@@ -18,11 +18,13 @@ The app's own image, started with `MODE=node`. See [`worker/docker-compose.yml`]
 * Mount your media **read-only**, at any path. The app maps its paths to the node's (Settings → Nodes → path
   mappings) and checks each file is the same one (size and modification time) before using it.
 * Pass the GPU exactly as you would to the app: `--device /dev/dri:/dev/dri` for Intel/AMD, or
-  `--gpus all` / `runtime: nvidia` with `NVIDIA_DRIVER_CAPABILITIES=all` for NVIDIA.
+  `--gpus all` / `runtime: nvidia` with `NVIDIA_DRIVER_CAPABILITIES=all` for NVIDIA. Leave `/dev/dri` out on a machine
+  without an Intel or AMD GPU: the container doesn't start without it ("error gathering device information").
 * The node makes its own key on first start and prints it once in `docker logs`. It is kept in
   `/config/node.json`, so mount `/config`. To pick your own, add `-e NODE_KEY=...` with a key made by
   `openssl rand -hex 24` (at least 16 characters).
-* `NODE_NAME` is the name the app shows (default: the hostname). The node listens on port **9494** (`NODE_PORT`).
+* `NODE_NAME` is the name the app shows (default: the hostname). The node listens on port **9494** (`NODE_PORT`;
+  change the published port, `-p`, to match).
 
 ```bash
 docker run -d --name media-preview-node -p 9494:9494 \
@@ -32,10 +34,17 @@ docker run -d --name media-preview-node -p 9494:9494 \
   stevezzau/media_preview_generator:latest
 ```
 
+### Updating it
+
+Update every worker node to the app's tag whenever you update the app: until then it says **Update needed** and gets
+no work. `docker compose pull && docker compose up -d` (or `docker pull` and the same `docker run` again) keeps its
+`/config`, so its id and key stay. Watchtower can update nodes too.
+
 ## Plex database node
 
 Runs beside Plex, with Plex's config folder mounted. Use the slim Linux image in [`plex-db/`](plex-db/) or the
-Windows build in [`windows/`](windows/).
+Windows build in [`windows/`](windows/). It doesn't have to match the app's version, only be new enough: the app says
+when it needs an update.
 
 ## Add it in the app
 

@@ -6,6 +6,10 @@
 #
 # Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
 # http://THIS_MACHINE:9494 and the key the node prints once in `docker logs` on first start (or your own NODE_KEY).
+#
+# Update: whenever you update the app, set the same tag below and run docker compose pull && docker compose up -d.
+# Until then the node says "Update needed" and gets no work. /config stays, so its id and key do too. Watchtower can
+# update it like the app.
 
 services:
   media-preview-node:
@@ -17,12 +21,13 @@ services:
       - "9494:9494"
 
     # --- Intel / AMD GPU (VAAPI) ---
-    # Both use /dev/dri passthrough. Verify with: ls -la /dev/dri
-    devices:
-      - /dev/dri:/dev/dri
+    # Uncomment only if this machine has an Intel or AMD GPU (check: ls -la /dev/dri). Without /dev/dri the container
+    # doesn't start ("error gathering device information").
+    # devices:
+    #   - /dev/dri:/dev/dri
 
     # --- NVIDIA GPU ---
-    # Comment out the 'devices' block above and uncomment the deploy block (and the two NVIDIA_* variables).
+    # Uncomment the deploy block (and the two NVIDIA_* variables).
     # Requires the NVIDIA Container Toolkit.
     #
     # deploy:
@@ -40,6 +45,7 @@ services:
       - NODE_KEY=${NODE_KEY:-}
       # The name the app shows for this node (default: the container's hostname).
       - NODE_NAME=gpu-box
+      # The port the node listens on inside the container. Change the ports: mapping above to match (9500:9500).
       # - NODE_PORT=9494
       # --- NVIDIA only ---
       # - NVIDIA_VISIBLE_DEVICES=all
