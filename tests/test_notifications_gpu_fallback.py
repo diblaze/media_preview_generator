@@ -45,7 +45,7 @@ class TestGpuKeepsFailingNotification:
             "title": "GPU keeps failing: files are running on the CPU",
             "body_html": (
                 "<p class='mb-0'>Intel UHD Graphics 770 couldn't process the last 5 files, so they ran on the CPU "
-                "(slower). Last reason: hevc not supported. Check the GPU driver in Settings → GPU.</p>"
+                "(slower). Last reason: hevc not supported. Check the GPU driver, and the GPU in Settings → Processing Options → GPU device tuning.</p>"
             ),
             "dismissable": True,
             "permanent_dismissable": False,

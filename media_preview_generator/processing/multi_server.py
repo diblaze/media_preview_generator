@@ -2188,7 +2188,7 @@ def _process_canonical_path_previews(
                     "This file will be marked failed and skipped — the rest of the queue keeps running. "
                     "Common causes: corrupt video file, unsupported codec, or a crash inside FFmpeg's "
                     "hardware acceleration. The traceback above shows the exact failure; if it keeps "
-                    "happening on the same file try toggling hardware acceleration off in Settings → Processing Options → GPU Configuration.",
+                    "happening on the same file try toggling hardware acceleration off in Settings → Processing Options → GPU device tuning.",
                     canonical_path,
                     type(exc).__name__,
                     exc,
