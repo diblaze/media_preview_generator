@@ -97,13 +97,16 @@ def test_a_trailer_or_other_extra_is_skipped_not_a_failed_music_file(ctx, db, me
     conn.commit()
     conn.close()
 
-    outcome = job.check_item(_item(str(local)), ctx=ctx)
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(str(local)), ctx=ctx)
 
     assert (outcome.outcome_key, outcome.message, outcome.publisher_rows) == (
         job.SKIPPED,
         "Extras aren't analysed for loudness",
         [],
     )
+    # The job log names each file as it happens: a skipped extra wrote no line at all.
+    write_line.assert_called_once_with(f"{job.display_name(str(local))}: extras aren't analysed for loudness")
     assert job.SKIPPED in job.OUTCOME_KEYS
     # Neither a success nor a failure: a job of nothing else completes without an error or a warning.
     assert job._completion({job.SKIPPED: 2}, []) == (0, None)
@@ -158,9 +161,23 @@ def test_a_date_named_file_replaced_in_its_folder_is_skipped_not_retried(tmp_pat
 
 
 def test_a_missing_file_nothing_replaced_is_still_not_found(ctx, tmp_path):
-    with patch.object(job, "source_replaced_reason", return_value=None):
-        outcome = job.check_item(_item(str(tmp_path / "gone.mkv")), ctx=ctx)
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    with (
+        patch.object(job, "source_replaced_reason", return_value=None),
+        patch.object(job, "write_line") as write_line,
+    ):
+        outcome = job.check_item(_item(gone), ctx=ctx)
     assert outcome.outcome_key == job.FILE_NOT_FOUND
+    write_line.assert_called_once_with("Anna Pigeon S01E10: not on disk")
+
+
+def test_a_missing_file_an_import_webhook_deleted_gets_its_job_log_line(ctx, tmp_path):
+    gone = str(tmp_path / "Anna Pigeon" / "Season 01" / "Anna Pigeon S01E10.mkv")
+    ctx.deleted_paths = frozenset({gone})
+    with patch.object(job, "write_line") as write_line:
+        outcome = job.check_item(_item(gone), ctx=ctx)
+    assert outcome.outcome_key == job.SOURCE_GONE
+    write_line.assert_called_once_with(f"Anna Pigeon S01E10: {outcome.message}")
 
 
 def test_worker_analyses_each_stream_once_and_writes_it(ctx, db, media):  # noqa: F811

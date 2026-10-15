@@ -331,6 +331,7 @@ def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
     its folder is gone for good and queues no retry; any other may still be copying in, so a webhook's job retries it."""
     replaced = source_replaced_reason(path, ctx.registry)
     if replaced is None:
+        write_line(f"{display_name(path)}: not on disk")
         return ItemOutcome(FILE_NOT_FOUND, "Not on disk")
     logger.bind(**{JOB_LOG_SKIP: True}).info(
         "Source file {} is no longer on disk and a newer file took its place ({}); skipping without a retry. "
@@ -347,11 +348,14 @@ def check_item(item: ProcessableItem, *, ctx: LoudnessContext) -> ItemOutcome | 
     path = item.canonical_path
     if is_extra(path):
         # Plex refuses loudness for an extra's item, so asking it would only count the file as failed.
+        write_line(f"{display_name(path)}: extras aren't analysed for loudness")
         return ItemOutcome(SKIPPED, EXTRAS_NOT_ANALYSED)
     source = _read_source(path)
     if source is None:
         if os.path.normpath(path) in ctx.deleted_paths:
-            return ItemOutcome(SOURCE_GONE, "Skipped: import webhook confirmed this absent source was deleted")
+            deleted = "Skipped: import webhook confirmed this absent source was deleted"
+            write_line(f"{display_name(path)}: {deleted}")
+            return ItemOutcome(SOURCE_GONE, deleted)
         return _not_on_disk(path, ctx)
     servers = owners(path, ctx.registry, ctx.server_id)
     if not servers:
