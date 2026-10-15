@@ -1799,7 +1799,7 @@ class JobDispatcher:
         with self._trackers_lock:
             if tracker.active_processing or tracker.active_checks or tracker.check_queue:
                 return ""
-            waits = []
+            waits: list[tuple[frozenset[str], str | None]] = []
             for item in _queue_head(tracker.item_queue):
                 excluded = tracker.excluded_nodes.get(item.canonical_path) or {}
                 dropped_on = tracker.dropped_on.get(item.canonical_path)
@@ -1808,16 +1808,16 @@ class JobDispatcher:
                 waits.append((frozenset(excluded), dropped_on))
         # The pool lock only copies its snapshot, taken after the dispatcher's lock is released.
         messages = []
-        for excluded, dropped_on in dict.fromkeys(waits):
+        for excluded_ids, dropped_on in dict.fromkeys(waits):
             if dropped_on is not None and not checked_ready_since_drop(dropped_on):
                 note_waiting_for_nodes({dropped_on})
                 nodes = getattr(self.worker_pool, "_node_hardware", None)
                 name = nodes.node_name(dropped_on) if isinstance(nodes, NodeHardware) else dropped_on
                 messages.append(f"Waiting for a node — {name}: checking it again")
                 continue
-            if not excluded:
+            if not excluded_ids:
                 return ""
-            capacity = self.worker_pool.capacity_outside(tracker.kind, excluded)
+            capacity = self.worker_pool.capacity_outside(tracker.kind, excluded_ids)
             if capacity is None or capacity["open"]:
                 return ""
             messages.append(capacity_wait_message(capacity))

@@ -54,9 +54,11 @@ def node_version(info: dict) -> str:
     Returns:
         The version, or "" when the node sent none.
     """
-    block = info.get("node") if isinstance(info.get("node"), dict) else {}
-    roles = block.get("roles") if isinstance(block.get("roles"), list) else []
-    agent = info.get("agent") if isinstance(info.get("agent"), dict) else {}
+    node_block, agent_block = info.get("node"), info.get("agent")
+    block: dict = node_block if isinstance(node_block, dict) else {}
+    agent: dict = agent_block if isinstance(agent_block, dict) else {}
+    roles = block.get("roles")
+    roles = roles if isinstance(roles, list) else []
     if ROLE_PLEX_DB in roles and ROLE_WORKER not in roles and agent.get("version"):
         return str(agent["version"])
     return str(block.get("version") or "")

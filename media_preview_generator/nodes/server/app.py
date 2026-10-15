@@ -202,7 +202,7 @@ def create_node_app(
     # static_folder=None: a node serves its API only; Flask's default would add /static/<path:filename>.
     app = Flask(__name__, static_folder=None)
     app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
-    app.json.sort_keys = False
+    app.json.sort_keys = False  # type: ignore[attr-defined]  # DefaultJSONProvider has it; the base class does not
 
     log_buffer = nodelog.install()
     if worker and ops is None:

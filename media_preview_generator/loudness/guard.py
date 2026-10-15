@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -522,7 +522,7 @@ def create_loudness_db(
             label=cfg.name or "",
             live_node_id=live_node_id,
         )
-        return RemoteLoudnessDb(server, db, server_name=cfg.name or "")
+        return RemoteLoudnessDb(server, cast("RemotePlexDb", db), server_name=cfg.name or "")
     plex = (cfg.markers or {}).get("plex") or {}
     agent = plex.get("agent") if isinstance(plex, dict) else None
     if isinstance(agent, dict) and agent.get("enabled"):

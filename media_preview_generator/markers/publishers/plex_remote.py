@@ -530,7 +530,7 @@ def error_to_json(exc: PublishError) -> dict:
             "message": str(exc),
             "state": exc.state.value if exc.state else None,
         }
-    answer = {
+    answer: dict[str, Any] = {
         "kind": next((name for cls, name in _ERROR_KINDS.items() if isinstance(exc, cls)), "publish"),
         "message": str(exc),
         "state": exc.state.value if exc.state else None,
@@ -1626,7 +1626,7 @@ def plex_database(
     mountinfo_path: str = "/proc/self/mountinfo",
     session: Any = None,
     live_node_id: Callable[[], str | None] | None = None,
-) -> PlexDatabase:
+) -> LocalPlexDb | RemotePlexDb:
     """The database half for one Plex server: the agent when one is set up, the local file otherwise.
 
     Args:

@@ -562,8 +562,8 @@ def _gpu_misdecoded(command: list[str], stderr_file: BinaryIO, luma: bytes, chro
             return "the GPU decodes greyscale H.264 into the wrong colours"
     lost = _LOST_COLOUR_CHROMA_MAX
     if (
-        int(np.frombuffer(chroma, dtype=np.uint8).max()) <= lost
-        and int(np.frombuffer(luma, dtype=np.uint8).max()) <= lost
+        int(np.max(np.frombuffer(chroma, dtype=np.uint8))) <= lost
+        and int(np.max(np.frombuffer(luma, dtype=np.uint8))) <= lost
     ):
         return "the GPU decoded this file's video without its colours"
     return None

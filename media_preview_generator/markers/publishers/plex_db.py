@@ -340,7 +340,8 @@ def node_wording(report: CapabilityReport) -> CapabilityReport:
         return CapabilityReport(report.state, relayed_text(unwritable_message(details, node=True)), details)
     if report.state is Capability.MISCONFIGURED and details.get("missing_db_path"):
         # The path is the node's, not this app's: said bare, it reads as a folder to fix on this app's side.
-        agent = details.get("agent") if isinstance(details.get("agent"), dict) else {}
+        agent_info = details.get("agent")
+        agent: dict = agent_info if isinstance(agent_info, dict) else {}
         who = str(agent.get("name") or "") or (f"at {agent['url']}" if agent.get("url") else "")
         node = f"The Plex database node {who}" if who else "The Plex database node"
         return CapabilityReport(

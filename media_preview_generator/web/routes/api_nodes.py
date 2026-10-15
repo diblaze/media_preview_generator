@@ -241,7 +241,8 @@ def _credit_notes(gpus: list[dict]) -> list[dict[str, str]]:
 
 def _probe_info(info: dict) -> dict[str, Any]:
     """The probe's ``info``: ``/v1/info`` projected to what Add node shows, plus whether the versions match."""
-    block = info.get("node") if isinstance(info.get("node"), dict) else {}
+    node_block = info.get("node")
+    block: dict = node_block if isinstance(node_block, dict) else {}
     roles = [r for r in block.get("roles") or [] if r in protocol.ROLES]
     version = protocol.node_version(info)
     worker = info.get("worker") if isinstance(info.get("worker"), dict) else None
@@ -295,8 +296,9 @@ def _probe(url: str, key: str) -> dict[str, Any]:
             )
             answer["error"]["node_version"] = node_version
             return answer
-        if exc.app_instance:
-            return _not_a_node(exc)
+        not_a_node = _not_a_node(exc)
+        if exc.app_instance and not_a_node is not None:
+            return not_a_node
         state, version = _legacy_ping(url, key)
         if state == AGENT_REJECTED:
             return _probe_error(protocol.KIND_AUTH, "The Plex database node refused this key.")

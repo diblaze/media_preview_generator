@@ -424,12 +424,15 @@ class TaskTable:
     def _remove_leftovers(self) -> None:
         # Tasks live in memory only, so a task dir found at start belongs to a process that died mid-task, and so does
         # an FFmpeg log: a preview's FFmpeg writes it here (utils.scratch_dir), outside the task's own dir.
+        root = self.temp_root
+        if root is None:
+            return
         try:
-            names = os.listdir(self.temp_root)
+            names = os.listdir(root)
         except OSError:
             return
         for name in names:
-            path = os.path.join(self.temp_root, name)
+            path = os.path.join(root, name)
             if os.path.islink(path):
                 continue
             if name.startswith(TASK_DIR_PREFIX) and os.path.isdir(path):

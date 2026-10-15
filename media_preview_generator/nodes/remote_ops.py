@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import os
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from . import protocol
@@ -160,7 +161,7 @@ def generate_images(
         raise _rebuilt(
             exc,
             {"CancellationError": _plain(CancellationError)},
-            lambda message=exc.message: CancellationError(message),
+            partial(CancellationError, exc.message),
         ) from exc
     except OSError as exc:
         # This app's own folder filled up (or is read-only, or its user may not write there) while the node's frames
@@ -458,7 +459,7 @@ def credits_result(raw: dict) -> CreditsTextResult:
         key_rows=_rows(raw.get("key_rows") or ()),
         fine_rows=_rows(raw.get("fine_rows") or ()),
         end_rows=_rows(raw.get("end_rows") or ()),
-        overlays=tuple(tuple(int(v) for v in box) for box in raw.get("overlays") or ()),
+        overlays=tuple((int(box[0]), int(box[1]), int(box[2]), int(box[3])) for box in raw.get("overlays") or ()),
         scale=int(raw.get("scale", 1)),
         run_rows=_rows(raw.get("run_rows") or ()),
         prose_start_s=seconds(raw.get("prose_start_s")),

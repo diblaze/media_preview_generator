@@ -259,7 +259,7 @@ def extract_artifact(data: bytes | bytearray | memoryview, dest: str) -> list[st
     """
     try:
         with tarfile.open(fileobj=_BufferFile(data), mode="r:") as tar:
-            members = []
+            members: list[tarfile.TarInfo] = []
             total = 0
             # A sparse member passes isfile() yet unpacks to any size it declares from a few bytes of tar.
             for member in tar:
@@ -837,7 +837,7 @@ def run_on_node(
         raise NodeUnavailableError(
             placement.node_id, placement.node_name, f"{placement.node_name} is no longer configured", started=False
         ) from exc
-    spec = {
+    spec: dict[str, Any] = {
         protocol.CLIENT_TASK_ID_FIELD: uuid.uuid4().hex,
         "op": op,
         "path": app_path,

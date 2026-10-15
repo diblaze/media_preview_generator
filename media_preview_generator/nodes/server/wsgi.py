@@ -157,6 +157,7 @@ def _limited_channels(listen_map: dict) -> Any:
 
     class NodeChannel(HTTPChannel):
         reading_since: float | None = None
+        will_close: bool  # waitress sets it; its package has no types
         caller = ""
         network: str | None = None
         held_bytes = 0

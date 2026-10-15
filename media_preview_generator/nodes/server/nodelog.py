@@ -11,9 +11,12 @@ import traceback
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 NODE_LOG_LINES = 2000
 # DEBUG lines from FFmpeg runs come by the hundred per file; neither log keeps them.
@@ -33,7 +36,7 @@ HELD_EXTRA = "node_held"
 LineCallback = Callable[[str, str], None]
 
 
-def _keep(record: dict[str, Any]) -> bool:
+def _keep(record: Record) -> bool:
     extra = record["extra"]
     return record["level"].no >= CAPTURE_MIN_LEVEL and not extra.get(SECRET_EXTRA) and not extra.get(HELD_EXTRA)
 
@@ -115,7 +118,7 @@ def capture_thread(callback: LineCallback) -> Iterator[None]:
     """
     thread_id = threading.get_ident()
 
-    def mine(record: dict[str, Any]) -> bool:
+    def mine(record: Record) -> bool:
         return record["thread"].id == thread_id and _keep(record) and not record["extra"].get(TASK_LOGGED_EXTRA)
 
     handler_id = logger.add(
@@ -148,7 +151,7 @@ def held_lines(into: list[tuple[str, str]]) -> Iterator[None]:
     """
     thread_id = threading.get_ident()
 
-    def held(record: dict[str, Any]) -> bool:
+    def held(record: Record) -> bool:
         return record["thread"].id == thread_id and bool(record["extra"].get(HELD_EXTRA))
 
     handler_id = logger.add(

@@ -18,7 +18,7 @@ from loguru import logger
 # A plain bool: the signal handler sets it, and a handler must not take a lock.
 _shutting_down = False
 # Each stop step with its name (None: unnamed), in the order registered.
-_callbacks: list[tuple[str | None, Callable[[], None]]] = []
+_callbacks: list[tuple[str | None, Callable[[], object]]] = []
 _callbacks_lock = threading.Lock()
 # Held while the callbacks run, so the exit hook waits for a run the signal began rather than starting another.
 _run_lock = threading.Lock()
@@ -39,7 +39,7 @@ def is_shutting_down() -> bool:
     return _shutting_down
 
 
-def on_shutdown(callback: Callable[[], None], *, name: str | None = None) -> None:
+def on_shutdown(callback: Callable[[], object], *, name: str | None = None) -> None:
     """Run ``callback`` once when the process begins stopping: right after SIGTERM / SIGINT, else at exit.
 
     Not only at exit: s6 kills the container's processes 3 s after a stop's SIGTERM (``S6_KILL_GRACETIME``), and

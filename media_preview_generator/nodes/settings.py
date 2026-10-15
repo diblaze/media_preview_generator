@@ -409,7 +409,7 @@ def node_address(node_id: str | None) -> tuple[str, str, str]:
 
 def default_record(**fields: Any) -> dict:
     """A record with every key present (for migrations that build one without a client)."""
-    record = {
+    record: dict[str, Any] = {
         "id": new_node_id(),
         "node_uid": None,
         "name": "",

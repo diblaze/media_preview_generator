@@ -89,6 +89,10 @@ class _RM_PROCESS_INFO(ctypes.Structure):
     ]
 
 
+def _last_error() -> int:
+    return ctypes.get_last_error()  # type: ignore[attr-defined]  # Windows-only API
+
+
 def _require_windows() -> None:
     if not IS_WINDOWS:
         raise WindowsOnlyError(f"Windows only (this is {sys.platform})")
@@ -98,9 +102,9 @@ def _require_windows() -> None:
 def _api() -> SimpleNamespace:
     """kernel32, advapi32 and Restart Manager with the signatures used here, loaded once."""
     _require_windows()
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    rm = ctypes.WinDLL("rstrtmgr")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]  # Windows-only API
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]  # Windows-only API
+    rm = ctypes.WinDLL("rstrtmgr")  # type: ignore[attr-defined]  # Windows-only API
 
     k32.CreateFileW.restype = wintypes.HANDLE
     k32.CreateFileW.argtypes = [
@@ -247,13 +251,13 @@ def dms_lock_held(shm_path: str) -> bool | None:
     k32 = _api().k32
     handle = _open(shm_path, _GENERIC_READ)
     if handle is None:
-        return False if ctypes.get_last_error() in (_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND) else None
+        return False if _last_error() in (_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND) else None
     try:
         flags = _LOCKFILE_FAIL_IMMEDIATELY | _LOCKFILE_EXCLUSIVE_LOCK
         if k32.LockFileEx(handle, flags, 0, 1, 0, ctypes.byref(_OVERLAPPED(Offset=SHM_DMS_BYTE))):
             k32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(_OVERLAPPED(Offset=SHM_DMS_BYTE)))
             return False
-        return True if ctypes.get_last_error() == _ERROR_LOCK_VIOLATION else None
+        return True if _last_error() == _ERROR_LOCK_VIOLATION else None
     finally:
         k32.CloseHandle(handle)
 
@@ -413,8 +417,8 @@ def _plex_registry_value(name: str) -> str | None:
     import winreg
 
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, PLEX_REGISTRY_KEY) as key:
-            value, _kind = winreg.QueryValueEx(key, name)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, PLEX_REGISTRY_KEY) as key:  # type: ignore[attr-defined]  # Windows-only API
+            value, _kind = winreg.QueryValueEx(key, name)  # type: ignore[attr-defined]  # Windows-only API
     except OSError:
         return None
     return str(value).strip() or None

@@ -447,7 +447,7 @@ def _clean_gpus(raw: object) -> tuple[dict, ...]:
     return tuple(gpus)
 
 
-def _count(raw: object) -> int:
+def _count(raw: Any) -> int:
     try:
         return max(0, int(raw or 0))
     except (TypeError, ValueError, OverflowError):
@@ -892,7 +892,7 @@ class NodeRegistry:
         if access_passed(result):
             live.access_problem = ""
             live.not_visible.clear()
-        return copy.deepcopy(live.record.get("path_mappings"))
+        return copy.deepcopy(live.record.get("path_mappings") or [])
 
     # ------------------------------------------------------------------ checks on demand
 
@@ -1530,11 +1530,12 @@ class NodeRegistry:
         )
 
         name = str(record.get("name") or "The node")
-        block = info.get("node") if isinstance(info.get("node"), dict) else {}
+        node_block = info.get("node")
+        block: dict = node_block if isinstance(node_block, dict) else {}
         uid = str(block.get("id") or "")
         roles = tuple(r for r in (block.get("roles") or []) if r in protocol.ROLES)
         version = protocol.node_version(info)
-        outcome = {"info": info, "version": version, "roles": roles, "uid": uid}
+        outcome: dict[str, Any] = {"info": info, "version": version, "roles": roles, "uid": uid}
         if info.get("stopping") is True:
             # It refuses every start until it is back (SIGTERM: a restart or an image update).
             return _Outcome(
@@ -1631,7 +1632,7 @@ class NodeRegistry:
 
         name = str(record.get("name") or "The node")
         state, version = self._legacy_ping(str(record.get("url") or ""), str(record.get("key") or ""))
-        legacy = {"legacy": True, "version": version, "roles": (protocol.ROLE_PLEX_DB,), "info": None}
+        legacy: dict[str, Any] = {"legacy": True, "version": version, "roles": (protocol.ROLE_PLEX_DB,), "info": None}
         if state == AGENT_CONNECTED:
             if record.get("node_uid"):
                 # A node that gave an id answered here before: every Plex database request names it, which this

@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any
+from typing import Any, Literal, overload
 
 from .. import protocol
 from ..protocol import OpError, OpFn, TaskContext
@@ -84,6 +84,14 @@ class _Reporter:
     def fallback(self, reason: str) -> None:
         self._fallbacks.append(str(reason))
         self._send()
+
+
+@overload
+def _choice(params: dict, name: str, allowed: Collection[str]) -> str: ...
+
+
+@overload
+def _choice(params: dict, name: str, allowed: Collection[str], *, optional: Literal[True]) -> str | None: ...
 
 
 def _choice(params: dict, name: str, allowed: Collection[str], *, optional: bool = False) -> str | None:
