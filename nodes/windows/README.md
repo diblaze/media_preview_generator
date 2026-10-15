@@ -51,7 +51,10 @@ The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\Medi
 (`node.json`, `logs\node.log`, `loudness-writes.jsonl`). To use a key of your own, set it before installing
 (`$env:NODE_KEY = "..."`); the installer saves it in `node.json`, so it still works after a reboot.
 
-To remove it: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1` (`-RemoveData` also deletes the key).
+To remove it: `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`.
+`-RemoveData` also deletes the key and log but keeps the loudness undo record, the only way to put Plex's audio
+tracks back; add `-RemoveUndoRecord` to delete it too. To undo loudness writes after removing the node, install it
+again first.
 
 ## Undoing loudness writes
 
