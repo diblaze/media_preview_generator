@@ -28,7 +28,7 @@ from typing import Any
 from loguru import logger
 
 from ...worker_groups import MAX_CPU_WORKERS, MAX_GPU_WORKERS
-from .app import CONTAINER_SETTINGS, EXTENSION, FILE_ENV_PREFIX, _env_from_files, create_node_app
+from .app import CONTAINER_SETTINGS, EXTENSION, FILE_ENV_PREFIX, SERVER_THREADS, _env_from_files, create_node_app
 from .identity import caller_key, caller_network
 
 # Every interface: the app on another machine is the whole point.
@@ -273,6 +273,10 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
     """
     from waitress import create_server
 
+    config = getattr(app, "config", None)
+    if isinstance(config, dict):
+        # The Plex database role leaves some of them free for the requests that never wait on Plex (plex_db.py).
+        config[SERVER_THREADS] = threads
     listen_map: dict = {}
     server = create_server(
         app,

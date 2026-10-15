@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
+import time
 import tomllib
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from flask import Flask
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
@@ -22,11 +25,12 @@ from packaging.version import Version
 
 from media_preview_generator.markers.models import Marker, MarkerType
 from media_preview_generator.markers.publishers import plex_db, plex_remote
-from media_preview_generator.markers.publishers.base import Capability, PublishError, Shown
+from media_preview_generator.markers.publishers.base import Capability, DatabaseBusyError, PublishError, Shown
 from media_preview_generator.markers.publishers.plex_db import PlexMarkerPublisher
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.markers.settings import ServerMarkersSettings
 from media_preview_generator.nodes import protocol
+from media_preview_generator.nodes.server import app as app_module
 from media_preview_generator.nodes.server import plex_db as plex_db_role
 from media_preview_generator.nodes.server import winplatform
 from media_preview_generator.servers.base import ServerConfig, ServerType
@@ -602,6 +606,137 @@ class TestTheAppWritesPlexThroughTheAgent:
         publisher = _publisher_through(FlaskSession(agent))
         assert publisher.item_missing("7") is False
         assert publisher.item_missing("999") is True
+
+
+class TestABusyPlexLeavesTheNodeAnswering:
+    """Plex holding its database's write lock (a nightly Optimize, a big scan) makes the role's requests wait minutes
+    on the node's threads; they never take them all, so its health check and a worker node's task polls answer."""
+
+    @staticmethod
+    def _plex_holds_the_write_lock(plex_config: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(_db_file(plex_config), isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    @pytest.fixture
+    def stuck(self, plex_config, tmp_path, monkeypatch):
+        """A node with one slot for the role's requests (two threads), and ``hold()`` to send one that waits there, as
+        it would for Plex's lock, until ``release`` is set; yields ``(app, hold, release)``."""
+        monkeypatch.setattr(plex_db_role, "SLOT_WAIT_S", 0.2)
+        entered, release = threading.Event(), threading.Event()
+        exists = plex_db.LocalPlexDb.item_exists
+
+        def waits_for_release(self, rating_key, *, deadline):
+            entered.set()
+            release.wait(10)
+            return exists(self, rating_key, deadline=deadline)
+
+        monkeypatch.setattr(plex_db.LocalPlexDb, "item_exists", waits_for_release)
+        app = node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path))
+        app.config[app_module.SERVER_THREADS] = 2
+        holders: list[threading.Thread] = []
+
+        def hold() -> None:
+            body = {"rating_key": 7, "deadline_s": 5}
+            holder = threading.Thread(target=lambda: app.test_client().post("/v1/item/exists", json=body, headers=AUTH))
+            holder.start()
+            holders.append(holder)
+            assert entered.wait(5)
+
+        yield app, hold, release
+        release.set()
+        for holder in holders:
+            holder.join(10)
+
+    def test_marker_writes_waiting_on_a_busy_plex_leave_the_health_check_answered(self, plex_config, tmp_path):
+        from media_preview_generator.nodes.server import wsgi
+
+        server = wsgi.create_node_server(
+            node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path)), host="127.0.0.1", port=0, threads=4
+        )
+        threading.Thread(target=server.run, daemon=True).start()
+        url = f"http://127.0.0.1:{server.effective_port}"
+        write = plex_remote.write_request_from_json(_write_body(rating_key=7, wanted=[INTRO])["write"])
+        outcomes: list[type] = []
+
+        def one_write() -> None:
+            try:
+                RemotePlexDb(url, TOKEN).write_item(write, deadline=time.monotonic() + 3.0)
+                outcomes.append(type(None))
+            except PublishError as exc:
+                outcomes.append(type(exc))
+
+        plex = self._plex_holds_the_write_lock(plex_config)
+        writers = [threading.Thread(target=one_write) for _ in range(4)]
+        try:
+            for writer in writers:
+                writer.start()
+            time.sleep(0.5)  # every write is at the node, waiting for Plex
+            assert requests.get(f"{url}/v1/health", timeout=2).status_code == 200
+            for writer in writers:
+                writer.join(10)
+        finally:
+            plex.close()
+            server.close()
+        # Nothing was written while Plex held the lock, and every write is retried as busy, not failed.
+        assert len(outcomes) == 4
+        assert all(issubclass(kind, DatabaseBusyError) for kind in outcomes), outcomes
+        assert _served(plex_config) == []
+
+    def test_a_node_full_of_stuck_requests_answers_busy_at_once_and_its_ping_still_answers(self, stuck):
+        app, hold, _release = stuck
+        hold()
+        time.sleep(0.3)  # the request in the slot is stuck (past SLOT_WAIT_S), not a quick one
+        client = app.test_client()
+        started = time.monotonic()
+        answer = client.post("/v1/item/exists", json={"rating_key": 7, "deadline_s": 5}, headers=AUTH)
+        assert time.monotonic() - started < 1.0
+        assert answer.status_code == 409
+        assert answer.headers["Retry-After"] == "1"
+        # An app from before reads it as Plex's database being busy: the file is tried again, not failed.
+        error = answer.get_json()["error"]
+        assert (error["kind"], error["state"]) == ("busy", Capability.UNREACHABLE.value)
+        assert isinstance(plex_remote.error_from_json({**error, "node_full": False}), DatabaseBusyError)
+        assert client.get("/v1/ping", headers=AUTH).status_code == 200
+
+    def test_a_request_behind_a_quick_one_waits_for_its_slot_instead_of_being_refused(self, stuck):
+        app, hold, release = stuck
+        hold()
+        threading.Timer(0.05, release.set).start()
+        answer = app.test_client().post("/v1/item/exists", json={"rating_key": 7, "deadline_s": 5}, headers=AUTH)
+        assert answer.status_code == 200
+        assert answer.get_json()["result"]["exists"] is True
+
+    def test_the_app_asks_a_full_node_again_until_the_request_s_wait_is_used_up(self, stuck):
+        app, hold, release = stuck
+        hold()
+        session = FlaskSession(app.test_client())
+        started = time.monotonic()
+        with pytest.raises(DatabaseBusyError) as refused:
+            RemotePlexDb("http://n", TOKEN, session=session).item_exists(7, deadline=started + 1.6)
+        # Asked again while its wait lasted, each time with what was left of it; then a busy database: retried later.
+        assert refused.value.state is Capability.UNREACHABLE
+        assert session.paths.count("/v1/item/exists") >= 2
+        assert session.bodies["/v1/item/exists"]["deadline_s"] < 1.6
+        assert time.monotonic() - started < 3.0
+
+        # A database check that finds the node full is a busy database too: not reused for the job's next files.
+        report = RemotePlexDb("http://n", TOKEN, session=session).file_checks(deadline=time.monotonic() + 0.4)
+        assert report.details.get("db_busy") is True
+
+        release.set()
+        assert RemotePlexDb("http://n", TOKEN, session=session).item_exists(7, deadline=time.monotonic() + 2) is True
+
+    def test_a_cancelled_job_stops_asking_a_full_node(self, stuck):
+        from media_preview_generator.markers.publishers.base import cancellable_waits
+
+        app, hold, _release = stuck
+        hold()
+        time.sleep(0.3)
+        session = FlaskSession(app.test_client())
+        with cancellable_waits(lambda: True), pytest.raises(DatabaseBusyError):
+            RemotePlexDb("http://n", TOKEN, session=session).item_exists(7, deadline=time.monotonic() + 30)
+        assert session.paths.count("/v1/item/exists") == 1
 
 
 class TestTheImageStaysInStepWithTheApp:

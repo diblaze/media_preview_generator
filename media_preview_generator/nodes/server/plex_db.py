@@ -36,10 +36,11 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 import time
 from typing import Any
 
-from flask import Blueprint, Flask, abort, jsonify, request
+from flask import Blueprint, Flask, abort, current_app, g, jsonify, request
 from loguru import logger
 
 from ...library_health.plex_rows import LIBRARY_HEALTH_CAPABILITY, read_rows, section_ids_from_json
@@ -47,7 +48,7 @@ from ...loudness import plex_db as loudness_db
 from ...loudness.guard import LoudnessPlexDb
 from ...markers.fs import filesystem_type, is_network_filesystem, mount_of, mount_root
 from ...markers.publishers import plex_remote
-from ...markers.publishers.base import Capability, PublishError
+from ...markers.publishers.base import NEXT_RUN, Capability, PublishError
 from ...markers.publishers.plex_chapters import (
     CHAPTER_CAPABILITY,
     LocalChapters,
@@ -61,6 +62,7 @@ from ...markers.publishers.plex_db import (
     publish_error_from_sqlite,
 )
 from ..protocol import KIND_PROTOCOL, KIND_RATE_LIMITED, KIND_WRONG_NODE, NODE_UID_HEADER, sendable_key, whole_number
+from .app import SERVER_THREADS
 from .identity import wrong_key_limit
 
 # This build's version. The app refuses an agent older than its ``plex_remote.MIN_AGENT_VERSION`` and says both
@@ -83,6 +85,12 @@ LOUDNESS_MAX_PATHS = 64
 MAX_PATH_CHARS = 32768
 LOUDNESS_OPERATIONS = frozenset({"file_checks", "check", "streams", "snapshot", "write", "mark"})
 DEFAULT_PORT = 9494
+# Each request here can wait minutes for Plex's database on one of the server's threads (a nightly Optimize or a big
+# scan holds its write lock), so at most half the threads run them: the rest keep the node's health check, the app's
+# checks and a worker node's task polls answered. A request that finds them all taken waits for one only while the
+# longest-running has run under SLOT_WAIT_S (a burst of quick ones); past that they are stuck on the database, and it
+# is answered "full" at once (``plex_remote.NodeFullError``): the app waits and asks again, holding none of ours.
+SLOT_WAIT_S = 2.0
 
 _ON_WINDOWS = os.name == "nt"
 # How undo_record_problem tells it runs in a container.
@@ -200,6 +208,44 @@ def _undo_record_unwritable(path: str) -> str:
 def agent_block() -> dict:
     """The agent's ``{"version", "protocols", "capabilities"}``: on every answer here, and on ``/v1/health``."""
     return {"version": AGENT_VERSION, "protocols": list(PROTOCOLS), "capabilities": list(CAPABILITIES)}
+
+
+class RequestSlots:
+    """The role's requests running now, held under a limit (see ``SLOT_WAIT_S``)."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._started: dict[object, float] = {}
+
+    def take(self, limit: int | None) -> object | None:
+        """A slot for one request, or None when the node is full.
+
+        Args:
+            limit: How many may run at once; None: no limit.
+
+        Returns:
+            The slot to give back once the request is answered, or None.
+        """
+        with self._changed:
+            while limit is not None and len(self._started) >= limit:
+                left = min(self._started.values()) + SLOT_WAIT_S - time.monotonic()
+                if left <= 0:
+                    return None
+                self._changed.wait(left)
+            slot = object()
+            self._started[slot] = time.monotonic()
+            return slot
+
+    def give_back(self, slot: object) -> None:
+        """Free a slot :meth:`take` handed out."""
+        with self._changed:
+            self._started.pop(slot, None)
+            self._changed.notify()
+
+
+def slot_limit(threads: Any) -> int | None:
+    """How many of this role's requests may run at once on a server with ``threads`` threads (None: not known)."""
+    return max(1, threads // 2) if type(threads) is int and threads > 0 else None
 
 
 def info_block(plex_config_dir: str | None = None) -> dict:
@@ -373,6 +419,7 @@ def register_plex_db(
     chapters = LocalChapters(folder, mountinfo_path=mountinfo_path)
     bp = Blueprint("plex_db", __name__)
     wrong_keys = wrong_key_limit(app)
+    slots = RequestSlots()
 
     def authorised(caller: str) -> bool:
         header = request.headers.get("Authorization", "")
@@ -444,7 +491,25 @@ def register_plex_db(
             body = None
         if not isinstance(body, dict):
             return _bad_request("The request body must be a JSON object")
+        if request.path == "/v1/ping":
+            return None  # it never opens the database
+        limit = slot_limit(current_app.config.get(SERVER_THREADS))
+        slot = slots.take(limit)
+        if slot is None:
+            message = (
+                f"Plex's database is busy: {limit} requests on the Plex database node are waiting for it already; "
+                f"{NEXT_RUN}"
+            )
+            answer, status = _refused(plex_remote.NodeFullError(message, state=Capability.UNREACHABLE))
+            return answer, status, {"Retry-After": "1"}
+        g.plex_db_slot = slot
         return None
+
+    @bp.teardown_request
+    def _give_back_slot(_exc: BaseException | None) -> None:
+        slot = g.pop("plex_db_slot", None)
+        if slot is not None:
+            slots.give_back(slot)
 
     @bp.get("/v1/ping")
     def ping() -> Any:
