@@ -1200,6 +1200,27 @@ class TestNewPlexDatabaseNodeId:
         assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
         h.registry.stop()
 
+    def test_a_new_id_waits_for_the_next_check_while_the_servers_using_the_node_cant_be_read(self):
+        # Unread settings can't say a server writes through the node, so they can't say none does either: taking
+        # the id on an answer without the role would skip the Plex check for good, as above.
+        h = self._harness([])
+
+        def unreadable(node_id):
+            raise OSError("settings.json unreadable")
+
+        h.registry._served_plex_ids = unreadable
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+
+        assert h.uids == []
+        assert h.registry.plex_db_hold("n1").waits  # neither taken nor held for a typed key: checked again soon
+        assert h.registry._nodes["n1"].next_check <= h.clock.now + reg.WAITING_RECHECK_S
+
+        h.registry._served_plex_ids = lambda node_id: ["plex-a"]
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+        assert h.uids == []
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
+        h.registry.stop()
+
     def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):
         h = self._harness(["plex-a"])
         self._answer(h, "uid-2", "")

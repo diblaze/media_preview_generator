@@ -1203,6 +1203,10 @@ class NodeRegistry:
             if self._nodes.get(node_id) is not live or live.record.get("node_uid") != record.get("node_uid"):
                 live.next_check = 0.0
                 return  # The saved id changed meanwhile (a restore, the key typed again): the next check settles it.
+            if confirmed is None:
+                # ``heard_uid`` stays None, so the node's Plex database work waits for that check.
+                live.next_check = min(live.next_check, self._clock() + WAITING_RECHECK_S)
+                return
             if confirmed:
                 live.unconfirmed_uid = ""
                 live.heard_uid = outcome.uid
@@ -1218,14 +1222,17 @@ class NodeRegistry:
         if confirmed:
             self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
 
-    def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool:
-        """Whether a node's new id may replace the saved one without asking.
+    def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool | None:
+        """Whether a node's new id may replace the saved one without asking, or None when that can't be told yet.
 
         A worker node (or one with no saved id yet) is this node by its saved key and address. A node that a Plex
         server uses as its Plex database node writes into that Plex's database, so its new id is taken only when it
         names the Plex machine identifier of every server that uses it; an empty identifier on either side (a Windows
         node with a custom Plex folder) proves nothing. That holds whether or not this answer names the role: an id
         taken without it would already match once the node names it.
+
+        Which servers use the node comes from the settings; while they can't be read the id is neither taken nor held
+        for the user to confirm (None), and the next check, soon, decides.
         """
         if not record.get("node_uid"):
             return True
@@ -1233,7 +1240,7 @@ class NodeRegistry:
             served = self._served_plex_ids(node_id)
         except Exception as exc:  # noqa: BLE001 - unreadable settings can't confirm anything
             logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
-            return protocol.ROLE_PLEX_DB not in outcome.roles
+            return None
         if not served:
             return True  # No server writes through it: nothing to protect.
         plex_db = (outcome.info or {}).get("plex_db")
