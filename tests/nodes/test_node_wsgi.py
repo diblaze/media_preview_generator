@@ -430,6 +430,48 @@ def test_request_bodies_the_node_holds_before_any_key_check_have_a_budget(served
         third.close()
 
 
+def test_one_address_cant_hold_the_whole_request_budget(served):
+    # One machine sending large bodies on many connections held all 64 MB: every other caller's large request was
+    # closed until its bodies timed out.
+    port = served(REQUEST_BYTES_FREE=10_000, REQUEST_BYTES_BUDGET=400_000, REQUEST_BYTES_PER_CALLER=100_000)
+    first = _half_sent_body(port, "127.0.0.2", 70_000)
+    held = [first]
+    try:
+        time.sleep(0.5)
+        second = _half_sent_body(port, "127.0.0.2", 70_000)
+        held.append(second)
+        assert _closed_by_the_node(second), "its second body takes it past its share"
+        other = _half_sent_body(port, "127.0.0.3", 70_000)
+        held.append(other)
+        assert not _closed_by_the_node(other), "another address still has the rest of the budget"
+        first.close()
+        time.sleep(0.5)
+        again = _half_sent_body(port, "127.0.0.2", 70_000)
+        held.append(again)
+        assert not _closed_by_the_node(again), "its share comes back once its first connection is gone"
+    finally:
+        for conn in held:
+            conn.close()
+
+
+def test_a_machine_with_an_address_per_connection_in_its_ipv6_64_has_one_share_of_the_budget(served, monkeypatch):
+    from media_preview_generator.nodes.server import wsgi
+
+    in_64 = {"127.0.0.2", "127.0.0.3"}
+    monkeypatch.setattr(wsgi, "caller_network", lambda address: "2001:db8:1:2::/64" if address in in_64 else None)
+    port = served(REQUEST_BYTES_FREE=10_000, REQUEST_BYTES_BUDGET=400_000, REQUEST_BYTES_PER_CALLER=100_000)
+    held = [_half_sent_body(port, "127.0.0.2", 70_000)]
+    try:
+        time.sleep(0.5)
+        held.append(_half_sent_body(port, "127.0.0.3", 70_000))
+        assert _closed_by_the_node(held[-1])
+        held.append(_half_sent_body(port, "127.0.0.4", 70_000))
+        assert not _closed_by_the_node(held[-1])
+    finally:
+        for conn in held:
+            conn.close()
+
+
 def _keep_alive(port: int, source: str) -> socket.socket:
     """A connection that had its answer and stays open, as each of the app's worker threads keeps one."""
     conn = socket.create_connection(("127.0.0.1", port), timeout=5, source_address=(source, 0))
