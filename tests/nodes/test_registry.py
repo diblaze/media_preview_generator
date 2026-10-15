@@ -1349,6 +1349,33 @@ class TestPlexDatabaseNodeNotHeardSinceStart:
 
         assert seen == [None]
 
+    def test_a_check_begun_before_a_restore_doesnt_vouch_for_the_restored_id(self, h):
+        # A restore with the same address and key but another saved id: the check that began before it heard the
+        # old id and stored it as heard, cleared the hold and put the next check 30 s out, so the restored record's
+        # Plex database work went to the machine with the old id.
+        client = h.client()
+        asked, release = threading.Event(), threading.Event()
+
+        def slow_info():
+            asked.set()
+            release.wait(5)
+            return self._answer("uid-1")
+
+        client.info = slow_info
+        check = threading.Thread(target=h.registry.check_now, args=("n1",))
+        check.start()
+        assert asked.wait(5)
+        h.change(node_uid="uid-2")
+        h.registry.views()
+        release.set()
+        check.join(5)
+
+        live = h.registry._nodes["n1"]
+        assert live.heard_uid is None
+        assert live.next_check == 0.0
+        client.info = lambda: self._answer("uid-1")
+        assert h.registry.plex_db_hold("n1") is not None
+
     def test_a_node_without_a_saved_id_is_never_held(self, h):
         h.change(node_uid=None)
         h.client().default_info = NodeUnreachableError("down")
@@ -1484,6 +1511,31 @@ class TestTwinOfAPlexDatabaseNode:
 
         # Still held once n1 is removed, until a check of B alone decides.
         assert h.registry._nodes["n2"].unconfirmed_uid == "uid-a"
+        h.registry.stop()
+
+    def test_a_twin_stays_held_after_a_mapping_edit_puts_it_back_to_checking(self):
+        # A restored settings file can hold two records with one id. The twin's check kept that id as the one it
+        # heard, so a mapping edit (the node back to "checking") let its Plex database work through to the other
+        # machine.
+        h = self._harness()
+        h.nodes[1] = {**h.nodes[1], "node_uid": "uid-a"}
+        h.revision += 1
+        self._answer(h, "n2", "uid-a")
+        assert h.registry.view("n2").state == reg.STATE_DUPLICATE
+
+        h.nodes[1] = {**h.nodes[1], "path_mappings": [{"app_prefix": "/media", "node_prefix": "/mnt"}]}
+        h.revision += 1
+
+        assert h.registry.view("n2").state == reg.STATE_CONNECTING
+        assert h.registry.plex_db_hold("n2") is not None
+        h.registry.stop()
+
+    def test_a_new_id_held_back_is_never_taken_for_the_one_heard(self):
+        h = self._harness()
+        self._answer(h, "n2", "uid-new")
+
+        assert h.registry._nodes["n2"].unconfirmed_uid == "uid-new"
+        assert h.registry._nodes["n2"].heard_uid is None
         h.registry.stop()
 
 
