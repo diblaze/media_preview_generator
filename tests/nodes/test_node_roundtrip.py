@@ -16,7 +16,6 @@ from media_preview_generator.nodes.client import (
     NodeAddress,
     NodeAuthError,
     NodeClient,
-    NodeProtocolError,
     NodeRequestError,
     NodeUnknownTaskError,
 )
@@ -217,14 +216,15 @@ class TestRoundTrip:
         with pytest.raises(NodeRequestError):
             _client(node[0]).start_task(_spec(media, "no.such.op"))
 
-    def test_missing_artifact_is_a_protocol_error(self, node, media):
+    def test_a_missing_artifact_is_the_nodes_refusal_not_an_older_node(self, node, media):
         client = _client(node[0])
         task_id = client.start_task(_spec(media, "test.slow"))
         client.cancel_task(task_id)
         _wait(client, task_id)
 
-        with pytest.raises(NodeProtocolError):
+        with pytest.raises(NodeRequestError) as raised:
             client.fetch_artifact(task_id)
+        assert str(raised.value) == "This task has no artifact"
 
     def test_log(self, node):
         lines = _client(node[0]).log(50)["lines"]

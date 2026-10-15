@@ -166,7 +166,8 @@ class NodeUnknownTaskError(NodeError):
 
 class NodeRequestError(NodeError):
     """The node refused the request (400, kind ``request``): it is malformed, or asks for a role the node wasn't
-    started with (a GPU rescan or an access check on a node without the worker role)."""
+    started with (a GPU rescan or an access check on a node without the worker role); or it hasn't what was asked for
+    (404, kind ``request``: the artifact of a task that made none)."""
 
 
 class NodeCantStartError(NodeError):
@@ -407,6 +408,9 @@ class NodeClient:
         message = protocol.relayed_text(str(error.get("message") or kind or f"HTTP {response.status_code}"))
         if response.status_code == 404 and kind == protocol.KIND_UNKNOWN_TASK:
             raise NodeUnknownTaskError(message)
+        if response.status_code == 404 and kind == protocol.KIND_REQUEST:
+            # The node knows the route but hasn't what was asked for (the artifact of a task that made none).
+            raise NodeRequestError(message)
         if response.status_code == 404:
             # A Plex helper from before nodes existed answers its own routes but 404s the node ones.
             raise NodeProtocolError(f"{self._address.base} doesn't know {path} (an older Plex database node?)")

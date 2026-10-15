@@ -287,6 +287,28 @@ class TestEveryFailureIsANodeError:
                 client.info()
 
 
+class TestA404:
+    """A task's missing artifact (404, kind ``request``) read as "an older Plex database node?", as if the node didn't
+    know the route at all."""
+
+    @pytest.mark.parametrize(
+        ("error", "raised", "message"),
+        [
+            ({"kind": "request", "message": "This task has no artifact"}, NodeRequestError, "This task has no artifact"),
+            ({"kind": "unknown_task", "message": "No such task"}, client_mod.NodeUnknownTaskError, "No such task"),
+            (None, NodeProtocolError, "http://node:9494 doesn't know /v1/tasks/t1/artifact (an older Plex database node?)"),
+        ],
+        ids=["missing-artifact", "unknown-task", "route-it-doesnt-know"],
+    )  # fmt: skip
+    def test_says_what_the_node_hasnt(self, error, raised, message):
+        body = {"ok": False, **({"error": error} if error else {})}
+        session = MagicMock(spec=requests.Session)
+        session.request.return_value = _response(404, json.dumps(body).encode())
+        with pytest.raises(raised) as caught:
+            NodeClient(NodeAddress("http://node:9494", "k"), session=session).fetch_artifact("t1")
+        assert type(caught.value) is raised and str(caught.value) == message
+
+
 class TestAStartAfterItsDelete:
     def test_is_its_own_error(self):
         session = MagicMock(spec=requests.Session)
