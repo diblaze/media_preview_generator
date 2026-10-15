@@ -262,8 +262,8 @@ FALLBACK_SIGNAL = "signal"
 
 def _io_error_places() -> str:
     """Where an I/O error (exit 251) comes from: reading the video, or writing thumbnails to the working folder."""
-    folder, setting = working_folder_hint()
-    return f"the disk or network share the video is on, and that {folder} ({setting}) isn't full and is writable"
+    folder, _move = working_folder_hint()
+    return f"the disk or network share the video is on, and that {folder} isn't full and is writable"
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +542,7 @@ def working_folder_failure(exc: OSError) -> str:
     Returns:
         The sentence.
     """
-    folder, setting = working_folder_hint()
+    folder, move = working_folder_hint()
     where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
     why = exc.strerror or os.strerror(exc.errno or 0)
     if exc.errno == errno.EROFS:
@@ -552,7 +552,7 @@ def working_folder_failure(exc: OSError) -> str:
     else:
         state = "is full"
     fix = folder_write_fix(exc.errno)
-    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or choose another folder ({setting})."
+    return f"Couldn't write the thumbnails: {where} {state} ({why}). {fix}, or {move}."
 
 
 def folder_write_fix(code: int | None) -> str:
@@ -2619,7 +2619,7 @@ def generate_bif(
     except PermissionError as e:
         logger.error(
             "Cannot read the temporary thumbnails folder at {}: permission denied ({}). "
-            "Verify the working folder (Settings → Advanced) is readable by the user running this "
+            "Verify the working folder is readable by the user running this "
             "tool. In Docker, check PUID/PGID. This file is skipped; the queue continues.",
             images_path,
             e,

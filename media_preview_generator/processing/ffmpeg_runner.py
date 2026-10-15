@@ -787,18 +787,18 @@ def create_ffmpeg_runner(
             refused = _folder_write_errno(proc.returncode, ffmpeg_output_lines, output_folder)
             if refused is not None:
                 # The folder's, not the file's or the GPU's: no hardware or codec advice.
-                folder, setting = working_folder_hint()
+                folder, move = working_folder_hint()
                 fix = folder_write_fix(refused)
                 logger.error(
                     "FFmpeg couldn't write thumbnails for {} to {} {}: {} (exit code {}). None of them are kept. "
-                    "{}, or choose another folder ({}). Other files in the queue will keep processing.",
+                    "{}, or {}. Other files in the queue will keep processing.",
                     video_file,
                     folder,
                     output_folder,
                     _FOLDER_WRITE_TEXT[refused][0],
                     proc.returncode,
                     fix,
-                    setting,
+                    move,
                 )
             elif no_decoder:
                 # The file's only failure line: the caller neither reruns it nor logs it again.
@@ -856,18 +856,17 @@ def create_ffmpeg_runner(
             elif refused is None and _io_cut_off(proc.returncode, ffmpeg_output_lines):
                 # Exit 251 with a GPU error in the stderr is the GPU's, not a disk's: the stderr lines below say so.
                 # One the folder refused (it couldn't create a frame file) was said above.
-                folder, setting = working_folder_hint()
+                folder, _move = working_folder_hint()
                 logger.warning(
                     "FFmpeg hit an I/O error on {}: reading the video from its disk or network share, or writing "
                     "thumbnails to {} ({}, exists: {}), failed. Check that disk or share, and that "
-                    "{} isn't full and is writable ({}). "
+                    "{} isn't full and is writable. "
                     "Other files in the queue will keep processing.",
                     video_file,
                     folder,
                     output_folder,
                     os.path.isdir(output_folder),
                     folder,
-                    setting,
                 )
             elif exit_diagnosis == "high_exit_non_signal":
                 logger.warning(

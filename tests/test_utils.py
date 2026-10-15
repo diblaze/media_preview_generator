@@ -7,6 +7,7 @@ and working directory setup.
 
 import errno
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -373,11 +374,11 @@ class TestNodeHints:
     """A node logs the app's GPU, FFmpeg and logging lines, but has none of the app's screens."""
 
     APP = {
-        "gpu_settings_hint": "Settings → Processing Options → GPU Configuration",
+        "gpu_settings_hint": "Settings → Processing Options → GPU device tuning",
         "cpu_workers_hint": "Settings → Workers",
-        "gpu_details_hint": "Settings → Processing Options → GPU Configuration",
+        "gpu_details_hint": "Settings → Processing Options → GPU device tuning",
         "log_viewer_hint": "the live web log viewer",
-        "working_folder_hint": ("the working folder", "Settings → Advanced"),
+        "working_folder_hint": ("the working folder", "mount a bigger, writable disk at the container's temp folder"),
         "debug_logging_hint": "enable Debug logging (Settings → Logging)",
     }
     NODE = {
@@ -385,7 +386,7 @@ class TestNodeHints:
         "cpu_workers_hint": "the app's Settings → Workers",
         "gpu_details_hint": "this node's Overview tab on the app's Nodes page",
         "log_viewer_hint": "this node's Log tab on the app's Nodes page",
-        "working_folder_hint": ("the node's temp folder", "NODE_TEMP_DIR"),
+        "working_folder_hint": ("the node's temp folder", "choose another folder (NODE_TEMP_DIR)"),
         "debug_logging_hint": "set LOG_LEVEL=DEBUG on the node and read its docker logs",
     }
 
@@ -406,7 +407,7 @@ class TestNodeHints:
 
         advice = generator.gpu_fallback_advice(generator.FALLBACK_IO_ERROR)
 
-        assert "the node's temp folder (NODE_TEMP_DIR) isn't full" in advice and "Settings" not in advice
+        assert "the node's temp folder isn't full" in advice and "Settings" not in advice
 
     def test_a_folder_its_user_may_not_write_names_whose_user_to_let_in(self, monkeypatch):
         from media_preview_generator.processing import generator
@@ -440,9 +441,47 @@ class TestNodeHints:
         monkeypatch.delenv("MODE", raising=False)
 
         assert "under Settings → Workers." in generator.gpu_fallback_advice(generator.FALLBACK_CODEC)
-        assert "under Settings → Processing Options → GPU Configuration." in generator.gpu_fallback_advice(
+        assert "under Settings → Processing Options → GPU device tuning." in generator.gpu_fallback_advice(
             generator.FALLBACK_HWACCEL
         )
+
+    def test_the_apps_gpu_hints_name_a_heading_the_settings_page_shows(self, monkeypatch):
+        """The GPU section's heading is "GPU device tuning"; only its anchor is still gpu-configuration."""
+        from pathlib import Path
+
+        from media_preview_generator import utils
+        from media_preview_generator.processing import generator
+
+        templates = Path(utils.__file__).parent / "web" / "templates"
+        menu = (templates / "base.html").read_text()
+        headings = {
+            heading.strip()
+            for heading in re.findall(
+                r'class="settings-subheading"[^>]*>(?:<i [^>]*></i>)?([^<]+)', (templates / "settings.html").read_text()
+            )
+        }
+        monkeypatch.delenv("MODE", raising=False)
+
+        for text in (
+            utils.gpu_settings_hint(),
+            utils.gpu_details_hint(),
+            generator.gpu_fallback_advice(generator.FALLBACK_HWACCEL),
+        ):
+            found = re.search(r"Settings → ([^→]+) → ([^.,)]+)", text)
+            assert found is not None, text
+            assert f"'{found.group(1).strip()}'" in menu and found.group(2).strip() in headings, text
+
+    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EACCES])
+    def test_the_apps_working_folder_failure_names_no_settings_screen(self, monkeypatch, code):
+        """Nothing in the app's Settings sets its working folder, so the fix is a bigger or writable disk for it."""
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+
+        message = generator.working_folder_failure(generator.WorkingFolderError(code, "x", "/tmp/job/frames"))
+
+        assert "Settings" not in message, message
+        assert message.endswith(", or mount a bigger, writable disk at the container's temp folder."), message
 
 
 def _running(pid: int) -> bool:

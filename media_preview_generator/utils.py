@@ -201,7 +201,7 @@ def scratch_dir() -> str:
 
 def gpu_settings_hint() -> str:
     """Where a GPU is turned off: the app's GPU settings, or for a node's GPUs, the app's worker groups."""
-    return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU Configuration"
+    return "the app's Settings → Workers" if is_node_mode() else "Settings → Processing Options → GPU device tuning"
 
 
 def cpu_workers_hint() -> str:
@@ -213,7 +213,7 @@ def gpu_details_hint() -> str:
     """Where each GPU's test result is shown."""
     if is_node_mode():
         return "this node's Overview tab on the app's Nodes page"
-    return "Settings → Processing Options → GPU Configuration"
+    return "Settings → Processing Options → GPU device tuning"
 
 
 def log_viewer_hint() -> str:
@@ -222,10 +222,14 @@ def log_viewer_hint() -> str:
 
 
 def working_folder_hint() -> tuple[str, str]:
-    """The folder FFmpeg writes thumbnails to, and where it is set: ``(name, setting)``."""
+    """The folder FFmpeg writes thumbnails to, and how to give it another disk: ``(name, move)``.
+
+    ``move`` follows "or ". The app has no setting for its working folder (``tmp_folder``, seeded once from
+    ``TMP_FOLDER``), so a bigger or writable one is a disk mounted at the container's temp folder.
+    """
     if is_node_mode():
-        return "the node's temp folder", "NODE_TEMP_DIR"
-    return "the working folder", "Settings → Advanced"
+        return "the node's temp folder", "choose another folder (NODE_TEMP_DIR)"
+    return "the working folder", "mount a bigger, writable disk at the container's temp folder"
 
 
 _PR_SET_PDEATHSIG = 1  # linux/prctl.h
