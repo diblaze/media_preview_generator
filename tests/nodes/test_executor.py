@@ -634,8 +634,10 @@ class TestErrors:
             (protocol.KIND_GPU_FAILED, "", CodecNotSupportedError),
             (protocol.KIND_CODEC_NOT_SUPPORTED, "", CodecNotSupportedError),
             ("failed", "RuntimeError", NodeTaskError),
+            (protocol.KIND_TEMP_FOLDER, "", NodeUnavailableError),
+            (protocol.KIND_CANCELLED, "", NodeTaskCancelledError),
         ],
-        ids=["gpu_failed", "codec_not_supported", "failed"],
+        ids=["gpu_failed", "codec_not_supported", "failed", "temp_folder", "cancelled"],
     )
     def test_an_error_names_the_file_by_this_apps_path(self, media, monkeypatch, kind, error_type, raised_type):
         """The CPU-fallback line and the worker card's reason named the file by the node's own path."""
