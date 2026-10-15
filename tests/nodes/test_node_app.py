@@ -615,5 +615,18 @@ class TestSecretFiles:
     def test_a_file_the_node_cant_read_refuses_to_start(self, make_app, monkeypatch, tmp_path):
         monkeypatch.setenv("FILE__NODE_KEY", str(tmp_path / "missing"))
 
-        with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names .*missing, which the node can't read \(No such"):
+        with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names a file the node can't read \(No such"):
             make_app(key=None)
+
+    def test_a_key_put_in_file_node_key_itself_is_never_printed(self, make_app, monkeypatch):
+        # The obvious slip (the key where the path of a file holding it belongs) put the key in the refusal, which
+        # the node logs to docker logs and its app.log.
+        key = "9f2c1d7e5a3b48c6a0e1f4d2b7c9e8a1"
+        monkeypatch.setenv("FILE__NODE_KEY", key)
+
+        with pytest.raises(SystemExit) as refused:
+            make_app(key=None)
+
+        assert "FILE__NODE_KEY" in str(refused.value) and "set NODE_KEY to the value itself" in str(refused.value)
+        assert key not in str(refused.value)
+        assert refused.value.__cause__ is None and refused.value.__suppress_context__

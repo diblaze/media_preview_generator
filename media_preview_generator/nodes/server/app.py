@@ -83,10 +83,12 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
                 value = handle.read()
         except (OSError, ValueError) as exc:
             reason = getattr(exc, "strerror", None) or type(exc).__name__
+            # Never the path: the obvious slip is the value itself (the key) in FILE__NODE_KEY, and this is logged.
+            # ``from None`` too: the OSError's own text names the path.
             raise SystemExit(
-                f"{var} names {path}, which the node can't read ({reason}). Fix the path, or let this container's "
-                "user (PUID/PGID) read the file."
-            ) from exc
+                f"{var} names a file the node can't read ({reason}). Set it to the path of a file holding {name} "
+                f"(or set {name} to the value itself), and let this container's user (PUID/PGID) read that file."
+            ) from None
         environ[name] = value.rstrip("\r\n")
         logger.info("{} set from {}", name, var)
 
