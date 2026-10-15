@@ -45,7 +45,7 @@ from loguru import logger
 
 from ..config import Config
 from ..shutdown import is_shutting_down
-from ..utils import debug_logging_hint, is_node_mode, working_folder_hint
+from ..utils import cpu_workers_hint, debug_logging_hint, gpu_details_hint, is_node_mode, working_folder_hint
 from .ffmpeg_runner import GPU_CANT_DECODE_LINE, STALL_WATCHDOG_LINE
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
@@ -512,11 +512,11 @@ def gpu_fallback_advice(kind: str) -> str:
     if kind == FALLBACK_CODEC:
         return (
             "No action needed — the file will still get a preview, it'll just be slower. If this happens for many "
-            "files, your GPU may not support the codec; consider raising CPU worker count under Settings → CPU."
+            f"files, your GPU may not support the codec; consider raising CPU worker count under {cpu_workers_hint()}."
         )
     return (
         "No action needed — the file will still get a preview, it'll just be slower. If this happens for many files, "
-        "check the GPU driver under Settings → Processing Options → GPU Configuration."
+        f"check the GPU driver under {gpu_details_hint()}."
     )
 
 
