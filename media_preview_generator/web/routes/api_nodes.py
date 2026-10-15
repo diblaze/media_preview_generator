@@ -9,6 +9,8 @@ send stored keys out.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from datetime import UTC, datetime
 from typing import Any
@@ -54,6 +56,7 @@ NODE_TEXT_MAX = 500
 NODE_LIST_MAX = 64
 NODE_DEPTH_MAX = 4
 KEY_FOR_NEW_ADDRESS = "Type the node's key again: a saved key is only sent to the address it was saved with."
+CHANGED_ELSEWHERE = "This node was changed in another tab. Reload the page, then make your change again."
 
 
 def _app_version() -> str:
@@ -104,6 +107,17 @@ def _node_sent(value: object, depth: int = 0) -> Any:
     return None
 
 
+def _edit_tag(record: dict) -> str:
+    """A fingerprint of what the node dialog edits: name, address, on/off and mappings (never the key).
+
+    The dialog sends back the tag it opened with, so a save from a tab opened before another tab's save is refused
+    instead of quietly putting the old values back. The id the node reports isn't in it: the app records that by
+    itself, and it must not make a dialog's save look stale.
+    """
+    edited = [record.get("name"), record.get("url"), record.get("enabled"), record.get("path_mappings")]
+    return hashlib.sha256(json.dumps(edited, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
 def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
     """``NODE_ROW`` for one stored node and its live details (None before the registry has it)."""
     view = details.view if details else None
@@ -127,6 +141,7 @@ def _node_row(record: dict, details: NodeDetails | None) -> dict[str, Any]:
         "path_mappings": list(record.get("path_mappings") or []),
         "used_by": _used_by(record["id"]),
         "to_fix": _to_fix(record, details),
+        "edit_tag": _edit_tag(record),
     }
 
 
@@ -444,8 +459,13 @@ def create_node():
 @api.route("/nodes/<node_id>", methods=["PUT"])
 @api_token_required
 def update_node(node_id: str):
-    """Change a node's name, address, key, on/off switch or mappings."""
-    data = {k: v for k, v in _json_body().items() if k in ("name", "url", "key", "enabled", "path_mappings")}
+    """Change a node's name, address, key, on/off switch or mappings.
+
+    With ``edit_tag`` (the row's, as the dialog opened it), a node saved elsewhere since is a 409, not overwritten.
+    """
+    body = _json_body()
+    data = {k: v for k, v in body.items() if k in ("name", "url", "key", "enabled", "path_mappings")}
+    loaded_tag = body.get("edit_tag")
     sm = get_settings_manager()
     before = find_node(sm.nodes, node_id)
     new_url = normalise_url(data["url"])[0] if "url" in data else None
@@ -458,6 +478,8 @@ def update_node(node_id: str):
         existing = find_node(nodes, node_id)
         if existing is None:
             return _not_found(node_id)
+        if loaded_tag is not None and loaded_tag != _edit_tag(existing):
+            return jsonify({"error": CHANGED_ELSEWHERE}), 409
         if "url" in data and data.get("key") in (None, KEY_MASK):
             new_url = normalise_url(data["url"])[0]
             if new_url is not None and not _same_address(new_url, existing):

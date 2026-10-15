@@ -357,6 +357,62 @@ def test_a_node_added_twice_is_named_at_connect(real_page: Page, real_app: str, 
     expect(page.locator("#addNodeNext")).to_be_hidden()
 
 
+def _open_node_settings(page: Page) -> None:
+    watch_modal_shown(page, "nodeModal")
+    page.locator(".nd-row .nd-open").first.click()
+    expect_modal_shown(page, "nodeModal")
+    _node_tab(page, "settings")
+
+
+@pytest.mark.e2e
+def test_a_tab_opened_before_another_tabs_save_cant_undo_it(
+    real_page: Page, context: BrowserContext, real_app: str, node_url: str
+) -> None:
+    tab_a = real_page
+    tab_a.goto(f"{real_app}/nodes")
+    expect(tab_a.locator("#nodeList")).to_contain_text("No nodes yet", timeout=10000)
+    _open_add(tab_a)
+    _connect(tab_a, node_url, NODE_KEY)
+    tab_a.locator("#addNodeNext").click()
+    expect(tab_a.locator("#addNodeStep2")).to_be_visible()
+    # Finish later saves the rows step 2 shows: the add flow's own save goes through.
+    with tab_a.expect_response(lambda r: r.request.method == "PUT" and "/api/nodes/" in r.url) as kept:
+        tab_a.locator("#addNodeCancel").click()
+    assert kept.value.status == 200
+
+    tab_b = context.new_page()
+    tab_b.set_viewport_size({"width": 1440, "height": 1000})
+    tab_b.goto(f"{real_app}/nodes")
+    expect(tab_b.locator(".nd-row")).to_have_count(1, timeout=10000)
+    _open_node_settings(tab_b)
+
+    _open_node_settings(tab_a)
+    tab_a.locator("#nodeSetName").fill("e2e-node-renamed")
+    tab_a.locator("#nodeSettingsSave").click()
+    expect(tab_a.locator("#nodeSettingsResult")).to_have_text("Saved", timeout=15000)
+
+    # Tab B still shows the old name; switching the node off there would save that name too.
+    expect(tab_b.locator("#nodeSetName")).to_have_value(NODE_NAME)
+    tab_b.locator("label[for='nodeSetEnabled']").click()
+    tab_b.locator("#nodeSettingsSave").click()
+
+    expect(tab_b.locator("#nodeSettingsResult")).to_have_text(
+        "This node was changed in another tab. Reload the page, then make your change again.", timeout=15000
+    )
+    (stored,) = tab_a.request.get(f"{real_app}/api/nodes").json()["nodes"]
+    assert (stored["name"], stored["enabled"]) == ("e2e-node-renamed", True)
+
+    # Reloaded, tab B saves its change on top of tab A's.
+    tab_b.goto(f"{real_app}/nodes")
+    expect(tab_b.locator(".nd-row .nd-name")).to_have_text("e2e-node-renamed", timeout=10000)
+    _open_node_settings(tab_b)
+    tab_b.locator("label[for='nodeSetEnabled']").click()
+    tab_b.locator("#nodeSettingsSave").click()
+    expect(tab_b.locator("#nodeSettingsResult")).to_have_text("Saved", timeout=15000)
+    (stored,) = tab_b.request.get(f"{real_app}/api/nodes").json()["nodes"]
+    assert (stored["name"], stored["enabled"]) == ("e2e-node-renamed", False)
+
+
 @pytest.mark.e2e
 def test_plex_database_nodes_are_added_and_offered_to_the_plex_server(
     real_page: Page, real_app: str, plex_db_node_url: str, helper_url: str, tmp_path: Path

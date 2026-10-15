@@ -5874,14 +5874,14 @@ schedule or global holds. Ordinary interrupted running jobs continue to follow t
 
 API token or session, like every other route. A `NODE_ROW` is a node's `id`, `name`, `url`, `enabled`, `state` and
 plain `reason`, `version`, `roles`, `legacy` (an older Plex helper), `platform`, `gpus`, `cpu`, `busy`, `last_seen`,
-`path_mappings` and `used_by` (`{"groups": [...], "servers": [...]}`). It never holds the key.
+`path_mappings`, `used_by` (`{"groups": [...], "servers": [...]}`) and `edit_tag`. It never holds the key.
 
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/nodes` | Every node as a `NODE_ROW`, and this app's `app_version`. |
 | POST | `/api/nodes/probe` | `{"url", "key"}` (and `id` to reuse a saved node's key with `****`): what answers there. Nothing is saved. |
 | POST | `/api/nodes` | Add a node (the [`nodes`](https://mediapreviewgenerator.dev/reference/#nodes) fields). `201` with its row; `400` for an invalid field; `409` when the machine answering there is already added. |
-| PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. |
+| PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. With the row's `edit_tag`, `409` when the node was saved from somewhere else since that row was read. |
 | DELETE | `/api/nodes/{id}` | Remove it. `409` with `used_by` while a worker group member or a Plex server uses it. |
 | POST | `/api/nodes/check` | Check every turned-on node in the background; `202` at once. Each row's `checking` is `true` until its check ends. |
 | POST | `/api/nodes/{id}/check` | Check it in the background; `202` at once. Its row's `checking` is `true` until the check ends. |

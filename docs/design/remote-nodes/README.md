@@ -402,7 +402,7 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 | `GET /nodes` | – | `{"nodes": [NODE_ROW], "app_version"}` |
 | `POST /nodes/probe` | `{url, key, id?}` | `{"ok": true, "info": PROBE_INFO}` or `{"ok": false, "error": {kind, message}}` — Add node step 1, nothing saved. With `id`, `"****"` means that node's stored key when `url` is its saved address (400 otherwise) |
 | `POST /nodes` | `{name, url, key, path_mappings}` | 201 `NODE_ROW`; 409 `{"error", "node_id", "name"}` when the node answering there is already added |
-| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact); 409 like `POST` when another saved node has that address or answers there |
+| `PUT /nodes/<id>` | any of `{name, url, key, enabled, path_mappings}`, and `edit_tag` | `NODE_ROW`; a new `url` needs a typed `key` and clears `node_uid` (recorded again on first contact); 409 like `POST` when another saved node has that address or answers there; 409 `{"error"}` when `edit_tag` isn't the node's now (the Nodes page sends the one its dialog opened with) |
 | `DELETE /nodes/<id>` | – | `{"ok": true}`; 409 `{"error", "used_by": [{kind: "group" \| "server", id, name}]}` while a group member or a Plex server with its node switched on uses it |
 | `POST /nodes/check` | – | 202 `{"nodes": [NODE_ROW], "app_version"}` at once: a health check of every turned-on node runs in the background (the Nodes page's Check now reads the list until no row is `checking`) |
 | `POST /nodes/<id>/check` | – | 202 `NODE_ROW` at once; the health check runs in the background, and one already running or queued for the node answers it |
@@ -413,7 +413,8 @@ keeps the stored key, but only for the address it was saved with: a probe or `PU
 
 `NODE_ROW = {id, name, url, enabled, state, reason, version, roles, legacy, platform: {os, arch, python}, gpus:
 [{type, device, name, status, error}], cpu: {cores, load1, ram_total, ram_available}, busy, last_seen, checking, path_mappings,
-used_by: {groups: [{id, name}], servers: [{id, name}]}, to_fix: {must_fix, recommended}}`. `to_fix` counts the
+used_by: {groups: [{id, name}], servers: [{id, name}]}, to_fix: {must_fix, recommended}, edit_tag}`. `edit_tag` is a
+fingerprint of `name`, `url`, `enabled` and `path_mappings` (not the key, not `node_uid`). `to_fix` counts the
 node's Setup Health rows to fix (without the Plex database checks, which ask the node). `busy` = how many tasks the node is running (int);
 `last_seen` = epoch seconds of the last answer, or null; `checking` = a health check is running or queued for it; `error` is `""` for a working GPU. Facts the node hasn't
 reported yet (before its first answer) are empty: `roles: []`, `platform: {}`, `gpus: []`, `cpu` values null.
