@@ -265,8 +265,45 @@ class TestNodeList:
                 expect(pill).to_have_class("pill")
             else:
                 expect(pill).to_have_class(f"pill {tone}")
-            expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
+            if chip == "Turned off":
+                expect(row.locator(".nd-status")).not_to_contain_text(f"why {i}")
+            else:
+                expect(row.locator(".nd-status")).to_contain_text(f"why {i}")
             expect(row.locator(".nd-open")).to_have_text(button)
+
+    def test_a_turned_off_node_says_so_once(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(
+            authed_page,
+            app_url,
+            [_node("n-off", "spare", "disabled", enabled=False, reason="Turned off on the Nodes page")],
+        )
+        api.health_answer = {
+            "overall_ok": True,
+            "sections": [
+                {
+                    "id": "node_connection",
+                    "title": "Connection",
+                    "checks": [
+                        {
+                            "id": "node_disabled",
+                            "label": "Turned off — no work is sent",
+                            "ok": False,
+                            "severity": "info",
+                            "informational": True,
+                        }
+                    ],
+                }
+            ],
+        }
+        status = authed_page.locator("#node-n-off .nd-status")
+        expect(status.locator(".pill")).to_have_text("Turned off")
+        expect(status).not_to_contain_text("Turned off on the Nodes page")
+
+        _open_node(authed_page, "n-off")
+        pane = _node_tab(authed_page, "health")
+        expect(pane.locator(".nd-note")).to_have_text("Turned off — no work is sent.")
+        expect(pane.locator(".readiness-bucket")).to_have_count(0)
+        expect(authed_page.locator("#nodeHealthSummary")).to_have_text("")
 
     def test_a_ready_card_says_how_many_setup_health_rows_to_fix(self, authed_page: Page, app_url: str) -> None:
         nodes = [

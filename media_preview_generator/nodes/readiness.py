@@ -88,15 +88,16 @@ def _section(section_id: str, title: str, checks: list[dict[str, Any]]) -> dict[
 def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
     view = details.view
     if view.state == STATE_DISABLED:
-        return [
-            _row(
-                "node_disabled",
-                f"{view.name} is turned off",
-                severity=RECOMMENDED,
-                ok=True,
-                explanation="Nothing is checked or sent to it until you turn it on.",
-            )
-        ]
+        row = _row(
+            "node_disabled",
+            "Turned off — no work is sent",
+            severity=INFO,
+            ok=False,
+            explanation="Nothing is checked or sent to it until you turn it on.",
+        )
+        # Neither a problem nor a pass: one neutral note, not an "All good" bucket around "is turned off".
+        row["informational"] = True
+        return [row]
     reachable = view.state not in (STATE_OFFLINE, STATE_CONNECTING)
     rows = [
         _row(

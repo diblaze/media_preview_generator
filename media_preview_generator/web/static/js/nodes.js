@@ -221,7 +221,8 @@
         const openTab = fixTab || (badge ? 'health' : 'overview');
         const used = usedByParts(node.used_by);
         const busy = isWorker(node) ? busyText(node.busy) : '';
-        const reason = node.reason ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
+        // A turned-off node's reason ("Turned off on the Nodes page") only repeats its chip.
+        const reason = node.reason && node.state !== 'disabled' ? `<span class="nd-faint">${esc(node.reason)}</span>` : '';
         const version = versionLine(node);
         const name = esc(node.name || node.id);
         return `
@@ -1329,7 +1330,8 @@
         const summary = [];
         if (partition.mustFix.length) summary.push(pill('bad', `${partition.mustFix.length} must fix`));
         if (partition.recommended.length) summary.push(pill('warn', `${partition.recommended.length} recommended`));
-        if (!summary.length) summary.push(pill('ok', '✓ All good'));
+        // Only notes (a turned-off node): no verdict, the note says it.
+        if (!summary.length && partition.allGood.length) summary.push(pill('ok', '✓ All good'));
         $('#nodeHealthSummary').innerHTML = summary.join('');
         if (partition.mustFix.length) {
             body.appendChild(bucket('critical', 'Must fix', partition.mustFix, true, '<i class="bi bi-x-octagon-fill text-danger me-2"></i>'));

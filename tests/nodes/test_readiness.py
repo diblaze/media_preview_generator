@@ -95,10 +95,17 @@ def test_an_offline_node_shows_only_its_connection():
     assert [s["id"] for s in _envelope(_details(reg.STATE_OFFLINE))["sections"]] == ["node_connection"]
 
 
-def test_a_disabled_node_is_all_good_and_shows_nothing_else():
+def test_a_disabled_node_is_one_neutral_note_and_nothing_else():
     envelope = _envelope(_details(reg.STATE_DISABLED))
     assert envelope["overall_ok"] is True
     assert [c["id"] for s in envelope["sections"] for c in s["checks"]] == ["node_disabled"]
+    row = _check(envelope, "node_disabled")
+    assert (row["label"], row["severity"], row["ok"], row["informational"]) == (
+        "Turned off — no work is sent",
+        "info",
+        False,
+        True,
+    )
 
 
 def test_test_access_results_are_one_row_per_library_with_the_suggestion():
