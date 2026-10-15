@@ -180,7 +180,9 @@ class LoudnessContext:
         """The server's Plex database, and "" when it can be written or why not.
 
         A writable answer holds for the job; any other is asked again after ``RECHECK_S``, so a moment when Plex was
-        restarting doesn't fail a whole library.
+        restarting doesn't fail a whole library. A Plex database node this app refused (``details["node_refused"]``:
+        turned off, or its new id held) is asked again for the next file: the Nodes page or the registry's next check
+        lifts that at any moment, and the refusal costs no request.
         """
         with self._locks_lock:
             lock = self._locks.setdefault(cfg.id, threading.Lock())
@@ -196,7 +198,10 @@ class LoudnessContext:
                 report = db.file_checks(deadline=time.monotonic() + BUSY_TIMEOUT_S)
                 self._states[cfg.id] = report.state
                 known = ("" if report.state is Capability.READY else report.message, time.monotonic())
-                self._ready[cfg.id] = known
+                if report.details.get("node_refused"):
+                    self._ready.pop(cfg.id, None)
+                else:
+                    self._ready[cfg.id] = known
             return db, known[0]
 
 

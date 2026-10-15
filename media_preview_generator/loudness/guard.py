@@ -336,7 +336,7 @@ class RemoteLoudnessDb:
         return result
 
     def _report(self, operation: str, body: dict, *, deadline: float, identity: bool) -> CapabilityReport:
-        from ..markers.publishers.plex_remote import report_from_json
+        from ..markers.publishers.plex_remote import NodeRefusedError, report_from_json
 
         try:
             if identity:
@@ -348,7 +348,8 @@ class RemoteLoudnessDb:
             if another:
                 report = CapabilityReport(Capability.MISCONFIGURED, another, report.details)
         except PublishError as exc:
-            report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc))
+            refused = {"node_refused": True} if isinstance(exc, NodeRefusedError) else {}
+            report = CapabilityReport(exc.state or Capability.AGENT_UNAVAILABLE, str(exc), refused)
         except ValueError as exc:
             logger.debug("Plex helper: unreadable loudness report: {}", exc)
             report = CapabilityReport(

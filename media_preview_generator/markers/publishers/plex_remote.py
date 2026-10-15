@@ -110,6 +110,14 @@ class AgentUnreachableError(AgentError):
     """
 
 
+class NodeRefusedError(AgentError):
+    """This app sent nothing: the node is turned off, its record is gone, or its new id is held (``node_refusal``).
+
+    The Nodes page or the registry's next check lifts it at any moment, so a check that ends in one is never reused for
+    a job's next file (``details["node_refused"]``).
+    """
+
+
 class NodeFullError(DatabaseBusyError):
     """The Plex database node ran nothing: as many of its requests as it lets wait for Plex's database already do.
 
@@ -898,7 +906,7 @@ class AgentClient:
         refusal = self.refusal()
         if refusal is not None:
             self.state = refusal.agent_state
-            error = AgentUnreachableError if refusal.waits else AgentError
+            error = AgentUnreachableError if refusal.waits else NodeRefusedError
             raise error(refusal.message, state=refusal.state)
 
     def require(self, capability: str, *, feature: str, needs: str, timeout: float = 5.0) -> None:
@@ -1098,12 +1106,15 @@ class RemotePlexDb(PlexDatabase):
         """The report of a check the node couldn't run.
 
         A node that stayed full is a busy database (``db_busy``), and one that didn't answer, or that is held until a
-        check hears its id (``node_refusal``), is work that waits for it (``node_waits``). A job reuses neither for
-        its next files: a check may confirm the node seconds later.
+        check hears its id (``node_refusal``), is work that waits for it (``node_waits``). One this app refuses
+        (``NodeRefusedError``: turned off, or a new id held until its key is typed again) is ``node_refused``. A job
+        reuses none of them for its next files: a check, or the user on the Nodes page, may lift it seconds later.
         """
         report = report_of_failure(exc, Capability.AGENT_UNAVAILABLE)
         if isinstance(exc, AgentUnreachableError):
             report = CapabilityReport(report.state, report.message, {**report.details, "node_waits": True})
+        elif isinstance(exc, NodeRefusedError):
+            report = CapabilityReport(report.state, report.message, {**report.details, "node_refused": True})
         return self._with_agent(report)
 
     def file_checks(self, *, deadline: float) -> CapabilityReport:

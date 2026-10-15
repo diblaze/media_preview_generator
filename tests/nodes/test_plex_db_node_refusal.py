@@ -18,6 +18,7 @@ import pytest
 from media_preview_generator.library_health import plex as health_plex
 from media_preview_generator.loudness import plex_db as loudness_db
 from media_preview_generator.loudness.guard import RemoteLoudnessDb, create_loudness_db, loudness_capability
+from media_preview_generator.loudness.job import LoudnessContext
 from media_preview_generator.loudness.plex_db import LOUDNESS_CAPABILITY
 from media_preview_generator.markers import pipeline
 from media_preview_generator.markers.publishers import plex_chapters, plex_db
@@ -36,7 +37,7 @@ from media_preview_generator.markers.publishers.plex_remote import (
 )
 from media_preview_generator.markers.settings import load_server
 from media_preview_generator.nodes import registry as reg
-from media_preview_generator.nodes.client import NodeUnreachableError
+from media_preview_generator.nodes.client import NodeProtocolError, NodeUnreachableError
 from media_preview_generator.nodes.protocol import KIND_WRONG_NODE, NODE_UID_HEADER, ROLE_PLEX_DB
 from media_preview_generator.nodes.registry import PlexDbHold, get_registry, set_registry
 from media_preview_generator.servers.base import ServerConfig, ServerType
@@ -511,47 +512,48 @@ def test_chapters_name_the_saved_id_and_another_machine_there_has_the_node_check
     get_registry().report_unavailable.assert_called_once_with(NODE["id"])
 
 
+@pytest.fixture
+def held(tmp_path, monkeypatch):
+    from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
+
+    monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
+    folder = tmp_path / "Plex Media Server"
+    _make_db(folder, journal_mode="wal")
+    node_client = node_app(str(folder), node_uid="uid-1", mountinfo_path=_mountinfo(tmp_path)).test_client()
+    record = _record(node_uid="uid-1", url=NODE_URL, key=TOKEN, name="Plex box", path_mappings=[])
+    reset_settings_manager()
+    sm = get_settings_manager(str(tmp_path / "app"))
+    sm.set("nodes", [record])
+    sm.set("media_servers", [{"id": "plex-1", "type": "plex", "server_identity": "plex-a", "markers": MARKERS}])
+    harness = Harness(nodes=[record])
+    reg.set_registry(harness.registry)
+    config = ServerConfig(
+        id="plex-1",
+        type=ServerType.PLEX,
+        name="Plex",
+        enabled=True,
+        url="http://plex:32400",
+        auth={},
+        output={"plex_config_folder": "/nowhere/plex"},
+        path_mappings=[],
+    )
+    settings = load_server(MARKERS, "plex")
+    server = MagicMock()
+    server.get_server_status.return_value = {"plex_pass": True, "version": "1.43.4"}
+    session = FlaskSession(node_client)
+    db = plex_database(settings, path_provider=lambda: None, label="Plex", session=session)
+    publisher = PlexMarkerPublisher(server, config, settings, db=db, ui_details=False)
+    yield harness, config, publisher, session
+    reg.set_registry(None)
+    harness.registry.stop()
+    reset_settings_manager()
+
+
 class TestAHeldNodeIsUsedOnceACheckConfirmsIt:
     """A Plex database node that was down (the Plex host rebooted) is held after it answers again, until the
     registry's check hears its saved id, at most ``WAITING_RECHECK_S`` later. A markers job that asked in that window
     was told "Checking ... nothing is lost", and kept that answer for the capability cache's five minutes: every file
     was skipped although the node was confirmed seconds later."""
-
-    @pytest.fixture
-    def held(self, tmp_path, monkeypatch):
-        from media_preview_generator.web.settings_manager import get_settings_manager, reset_settings_manager
-
-        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
-        folder = tmp_path / "Plex Media Server"
-        _make_db(folder, journal_mode="wal")
-        node_client = node_app(str(folder), node_uid="uid-1", mountinfo_path=_mountinfo(tmp_path)).test_client()
-        record = _record(node_uid="uid-1", url=NODE_URL, key=TOKEN, name="Plex box", path_mappings=[])
-        reset_settings_manager()
-        sm = get_settings_manager(str(tmp_path / "app"))
-        sm.set("nodes", [record])
-        sm.set("media_servers", [{"id": "plex-1", "type": "plex", "markers": MARKERS}])
-        harness = Harness(nodes=[record])
-        reg.set_registry(harness.registry)
-        config = ServerConfig(
-            id="plex-1",
-            type=ServerType.PLEX,
-            name="Plex",
-            enabled=True,
-            url="http://plex:32400",
-            auth={},
-            output={"plex_config_folder": "/nowhere/plex"},
-            path_mappings=[],
-        )
-        settings = load_server(MARKERS, "plex")
-        server = MagicMock()
-        server.get_server_status.return_value = {"plex_pass": True, "version": "1.43.4"}
-        session = FlaskSession(node_client)
-        db = plex_database(settings, path_provider=lambda: None, label="Plex", session=session)
-        publisher = PlexMarkerPublisher(server, config, settings, db=db, ui_details=False)
-        yield harness, config, publisher, session
-        reg.set_registry(None)
-        harness.registry.stop()
-        reset_settings_manager()
 
     def test_a_markers_job_writes_once_the_check_confirms_the_node_it_asked_about_while_held(self, held):
         harness, config, publisher, _session = held
@@ -584,3 +586,96 @@ class TestAHeldNodeIsUsedOnceACheckConfirmsIt:
 
         session.stopped = False  # back before the registry's next check
         assert pipeline.cached_capability(ctx, config, publisher).ready
+
+
+def _plex_db_info(uid: str, machine: str) -> dict:
+    info = _info(uid=uid, roles=(ROLE_PLEX_DB,))
+    info["plex_db"] = {"machine_identifier": machine}
+    info["agent"] = {"version": "1.2.0", "protocols": [1, 2], "capabilities": []}
+    return info
+
+
+def _save_node(harness: Harness, **fields) -> None:
+    """Change the node's record in settings and in the registry's copy, as the Nodes page does."""
+    from media_preview_generator.web.settings_manager import get_settings_manager
+
+    sm = get_settings_manager()
+    nodes = sm.nodes
+    nodes[0].update(fields)
+    sm.update_nodes(nodes)
+    harness.change(**fields)
+
+
+# What stops the node's work, and how the user (or the registry's next check) lifts it.
+REFUSALS = {
+    "another-machine-at-its-address-then-it-left": AGENT_UNCONFIRMED_NODE,
+    "rolled-back-to-1.1.2-then-updated": AGENT_UNCONFIRMED_NODE,
+    "turned-off-then-on": AGENT_DISABLED,
+    "recreated-then-its-key-typed-again": AGENT_UNCONFIRMED_NODE,
+}
+
+
+def _refuse(harness: Harness, refusal: str) -> None:
+    client = harness.client()
+    if refusal == "turned-off-then-on":
+        _save_node(harness, enabled=False)
+    elif refusal == "rolled-back-to-1.1.2-then-updated":
+        client.default_info = NodeProtocolError("no /v1/info")  # 1.1.2 has no /v1/info, so it gives no id
+        harness.legacy = ("connected", "1.1.2")
+    else:  # another machine took the address with the same key, or the node lost its /config: a new id
+        client.default_info = _plex_db_info("uid-2", "plex-b")
+    harness.registry.check_now("n1")
+
+
+def _lift(harness: Harness, refusal: str) -> None:
+    client = harness.client()
+    if refusal == "turned-off-then-on":
+        _save_node(harness, enabled=True)
+    elif refusal == "recreated-then-its-key-typed-again":
+        _save_node(harness, node_uid=None)
+    else:
+        client.default_info = _plex_db_info("uid-1", "plex-a")  # the saved machine answers there again
+        harness.clock.now += reg.WAITING_RECHECK_S
+    harness.registry.check_now("n1")
+
+
+class TestARefusalLiftedWhileAJobRunsReachesItsNextFile:
+    """A node this app refuses (turned off, or a new id or none held until the saved machine answers or its key is
+    typed again) is lifted by the Nodes page or the registry's next check, not by the node. A job that kept the
+    refusal (markers' capability cache, loudness's recheck delay) skipped or failed files after it was lifted."""
+
+    @pytest.fixture
+    def refused(self, held, request):
+        harness, config, publisher, _session = held
+        harness.client().default_info = _plex_db_info("uid-1", "plex-a")
+        harness.registry.check_now("n1")
+        assert harness.registry.plex_db_hold("n1") is None
+        _refuse(harness, request.param)
+        return harness, config, publisher, request.param
+
+    @pytest.mark.parametrize("refused", list(REFUSALS), indirect=True)
+    def test_a_markers_job_writes_the_next_file(self, refused):
+        harness, config, publisher, refusal = refused
+        ctx = _ctx(MagicMock(), MagicMock())
+        first = pipeline.cached_capability(ctx, config, publisher)
+        assert first.state is Capability.AGENT_UNAVAILABLE
+        assert first.details["agent"]["state"] == REFUSALS[refusal]
+
+        _lift(harness, refusal)
+        assert harness.registry.plex_db_hold("n1") is None
+
+        again = pipeline.cached_capability(ctx, config, publisher)
+        assert again.ready, f"still the lifted refusal: {again.state.value}: {again.message}"
+
+    @pytest.mark.parametrize("refused", list(REFUSALS), indirect=True)
+    def test_a_loudness_job_writes_the_next_file(self, refused):
+        harness, config, publisher, refusal = refused
+        ctx = LoudnessContext(registry=MagicMock(), ffmpeg="ffmpeg")
+        ctx._dbs[config.id] = RemoteLoudnessDb(MagicMock(), publisher._db, server_name="Plex")
+        _db, why = ctx.db(config)
+        assert why and ctx._states[config.id] is Capability.AGENT_UNAVAILABLE
+
+        _lift(harness, refusal)
+
+        _db, why = ctx.db(config)
+        assert why == "", f"still the lifted refusal: {why}"
