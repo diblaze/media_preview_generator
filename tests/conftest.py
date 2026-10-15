@@ -398,6 +398,33 @@ def mock_config():
     return config
 
 
+@pytest.fixture(scope="session")
+def video_mediainfo_cant_read(tmp_path_factory) -> str:
+    """A real 4 s video whose title holds U+FFFF: MediaInfo copies the tag into its XML as it is, so pymediainfo can't
+    read that XML (``ParseError``), while FFmpeg reads the file fine."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    from pymediainfo import MediaInfo
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("needs ffmpeg")
+    path = tmp_path_factory.mktemp("mediainfo-cant-read") / "Tagged (2020).mkv"
+    subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=4:s=64x36:r=5", "-c:v", "mpeg4",
+         "-metadata", "title=q￿r", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )  # fmt: skip
+    try:
+        MediaInfo.parse(str(path))
+    except ET.ParseError:
+        return str(path)
+    pytest.skip("this MediaInfo writes the tag into XML pymediainfo can read")
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for tests that is cleaned up afterwards."""

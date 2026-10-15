@@ -1,13 +1,17 @@
 """Chapter artifact lifecycles, separate from an already completed BIF."""
 
 import json
+import shutil
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from loguru import logger
 from PIL import Image
+from pymediainfo import MediaInfo
 
 from media_preview_generator.output.plex_bundle import PlexBundleAdapter
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
@@ -57,7 +61,7 @@ def _image(path, color="red"):
 
 @pytest.fixture
 def extraction(monkeypatch):
-    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: object())
+    monkeypatch.setattr(MediaInfo, "parse", lambda _path: object())
     run = MagicMock(side_effect=lambda _source, _start, path, *_args, **_kw: _image(path))
     monkeypatch.setattr(chapters, "extract_chapter_frame", run)
     register = MagicMock()
@@ -308,6 +312,40 @@ def test_extraction_errors_fail_instead_of_waiting_for_plex(plan, config, extrac
     assert (result.completed, result.total) == (0, 2)
     assert result.message == str(failure)
     register.assert_not_called()
+
+
+def test_a_file_whose_details_mediainfo_cant_read_gets_every_chapter_and_one_warning(
+    plan, config, extraction, monkeypatch
+):
+    run, register = extraction
+    # What pymediainfo raises for a tag MediaInfo writes into its XML as it is (U+FFFF in a title).
+    parse = MagicMock(side_effect=ET.ParseError("not well-formed (invalid token): line 50, column 8"))
+    monkeypatch.setattr(MediaInfo, "parse", parse)
+    warnings: list[str] = []
+    sink = logger.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+    try:
+        result = chapters.publish_chapters(plan, config)
+    finally:
+        logger.remove(sink)
+
+    assert (result.status, result.completed, result.total) == ("ready", 2, 2)
+    assert parse.call_count == 1
+    assert [call.kwargs["media_info"].video_tracks[0].hdr_format for call in run.call_args_list] == [None, None]
+    assert len(warnings) == 1 and plan.canonical_path in warnings[0], warnings
+    register.assert_called_once()
+
+
+def test_a_chapter_frame_of_a_file_whose_details_mediainfo_cant_read_is_extracted(video_mediainfo_cant_read, tmp_path):
+    config = SimpleNamespace(
+        ffmpeg_path=shutil.which("ffmpeg"), ffmpeg_threads=2, thumbnail_quality=4, tonemap_algorithm="hable",
+        log_level="INFO",
+    )  # fmt: skip
+    output = tmp_path / "chapter.jpg"
+
+    chapters.extract_chapter_frame(video_mediainfo_cant_read, 2000, output, config)
+
+    with Image.open(output) as image:
+        assert image.width == 1280
 
 
 def test_rejected_image_reports_actual_dimensions(tmp_path):
@@ -570,7 +608,7 @@ def test_ffmpeg_failure_preserves_existing_bif_and_records_chapter_warning(plan,
     bif.write_bytes(b"existing BIF")
     monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
     track = SimpleNamespace(hdr_format=None, transfer_characteristics=None)
-    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: SimpleNamespace(video_tracks=[track]))
+    monkeypatch.setattr(MediaInfo, "parse", lambda _path: SimpleNamespace(video_tracks=[track]))
     runner = MagicMock(return_value=(234, 0.1, 0, ["File ended prematurely"]))
     factory = MagicMock(return_value=runner)
     monkeypatch.setattr(chapters, "create_ffmpeg_runner", factory)
@@ -1006,7 +1044,7 @@ def test_corrupt_index_with_past_end_chapter_is_ready_with_note(plan, config, ex
     run, register = extraction
     monkeypatch.setattr(chapters, "inspect_seek_index", lambda *a, **kw: "Invalid Cues")
     track = SimpleNamespace(duration=1500)
-    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: SimpleNamespace(video_tracks=[track]))
+    monkeypatch.setattr(MediaInfo, "parse", lambda _path: SimpleNamespace(video_tracks=[track]))
     plan.target = replace(
         plan.target, chapters=(plan.target.chapters[0], replace(plan.target.chapters[1], start_ms=9000))
     )

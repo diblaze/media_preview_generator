@@ -25,7 +25,6 @@ from typing import BinaryIO, NamedTuple
 
 import numpy as np
 from loguru import logger
-from pymediainfo import MediaInfo
 
 from ...processing.ffmpeg_runner import GPU_CANT_DECODE_VERDICT
 from ...processing.hwaccel import hwaccel_decode_args
@@ -575,10 +574,10 @@ def _input_is_greyscale_h264(command: list[str]) -> bool:
 
     Parse speed 0 reads only the file's start, which ffmpeg has just read: 11 ms warm on a 1080p H.264 movie's mkv.
     """
-    from ...processing.generator import is_greyscale_h264
+    from ...processing.generator import is_greyscale_h264, read_media_info
 
     try:
-        return is_greyscale_h264(MediaInfo.parse(command[command.index("-i") + 1], parse_speed=0))
+        return is_greyscale_h264(read_media_info(command[command.index("-i") + 1], parse_speed=0))
     except (ValueError, IndexError, OSError, RuntimeError):
         return False
 

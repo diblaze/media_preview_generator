@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
 from typing import Any, Protocol
@@ -58,6 +59,7 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
     build_hdr10_zscale_chain,
+    rotation_filter,
 )
 from .hdr_detection import (
     is_dolby_vision,
@@ -1828,6 +1830,57 @@ def _thumbnails_lost_their_colour(output_folder: str) -> bool:
     return True
 
 
+# What a file MediaInfo can't read is taken to hold: one video track with nothing known about it, in the XML layout
+# pymediainfo's constructor reads.
+_UNREAD_MEDIA_INFO_XML = '<Mediainfo><File><track type="Video"/></File></Mediainfo>'
+
+
+def read_media_info(video_file: str, **parse_options: Any) -> MediaInfo:
+    """The file's details as MediaInfo reads them; a file it can't read is one video track with none, and one warning.
+
+    MediaInfo copies a tag into its XML as it is, so a title holding U+FFFF makes the XML unreadable and pymediainfo
+    raises ``ParseError``. FFmpeg reads the file fine, so it is processed as one that declares nothing (SDR, no
+    runtime) rather than failed over a tag.
+
+    Args:
+        video_file: The file.
+        **parse_options: Passed on to ``MediaInfo.parse`` (``parse_speed``).
+
+    Returns:
+        The file's details, or a video track with none when MediaInfo's answer can't be read.
+
+    Raises:
+        OSError: The file is missing, or the MediaInfo library can't be loaded.
+        RuntimeError: MediaInfo couldn't open the file.
+    """
+    try:
+        return MediaInfo.parse(video_file, **parse_options)
+    except (ET.ParseError, ValueError) as exc:
+        logger.warning("MediaInfo couldn't read the details of {} ({}); carrying on without them.", video_file, exc)
+        return MediaInfo(_UNREAD_MEDIA_INFO_XML)
+
+
+def display_rotation(media_info: MediaInfo) -> int:
+    """How far clockwise the video is shown turned from how it is stored, as MediaInfo reads it (a phone's portrait
+    video stored landscape is 90).
+
+    MediaInfo reads it from MP4 and MOV (where phones write it) but not from Matroska, and doesn't say when the turn
+    is mirrored too: on a GPU a rotated Matroska file's thumbnails stay as stored, and a mirrored one's stay mirrored.
+
+    Args:
+        media_info: The file's ``MediaInfo.parse`` result.
+
+    Returns:
+        0, 90, 180 or 270; 0 for any other angle (FFmpeg turns those only on the CPU, with ``rotate``).
+    """
+    tracks = media_info.video_tracks
+    try:
+        degrees = round(float(getattr(tracks[0], "rotation", None))) % 360 if tracks else 0
+    except (TypeError, ValueError):
+        return 0
+    return degrees if degrees in (90, 180, 270) else 0
+
+
 def is_greyscale_h264(media_info: MediaInfo) -> bool:
     """Whether the video is H.264 in greyscale (4:0:0), as MediaInfo reads it before FFmpeg runs (FFmpeg lists it as
     4:2:0). Intro & Credits frames check it too (``markers.credits.frames``).
@@ -1879,7 +1932,7 @@ def generate_images(
         WorkingFolderError: FFmpeg couldn't write the thumbnails to ``output_folder`` (full, over its quota,
             read-only, or not writable by this user); none of them are kept.
     """
-    media_info = MediaInfo.parse(video_file)
+    media_info = read_media_info(video_file)
     if gpu == "NVIDIA" and is_greyscale_h264(media_info):
         # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
         # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.
@@ -2042,11 +2095,14 @@ def generate_images(
                             and gpu_device_path.startswith("/dev/dri/")
                         )
                         path_kind = DV5_PATH_VAAPI_VULKAN if use_vaapi_dv5_path else DV5_PATH_LIBPLACEBO
+                    # The VAAPI paths' frames stay on the GPU until their download, which FFmpeg doesn't turn
+                    # upright; the libplacebo path uploads frames FFmpeg has already turned.
+                    turn = rotation_filter(display_rotation(media_info)) if path_kind != DV5_PATH_LIBPLACEBO else None
                     libplacebo_vf = build_dv5_vf(
                         path_kind=path_kind,
                         tonemap_algorithm=config.tonemap_algorithm,
                         fps_value=fps_value,
-                        base_scale=base_scale,
+                        base_scale=f"{turn},{base_scale}" if turn else base_scale,
                     )
             elif is_dolby_vision(hdr_fmt):
                 # Dolby Vision Profile 7/8/10 with an HDR10 or HLG
@@ -2111,6 +2167,7 @@ def generate_images(
         fps_filter=fps_filter,
         hdr10_zscale_chain=hdr10_zscale_chain,
         last_command=last_command,
+        rotation=display_rotation(media_info),
     )
 
     def _run_ffmpeg(*args: Any, **kwargs: Any) -> tuple[int, float, str, list[str]]:

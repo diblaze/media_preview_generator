@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
+from pymediainfo import MediaInfo
 
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapters
@@ -33,7 +34,7 @@ def extraction(tmp_path, monkeypatch):
     )
     track = SimpleNamespace(duration=10000, transfer_characteristics=None, hdr_format=None)
     media = SimpleNamespace(video_tracks=[track])
-    monkeypatch.setattr(chapters.MediaInfo, "parse", lambda _path: media)
+    monkeypatch.setattr(MediaInfo, "parse", lambda _path: media)
     config = SimpleNamespace(tonemap_algorithm="hable", ffmpeg_threads=2, thumbnail_quality=2)
     register = MagicMock()
     monkeypatch.setattr("media_preview_generator.servers.plex_chapters.register_chapters", register)
