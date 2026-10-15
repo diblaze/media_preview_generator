@@ -327,6 +327,11 @@ def _port(value: str) -> int | None:
     return port if 1 <= port <= 65535 else None
 
 
+def _host_port(host: str, port: int) -> str:
+    """``host:port`` as a URL writes it: an IPv6 address in brackets (``[::]:9494``, not ``:::9494``)."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def main(argv: list[str] | None = None) -> int:
     """Start the node and serve until SIGTERM or SIGINT.
 
@@ -386,7 +391,7 @@ def _serve(argv: list[str] | None) -> int:
     try:
         server = create_node_server(app, host=args.host, port=args.port, threads=args.threads)
     except OSError as exc:
-        logger.error("The node couldn't listen on {}:{}: {}", args.host, args.port, exc)
+        logger.error("The node couldn't listen on {}: {}", _host_port(args.host, args.port), exc)
         state.close()
         return 1
     # waitress's loop runs in a thread of its own and the main thread waits for SIGTERM/SIGINT, so the stop below can
@@ -405,7 +410,7 @@ def _serve(argv: list[str] | None) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
-    logger.info("Listening on http://{}:{} ({} threads)", args.host, args.port, args.threads)
+    logger.info("Listening on http://{} ({} threads)", _host_port(args.host, args.port), args.threads)
     serving = threading.Thread(target=serve, name="node-server", daemon=True)
     serving.start()
     while not stopping and serving.is_alive():

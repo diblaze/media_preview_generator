@@ -122,6 +122,41 @@ def test_a_node_port_that_isnt_a_port_is_one_line_and_exit_1(node_env, monkeypat
     assert lines == [f"ERROR The node didn't start: NODE_PORT is {port!r}, which isn't a port number from 1 to 65535"]
 
 
+@pytest.mark.parametrize(
+    ("host", "shown"),
+    [
+        ("::", "[::]:9494"),
+        ("fd42::101", "[fd42::101]:9494"),
+        ("0.0.0.0", "0.0.0.0:9494"),
+        ("nas.lan", "nas.lan:9494"),
+    ],
+    ids=["any-ipv6", "one-ipv6-address", "any-ipv4", "host-name"],
+)
+@pytest.mark.parametrize("listens", [True, False], ids=["listening", "cant-listen"])
+def test_the_address_the_node_logs_brackets_an_ipv6_host(node_env, monkeypatch, host, shown, listens):
+    # "http://:::9494" for NODE_HOST=:: is no address anyone can open or paste.
+    from types import SimpleNamespace
+
+    wsgi, lines = node_env
+    monkeypatch.setenv("NODE_HOST", host)
+    state = SimpleNamespace(close=lambda **_: None, tasks=SimpleNamespace(wait_until_told=lambda: None))
+    monkeypatch.setattr(wsgi, "create_node_app", lambda: SimpleNamespace(extensions={wsgi.EXTENSION: state}))
+
+    def server(app, **_):
+        if not listens:
+            raise OSError("Address already in use")
+        return SimpleNamespace(run=lambda: None, close=lambda: None)
+
+    monkeypatch.setattr(wsgi, "create_node_server", server)
+
+    wsgi.main(["--threads", "2"])
+
+    if listens:
+        assert f"INFO Listening on http://{shown} (2 threads)" in lines
+    else:
+        assert f"ERROR The node couldn't listen on {shown}: Address already in use" in lines
+
+
 def test_a_bad_port_on_the_command_line_is_one_line_and_exit_1(node_env):
     wsgi, lines = node_env
 
