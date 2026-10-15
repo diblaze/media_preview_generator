@@ -65,6 +65,8 @@ AGENT_NO_ROLE = "no_role"
 # The app refuses to send anything (``node_refusal``): the node is turned off, or the server's node record is gone.
 AGENT_DISABLED = "disabled"
 AGENT_NO_NODE = "no_node"
+# The node reports a new id this app can't tie to the server's Plex (``NodeRegistry.plex_db_refusal``).
+AGENT_UNCONFIRMED_NODE = "unconfirmed_node"
 
 
 class AgentError(PublishError):
@@ -481,10 +483,10 @@ NO_NODE_REFUSAL = NodeRefusal(
 def node_refusal(settings: Any) -> NodeRefusal | None:
     """Why the server's Plex database node mustn't be used now, or None when it may.
 
-    A node turned off on the Nodes page gets nothing. A node that answers with the saved key at the saved address is
-    this server's node even when it reports a new id (it was reinstalled); a node beside the wrong Plex is caught by
-    the Plex machine identifier check instead. The node's record is read on every call, so a job that opened the
-    database before the node was turned off is refused from its next request on.
+    A node turned off on the Nodes page gets nothing, and neither does one that reports a new id this app can't tie
+    to the server's Plex (a different machine given the same key and address would write the wrong Plex's database)
+    until its key is typed again. The node's record and the registry are read on every call, so a job that opened
+    the database before the node was turned off is refused from its next request on.
 
     Args:
         settings: That server's ``ServerMarkersSettings``.
@@ -509,6 +511,12 @@ def node_refusal(settings: Any) -> NodeRefusal | None:
             Capability.AGENT_UNAVAILABLE,
             AGENT_DISABLED,
         )
+    if node_id:
+        from ...nodes.registry import get_registry
+
+        unconfirmed = get_registry().plex_db_refusal(str(node_id))
+        if unconfirmed:
+            return NodeRefusal(unconfirmed, Capability.AGENT_UNAVAILABLE, AGENT_UNCONFIRMED_NODE)
     return None
 
 

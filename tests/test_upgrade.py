@@ -3380,8 +3380,9 @@ class TestMigrateToV24:
         assert node["enabled"] is False
         assert _agent_of(settings_manager, 0) == {"enabled": True, "node_id": node["id"]}
 
-    def test_a_re_run_drops_the_old_address_and_key_an_earlier_build_kept(self, settings_manager):
-        """Earlier builds of v24 left url/token beside node_id; running it again drops them and keeps the node."""
+    def test_a_block_that_already_has_a_node_keeps_it_and_loses_its_old_address_and_key(self, settings_manager):
+        """Called on a block that already has node_id, it drops url/token beside it and keeps the node; twice is a
+        no-op. (Settings already at v24 never run it: _migrate_schema stops at the current schema.)"""
         from media_preview_generator.upgrade import _migrate_to_v24
 
         agent = {**self.HELPER, "node_id": "n-earlier"}

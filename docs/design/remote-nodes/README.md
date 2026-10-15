@@ -42,9 +42,12 @@ I'll review the design later and may ask for changes"). Not pushed to `dev`, not
   - v24 moves the old helper's `url`/`token` into the node and drops them from the server. Rolling back means
     restoring `settings.json.pre-v<N>.bak` (written beside settings.json before migrating): an older build
     refuses a v24 file.
-  - A node that answers with the saved key at the saved address is that node even when it reports a new id
-    (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
-    node beside the wrong Plex is caught by the Plex machine identifier check.
+  - A worker node that answers with the saved key at the saved address is that node even when it reports a new
+    id (recreated without its `/config`): the new id is recorded and logged, nothing is refused. A Plex database
+    node's new id is taken silently only when its `plex_db.machine_identifier` matches every server that uses it;
+    otherwise its Plex database work is refused ("Type the node's key again on its Settings tab to confirm") until
+    the key is typed again, which clears the saved id. A Plex database node beside the wrong Plex is caught by the
+    Plex machine identifier check.
   - The Plex database node needs a `/config` volume for loudness (the undo record lives there); without one it
     refuses loudness writes.
 * **Still open:**
@@ -182,8 +185,9 @@ retry runs (on the **node's** CPU, see §6).
 
 * New top-level `nodes`: `[{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings": [{"app_prefix",
   "node_prefix"}], "added_at"}]`. `id` is assigned by the app (stable; members and Plex servers reference it).
-  `node_uid` is the id the node reports, recorded on contact; a node that reports a new one (reinstalled) is
-  still that node, and the new id replaces the old. Add node and an address change refuse an address another
+  `node_uid` is the id the node reports, recorded on contact; a worker node that reports a new one
+  (reinstalled) is still that node, and the new id replaces the old (a Plex database node: see §0.1). A new address
+  or the key typed again clears it. Add node and an address change refuse an address another
   saved node has, or where an added node answers. A legacy helper has no `node_uid`.
 * Worker group members gain `"node": <node id> | null` (null = this app). A node member's `device` is the node's
   device string. Resource keys become `node:<id>:gpu:<device>` / `node:<id>:cpu`.

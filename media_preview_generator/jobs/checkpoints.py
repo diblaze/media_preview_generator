@@ -19,6 +19,15 @@ from ..processing.types import ProcessableItem
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
+def _old_drop_count(value: object) -> bool:
+    """A ``node_drops`` entry as builds before the node names wrote it: how many times the file was dropped."""
+    return type(value) is int and value >= 0
+
+
+def _drop_names(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(name, str) for name in value)
+
+
 def _validate_accounting(snapshot: dict) -> None:
     """Reject corrupt accounting rather than prematurely completing remaining work."""
     state = snapshot.get("state")
@@ -45,8 +54,7 @@ def _validate_accounting(snapshot: dict) -> None:
         raise ValueError("Invalid checkpoint node failures")
     drops = state.get("node_drops", {})
     if not isinstance(drops, dict) or any(
-        not isinstance(path, str) or not isinstance(names, list) or any(not isinstance(name, str) for name in names)
-        for path, names in drops.items()
+        not isinstance(path, str) or not (_old_drop_count(names) or _drop_names(names)) for path, names in drops.items()
     ):
         raise ValueError("Invalid checkpoint node tries")
     starts = state.get("node_start_failures", {})
@@ -163,6 +171,12 @@ def read_checkpoint(config_dir: str | Path, job_id: str, reference: str) -> dict
     _validate_accounting(payload)
     if not isinstance(payload.get("state"), dict) or not isinstance(payload.get("bookkeeping", {}), dict):
         raise ValueError("Invalid checkpoint accounting")
+    drops = payload["state"].get("node_drops")
+    if isinstance(drops, dict):
+        # An earlier build counted drops without naming the node: each counted drop keeps its place, unnamed.
+        payload["state"]["node_drops"] = {
+            path: [""] * names if _old_drop_count(names) else names for path, names in drops.items()
+        }
     return payload
 
 

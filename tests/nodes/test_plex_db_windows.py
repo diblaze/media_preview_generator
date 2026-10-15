@@ -221,8 +221,16 @@ class TestTheWindowsEntryPoint:
             seen["undo_problem"] = plex_db_role.undo_record_problem()
             return object()
 
+        class Server:
+            def run(self):
+                seen["served"] = True
+
+        def create_server(app, **kwargs):
+            seen["server_settings"] = kwargs
+            return Server()
+
         waitress = types.ModuleType("waitress")
-        waitress.serve = lambda *_a, **_k: None
+        waitress.create_server = create_server
         monkeypatch.setitem(sys.modules, "waitress", waitress)
         monkeypatch.setattr(node_app_module, "create_node_app", create_node_app)
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)
@@ -239,6 +247,17 @@ class TestTheWindowsEntryPoint:
         assert seen["config_dir"] == str(node_dir)
         assert os.path.dirname(seen["undo_record"]) == str(node_dir)
         assert seen["undo_problem"] == ""
+
+    def test_it_serves_with_the_same_request_limits_as_the_docker_node(self, started):
+        from media_preview_generator.nodes.server import wsgi
+
+        _node_dir, seen = started
+        settings = seen["server_settings"]
+        assert seen["served"] is True
+        assert settings["channel_timeout"] == wsgi.CHANNEL_TIMEOUT_S
+        assert settings["max_request_body_size"] == wsgi.MAX_REQUEST_BODY_BYTES
+        assert settings["connection_limit"] in (wsgi.CONNECTION_LIMIT, wsgi.SELECT_CONNECTION_LIMIT)
+        assert settings["asyncore_use_poll"] is True and settings["ident"] == "mpg-plex-db-node"
 
     def test_a_windows_node_without_its_own_folder_writes_no_loudness(self, monkeypatch):
         monkeypatch.setattr(plex_db_role, "_ON_WINDOWS", True)

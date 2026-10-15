@@ -48,6 +48,7 @@ HIDDEN = [
     "media_preview_generator.nodes.server.app",
     "media_preview_generator.nodes.server.plex_db",
     "media_preview_generator.nodes.server.winplatform",
+    "media_preview_generator.nodes.server.wsgi",
     "media_preview_generator.markers.publishers.plex_chapters",
     "waitress",
 ]

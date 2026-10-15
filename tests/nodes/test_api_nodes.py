@@ -176,6 +176,15 @@ class TestListAndProbe:
         info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
         assert info["suggested_path_mappings"] == [{"app_prefix": str(movies), "node_prefix": str(movies)}]
 
+    @pytest.mark.parametrize(("node_build", "match"), [("b" * 40, False), ("a" * 7, True), ("", True)])
+    def test_probe_compares_the_build_of_the_same_version(self, client, nodes, monkeypatch, node_build, match):
+        monkeypatch.setenv("GIT_SHA", "a" * 40)
+        answer = _info()
+        answer["node"]["build"] = node_build
+        nodes("http://nuc:9494").info_answer = answer
+        info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
+        assert info["version_match"] is match
+
     def test_probe_says_when_the_version_differs(self, client, nodes):
         nodes("http://nuc:9494").info_answer = _info(version="1.0.0")
         info = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "k"}).get_json()["info"]
@@ -641,30 +650,79 @@ class TestSwitchedOffPlexDatabaseNode:
 class TestReinstalledNode:
     """The saved key at the saved address is what makes a node this node; a new id means it was reinstalled."""
 
-    def _plex_db_info(self, uid: str) -> dict:
+    def _plex_db_info(self, uid: str, machine_identifier: str = "plex-a") -> dict:
         answer = _info(uid=uid)
         answer["node"]["roles"] = ["plex_db"]
         del answer["worker"]
+        answer["plex_db"] = {"config_dir": "/plex", "db_present": True, "machine_identifier": machine_identifier}
         return answer
 
-    def test_a_recreated_plex_database_node_keeps_working_and_its_new_id_is_recorded(self, client, nodes):
-        from media_preview_generator.markers.publishers import plex_remote
-        from media_preview_generator.markers.settings import load_server
-
+    def _recreated(self, client, nodes, *, machine_identifier: str, server_identity: str | None = "plex-a"):
+        """A Plex database node added, used by a server, then recreated with a new id; answers its node id."""
         helper = nodes("http://plex-host:9494")
         helper.info_answer = self._plex_db_info("first-container")
         node_id = _add(client, url="http://plex-host:9494", name="Plex helper").get_json()["id"]
-        _sm().set("media_servers", [_plex_server({"enabled": True, "node_id": node_id})])
+        server = _plex_server({"enabled": True, "node_id": node_id})
+        server["server_identity"] = server_identity
+        _sm().set("media_servers", [server])
         assert _sm().nodes[0]["node_uid"] == "first-container"
 
         # docker pull + rm + run without a kept /config: a fresh node.json, so a new id.
-        helper.info_answer = self._plex_db_info("second-container")
+        helper.info_answer = self._plex_db_info("second-container", machine_identifier)
         row = client.post(f"/api/nodes/{node_id}/check").get_json()
-
         assert row["state"] == "ready", row["reason"]
+        return node_id
+
+    def _refusal(self):
+        from media_preview_generator.markers.publishers import plex_remote
+        from media_preview_generator.markers.settings import load_server
+
+        return plex_remote.node_refusal(load_server(_sm().get("media_servers")[0]["markers"], "plex"))
+
+    def test_a_recreated_plex_database_node_beside_the_same_plex_keeps_working(self, client, nodes):
+        self._recreated(client, nodes, machine_identifier="plex-a")
+
         assert _sm().nodes[0]["node_uid"] == "second-container"
-        settings = load_server(_sm().get("media_servers")[0]["markers"], "plex")
-        assert plex_remote.node_refusal(settings) is None
+        assert self._refusal() is None
+
+    @pytest.mark.parametrize(
+        ("machine_identifier", "server_identity"),
+        [("", "plex-a"), ("plex-a", None), ("plex-b", "plex-a")],
+        ids=["node-doesnt-say", "server-doesnt-say", "another-plex"],
+    )
+    def test_a_new_id_that_cant_be_tied_to_the_servers_plex_stops_its_plex_database_work(
+        self, client, nodes, machine_identifier, server_identity
+    ):
+        from media_preview_generator.markers.publishers.plex_remote import AGENT_UNCONFIRMED_NODE
+
+        self._recreated(client, nodes, machine_identifier=machine_identifier, server_identity=server_identity)
+
+        assert _sm().nodes[0]["node_uid"] == "first-container"
+        refusal = self._refusal()
+        assert refusal is not None and refusal.agent_state == AGENT_UNCONFIRMED_NODE
+        assert refusal.message == (
+            "Plex helper reports a new id and this app can't confirm it is the same Plex. Type the node's key again "
+            "on its Settings tab to confirm."
+        )
+
+    def test_typing_the_key_again_confirms_it_and_records_the_new_id(self, client, nodes):
+        node_id = self._recreated(client, nodes, machine_identifier="")
+        assert self._refusal() is not None
+
+        resp = client.put(f"/api/nodes/{node_id}", json={"key": "node-key"})
+
+        assert resp.status_code == 200, resp.get_json()
+        assert self._refusal() is None
+        client.post(f"/api/nodes/{node_id}/check")
+        assert _sm().nodes[0]["node_uid"] == "second-container"
+        assert self._refusal() is None
+
+    def test_saving_settings_without_typing_the_key_doesnt_confirm_it(self, client, nodes):
+        node_id = self._recreated(client, nodes, machine_identifier="")
+
+        assert client.put(f"/api/nodes/{node_id}", json={"name": "Plex box", "key": "****"}).status_code == 200
+
+        assert self._refusal() is not None
 
     def test_the_new_id_is_logged_once(self, client, nodes):
         from loguru import logger

@@ -42,6 +42,19 @@ def build_sha() -> str:
     return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else ""
 
 
+def same_build(node_build: str, app_build: str) -> bool:
+    """Whether two commits are the same build; True when either is unknown.
+
+    One side may report the short commit and the other the full one, so a prefix of at least 7 characters matches.
+    """
+    a, b = str(node_build or "").strip().lower(), str(app_build or "").strip().lower()
+    if not a or not b:
+        return True
+    if min(len(a), len(b)) < 7:
+        return a == b
+    return a.startswith(b) or b.startswith(a)
+
+
 def sendable_key(key: str) -> bool:
     """Whether a key can go in an Authorization header: printable ASCII with no spaces (33..126).
 

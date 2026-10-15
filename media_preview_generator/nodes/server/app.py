@@ -244,7 +244,13 @@ def _node_blueprint(state: NodeServerState) -> Blueprint:
             return refuse(protocol.KIND_REQUEST, 400, "This node has no worker role")
         state.worker_info.rescan()
         return answer(
-            {"worker": {"gpus": state.worker_info.gpus(), "gpu_checked_at": state.worker_info.gpu_checked_at}}
+            {
+                "worker": {
+                    "gpus": state.worker_info.gpus(),
+                    "gpu_checked_at": state.worker_info.gpu_checked_at,
+                    "gpu_error": state.worker_info.gpu_error,
+                }
+            }
         )
 
     @bp.post(protocol.ROUTE_ACCESS_CHECK)

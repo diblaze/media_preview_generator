@@ -75,6 +75,24 @@ class TestDetection:
         assert block["gpus"] == [] and block["gpu_checked_at"] is not None
         assert block["gpu_error"] == "OSError: vulkaninfo: device lost"
 
+    def test_a_detection_that_raises_keeps_the_last_gpu_list(self, tmp_path):
+        results = [[("NVIDIA", "cuda:0", {"name": "GPU 0"})], RuntimeError("GPU busy")]
+
+        def detect():
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=detect)
+        worker.rescan()
+
+        assert [g["device"] for g in worker.rescan()] == ["cuda:0"]
+
+        block = worker.block(busy=0)
+        assert [g["device"] for g in block["gpus"]] == ["cuda:0"]
+        assert block["gpu_error"] == "RuntimeError: GPU busy" and worker.gpu_error == block["gpu_error"]
+
     def test_a_working_detection_clears_the_error(self, tmp_path):
         results = [OSError("device lost"), [("NVIDIA", "cuda:0", {"name": "GPU 0"})]]
 

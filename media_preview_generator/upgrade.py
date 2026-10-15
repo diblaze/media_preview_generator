@@ -1832,9 +1832,11 @@ def _migrate_to_v24(sm) -> list[str]:
     (``SchemaDowngradeError``), and the copy :func:`_backup_settings_before_migrating` takes before migrating
     (``settings.json.pre-v<N>.bak`` beside settings.json) still has the helper's address and key.
 
-    A re-run changes nothing: a block that already has ``node_id`` keeps it (earlier builds of this migration left the
-    old ``url``/``token`` beside it; they are dropped), and a helper already on the nodes list (same address and key)
-    is reused.
+    Calling it twice changes nothing: a block that already has ``node_id`` keeps it (any ``url``/``token`` beside it
+    is dropped), and a helper already on the nodes list (same address and key) is reused. Settings already at v24
+    never run it again, so a lab install whose earlier build of this migration kept ``url``/``token`` beside
+    ``node_id`` keeps them until it restores the backup taken before that upgrade (``settings.json.pre-v<N>.bak``)
+    and upgrades again. No released build ever wrote v24.
     """
     from .nodes.settings import NAME_MAX_LEN, default_record, normalise_url
 

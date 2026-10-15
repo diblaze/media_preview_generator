@@ -169,6 +169,7 @@
         disabled: ['warn', 'Turned off'],
         no_role: ['bad', 'Role off'],
         no_node: ['bad', 'No node'],
+        unconfirmed_node: ['bad', 'Not confirmed'],
     };
 
     function renderPlexStatus(status) {

@@ -80,7 +80,7 @@ def _section(section_id: str, title: str, checks: list[dict[str, Any]]) -> dict[
     }
 
 
-def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
+def _connection(details: NodeDetails, app_version: str, app_build: str = "") -> list[dict[str, Any]]:
     view = details.view
     if view.state == STATE_DISABLED:
         return [
@@ -136,6 +136,12 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             f"A Plex database node needs version {MIN_AGENT_VERSION} or newer of its Plex database role. It doesn't "
             "have to match this app's version."
         )
+    current, recommended = view.version or "unknown", app_version if protocol.ROLE_WORKER in view.roles else None
+    node_block = (details.info or {}).get("node")
+    node_build = str(node_block.get("build") or "") if isinstance(node_block, dict) else ""
+    if recommended and view.version == app_version and not protocol.same_build(node_build, app_build):
+        # The same version on both sides: only the commits tell the two builds apart.
+        current, recommended = f"{view.version} ({node_build[:7]})", f"{app_version} ({app_build[:7]})"
     rows.append(
         _row(
             "node_version",
@@ -143,8 +149,8 @@ def _connection(details: NodeDetails, app_version: str) -> list[dict[str, Any]]:
             severity=CRITICAL,
             ok=version_ok,
             explanation=explanation,
-            current=view.version or "unknown",
-            recommended=app_version if protocol.ROLE_WORKER in view.roles else None,
+            current=current,
+            recommended=recommended,
             reason=None if version_ok else view.reason,
             fix_where=FIX_ON_NODE,
         )
@@ -403,6 +409,7 @@ def node_readiness(
     key: str,
     worker_groups: object,
     app_version: str,
+    app_build: str = "",
     file_checks: Callable[[str, str], Any] = _default_file_checks,
 ) -> dict[str, Any]:
     """The Setup Health envelope for one node.
@@ -412,13 +419,14 @@ def node_readiness(
         key: The node's stored key (for the Plex database file checks).
         worker_groups: The stored ``worker_groups`` list.
         app_version: This app's version.
+        app_build: This app's commit ("" when unknown); shown when only the node's commit differs.
         file_checks: ``(url, key) -> CapabilityReport`` for the Plex database role (tests pass their own).
 
     Returns:
         ``{"overall_ok", "sections"}``.
     """
     view = details.view
-    sections = [_section("node_connection", "Connection", _connection(details, app_version))]
+    sections = [_section("node_connection", "Connection", _connection(details, app_version, app_build))]
     usable = view.state not in (STATE_DISABLED, STATE_OFFLINE, STATE_CONNECTING, STATE_KEY_REFUSED)
     worker = protocol.ROLE_WORKER in view.roles or not view.roles
     if usable and worker and not view.legacy:

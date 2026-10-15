@@ -2,8 +2,10 @@
 
 A node record is ``{"id", "node_uid", "name", "url", "key", "enabled", "path_mappings", "added_at"}``. ``id`` is
 assigned here and never changes (worker group members and Plex servers point at it); ``node_uid`` is the id the node
-itself reports, recorded on contact. A reinstalled node reports a new id, which replaces the old one: the saved key
-at the saved address is what makes it this node; the id only tells Add node that a node is already added. The key
+itself reports, recorded on contact. A reinstalled worker node reports a new id, which replaces the old one: the
+saved key at the saved address is what makes it this node; the id tells Add node that a node is already added. A
+Plex database node's new id replaces the old one only when its Plex is the server's; otherwise typing its key again
+(which clears the saved id) confirms it. The key
 is a secret: it leaves the app only in the node's Authorization header and comes back from the API as ``****``.
 """
 
@@ -118,8 +120,8 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     """Validate one posted node against the record it updates and the other nodes.
 
     Fields left out keep their stored value. ``id``, ``node_uid`` and ``added_at`` are never taken from a client
-    for an existing node; a new node gets a fresh id. A new address clears ``node_uid`` (it is recorded again on
-    first contact).
+    for an existing node; a new node gets a fresh id. A new address, or the key typed again, clears ``node_uid``
+    (it is recorded again on the next answer).
 
     Args:
         raw: The posted fields.
@@ -152,8 +154,10 @@ def validate_node(raw: object, *, existing: dict | None, others: list[dict]) -> 
     if type(enabled) is not bool:
         return None, "enabled must be true or false"
     uid = base.get("node_uid") if existing is not None else raw.get("node_uid")
-    if existing is not None and url != normalise_url(base.get("url"))[0]:
-        # A new address may be another machine: its id is recorded on its first answer.
+    key_typed = raw.get("key") not in (None, KEY_MASK)
+    if existing is not None and (url != normalise_url(base.get("url"))[0] or key_typed):
+        # A new address may be another machine, and typing the key again is how the user confirms a Plex database
+        # node that reports a new id: either way the id is recorded on its next answer.
         uid = None
     return {
         "id": str(base.get("id") or "") or new_node_id(),

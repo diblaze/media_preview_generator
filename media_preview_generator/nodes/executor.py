@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import os
 import tarfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -46,6 +47,9 @@ MAX_FAILED_POLLS = 3
 # A cancelled task the node still reports running after this long is given up on: the node's own unpolled-task expiry
 # stops it.
 CANCEL_WAIT_S = 30.0
+# The read timeout of the one DELETE sent to a node that stopped answering; it runs on a thread of its own, so the
+# file is queued again without waiting for it.
+GONE_DELETE_TIMEOUT_S = 3.0
 # A preview frame is a 320x240 JPEG (tens of KB; raw RGB would be 225 KB), and a 4-hour film at the 1 s interval
 # is 14,400 of them: anything past these is not a preview's frames.
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -169,7 +173,36 @@ def requeue_for(exc: BaseException) -> NodeRequeue | None:
     return None
 
 
-def extract_artifact(data: bytes, dest: str) -> list[str]:
+class _BufferFile(io.RawIOBase):
+    """A read-only file over a buffer that doesn't copy it (``io.BytesIO`` copies anything but ``bytes``)."""
+
+    def __init__(self, data: bytes | bytearray | memoryview) -> None:
+        super().__init__()
+        self._view = memoryview(data).cast("B")
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        count = max(0, min(len(buffer), len(self._view) - self._pos))
+        buffer[:count] = self._view[self._pos : self._pos + count]
+        self._pos += count
+        return count
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: len(self._view)}[whence]
+        self._pos = max(0, base + offset)
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+
+def extract_artifact(data: bytes | bytearray | memoryview, dest: str) -> list[str]:
     """Unpack a preview's frames tar into ``dest``: plain files with bare names only, every entry checked first.
 
     Args:
@@ -184,7 +217,7 @@ def extract_artifact(data: bytes, dest: str) -> list[str]:
             than any preview's frames.
     """
     try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        with tarfile.open(fileobj=_BufferFile(data), mode="r:") as tar:
             members = []
             total = 0
             # A sparse member passes isfile() yet unpacks to any size it declares from a few bytes of tar.
@@ -274,8 +307,10 @@ class _TaskRun:
         self._cancel_delivered = False
         self._paused_at: float | None = None
         self._forgotten = False
+        self._node_gone = False
 
     def _unavailable(self, message: str, *, started: bool = True) -> Exception:
+        self._node_gone = True
         _report("an unavailable node", self._registry.report_unavailable, self._placement.node_id)
         if self._cancel_seen_at is not None:
             # The job was cancelled meanwhile: the file ends as cancelled, never queued again.
@@ -461,14 +496,31 @@ class _TaskRun:
         extract_artifact(data, dest)
 
     def delete(self) -> None:
-        # Also after the node stopped answering: when it comes back, a task it still runs stops now rather than at
-        # its unpolled-task expiry, beside the file's next try.
+        """Free the task on the node.
+
+        After the node stopped answering the DELETE is sent once from a short-lived thread, so the file is queued
+        again at once: a node that answers it in time stops a task it still runs rather than at its unpolled-task
+        expiry; one that doesn't stops it at that expiry.
+        """
         if not self._task_id or self._forgotten:
             return
+        if not self._node_gone:
+            self._send_delete(None)
+            return
+        threading.Thread(
+            target=self._send_delete, args=(GONE_DELETE_TIMEOUT_S,), name="node-task-delete", daemon=True
+        ).start()
+
+    def _send_delete(self, read_timeout: float | None) -> None:
         try:
-            self._client.delete_task(self._task_id)
+            if read_timeout is None:
+                self._client.delete_task(self._task_id)
+            else:
+                self._client.delete_task(self._task_id, read_timeout=read_timeout)
         except NodeError as exc:
             logger.debug("{}couldn't free the task: {}", self._prefix, exc)
+        except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
+            logger.opt(exception=True).debug("{}freeing the task failed", self._prefix)
 
 
 def run_on_node(

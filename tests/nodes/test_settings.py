@@ -111,9 +111,24 @@ class TestValidateNode:
     def test_a_new_address_forgets_the_node_id_recorded_at_the_old_one(self, url, kept):
         stored, _ = ns.validate_node(_post(), existing=None, others=[])
         stored["node_uid"] = "uid-1"
-        record, err = ns.validate_node({"url": url, "key": "k-123"}, existing=stored, others=[])
+        record, err = ns.validate_node({"url": url, "key": ns.KEY_MASK}, existing=stored, others=[])
         assert err == ""
         assert record["node_uid"] == ("uid-1" if kept else None)
+
+    @pytest.mark.parametrize("key", [None, ns.KEY_MASK], ids=["left-out", "masked"])
+    def test_saving_without_typing_the_key_keeps_the_node_id(self, key):
+        stored, _ = ns.validate_node(_post(), existing=None, others=[])
+        stored["node_uid"] = "uid-1"
+        post = {"name": "renamed"} if key is None else {"name": "renamed", "key": key}
+        record, err = ns.validate_node(post, existing=stored, others=[])
+        assert err == "" and record["node_uid"] == "uid-1"
+
+    def test_typing_the_key_again_at_the_same_address_forgets_the_node_id(self):
+        # How the user confirms a Plex database node that reports a new id: it is recorded on its next answer.
+        stored, _ = ns.validate_node(_post(), existing=None, others=[])
+        stored["node_uid"] = "uid-1"
+        record, err = ns.validate_node({"key": stored["key"]}, existing=stored, others=[])
+        assert err == "" and record["node_uid"] is None
 
     def test_enabled_must_be_a_boolean(self):
         record, err = ns.validate_node(_post(enabled="yes"), existing=None, others=[])

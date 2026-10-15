@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from loguru import logger
 
@@ -53,6 +53,8 @@ CHECK_ATTEMPTS = 3
 ATTEMPT_GAP_S = 4.0
 NOT_VISIBLE_WINDOW_S = 600.0
 NOT_VISIBLE_LIMIT = 3
+# A Test access of rows not saved yet is adopted only if those rows are saved within this long.
+PENDING_ACCESS_TTL_S = 600.0
 GPU_LOST_RECHECK_S = 300.0
 MAX_PARALLEL_CHECKS = 8
 LEGACY_PING_TIMEOUT_S = 10.0
@@ -127,6 +129,16 @@ class _Outcome:
     uid: str = ""
 
 
+class _PendingAccess(NamedTuple):
+    """A Test access of rows not saved yet, kept until exactly those rows are saved at the same address."""
+
+    rows: list
+    result: dict
+    checked_at: float
+    url: str
+    held_at: float
+
+
 @dataclass
 class _Live:
     record: dict
@@ -149,9 +161,11 @@ class _Live:
     next_gpu_check: float = 0.0
     access_result: dict | None = None
     access_checked_at: float | None = None
-    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save): kept as
-    # ``(rows, result, checked_at)`` and adopted when exactly those rows are saved.
-    pending_access: tuple[list, dict, float] | None = None
+    # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save).
+    pending_access: _PendingAccess | None = None
+    # A new id a Plex database node reported that this app couldn't tie to the Plex it serves; its Plex database
+    # writes are refused until the user types the node's key again (which clears the saved id).
+    unconfirmed_uid: str = ""
     check_lock: threading.Lock = field(default_factory=threading.Lock)
     # Health checks begun so far, the number of the last one that came back ready, and how many had begun when job
     # code last reported the node unavailable: only a check begun after that report vouches for the node again.
@@ -197,11 +211,28 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
     return agent.state, agent.version
 
 
+def _default_served_plex_ids(node_id: str) -> list[str]:
+    """The machine identifier of every Plex server whose Plex database node is ``node_id`` ("" where unknown)."""
+    from ..web.settings_manager import get_settings_manager
+
+    out = []
+    for entry in get_settings_manager().get("media_servers") or []:
+        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+            continue
+        markers = entry.get("markers")
+        plex = markers.get("plex") if isinstance(markers, dict) else None
+        agent = plex.get("agent") if isinstance(plex, dict) else None
+        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+            out.append(str(entry.get("server_identity") or ""))
+    return out
+
+
 def _default_record_uid(node_id: str, uid: str, url: str) -> None:
     """Save the id a node reported, when the record still has the address it was learnt at.
 
-    The saved key at the saved address is what makes a node this node: one that answers with a new id (recreated
-    without its ``/config``, reinstalled) is the same node, so the new id replaces the old one.
+    The saved key at the saved address is what makes a worker node this node: one that answers with a new id
+    (recreated without its ``/config``, reinstalled) is the same node, so the new id replaces the old one. A Plex
+    database node's new id only gets here once it is tied to its Plex (``NodeRegistry._new_uid_confirmed``).
     """
     from ..web.settings_manager import get_settings_manager
 
@@ -275,6 +306,19 @@ def _gpus_in(answer: object) -> tuple[dict, ...]:
     return _clean_gpus(worker.get("gpus")) if isinstance(worker, dict) else ()
 
 
+def _gpu_detection_pending(answer: object) -> str:
+    """Why a node couldn't detect its GPUs yet: its ``gpu_error`` while it has no GPU list at all, else "".
+
+    A node keeps its last list when a detection fails, so an error beside an empty list means no detection has
+    worked since it started; its GPUs may still be there.
+    """
+    if not isinstance(answer, dict) or _gpus_in(answer):
+        return ""
+    worker = answer.get("worker")
+    error = worker.get("gpu_error") if isinstance(worker, dict) else None
+    return str(error) if error else ""
+
+
 def _gpu_ok(gpus: tuple[dict, ...], device: str) -> tuple[bool, str]:
     match = next((g for g in gpus if g["device"] == device), None)
     if match is None:
@@ -294,6 +338,7 @@ class NodeRegistry:
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
         record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
         quick_access: Checks one file per mapping row on a node; True when every one is visible.
+        served_plex_ids: The machine identifiers of the Plex servers that use a node as their Plex database node.
         app_version: This app's version (a worker node must match it exactly).
         app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
         attempt_gap_s: Seconds between the attempts of one check.
@@ -311,6 +356,7 @@ class NodeRegistry:
         record_uid: Callable[[str, str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
         library_names: Callable[[list[str]], list[str]] = _default_library_names,
+        served_plex_ids: Callable[[str], list[str]] = _default_served_plex_ids,
         app_version: Callable[[], str] = _app_version,
         app_build: Callable[[], str] = protocol.build_sha,
         attempt_gap_s: float = ATTEMPT_GAP_S,
@@ -327,6 +373,7 @@ class NodeRegistry:
         self._record_uid = record_uid
         self._quick_access = quick_access
         self._library_names = library_names
+        self._served_plex_ids = served_plex_ids
         self._app_version = app_version
         self._app_build = app_build
         self._attempt_gap_s = attempt_gap_s
@@ -412,6 +459,23 @@ class NodeRegistry:
                 return NodeCapacity(True, False, reason)
             return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
 
+    def plex_db_refusal(self, node_id: str) -> str:
+        """Why this app sends no Plex database work to the node now ("" when it may).
+
+        A Plex database node that reports a new id could be a different machine that was given the same key and
+        address; unless its Plex is the one the server uses, the user confirms it by typing its key again.
+        """
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None or not live.unconfirmed_uid:
+                return ""
+            name = str(live.record.get("name") or "The Plex database node")
+        return (
+            f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key again on "
+            "its Settings tab to confirm."
+        )
+
     # ------------------------------------------------------------------ reports from job code
 
     def report_unavailable(self, node_id: str) -> None:
@@ -493,26 +557,35 @@ class NodeRegistry:
                 return
         self._submit(self._gpu_check, node_id, device)
 
-    def record_access_result(self, node_id: str, result: dict, *, tested_mappings: list[dict]) -> None:
+    def record_access_result(
+        self, node_id: str, result: dict, *, tested_mappings: list[dict], tested_url: str | None = None
+    ) -> None:
         """Remember a Test access result; a passing one clears an access problem.
 
         A result for rows other than the saved ones (rows still being edited, or mappings that changed during the
         test) says nothing about how the node runs work now. It is held aside and adopted only if exactly those
-        rows are saved next.
+        rows are saved next, at the same address, within :data:`PENDING_ACCESS_TTL_S`. A result from an address the
+        node no longer has is dropped: it was another machine's answer.
 
         Args:
             node_id: The node.
             result: ``{"libraries": [...]}`` as ``mappings.run_test_access`` returns it.
             tested_mappings: The ``path_mappings`` rows the test ran with.
+            tested_url: The address the test asked; None for the node's saved one.
         """
         self._sync()
         with self._lock:
             live = self._nodes.get(node_id)
             if live is None:
                 return
+            url = str(live.record.get("url") or "")
+            if tested_url is not None and tested_url != url:
+                return
             checked_at = self._wall_clock()
             if tested_mappings != (live.record.get("path_mappings") or []):
-                live.pending_access = (copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at)
+                live.pending_access = _PendingAccess(
+                    copy.deepcopy(tested_mappings), copy.deepcopy(result), checked_at, url, self._clock()
+                )
                 return
             live.pending_access = None
             mappings, keep = self._adopt_access(live, result, checked_at), set(self._nodes)
@@ -703,6 +776,9 @@ class NodeRegistry:
             or (record.get("enabled", True) and not old.get("enabled", True))
         )
         live.record = copy.deepcopy(record)
+        if address_changed or old.get("node_uid") != record.get("node_uid"):
+            # Another address or key, or the key typed again (which clears the saved id): nothing to confirm now.
+            live.unconfirmed_uid = ""
         if address_changed:
             live.client = self._client_factory(record)
         if reconnect:
@@ -714,13 +790,20 @@ class NodeRegistry:
             live.not_visible.clear()
             if address_changed:
                 live.gpu_lost = live.lost_device = ""
+                # A test held aside was another machine's answer, or one asked with the old key.
+                live.pending_access = None
         if old.get("path_mappings") != record.get("path_mappings"):
             # A test of other mappings says nothing about these, unless it tested exactly the rows just saved.
             pending, live.pending_access = live.pending_access, None
-            if pending is not None and pending[0] == (record.get("path_mappings") or []):
-                rows = self._adopt_access(live, pending[1], pending[2])
+            if (
+                pending is not None
+                and pending.rows == (record.get("path_mappings") or [])
+                and pending.url == str(record.get("url") or "")
+                and self._clock() - pending.held_at <= PENDING_ACCESS_TTL_S
+            ):
+                rows = self._adopt_access(live, pending.result, pending.checked_at)
                 if self._access_store is not None:
-                    store_work.append(("save", str(record.get("id")), (rows, pending[1], pending[2])))
+                    store_work.append(("save", str(record.get("id")), (rows, pending.result, pending.checked_at)))
             else:
                 live.access_result = live.access_checked_at = None
                 if self._access_store is not None:
@@ -810,7 +893,10 @@ class NodeRegistry:
                     self._apply(live, outcome, number)
                     has_access_problem = bool(live.access_problem)
                 if outcome.uid and outcome.uid != record.get("node_uid"):
-                    self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
+                    self._new_uid(node_id, live, record, outcome)
+                elif outcome.uid:
+                    with self._lock:
+                        live.unconfirmed_uid = ""
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -818,6 +904,45 @@ class NodeRegistry:
         finally:
             with self._lock:
                 live.checking = False
+
+    def _new_uid(self, node_id: str, live: _Live, record: dict, outcome: _Outcome) -> None:
+        """Record a node's new id, or hold back a Plex database node's until it is tied to its Plex."""
+        if self._new_uid_confirmed(node_id, record, outcome):
+            with self._lock:
+                live.unconfirmed_uid = ""
+            self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
+            return
+        with self._lock:
+            if self._nodes.get(node_id) is not live or live.record.get("node_uid") != record.get("node_uid"):
+                return  # The id was cleared meanwhile (the key typed again): the next check records it.
+            if live.unconfirmed_uid != outcome.uid:
+                logger.warning(
+                    "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work waits "
+                    "until its key is typed again",
+                    record.get("name") or node_id,
+                )
+            live.unconfirmed_uid = outcome.uid
+
+    def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool:
+        """Whether a node's new id may replace the saved one without asking.
+
+        A worker node (or one with no saved id yet) is this node by its saved key and address. A Plex database node
+        writes into a Plex's database, so its new id is taken only when it names the Plex machine identifier of
+        every server that uses it; an empty identifier on either side (a Windows node with a custom Plex folder)
+        proves nothing.
+        """
+        if not record.get("node_uid") or protocol.ROLE_PLEX_DB not in outcome.roles:
+            return True
+        try:
+            served = self._served_plex_ids(node_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable settings can't confirm anything
+            logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
+            return False
+        if not served:
+            return True  # No server writes through it: nothing to protect.
+        plex_db = (outcome.info or {}).get("plex_db")
+        theirs = str(plex_db.get("machine_identifier") or "") if isinstance(plex_db, dict) else ""
+        return bool(theirs) and all(ours == theirs for ours in served)
 
     def _apply(self, live: _Live, outcome: _Outcome, number: int) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason
@@ -839,7 +964,28 @@ class NodeRegistry:
             live.gpus = _gpus_in(outcome.info)
             if live.gpu_lost and live.lost_device and _gpu_ok(live.gpus, live.lost_device)[0]:
                 live.gpu_lost = live.lost_device = ""
+            self._note_gpu_detection(live, outcome.info)
         self._touch()
+
+    def _note_gpu_detection(self, live: _Live, answer: object) -> None:
+        """Pause a worker node's GPU members while it couldn't detect its GPUs yet (the caller holds the lock).
+
+        Read as a GPU check still to come (``gpu_lost`` with no ``lost_device``), so its members come back once a
+        detection works rather than waiting on someone.
+        """
+        error = _gpu_detection_pending(answer) if protocol.ROLE_WORKER in live.roles else ""
+        if error and not live.gpu_lost:
+            name = str(live.record.get("name") or "The node")
+            logger.warning(
+                "Node {} couldn't detect its GPUs ({}); its GPU workers wait for its next check", name, error
+            )
+            live.gpu_lost = (
+                f"{name} couldn't check its GPUs yet ({error}). It tries again in a few minutes; its CPU workers "
+                "keep running."
+            )
+            live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
+        elif not error and live.gpu_lost and not live.lost_device:
+            live.gpu_lost = ""
 
     def _probe(self, record: dict, client: NodeClient) -> _Outcome:
         name = str(record.get("name") or "The node")
@@ -906,7 +1052,7 @@ class NodeRegistry:
                 **outcome,
             )
         build, app_build = str(block.get("build") or ""), self._app_build()
-        if protocol.ROLE_WORKER in roles and build and app_build and build != app_build:
+        if protocol.ROLE_WORKER in roles and not protocol.same_build(build, app_build):
             return _Outcome(
                 STATE_UPDATE_NEEDED,
                 f"{name} runs another build of version {version} ({build[:7]}) than this app ({app_build[:7]}). "
@@ -984,7 +1130,8 @@ class NodeRegistry:
                 return
             client, name = live.client, str(live.record.get("name") or "The node")
         try:
-            gpus = _gpus_in(client.rescan_gpus())
+            answer = client.rescan_gpus()
+            gpus = _gpus_in(answer)
         except NodeError as exc:
             logger.debug("GPU rescan on node {} failed: {}", name, exc)
             self.report_unavailable(node_id)
@@ -1004,6 +1151,7 @@ class NodeRegistry:
                     live.gpu_lost = f"{name} lost its GPU {device} ({why}). Its CPU workers keep running."
                     live.lost_device = device
                     live.next_gpu_check = self._clock() + GPU_LOST_RECHECK_S
+            self._note_gpu_detection(live, answer)
             self._touch()
 
 

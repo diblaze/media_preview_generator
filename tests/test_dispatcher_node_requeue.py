@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import threading
 import time
 from collections import deque
@@ -534,10 +535,39 @@ class TestParkAndResume:
             {},
         )
 
+    def test_a_snapshot_that_counted_drops_without_names_still_resumes(self, tmp_path):
+        from media_preview_generator.jobs.checkpoints import read_checkpoint, write_checkpoint
+
+        snapshot = self._parked_snapshot()
+        reference = write_checkpoint(tmp_path, "j", snapshot)
+        path = tmp_path / "job_checkpoints" / reference
+        payload = json.loads(path.read_text())
+        payload["state"]["node_drops"] = {"/m/a.mkv": 1}
+        path.write_text(json.dumps(payload))
+
+        state = read_checkpoint(tmp_path, "j", reference)["state"]
+        resumed = JobTracker(job_id="j", items=[], config=_config(), registry=MagicMock(), carried_state=state)
+
+        assert resumed.node_drops == {"/m/a.mkv": [""]}
+
+    @pytest.mark.parametrize(
+        ("names", "why"),
+        [
+            (["", "N1"], "nodes N1 and an earlier one unavailable (each dropped the file once)"),
+            (["", ""], "nodes unavailable (they dropped the file twice)"),
+        ],
+    )
+    def test_a_drop_counted_without_its_node_still_reads_plainly(self, names, why):
+        from media_preview_generator.jobs.dispatcher import _drops_failure
+
+        assert _drops_failure(names) == why
+
     @pytest.mark.parametrize(
         ("field", "bad"),
         [
             ("node_drops", {"/m/a.mkv": "1"}),
+            ("node_drops", {"/m/a.mkv": -1}),
+            ("node_drops", {"/m/a.mkv": True}),
             ("node_drops", {"/m/a.mkv": [1]}),
             ("node_start_failures", {"/m/a.mkv": True}),
             ("dropped_on", {"/m/a.mkv": 5}),

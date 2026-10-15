@@ -224,11 +224,37 @@ class TestStates:
         assert "bbbbbbb" in view.reason and "aaaaaaa" in view.reason
         assert h.registry.capacity("n1") == reg.NodeCapacity(False, False, "node needs an update")
 
-    @pytest.mark.parametrize(("app_build", "node_build"), [("a" * 40, "a" * 40), ("", "b" * 40), ("a" * 40, "")])
+    @pytest.mark.parametrize(
+        ("app_build", "node_build"),
+        [
+            ("a" * 40, "a" * 40),
+            ("", "b" * 40),
+            ("a" * 40, ""),
+            ("abc1234" + "0" * 33, "abc1234"),
+            ("abc1234", "ABC1234" + "0" * 33),
+        ],
+        ids=["same", "app-unknown", "node-unknown", "node-short", "app-short"],
+    )
     def test_the_same_build_or_an_unknown_one_is_ready(self, h, app_build, node_build):
         h.app_build = app_build
         info = _info()
         info["node"]["build"] = node_build
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
+    def test_a_short_commit_of_another_build_needs_an_update(self, h):
+        h.app_build = "abc1234" + "0" * 33
+        info = _info()
+        info["node"]["build"] = "abc1235"
+        h.client().default_info = info
+
+        assert h.registry.check_now("n1").state == reg.STATE_UPDATE_NEEDED
+
+    def test_a_plex_database_only_node_on_another_build_stays_ready(self, h):
+        h.app_build = "a" * 40
+        info = _info(roles=(ROLE_PLEX_DB,))
+        info["node"]["build"] = "b" * 40
         h.client().default_info = info
 
         assert h.registry.check_now("n1").state == reg.STATE_READY
@@ -408,6 +434,47 @@ class TestAccessProblem:
         assert h.registry.view("n1").state == reg.STATE_ACCESS_PROBLEM
         assert h.registry.details("n1").access_result is None
 
+    NEW_ROWS = [{"app_prefix": "/data", "node_prefix": "/volume1"}]
+    PASS = {"libraries": [{"checked": 3, "ok": True}]}
+
+    def test_a_test_of_unsaved_rows_is_adopted_when_those_rows_are_saved(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        assert h.registry.details("n1").access_result is None
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result == self.PASS
+
+    def test_a_held_test_is_dropped_when_the_address_changes_with_the_rows(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+
+        h.change(url="http://other:9494", path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_held_test_is_dropped_when_the_key_changes(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        h.change(key="another-key")
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_held_test_expires_after_ten_minutes(self, h):
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=self.NEW_ROWS)
+        h.clock.now += reg.PENDING_ACCESS_TTL_S + 1
+
+        h.change(path_mappings=self.NEW_ROWS)
+
+        assert h.registry.details("n1").access_result is None
+
+    def test_a_test_of_an_address_the_node_no_longer_has_is_dropped(self, h):
+        h.change(url="http://other:9494")
+
+        h.registry.record_access_result("n1", self.PASS, tested_mappings=MAPPINGS, tested_url="http://nuc:9494")
+
+        assert h.registry.details("n1").access_result is None
+
     def test_check_now_clears_it_only_when_the_quick_access_check_passes(self, h):
         self.test_three_different_files_in_ten_minutes_is_an_access_problem(h)
         h.quick = False
@@ -461,6 +528,53 @@ class TestGpuLost:
         h.clock.now += reg.GPU_LOST_RECHECK_S
         h.registry._tick()
         assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_READY)
+
+    def test_a_node_that_couldnt_detect_its_gpus_yet_pauses_gpu_members_until_it_can(self, h):
+        from media_preview_generator.jobs.node_members import NodeHardware
+
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+
+        view = h.registry.check_now("n1")
+
+        assert view.state == reg.STATE_GPU_LOST and "couldn't check its GPUs" in view.reason
+        capacity = h.registry.capacity("n1")
+        assert (capacity.cpu, capacity.gpu) == (True, False)
+        hardware = NodeHardware(1, {"n1": view}, {"n1": capacity})
+        assert hardware.member_can_come_back({"node": "n1", "resource": "gpu", "device": "cuda:0"})
+
+        h.client().default_info = _info(gpus=[GPU_OK])
+        assert h.registry.check_now("n1").state == reg.STATE_READY
+
+    def test_the_health_loop_rescans_a_node_that_couldnt_detect_its_gpus(self, h):
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+        h.registry.check_now("n1")
+        h.registry._nodes["n1"].next_check = h.clock.now + 10_000
+        h.clock.now += reg.GPU_LOST_RECHECK_S
+
+        h.registry._tick()
+
+        assert _wait_for(lambda: h.registry.view("n1").state == reg.STATE_READY)
+        assert h.client().rescan_calls == 1
+
+    def test_a_rescan_that_still_cant_detect_keeps_the_check_pending(self, h):
+        failing = _info()
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+        h.registry.check_now("n1")
+        h.client().rescans = [{"worker": {"gpus": [], "gpu_error": "RuntimeError: GPU busy"}}]
+
+        assert h.registry.rescan_gpus("n1").state == reg.STATE_GPU_LOST
+
+    def test_a_plex_database_only_node_with_a_detection_error_stays_ready(self, h):
+        failing = _info(roles=(ROLE_PLEX_DB,))
+        failing["worker"]["gpu_error"] = "RuntimeError: GPU busy"
+        h.client().default_info = failing
+
+        assert h.registry.check_now("n1").state == reg.STATE_READY
 
 
 class TestRevisionAndSettings:
@@ -737,6 +851,62 @@ class TestAccessResultSurvivesRestart:
     def test_an_unreadable_file_reads_as_untested(self, store, tmp_path):
         (tmp_path / "node_access_results.json").write_text("{not json")
         assert Harness(access_store=store).registry.details("n1").access_result is None
+
+
+class TestNewPlexDatabaseNodeId:
+    """A Plex database node that reports a new id is taken silently only when its Plex is the one it serves."""
+
+    def _harness(self, served):
+        harness = Harness(nodes=[_record(node_uid="uid-1")])
+        harness.registry._served_plex_ids = lambda node_id: list(served)
+        return harness
+
+    def _answer(self, h, uid, machine_identifier="plex-a", roles=(ROLE_PLEX_DB,)):
+        info = _info(uid=uid, roles=roles)
+        info["plex_db"] = {"machine_identifier": machine_identifier}
+        h.client().default_info = info
+        h.registry.check_now("n1")
+
+    @pytest.mark.parametrize(
+        ("served", "machine_identifier", "recorded"),
+        [
+            (["plex-a"], "plex-a", True),
+            ([], "", True),
+            (["plex-a"], "", False),
+            ([""], "plex-a", False),
+            (["plex-a", "plex-b"], "plex-a", False),
+        ],
+        ids=["same-plex", "no-server-uses-it", "node-doesnt-say", "server-doesnt-say", "two-plexes"],
+    )
+    def test_when_its_new_id_is_recorded(self, served, machine_identifier, recorded):
+        h = self._harness(served)
+        self._answer(h, "uid-2", machine_identifier)
+        assert (h.uids == [("n1", "uid-2")]) is recorded
+        assert (h.registry.plex_db_refusal("n1") == "") is recorded
+        h.registry.stop()
+
+    def test_a_worker_node_with_a_new_id_is_recorded_whatever_its_plex(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+        assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "")
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
+
+        h.change(node_uid=None)
+
+        assert h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_the_old_id_answering_again_lifts_the_refusal(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "")
+        self._answer(h, "uid-1", "")
+        assert h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
 
 
 class TestRecordedNodeId:
