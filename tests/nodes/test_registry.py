@@ -482,6 +482,64 @@ class TestStates:
         assert h.registry.view("n1").state == reg.STATE_READY
         assert h.registry._nodes["n1"].next_check - h.clock.now == reg.HEALTH_INTERVAL_S
 
+    @pytest.mark.parametrize(
+        ("not_answering", "cause_after"),
+        [
+            (
+                lambda: NodeUnreachableError("http://nuc:9494 refused", reason=UNREACHABLE_REFUSED),
+                reg.OFFLINE_UNREACHABLE,
+            ),
+            (lambda: NodeTimeoutError("http://nuc:9494 dropped the connection before answering"), reg.OFFLINE_STUCK),
+            (lambda: NodeRateLimitedError("http://nuc:9494 asks this app to wait"), reg.OFFLINE_RATE_LIMITED),
+        ],
+        ids=["refused", "dropped", "asks-to-wait"],
+    )
+    def test_a_restarting_node_that_stops_answering_still_says_it_is_restarting_until_its_window_ends(
+        self, h, not_answering, cause_after
+    ):
+        """It said it stops, then refused connections while it started again: its card and the bell switched to
+        "Nothing is listening on that port. Check the port..." for a node in the middle of a routine restart."""
+        client = h.client()
+        stopping = _info()
+        stopping["stopping"] = True
+        client.infos = [stopping]
+        client.default_info = not_answering()
+        h.registry.check_now("n1")
+
+        view = h.registry.check_now("n1")
+
+        restarting = cause_after != reg.OFFLINE_RATE_LIMITED  # a wait has something else to fix: its own words
+        assert view.state == reg.STATE_OFFLINE
+        assert view.cause == (reg.OFFLINE_RESTARTING if restarting else cause_after)
+        assert (view.reason == "nuc is restarting; it gets no files until it is back.") is restarting
+        assert (h.registry.capacity("n1").reason == "node restarting") is restarting
+
+        h.clock.now += reg.RESTART_WINDOW_S
+        view = h.registry.check_now("n1")
+        assert (view.state, view.cause) == (reg.STATE_OFFLINE, cause_after)
+        assert "restarting" not in view.reason
+
+    @pytest.mark.parametrize(
+        ("answer", "sent"),
+        [
+            (_info, True),
+            (lambda: dict(_info(), worker={**_info()["worker"], "temp": {"path": "/t", "problem": "is full"}}), True),
+            (lambda: NodeUnreachableError("http://nuc:9494 refused", reason=UNREACHABLE_REFUSED), False),
+            (lambda: NodeAuthError("http://nuc:9494 refused the key"), False),
+        ],
+        ids=["ready", "temp-folder-full", "unreachable", "key-refused"],
+    )
+    def test_a_check_the_node_answers_sends_the_deletes_lost_while_it_was_away(self, h, monkeypatch, answer, sent):
+        from media_preview_generator.nodes import executor
+
+        calls = []
+        monkeypatch.setattr(executor, "send_pending_deletes", lambda node_id, client: calls.append((node_id, client)))
+        h.client().default_info = answer()
+
+        h.registry.check_now("n1")
+
+        assert calls == ([("n1", h.client())] if sent else [])
+
     def test_a_node_that_never_comes_back_from_a_restart_goes_back_to_the_offline_back_off(self, h):
         client = h.client()
         stopping = _info()

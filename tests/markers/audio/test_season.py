@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,15 +21,18 @@ import pytest
 
 from media_preview_generator import shutdown
 from media_preview_generator.markers import pipeline
-from media_preview_generator.markers.audio import POINT_S, fingerprint, matcher, season
+from media_preview_generator.markers.audio import POINT_S, end_picture, fingerprint, matcher, season
 from media_preview_generator.markers.decide import LONG_INTRO_CHAPTER_REASON, DecisionStatus
 from media_preview_generator.markers.external_ids import ids_from_path
 from media_preview_generator.markers.models import Candidate, FileIdentity, Marker, MarkerType, Source
 from media_preview_generator.markers.outcomes import FileOutcome
-from media_preview_generator.markers.probe import Chapter, MediaProbe, ProbeError, ProbeStalledError
+from media_preview_generator.markers.probe import Chapter, MediaProbe, ProbeError, ProbeStalledError, StreamStarts
 from media_preview_generator.markers.sources.chapters import CHAPTER_RULES_VERSION, chapter_candidates
 from media_preview_generator.markers.sources.online import LookupResult
 from media_preview_generator.markers.store import CachedShare, EndPictureKey, MarkerStore
+from media_preview_generator.nodes import protocol
+from media_preview_generator.nodes.executor import FileNotVisibleError, Placement, placed_on
+from media_preview_generator.nodes.registry import set_registry
 from media_preview_generator.servers.base import ServerType
 from tests.markers.audio.helpers import (
     DUR,
@@ -47,6 +51,7 @@ from tests.markers.audio.helpers import (
 )
 from tests.markers.fakes import FakeRegistry, ready_publisher
 from tests.markers.pipeline_helpers import _clients, _ctx, _item, _registry, _run
+from tests.nodes.executor_fakes import NODE_ID, NODE_NAME, identity_registry
 
 
 @pytest.fixture
@@ -651,6 +656,113 @@ class TestEndPictureCheck:
         assert audio.compared and {p for t, p, *_ in audio.compared if t == s2e1} <= set(s1)
         assert _evidence(store, s2e1, Source.SEASON_AUDIO_PREVIOUS)
         assert season.season_audio_needs_worker(recs[-1], _season_ctx(store, s2e1)) is False
+
+
+_END_CARD = np.tile(np.linspace(0, 255, 64, dtype=np.float32), (36, 1))  # the same end card in every episode
+
+
+class _Node:
+    """A node's client that finishes each season-audio task at once and can't see the files in ``unseen``."""
+
+    def __init__(self, unseen: set[str], points=fake_points) -> None:
+        self.unseen, self.points = unseen, points
+        self.tasks: dict[str, dict] = {}
+
+    def start_task(self, spec: dict) -> str:
+        task_id, path, params = spec[protocol.CLIENT_TASK_ID_FIELD], spec["path"], spec["params"]
+        if path in self.unseen:
+            reason = protocol.NOT_VISIBLE_MISSING
+            state = {"status": protocol.STATUS_FILE_NOT_VISIBLE, "error": {"kind": protocol.KIND_FILE_NOT_VISIBLE,
+                     "reason": reason, "message": f"{path} doesn't exist on this node"}}  # fmt: skip
+        elif spec["op"] == protocol.OP_INTRO_FINGERPRINT:
+            state = {
+                "status": protocol.STATUS_DONE,
+                "result": {"points": protocol.encode_array(self.points(path), "uint32")},
+            }
+        else:
+            start, length = float(params["start_s"]), float(params["length_s"])
+            frames = [{"t": start + i * 0.25, "frame": protocol.encode_array(_END_CARD, "float32")}
+                      for i in range(int(length / 0.25) + 1)]  # fmt: skip
+            state = {"status": protocol.STATUS_DONE, "result": {"frames": frames}}
+        self.tasks[task_id] = {"id": task_id, "log": [], **state}
+        return task_id
+
+    def poll_task(self, task_id: str, *, log_from: int = 0) -> dict:
+        return self.tasks[task_id]
+
+    def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
+        pass
+
+
+@pytest.fixture
+def on_node():
+    """Runs the block's heavy steps on a node whose client is ``_Node(unseen, points)``; yields the registry."""
+
+    @contextmanager
+    def node(unseen: set[str], points=fake_points):
+        registry = identity_registry(_Node(unseen, points))
+        set_registry(registry)
+        try:
+            with placed_on(Placement(NODE_ID, NODE_NAME)):
+                yield registry
+        finally:
+            set_registry(None)
+
+    return node
+
+
+class TestOnANode:
+    """A remote worker's season step reads every sibling on its node. One the node can't see (another disk, its user
+    can't read it) was handed back as the episode's own "not visible": every episode of the season gave up on the
+    node, and each one counted towards pausing it."""
+
+    @pytest.mark.parametrize("unseen", ["sibling", "own"])
+    def test_a_sibling_the_node_cant_see_is_left_out_of_the_fingerprints_unlike_the_episode_itself(
+        self, store, show, on_node, unseen
+    ):
+        e1, _e2, e3 = show(1, 3)
+        ctx = _season_ctx(store, e1)
+        hidden = e3 if unseen == "sibling" else e1
+        with Audio(), on_node({hidden}) as registry:
+            if unseen == "own":
+                with pytest.raises(FileNotVisibleError):
+                    _run(ctx, e1, {"plex-1": ready_publisher()}, stage="process")
+                assert [r[:3] for r in registry.reports] == [("not_visible", "node-a", e1)]
+                return
+            _run(ctx, e1, {"plex-1": ready_publisher()}, stage="process")
+        (cand,) = _evidence(store, e1, Source.SEASON_AUDIO)
+        assert cand.origin == "1/1"
+        assert registry.reports == []
+        # Not ffmpeg's failure on it: a worker that sees it fingerprints it on the next run.
+        assert store.member_fingerprint_failed_at(FileIdentity(e3, *_identity(e3))) is None
+
+    @pytest.mark.parametrize("unseen", ["partner", "own"])
+    def test_an_end_picture_partner_the_node_cant_see_is_left_out_unlike_the_episode_itself(
+        self, store, show, on_node, unseen
+    ):
+        e1, e2, e3 = show(1, 3)
+        real_share = end_picture.Reader.share
+        with Audio(points=early_points) as audio:
+            _run(_season_ctx(store, e2), e2, {"plex-1": ready_publisher()}, stage="process")  # fingerprints all here
+            assert len(audio.computed) == 3
+        hidden = e3 if unseen == "partner" else e1
+        with (
+            Audio(points=early_points),
+            patch.object(end_picture.Reader, "share", real_share),
+            patch.object(end_picture, "stream_starts", return_value=StreamStarts(0.0, 0.0, True, "yuv420p")),
+            on_node({hidden}, early_points) as registry,
+        ):
+            if unseen == "own":
+                with pytest.raises(FileNotVisibleError):
+                    _run(_season_ctx(store, e1), e1, {"plex-1": ready_publisher()}, stage="process")
+                assert [r[:3] for r in registry.reports] == [("not_visible", "node-a", e1)]
+                return
+            _run(_season_ctx(store, e1), e1, {"plex-1": ready_publisher()}, stage="process")
+        assert registry.reports == []
+        # Not ffmpeg's failure on it: other workers, which may see it, aren't kept off it for a day.
+        assert store.end_picture_failed_at(FileIdentity(e3, *_identity(e3))) is None
+        # The partner it could see was compared.
+        assert any(a == store.get_file(e1).id and b == store.get_file(e2).id for a, b in _end_picture_keys(store))
 
 
 def _end_picture_keys(store):

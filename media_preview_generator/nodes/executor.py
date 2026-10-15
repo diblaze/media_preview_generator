@@ -61,8 +61,8 @@ RATE_LIMITED_GIVE_UP_S = protocol.TASK_UNPOLLED_EXPIRY_S + 12.0
 # The read timeout of a task's DELETE, sent from a thread of its own so the file (its result, or its next try) never
 # waits for it: a node that stops answering right after the result would hold the file for the full read timeout.
 GONE_DELETE_TIMEOUT_S = 3.0
-# A DELETE lost to a passing error is sent again after each of these waits: until one arrives the node keeps the task
-# and its temp dir (a preview's frames and their tar) for 10 minutes.
+# A DELETE lost to a passing error is sent again after each of these waits, then once the node answers a check again:
+# until one arrives the node keeps the task and its temp dir (a preview's frames and their tar) for 10 minutes.
 DELETE_RETRY_DELAYS_S = (1.0, 4.0)
 # How long a stopping app waits in all for the DELETEs of its tasks still running on nodes (cancel_running_tasks).
 STOP_DELETE_BUDGET_S = 1.0
@@ -114,6 +114,28 @@ def placed_on(placement: Placement | None) -> Iterator[None]:
         yield
     finally:
         _placement.reset(token)
+
+
+# Set while a step reads a file other than the worker's own (a season sibling, an end-picture partner).
+_other_file: ContextVar[bool] = ContextVar("node_other_file", default=False)
+
+
+@contextmanager
+def reading_other_file(other: bool = True) -> Iterator[None]:
+    """Run the block's node steps on a file other than the worker's own (when ``other``).
+
+    One the node can't see still raises :class:`FileNotVisibleError`, for the caller to leave out, but isn't reported
+    to the registry: another worker may see it fine, and each episode of its season would count it towards pausing
+    the node.
+
+    Args:
+        other: False runs the block as the worker's own file (for a caller that reads both).
+    """
+    token = _other_file.set(other)
+    try:
+        yield
+    finally:
+        _other_file.reset(token)
 
 
 class NodeUnavailableError(Exception):
@@ -565,7 +587,8 @@ class _TaskRun:
             return result if isinstance(result, dict) else {}
         if status == protocol.STATUS_FILE_NOT_VISIBLE or kind == protocol.KIND_FILE_NOT_VISIBLE:
             reason = protocol.relayed_text(str(error.get("reason") or protocol.NOT_VISIBLE_MISSING))
-            _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
+            if not _other_file.get():
+                _report("a file the node can't see", self._registry.report_not_visible, node_id, app_path, reason)
             # The job log names the file by this app's path already; the node's message would add its own path.
             plain = protocol.not_visible_text(reason)
             raise FileNotVisibleError(node_id, name, reason, f"{name} can't see the file: {plain}")
@@ -588,15 +611,33 @@ class _TaskRun:
         raise NodeTaskError(kind or protocol.KIND_FAILED, message, error_type=error_type, extra=extra)
 
     def _download(self, dest: str) -> None:
-        try:
-            data = self._client.fetch_artifact(self._task_id)
-        except NodeAuthError as exc:
-            raise self._refused_key() from exc
-        except NodeError as exc:
-            raise self._unavailable(
-                f"{self._placement.node_name} didn't send the frames: {exc}",
-                started=not isinstance(exc, NodeStoppingError),
-            ) from exc
+        """Fetch the finished task's frames into ``dest``.
+
+        The node keeps a finished task for minutes, so a fetch lost to an error that may pass (a 429, no answer in
+        time, a dropped connection, a 5xx) is tried again, given up by the same rule as the task's polls rather than
+        throwing the finished work away. A 429 given up on is no drop (neither the node's doing nor the file's).
+        """
+        failed = 0
+        failing_since = 0.0
+        while True:
+            try:
+                data = self._client.fetch_artifact(self._task_id)
+                break
+            except NodeAuthError as exc:
+                raise self._refused_key() from exc
+            except NodeError as exc:
+                if failed == 0:
+                    failing_since = time.monotonic()
+                failed += 1
+                passing = isinstance(exc, NodeUnreachableError) and not isinstance(exc, NodeStoppingError)
+                if passing and (failed < MAX_FAILED_POLLS or time.monotonic() - failing_since < NODE_GONE_AFTER_S):
+                    logger.debug("{}frames not fetched yet: {}", self._prefix, exc)
+                    time.sleep(POLL_INTERVAL_S)
+                    continue
+                raise self._unavailable(
+                    f"{self._placement.node_name} didn't send the frames: {exc}",
+                    started=not isinstance(exc, NodeStoppingError | NodeRateLimitedError),
+                ) from exc
         extract_artifact(data, dest)
 
     def delete(self) -> None:
@@ -612,7 +653,8 @@ class _TaskRun:
 
     def _free_later(self, task_id: str) -> None:
         """Send the DELETE of ``task_id`` from a short-lived thread at once, and again after each
-        ``DELETE_RETRY_DELAYS_S`` wait while nothing answers it.
+        ``DELETE_RETRY_DELAYS_S`` wait while nothing answers it; one still unanswered then is kept for the node's next
+        answer to a check (:func:`send_pending_deletes`).
 
         Args:
             task_id: The node's task id (a start's client task id before the node answered with one).
@@ -622,23 +664,63 @@ class _TaskRun:
     def _retry_delete(self, task_id: str) -> None:
         for delay in (0.0, *DELETE_RETRY_DELAYS_S):
             time.sleep(delay)
-            if not self._send_delete(task_id):
+            if not _send_delete(self._client, task_id, self._prefix):
                 return
+        _keep_pending(self._placement.node_id, task_id)
 
-    def _send_delete(self, task_id: str) -> bool:
-        """Send one DELETE; True when no answer came from the node, so it may get through if sent again."""
-        try:
-            self._client.delete_task(task_id, read_timeout=GONE_DELETE_TIMEOUT_S)
-        except NodeUnknownTaskError:
-            pass  # The node doesn't have it: the start never reached it, or it already freed the task.
-        except NodeUnreachableError as exc:
-            logger.debug("{}couldn't free the task: {}", self._prefix, exc)
-            return True
-        except NodeError as exc:
-            logger.debug("{}couldn't free the task: {}", self._prefix, exc)
-        except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
-            logger.opt(exception=True).debug("{}freeing the task failed", self._prefix)
-        return False
+
+def _send_delete(client: NodeClient, task_id: str, prefix: str) -> bool:
+    """Send one DELETE; True when no answer came from the node, so it may get through if sent again."""
+    try:
+        client.delete_task(task_id, read_timeout=GONE_DELETE_TIMEOUT_S)
+    except NodeUnknownTaskError:
+        pass  # The node doesn't have it: the start never reached it, or it already freed the task.
+    except NodeUnreachableError as exc:
+        logger.debug("{}couldn't free the task: {}", prefix, exc)
+        return True
+    except NodeError as exc:
+        logger.debug("{}couldn't free the task: {}", prefix, exc)
+    except Exception:  # noqa: BLE001 - nothing waits on this thread to see it fail
+        logger.opt(exception=True).debug("{}freeing the task failed", prefix)
+    return False
+
+
+# DELETEs nothing answered after their retries (node id -> task ids, oldest first), sent again once a check hears the
+# node (send_pending_deletes), so an outage longer than the retries doesn't leave the node a finished task's temp dir
+# for 10 minutes. At most MAX_PENDING_DELETES per node, the oldest dropped first (the node's own expiry frees those).
+# Under _pending_lock, which is taken alone.
+MAX_PENDING_DELETES = 256
+_pending_deletes: dict[str, dict[str, None]] = {}
+_pending_lock = threading.Lock()
+
+
+def _keep_pending(node_id: str, task_id: str) -> None:
+    with _pending_lock:
+        pending = _pending_deletes.setdefault(node_id, {})
+        pending[task_id] = None
+        while len(pending) > MAX_PENDING_DELETES:
+            del pending[next(iter(pending))]
+
+
+def send_pending_deletes(node_id: str, client: NodeClient) -> None:
+    """Send the node's DELETEs nothing answered again, from a short-lived thread: a check just heard it answer.
+
+    Args:
+        node_id: The node.
+        client: Its client now.
+    """
+    with _pending_lock:
+        task_ids = list(_pending_deletes.pop(node_id, {}))
+    if task_ids:
+        threading.Thread(
+            target=_resend_deletes, args=(node_id, client, task_ids), name="node-task-delete", daemon=True
+        ).start()
+
+
+def _resend_deletes(node_id: str, client: NodeClient, task_ids: list[str]) -> None:
+    for task_id in task_ids:
+        if _send_delete(client, task_id, f"{node_id} · "):
+            _keep_pending(node_id, task_id)  # gone again: sent at its next answer
 
 
 # The tasks running on nodes now, so a stopping app can free them (cancel_running_tasks).

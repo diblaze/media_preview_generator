@@ -61,6 +61,7 @@ def _fast_polls(monkeypatch):
     monkeypatch.setattr(executor, "POLL_INTERVAL_S", 0.0)
     # Polls take no time here, so the node counts as gone on the failed-poll count alone.
     monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 0.0)
+    monkeypatch.setattr(executor, "_pending_deletes", {})
     yield
     set_registry(None)
 
@@ -288,9 +289,97 @@ class TestArtifact:
         client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
         client.fetch_artifact = lambda task_id: (_ for _ in ()).throw(unreachable())
         registry = _install(client)
-        with pytest.raises(NodeUnavailableError):
+        with pytest.raises(NodeUnavailableError) as raised:
             _run(media, artifact_to=str(tmp_path))
+        assert raised.value.started is True
+        assert len(client.named("poll")) == 1
         assert registry.reports == [("unavailable", NODE_ID)]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NodeRateLimitedError("http://n asks this app to wait: too many wrong keys came from here"),
+            NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT),
+            NodeTimeoutError("http://n dropped the connection while answering"),
+            NodeUnreachableError("http://n answered HTTP 502"),
+            NodeUnreachableError("http://n can't be reached (connection refused)", reason=UNREACHABLE_REFUSED),
+        ],
+        ids=["429", "no-answer-in-time", "connection-dropped", "gateway-502", "refused"],
+    )
+    def test_a_passing_error_fetching_the_finished_frames_is_tried_again_not_a_drop(self, media, tmp_path, error):
+        """The node keeps a finished task for minutes: the finished frames were thrown away and the file went back
+        in the queue with a drop counted (two fail it) for a 429 or a moment's drop."""
+        tar = _tar([("0000000000.jpg", b"a")])
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={"frames": 1})], artifact=tar)
+        answers = [error, error]
+
+        def fetch(task_id):
+            client.calls.append(("artifact",))
+            if answers:
+                raise answers.pop(0)
+            return tar
+
+        client.fetch_artifact = fetch
+        registry = _install(client)
+        dest = tmp_path / "frames"
+        dest.mkdir()
+
+        assert _run(media, artifact_to=str(dest)) == {"frames": 1}
+
+        assert os.listdir(dest) == ["0000000000.jpg"]
+        assert len(client.named("artifact")) == 3
+        assert registry.reports == []
+
+    @pytest.mark.parametrize(
+        ("error", "started"),
+        [
+            (NodeRateLimitedError("http://n asks this app to wait"), False),
+            (NodeTimeoutError("http://n didn't answer in time", reason=UNREACHABLE_TIMEOUT), True),
+        ],
+        ids=["429-is-no-drop", "no-answer-is-a-drop"],
+    )
+    def test_a_fetch_failing_as_long_as_a_poll_may_is_given_up(self, media, tmp_path, monkeypatch, error, started):
+        clock = _FakeTime()
+        monkeypatch.setattr(executor, "time", clock)
+        monkeypatch.setattr(executor, "POLL_INTERVAL_S", 1.0)
+        monkeypatch.setattr(executor, "NODE_GONE_AFTER_S", 12.0)
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        fetched_at: list[float] = []
+
+        def fetch(task_id):
+            fetched_at.append(clock.now)
+            if len(fetched_at) > 1000:  # a build that never gives up fails here instead of hanging
+                return _tar([])
+            raise error
+
+        client.fetch_artifact = fetch
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError, match="didn't send the frames") as raised:
+            _run(media, artifact_to=str(tmp_path))
+
+        assert raised.value.started is started
+        assert fetched_at[-1] - fetched_at[0] == 12.0
+        assert len(fetched_at) == 13
+        reason = executor.REQUEUE_NODE_UNAVAILABLE if started else executor.REQUEUE_NODE_NOT_STARTED
+        assert executor.requeue_for(raised.value).reason == reason
+
+    @pytest.mark.parametrize(
+        ("error", "started"),
+        [(NodeUnknownTaskError("unknown_task"), True), (NodeStoppingError("http://n is restarting"), False)],
+        ids=["forgot-the-task", "restarting"],
+    )
+    def test_a_node_that_no_longer_has_the_frames_isnt_asked_again(self, media, tmp_path, error, started):
+        client = ScriptedClient([finished(protocol.STATUS_DONE, result={})])
+        fetched: list[str] = []
+        client.fetch_artifact = lambda task_id: fetched.append(task_id) or (_ for _ in ()).throw(error)
+        _install(client)
+
+        with pytest.raises(NodeUnavailableError) as raised:
+            _run(media, artifact_to=str(tmp_path))
+
+        assert raised.value.started is started
+        assert fetched == ["t1"]
 
 
 class TestNodeDrops:
@@ -710,6 +799,40 @@ class TestFreeingTheTask:
         time.sleep(0.1)
         assert len(client.named("delete")) == 3 and client.deleted == []
 
+    @pytest.mark.parametrize("node_gone", [False, True], ids=["after-a-finished-task", "after-the-node-went-away"])
+    def test_a_delete_nothing_answers_is_sent_again_once_the_node_answers_a_check(self, media, monkeypatch, node_gone):
+        """An outage longer than the retries (~5 s) left the node a finished task's temp dir (a preview's frames and
+        their tar) for 10 minutes."""
+        monkeypatch.setattr(executor, "DELETE_RETRY_DELAYS_S", (0.0, 0.0))
+        script = [running(), unreachable()] if node_gone else self.DONE
+        lost = NodeTimeoutError("http://n didn't answer in time")
+        client = _DeleteAnswers(script, [lost, lost, lost, lost])
+        _install(client)
+
+        if node_gone:
+            with pytest.raises(NodeUnavailableError):
+                _run(media)
+        else:
+            _run(media)
+
+        assert _wait_until(lambda: executor._pending_deletes == {NODE_ID: {"t1": None}})
+        assert client.deleted == []
+        executor.send_pending_deletes("another-node", client)
+        executor.send_pending_deletes(NODE_ID, client)  # it answers a check, but the DELETE is lost again
+        assert _wait_until(lambda: len(client.named("delete")) == 4 and executor._pending_deletes)
+        assert executor._pending_deletes == {NODE_ID: {"t1": None}}
+        executor.send_pending_deletes(NODE_ID, client)
+        assert _wait_until(lambda: client.deleted == ["t1"])
+        assert executor._pending_deletes == {} and client.timeouts == [executor.GONE_DELETE_TIMEOUT_S] * 5
+
+    def test_a_node_away_for_long_keeps_only_its_latest_lost_deletes(self, monkeypatch):
+        monkeypatch.setattr(executor, "MAX_PENDING_DELETES", 2)
+        for task_id in ("t1", "t2", "t3"):
+            executor._keep_pending(NODE_ID, task_id)
+        executor._keep_pending("node-b", "t9")
+
+        assert executor._pending_deletes == {NODE_ID: {"t2": None, "t3": None}, "node-b": {"t9": None}}
+
     @pytest.mark.parametrize(
         "answer",
         [NodeUnknownTaskError("unknown_task"), NodeAuthError("http://n refused the key")],
@@ -810,16 +933,23 @@ class TestARefusedKeyMidTask:
 
 
 class TestErrors:
-    def test_file_not_visible_is_reported_and_raised_with_the_reason(self, media):
+    @pytest.mark.parametrize("other", [None, False, True], ids=["own-file", "own-file-said-so", "other-file"])
+    def test_file_not_visible_is_raised_with_the_reason_and_reported_unless_it_isnt_the_workers_own(self, media, other):
+        """A season sibling the node can't see is left out by the step reading it; reported, each episode of its
+        season counted it towards pausing the node."""
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file", "reason": "missing"}
         client = ScriptedClient([finished(protocol.STATUS_FILE_NOT_VISIBLE, error=error)])
         registry = _install(client)
 
         with pytest.raises(FileNotVisibleError) as raised:
-            _run(media)
+            if other is None:
+                _run(media)
+            else:
+                with executor.reading_other_file(other):
+                    _run(media)
 
         assert (raised.value.node_id, raised.value.node_name, raised.value.reason) == (NODE_ID, NODE_NAME, "missing")
-        assert registry.reports == [("not_visible", NODE_ID, media, "missing")]
+        assert registry.reports == ([] if other else [("not_visible", NODE_ID, media, "missing")])
 
     def test_file_not_visible_says_why_in_plain_words_without_the_nodes_path(self, media):
         error = {"kind": protocol.KIND_FILE_NOT_VISIBLE, "message": "no such file: /mnt/nas/a.mkv", "reason": "missing"}

@@ -8,7 +8,9 @@ A call site picks one or the other by :func:`..executor.current_placement`::
 The ``ffmpeg`` argument the local functions take is accepted and not sent: a node runs its own FFmpeg. A failure the
 node names (``NodeTaskError.error_type``) is raised again as the same exception class with the same message; one it
 doesn't name stays a ``NodeTaskError`` (a ``RuntimeError``), as an unexpected exception from the local function would
-propagate. ``NodeUnavailableError`` and ``FileNotVisibleError`` always propagate: the worker gives the file back.
+propagate. ``NodeUnavailableError`` and ``FileNotVisibleError`` always propagate: the worker gives the file back, unless
+the file isn't the worker's own (a season sibling, read under ``executor.reading_other_file``), which its caller leaves
+out.
 """
 
 from __future__ import annotations
