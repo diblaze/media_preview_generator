@@ -421,8 +421,15 @@ def run_test_access(
     sampled = _sample_folders([root.app_root for root in roots] + nested, SAMPLE_BUDGET_S, limit=SAMPLES_PER_ROOT)
     samplings = dict(zip(roots, sampled[: len(roots)], strict=True))
     by_folder = dict(zip(nested, sampled[len(roots) :], strict=True))
+    # An inner row this app can't read isn't tested, so the library can't pass on its other rows' files.
+    unread: dict[LibraryRoot, str] = {}
     for root, folders in inside.items():
         parts = [by_folder[folder] for folder in folders]
+        for folder, part in zip(folders, parts, strict=True):
+            if part.timed_out and not part.found:
+                unread.setdefault(root, f"Timed out reading {folder} (no answer within {SAMPLE_BUDGET_S:g} s)")
+            elif not part.opened and not part.found:
+                unread.setdefault(root, f"This app can't open {folder}")
         samplings[root] = _Sampling(
             found=_interleave([list(part.found) for part in parts], max(SAMPLES_PER_ROOT, len(parts))),
             folder=next((part.folder for part in parts if part.folder), ""),
@@ -487,6 +494,9 @@ def run_test_access(
         elif not picked:
             empty = True
             error = f"No video files found near the top of {root.app_root}"
+        elif root in unread:
+            ok = False
+            error = unread[root]
         libraries.append(
             {
                 "server": root.server,

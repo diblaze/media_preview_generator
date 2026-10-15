@@ -414,6 +414,21 @@ class TestRunTestAccess:
         assert movies["ok"] is False
         assert {os.path.basename(f["path"])[0] for f in movies["files"]} == {"A", "B"}
 
+    def test_an_inner_row_this_app_cant_open_fails_the_library(self, tmp_path):
+        _video(tmp_path / "media" / "Movies" / "A" / "a.mkv")
+        servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
+        missing = tmp_path / "media" / "Movies" / "B"
+        rows = [
+            PathMapping(str(tmp_path / "media" / "Movies" / "A"), "/mnt/A"),
+            PathMapping(str(missing), "/mnt/B"),
+        ]
+
+        (movies,) = nm.run_test_access(FakeClient(), rows, servers)["libraries"]
+
+        assert (movies["checked"], movies["ok"]) == (1, False)
+        assert movies["error"] == f"This app can't open {missing}"
+        assert reg.access_passed({"libraries": [movies]}) is False
+
     def test_overlapping_rows_inside_a_library_test_each_file_once(self, tmp_path):
         _video(tmp_path / "media" / "Movies" / "A" / "sub" / "s.mkv")
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
