@@ -63,15 +63,15 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
     """Set each ``FILE__<NAME>`` variable's ``<NAME>`` to the contents of the file it names (a Docker secret).
 
     The main image's s6 init would do this, but the image keeps the container's own environment (``S6_KEEP_ENV``), so
-    its copy never reaches the node; the Plex database image has no such init. Trailing newlines (what
-    ``echo key > file`` leaves) are dropped.
+    its copy never reaches the node; the Plex database image has no such init. Whitespace around the value (the
+    newline ``echo key > file`` leaves) and a byte-order mark (Notepad's) are dropped.
 
     Args:
         environ: For tests; default ``os.environ``.
 
     Raises:
-        SystemExit: A named file can't be read: the node would otherwise start with a key of its own, and the app's
-            every request would be refused.
+        SystemExit: A named file can't be read or holds nothing: the node would otherwise start with a key of its
+            own, and the app's every request would be refused.
     """
     environ = os.environ if environ is None else environ
     for var, path in sorted(environ.items()):
@@ -79,8 +79,8 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
         if not var.startswith(FILE_ENV_PREFIX) or not name:
             continue
         try:
-            with open(path, encoding="utf-8") as handle:
-                value = handle.read()
+            with open(path, encoding="utf-8-sig") as handle:
+                value = handle.read().strip()
         except (OSError, ValueError) as exc:
             reason = getattr(exc, "strerror", None) or type(exc).__name__
             # Never the path: the obvious slip is the value itself (the key) in FILE__NODE_KEY, and this is logged.
@@ -89,7 +89,11 @@ def _env_from_files(environ: MutableMapping[str, str] | None = None) -> None:
                 f"{var} names a file the node can't read ({reason}). Set it to the path of a file holding {name} "
                 f"(or set {name} to the value itself), and let this container's user (PUID/PGID) read that file."
             ) from None
-        environ[name] = value.rstrip("\r\n")
+        if not value:
+            # A secret never filled in (``touch``, ``echo $UNSET > file``): NODE_KEY would be blank, which the node
+            # skips for node.json's key without a word.
+            raise SystemExit(f"{var} names {path}, which is empty. Put {name} in that file, or set {name} instead.")
+        environ[name] = value
         logger.info("{} set from {}", name, var)
 
 

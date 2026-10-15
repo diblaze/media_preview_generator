@@ -618,6 +618,30 @@ class TestSecretFiles:
         with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names a file the node can't read \(No such"):
             make_app(key=None)
 
+    @pytest.mark.parametrize("content", ["", "\n", "   \r\n"], ids=["empty", "newline", "blank"])
+    def test_an_empty_file_refuses_to_start(self, make_app, monkeypatch, tmp_path, content):
+        # NODE_KEY came out blank, which the node skips for node.json's key without a word: the app's every request
+        # was then refused.
+        secret = tmp_path / "node_key"
+        secret.write_text(content)
+        monkeypatch.setenv("NODE_KEY", "")  # so monkeypatch takes back the value the node would set
+        monkeypatch.setenv("FILE__NODE_KEY", str(secret))
+
+        with pytest.raises(SystemExit, match=r"FILE__NODE_KEY names .*node_key, which is empty\. Put NODE_KEY in"):
+            make_app(key=None)
+
+    def test_a_key_file_saved_by_notepad_gives_the_key_itself(self, make_app, monkeypatch, tmp_path):
+        # Notepad starts a UTF-8 file with a byte-order mark and ends a line with CRLF; a trailing space is a slip.
+        secret = tmp_path / "node_key"
+        secret.write_bytes("\ufeff a-key-from-notepad \r\n".encode())
+        monkeypatch.setenv("NODE_KEY", "")
+        monkeypatch.setenv("FILE__NODE_KEY", str(secret))
+
+        client = make_app(key=None).test_client()
+
+        allowed = {"Authorization": "Bearer a-key-from-notepad", protocol.PROTOCOL_HEADER: "1"}
+        assert client.get("/v1/log", headers=allowed).status_code == 200
+
     def test_a_key_put_in_file_node_key_itself_is_never_printed(self, make_app, monkeypatch):
         # The obvious slip (the key where the path of a file holding it belongs) put the key in the refusal, which
         # the node logs to docker logs and its app.log.
