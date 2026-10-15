@@ -779,12 +779,15 @@ class TestTheRunnersFailureLines:
         ],
         ids=["full", "read-only", "over-quota", "no-permission"],
     )
-    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(self, run, tmp_path, rc, stderr, said):
+    def test_a_refused_write_names_the_folder_not_a_crash_or_the_gpu(
+        self, run, tmp_path, mock_config, rc, stderr, said
+    ):
         outcome = self._run_real(run, tmp_path, rc, stderr)
 
         assert isinstance(outcome.result, WorkingFolderError)
         refused = [line for line in outcome.warnings if "couldn't write thumbnails" in line]
         assert len(refused) == 1 and str(tmp_path / "frames") in refused[0] and said in refused[0], outcome.warnings
+        assert f"mount a bigger, writable disk at {mock_config.tmp_folder}." in refused[0], refused
         assert not any(
             "crashed" in line or "hardware acceleration" in line or "GPU" in line for line in outcome.warnings
         ), outcome.warnings

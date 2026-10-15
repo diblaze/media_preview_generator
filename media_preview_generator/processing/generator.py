@@ -545,16 +545,17 @@ class WorkingFolderError(OSError):
     """
 
 
-def working_folder_failure(exc: OSError) -> str:
+def working_folder_failure(exc: OSError, tmp_folder: str | None = None) -> str:
     """The sentence a file that couldn't be written to the working folder fails with: the folder, why, and the fix.
 
     Args:
         exc: The error, with the folder as its ``filename``.
+        tmp_folder: The app's working folder (``Config.tmp_folder``), where a bigger disk goes (``working_folder_hint``).
 
     Returns:
         The sentence.
     """
-    folder, move = working_folder_hint()
+    folder, move = working_folder_hint(tmp_folder)
     where = f"{folder} {exc.filename}" if isinstance(exc.filename, str) else folder
     why = exc.strerror or os.strerror(exc.errno or 0)
     if exc.errno == errno.EROFS:

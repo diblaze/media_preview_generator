@@ -2167,7 +2167,7 @@ def _process_canonical_path_previews(
                 raise  # not this file's failure: the worker gives it back to the queue
             except WorkingFolderError as exc:
                 # The folder's condition, not the file's: no traceback, and nothing of the run is published.
-                message = working_folder_failure(exc)
+                message = working_folder_failure(exc, getattr(config, "tmp_folder", None))
                 logger.error("{}: {}", canonical_path, message)
                 return MultiServerResult(
                     canonical_path=canonical_path, status=MultiServerStatus.FAILED, message=message

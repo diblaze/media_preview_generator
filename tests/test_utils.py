@@ -483,6 +483,41 @@ class TestNodeHints:
         assert "Settings" not in message, message
         assert message.endswith(", or mount a bigger, writable disk at the container's temp folder."), message
 
+    def test_a_working_folder_elsewhere_gets_its_bigger_disk_where_it_is(self, monkeypatch):
+        """TMP_FOLDER=/transcode puts the frames on /transcode: a disk at the container's temp folder changes nothing."""
+        from media_preview_generator.processing import generator
+
+        monkeypatch.delenv("MODE", raising=False)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+        full = generator.WorkingFolderError(errno.ENOSPC, "No space left on device", "/transcode/frame_cache/frames-0")
+
+        message = generator.working_folder_failure(full, "/transcode")
+
+        assert "container's temp folder" not in message, message
+        assert message.endswith("Free up space there, or mount a bigger, writable disk at /transcode."), message
+
+    @pytest.mark.parametrize("tmp_folder", [None, "/tmp", "/tmp/"])
+    def test_the_default_working_folder_keeps_the_containers_temp_folder(self, monkeypatch, tmp_folder):
+        from media_preview_generator import utils
+
+        monkeypatch.delenv("MODE", raising=False)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+
+        assert utils.working_folder_hint(tmp_folder) == (
+            "the working folder",
+            "mount a bigger, writable disk at the container's temp folder",
+        )
+
+    def test_a_node_keeps_its_own_temp_folder_whatever_the_apps_working_folder(self, monkeypatch):
+        from media_preview_generator import utils
+
+        monkeypatch.setenv("MODE", "node")
+
+        assert utils.working_folder_hint("/transcode") == (
+            "the node's temp folder",
+            "choose another folder (NODE_TEMP_DIR)",
+        )
+
 
 def _running(pid: int) -> bool:
     """A process that exists and isn't a zombie waiting to be reaped."""

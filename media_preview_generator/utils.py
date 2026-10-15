@@ -221,14 +221,20 @@ def log_viewer_hint() -> str:
     return "this node's Log tab on the app's Nodes page" if is_node_mode() else "the live web log viewer"
 
 
-def working_folder_hint() -> tuple[str, str]:
+def working_folder_hint(tmp_folder: str | None = None) -> tuple[str, str]:
     """The folder FFmpeg writes thumbnails to, and how to give it another disk: ``(name, move)``.
 
     ``move`` follows "or ". The app has no setting for its working folder (``tmp_folder``, seeded once from
-    ``TMP_FOLDER``), so a bigger or writable one is a disk mounted at the container's temp folder.
+    ``TMP_FOLDER``), so a bigger or writable one is a disk mounted where it is: the container's temp folder, or the
+    folder ``TMP_FOLDER`` seeded.
+
+    Args:
+        tmp_folder: The app's working folder (``Config.tmp_folder``); None or the system's temp folder for the default.
     """
     if is_node_mode():
         return "the node's temp folder", "choose another folder (NODE_TEMP_DIR)"
+    if tmp_folder and os.path.normpath(tmp_folder) != os.path.normpath(tempfile.gettempdir()):
+        return "the working folder", f"mount a bigger, writable disk at {tmp_folder}"
     return "the working folder", "mount a bigger, writable disk at the container's temp folder"
 
 
