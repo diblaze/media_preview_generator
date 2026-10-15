@@ -184,14 +184,19 @@ def is_node_mode() -> bool:
 FFMPEG_LOG_PREFIX = "ffmpeg_output_"
 
 
+def node_temp_root() -> str:
+    """A node's temp folder: ``NODE_TEMP_DIR``, or ``<system temp>/mpg-node``."""
+    return os.environ.get("NODE_TEMP_DIR", "").strip() or os.path.join(tempfile.gettempdir(), "mpg-node")
+
+
 def scratch_dir() -> str:
     """The folder for this process's short-lived files (FFmpeg's log, a helper's stderr).
 
-    On a node, its temp folder (``NODE_TEMP_DIR``), the one it checks at start: a node run read-only may have no
-    writable system temp at all, and every file sent to it would fail. Else the system's temp folder.
+    On a node, its temp folder (:func:`node_temp_root`), the one it makes and checks at start and sweeps for what a
+    killed node left: a node run read-only may have no writable system temp at all, and every file sent to it would
+    fail. Else the system's temp folder.
     """
-    chosen = os.environ.get("NODE_TEMP_DIR", "").strip() if is_node_mode() else ""
-    return chosen or tempfile.gettempdir()
+    return node_temp_root() if is_node_mode() else tempfile.gettempdir()
 
 
 def gpu_settings_hint() -> str:

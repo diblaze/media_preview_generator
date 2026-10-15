@@ -968,13 +968,19 @@ class TestScratchDir:
         monkeypatch.setenv("NODE_TEMP_DIR", f"  {tmp_path}  ")
         assert scratch_dir() == str(tmp_path)
 
-    def test_a_node_without_one_and_the_app_use_the_system_temp_folder(self, monkeypatch, tmp_path):
+    def test_a_node_without_one_uses_the_temp_folder_its_tasks_use_and_the_app_the_system_one(
+        self, monkeypatch, tmp_path
+    ):
+        # The image sets no NODE_TEMP_DIR: FFmpeg's logs went to the system temp folder while the node swept
+        # <system temp>/mpg-node for the ones a killed node left behind.
         import tempfile
+
+        from media_preview_generator.nodes.server.tasks import default_temp_root
 
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         monkeypatch.setenv("MODE", "node")
         monkeypatch.setenv("NODE_TEMP_DIR", "")
-        assert scratch_dir() == str(tmp_path)
+        assert scratch_dir() == default_temp_root() == str(tmp_path / "mpg-node")
         monkeypatch.delenv("MODE")
         monkeypatch.setenv("NODE_TEMP_DIR", "/elsewhere")  # a node's setting: the app has no use for it
         assert scratch_dir() == str(tmp_path)

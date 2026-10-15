@@ -26,7 +26,7 @@ from typing import Any
 
 from loguru import logger
 
-from ...utils import FFMPEG_LOG_PREFIX
+from ...utils import FFMPEG_LOG_PREFIX, node_temp_root
 from ..protocol import (
     CLIENT_TASK_ID_FIELD,
     CLIENT_TASK_ID_PATTERN,
@@ -106,8 +106,8 @@ TEMP_ROOM_MADE_BYTES = 1 << 20
 
 
 def default_temp_root() -> str:
-    """``NODE_TEMP_DIR``, or ``<system temp>/mpg-node``."""
-    return os.environ.get("NODE_TEMP_DIR", "").strip() or os.path.join(tempfile.gettempdir(), "mpg-node")
+    """``NODE_TEMP_DIR``, or ``<system temp>/mpg-node``: where FFmpeg's logs go too (``utils.scratch_dir``)."""
+    return node_temp_root()
 
 
 def temp_folder_problem(temp_root: str, exc: OSError) -> str:

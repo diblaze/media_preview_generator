@@ -811,6 +811,24 @@ class TestExpiry:
 
         assert sorted(os.listdir(root)) == ["ffmpeg_output_notes.txt"]
 
+    def test_without_node_temp_dir_ffmpeg_logs_go_where_the_start_sweep_looks(self, tmp_path, monkeypatch):
+        import tempfile
+
+        from media_preview_generator.utils import scratch_dir
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.delenv("NODE_TEMP_DIR", raising=False)
+        root = tasks.default_temp_root()
+        os.makedirs(root)
+        log = os.path.join(scratch_dir(), "ffmpeg_output_4150646_1_2.log")
+        with open(log, "w") as handle:
+            handle.write("frame=  120 fps= 60\n")
+
+        tasks.TaskTable({}, temp_root=root).close()
+
+        assert not os.path.exists(log)
+
 
 class TestStopping:
     """SIGTERM closes the table first; the server answers until the cancelled tasks' FFmpeg has stopped."""
