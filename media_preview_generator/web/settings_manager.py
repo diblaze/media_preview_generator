@@ -163,8 +163,8 @@ class SettingsManager:
             )
         if switched_off:
             logger.warning(
-                "The on/off switch of {} in settings.json isn't true or false, so it is turned off. Switch it on on "
-                "the Nodes page if it should be on.",
+                "The on/off switch of {} in settings.json isn't true or false, so it is turned off. To use it, turn it "
+                "back on from the Nodes page.",
                 ", ".join(switched_off),
             )
         try:
