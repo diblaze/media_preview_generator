@@ -7,6 +7,7 @@ import threading
 import time
 import types
 
+import pytest
 from loguru import logger
 
 from media_preview_generator.nodes.server import info, nodelog
@@ -241,6 +242,31 @@ class TestHost:
 
     def test_meminfo_missing_is_none(self, tmp_path):
         assert info._meminfo(str(tmp_path / "nope")) == (None, None)
+
+    def test_cores_are_the_ones_the_node_may_use_not_the_hosts(self, tmp_path, monkeypatch):
+        # A node started with --cpus 0.5 (or pinned to one core) on a 20-core host said it had 20.
+        monkeypatch.setattr(info.os, "sched_getaffinity", lambda pid: {0}, raising=False)
+        monkeypatch.setattr(info.os, "cpu_count", lambda: 20)
+        worker = info.WorkerInfo(temp_root=str(tmp_path), detect=list)
+
+        assert worker.block(busy=0)["cpu"]["cores"] == 1
+
+    @pytest.mark.parametrize(
+        ("cpu_max", "cores"),
+        [("50000 100000\n", 1), ("200000 100000\n", 2), ("250000 100000\n", 3), ("max 100000\n", 8), ("junk", 8)],
+    )
+    def test_cores_are_capped_by_the_containers_cpu_limit(self, tmp_path, monkeypatch, cpu_max, cores):
+        path = tmp_path / "cpu.max"
+        path.write_text(cpu_max)
+        monkeypatch.setattr(info.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+
+        assert info._cores(str(path)) == cores
+
+    def test_cores_without_an_affinity_call_are_the_cpu_count(self, tmp_path, monkeypatch):
+        monkeypatch.delattr(info.os, "sched_getaffinity", raising=False)  # macOS and Windows
+        monkeypatch.setattr(info.os, "cpu_count", lambda: 6)
+
+        assert info._cores(str(tmp_path / "no-cgroup")) == 6
 
     def test_load1_none_without_a_load_average(self, monkeypatch):
         def no_load():

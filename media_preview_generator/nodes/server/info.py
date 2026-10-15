@@ -9,6 +9,7 @@ re-checked in the background every :data:`GPU_RECHECK_S`, at once after a task r
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import shutil
 import subprocess
@@ -82,6 +83,31 @@ def _meminfo(path: str = "/proc/meminfo") -> tuple[int | None, int | None]:
     except OSError:
         return None, None
     return values.get("MemTotal"), values.get("MemAvailable")
+
+
+def _cores(cpu_max_path: str = "/sys/fs/cgroup/cpu.max") -> int:
+    """The CPU cores this node may use: the ones it may run on, capped by a container's CPU limit (``--cpus``).
+
+    ``os.cpu_count()`` is the host's: a node started with ``--cpus 0.5`` on a 20-core host said it had 20.
+
+    Args:
+        cpu_max_path: The cgroup v2 ``cpu.max`` file (``"<quota> <period>"``, or ``"max <period>"`` for no limit).
+
+    Returns:
+        At least 1.
+    """
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # macOS and Windows have no affinity call
+        cores = os.cpu_count() or 1
+    try:
+        with open(cpu_max_path, encoding="ascii") as handle:
+            quota, _, period = handle.read().strip().partition(" ")
+        if quota != "max":
+            cores = min(cores, math.ceil(int(quota) / int(period)))
+    except (OSError, ValueError, ZeroDivisionError):
+        pass  # no cgroup v2 limit to read: the affinity count stands
+    return max(1, cores)
 
 
 def _load1() -> float | None:
@@ -265,7 +291,7 @@ class WorkerInfo:
         return {
             "gpus": gpus,
             "cpu": {
-                "cores": os.cpu_count() or 1,
+                "cores": _cores(),
                 "load1": _load1(),
                 "ram_total": ram_total,
                 "ram_available": ram_available,
