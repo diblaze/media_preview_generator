@@ -95,6 +95,10 @@ def sendable_key(key: str) -> bool:
     return bool(key) and all(33 <= ord(ch) <= 126 for ch in key)
 
 
+# The longest key either side takes: the app refuses to store a longer one, so a node refuses to start with one.
+KEY_MAX_LEN = 200
+
+
 def whole_number(raw: str) -> int | None:
     """``raw`` as a non-negative int when it is 1 to 18 ASCII digits (surrounding spaces ignored), else None.
 

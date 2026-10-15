@@ -20,12 +20,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from .protocol import PathMapping, sendable_key
+from .protocol import KEY_MAX_LEN, PathMapping, sendable_key
 
 KEY_MASK = "****"
 NAME_MAX_LEN = 80
 URL_MAX_LEN = 500
-KEY_MAX_LEN = 200
 MAX_MAPPINGS = 50
 # "/v1", or a route under it, at the end of an address ("http://nuc:9494/v1/health").
 _NODE_ROUTE_TAIL = re.compile(r"/v1(?:/[a-z/-]*)?$")
