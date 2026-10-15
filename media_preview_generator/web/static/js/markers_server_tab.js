@@ -30,8 +30,6 @@
         plexDbNodes: null,
         // Every node from /api/nodes, to name a saved choice whose node hasn't reported its roles yet.
         allNodes: [],
-        // The Plex database choice before the last change, so "Add a Plex database node…" can put it back.
-        dbChoice: '',
     };
 
     function vendorOf(server) {
@@ -66,7 +64,6 @@
 
     // The select's values besides a node id: this app, and the entry that opens the Nodes page.
     const DB_LOCAL = '';
-    const DB_ADD_NODE = '__add_node__';
     // Switched on with no node behind it (a helper the upgrade couldn't move to the Nodes page): kept as it is on
     // save, and refused with "no node" until a node is chosen, so this app never opens its own copy instead.
     const DB_OLD_HELPER = '__old_helper__';
@@ -345,8 +342,9 @@
         return `<option value="${escapeHtml(value)}">${escapeHtml(text)}</option>`;
     }
 
-    // "Open it from this app", each Plex database node, the stored choice even when its node is gone, and the
-    // entry that opens the Nodes page. Keeps whatever is selected now.
+    // "Open it from this app", each Plex database node and the stored choice even when its node is gone. Keeps
+    // whatever is selected now. Adding a node is the link beside it: as an entry here, arrowing through the list
+    // opened the Nodes page on every key press that reached it.
     function renderDbOptions(server) {
         const select = $('#markersPlexDatabase');
         if (!select) return;
@@ -367,12 +365,10 @@
                 : (tab.plexDbNodes === null ? stored : `${stored} (not on the Nodes page any more)`);
             html += dbOption(stored, dbNodeOptionText(label, known));
         }
-        html += dbOption(DB_ADD_NODE, 'Add a Plex database node…');
         select.innerHTML = html;
         select.value = current;
         if (select.value !== current) select.value = stored;
         select.dataset.loaded = '1';
-        tab.dbChoice = select.value;
     }
 
     async function fetchPlexDbNodes(server) {
@@ -394,23 +390,7 @@
         renderAgentState(tab.status);
     }
 
-    // Not an edit of this server: the dialog counts its input and change events as edits, and neither reaches it.
-    function onDbChoiceInput(event) {
-        if (event.target.value === DB_ADD_NODE) event.stopPropagation();
-    }
-
-    function onDbChoiceChange(event) {
-        const select = event.target;
-        if (select.value === DB_ADD_NODE) {
-            // Put the choice back: picking it only opens the Nodes page.
-            event.stopPropagation();
-            select.value = tab.dbChoice;
-            const opened = window.open('/nodes#add', '_blank');
-            if (opened) opened.opener = null;
-            else window.location.assign('/nodes#add');
-            return;
-        }
-        tab.dbChoice = select.value;
+    function onDbChoiceChange() {
         renderAgentState(tab.status);
     }
 
@@ -743,7 +723,6 @@
     function wire() {
         const dbSelect = $('#markersPlexDatabase');
         if (dbSelect) {
-            dbSelect.addEventListener('input', onDbChoiceInput);
             dbSelect.addEventListener('change', onDbChoiceChange);
         }
         const agentState = $('#markersAgentState');

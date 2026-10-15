@@ -1900,7 +1900,7 @@ class TestPlexDatabaseSelector:
         self._open(authed_page, app_url, None)
         # storage, nuc and old-laptop are worker-only nodes: not a route to Plex's database.
         expect(authed_page.locator("#markersPlexDatabase option")).to_have_text(
-            ["Open it from this app", "Through a Plex database node: gaming-pc", "Add a Plex database node…"]
+            ["Open it from this app", "Through a Plex database node: gaming-pc"]
         )
         expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
         expect(authed_page.locator("#markersAgentState")).to_be_hidden()
@@ -1975,27 +1975,46 @@ class TestPlexDatabaseSelector:
         body = _save_and_read_put(authed_page, "plex-1")
         assert body["markers"]["plex"]["agent"] == {"enabled": False, "node_id": "n-off"}
 
-    def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(self, authed_page: Page, app_url: str) -> None:
-        self._open(authed_page, app_url, None)
+    @pytest.mark.parametrize("agent", [None, {"enabled": True, "node_id": "n-pc"}], ids=["this-app", "node"])
+    def test_add_a_node_opens_the_nodes_page_and_keeps_the_choice(
+        self, authed_page: Page, app_url: str, agent: dict | None
+    ) -> None:
+        self._open(authed_page, app_url, agent)
+        chosen = "n-pc" if agent else ""
         with authed_page.context.expect_page() as opened:
-            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+            authed_page.locator("#markersAddPlexDbNode").click()
         new_page = opened.value
         new_page.wait_for_load_state("domcontentloaded")
         assert new_page.url.endswith("/nodes#add")
         new_page.close()
-        expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
+        expect(authed_page.locator("#markersPlexDatabase")).to_have_value(chosen)
 
     def test_add_a_node_is_not_an_edit_of_the_server(self, authed_page: Page, app_url: str) -> None:
         """The select's input event reached the dialog: Save turned on and closing asked to discard nothing."""
         self._open(authed_page, app_url, None)
         expect(authed_page.locator("#editServerSave")).to_be_disabled()
         with authed_page.context.expect_page() as opened:
-            authed_page.locator("#markersPlexDatabase").select_option("__add_node__")
+            authed_page.locator("#markersAddPlexDbNode").click()
         opened.value.close()
 
         expect(authed_page.locator("#markersPlexDatabase")).to_have_value("")
         expect(authed_page.locator("#editServerDirty")).to_be_hidden()
         expect(authed_page.locator("#editServerSave")).to_be_disabled()
+
+    @pytest.mark.parametrize("key", ["End", "ArrowDown"])
+    def test_arrowing_through_the_choices_never_opens_the_nodes_page(
+        self, authed_page: Page, app_url: str, key: str
+    ) -> None:
+        """Lab: "Add a Plex database node…" was the list's last entry, so End, or the arrow keys past the last node,
+        opened the Nodes page in a new tab on every key press that reached it."""
+        self._open(authed_page, app_url, None)
+        select = authed_page.locator("#markersPlexDatabase")
+        select.focus()
+        for _ in range(3):
+            authed_page.keyboard.press(key)
+        authed_page.wait_for_timeout(300)
+        assert len(authed_page.context.pages) == 1, [p.url for p in authed_page.context.pages]
+        expect(select).to_have_value("n-pc")
 
     def test_setup_health_link_lands_on_the_selector(self, authed_page: Page, app_url: str) -> None:
         server = _plex_server()

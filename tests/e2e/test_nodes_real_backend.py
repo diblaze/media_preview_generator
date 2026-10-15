@@ -463,7 +463,6 @@ def test_plex_database_nodes_are_added_and_offered_to_the_plex_server(
             "Open it from this app",
             f"Through a Plex database node: {PLEX_DB_NODE_NAME}",
             "Through a Plex database node: 127.0.0.1",
-            "Add a Plex database node…",
         ],
         timeout=10000,
     )
