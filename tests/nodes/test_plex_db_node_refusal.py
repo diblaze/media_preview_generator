@@ -21,12 +21,14 @@ from media_preview_generator.markers.publishers.base import Capability, PublishE
 from media_preview_generator.markers.publishers.plex_remote import (
     AGENT_DISABLED,
     AGENT_NO_NODE,
+    AGENT_UNCONFIRMED_NODE,
     AgentClient,
     AgentError,
     RemotePlexDb,
     plex_database,
 )
 from media_preview_generator.markers.settings import load_server
+from media_preview_generator.nodes.registry import set_registry
 from media_preview_generator.servers.base import ServerType
 from tests.loudness.test_plex_db import FIELDS
 
@@ -59,19 +61,28 @@ def node(tmp_path):
     reset_settings_manager()
     sm = get_settings_manager(str(tmp_path))
 
-    def configure(*, enabled: bool) -> None:
+    def configure(*, enabled: bool, unconfirmed: bool = False) -> None:
         sm.set("nodes", [{**NODE, "enabled": enabled}])
+        # The registry's word on a new id it couldn't tie to the server's Plex.
+        registry.plex_db_refusal = lambda node_id: MESSAGES[AGENT_UNCONFIRMED_NODE] if unconfirmed else ""
 
+    registry = MagicMock()
+    set_registry(registry)
     yield configure
+    set_registry(None)
     reset_settings_manager()
 
 
-# enabled -> the refusal's badge state, or None when the node is used.
+# (enabled, new id unconfirmed) -> the refusal's badge state, or None when the node is used.
 CELLS = [
-    pytest.param(True, None, id="enabled"),
-    pytest.param(False, AGENT_DISABLED, id="disabled"),
+    pytest.param((True, False), None, id="enabled"),
+    pytest.param((False, False), AGENT_DISABLED, id="disabled"),
+    pytest.param((True, True), AGENT_UNCONFIRMED_NODE, id="new-id-unconfirmed"),
 ]
-MESSAGES = {AGENT_DISABLED: "Plex box is turned off on the Nodes page"}
+MESSAGES = {
+    AGENT_DISABLED: "Plex box is turned off on the Nodes page",
+    AGENT_UNCONFIRMED_NODE: "Plex box reports a new id and this app can't confirm it is the same Plex.",
+}
 
 
 def _cfg(tmp_path) -> SimpleNamespace:
@@ -87,7 +98,7 @@ def _cfg(tmp_path) -> SimpleNamespace:
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_markers(node, enabled, refused):
-    node(enabled=enabled)
+    node(enabled=enabled[0], unconfirmed=enabled[1])
     session = MagicMock()
     db = plex_database(load_server(MARKERS, "plex"), path_provider=lambda: "/local/db", label="Home", session=session)
     assert isinstance(db, RemotePlexDb)
@@ -104,7 +115,7 @@ def test_markers(node, enabled, refused):
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_chapters(node, monkeypatch, enabled, refused):
-    node(enabled=enabled)
+    node(enabled=enabled[0], unconfirmed=enabled[1])
     monkeypatch.setattr(plex_chapters, "_server_identity", lambda server, plex, reuse_recent: ("machine", "1.43"))
     config = SimpleNamespace(markers=MARKERS, output={})
     if refused is None:
@@ -119,7 +130,7 @@ def test_chapters(node, monkeypatch, enabled, refused):
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_loudness(node, tmp_path, monkeypatch, enabled, refused):
-    node(enabled=enabled)
+    node(enabled=enabled[0], unconfirmed=enabled[1])
     sent = MagicMock(side_effect=AssertionError("nothing may be sent"))
     monkeypatch.setattr("requests.Session.post", sent)
     monkeypatch.setattr("requests.Session.get", sent)
@@ -141,7 +152,7 @@ def test_loudness(node, tmp_path, monkeypatch, enabled, refused):
 
 @pytest.mark.parametrize(("enabled", "refused"), CELLS)
 def test_library_health(node, tmp_path, monkeypatch, enabled, refused):
-    node(enabled=enabled)
+    node(enabled=enabled[0], unconfirmed=enabled[1])
     sent = MagicMock(side_effect=AssertionError("nothing may be sent"))
     monkeypatch.setattr("requests.Session.post", sent)
     monkeypatch.setattr("requests.Session.get", sent)

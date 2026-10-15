@@ -163,6 +163,9 @@ class _Live:
     access_checked_at: float | None = None
     # A Test access of rows not saved yet (the Add node wizard and the Media tab test before they save).
     pending_access: _PendingAccess | None = None
+    # A new id a Plex database node reported that this app couldn't tie to the Plex it serves; its Plex database
+    # writes are refused until the user types the node's key again (which clears the saved id).
+    unconfirmed_uid: str = ""
     check_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -203,11 +206,28 @@ def _default_legacy_ping(url: str, key: str) -> tuple[str, str]:
     return agent.state, agent.version
 
 
+def _default_served_plex_ids(node_id: str) -> list[str]:
+    """The machine identifier of every Plex server whose Plex database node is ``node_id`` ("" where unknown)."""
+    from ..web.settings_manager import get_settings_manager
+
+    out = []
+    for entry in get_settings_manager().get("media_servers") or []:
+        if not isinstance(entry, dict) or str(entry.get("type") or "").lower() != "plex":
+            continue
+        markers = entry.get("markers")
+        plex = markers.get("plex") if isinstance(markers, dict) else None
+        agent = plex.get("agent") if isinstance(plex, dict) else None
+        if isinstance(agent, dict) and agent.get("node_id") == node_id:
+            out.append(str(entry.get("server_identity") or ""))
+    return out
+
+
 def _default_record_uid(node_id: str, uid: str, url: str) -> None:
     """Save the id a node reported, when the record still has the address it was learnt at.
 
-    The saved key at the saved address is what makes a node this node: one that answers with a new id (recreated
-    without its ``/config``, reinstalled) is the same node, so the new id replaces the old one.
+    The saved key at the saved address is what makes a worker node this node: one that answers with a new id
+    (recreated without its ``/config``, reinstalled) is the same node, so the new id replaces the old one. A Plex
+    database node's new id only gets here once it is tied to its Plex (``NodeRegistry._new_uid_confirmed``).
     """
     from ..web.settings_manager import get_settings_manager
 
@@ -297,6 +317,7 @@ class NodeRegistry:
         legacy_ping: Asks an address the old Plex helper's ping; answers ``(agent state, version)``.
         record_uid: Persists the ``node_uid`` a node reported, given the address it answered at.
         quick_access: Checks one file per mapping row on a node; True when every one is visible.
+        served_plex_ids: The machine identifiers of the Plex servers that use a node as their Plex database node.
         app_version: This app's version (a worker node must match it exactly).
         app_build: This app's git commit, "" when unknown (a worker node reporting another one needs an update).
         attempt_gap_s: Seconds between the attempts of one check.
@@ -313,6 +334,7 @@ class NodeRegistry:
         legacy_ping: Callable[[str, str], tuple[str, str]] = _default_legacy_ping,
         record_uid: Callable[[str, str, str], None] = _default_record_uid,
         quick_access: Callable[[NodeClient, list[PathMapping]], bool] = _default_quick_access,
+        served_plex_ids: Callable[[str], list[str]] = _default_served_plex_ids,
         app_version: Callable[[], str] = _app_version,
         app_build: Callable[[], str] = protocol.build_sha,
         attempt_gap_s: float = ATTEMPT_GAP_S,
@@ -328,6 +350,7 @@ class NodeRegistry:
         self._legacy_ping = legacy_ping
         self._record_uid = record_uid
         self._quick_access = quick_access
+        self._served_plex_ids = served_plex_ids
         self._app_version = app_version
         self._app_build = app_build
         self._attempt_gap_s = attempt_gap_s
@@ -412,6 +435,23 @@ class NodeRegistry:
             if state == STATE_GPU_LOST:
                 return NodeCapacity(True, False, reason)
             return NodeCapacity(False, False, _CAPACITY_REASONS.get(state, reason))
+
+    def plex_db_refusal(self, node_id: str) -> str:
+        """Why this app sends no Plex database work to the node now ("" when it may).
+
+        A Plex database node that reports a new id could be a different machine that was given the same key and
+        address; unless its Plex is the one the server uses, the user confirms it by typing its key again.
+        """
+        self._sync()
+        with self._lock:
+            live = self._nodes.get(node_id)
+            if live is None or not live.unconfirmed_uid:
+                return ""
+            name = str(live.record.get("name") or "The Plex database node")
+        return (
+            f"{name} reports a new id and this app can't confirm it is the same Plex. Type the node's key again on "
+            "its Settings tab to confirm."
+        )
 
     # ------------------------------------------------------------------ reports from job code
 
@@ -681,6 +721,9 @@ class NodeRegistry:
             or (record.get("enabled", True) and not old.get("enabled", True))
         )
         live.record = copy.deepcopy(record)
+        if address_changed or old.get("node_uid") != record.get("node_uid"):
+            # Another address or key, or the key typed again (which clears the saved id): nothing to confirm now.
+            live.unconfirmed_uid = ""
         if address_changed:
             live.client = self._client_factory(record)
         if reconnect:
@@ -792,7 +835,10 @@ class NodeRegistry:
                     self._apply(live, outcome)
                     has_access_problem = bool(live.access_problem)
                 if outcome.uid and outcome.uid != record.get("node_uid"):
-                    self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
+                    self._new_uid(node_id, live, record, outcome)
+                elif outcome.uid:
+                    with self._lock:
+                        live.unconfirmed_uid = ""
                 if access and has_access_problem and outcome.state == STATE_READY:
                     self._quick_access_clear(node_id, live, client)
         except Exception:
@@ -800,6 +846,45 @@ class NodeRegistry:
         finally:
             with self._lock:
                 live.checking = False
+
+    def _new_uid(self, node_id: str, live: _Live, record: dict, outcome: _Outcome) -> None:
+        """Record a node's new id, or hold back a Plex database node's until it is tied to its Plex."""
+        if self._new_uid_confirmed(node_id, record, outcome):
+            with self._lock:
+                live.unconfirmed_uid = ""
+            self._record_uid(node_id, outcome.uid, str(record.get("url") or ""))
+            return
+        with self._lock:
+            if self._nodes.get(node_id) is not live or live.record.get("node_uid") != record.get("node_uid"):
+                return  # The id was cleared meanwhile (the key typed again): the next check records it.
+            if live.unconfirmed_uid != outcome.uid:
+                logger.warning(
+                    "{} reports a new id and isn't next to a Plex this app can confirm; its Plex database work waits "
+                    "until its key is typed again",
+                    record.get("name") or node_id,
+                )
+            live.unconfirmed_uid = outcome.uid
+
+    def _new_uid_confirmed(self, node_id: str, record: dict, outcome: _Outcome) -> bool:
+        """Whether a node's new id may replace the saved one without asking.
+
+        A worker node (or one with no saved id yet) is this node by its saved key and address. A Plex database node
+        writes into a Plex's database, so its new id is taken only when it names the Plex machine identifier of
+        every server that uses it; an empty identifier on either side (a Windows node with a custom Plex folder)
+        proves nothing.
+        """
+        if not record.get("node_uid") or protocol.ROLE_PLEX_DB not in outcome.roles:
+            return True
+        try:
+            served = self._served_plex_ids(node_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable settings can't confirm anything
+            logger.debug("Couldn't read which Plex servers use node {}: {}", node_id, exc)
+            return False
+        if not served:
+            return True  # No server writes through it: nothing to protect.
+        plex_db = (outcome.info or {}).get("plex_db")
+        theirs = str(plex_db.get("machine_identifier") or "") if isinstance(plex_db, dict) else ""
+        return bool(theirs) and all(ours == theirs for ours in served)
 
     def _apply(self, live: _Live, outcome: _Outcome) -> None:
         live.probe_state, live.probe_reason = outcome.state, outcome.reason

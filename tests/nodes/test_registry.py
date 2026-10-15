@@ -766,6 +766,62 @@ class TestAccessResultSurvivesRestart:
         assert Harness(access_store=store).registry.details("n1").access_result is None
 
 
+class TestNewPlexDatabaseNodeId:
+    """A Plex database node that reports a new id is taken silently only when its Plex is the one it serves."""
+
+    def _harness(self, served):
+        harness = Harness(nodes=[_record(node_uid="uid-1")])
+        harness.registry._served_plex_ids = lambda node_id: list(served)
+        return harness
+
+    def _answer(self, h, uid, machine_identifier="plex-a", roles=(ROLE_PLEX_DB,)):
+        info = _info(uid=uid, roles=roles)
+        info["plex_db"] = {"machine_identifier": machine_identifier}
+        h.client().default_info = info
+        h.registry.check_now("n1")
+
+    @pytest.mark.parametrize(
+        ("served", "machine_identifier", "recorded"),
+        [
+            (["plex-a"], "plex-a", True),
+            ([], "", True),
+            (["plex-a"], "", False),
+            ([""], "plex-a", False),
+            (["plex-a", "plex-b"], "plex-a", False),
+        ],
+        ids=["same-plex", "no-server-uses-it", "node-doesnt-say", "server-doesnt-say", "two-plexes"],
+    )
+    def test_when_its_new_id_is_recorded(self, served, machine_identifier, recorded):
+        h = self._harness(served)
+        self._answer(h, "uid-2", machine_identifier)
+        assert (h.uids == [("n1", "uid-2")]) is recorded
+        assert (h.registry.plex_db_refusal("n1") == "") is recorded
+        h.registry.stop()
+
+    def test_a_worker_node_with_a_new_id_is_recorded_whatever_its_plex(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "", roles=(ROLE_WORKER,))
+        assert h.uids == [("n1", "uid-2")] and h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_the_refusal_lifts_when_the_saved_id_is_cleared(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "")
+        assert "Type the node's key again" in h.registry.plex_db_refusal("n1")
+
+        h.change(node_uid=None)
+
+        assert h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+    def test_the_old_id_answering_again_lifts_the_refusal(self):
+        h = self._harness(["plex-a"])
+        self._answer(h, "uid-2", "")
+        self._answer(h, "uid-1", "")
+        assert h.registry.plex_db_refusal("n1") == ""
+        h.registry.stop()
+
+
 class TestRecordedNodeId:
     """What ``_default_record_uid`` writes to settings.json."""
 

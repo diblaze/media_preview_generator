@@ -119,11 +119,16 @@ AGENT_STATES: dict[str, tuple[str, str, str]] = {
         "no node",
         "Choose a Plex database node in Edit → Connection.",
     ),
+    "unconfirmed_node": (
+        "The Plex database node reports a new id",
+        "not confirmed",
+        "Type the node's key again on its Settings tab on the Nodes page to confirm it is the same Plex.",
+    ),
 }
 AGENT_FALLBACK_STATE = "unreachable"
 # States where this app refused to send anything: the fix is in this app (the Nodes page, Edit → Connection), not on
 # the node's machine.
-AGENT_FIXED_IN_APP = frozenset({"disabled", "no_node"})
+AGENT_FIXED_IN_APP = frozenset({"disabled", "no_node", "unconfirmed_node"})
 # Connected, and refused anyway: the agent is beside a different Plex than this server (a mistyped address).
 AGENT_WRONG_PLEX = (
     "The Plex database node is beside a different Plex",
