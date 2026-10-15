@@ -8,6 +8,7 @@ as parameters. Stdlib only, so the node's slim builds can import it.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 
 # What a Plex database node advertises when it can run these queries.
 LIBRARY_HEALTH_CAPABILITY = "library_health_v1"
@@ -61,8 +62,41 @@ WHERE t.tag_type = 12 AND tg.text IN ('intro', 'credits')
 """
 
 
+def query_rows(
+    conn: sqlite3.Connection, section_ids: list[int], *, want_markers: bool, want_chapters: bool
+) -> dict[str, Iterator[tuple]]:
+    """The queries for these sections, each run only when its rows are first read, one after another.
+
+    The app reads them straight into its lookups: holding every row in a second copy first costs a big library
+    about a third more memory on every Health check.
+
+    Args:
+        conn: A read-only connection to Plex's database, open until every query has been read.
+        section_ids: Plex library section ids (whole numbers, bound as parameters).
+        want_markers: Also read the intro/credits marker rows.
+        want_chapters: Also read chapters and the items' durations.
+
+    Returns:
+        ``{"parts", "audio_counts", "loudness_streams", "markers", "chapters", "durations"}``, each SQLite's row
+        tuples (``markers``/``chapters``/``durations`` empty when not wanted).
+    """
+    marks = ",".join("?" * len(section_ids))
+
+    def rows(sql: str, params: list[int]) -> Iterator[tuple]:
+        yield from conn.execute(sql.format(ids=marks), params)
+
+    return {
+        "parts": rows(PARTS_SQL, section_ids),
+        "audio_counts": rows(AUDIO_COUNT_SQL, section_ids),
+        "loudness_streams": rows(LOUDNESS_STREAMS_SQL, section_ids),
+        "markers": rows(MARKERS_SQL, []) if want_markers else iter(()),
+        "chapters": rows(CHAPTERS_SQL, section_ids) if want_chapters else iter(()),
+        "durations": rows(DURATIONS_SQL, section_ids) if want_chapters else iter(()),
+    }
+
+
 def read_rows(conn: sqlite3.Connection, section_ids: list[int], *, want_markers: bool, want_chapters: bool) -> dict:
-    """Run the queries for these sections.
+    """Run the queries for these sections, for a Plex database node's JSON reply.
 
     Args:
         conn: A read-only connection to Plex's database.
@@ -71,22 +105,10 @@ def read_rows(conn: sqlite3.Connection, section_ids: list[int], *, want_markers:
         want_chapters: Also read chapters and the items' durations.
 
     Returns:
-        ``{"parts", "audio_counts", "loudness_streams", "markers", "chapters", "durations"}``, each a list of row
-        lists exactly as SQLite returned them (``markers``/``chapters``/``durations`` empty when not wanted).
+        ``query_rows``' keys, each a list of row lists exactly as SQLite returned them.
     """
-    marks = ",".join("?" * len(section_ids))
-
-    def rows(sql: str, params: list[int]) -> list[list]:
-        return [list(row) for row in conn.execute(sql.format(ids=marks), params)]
-
-    return {
-        "parts": rows(PARTS_SQL, section_ids),
-        "audio_counts": rows(AUDIO_COUNT_SQL, section_ids),
-        "loudness_streams": rows(LOUDNESS_STREAMS_SQL, section_ids),
-        "markers": rows(MARKERS_SQL, []) if want_markers else [],
-        "chapters": rows(CHAPTERS_SQL, section_ids) if want_chapters else [],
-        "durations": rows(DURATIONS_SQL, section_ids) if want_chapters else [],
-    }
+    queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+    return {key: [list(row) for row in rows] for key, rows in queries.items()}
 
 
 def section_ids_from_json(raw: object) -> list[int]:

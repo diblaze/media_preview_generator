@@ -2,6 +2,7 @@
 
 import json
 import time
+import tracemalloc
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -353,6 +354,30 @@ def test_large_library_counts_quickly(monkeypatch, tmp_path):
     assert _cell(result, "1", Feature.PREVIEWS).done == total // 20
     assert _cell(result, "1", Feature.LOUDNESS).done == total // 2
     assert elapsed < 5
+
+
+def test_a_local_database_is_read_straight_into_the_lookups_without_a_second_copy(monkeypatch, tmp_path):
+    # Copying every row into lists before the lookups cost big libraries about 40% more peak memory per check.
+    monkeypatch.setattr(plex, "skipped_count_by_part_hash", lambda _ffmpeg: {})
+    items = [
+        _with_chapters(
+            _movie(f"M{i}", f"/m/{i}.mkv", f"{i:040x}", SD_FLAG, [_FULL_LOUDNESS], tags=("intro",)),
+            [(0, ""), (300_000, "media://x")],
+        )
+        for i in range(2000)
+    ]
+    db_path = tmp_path / "plex.db"
+    build_plex_db(db_path, items)
+
+    tracemalloc.start()
+    try:
+        rows = plex._read_rows(FakeLocalDb(db_path), [1], want_markers=True, want_chapters=True)
+        kept, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(rows.parts) == 2000 and len(rows.chapters) == 2000 and len(rows.markers) == 2000
+    assert peak <= kept * 1.15, f"reading the rows peaked at {peak / kept:.2f}x what the lookups keep"
 
 
 def test_an_undecodable_audio_stream_does_not_keep_the_part_to_do(monkeypatch, tmp_path):

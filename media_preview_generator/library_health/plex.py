@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
@@ -31,7 +31,7 @@ from ..output.plex_bundle import PlexBundleAdapter
 from ..output.plex_hash import get_source_fingerprint
 from ..servers.base import MediaServer, ServerConfig
 from .models import Cell, CellState, CheckCancelled, Feature, LibraryResult, ServerResult, TodoFile
-from .plex_rows import read_rows
+from .plex_rows import query_rows
 from .scope import LibraryScope, excluded, library_scopes
 
 ACCESS_DIRECT = "Reads Plex's database directly"
@@ -230,8 +230,8 @@ def _parse_missing(text: str | None) -> list[tuple[int, int]]:
     return missing
 
 
-def _rows_from(raw: dict, undecodable: dict[str, int]) -> _PlexRows:
-    """The queries' rows (``plex_rows.read_rows``' shape, read here or by a Plex database node) as lookups.
+def _rows_from(raw: Mapping[str, Iterable[Sequence[Any]]], undecodable: dict[str, int]) -> _PlexRows:
+    """The queries' rows (``plex_rows.query_rows``' cursors here, or a Plex database node's lists) as lookups.
 
     Raises:
         ValueError: A node sent rows in another shape.
@@ -277,10 +277,10 @@ def _read_rows(
             needs=LIBRARY_HEALTH_AGENT_VERSION,
             machine_identifier=machine_identifier,
         )
-    else:
-        with db._database(read_only=True, deadline=deadline) as conn:
-            raw = read_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
-    return _rows_from(raw, skipped_count_by_part_hash(ffmpeg))
+        return _rows_from(raw, skipped_count_by_part_hash(ffmpeg))
+    with db._database(read_only=True, deadline=deadline) as conn:
+        queries = query_rows(conn, section_ids, want_markers=want_markers, want_chapters=want_chapters)
+        return _rows_from(queries, skipped_count_by_part_hash(ffmpeg))
 
 
 def _loudness_done(part_id: int, part_hash: str, rows: _PlexRows) -> bool:
