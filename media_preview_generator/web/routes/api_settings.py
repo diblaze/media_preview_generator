@@ -1762,10 +1762,35 @@ def _bring_restored_settings_up_to_date(settings: Any, live_groups_revision: int
     """
     from ...upgrade import _CURRENT_SCHEMA_VERSION, run_migrations
 
-    if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
-        run_migrations(settings)
-    revision = max(settings.worker_groups_revision, live_groups_revision) + 1
-    settings.apply_changes(updates={"worker_groups_revision": revision})
+    try:
+        if settings.get("_schema_version", 1) < _CURRENT_SCHEMA_VERSION:
+            run_migrations(settings)
+    finally:
+        # Even when a migration failed: the restored file is in place either way, and the pool must follow it.
+        revision = max(settings.worker_groups_revision, live_groups_revision) + 1
+        settings.apply_changes(updates={"worker_groups_revision": revision})
+
+
+def _settings_replaced(settings: Any) -> str | None:
+    """Make everything that read the old settings.json read the restored one: the config cache, the node registry and
+    the running worker pool.
+
+    Args:
+        settings: The settings manager, holding the restored file.
+
+    Returns:
+        A warning when the worker pool couldn't be refreshed, else None.
+    """
+    from ...config import clear_config_cache
+    from ...nodes.registry import get_registry
+
+    clear_config_cache()
+    get_registry().settings_replaced()
+    if not isinstance(settings.get("worker_groups"), list):
+        return None
+    from .api_worker_groups import reconcile_group_settings
+
+    return reconcile_group_settings(settings)
 
 
 def _newer_settings_refusal(path: str) -> str:
@@ -1857,37 +1882,36 @@ def restore_backup():
     # the next save of anything would write the old in-memory content back over the restore.
     settings = get_settings_manager()
     tmp_path = f"{live}.restore.tmp"
+    replaced = False
+    failure = None
     try:
         with settings.locked():
             live_groups_revision = settings.worker_groups_revision
             shutil.copy2(bak_path, tmp_path)
             os.replace(tmp_path, live)
+            replaced = True
             if name == "settings.json":
                 settings.reload()
                 _bring_restored_settings_up_to_date(settings, live_groups_revision)
             elif name == "setup_state.json":
                 settings.reload_setup_state()
-    except OSError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
     except Exception as exc:
-        logger.exception("Restored {} from {}, but updating it to this version failed", live, bak_path)
-        return jsonify({"success": False, "error": f"Restored, but updating it to this version failed: {exc}"}), 500
+        if not replaced:
+            failure = str(exc) if isinstance(exc, OSError) else f"Restore failed: {exc}"
+            logger.warning("Couldn't restore {} from {}: {}", live, bak_path, exc)
+        else:
+            failure = f"Restored, but updating it to this version failed: {exc}"
+            logger.exception("Restored {} from {}, but updating it to this version failed", live, bak_path)
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
-    body = {"success": True, "file": name, "backup": os.path.basename(bak_path)}
-    if name == "settings.json":
-        from ...config import clear_config_cache
-        from ...nodes.registry import get_registry
-
-        clear_config_cache()
-        get_registry().settings_replaced()
-        if isinstance(settings.get("worker_groups"), list):
-            from .api_worker_groups import reconcile_group_settings
-
-            warning = reconcile_group_settings(settings)
-            if warning:
-                body["warning"] = warning
+    # Whenever the file was replaced, even with its update failed: what read the old file must read this one.
+    warning = _settings_replaced(settings) if replaced and name == "settings.json" else None
+    if failure:
+        return jsonify({"success": False, "error": failure}), 500
 
     logger.info("Restored {} from {}", live, bak_path)
+    body = {"success": True, "file": name, "backup": os.path.basename(bak_path)}
+    if warning:
+        body["warning"] = warning
     return jsonify(body)
