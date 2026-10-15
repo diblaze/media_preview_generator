@@ -100,7 +100,9 @@ class TestLibraryRoots:
             {"id": "bad", "type": "nonsense"},
         ]
         roots = nm.library_roots(servers)
-        assert roots == [nm.LibraryRoot("Home", "p1", "Movies", "1", str(tmp_path / "media" / "Movies"))]
+        assert roots == [
+            nm.LibraryRoot("Home", "p1", "Movies", "1", str(tmp_path / "media" / "Movies"), "/plexmedia/Movies")
+        ]
 
 
 class TestSampleFiles:
@@ -204,12 +206,44 @@ class TestRunTestAccess:
         lib = result["libraries"][0]
         assert (lib["checked"], lib["ok"]) == (0, False)
         assert "can't open" in lib["error"]
+        assert lib["empty"] is False
         assert client.requests == []
 
     def test_an_empty_library_says_no_videos_were_found(self, tmp_path):
         (tmp_path / "media" / "Movies").mkdir(parents=True)
         servers = [_server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/plexmedia/Movies"]}])]
-        assert "No video files" in nm.run_test_access(FakeClient(), [], servers)["libraries"][0]["error"]
+        lib = nm.run_test_access(FakeClient(), [], servers)["libraries"][0]
+        assert "No video files" in lib["error"]
+        assert lib["empty"] is True
+
+    @staticmethod
+    def _multi_disk(tmp_path, disks):
+        server = _server(tmp_path, [{"id": "1", "name": "Movies", "remote_paths": ["/data/Movies"]}])
+        server["path_mappings"] = [{"remote_prefix": "/data", "local_prefix": str(tmp_path / d)} for d in disks]
+        return [server]
+
+    def test_a_disk_without_the_library_folder_is_left_out_while_another_disk_holds_it(self, tmp_path, real_node):
+        _video(tmp_path / "disk1" / "Movies" / "a.mkv", b"x" * 10)
+        (tmp_path / "disk2").mkdir()
+        _video(tmp_path / "nas" / "disk1" / "Movies" / "a.mkv", b"x" * 10)
+        rows = [PathMapping(str(tmp_path / d), str(tmp_path / "nas" / d)) for d in ("disk1", "disk2")]
+
+        libraries = nm.run_test_access(real_node, rows, self._multi_disk(tmp_path, ["disk1", "disk2"]))["libraries"]
+
+        assert [(lib["app_root"], lib["ok"], lib["error"]) for lib in libraries] == [
+            (str(tmp_path / "disk1" / "Movies"), True, None)
+        ]
+
+    def test_a_library_missing_from_every_disk_says_the_app_cant_open_it(self, tmp_path):
+        for disk in ("disk1", "disk2"):
+            (tmp_path / disk).mkdir()
+
+        libraries = nm.run_test_access(FakeClient(), [], self._multi_disk(tmp_path, ["disk1", "disk2"]))["libraries"]
+
+        assert [lib["error"] for lib in libraries] == [
+            f"This app can't open {tmp_path / 'disk1' / 'Movies'}",
+            f"This app can't open {tmp_path / 'disk2' / 'Movies'}",
+        ]
 
     def test_a_misnamed_node_folder_gets_a_suggestion_from_a_real_node(self, tmp_path, real_node):
         _video(tmp_path / "media" / "Movies" / "a.mkv", b"x" * 10)

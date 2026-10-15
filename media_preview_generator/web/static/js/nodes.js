@@ -472,8 +472,10 @@
                 if (row) $('.nd-chip-slot', row).insertAdjacentHTML('beforeend', libraryChip(lib));
                 else loose.push(libraryChip(lib));
             });
-            const failures = libraries.map((lib, i) => (lib.ok ? '' : failureCard(lib, i))).join('');
-            const allOk = libraries.every((lib) => lib.ok);
+            // A library with no video yet has nothing to test; its chip says so and it isn't a failure.
+            const passed = (lib) => lib.ok || lib.empty === true;
+            const failures = libraries.map((lib, i) => (passed(lib) ? '' : failureCard(lib, i))).join('');
+            const allOk = libraries.every(passed);
             results.innerHTML = (loose.length ? `<div class="nd-lib-chips">${loose.join('')}</div>` : '')
                 + (allOk ? `<div class="sm-vmsg ok"><i class="bi bi-check-circle-fill"></i>The node sees every library, same files.</div>` : failures);
         }

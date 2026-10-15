@@ -390,12 +390,14 @@ helper this app can use), `request` (the node refused the request as malformed),
 node than the saved one answers there).
 
 `LIBRARY_ACCESS = {server, library, app_root, checked, ok, files: [{path, ok, kind, message, node_path}], nearby:
-{node_dir: [names]}, suggestion: {from, to} | null, error: str | null}`. `kind` is a `NOT_VISIBLE_*` reason (`""` when
+{node_dir: [names]}, suggestion: {from, to} | null, error: str | null, empty: bool}`. `kind` is a `NOT_VISIBLE_*` reason (`""` when
 seen); `nearby` holds the node's listings of the deepest existing folder above this library's missing files inside
 the mapped roots or, when the row's node folder itself doesn't exist, the folder names (no files) in its parent, never
 higher; `suggestion` swaps the covering row's `node_prefix` for a listed folder named like the library folder
 (exact name first, then ignoring case, then ignoring Unicode form; `from`, `to` are node-side paths); `error` says
-why no file was sampled (folder missing or no video near its top), with `checked: 0`.
+why no file was sampled (folder missing, timed out, or no video near its top), with `checked: 0`; `empty` is true for
+the last (an empty library is not a problem: its Setup Health row passes). One server folder mapped to several disks
+reports only the disks that hold it, unless none does.
 
 Node Setup Health rows are server Setup Health rows; a failing one also says where its fix is: `fix_tab`
 (`media` / `settings` / `overview`, the node dialog tab) with `fix_label` and, on a media row, `suggestion: {from, to,

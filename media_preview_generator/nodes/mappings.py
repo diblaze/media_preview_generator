@@ -47,6 +47,8 @@ class LibraryRoot:
     library: str
     library_id: str
     app_root: str
+    # The server's folder this one was mapped from: a multi-disk setup maps one to several of this app's folders.
+    remote: str = ""
 
 
 def library_roots(servers: list[dict]) -> list[LibraryRoot]:
@@ -80,7 +82,7 @@ def library_roots(servers: list[dict]) -> list[LibraryRoot]:
                     if key in seen:
                         continue
                     seen.add(key)
-                    out.append(LibraryRoot(cfg.name, cfg.id, lib.name, lib.id, root))
+                    out.append(LibraryRoot(cfg.name, cfg.id, lib.name, lib.id, root, remote))
     return out
 
 
@@ -91,6 +93,7 @@ class _Sampling:
     found: list[dict] = field(default_factory=list)
     folder: str = ""
     timed_out: bool = False
+    opened: bool = False
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -130,6 +133,7 @@ def _sample_into(sampling: _Sampling, root: str, *, limit: int, walk_limit: int,
                 entries = sorted(it, key=lambda e: e.name)
         except OSError:
             continue
+        sampling.opened = True
         for entry in entries:
             seen += 1
             if seen > walk_limit or len(found) >= limit:
@@ -297,8 +301,10 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
     Returns:
         ``{"libraries": [{"server", "library", "app_root", "checked", "ok", "files": [{"path", "ok", "kind",
         "message", "node_path"}], "nearby": {node_dir: [names]}, "suggestion": {"from", "to"} | None,
-        "error": str | None}]}``. ``nearby`` lists what the node does see above the library's missing files;
-        ``suggestion`` is the corrected ``node_prefix`` of the row covering the library.
+        "error": str | None, "empty": bool}]}``. ``nearby`` lists what the node does see above the library's
+        missing files; ``suggestion`` is the corrected ``node_prefix`` of the row covering the library; ``empty`` says this app
+        opened the folder and found no video near its top. A disk of a multi-disk library that lacks the folder is
+        left out while another disk holds it.
 
     Raises:
         NodeError: The node couldn't be asked.
@@ -309,9 +315,15 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
     samples = {root: list(samplings[root].found) for root in roots}
     files = [f for picked in samples.values() for f in picked]
     results, nearby = _check(client, mappings, files) if files else ({}, {})
+    # One server folder mapped to several disks: a disk without it is normal while another disk holds it.
+    held = {(r.server_id, r.library_id, r.remote) for r in roots if samplings[r].opened}
     libraries = []
     for root in roots:
         picked = samples[root]
+        sampling = samplings[root]
+        if not picked and not sampling.opened and not sampling.timed_out:
+            if (root.server_id, root.library_id, root.remote) in held:
+                continue
         rows = []
         for f in picked:
             result = results.get(f["path"]) or {}
@@ -327,16 +339,14 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
         ok = bool(rows) and all(r["ok"] for r in rows)
         seen_nearby = _nearby_for(rows, nearby)
         error = None
-        if not picked and samplings[root].timed_out:
-            error = (
-                f"Timed out reading {samplings[root].folder or root.app_root} (no answer within {SAMPLE_BUDGET_S:g} s)"
-            )
+        empty = False
+        if not picked and sampling.timed_out:
+            error = f"Timed out reading {sampling.folder or root.app_root} (no answer within {SAMPLE_BUDGET_S:g} s)"
+        elif not picked and not sampling.opened:
+            error = f"This app can't open {root.app_root}"
         elif not picked:
-            error = (
-                f"This app can't open {root.app_root}"
-                if not os.path.isdir(root.app_root)
-                else f"No video files found near the top of {root.app_root}"
-            )
+            empty = True
+            error = f"No video files found near the top of {root.app_root}"
         libraries.append(
             {
                 "server": root.server,
@@ -348,6 +358,7 @@ def run_test_access(client: NodeClient, mappings: list[PathMapping], servers: li
                 "nearby": seen_nearby,
                 "suggestion": None if ok or not rows else suggest_row(root.app_root, mappings, seen_nearby),
                 "error": error,
+                "empty": empty,
             }
         )
     return {"libraries": libraries}

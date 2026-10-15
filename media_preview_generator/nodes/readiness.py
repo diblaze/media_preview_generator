@@ -187,8 +187,20 @@ def _media_access(details: NodeDetails) -> list[dict[str, Any]]:
         if not isinstance(lib, dict):
             continue
         label = f"{lib.get('server')} · {lib.get('library')}"
+        if not lib.get("checked") and lib.get("empty"):
+            rows.append(
+                _row(
+                    f"node_access_{index}",
+                    f"{label}: no video files in this library yet",
+                    severity=RECOMMENDED,
+                    ok=True,
+                    explanation="Test access found no video near the top of this library's folder, so there was "
+                    "nothing to ask the node about.",
+                )
+            )
+            continue
         if not lib.get("checked"):
-            # Nothing was sampled: this app can't open the folder itself or found no video in it, so the node was
+            # Nothing was sampled: this app can't open the folder itself or timed out reading it, so the node was
             # never asked. Blaming the node (critical, "Open Media") would send the user to the wrong machine.
             rows.append(
                 _row(
