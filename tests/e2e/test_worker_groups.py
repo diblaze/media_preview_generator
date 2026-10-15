@@ -896,3 +896,39 @@ def test_capacity_line_counts_node_workers_apart_from_this_apps(
     group_api["state"]["capacity"].update(current={"cpu": 0, "gpu": 0}, peak={"cpu": 0, "gpu": 0}, **(nodes or {}))
     settings_page(authed_page, app_url)
     expect(authed_page.locator("#workerGroupCapacity")).to_contain_text(expected)
+
+
+def _with_nas_node(group_api: dict, gpu_status: str = "ok") -> None:
+    """A node "nas" with its CPU and its one GPU in the first group, next to this app's CPU."""
+    group_api["state"]["nodes"] = [
+        {
+            "id": "nas",
+            "name": "nas-node",
+            "state": "ready",
+            "reason": "",
+            "devices": [{"device": "cuda:0", "name": "Quadro P5000", "type": "NVIDIA", "status": gpu_status}],
+            "cpu_cores": 8,
+        }
+    ]
+    group_api["state"]["groups"][0]["members"] += [
+        {"id": "m-ncpu", "resource": "cpu", "device": None, "count": 1, "job_types": ["loudness"], "node": "nas"},
+        {"id": "m-ngpu", "resource": "gpu", "device": "cuda:0", "count": 1, "job_types": ["previews"], "node": "nas"},
+    ]
+
+
+def test_each_machines_cpu_and_gpu_get_their_own_colour(authed_page: Page, app_url: str, group_api: dict) -> None:
+    _with_nas_node(group_api)
+    _add_gpu_member(group_api)
+    settings_page(authed_page, app_url)
+    row = authed_page.locator('#workerGroupRows [data-group-id="cpu-night"]')
+    colours = row.locator(".mchip").evaluate_all("chips => chips.map(c => c.style.getPropertyValue('--c'))")
+    assert len(colours) == 4 and len(set(colours)) == 4, colours
+
+
+def test_a_node_gpu_that_failed_its_test_says_so_instead_of_not_found(
+    authed_page: Page, app_url: str, group_api: dict
+) -> None:
+    _with_nas_node(group_api, gpu_status="failed")
+    settings_page(authed_page, app_url)
+    chip = authed_page.locator('#workerGroupRows [data-group-id="cpu-night"] .mchip', has_text="P5000")
+    expect(chip).to_have_attribute("title", re.compile("GPU failed its test on this node"))

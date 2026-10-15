@@ -99,24 +99,43 @@
         if (member.resource === 'cpu') return ['ready', 'gpu_lost'].includes(node.state) ? '' : reason;
         if (node.state !== 'ready') return reason;
         const gpu = (node.devices || []).find(item => item.device === member.device);
-        return gpu && gpu.status !== 'failed' ? '' : 'GPU not found on this node';
+        if (!gpu) return 'GPU not found on this node';
+        return gpu.status === 'failed' ? 'GPU failed its test on this node' : '';
     }
 
-    // The dashboard page does not load week_graph.js, so it keeps the same palette (CPU green, GPUs in detected order).
-    const FALLBACK_GPU_COLORS = ['var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)'];
-    // Local GPUs keep their colours; a node's GPUs follow them, so a node GPU named like a local one still differs.
-    const paletteKey = member => (member.node ? `node:${member.node}:${member.device}` : member.device);
+    // The dashboard page does not load week_graph.js, so it keeps a copy of the same palette (see week_graph.js).
+    const FALLBACK_GPU_COLORS = [
+        'var(--run)', 'var(--t-intro)', 'var(--t-loud)', 'var(--accent)', 'var(--t-chapters)',
+        'color-mix(in srgb, var(--run) 50%, var(--t-chapters))', 'color-mix(in srgb, var(--t-loud) 50%, var(--accent))',
+        'color-mix(in srgb, var(--t-intro) 50%, var(--t-loud))',
+    ];
+    const FALLBACK_CPU_COLORS = [
+        'var(--ok)', 'color-mix(in srgb, var(--ok) 55%, var(--accent))', 'color-mix(in srgb, var(--ok) 55%, var(--bs-body-color))',
+        'color-mix(in srgb, var(--ok) 45%, var(--bs-body-bg))',
+    ];
+    // Local devices keep their colours; each node's follow them, so a node's CPU or a node GPU named like a local
+    // one still differs.
+    const paletteKey = member => {
+        const device = member.resource === 'cpu' ? 'cpu' : member.device;
+        return member.node ? `node:${member.node}:${device}` : device;
+    };
     const paletteDevices = () => [
+        { resource: 'cpu', device: 'cpu' },
         ...(snapshot.hardware || []).map(item => ({ device: item.device })),
-        ...nodesList().flatMap(node => (node.devices || []).map(item => ({ device: `node:${node.id}:${item.device}` }))),
+        ...nodesList().flatMap(node => [
+            { resource: 'cpu', device: `node:${node.id}:cpu` },
+            ...(node.devices || []).map(item => ({ device: `node:${node.id}:${item.device}` })),
+        ]),
     ];
     function deviceColor(member) {
         const keyed = { resource: member.resource, device: paletteKey(member) };
         const palette = paletteDevices();
         if (window.WeekGraph) return window.WeekGraph.deviceColor(keyed, palette);
-        if (member.resource === 'cpu') return 'var(--ok)';
-        const index = palette.findIndex(item => item.device === keyed.device);
-        return FALLBACK_GPU_COLORS[(index < 0 ? palette.length : index) % FALLBACK_GPU_COLORS.length];
+        const cpu = member.resource === 'cpu';
+        const pool = palette.filter(item => (item.resource === 'cpu') === cpu);
+        const index = pool.findIndex(item => item.device === keyed.device);
+        const colors = cpu ? FALLBACK_CPU_COLORS : FALLBACK_GPU_COLORS;
+        return colors[(index < 0 ? (cpu ? 0 : pool.length) : index) % colors.length];
     }
     const totalWorkers = group => group.members.reduce((sum, member) => sum + member.count, 0);
     const groupJobTypes = group => [...new Set(group.members.flatMap(member => member.job_types))];
