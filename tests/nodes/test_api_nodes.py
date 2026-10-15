@@ -618,8 +618,19 @@ class TestHealthAndLog:
     def test_log_errors(self, client, nodes):
         node_id = _add(client).get_json()["id"]
         assert client.get(f"/api/nodes/{node_id}/log?lines=x").status_code == 400
-        nodes("http://nuc:9494").log_answer = NodeProtocolError("old helper")
-        assert client.get(f"/api/nodes/{node_id}/log").status_code == 502
+        nodes("http://nuc:9494").log_answer = NodeProtocolError("other protocol", node={"version": "8.0.0"})
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 502 and resp.get_json()["error"] == "Couldn't read nuc's log: other protocol"
+
+    def test_the_log_of_an_older_plex_helper_says_it_cant_share_one_in_plain_words(self, client, nodes):
+        node_id = _add(client).get_json()["id"]
+        refusal = "This Plex marker agent is version 1.0.0 and speaks protocol 1; the app asked for none."
+        nodes("http://nuc:9494").log_answer = NodeProtocolError(refusal)
+        resp = client.get(f"/api/nodes/{node_id}/log")
+        assert resp.status_code == 502
+        assert resp.get_json()["error"] == (
+            "This node is an older Plex helper and can't share its log. Update it to see its log here."
+        )
 
 
 class TestAuth:
