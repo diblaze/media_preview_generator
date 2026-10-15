@@ -772,13 +772,20 @@ def _migrate_to_v3(sm) -> list:
     return []
 
 
+def _v4_scanner_name(entry: str | None) -> str:
+    """The name v4 gives the Recently Added schedule it makes for a ``recently_added_libraries`` entry (None: every
+    library)."""
+    return "Recently Added Scanner" if entry is None else f"Recently Added Scanner — {entry}"
+
+
 def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bool:
     """Whether a Recently Added schedule already scans what v4 would make one for.
 
     A settings file from before v4 restored over an install that already ran it (Settings -> Backups, or copied back
     by hand) runs v4 again; the schedules it made the first time are still in schedules.json, maybe renamed or
     retimed since. For every library, any Recently Added schedule counts: the one v4 made may have been pointed at
-    some libraries since, and Recently Added schedules only exist once v4 has run.
+    some libraries since, and Recently Added schedules only exist once v4 has run. For one library, a schedule for
+    every library counts, and so does the one v4 made for it (by its name) pointed at other libraries since.
 
     Args:
         schedules: Every stored schedule.
@@ -793,6 +800,10 @@ def _has_recently_added_schedule(schedules: list[dict], entry: str | None) -> bo
         if schedule.get("library_id"):
             ids.add(str(schedule["library_id"]))
         name = str(schedule.get("library_name") or "")
+        if not ids and not name:
+            return True
+        if schedule.get("name") == _v4_scanner_name(entry):
+            return True
         if (entry in ids) if entry.isdigit() else (name == entry):
             return True
     return False
@@ -851,7 +862,7 @@ def _migrate_to_v4(sm) -> list:
                 notes.append("v4: the recently-added schedule is already there")
             elif not library_entries:
                 schedule = manager.create_schedule(
-                    name="Recently Added Scanner",
+                    name=_v4_scanner_name(None),
                     interval_minutes=interval,
                     library_id=None,
                     library_name="",
@@ -866,7 +877,7 @@ def _migrate_to_v4(sm) -> list:
                 missing = [entry for entry in library_entries if not _has_recently_added_schedule(existing, entry)]
                 for entry in missing:
                     schedule = manager.create_schedule(
-                        name=f"Recently Added Scanner — {entry}",
+                        name=_v4_scanner_name(entry),
                         interval_minutes=interval,
                         library_id=entry if entry.isdigit() else None,
                         library_name=entry if not entry.isdigit() else "",

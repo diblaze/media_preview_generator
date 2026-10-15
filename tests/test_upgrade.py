@@ -1052,6 +1052,45 @@ class TestMigrateToV4:
 
         assert sorted(s["library_id"] for s in manager.get_all_schedules()) == ["1", "2"]
 
+    @pytest.mark.parametrize("existing", ["all-libraries", "retargeted"])
+    def test_restoring_a_library_list_counts_a_scanner_that_still_covers_it(
+        self, settings_manager, _fresh_schedule_manager, existing
+    ):
+        """A restored 2.x file with a library list runs v4 again. A Recently Added schedule for every library covers
+        each library on the list, and so do the ones v4 made for them after they were pointed at other libraries."""
+        from media_preview_generator.upgrade import _migrate_to_v4
+        from media_preview_generator.web.scheduler import get_schedule_manager
+
+        legacy = {
+            "recently_added_enabled": True,
+            "recently_added_interval_minutes": 15,
+            "recently_added_lookback_hours": 24,
+            "recently_added_libraries": ["1", "TV Shows"],
+        }
+        manager = get_schedule_manager(config_dir=_fresh_schedule_manager)
+        if existing == "all-libraries":
+            manager.create_schedule(
+                name="Every library",
+                interval_minutes=30,
+                library_id=None,
+                library_name="",
+                config={"job_type": "recently_added", "lookback_hours": 24},
+                enabled=True,
+            )
+        else:
+            settings_manager.apply_changes(updates=legacy)
+            _migrate_to_v4(settings_manager)
+            for schedule in manager.get_all_schedules():
+                manager.update_schedule(schedule["id"], library_id="7", library_name="Kids")
+        first = manager.get_all_schedules()
+
+        settings_manager.apply_changes(updates=legacy)
+        notes = _migrate_to_v4(settings_manager)
+
+        assert sorted(s["id"] for s in manager.get_all_schedules()) == sorted(s["id"] for s in first)
+        assert settings_manager.get("recently_added_enabled") is None
+        assert not any("created" in n for n in notes), notes
+
 
 class TestMigrateToV6:
     """Tests for the v6 migration that strips stale generic 'cuda' gpu_config entries."""
