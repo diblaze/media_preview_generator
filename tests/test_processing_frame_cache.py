@@ -21,7 +21,7 @@ from media_preview_generator.processing.frame_cache import (
     get_frame_cache,
     reset_frame_cache,
 )
-from media_preview_generator.processing.generator import WorkingFolderError
+from media_preview_generator.processing.generator import CancellationError, WorkingFolderError
 from media_preview_generator.processing.multi_server import (
     MultiServerStatus,
     process_canonical_path,
@@ -97,6 +97,16 @@ class TestFrameCacheBasics:
 
         assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
         # On-disk dir is gone too.
+        assert not slot.exists()
+
+    def test_invalidate_removes_a_slot_no_entry_owns(self, tmp_path):
+        """An extraction stopped part-way leaves frames in the slot before any entry is stored for them."""
+        cache = FrameCache(tmp_path / "cache")
+        slot = cache.frame_dir_for(str(tmp_path / "m.mkv"))
+        _populate_real_jpgs(slot, count=2)
+
+        cache.invalidate(str(tmp_path / "m.mkv"))
+
         assert not slot.exists()
 
     def test_clear_drops_everything(self, tmp_path):
@@ -756,6 +766,46 @@ class TestDispatcherIntegration:
         assert len(runs) == 3, "the third dispatch reused the slot the failed regenerate emptied"
         assert third.status is MultiServerStatus.PUBLISHED
         assert read_bif_metadata(str(sidecar)).frame_count == 3
+
+    @pytest.mark.parametrize("regenerate", [False, True], ids=["dispatch", "regenerate"])
+    def test_an_extraction_cancelled_part_way_leaves_no_frames_in_the_slot(self, mock_config, tmp_path, regenerate):
+        """With no entry for them, the frames would wait there for a sibling BIF to be unpacked beside them."""
+        mock_config.tmp_folder = str(tmp_path / "tmp")
+        mock_config.working_tmp_folder = str(tmp_path / "tmp")
+        media = tmp_path / "movies" / "Test.mkv"
+        _seed_canonical_file(media)
+        registry = ServerRegistry.from_settings(
+            [
+                {
+                    "id": "emby-1",
+                    "type": "emby",
+                    "name": "Emby",
+                    "enabled": True,
+                    "url": "http://emby:8096",
+                    "auth": {},
+                    "libraries": [
+                        {"id": "1", "name": "Movies", "remote_paths": [str(tmp_path / "movies")], "enabled": True}
+                    ],
+                    "output": {"adapter": "emby_sidecar", "width": 320, "frame_interval": 10},
+                }
+            ],
+        )
+        slot = get_frame_cache(base_dir=str(tmp_path / "tmp" / "frame_cache")).frame_dir_for(str(media))
+
+        def cancelled_part_way(video_file, output_folder, *args, **kwargs):
+            assert output_folder == str(slot)
+            _populate_real_jpgs(Path(output_folder), count=4)
+            raise CancellationError(f"Processing cancelled for {video_file}")
+
+        with (
+            patch("media_preview_generator.processing.multi_server.generate_images", side_effect=cancelled_part_way),
+            pytest.raises(CancellationError),
+        ):
+            process_canonical_path(
+                canonical_path=str(media), registry=registry, config=mock_config, regenerate=regenerate
+            )
+
+        assert not slot.exists()
 
     def test_use_frame_cache_false_uses_adhoc_tmp(self, mock_config, tmp_path):
         mock_config.working_tmp_folder = str(tmp_path / "tmp")

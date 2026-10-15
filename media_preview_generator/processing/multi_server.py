@@ -66,6 +66,7 @@ from .generator import (
     CancellationError,
     CodecNotSupportedError,
     WorkingFolderError,
+    _clean_output_images,
     _cleanup_temp_directory,
     generate_images,
     gpu_fallback_announcement,
@@ -811,7 +812,7 @@ def _try_reuse_existing_bif(
         publishers: ``[(server, adapter, item_id_hint), ...]`` from the
             normal publisher resolution step.
         canonical_path: The source media file we're trying to publish.
-        out_dir: Frame-cache slot to unpack into. Must be safe to overwrite.
+        out_dir: Frame-cache slot to unpack into; its JPEGs are removed first.
         probe_bundle_factory: Zero-arg callable returning a placeholder
             :class:`BifBundle` for ``compute_output_paths`` (the Plex bundle
             path reads the canonical_path and, for bulk scans, the server hash).
@@ -884,6 +885,8 @@ def _try_reuse_existing_bif(
                 continue
             try:
                 os.makedirs(out_dir, exist_ok=True)
+                # BIF writers pack every .jpg in the folder: frames a stopped run or a failed unpack left would follow.
+                _clean_output_images(out_dir)
                 count = unpack_bif_to_jpegs(candidate_str, out_dir)
             except Exception as exc:
                 logger.warning(
@@ -2018,8 +2021,9 @@ def _process_canonical_path_previews(
     cache_hit: bool = False
     cleanup_path: str | None = None
     generation_lock = None
-    # The extraction empties the cache slot first. Until its frames are stored again, an entry left from before (a
-    # regenerate skips the lookup) describes frames that are gone, so a run that stops short drops it.
+    # The extraction and a sibling BIF's unpack empty the cache slot first. Until frames are stored again, an entry left
+    # from before (a regenerate skips the lookup) describes frames that are gone, and frames written since have no
+    # entry, so a run that stops short drops the entry and the slot folder.
     slot_emptied = False
 
     # Acquire the per-path lock first (when caching is on) so the
@@ -2077,6 +2081,7 @@ def _process_canonical_path_previews(
             # publisher means *its* BIF is stale, so unpacking it would
             # serve frames from the previous source-file revision.
             unpack_dest = str(cache.frame_dir_for(canonical_path))
+            slot_emptied = True
             recovered = _try_reuse_existing_bif(
                 publishers,
                 canonical_path,
@@ -2098,6 +2103,7 @@ def _process_canonical_path_previews(
                     extraction_key=extraction_key,
                     source_fingerprint=source_fingerprint,
                 )
+                slot_emptied = False
                 _phase("Reusing sibling BIF")
                 logger.info(
                     "Frames: REUSED from existing BIF for {} ({} frames, no FFmpeg)",

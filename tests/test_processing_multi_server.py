@@ -1306,11 +1306,13 @@ class TestCrossServerBifReuse:
         truncate_plex_bif_to: int | None = None,
         header_interval_ms: int | None = None,
         timestamp_step: int = 1,
+        slot_leftovers: int = 0,
     ):
         """Plex already has an ``index-sd.bif`` made at ``plex_bif_interval_ms``; Emby at 5 s has no output yet.
 
         Plex's bundle path doesn't encode the interval, so the BIF still looks fresh after an interval change.
         ``truncate_plex_bif_to`` cuts the Plex BIF to that many bytes, as a partial write would.
+        ``slot_leftovers`` frames sit in the file's frame-cache slot with no cache entry, named as FFmpeg writes them.
 
         Returns:
             ``(result, emby_bif_path, generate_images_calls)``.
@@ -1336,6 +1338,11 @@ class TestCrossServerBifReuse:
         )
         if truncate_plex_bif_to is not None:
             plex_bif.write_bytes(plex_bif.read_bytes()[:truncate_plex_bif_to])
+        if slot_leftovers:
+            slot = get_frame_cache(base_dir=str(tmp_path / "tmp" / "frame_cache")).frame_dir_for(str(media_file))
+            slot.mkdir(parents=True)
+            for i in range(1, slot_leftovers + 1):
+                (slot / f"img-{i:06d}.jpg").write_bytes(buf.getvalue())
         from media_preview_generator.output.journal import write_meta
 
         write_meta([plex_bif], str(media_file), publisher="plex_bundle")
@@ -1401,6 +1408,19 @@ class TestCrossServerBifReuse:
         # The unpacked frames enter the cache stamped with the settings they were checked against.
         canonical_path = str(tmp_path / "data" / "movies" / "Test (2024)" / "Test (2024).mkv")
         assert get_frame_cache().get(canonical_path, extraction_key=(5, 4, "hable")) is not None
+
+    def test_frames_left_in_the_slot_are_not_published_with_the_sibling_bif(self, mock_config_for_processing, tmp_path):
+        """A cancelled extraction, or the previous run of the app, leaves frames in the slot with no cache entry. The
+        sibling BIF unpacked there must give Emby Plex's 20 frames, not those with the leftovers after them."""
+        result, emby_bif, calls = self._dispatch_plex_bif_to_emby_at_5s(
+            mock_config_for_processing, tmp_path, plex_bif_interval_ms=5000, slot_leftovers=7
+        )
+
+        assert calls == []
+        sources = {p.server_id: p.frame_source for p in result.publishers}
+        assert sources["emby-1"] == "cache_hit"
+        meta = read_bif_metadata(str(emby_bif))
+        assert (meta.frame_count, meta.frame_interval_ms) == (20, 5000)
 
     def test_sibling_bif_is_skipped_when_interval_differs(self, mock_config_for_processing, tmp_path):
         """A Plex BIF written at 10 s before the user switched to 5 s must not feed Emby's 5 s BIF."""

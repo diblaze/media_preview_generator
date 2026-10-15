@@ -317,9 +317,20 @@ class FrameCache:
         return entry
 
     def invalidate(self, canonical_path: str) -> None:
-        """Remove ``canonical_path`` from the cache + disk if present."""
+        """Remove ``canonical_path``'s entry and its slot folder, entry or not.
+
+        An extraction stopped part-way leaves frames in the slot before any entry is stored for them; left there, a
+        sibling BIF unpacked into the slot later would be published with them.
+        """
+        slot = self.frame_dir_for(canonical_path)
         with self._lock:
             self._evict(self._key(canonical_path))
+            try:
+                shutil.rmtree(slot)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("Frame cache: failed to rmtree {}: {}", slot, exc)
 
     def clear(self) -> None:
         """Remove all entries from memory and disk."""
