@@ -43,6 +43,18 @@ def _slow_op(ctx, node_path, params):
     return {}
 
 
+# When the watched op began and stopped (cleared by the test that uses it).
+WATCHED = {"started": threading.Event(), "stopped": threading.Event()}
+
+
+def _watched_op(ctx, node_path, params):
+    WATCHED["started"].set()
+    try:
+        return _slow_op(ctx, node_path, params)
+    finally:
+        WATCHED["stopped"].set()
+
+
 @pytest.fixture
 def node(tmp_path, monkeypatch):
     for name in ("NODE_KEY", "AGENT_TOKEN", "NODE_ROLES"):
@@ -52,7 +64,7 @@ def node(tmp_path, monkeypatch):
     monkeypatch.setattr(info, "_ffmpeg", lambda: {"path": "/usr/bin/ffmpeg", "version": "ffmpeg version 7.1"})
     app = node_app.create_node_app(
         config_dir=str(tmp_path / "config"), roles=["worker"], key=KEY,
-        ops={protocol.OP_PREVIEW_FRAMES: _frames_op, "test.slow": _slow_op},
+        ops={protocol.OP_PREVIEW_FRAMES: _frames_op, "test.slow": _slow_op, "test.watched": _watched_op},
     )  # fmt: skip
     server = make_server("127.0.0.1", 0, app, threaded=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -187,3 +199,49 @@ class TestRoundTrip:
         lines = _client(node[0]).log(50)["lines"]
 
         assert any("ready" in line["message"] for line in lines)
+
+
+class TestAppStop:
+    def test_a_stopping_app_stops_the_task_it_runs_on_the_node_at_once(self, node, media):
+        from media_preview_generator.nodes import executor
+        from media_preview_generator.nodes.registry import set_registry
+
+        from .executor_fakes import NODE_ID, NODE_NAME, identity_registry
+
+        for event in WATCHED.values():
+            event.clear()
+        set_registry(identity_registry(_client(node[0])))
+        ended: list[BaseException] = []
+
+        def work():
+            try:
+                with executor.placed_on(executor.Placement(NODE_ID, NODE_NAME)):
+                    executor.run_on_node("test.watched", str(media / "a.mkv"), {}, gpu=None, cancel_check=None)
+            except BaseException as exc:  # noqa: BLE001 - the test reads how the worker's file ended
+                ended.append(exc)
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        try:
+            assert WATCHED["started"].wait(5)
+
+            # The op starts on the node a moment before the node's answer reaches the worker.
+            deadline = time.monotonic() + 5
+            while True:
+                began = time.monotonic()
+                freed = executor.cancel_running_tasks()
+                took = time.monotonic() - began
+                if freed or time.monotonic() > deadline:
+                    break
+                time.sleep(0.01)
+            assert freed == 1
+
+            # Left alone it runs on to its node's unpolled-task expiry (10 s for this op).
+            assert WATCHED["stopped"].wait(2)
+            assert took <= executor.STOP_DELETE_BUDGET_S + 0.5
+            worker.join(10)
+            # Not the file's failure: the job stays running and the next start revives it.
+            assert [type(exc) for exc in ended] == [executor.NodeUnavailableError]
+            assert executor.cancel_running_tasks() == 0
+        finally:
+            set_registry(None)

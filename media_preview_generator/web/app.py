@@ -276,12 +276,14 @@ def _prewarm_caches() -> None:
 
 
 def _start_node_registry() -> None:
-    """Start the remote nodes' health loop, and stop it when the process exits."""
+    """Start the remote nodes' health loop; when the process exits, stop it and free the tasks running on nodes."""
+    from ..nodes.executor import cancel_running_tasks
     from ..nodes.registry import get_registry
 
     registry = get_registry()
     registry.start()
     atexit.register(registry.stop)
+    atexit.register(cancel_running_tasks)
 
 
 # Chains whose `retry_started_at` is older than this at boot time are

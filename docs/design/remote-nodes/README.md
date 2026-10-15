@@ -153,6 +153,9 @@ it sends `DELETE /v1/tasks/<client_task_id>` (404 = it never started), so FFmpeg
 unpolled-task expiry. The node remembers an id it was asked to delete before knowing it (5 minutes, at most 1024 ids):
 a start arriving after that DELETE answers 409 `task_deleted` and runs nothing.
 
+A stopping app sends `DELETE /v1/tasks/<id>` for every task it still runs on a node, all at once and waiting 1 s at
+most, so none runs on until the unpolled-task expiry beside the tasks the job revived on the next start sends.
+
 `TASK_STATE = {"id", "op", "status", "progress": {"percent", ...}, "log": [{"seq", "level", "message"}],
 "next_log": int, "result": {...} | null, "error": {"kind", "message"} | null, "seconds"}`.
 

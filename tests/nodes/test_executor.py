@@ -724,3 +724,54 @@ class TestLogsAndProgress:
             raise ValueError("display")
 
         assert _run(media, progress_callback=boom) == {"x": 1}
+
+
+class TestAppStop:
+    """A stopping app frees its tasks on nodes, so none runs on beside the ones its revived job starts."""
+
+    def test_only_tasks_still_running_are_freed_and_a_node_that_does_not_answer_holds_up_no_other(self, media):
+        release = threading.Event()
+
+        class Node(ScriptedClient):
+            def __init__(self, hangs: bool) -> None:
+                super().__init__([lambda client: running() if not client.deleted else NodeUnknownTaskError("gone")])
+                self.hangs = hangs
+                self.timeouts: list = []
+
+            def delete_task(self, task_id: str, *, read_timeout: float | None = None) -> None:
+                self.timeouts.append(read_timeout)
+                if self.hangs:
+                    release.wait(5)
+                super().delete_task(task_id, read_timeout=read_timeout)
+
+        asleep, awake, done = Node(hangs=True), Node(hangs=False), ScriptedClient([finished(protocol.STATUS_DONE)])
+        set_registry(FakeRegistry({"asleep": asleep, "awake": awake, "done": done}))
+        _run_on("done", media)
+        workers = [threading.Thread(target=_run_on, args=(name, media), daemon=True) for name in ("asleep", "awake")]
+        for worker in workers:
+            worker.start()
+        try:
+            assert _wait_until(lambda: asleep.named("poll") and awake.named("poll"))
+
+            began = time.monotonic()
+            freed = executor.cancel_running_tasks(budget_s=0.3)
+            took = time.monotonic() - began
+
+            assert freed == 2 and took < 1.0
+            assert awake.deleted == ["t1"] and awake.timeouts == [0.3]
+            assert asleep.timeouts == [0.3] and asleep.deleted == []
+            assert done.deleted == ["t1"]  # its own delete when it finished; nothing more
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(5)
+        assert executor.cancel_running_tasks() == 0
+
+
+def _run_on(node_id: str, media: str) -> None:
+    """One task on ``node_id``; how it ends doesn't matter here."""
+    try:
+        with placed_on(Placement(node_id, node_id)):
+            run_on_node(protocol.OP_INTRO_FINGERPRINT, media, {"duration_ms": 1000}, gpu=None, cancel_check=None)
+    except Exception:  # noqa: BLE001
+        pass

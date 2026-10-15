@@ -790,8 +790,9 @@ def test_get_registry_is_a_singleton_and_set_registry_replaces_it():
     assert reg.get_registry() is not first
 
 
-def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
+def test_the_app_factory_starts_the_registry_and_at_exit_stops_it_and_frees_the_tasks_on_nodes(monkeypatch):
     import media_preview_generator.web.app as app_mod
+    from media_preview_generator.nodes.executor import cancel_running_tasks
 
     calls = []
 
@@ -809,7 +810,7 @@ def test_the_app_factory_starts_the_registry_and_stops_it_at_exit(monkeypatch):
     registered = []
     monkeypatch.setattr(app_mod.atexit, "register", registered.append)
     app_mod._start_node_registry()
-    assert calls == ["start"] and registered == [stub.stop]
+    assert calls == ["start"] and registered == [stub.stop, cancel_running_tasks]
 
 
 class _LockProbingStore(AccessResultStore):
