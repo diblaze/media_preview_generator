@@ -225,7 +225,8 @@ class TestArtifact:
 
         assert sorted(os.listdir(dest)) == ["0000000000.jpg", "0000000005.jpg"]
         assert (dest / "0000000005.jpg").read_bytes() == b"b"
-        assert client.named("artifact") and client.named("delete")
+        assert client.named("artifact")
+        assert _wait_until(lambda: client.named("delete") == [("delete",)])
 
     @pytest.mark.parametrize(
         ("entries", "symlink"),
@@ -677,6 +678,7 @@ class TestFreeingTheTask:
 
         _run(media)
 
+        assert _wait_until(lambda: len(client.named("delete")) == 1)
         time.sleep(0.1)
         assert len(client.named("delete")) == 1
 
