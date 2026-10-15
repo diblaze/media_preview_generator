@@ -432,7 +432,11 @@ def report_to_json(report: CapabilityReport) -> dict:
 
 
 def report_from_json(raw: Any) -> CapabilityReport:
-    """Read a capability report.
+    """Read a capability report a node sent.
+
+    Its message and the text in its details (the paths, filesystem and users this app words its own sentences from)
+    go to the app's log, the job's file rows and Setup Health, so they are relayed like any text a node sends
+    (``protocol.relayed_text``).
 
     Raises:
         ValueError: The answer isn't a capability report.
@@ -442,10 +446,21 @@ def report_from_json(raw: Any) -> CapabilityReport:
     try:
         details = raw.get("details")
         return CapabilityReport(
-            Capability(str(raw["state"])), str(raw.get("message") or ""), details if isinstance(details, dict) else {}
+            Capability(str(raw["state"])),
+            relayed_text(str(raw.get("message") or "")),
+            {key: _relayed_detail(value) for key, value in details.items()} if isinstance(details, dict) else {},
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"not a capability report: {exc}") from exc
+
+
+def _relayed_detail(value: Any) -> Any:
+    """A report detail with its text relayed: a string, or each string in a list (the unwritable paths)."""
+    if isinstance(value, str):
+        return relayed_text(value)
+    if isinstance(value, list):
+        return [relayed_text(item) if isinstance(item, str) else item for item in value]
+    return value
 
 
 # Refusal kinds an answer names, per exception type; anything else is a plain ``PublishError``. An app older than a kind
