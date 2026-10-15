@@ -403,7 +403,7 @@
     // Why the node didn't see a file, from the access check's reason.
     const NOT_VISIBLE = {
         unmapped: 'no mapping covers this folder',
-        outside_roots: 'outside the folders the node is allowed to read',
+        outside_roots: 'it resolves to a folder no mapping covers. If it\'s a link, add a row for the folder it points into',
         missing: 'not found on the node',
         different_file: 'a different file is at that path (size or modified time differ)',
         unreadable: "the node can't read it",
@@ -569,7 +569,9 @@
             const bad = files.find((f) => !f.ok) || {};
             // A library with no files sampled failed on this app's side, and one the node lacks entirely is said
             // so plainly; either way its error says why.
-            const why = lib.error || NOT_VISIBLE[bad.kind] || bad.message || 'not visible on the node';
+            // A link's own message names the folder it points into, which the user has to map.
+            const why = lib.error || (bad.kind === 'outside_roots' && bad.message) || NOT_VISIBLE[bad.kind] || bad.message
+                || 'not visible on the node';
             const tried = bad.node_path || bad.path || '';
             let html = `<div class="nd-fail" data-library="${esc(lib.library)}">`
                 + `<div><span class="nd-fail-h">${esc(libraryLabel(lib))}: ${esc(String(why).replace(/\.$/, ''))}.</span>`

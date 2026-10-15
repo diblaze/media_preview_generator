@@ -1918,6 +1918,29 @@ class TestExpandDirectoryToMediaFiles:
 
         assert result == [path]
 
+    def test_walk_stops_when_job_cancelled_mid_walk(self, tmp_path):
+        """A cancel during a big library walk stops it at the next folder, not after minutes of listing."""
+        for n in range(5):
+            season = tmp_path / "Show" / f"Season {n}"
+            season.mkdir(parents=True)
+            (season / "e.mkv").write_bytes(b"x")
+        checks = iter([False, False, True])
+
+        result = _expand_directory_to_media_files([str(tmp_path / "Show")], cancel_check=lambda: next(checks, True))
+
+        assert result == []
+
+    def test_walk_lists_everything_when_not_cancelled(self, tmp_path):
+        """The cancel check alone doesn't change what a full walk returns."""
+        for n in range(3):
+            season = tmp_path / "Show" / f"Season {n}"
+            season.mkdir(parents=True)
+            (season / "e.mkv").write_bytes(b"x")
+
+        result = _expand_directory_to_media_files([str(tmp_path / "Show")], cancel_check=lambda: False)
+
+        assert result == sorted(str(tmp_path / "Show" / f"Season {n}" / "e.mkv") for n in range(3))
+
 
 class TestDetectPathPrefixMismatches:
     """Tests for _detect_path_prefix_mismatches helper."""

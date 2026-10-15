@@ -99,7 +99,9 @@ def resolve(app_path: str, size: int | None, mtime_ns: int | None, mappings: lis
     real = os.path.realpath(mapped)
     if not any(_within(real, root) for root in mapped_roots(mappings)):
         raise NotVisible(
-            NOT_VISIBLE_OUTSIDE_ROOTS, f"{mapped} resolves to {real}, outside every mapped folder", node_path=mapped
+            NOT_VISIBLE_OUTSIDE_ROOTS,
+            f"{mapped} resolves to {real}, which no mapping covers. If it's a link, add a row for the folder it points into",
+            node_path=mapped,
         )
     try:
         st = os.stat(real)

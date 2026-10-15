@@ -628,7 +628,7 @@ def build_items(
         mappings = [m for cfg in configs for m in (cfg.path_mappings or [])]
         hints = job_config.get("webhook_item_id_hints") or {}
         by_path: dict[str, ProcessableItem] = {}
-        for raw in _expand_directory_to_media_files(file_paths, mappings):
+        for raw in _expand_directory_to_media_files(file_paths, mappings, cancel_check=cancel_check):
             canonical, _owners = orchestrator._resolve_webhook_path_to_canonical(raw, configs, log_resolution=False)
             sender_hints = dict(hints.get(raw) or {})
             known = by_path.get(canonical)

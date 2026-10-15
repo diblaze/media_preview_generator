@@ -2253,12 +2253,13 @@ class JobManager:
         Idempotent: if the job is already running, this is a no-op.  The
         existing ``started_at`` timestamp is preserved so wall-clock
         duration reflects when the worker thread began, not when items
-        were first dispatched.
+        were first dispatched.  A cancelled job stays cancelled: its runner
+        can reach here after a long file listing the user cancelled during.
         """
         started = False
         with self._lock:
             job = self._jobs.get(job_id)
-            if job and job.status != JobStatus.RUNNING:
+            if job and job.status not in (JobStatus.RUNNING, JobStatus.CANCELLED):
                 job.status = JobStatus.RUNNING
                 self._set_pause_reasons(job, job_pause_reasons(job))
                 job.started_at = job.started_at or datetime.now(UTC).isoformat()

@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import requests
@@ -780,6 +781,7 @@ VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv", ".m
 def _expand_directory_to_media_files(
     paths: list[str],
     path_mappings: list[dict] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Expand directory paths into contained media files; pass file paths through unchanged.
 
@@ -796,12 +798,15 @@ def _expand_directory_to_media_files(
         paths: Absolute paths that may be files or directories.
         path_mappings: Optional path-mapping rows from config for resolving
             webhook/Plex paths to local equivalents.
+        cancel_check: True once the job is cancelled; the walk stops at the next folder (a big library takes minutes).
 
     Returns:
-        Flat list of file paths with directories replaced by their media files.
+        Flat list of file paths with directories replaced by their media files; what was found so far when cancelled.
     """
     expanded: list[str] = []
     for path in paths:
+        if cancel_check and cancel_check():
+            return expanded
         if not isinstance(path, str):
             expanded.append(path)
             continue
@@ -814,12 +819,12 @@ def _expand_directory_to_media_files(
                 break
 
         if resolved_dir is not None:
-            media_files = sorted(
-                os.path.join(root, f)
-                for root, _, files in os.walk(resolved_dir, followlinks=True)
-                for f in files
-                if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
-            )
+            found: list[str] = []
+            for root, _, files in os.walk(resolved_dir, followlinks=True):
+                if cancel_check and cancel_check():
+                    return expanded
+                found.extend(os.path.join(root, f) for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS)
+            media_files = sorted(found)
             if media_files:
                 if resolved_dir != path:
                     logger.info("Mapped directory '{}' -> '{}'", path, resolved_dir)

@@ -1691,7 +1691,7 @@ def _run_webhook_paths_phase(
     all_mappings: list[dict] = []
     for cfg in server_configs:
         all_mappings.extend(getattr(cfg, "path_mappings", None) or [])
-    paths = _expand_directory_to_media_files(raw_paths, all_mappings)
+    paths = _expand_directory_to_media_files(raw_paths, all_mappings, cancel_check=cancel_check)
     total_paths = len(paths)
 
     if progress_callback:

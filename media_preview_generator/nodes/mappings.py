@@ -352,8 +352,8 @@ def _suggest_for(
     if row is not None and id(row) in passed_rows:
         if all(f["kind"] == NOT_VISIBLE_MISSING for f in library["files"] if not f["ok"]):
             return None, (
-                f"{node_name} doesn't have this library's folder. Mount it on the node, or remove its folder "
-                "mapping so other workers take this library's files."
+                f"{node_name} doesn't have this library's folder. Mount it on the node, or give each library its own "
+                "row and leave this one out, so other workers take its files."
             )
         return None, None
     taken = {

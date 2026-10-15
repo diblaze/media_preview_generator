@@ -1542,8 +1542,8 @@ class TestNodeDialog:
         _open_node(authed_page, "n-storage")
         pane = _node_tab(authed_page, "media")
         reason = (
-            "storage doesn't have this library's folder. Mount it on the node, or remove its folder "
-            "mapping so other workers take this library's files."
+            "storage doesn't have this library's folder. Mount it on the node, or give each library its own "
+            "row and leave this one out, so other workers take its files."
         )
         api.test_answers = [
             {

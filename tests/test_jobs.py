@@ -470,6 +470,31 @@ class TestClose:
         assert [jm for jm in managers[:-1] if jm._retention_timer is not None] == []
 
 
+class TestStartJobAfterCancel:
+    """A job cancelled before its runner reaches start_job stays cancelled."""
+
+    def test_start_job_does_not_revive_a_cancelled_job(self, config_dir):
+        """Cancelled during a long file listing: the runner's later start_job leaves it cancelled, so no retry queues."""
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Manual: 2 folders")
+        jm.cancel_job(job.id)
+
+        jm.start_job(job.id)
+
+        assert jm.get_job(job.id).status == JobStatus.CANCELLED
+        assert job.id not in jm._running_job_ids
+
+    def test_start_job_still_starts_a_pending_job(self, config_dir):
+        os.makedirs(config_dir, exist_ok=True)
+        jm = JobManager(config_dir=config_dir)
+        job = jm.create_job(library_name="Test")
+
+        jm.start_job(job.id)
+
+        assert jm.get_job(job.id).status == JobStatus.RUNNING
+
+
 class TestCompleteJobWarning:
     """complete_job warning= parameter produces COMPLETED status with error message."""
 

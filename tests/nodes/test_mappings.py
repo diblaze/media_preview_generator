@@ -343,7 +343,8 @@ class TestRunTestAccess:
         assert (movies["ok"], tv["ok"], films["ok"]) == (True, True, False)
         assert films["suggestion"] is None
         assert films["error"] == (
-            "lab-cpu doesn't have this library's folder. Mount it on the node, or remove its folder mapping so other workers take this library's files."
+            "lab-cpu doesn't have this library's folder. Mount it on the node, or give each library its own row and leave "
+            "this one out, so other workers take its files."
         )
 
     def test_a_library_no_row_covers_is_listed_as_not_mapped_and_never_sent_to_the_node(self, tmp_path):
