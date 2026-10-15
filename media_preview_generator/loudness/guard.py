@@ -355,9 +355,10 @@ class RemoteLoudnessDb:
             report = CapabilityReport(
                 Capability.AGENT_UNAVAILABLE, "The Plex database node sent a loudness answer this app can't read"
             )
-        # The file checks ran on the node: a refusal of theirs is about the node, not this app.
-        report = node_wording(report)
-        return CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
+        # The file checks ran on the node: a refusal of theirs is about the node, not this app (and names it).
+        return node_wording(
+            CapabilityReport(report.state, report.message, {**report.details, "agent": self._remote.agent_details()})
+        )
 
     def file_checks(self, *, deadline: float) -> CapabilityReport:
         """The database file's checks, run on the node (found, local disk there, writable, held open by Plex)."""

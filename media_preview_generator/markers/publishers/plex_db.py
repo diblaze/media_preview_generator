@@ -338,6 +338,19 @@ def node_wording(report: CapabilityReport) -> CapabilityReport:
         )
     if report.state is Capability.MISCONFIGURED and details.get("unwritable"):
         return CapabilityReport(report.state, relayed_text(unwritable_message(details, node=True)), details)
+    if report.state is Capability.MISCONFIGURED and details.get("missing_db_path"):
+        # The path is the node's, not this app's: said bare, it reads as a folder to fix on this app's side.
+        agent = details.get("agent") if isinstance(details.get("agent"), dict) else {}
+        who = str(agent.get("name") or "") or (f"at {agent['url']}" if agent.get("url") else "")
+        node = f"The Plex database node {who}" if who else "The Plex database node"
+        return CapabilityReport(
+            report.state,
+            relayed_text(
+                f"{node} doesn't find Plex's database at {details['missing_db_path']} on its machine. Give the node "
+                "Plex's own config folder."
+            ),
+            details,
+        )
     if report.state is Capability.UNREACHABLE and details.get("lock_holder") is False:
         return CapabilityReport(
             report.state,
@@ -1491,7 +1504,9 @@ class LocalPlexDb(PlexDatabase):
         db = self._path()
         if not db or not os.path.isfile(db):
             return CapabilityReport(
-                Capability.MISCONFIGURED, f"Plex database not found at {db or '(Plex config folder not set)'}"
+                Capability.MISCONFIGURED,
+                f"Plex database not found at {db or '(Plex config folder not set)'}",
+                {"missing_db_path": db} if db else {},
             )
         # realpath: a symlinked config folder or DB file must be judged by where SQLite actually locks it.
         real = os.path.realpath(db)

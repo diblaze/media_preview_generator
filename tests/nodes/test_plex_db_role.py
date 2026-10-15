@@ -943,6 +943,54 @@ class TestChapterRefusalsNameTheNode:
         assert str(refused.value) == "The Plex database node Plex box sent a chapter snapshot this app can't read"
 
 
+class TestADatabaseTheNodeDoesntFindIsSaidToBeOnTheNode:
+    """The path a node looks in is its own: said bare ("Plex database not found at <path>"), it reads as a folder to
+    fix on this app's side."""
+
+    @pytest.fixture
+    def through(self, tmp_path):
+        """A node started with a Plex folder that holds no database, reached under ``name``."""
+        folder = tmp_path / "node" / "Plex Media Server"
+        folder.mkdir(parents=True)
+        node = node_app(str(folder), mountinfo_path=_mountinfo(tmp_path)).test_client()
+        missing = plex_db.plex_db_path(str(folder))
+        return lambda name: RemotePlexDb(NODE_URL, TOKEN, name=name, session=FlaskSession(node)), missing
+
+    @staticmethod
+    def _markers(db: RemotePlexDb):
+        config = ServerConfig(
+            id="plex-1", type=ServerType.PLEX, name="Plex", enabled=True, url="http://plex:32400", auth={}, output={}
+        )
+        settings = ServerMarkersSettings(
+            True, None, "2026-09-13T00:00:00+00:00", "restore", agent_enabled=True, agent_url=NODE_URL
+        )
+        return PlexMarkerPublisher(MagicMock(), config, settings, db=db).capability()
+
+    @staticmethod
+    def _loudness_job(db: RemotePlexDb):
+        from media_preview_generator.loudness.guard import RemoteLoudnessDb
+
+        return RemoteLoudnessDb(MagicMock(), db, server_name="Plex").file_checks(deadline=time.monotonic() + 5)
+
+    @staticmethod
+    def _loudness_setup_health(db: RemotePlexDb):
+        from media_preview_generator.loudness.guard import RemoteLoudnessDb
+        from tests.nodes.test_plex_db_loudness import _plex
+
+        return RemoteLoudnessDb(_plex(), db, server_name="Plex").capability(deadline=time.monotonic() + 5)
+
+    @pytest.mark.parametrize("feature", ["_markers", "_loudness_job", "_loudness_setup_health"])
+    @pytest.mark.parametrize(("name", "called"), [("Plex box", "Plex box"), ("", f"at {NODE_URL}")])
+    def test_the_refusal_names_the_node(self, through, feature, name, called):
+        make, missing = through
+        report = getattr(self, feature)(make(name))
+        assert (report.state, report.message) == (
+            Capability.MISCONFIGURED,
+            f"The Plex database node {called} doesn't find Plex's database at {missing} on its machine. Give the "
+            "node Plex's own config folder.",
+        )
+
+
 class TestTheAgentBlock:
     """What old apps read off every answer and off ``/v1/health``: the version, the protocols, the capabilities."""
 
