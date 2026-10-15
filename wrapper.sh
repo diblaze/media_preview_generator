@@ -42,7 +42,9 @@ run_as_user() {
 # MODE=node: run as a remote node (lends this machine's GPU/CPU, or opens Plex's database here) instead of the app.
 # One process (its task table lives in its memory), served by waitress: it reads each request whole before a thread
 # takes it, so a few half-sent requests from anyone on the network can't freeze the node (nodes/server/wsgi.py).
-if [[ "${MODE:-}" == "node" ]]; then
+# Same rule as utils.is_node_mode() and the HEALTHCHECK: case and surrounding spaces don't matter (MODE=Node is a node).
+mode="${MODE:-}"
+if [[ "${mode,,}" =~ ^[[:space:]]*node[[:space:]]*$ ]]; then
     echo "Starting node on port ${NODE_PORT:-9494}..."
     run_as_user python3 -m media_preview_generator.nodes.server.wsgi --port "${NODE_PORT:-9494}" --threads 16
 fi

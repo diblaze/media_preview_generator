@@ -239,7 +239,7 @@ EXPOSE 8080
 # timeout=5 ensures the process exits if the server is unresponsive.
 # `or`, not get()'s default: an empty NODE_PORT/WEB_PORT is the default port to wrapper.sh (${NODE_PORT:-9494}).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD exec python3 -c "import urllib.request, os; node = os.environ.get('MODE') == 'node'; urllib.request.urlopen('http://localhost:' + ((os.environ.get('NODE_PORT') or '9494') + '/v1/health' if node else (os.environ.get('WEB_PORT') or '8080') + '/api/health'), timeout=5)"
+    CMD exec python3 -c "import urllib.request, os; node = (os.environ.get('MODE') or '').strip().lower() == 'node'; urllib.request.urlopen('http://localhost:' + ((os.environ.get('NODE_PORT') or '9494') + '/v1/health' if node else (os.environ.get('WEB_PORT') or '8080') + '/api/health'), timeout=5)"
 
 # Use LinuxServer's /init for PUID/PGID handling
 ENTRYPOINT ["/init", "/app/wrapper.sh"]
