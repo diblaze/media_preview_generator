@@ -216,7 +216,7 @@
 
     // ---------- list ---------------------------------------------------------------------------------------------
 
-    const page = { nodes: [], appVersion: '', loaded: false, timer: null, loading: false, checking: false, openId: null };
+    const page = { nodes: [], thisApp: null, appVersion: '', loaded: false, timer: null, loading: false, checking: false, openId: null };
 
     function nodeIcon(node) {
         if (isWindows(node)) return 'bi-windows';
@@ -258,6 +258,40 @@
                     <button type="button" class="btn btn-sm ${fixTab ? 'btn-warning' : 'btn-outline-secondary'} nd-open" data-id="${esc(node.id)}" data-tab="${openTab}" aria-label="${fixTab ? 'Fix' : 'Open'} ${name}">${fixTab ? 'Fix' : 'Open'}</button>
                 </div>
             </article>`;
+    }
+
+    // This app's own machine, shown like a node so every machine with workers is on the page. It isn't one: it has
+    // no id, never goes to a /api/nodes/<id> route, and has nothing to open, edit or remove here.
+    function thisAppRow(app) {
+        const used = usedByParts(app.used_by);
+        const busy = busyText(app.busy);
+        const version = page.appVersion ? `v${page.appVersion}` : '';
+        const mainTip = "The machine running this app: it keeps the queue and settings, and runs its own workers. It can't be edited or removed here.";
+        return `
+            <article class="nd-row nd-this-app" data-state="running" data-tone="ok">
+                <div class="nd-ico" aria-hidden="true"><i class="bi bi-house-door"></i></div>
+                <div class="nd-id">
+                    <h2 class="nd-name">This app <span class="pill role nd-main" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="${esc(mainTip)}">Main <i class="bi bi-info-circle" aria-hidden="true"></i></span></h2>
+                </div>
+                <div class="nd-chips">${hardwareChips(app)}${busy ? `<span class="nd-faint nd-busy">${esc(busy)}</span>` : ''}${used.length ? `<span class="nd-faint">used by ${esc(used.join(', '))}</span>` : ''}</div>
+                <div class="nd-status">${pill('ok', '✓ Running')}${version ? `<span class="nd-faint nd-version">${esc(version)}</span>` : ''}</div>
+                <div class="nd-acts">
+                    <a class="btn btn-sm btn-outline-secondary nd-workers" href="/settings#section-workers" aria-label="Workers settings for this app">Workers</a>
+                </div>
+            </article>`;
+    }
+
+    function renderThisApp() {
+        const host = $('#thisAppList');
+        if (!host || !page.thisApp) return;
+        const html = thisAppRow(page.thisApp);
+        if (host._markup === html) return;
+        const hadFocus = host.contains(document.activeElement);
+        disposeTooltips(host);
+        host.innerHTML = html;
+        host._markup = html;
+        initTooltips(host);
+        if (hadFocus) $('.nd-workers', host).focus();
     }
 
     function emptyState() {
@@ -308,6 +342,7 @@
     function renderList() {
         const list = $('#nodeList');
         if (!list) return;
+        renderThisApp();
         if (page.nodes.length) {
             renderRows(list);
         } else {
@@ -337,6 +372,7 @@
         }
         page.nodes = Array.isArray(r.data && r.data.nodes) ? r.data.nodes : [];
         page.appVersion = (r.data && r.data.app_version) || '';
+        page.thisApp = (r.data && r.data.this_app) || null;
         const first = !page.loaded;
         page.loaded = true;
         renderList();

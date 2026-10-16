@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -370,18 +371,52 @@ def _json_body() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _local_cores() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # macOS and Windows have no affinity call
+        return os.cpu_count() or 1
+
+
+def _this_app() -> dict[str, Any]:
+    """The Nodes page's first row: this app's own machine, which isn't a node and is kept out of ``nodes``.
+
+    Returns:
+        ``{"gpus", "cpu": {"cores"}, "busy", "used_by": {"groups"}}``: the GPUs the Workers settings offer, the CPU
+        cores this app may use, the files its own workers are running and the worker groups with a member here.
+    """
+    from ._helpers import _ensure_gpu_cache
+    from .api_jobs import _get_shared_worker_pool
+
+    gpus = [
+        {key: gpu.get(key) for key in ("device", "name", "type", "status", "error")}
+        for gpu in _ensure_gpu_cache()
+        if isinstance(gpu, dict)
+    ]
+    pool = _get_shared_worker_pool()
+    snapshots = pool.member_snapshots() if pool is not None else []
+    busy = sum(row.get("running", 0) for row in snapshots if not row.get("node"))
+    groups = [
+        {"id": str(group.get("id") or ""), "name": str(group.get("name") or "")}
+        for group in get_settings_manager().get("worker_groups") or []
+        if isinstance(group, dict)
+        and any(isinstance(member, dict) and not member.get("node") for member in group.get("members") or [])
+    ]
+    return {"gpus": gpus, "cpu": {"cores": _local_cores()}, "busy": busy, "used_by": {"groups": groups}}
+
+
 def _list_body() -> dict[str, Any]:
     registry = get_registry()
     rows = [
         _node_row(record, registry.details(record["id"])) for record in get_settings_manager().nodes if record.get("id")
     ]
-    return {"nodes": rows, "app_version": _app_version()}
+    return {"nodes": rows, "this_app": _this_app(), "app_version": _app_version()}
 
 
 @api.route("/nodes", methods=["GET"])
 @api_token_required
 def list_nodes():
-    """Every node as ``NODE_ROW`` and this app's version."""
+    """Every node as ``NODE_ROW``, this app's own machine (``this_app``) and its version."""
     return jsonify(_list_body())
 
 

@@ -42,6 +42,12 @@ KEY_REFUSED = {
     "fix_label": "Change the key",
 }
 KEY_ACCEPTED = {"id": "node_key", "label": "The node accepts this app's key", "ok": True, "severity": "critical"}
+THIS_APP = {
+    "gpus": [{"device": "cuda:0", "name": "RTX 4090", "type": "NVIDIA", "status": "ok", "error": None}],
+    "cpu": {"cores": 16},
+    "busy": 1,
+    "used_by": {"groups": [{"id": "g-local", "name": "Local GPU"}]},
+}
 
 
 def _health(*checks: dict) -> dict:
@@ -141,6 +147,7 @@ class NodesApi:
 
     def __init__(self, page: Page, nodes: list[dict]) -> None:
         self.nodes = nodes
+        self.this_app: dict = json.loads(json.dumps(THIS_APP))
         self.calls: list[tuple[str, str, object]] = []
         self.probe_answer: dict = {"ok": True, "info": _probe_info()}
         self.create_answer: tuple[int, dict] | None = None
@@ -160,7 +167,11 @@ class NodesApi:
         return [body for m, path, body in self.calls if m == method and path.endswith(suffix)]
 
     def _list(self, *, checking: bool) -> dict:
-        return {"nodes": [{**node, "checking": checking} for node in self.nodes], "app_version": APP_VERSION}
+        return {
+            "nodes": [{**node, "checking": checking} for node in self.nodes],
+            "this_app": self.this_app,
+            "app_version": APP_VERSION,
+        }
 
     def _find(self, node_id: str) -> dict:
         return next(n for n in self.nodes if n["id"] == node_id)
@@ -637,6 +648,73 @@ class TestNodeList:
                 assert icon["hint"].endswith(f" {MORE}") and icon["pointerClass"], icon
             else:
                 assert "click for" not in icon["hint"].lower() and not icon["pointerClass"], icon
+
+
+@pytest.mark.e2e
+class TestThisAppRow:
+    """This app's own machine is listed first, like a node, but it isn't one: nothing to open, edit or remove."""
+
+    def test_it_comes_first_with_the_main_badge_hardware_and_who_uses_it(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        row = authed_page.locator(".nd-row").first
+        expect(row).to_have_class(re.compile(r"\bnd-this-app\b"))
+        expect(row.locator(".nd-name")).to_contain_text("This app")
+        badge = row.locator(".nd-main")
+        expect(badge).to_have_text("Main")
+        assert "can't be edited or removed here" in (
+            badge.get_attribute("data-bs-original-title") or badge.get_attribute("title") or ""
+        )
+        badge.focus()
+        expect(authed_page.locator(".tooltip")).to_contain_text("keeps the queue and settings")
+        chips = row.locator(".nd-chips")
+        expect(chips).to_contain_text("RTX 4090")
+        expect(chips).to_contain_text("16 CPU")
+        expect(chips).to_contain_text("1 file running")
+        expect(chips).to_contain_text('used by worker group "Local GPU"')
+        expect(row.locator(".nd-status .pill")).to_have_text("✓ Running")
+        expect(row.locator(".nd-status .pill")).to_have_class("pill ok")
+        expect(row).to_have_attribute("data-tone", "ok")
+
+    def test_it_has_a_workers_link_and_no_node_actions(self, authed_page: Page, app_url: str) -> None:
+        api = _open_nodes(authed_page, app_url, _four_nodes())
+        row = authed_page.locator(".nd-this-app")
+        expect(row.locator("button")).to_have_count(0)
+        for name in ("Check now", "Edit", "Remove", "Open", "Fix", "Setup Health"):
+            expect(row.get_by_text(name, exact=True)).to_have_count(0)
+        assert row.get_attribute("id") is None and row.get_attribute("data-id") is None
+        link = row.get_by_role("link", name="Workers settings for this app")
+        expect(link).to_have_text("Workers")
+        expect(link).to_have_attribute("href", "/settings#section-workers")
+        # Its row isn't a node: the page asked /api/nodes for the list and nothing else.
+        assert {(method, path) for method, path, _ in api.calls} == {("GET", "/nodes")}
+        link.click()
+        expect(authed_page).to_have_url(re.compile(r"/settings#section-workers$"))
+
+    def test_with_no_nodes_the_explanation_still_shows_below_it(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, [])
+        row = authed_page.locator(".nd-this-app")
+        empty = authed_page.locator("#nodeList .nd-empty")
+        expect(row).to_be_visible()
+        expect(empty).to_contain_text("No nodes yet")
+        assert empty.bounding_box()["y"] > row.bounding_box()["y"] + row.bounding_box()["height"]
+        expect(authed_page.locator("#nodeList .nd-row")).to_have_count(0)
+        expect(authed_page.locator("#nodesCheckNow")).to_be_hidden()
+
+    def test_node_rows_below_it_still_open(self, authed_page: Page, app_url: str) -> None:
+        _open_nodes(authed_page, app_url, _four_nodes())
+        expect(authed_page.locator("#nodeList .nd-row")).to_have_count(4)
+        expect(authed_page.locator("#nodesCheckNow")).to_be_visible()
+        modal = _open_node(authed_page, "n-storage")
+        expect(modal.locator("#nodeModalName")).to_have_text("storage")
+
+    def test_on_a_phone_it_fits_and_its_link_is_full_width(self, authed_page: Page, app_url: str) -> None:
+        authed_page.set_viewport_size(PHONE)
+        _open_nodes(authed_page, app_url, _four_nodes())
+        assert authed_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        row = authed_page.locator(".nd-this-app")
+        link = row.locator(".nd-workers")
+        expect(link).to_be_visible()
+        assert link.bounding_box()["width"] > row.bounding_box()["width"] * 0.8
 
 
 @pytest.mark.e2e
@@ -2149,5 +2227,5 @@ class TestPlexDatabaseSelector:
 def test_nodes_page_screenshot(authed_page: Page, app_url: str, tmp_path: Path) -> None:
     authed_page.set_viewport_size({"width": 1440, "height": 900})
     _open_nodes(authed_page, app_url, _four_nodes())
-    expect(authed_page.locator(".nd-row")).to_have_count(4)
+    expect(authed_page.locator("#nodeList .nd-row")).to_have_count(4)
     _capture(authed_page.locator(".nodes-page"), "nodes-page.png", tmp_path)

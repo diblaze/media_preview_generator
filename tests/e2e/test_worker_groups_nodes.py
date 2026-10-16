@@ -435,3 +435,65 @@ def test_a_member_switched_from_a_gpu_back_to_a_cpu_runs_loudness_again(
     row = page.locator('[data-member="m-cpu"]')
     expect(row).to_contain_text("Loudness added, as the group runs it.")
     expect(row.locator('[data-kind="loudness"]')).to_have_attribute("aria-pressed", "true")
+
+
+LOCAL_WORKER = {
+    "worker_id": 1,
+    "worker_type": "GPU",
+    "worker_name": "GPU Worker 1 (NVIDIA card)",
+    "group_name": "Video",
+    "group_id": "gpu-video",
+    "member_id": "m-gpu",
+    "status": "processing",
+    "current_title": "Severance · S02E01",
+    "ffmpeg_started": True,
+    "progress_percent": 30,
+}
+NODE_WORKER = {
+    "worker_id": 4,
+    "worker_type": "GPU",
+    "worker_name": "old-laptop · GPU Worker 1 (GTX 1650)",
+    "group_name": "Video",
+    "group_id": "gpu-video",
+    "member_id": "m-laptop",
+    "status": "processing",
+    "current_title": "The Bear · S02E06",
+    "ffmpeg_started": True,
+    "progress_percent": 60,
+    "node": {"id": "laptop", "name": "old-laptop"},
+    "node_state": "ready",
+}
+
+
+def test_with_a_worker_on_a_node_this_apps_worker_cards_say_this_app(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    offline_node_group(group_api)
+    mock_dashboard_defaults(authed_page)
+    workers = [LOCAL_WORKER, NODE_WORKER]
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": workers}))
+    authed_page.goto(app_url + "/")
+    local = authed_page.locator('[data-worker-key="GPU_1"] [data-node-chip]')
+    expect(local).to_have_text("This app")
+    expect(local).not_to_have_attribute("hidden", "")
+    expect(local).to_have_attribute("title", "Runs on this app's machine")
+    remote = authed_page.locator('[data-worker-key="GPU_4"] [data-node-chip]')
+    expect(remote).to_have_text("old-laptop")
+    expect(remote).to_have_attribute("title", "Runs on node old-laptop")
+
+
+def test_without_a_worker_on_a_node_worker_cards_have_no_machine_chip(
+    authed_page: Page,
+    app_url: str,
+    group_api: dict,  # noqa: F811
+) -> None:
+    mock_dashboard_defaults(authed_page)
+    authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": [LOCAL_WORKER]}))
+    authed_page.goto(app_url + "/")
+    card = authed_page.locator('[data-worker-key="GPU_1"]')
+    expect(card).to_be_visible()
+    expect(card.locator("[data-node-chip]")).to_have_attribute("hidden", "")
+    expect(card.locator("[data-node-chip]")).to_have_text("")
+    expect(card.locator("[data-node-chip]")).to_have_attribute("title", "")

@@ -277,7 +277,7 @@ def test_a_worker_node_end_to_end(
     expect(modal).to_be_hidden(timeout=10000)
 
     # The list: the real registry's state after a check.
-    row = page.locator(".nd-row").first
+    row = page.locator("#nodeList .nd-row").first
     expect(row.locator(".nd-name")).to_have_text(NODE_NAME)
     page.locator("#nodesCheckNow").click()
     expect(row.locator(".nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready", timeout=20000)
@@ -343,7 +343,7 @@ def test_a_node_added_twice_is_named_at_connect(real_page: Page, real_app: str, 
     page.locator("#addNodeNext").click()
     expect(page.locator("#addNodeStep2")).to_be_visible()
     page.locator("#addNodeCancel").click()
-    expect(page.locator(".nd-row")).to_have_count(1)
+    expect(page.locator("#nodeList .nd-row")).to_have_count(1)
 
     _open_add(page)
     page.locator("#addNodeUrl").fill(node_url)
@@ -359,7 +359,7 @@ def test_a_node_added_twice_is_named_at_connect(real_page: Page, real_app: str, 
 
 def _open_node_settings(page: Page) -> None:
     watch_modal_shown(page, "nodeModal")
-    page.locator(".nd-row .nd-open").first.click()
+    page.locator("#nodeList .nd-row .nd-open").first.click()
     expect_modal_shown(page, "nodeModal")
     _node_tab(page, "settings")
 
@@ -383,7 +383,7 @@ def test_a_tab_opened_before_another_tabs_save_cant_undo_it(
     tab_b = context.new_page()
     tab_b.set_viewport_size({"width": 1440, "height": 1000})
     tab_b.goto(f"{real_app}/nodes")
-    expect(tab_b.locator(".nd-row")).to_have_count(1, timeout=10000)
+    expect(tab_b.locator("#nodeList .nd-row")).to_have_count(1, timeout=10000)
     _open_node_settings(tab_b)
 
     _open_node_settings(tab_a)
@@ -404,7 +404,7 @@ def test_a_tab_opened_before_another_tabs_save_cant_undo_it(
 
     # Reloaded, tab B saves its change on top of tab A's.
     tab_b.goto(f"{real_app}/nodes")
-    expect(tab_b.locator(".nd-row .nd-name")).to_have_text("e2e-node-renamed", timeout=10000)
+    expect(tab_b.locator("#nodeList .nd-row .nd-name")).to_have_text("e2e-node-renamed", timeout=10000)
     _open_node_settings(tab_b)
     tab_b.locator("label[for='nodeSetEnabled']").click()
     tab_b.locator("#nodeSettingsSave").click()
@@ -444,8 +444,8 @@ def test_plex_database_nodes_are_added_and_offered_to_the_plex_server(
     expect(modal).to_be_hidden(timeout=10000)
 
     page.locator("#nodesCheckNow").click()
-    plex_box = page.locator(".nd-row", has_text=PLEX_DB_NODE_NAME)
-    helper = page.locator(".nd-row", has_text="127.0.0.1").filter(has_not_text=PLEX_DB_NODE_NAME)
+    plex_box = page.locator("#nodeList .nd-row", has_text=PLEX_DB_NODE_NAME)
+    helper = page.locator("#nodeList .nd-row", has_text="127.0.0.1").filter(has_not_text=PLEX_DB_NODE_NAME)
     expect(plex_box.locator(".nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready", timeout=20000)
     expect(plex_box.locator(".nd-ico i")).to_have_class("bi bi-database")
     expect(helper.locator(".nd-status .pill:not(.nd-to-fix)")).to_have_text("✓ Ready", timeout=20000)

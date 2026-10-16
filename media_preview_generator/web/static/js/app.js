@@ -3137,6 +3137,7 @@ function updateWorkerStatuses(workers, options = {}) {
         container.appendChild(fallback);
     }
 
+    const anyOnNode = workers.some(w => !!w.node);
     const seenKeys = new Set();
     for (const worker of workers) {
         const key = `${worker.worker_type}_${worker.worker_id}`;
@@ -3179,7 +3180,7 @@ function updateWorkerStatuses(workers, options = {}) {
             // Cosmetic: slightly tighter icon spacing.
             col.querySelector('[data-icon]').classList.add('me-2');
         }
-        _patchWorkerCard(col, worker);
+        _patchWorkerCard(col, worker, anyOnNode);
     }
 
     // Drop any cards for workers that vanished (a job ending, a pool
@@ -3211,7 +3212,7 @@ window.NODE_STATES = Object.freeze({
     disabled: { tone: 'off', label: 'Turned off', short: 'node turned off' },
 });
 
-function _patchWorkerCard(col, worker) {
+function _patchWorkerCard(col, worker, anyOnNode = false) {
     const fallbackActive = !!worker.fallback_active;
     const isProcessing = worker.status === 'processing';
     const paused = isProcessing && (processingPaused || worker.paused);
@@ -3296,12 +3297,14 @@ function _patchWorkerCard(col, worker) {
         nameEl.textContent = kindName;
     }
     nameEl.title = worker.worker_name || '';
-    // A worker on a node shows the node's name in front, as every other place that names its device does.
+    // A worker on a node shows the node's name in front, as every other place that names its device does. Once any
+    // worker runs on a node, this app's own say "This app" so the two can be told apart; with none, no chip at all.
     const nodeChip = col.querySelector('[data-node-chip]');
     const nodeName = worker.node ? worker.node.name || worker.node.id || '' : '';
-    if (nodeChip.textContent !== nodeName) nodeChip.textContent = nodeName;
-    nodeChip.hidden = !nodeName;
-    nodeChip.title = nodeName ? `Runs on node ${nodeName}` : '';
+    const chipText = nodeName || (!worker.node && anyOnNode ? 'This app' : '');
+    if (nodeChip.textContent !== chipText) nodeChip.textContent = chipText;
+    nodeChip.hidden = !chipText;
+    nodeChip.title = nodeName ? `Runs on node ${nodeName}` : chipText ? "Runs on this app's machine" : '';
 
     // Fallback badge + note
     fallbackBadge.classList.toggle('d-none', !fallbackActive);

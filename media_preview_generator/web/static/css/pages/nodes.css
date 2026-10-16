@@ -28,6 +28,8 @@
 .nd-url { font: 12px/1.3 var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nd-chips, .nd-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
 .nd-acts .btn { min-width: 72px; }
+.nd-this-app-list:not(:empty) { margin-bottom: 12px; }
+.nd-main { margin-left: 6px; font-size: 11px; vertical-align: middle; cursor: help; }
 .nd-empty { display: grid; gap: 10px; justify-items: center; padding: 36px 20px; text-align: center; border: 1px dashed var(--line-strong); border-radius: var(--radius-card); color: var(--muted); }
 .nd-empty strong { color: var(--bs-body-color); font-size: 16px; }
 .nd-empty p { max-width: 560px; margin: 0; }

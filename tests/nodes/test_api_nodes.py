@@ -168,7 +168,8 @@ def _checked(client, node_id):
 class TestListAndProbe:
     def test_an_install_without_nodes(self, client, nodes):
         body = client.get("/api/nodes").get_json()
-        assert body == {"nodes": [], "app_version": APP_VERSION}
+        assert body["nodes"] == [] and body["app_version"] == APP_VERSION
+        assert set(body) == {"nodes", "this_app", "app_version"}
 
     def test_probe_reports_what_answers_without_saving(self, client, nodes):
         resp = client.post("/api/nodes/probe", json={"url": "http://nuc:9494", "key": "node-key"})
@@ -426,6 +427,65 @@ class TestListAndProbe:
         assert body["ok"] is False and body["error"]["kind"] == "protocol"
         assert body["error"]["node_version"] == "9.10.0" and "9.10.0" in body["error"]["message"]
         assert pinged == []
+
+
+class _FakePool:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def member_snapshots(self):
+        return self.rows
+
+
+class TestThisApp:
+    """``this_app``: the Nodes page's row for this app's own machine, which is never a node."""
+
+    LOCAL_GPU = {"type": "NVIDIA", "device": "cuda:0", "name": "RTX 4090", "status": "ok", "path": "/dev/nvidia0"}
+
+    @pytest.fixture
+    def local(self, monkeypatch):
+        from media_preview_generator.web.routes import _helpers, api_jobs
+
+        monkeypatch.setattr(_helpers, "_ensure_gpu_cache", lambda: [self.LOCAL_GPU])
+        monkeypatch.setattr(api_nodes, "_local_cores", lambda: 12)
+        pool = _FakePool([])
+        monkeypatch.setattr(api_jobs, "_get_shared_worker_pool", lambda: pool)
+        return pool
+
+    def test_it_shows_this_apps_gpus_and_cores(self, client, nodes, local):
+        this_app = client.get("/api/nodes").get_json()["this_app"]
+        assert this_app["gpus"] == [
+            {"device": "cuda:0", "name": "RTX 4090", "type": "NVIDIA", "status": "ok", "error": None}
+        ]
+        assert this_app["cpu"] == {"cores": 12}
+
+    def test_busy_counts_only_the_workers_on_this_app(self, client, nodes, local):
+        local.rows = [{"node": None, "running": 2}, {"running": 1}, {"node": "n1", "running": 5}]
+        assert client.get("/api/nodes").get_json()["this_app"]["busy"] == 3
+
+    def test_busy_is_zero_with_no_worker_pool(self, client, nodes, local, monkeypatch):
+        from media_preview_generator.web.routes import api_jobs
+
+        monkeypatch.setattr(api_jobs, "_get_shared_worker_pool", lambda: None)
+        assert client.get("/api/nodes").get_json()["this_app"]["busy"] == 0
+
+    def test_used_by_is_the_groups_with_a_member_on_this_app(self, client, nodes, local):
+        _sm().set(
+            "worker_groups",
+            [
+                {"id": "g1", "name": "Local", "members": [{"id": "m1", "resource": "cpu"}]},
+                {"id": "g2", "name": "Remote", "members": [{"id": "m2", "node": "n1"}]},
+                {"id": "g3", "name": "Mixed", "members": [{"id": "m3", "node": "n1"}, {"id": "m4", "node": None}]},
+            ],
+        )
+        used_by = client.get("/api/nodes").get_json()["this_app"]["used_by"]
+        assert used_by == {"groups": [{"id": "g1", "name": "Local"}, {"id": "g3", "name": "Mixed"}]}
+
+    def test_it_is_never_in_the_node_list(self, client, nodes, local):
+        node_id = _add(client).get_json()["id"]
+        body = client.get("/api/nodes").get_json()
+        assert [row["id"] for row in body["nodes"]] == [node_id]
+        assert "id" not in body["this_app"]
 
 
 class _NotANode(http.server.BaseHTTPRequestHandler):

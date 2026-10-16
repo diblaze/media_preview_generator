@@ -5951,7 +5951,7 @@ plain `reason`, `version`, `roles`, `legacy` (an older Plex database node that o
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/nodes` | Every node as a `NODE_ROW`, and this app's `app_version`. |
+| GET | `/api/nodes` | Every node as a `NODE_ROW`, this app's `app_version`, and `this_app`: this app's own machine (not a node), as `gpus`, `cpu` (`cores`), `busy` and `used_by` (`{"groups": [...]}`, the groups with a member on this app). |
 | POST | `/api/nodes/probe` | `{"url", "key"}` (and `id` to reuse a saved node's key with `****`): what answers there. Nothing is saved. |
 | POST | `/api/nodes` | Add a node (the [`nodes`](https://mediapreviewgenerator.dev/reference/#nodes) fields). `201` with its row; `400` for an invalid field; `409` when the machine answering there is already added. |
 | PUT | `/api/nodes/{id}` | Change `name`, `url`, `key`, `enabled` or `path_mappings`. A new `url` needs the key typed again. With the row's `edit_tag`, `409` when the node was saved from somewhere else since that row was read. |
