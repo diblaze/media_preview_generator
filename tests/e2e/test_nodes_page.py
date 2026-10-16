@@ -305,7 +305,6 @@ class TestSettingsSidebar:
         expect(sidebar).to_be_visible()
         expect(sidebar.locator("a.nav-link.active")).to_have_text("Nodes")
         expect(sidebar.locator('a[aria-current="page"]')).to_have_attribute("href", "/nodes")
-        authed_page.screenshot(path=os.environ.get("NODES_SHOT", "/dev/null"), full_page=False)
         sidebar.get_by_role("link", name="Logging").click()
         expect(authed_page).to_have_url(re.compile(r"/settings#section-logging$"))
 
@@ -315,7 +314,6 @@ class TestSettingsSidebar:
         picker = authed_page.locator("#settingsMobileSection")
         expect(picker).to_have_value("/nodes")
         expect(authed_page.locator("#settings-sidebar")).to_be_hidden()
-        authed_page.screenshot(path=os.environ.get("NODES_SHOT_PHONE", "/dev/null"), full_page=False)
         picker.select_option(label="Backups")
         expect(authed_page).to_have_url(re.compile(r"/settings#section-backups$"))
         expect(authed_page.locator("#settingsMobileSection")).to_have_value("section-backups")
