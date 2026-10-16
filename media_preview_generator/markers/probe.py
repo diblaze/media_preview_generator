@@ -23,7 +23,7 @@ from typing import Any
 
 from loguru import logger
 
-from ..processing.filter_chain import display_matrix, rotation_filter
+from ..display_rotation import display_matrix, rotation_filter
 
 KILL_WAIT_S = 5.0
 FFPROBE_REAPER = "ffprobe-reaper"

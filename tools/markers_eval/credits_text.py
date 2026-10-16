@@ -75,7 +75,7 @@ DETECTOR_SOURCES = (
     "markers/credits/*.py",
     "markers/probe.py",
     "processing/hwaccel.py",
-    "processing/filter_chain.py",
+    "display_rotation.py",
     "markers/decide.py",
 )
 # The detector files that choose which windows are decoded (so they are in the ffmpeg command, the decode cache's key)

@@ -3486,7 +3486,7 @@ class TestDisplayMatrixTurn:
 
     @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
     def test_each_matrix_gets_ffmpegs_own_filters(self, matrix, turn, box):
-        from media_preview_generator.processing.filter_chain import rotation_filter
+        from media_preview_generator.display_rotation import rotation_filter
 
         assert rotation_filter(matrix) == turn
 
@@ -3496,13 +3496,13 @@ class TestDisplayMatrixTurn:
         ids=["none", "identity", "all-zero", "short", "45-degrees"],
     )
     def test_a_stream_shown_as_stored_or_at_an_angle_the_gpu_cant_mirror_gets_none(self, matrix):
-        from media_preview_generator.processing.filter_chain import rotation_filter
+        from media_preview_generator.display_rotation import rotation_filter
 
         assert rotation_filter(matrix) is None
 
     @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
     def test_the_matrix_is_read_from_ffprobes_side_data(self, matrix, turn, box):
-        from media_preview_generator.processing.filter_chain import display_matrix
+        from media_preview_generator.display_rotation import display_matrix
 
         assert display_matrix(json.loads(_ffprobe_side_data(matrix))["streams"][0]) == matrix
 
@@ -3519,12 +3519,12 @@ class TestDisplayMatrixTurn:
         ids=["no-side-data", "null", "number", "other-side-data", "not-numbers", "one-row"],
     )
     def test_a_stream_without_a_readable_matrix_has_none(self, stream):
-        from media_preview_generator.processing.filter_chain import display_matrix
+        from media_preview_generator.display_rotation import display_matrix
 
         assert display_matrix(stream) is None
 
     def test_the_matrix_after_other_side_data_is_still_found(self):
-        from media_preview_generator.processing.filter_chain import display_matrix
+        from media_preview_generator.display_rotation import display_matrix
 
         stream = json.loads(_ffprobe_side_data(_matrix(-ONE, 0, 0, ONE)))["streams"][0]
         stream["side_data_list"].insert(0, {"dv_profile": 8})

@@ -50,6 +50,7 @@ from typing import Any, Protocol
 from loguru import logger
 
 from ..config import Config
+from ..display_rotation import display_matrix, rotation_filter
 from ..shutdown import is_shutting_down
 from ..utils import cpu_workers_hint, debug_logging_hint, gpu_details_hint, is_node_mode, working_folder_hint
 from .ffmpeg_runner import GPU_CANT_DECODE_LINE, STALL_WATCHDOG_LINE
@@ -59,8 +60,6 @@ from .filter_chain import (
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
     build_hdr10_zscale_chain,
-    display_matrix,
-    rotation_filter,
 )
 from .hdr_detection import (
     is_dolby_vision,
@@ -1909,7 +1908,7 @@ def display_turn(video_file: str) -> str | None:
         video_file: The file.
 
     Returns:
-        The filters (:func:`filter_chain.rotation_filter`), or None for a stream shown as stored or one ffprobe can't
+        The filters (:func:`display_rotation.rotation_filter`), or None for a stream shown as stored or one ffprobe can't
         read.
     """
     cmd = ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries", "stream_side_data=displaymatrix",
