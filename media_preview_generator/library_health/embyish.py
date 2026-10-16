@@ -25,6 +25,7 @@ from ..servers._embyish import (
     _LIST_ITEMS_PAGE_SIZE,
     _LIST_ITEMS_RETRY_BASE_WAIT_S,
     _LIST_ITEMS_TIMEOUT_S,
+    _NO_BOXSET_COLLAPSE,
 )
 from ..servers.base import MediaServer, ServerConfig, ServerType
 from .markers_db import path_key
@@ -208,6 +209,7 @@ def _list_items(
             "Fields": fields,
             "Limit": _LIST_ITEMS_PAGE_SIZE,
             "StartIndex": start_index,
+            **_NO_BOXSET_COLLAPSE,
         }
         payload = _fetch_page(request, params, cancel_check)
         raw_items = payload.get("Items") or []
