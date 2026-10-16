@@ -675,6 +675,18 @@ class TestThisAppRow:
         expect(row.locator(".nd-status .pill")).to_have_class("pill ok")
         expect(row).to_have_attribute("data-tone", "ok")
 
+    def test_an_lspci_gpu_name_shows_its_model_and_keeps_the_full_name_as_a_tip(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        # Linux names Intel/AMD GPUs the lspci way; the whole name ran over the status column on sflix.
+        full = "Intel Corporation Raptor Lake-S GT1 [UHD Graphics 770] (rev 04)"
+        api = NodesApi(authed_page, _four_nodes())
+        api.this_app["gpus"] = [{"device": "/dev/dri/renderD128", "name": full, "type": "INTEL", "status": "ok"}]
+        authed_page.goto(f"{app_url}/nodes")
+        chip = authed_page.locator(".nd-this-app .nd-chips .pill").first
+        expect(chip).to_have_text("UHD Graphics 770")
+        expect(chip).to_have_attribute("title", full)
+
     def test_it_has_a_workers_link_and_no_node_actions(self, authed_page: Page, app_url: str) -> None:
         api = _open_nodes(authed_page, app_url, _four_nodes())
         row = authed_page.locator(".nd-this-app")

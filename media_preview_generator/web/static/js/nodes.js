@@ -198,8 +198,13 @@
         let html = '';
         gpus(node).forEach((gpu) => {
             const failed = gpu.status && gpu.status !== 'ok';
-            const name = gpu.name || gpu.device || gpu.type || 'GPU';
-            html += pill(failed ? 'warn' : 'off', failed ? `${name} · not working` : name, failed && gpu.error ? { title: gpu.error } : null);
+            const fullName = gpu.name || gpu.device || gpu.type || 'GPU';
+            // lspci names (Intel/AMD on Linux) carry the marketing name in their last [brackets]:
+            // "Intel Corporation Raptor Lake-S GT1 [UHD Graphics 770] (rev 04)" is a UHD Graphics 770.
+            const brackets = fullName.match(/\[([^\]]+)\][^[]*$/);
+            const name = brackets ? brackets[1] : fullName;
+            const title = failed && gpu.error ? gpu.error : (name !== fullName ? fullName : '');
+            html += pill(failed ? 'warn' : 'off', failed ? `${name} · not working` : name, title ? { title } : null);
         });
         const cores = node.cpu && Number(node.cpu.cores);
         if (cores) html += pill('off', `${cores} CPU`);
