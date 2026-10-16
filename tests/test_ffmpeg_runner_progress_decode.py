@@ -55,7 +55,7 @@ def _runner_kwargs(tmp_path):
         use_libplacebo=False,
         dv5_software_fallback=False,
         base_scale="scale=w=320:h=240:force_original_aspect_ratio=decrease",
-        fps_filter="fps=fps=0.1:round=up",
+        fps_filter="fps=fps=0.1:round=up:start_time=0",
         hdr10_zscale_chain="",
     )
 

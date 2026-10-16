@@ -17,6 +17,22 @@ DV5_PATH_VAAPI_VULKAN = "libplacebo_vaapi"
 DV5_PATH_LIBPLACEBO = "libplacebo_dv5"
 
 
+def build_fps_filter(fps_value: float) -> str:
+    """Return the ``fps`` filter that picks one thumbnail per interval, thumbnail *i* at ``i / fps_value`` seconds.
+
+    ``start_time=0`` pins the first thumbnail to 0 s. Without it ``round=up`` starts at the first interval mark at or
+    after the video's first frame, so a video that starts even 1 ms after the audio (41 of 400 sampled library MKVs, by
+    up to 83 ms) had every thumbnail one interval late, and a clip shorter than the interval got none (issue #408).
+
+    Args:
+        fps_value: Thumbnails per second (``1 / interval``).
+
+    Returns:
+        The filter, for the front of a ``-vf`` chain.
+    """
+    return f"fps=fps={fps_value}:round=up:start_time=0"
+
+
 def build_hdr10_zscale_chain(tonemap_algorithm: str, input_options: Sequence[str] = ()) -> str:
     """Return the software tone-map chain that turns HDR10 (or a DV base layer) into SDR yuv420p.
 
@@ -75,7 +91,7 @@ def build_dv5_vf(
     Raises:
         ValueError: if ``path_kind`` is not a recognised DV5 variant.
     """
-    fps = f"fps=fps={fps_value}:round=up"
+    fps = build_fps_filter(fps_value)
     if path_kind == DV5_PATH_INTEL_OPENCL:
         return (
             f"{fps},"

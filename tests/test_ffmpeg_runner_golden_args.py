@@ -50,7 +50,7 @@ DV_SAFE_RETRY_DEVICES = (
 # What generator.py passes as vf_override on the software libplacebo retry: build_dv5_vf(DV5_PATH_LIBPLACEBO) with
 # the default hable tonemap, a 10 s frame interval and the production base scale.
 SW_LIBPLACEBO_VF = (
-    "fps=fps=0.1:round=up,hwupload,libplacebo=tonemapping=hable:format=yuv420p:contrast=1.3:saturation=1.3,"
+    "fps=fps=0.1:round=up:start_time=0,hwupload,libplacebo=tonemapping=hable:format=yuv420p:contrast=1.3:saturation=1.3,"
     "hwdownload,format=yuv420p,scale=w=320:h=240:force_original_aspect_ratio=decrease"
 )
 
@@ -123,7 +123,7 @@ def _argv(case: dict) -> dict:
         use_libplacebo=case["init_vulkan"],
         dv5_software_fallback=False,
         base_scale="scale=w=320:h=240:force_original_aspect_ratio=decrease",
-        fps_filter="fps=fps=0.1:round=up",
+        fps_filter="fps=fps=0.1:round=up:start_time=0",
         hdr10_zscale_chain="ZSCALE_CHAIN",
     )
     proc = MagicMock(returncode=0, pid=4242)

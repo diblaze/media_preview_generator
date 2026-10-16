@@ -59,6 +59,7 @@ from .filter_chain import (
     DV5_PATH_LIBPLACEBO,
     DV5_PATH_VAAPI_VULKAN,
     build_dv5_vf,
+    build_fps_filter,
     build_hdr10_zscale_chain,
 )
 from .hdr_detection import (
@@ -257,6 +258,12 @@ _GPU_DECODABLE_CODECS = {
 # H.264 profiles FFmpeg offers no VAAPI or D3D11VA decoder for. NVDEC tries them and says it lacks the capabilities.
 _H264_SOFTWARE_ONLY_CHROMA = ("4:2:2", "4:4:4")
 NO_DECODER_SUMMARY = "This file's video can't be decoded by any device (unknown or protected codec)"
+# How FFmpeg's filter thread ends when a frame carries one kind of side data twice. A 3D MKV whose H.264 also holds a
+# frame-packing SEI does: its StereoMode header and the SEI each add a Stereo3D entry to every frame (FFmpeg 8.0.1 and
+# the app's 8.1.2, on the CPU, VAAPI and CUDA alike; exit 239).
+_SIDE_DATA_TWICE_LINE = "Task finished with error code: -17 (File exists)"
+# Drops H.264's SEI NAL units (type 6) before the decoder, and with them the stream's copy of the 3D layout.
+STRIP_H264_SEI_BSF = "filter_units=remove_types=6"
 
 # A failure log keeps this many lines from each end: one file's stderr reached 280,594 lines (21 MB).
 _FAILURE_LOG_EDGE_LINES = 200
@@ -944,6 +951,30 @@ def _gpu_lacks_the_decoder(rc: int, stderr_lines: list[str], hwaccel: str | None
             [line for line in stderr_lines_all if _HWACCEL_INIT_FAILED not in line.lower()]
         )
     return _decoded_in_software(stderr_lines, hwaccel) and not _detect_hwaccel_runtime_error(stderr_lines_all)
+
+
+def h264_side_data_twice(rc: int, stderr_lines: list[str]) -> bool:
+    """Whether FFmpeg refused an H.264 video's frames for carrying the same side data twice (issue #408).
+
+    A 3D MKV whose H.264 also holds a frame-packing SEI gives each frame two Stereo3D entries, and FFmpeg's filter
+    thread ends with "File exists" on every device. Read without the SEI (``STRIP_H264_SEI_BSF``) the frames carry the
+    header's entry alone and decode fine: the runner (``create_ffmpeg_runner``) reruns it that way at once, and every
+    later run too.
+
+    Args:
+        rc: The run's exit code.
+        stderr_lines: The run's stderr, with FFmpeg's listing of the input.
+
+    Returns:
+        True for such a run of an H.264 video; False otherwise, and when the listing is missing.
+    """
+    if rc == 0 or not any(line.lstrip().startswith("[vf#") and _SIDE_DATA_TWICE_LINE in line for line in stderr_lines):
+        return False
+    for line in stderr_lines:
+        found = _INPUT_VIDEO_STREAM_RE.match(line)
+        if found is not None and "(attached pic)" not in line:
+            return found.group(1) == "h264"
+    return False
 
 
 def _decoded_in_software(stderr_lines: list[str], hwaccel: str | None) -> bool:
@@ -1993,7 +2024,7 @@ def generate_images(
     # Filter primitives.  The final vf chain is assembled inside
     # _run_ffmpeg so it can adapt to the effective GPU on each attempt
     # (GPU→CPU retry, NVIDIA↔VAAPI overrides, etc.).
-    fps_filter = f"fps=fps={fps_value}:round=up"
+    fps_filter = build_fps_filter(fps_value)
     base_scale = "scale=w=320:h=240:force_original_aspect_ratio=decrease"
 
     # vf assembly classification.  Set by HDR detection below; consumed

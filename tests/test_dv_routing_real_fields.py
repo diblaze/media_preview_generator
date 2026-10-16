@@ -22,7 +22,7 @@ from media_preview_generator.processing.filter_chain import DV5_PATH_LIBPLACEBO,
 HW_VULKAN = VulkanProbeResult(device="Quadro P5000 (discrete) (0x1bb0)", is_software=False)
 SW_VULKAN = VulkanProbeResult(device="llvmpipe (LLVM 18.1.3, 256 bits) (software) (0x0)", is_software=True)
 
-FPS = "fps=fps=0.2:round=up"
+FPS = "fps=fps=0.2:round=up:start_time=0"
 SCALE = "scale=w=320:h=240:force_original_aspect_ratio=decrease"
 TONEMAP = (
     "zscale=t=linear:npl=100,format=gbrpf32le,"

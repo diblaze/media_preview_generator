@@ -173,7 +173,9 @@ def create_ffmpeg_runner(
         _FOLDER_WRITE_TEXT,
         FFMPEG_STALL_TIMEOUT_SEC,
         NO_DECODER_PHRASE,
+        STRIP_H264_SEI_BSF,
         CancellationError,
+        _clean_output_images,
         _crash_signal,
         _diagnose_ffmpeg_exit_code,
         _folder_write_errno,
@@ -183,9 +185,13 @@ def create_ffmpeg_runner(
         _save_ffmpeg_failure_log,
         _without_metadata_tags,
         folder_write_fix,
+        h264_side_data_twice,
         hwaccel_in,
         parse_ffmpeg_progress_line,
     )
+
+    # Set once FFmpeg refused the video for carrying its 3D layout twice (``h264_side_data_twice``).
+    read_without_sei = False
 
     def _gpu_scale_segment(effective_gpu: str | None, hw_decode_active: bool, fmt: str) -> str | None:
         """GPU-side scale + hwdownload segment for the active vendor,
@@ -278,7 +284,15 @@ def create_ffmpeg_runner(
         disable_vaapi_dv5: bool = False,
         path_kind_override: str | None = None,
     ) -> tuple[int, float, str, list[str]]:
-        """Run FFmpeg once and return (returncode, seconds, speed, stderr_lines)."""
+        """Run FFmpeg once and return (returncode, seconds, speed, stderr_lines).
+
+        A 3D video FFmpeg refuses as it is (``h264_side_data_twice``) is run again at once without its H.264 SEI, and
+        so is every later run of this runner, decoding every frame: the SEI also carries the recovery points that let
+        ``-skip_frame nokey`` decode an open-GOP encode's keyframes, so keyframe-only decode would keep only the first.
+        """
+        nonlocal read_without_sei
+        if read_without_sei:
+            use_skip = False
         # Build FFmpeg command with proper argument ordering
         # Hardware acceleration flags must come BEFORE the input file (-i)
         # Propagate the app's log level to FFmpeg so DEBUG reports include
@@ -459,6 +473,10 @@ def create_ffmpeg_runner(
         else:
             effective_vf = _assemble_vf(effective_gpu, hw_decode_active, effective_kind)
 
+        if read_without_sei:
+            # The first video stream, the one ``h264_side_data_twice`` read the codec of. FFmpeg maps the largest one,
+            # so a file with two real video streams of different codecs could be left as it was and fail again.
+            args += ["-bsf:V:0", STRIP_H264_SEI_BSF]
         # Chapter grabs reuse the managed process lifecycle but seek directly
         # and stop after one frame rather than decoding an interval sequence.
         if chapter_start_ms is not None:
@@ -819,12 +837,24 @@ def create_ffmpeg_runner(
                 video_file,
                 proc.returncode,
             )
+        # A normal rerun too: the caller reads the video again without its SEI, so this run is no failure yet.
+        side_data_twice = (
+            not stalled and not read_without_sei and h264_side_data_twice(proc.returncode, ffmpeg_output_lines)
+        )
+        if side_data_twice:
+            logger.info(
+                "{} is a 3D video FFmpeg can't read as it is: its 3D layout is stored twice (FFmpeg exit code {}). "
+                "Reading it again without the video stream's copy, decoding every frame.",
+                video_file,
+                proc.returncode,
+            )
         # Error logging (skip generic failure log when we stopped FFmpeg ourselves; already logged above)
         if (
             proc.returncode != 0
             and not stalled
             and not gpu_cant_decode
             and not gpu_lacks_decoder
+            and not side_data_twice
             and not chapter_without_frame
         ):
             exit_diagnosis = _diagnose_ffmpeg_exit_code(proc.returncode, ffmpeg_output_lines, output_folder)
@@ -994,6 +1024,19 @@ def create_ffmpeg_runner(
             if proc.returncode is None and PROCESS_EXIT_PENDING_LINE in ffmpeg_output_lines
             else proc.returncode
         )
+        if side_data_twice:
+            read_without_sei = True
+            if chapter_output is None:
+                _clean_output_images(output_folder)
+            return _run_ffmpeg(
+                use_skip,
+                gpu_override=gpu_override,
+                gpu_device_path_override=gpu_device_path_override,
+                vf_override=vf_override,
+                init_vulkan=init_vulkan,
+                disable_vaapi_dv5=disable_vaapi_dv5,
+                path_kind_override=path_kind_override,
+            )
         return returncode, seconds_local, speed_local, ffmpeg_output_lines
 
     return _run_ffmpeg

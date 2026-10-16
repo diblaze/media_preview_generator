@@ -3189,7 +3189,7 @@ class TestHdrVersusSdrFilterChain:
     ``TestGpuScaleOptimisation`` already covers, so this matrix runs on CPU.
     """
 
-    FPS = "fps=fps=0.2:round=up"
+    FPS = "fps=fps=0.2:round=up:start_time=0"
     SCALE = "scale=w=320:h=240:force_original_aspect_ratio=decrease"
     TONEMAP = (
         "zscale=t=linear:npl=100,format=gbrpf32le,"
@@ -3663,7 +3663,7 @@ class TestRotatedVideo:
         args = self._command(mock_config, "NVIDIA", "cuda", matrix)
 
         assert args[args.index("-vf") + 1] == (
-            f"fps=fps=0.2:round=up,scale_cuda={box}:force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            f"fps=fps=0.2:round=up:start_time=0,scale_cuda={box}:force_original_aspect_ratio=decrease:force_divisible_by=2:"
             f"format=nv12,hwdownload,format=nv12,{turn},{CPU_SCALE}"
         )
 
@@ -4627,7 +4627,7 @@ class TestBuildDV5Vf:
             base_scale=self._BASE_SCALE,
         )
         assert got == (
-            "fps=fps=0.5:round=up,"
+            "fps=fps=0.5:round=up:start_time=0,"
             "setparams=color_primaries=bt2020:"
             "color_trc=smpte2084:colorspace=bt2020nc,"
             "hwmap=derive_device=opencl:mode=read,"
@@ -4645,7 +4645,7 @@ class TestBuildDV5Vf:
             base_scale=self._BASE_SCALE,
         )
         assert got == (
-            "fps=fps=0.5:round=up,"
+            "fps=fps=0.5:round=up:start_time=0,"
             "hwmap=derive_device=vulkan,"
             "libplacebo=tonemapping=reinhard"
             ":format=yuv420p"
@@ -4661,7 +4661,7 @@ class TestBuildDV5Vf:
             base_scale=self._BASE_SCALE,
         )
         assert got == (
-            "fps=fps=0.5:round=up,"
+            "fps=fps=0.5:round=up:start_time=0,"
             "hwupload,"
             "libplacebo=tonemapping=reinhard"
             ":format=yuv420p"
@@ -4693,4 +4693,4 @@ class TestBuildDV5Vf:
                 fps_value=0.5,
                 base_scale=self._BASE_SCALE,
             )
-            assert got.startswith("fps=fps=0.5:round=up,"), path
+            assert got.startswith("fps=fps=0.5:round=up:start_time=0,"), path
