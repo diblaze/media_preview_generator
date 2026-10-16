@@ -321,6 +321,7 @@ class TestSettingsSidebar:
         expect(authed_page.locator("#settingsMobileSection")).to_have_value("section-backups")
 
 
+@pytest.mark.e2e
 class TestNodeList:
     def test_each_state_gets_its_chip_colour_and_button(self, authed_page: Page, app_url: str) -> None:
         # Red is a node that gets no work (Setup Health's Must fix); every problem state's button says Fix.
