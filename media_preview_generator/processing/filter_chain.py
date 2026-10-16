@@ -21,8 +21,9 @@ def build_fps_filter(fps_value: float) -> str:
     """Return the ``fps`` filter that picks one thumbnail per interval, thumbnail *i* at ``i / fps_value`` seconds.
 
     ``start_time=0`` pins the first thumbnail to 0 s. Without it ``round=up`` starts at the first interval mark at or
-    after the video's first frame, so a video that starts even 1 ms after the audio (41 of 400 sampled library MKVs, by
-    up to 83 ms) had every thumbnail one interval late, and a clip shorter than the interval got none (issue #408).
+    after the video's first frame, so for a video that starts even 1 ms after the audio (41 of 400 sampled library MKVs,
+    by up to 83 ms) FFmpeg filled thumbnail 0 with a copy of thumbnail 1, and a clip shorter than the interval got no
+    thumbnail at all (issue #408).
 
     Args:
         fps_value: Thumbnails per second (``1 / interval``).

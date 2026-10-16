@@ -1,9 +1,9 @@
-"""Issue #408: thumbnails one interval late, and 3D videos FFmpeg refused.
+"""Issue #408: the first thumbnail of a video that starts after its audio, and 3D videos FFmpeg refused.
 
-A video that starts after its audio (41 of 400 sampled library MKVs, by up to 83 ms) had every thumbnail one interval
-late: ``fps=…:round=up`` began at the first interval mark after the video's first frame, while the BIF shows thumbnail
-*i* at ``i * interval``. A clip shorter than the interval got no thumbnail at all, and FFmpeg then failed opening the
-JPEG encoder (exit 234, "Error sending frames to consumers: Invalid argument").
+For a video that starts after its audio (41 of 400 sampled library MKVs, by up to 83 ms) ``fps=…:round=up`` began at
+the first interval mark after the video's first frame, and FFmpeg filled thumbnail 0 with a copy of thumbnail 1: the
+BIF showed the first interval's picture at 0 s. A clip shorter than the interval got no thumbnail at all, and FFmpeg
+then failed opening the JPEG encoder (exit 234, "Error sending frames to consumers: Invalid argument").
 
 A 3D MKV whose H.264 also holds a frame-packing SEI carries its 3D layout twice, and FFmpeg 8 refused every frame
 ("-17 (File exists)", exit 239) on the CPU and every GPU. It is read again without the SEI.
@@ -110,7 +110,7 @@ class TestThumbnailsStartAtZero:
         outcome = _real_run(run, mock_config, duration_s=25)
 
         assert_published(outcome, 3)
-        # Brightness is 8 × seconds: 0 s, 10 s and 20 s read about 0, 80 and 160. One interval late they read 80, 160.
+        # Brightness is 8 × seconds: 0 s, 10 s and 20 s read about 0, 80 and 160. Before, thumbnail 0 read about 80.
         brightness = [_brightness(tmp_path / "frames" / name) for name in outcome.frames_left]
         for k, value in enumerate(brightness):
             assert abs(value - 8 * k * INTERVAL_S) < 12, brightness
