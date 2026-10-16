@@ -31,6 +31,12 @@ released.
   mapped to part of a library was reported unmapped), all fixed.
 * **Live on sflix:** storage runs previews and loudness for plex's jobs (loudness at about 24x on its CPU); Test access
   passes 3/3 on all nine libraries; a big manual job cancelled mid-walk stays cancelled with nothing run.
+* **After the merge (rounds 10–13, all on `dev`):** library rows inside one mapping row (Test access and the quick
+  check share one rule), a node's answer whose headers trickle in is given up on at the read timeout, the Nodes page
+  keeps the Settings sidebar and lists **This app** first (Main badge, no Edit/Remove), and dashboard device rows say
+  "This app" beside a node's once any worker runs on a node. Round 13 found nothing above LOW. A Plex database node
+  must import with only `nodes/plex-db/requirements.txt` (`tests/nodes/test_plex_db_node_imports.py` blocks the
+  rest); a markers probe change once broke that.
 
 * **Built:** every lane in §8: node server + `MODE=node`, Nodes page and API, node devices in worker groups, remote
   execution for previews / Intro & Credits / loudness, the Plex database role (old helper folded in, plus loudness
@@ -72,8 +78,8 @@ released.
 * **Still open:**
   - The image name `plex-marker-agent` and tag prefix `marker-agent-v*` are unchanged; renaming is a release-time
     decision.
-  - The Windows node has never touched a real Plex on Windows (needs the #407 reporter's beta), and Docker Desktop
-    reaching a native node via `host.docker.internal` is untested.
+  - The Windows node has never touched a real Plex on Windows, and Docker Desktop reaching a native node via
+    `host.docker.internal` is untested. Test steps went to the #407 reporter on 2026-10-16.
   - Nodes in a different time zone from the app weren't tried in the lab (all ran one zone).
   - A worker node must run the app's exact version, so every app update means updating each worker node.
 
