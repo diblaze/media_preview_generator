@@ -356,15 +356,33 @@ class TestHeadersSentSlowlyAreGivenUpOn:
         with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=0.5, gap_s=0.01) as url:
             assert NodeClient(NodeAddress(url, "k" * 24)).info()["node"]["id"] == "uid-1"
 
-    def test_the_connection_given_up_on_is_not_used_again(self):
-        """Its socket still has the rest of the dripped headers coming: reused, the next answer would be those."""
+    def test_a_request_after_one_given_up_on_is_answered(self):
+        """Giving up shuts that connection's socket; the next request still gets its answer."""
         with headers_dripping_server(json.dumps(NODE_INFO).encode(), drip_s=10, gap_s=0.05, dripped=1) as url:
             client = NodeClient(NodeAddress(url, "k" * 24))
             with pytest.raises(NodeTimeoutError):
                 client.info()
             assert client.info()["node"]["id"] == "uid-1"
 
+    @pytest.mark.parametrize(
+        ("call", "drip_s", "expected"),
+        [
+            (lambda c: c.info()["node"]["id"], READ_S + 0.2, "uid-1"),
+            (
+                lambda c: bytes(c.fetch_artifact("t1")).lstrip(),
+                ARTIFACT_HEADERS_S + 0.5,
+                json.dumps(NODE_INFO).encode(),
+            ),
+        ],
+        ids=["info", "artifact"],
+    )
+    def test_a_body_arriving_past_the_headers_wait_is_read(self, call, drip_s, expected):
+        """The headers' watchdog is off once they arrive: the body has its own deadline, counted from them."""
+        with dripping_server(json.dumps(NODE_INFO).encode(), drip_s=drip_s, gap_s=0.05) as url:
+            assert call(NodeClient(NodeAddress(url, "k" * 24))) == expected
+
     def test_a_prompt_answer_is_read_and_its_connection_kept_for_the_next_request(self):
+        """A pooled connection idle past the headers' wait is still whole: the watchdog went off with its answer."""
         connections: list[object] = []
 
         class KeepAlive(_Answer):
@@ -380,11 +398,41 @@ class TestHeadersSentSlowlyAreGivenUpOn:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             client = NodeClient(NodeAddress(f"http://127.0.0.1:{server.server_port}", "k" * 24))
-            assert [client.info()["node"]["id"] for _ in range(3)] == ["uid-1"] * 3
+            assert client.info()["node"]["id"] == "uid-1"
+            time.sleep(self.READ_S + 0.3)
+            assert [client.info()["node"]["id"] for _ in range(2)] == ["uid-1"] * 2
         finally:
             server.shutdown()
             server.server_close()
         assert len(connections) == 1
+
+
+class TestAProxyKeepsTheHeadersDeadline:
+    @pytest.mark.parametrize("target", ["http://node:9494", "https://node:9494"])
+    def test_an_http_proxys_connections_have_it(self, target):
+        adapter = client_mod._HeadersDeadlineAdapter()
+        pool = adapter.proxy_manager_for("http://proxy:3128").connection_from_url(target)
+        assert type(pool) is client_mod._HEADERS_DEADLINE_POOLS[target.split(":", 1)[0]]
+
+    def test_a_socks_proxys_own_connections_are_left_alone(self):
+        pytest.importorskip("socks")
+        from urllib3.contrib.socks import SOCKSHTTPConnectionPool
+
+        adapter = client_mod._HeadersDeadlineAdapter()
+        pool = adapter.proxy_manager_for("socks5://proxy:1080").connection_from_url("http://node:9494")
+        assert type(pool) is SOCKSHTTPConnectionPool
+
+
+class TestTheHeadersWatchdog:
+    def test_no_thread_for_it_leaves_the_request_to_its_read_timeout(self, monkeypatch, serve):
+        def no_thread(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Timer, "start", no_thread)
+        url, _ = serve(200, json.dumps(NODE_INFO).encode())
+        session = client_mod.new_session()
+        session.trust_env = False
+        assert NodeClient(NodeAddress(url, "k"), session=session).info()["node"]["id"] == "uid-1"
 
 
 class TestEveryFailureIsANodeError:

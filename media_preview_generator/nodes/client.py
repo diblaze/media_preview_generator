@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
@@ -261,6 +262,9 @@ class _HeadersDeadline:
     the calling thread for as long as the sender liked (the body has its own deadline: ``answer_pieces``). At the
     deadline the socket is shut down, which wakes the blocked read; the request then fails as a read timeout, and
     urllib3 closes the connection rather than pooling it.
+
+    Through an http proxy, an https request's CONNECT reply is read while connecting, before this: it is bounded only
+    per read.
     """
 
     timeout: Any
@@ -281,15 +285,21 @@ class _HeadersDeadline:
 
         def expire() -> None:
             nonlocal expired
+            # Shut under the lock: once ``finished`` the connection may be closed and its descriptor reused elsewhere.
             with lock:
                 if finished:
                     return
                 expired = True
-            _shut_down(sock)
+                _shut_down(sock)
 
         timer = threading.Timer(budget, expire)
         timer.daemon = True
-        timer.start()
+        try:
+            timer.start()
+        except RuntimeError:
+            # No thread to spare (a process limit, or the interpreter shutting down): each read is still bounded.
+            logger.warning("No thread for a node answer's headers deadline; waiting on the read timeout alone")
+            return super().getresponse()  # type: ignore[misc]
         try:
             response = super().getresponse()  # type: ignore[misc]
         finally:
