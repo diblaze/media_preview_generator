@@ -15,6 +15,7 @@ down or not ready when the editor saved) is different: no backoff, every run pub
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from collections.abc import Callable, Iterable
@@ -119,7 +120,7 @@ def find_drift(
                 server,
                 cfg,
                 sibling_markers=lambda path: markers_for_path(store, path),
-                item_record=lambda other, server_id=cfg.id: item_record_for(store, server_id, other),
+                item_record=functools.partial(item_record_for, store, cfg.id),
                 ui_details=False,
             )
             if server is not None
