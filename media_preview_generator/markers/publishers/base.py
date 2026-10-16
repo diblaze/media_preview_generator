@@ -362,6 +362,21 @@ class MarkerPublisher(ABC):
         """
         return ()
 
+    def sibling_kept_types(self, item_id: str) -> frozenset[MarkerType]:
+        """The types kept as the server's own on the other items holding this item's files, at the last read.
+
+        The caller releases them as it does the item's own kept types (the server set to use ours, the type locked):
+        only this item's file runs, and its write rewrites every item holding the file.
+
+        Args:
+            item_id: The server's item id.
+
+        Returns:
+            The union of those items' recorded kept types; empty when not read or where a file has one item (this
+            default: Jellyfin and Emby).
+        """
+        return frozenset()
+
     def shows_many(
         self, items: list[ReadBackItem], *, cancel_check: Callable[[], bool] | None = None
     ) -> dict[str, Shown | None]:

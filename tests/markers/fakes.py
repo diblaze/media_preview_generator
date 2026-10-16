@@ -113,6 +113,7 @@ def ready_publisher(name="plex_db", types=("intro", "credits"), *, atomic_writes
     pub.projection_note.return_value = ""
     # None of the server's markers were made for an earlier file (tests of "can't tell" set None).
     pub.types_not_made_for_file.return_value = frozenset()
+    pub.sibling_kept_types.return_value = frozenset()  # no other item holds the file
     pub.stale_types_unanswerable = False
 
     def succeed(item_id, markers, **kwargs):

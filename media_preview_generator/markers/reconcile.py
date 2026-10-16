@@ -28,6 +28,7 @@ from ..job_kinds import JOB_KIND_INTRO_CREDITS
 from ..processing.types import ProcessableItem
 from ..servers.base import ServerConfig
 from ..web.jobs import PRIORITY_LOW, Job, get_job_manager, is_live_retry_chain
+from .models import MarkerType
 from .models import utcnow as _utcnow
 from .outcomes import NOT_IN_LIBRARY, ServerStatus
 from .ownership import marker_matches
@@ -129,6 +130,7 @@ def find_drift(
             continue
         answers: dict[str, Shown | None] = {}
         live: dict[str, tuple[str, ...]] = {}
+        sibling_kept: dict[str, frozenset[MarkerType]] = {}
         stopped = False
         try:
             report = capability(cfg, publisher) if capability is not None else publisher.capability()
@@ -154,6 +156,7 @@ def find_drift(
                 read = publisher.shows_many(batch, cancel_check=cancel_check)
                 answers.update(read)
                 live.update({item_id: tuple(publisher.live_files(item_id)) for item_id in read})
+                sibling_kept.update({item_id: publisher.sibling_kept_types(item_id) for item_id in read})
                 if stopped_unreadable(batch, read):
                     stopped = True
                     break
@@ -164,7 +167,9 @@ def find_drift(
             logger.warning("Check servers couldn't check {}: {}", name, type(exc).__name__)
             warnings.append(f"Couldn't check {name}")
             continue
-        found, unreadable = _drifted(store, cfg, rows, answers, live, release_kept=not settings.keeps_server_markers)
+        found, unreadable = _drifted(
+            store, cfg, rows, answers, live, sibling_kept, release_kept=not settings.keeps_server_markers
+        )
         drifts.extend(found)
         if stopped:
             logger.warning("Check servers stopped reading {}: {} reads in a row failed", name, UNREADABLE_IN_A_ROW)
@@ -180,12 +185,14 @@ def _drifted(
     rows: list,
     answers: dict[str, Shown | None],
     live: dict[str, tuple[str, ...]],
+    sibling_kept: dict[str, frozenset[MarkerType]],
     *,
     release_kept: bool,
 ) -> tuple[list[Drift], int]:
     """One server's drifted items from its read-back answers (``find_drift``), and how many items couldn't be read.
 
-    ``live`` holds each read item's current files (``MarkerPublisher.live_files``).
+    ``live`` holds each read item's current files (``MarkerPublisher.live_files``), ``sibling_kept`` the types kept on
+    the other items holding them (``MarkerPublisher.sibling_kept_types``).
     """
     name = cfg.name or cfg.id
     drifts: list[Drift] = []
@@ -199,7 +206,8 @@ def _drifted(
             continue
         # A type kept as the server's own (or left to it undecided) goes back to ours once the server is set to use
         # ours: the pipeline reads and writes it.
-        if shown is Shown.OURS and (row.kept_types or row.own_types) and release_kept:
+        kept = row.kept_types or row.own_types or sibling_kept.get(row.item_id)
+        if shown is Shown.OURS and kept and release_kept:
             shown = Shown.REPLACED
         if shown is Shown.OURS:
             continue

@@ -5888,6 +5888,60 @@ class TestRealPlexPublisher:
         assert [row[0] for row in _served(db, 8)] == ["intro", "credits"]
         assert run()["status"] == ServerStatus.UP_TO_DATE.value
 
+    @pytest.mark.parametrize("release", ["set-to-use-ours", "locked"])
+    def test_plexs_own_intro_kept_on_the_second_episode_only_goes_back_to_ours_when_released(
+        self, store, media, tmp_path, monkeypatch, release
+    ):
+        from media_preview_generator.markers.publishers import plex_db
+        from media_preview_generator.markers.publishers.plex_db import encode_extra_data
+        from tests.markers.test_plex_db_publisher import (
+            INTRO_ROW_EXTRA,
+            NATIVE_INTROS,
+            PLEX_VERSION,
+            _add_item,
+            _exec,
+            _insert_taggings,
+            _make_db,
+            _served,
+            _set_part_extra,
+        )
+
+        folder = tmp_path / "Plex Media Server"
+        db = str(_make_db(folder, parts=((media, None),)))
+        _exec(db, "UPDATE metadata_items SET library_section_id=1 WHERE id=7")
+        second_part = _add_item(db, 8, [media])[0]
+        _insert_taggings(db, (8, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))  # Plex's own, on episode 2 only
+        _set_part_extra(db, second_part, encode_extra_data({"pv:intros": NATIVE_INTROS}))
+        monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)
+        monkeypatch.setattr(plex_db, "filesystem_type", lambda _path, **_kw: "ext4")
+        reg = _registry(media, ServerType.PLEX)
+        cfg = reg.configs_by_id["plex-1"]
+        cfg.output = {"plex_config_folder": str(folder)}
+        cfg.markers["plex"]["on_plex_redetect"] = "keep_plex"
+        server = reg.get("plex-1")
+        server.resolve_remote_path_to_item_id.return_value = "7"
+        server.get_server_status.return_value = {"plex_pass": True, "version": PLEX_VERSION}
+
+        def run() -> dict:
+            with patch.object(pipeline, "probe_media", return_value=_probe(CHAPTERS_BOTH)):
+                return _rows(check_item(_item(media), ctx=_ctx(store, reg)))["plex-1"]
+
+        assert run()["status"] == ServerStatus.WRITTEN.value
+        assert _served(db, 8)[0] == ("intro", 990, 29_306)
+        assert store.get_item_publish_state("plex-1", "8").kept_types == {T.INTRO}
+        assert run()["status"] == ServerStatus.UP_TO_DATE.value
+
+        if release == "locked":
+            store.lock_marker(
+                store.get_file(media).id, Marker(T.INTRO, INTRO_CH.start_ms, INTRO_CH.end_ms, ("user",), locked=True)
+            )
+        else:
+            cfg.markers["plex"]["on_plex_redetect"] = "restore"
+        assert run()["status"] == ServerStatus.WRITTEN.value
+        assert _served(db, 8)[0] == _served(db, 7)[0] == ("intro", INTRO_CH.start_ms, INTRO_CH.end_ms)
+        assert store.get_item_publish_state("plex-1", "8").kept_types == frozenset()
+        assert run()["status"] == ServerStatus.UP_TO_DATE.value
+
 
 def test_markers_for_path(store, media):
     assert pipeline.markers_for_path(store, media) is None

@@ -2144,6 +2144,7 @@ class PlexMarkerPublisher(MarkerPublisher):
         self._settings_provider = settings_provider
         self._sibling_markers = sibling_markers or (lambda _path: None)
         self._item_record = item_record
+        self._sibling_kept: dict[str, frozenset[MarkerType]] = {}
         self._ui_details = ui_details
         self._db_timeout_s = db_timeout_s
         self._db = db or LocalPlexDb(self.db_path, label=config.name, mountinfo_path=mountinfo_path)
@@ -2580,6 +2581,17 @@ class PlexMarkerPublisher(MarkerPublisher):
             logger.debug("Plex {}: couldn't look item {} up: {}", self._config.name, item_id, type(exc).__name__)
             return None
 
+    def sibling_kept_types(self, item_id: str) -> frozenset[MarkerType]:
+        """The kept types recorded for the other episodes of the item's file, at its last ``shows_many`` read.
+
+        Args:
+            item_id: Plex rating key.
+
+        Returns:
+            Their union; empty when the item wasn't read, showed less than ours, or shares its file with no item.
+        """
+        return self._sibling_kept.get(item_id, frozenset())
+
     def live_files(self, item_id: str) -> tuple[str, ...]:
         """The item's versions (optimized copies left out) at its last ``shows_many`` read, mapped to local paths.
 
@@ -2610,6 +2622,7 @@ class PlexMarkerPublisher(MarkerPublisher):
         """
         out: dict[str, Shown | None] = {}
         self._live_files = {}
+        self._sibling_kept = {}
         if not items:
             return out
         local = self._local_checks(deadline=self._db_deadline(), trust_recent=True)
@@ -2651,17 +2664,23 @@ class PlexMarkerPublisher(MarkerPublisher):
 
         A write gives every one of them the file's markers, so one of them showing less is the item needing a write,
         and one this app has no record of has never been written (an episode a write from before siblings left out).
-        A sibling whose read fails says nothing.
+        A sibling whose record or read fails says nothing. Their kept types are kept for ``sibling_kept_types``.
         """
         out: dict[str, Shown] = {}
         asks: list[ShownAsk] = []
         owners: list[str] = []
         for item_id, keys in siblings.items():
             for key in keys:
-                record = self._item_record(str(key))  # type: ignore[misc]  # checked by the caller
+                try:
+                    record = self._item_record(str(key))  # type: ignore[misc]  # checked by the caller
+                except Exception as exc:
+                    logger.debug("Plex {}: couldn't look item {} up: {}", self._config.name, key, type(exc).__name__)
+                    continue
                 if record is None:
                     out.setdefault(item_id, Shown.MISSING)
                     continue
+                if record.kept_types:
+                    self._sibling_kept[item_id] = self._sibling_kept.get(item_id, frozenset()) | record.kept_types
                 asks.append(
                     ShownAsk(key, self.project(record.markers), frozenset(record.kept_types), record.item_files)
                 )

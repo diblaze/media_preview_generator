@@ -167,6 +167,22 @@ class TestFindDrift:
         # A kept type goes along to the read-back either way (one Plex no longer shows at all comes back MISSING).
         assert pub.shows_many.call_args.args[0][0][2] == frozenset({T.CREDITS})
 
+    @pytest.mark.parametrize(("redetect", "drift"), [("restore", True), ("keep_plex", False)])
+    def test_a_type_kept_only_on_another_episode_of_the_file_is_released_through_the_file(
+        self, store, media, redetect, drift
+    ):
+        block = {"plex": {"db_write_confirmed_at": "2026-09-13T00:00:00+00:00", "on_plex_redetect": redetect}}
+        cfg = server_config("plex-1", ServerType.PLEX, root=media.root, markers={"enabled": True, **block})
+        _published(store, "plex-1", "1", media("a.mkv"))
+        pub = ready_publisher()
+        pub.shows_many.return_value = {"1": Shown.OURS}
+        pub.sibling_kept_types.side_effect = lambda item_id: frozenset({T.CREDITS}) if item_id == "1" else frozenset()
+        with patch.object(reconcile, "publisher_for", return_value=pub):
+            drifts, _ = reconcile.find_drift(registry=_registry(cfg), store=store)
+        assert [(d.item_id, d.shown, d.files) for d in drifts] == (
+            [("1", Shown.REPLACED, (media("a.mkv"),))] if drift else []
+        )
+
     @pytest.mark.parametrize(
         "switch",
         [{"markers": {"enabled": False, "library_ids": None}}, {"enabled": False}],

@@ -2643,9 +2643,11 @@ def _publish_to(
                 # a marker the user adjusted or locked wins over "Keep Plex's" / "Keep Emby's".
                 # A lock alone doesn't change the decided times, so without this the unchanged test above would leave
                 # the server showing its own markers for a type the user just took over.
-                released = bool(item_row.kept_types) and (
+                # The other episodes of a multi-episode file have their own kept types, and only this file runs.
+                kept = item_row.kept_types | publisher.sibling_kept_types(item_id)
+                released = bool(kept) and (
                     not _live_markers_settings(ctx, cfg).keeps_server_markers
-                    or bool(item_row.kept_types & {m.type for m in wanted if m.locked})
+                    or bool(kept & {m.type for m in wanted if m.locked})
                 )
                 if shown is Shown.OURS and not released:
                     return _up_to_date(item_row.kept_types)

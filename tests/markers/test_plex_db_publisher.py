@@ -4361,8 +4361,40 @@ class TestMultiEpisodeFile:
         assert (part_intros["pv:intros"] == NATIVE_INTROS) is kept
         # Read back against its own record: the kept episode asks for no write, so no run rewrites it again and again.
         assert records.shown(pub) is Shown.OURS
+        assert pub.sibling_kept_types("7") == ({T.INTRO} if kept else frozenset())  # for the job to release it
         records.write(pub, [INTRO, CREDITS_FINAL], previous=ours)
         assert pub.last_write_changed is False
+
+    def test_a_type_kept_on_an_episode_only_goes_back_to_ours_once_the_server_is_set_to_use_ours(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db, parts = _multi_episode_db(folder)
+        _insert_taggings(db, (8, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
+        _set_part_extra(db, parts[8], encode_extra_data({"pv:intros": NATIVE_INTROS}))
+        records = _Records()
+        ours = records.write(_recording_publisher(tmp_path, folder, records, redetect="keep_plex"), [INTRO])
+        assert records.rows["8"].kept_types == {T.INTRO}
+        pub = _recording_publisher(tmp_path, folder, records, redetect="restore")
+
+        records.write(pub, [INTRO], previous=ours)
+
+        assert pub.last_write_changed is True
+        assert pub.last_siblings == {"8": ([INTRO], frozenset())}
+        assert _served(db, 8) == _served(db, 7) == [(T.INTRO, 11_000, 37_000)]
+        assert records.shown(pub) is Shown.OURS
+        assert pub.sibling_kept_types("7") == frozenset()
+
+    def test_an_episode_whose_record_cant_be_read_says_nothing(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        _db, _parts = _multi_episode_db(folder)
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
+        records.write(pub, [INTRO])
+
+        def broken(_item_id):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        pub._item_record = broken
+        assert records.shown(pub) is Shown.OURS
 
     def test_plex_redetecting_an_episode_under_use_ours_is_noticed_and_put_back(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
