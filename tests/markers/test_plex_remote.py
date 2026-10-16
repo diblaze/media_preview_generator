@@ -28,12 +28,15 @@ from media_preview_generator.markers.publishers.base import (
 )
 from media_preview_generator.markers.publishers.plex_db import (
     ItemRead,
+    ItemRecord,
     LocalPlexDb,
     Part,
     PlexMarkerPublisher,
     ShownAnswer,
     ShownAsk,
     ShownBatch,
+    SiblingResult,
+    SiblingState,
     WriteRequest,
     WriteResult,
 )
@@ -207,17 +210,49 @@ class TestCodec:
         ask = ShownAsk(7, [INTRO], frozenset({T.CREDITS}), files)
         assert plex_remote.shown_ask_from_json(plex_remote.shown_ask_to_json(ask)) == ask
 
-    @pytest.mark.parametrize("keep_plex", [True, False, None])
-    def test_a_read_back_ask_carries_the_keep_plexs_setting(self, keep_plex):
-        ask = ShownAsk(7, [INTRO], frozenset(), None, keep_plex)
-        body = plex_remote.shown_ask_to_json(ask)
-        assert body["keep_plex"] is keep_plex
-        assert plex_remote.shown_ask_from_json(body) == ask
+    def test_the_records_of_the_items_sharing_its_file_travel_with_a_write(self):
+        request = WriteRequest(
+            7, [PART], [INTRO], [], 1, [], (1,), frozenset(), True,
+            siblings=(SiblingState(8, [INTRO], frozenset({T.CREDITS})), SiblingState(9, [], frozenset())),
+        )  # fmt: skip
+        body = plex_remote.write_request_to_json(request)
+        assert body["siblings"][0] == {"rating_key": 8, "prior": [plex_remote.marker_to_json(INTRO)],
+                                       "kept_types": ["credits"]}  # fmt: skip
+        assert plex_remote.write_request_from_json(body) == request
+        body.pop("siblings")  # an app older than this field
+        assert plex_remote.write_request_from_json(body).siblings == ()
 
-    def test_an_older_apps_read_back_ask_leaves_the_setting_unknown(self):
-        body = plex_remote.shown_ask_to_json(ShownAsk(7, [INTRO], frozenset(), None, True))
-        body.pop("keep_plex")
-        assert plex_remote.shown_ask_from_json(body).keep_plex is None
+    def test_a_write_result_says_what_each_item_sharing_its_file_was_left_with(self):
+        result = WriteResult(
+            True, [INTRO], frozenset(), frozenset(),
+            siblings=(SiblingResult(8, True, [INTRO], frozenset()), SiblingResult(9, False, [], frozenset({T.INTRO}))),
+        )  # fmt: skip
+        body = plex_remote.write_result_to_json(result)
+        assert plex_remote.write_result_from_json(body) == result
+        body.pop("siblings")  # an agent older than this field writes no other item
+        assert plex_remote.write_result_from_json(body).siblings == ()
+
+    def test_an_item_read_names_the_items_sharing_its_file(self):
+        item = ItemRead(True, [PART], frozenset(), (8, 9))
+        body = plex_remote.item_read_to_json(item)
+        assert body["siblings"] == [8, 9]
+        assert plex_remote.item_read_from_json(body) == item
+        body.pop("siblings")  # an agent older than this field: unknown
+        assert plex_remote.item_read_from_json(body).siblings is None
+
+    def test_a_read_back_answer_names_the_items_sharing_its_file(self):
+        batch = ShownBatch([ShownAnswer(Shown.OURS, ("/a.mkv",), (8,)), ShownAnswer(None, ())], False)
+        body = plex_remote.shown_batch_to_json(batch)
+        assert plex_remote.shown_batch_from_json(body) == batch
+        for answer in body["answers"]:
+            answer.pop("siblings")  # an agent older than this field
+        assert [a.siblings for a in plex_remote.shown_batch_from_json(body).answers] == [(), ()]
+
+    @pytest.mark.parametrize("siblings", ["8", [{"rating_key": "x", "prior": []}], [{"prior": []}]])
+    def test_sibling_records_that_arent_records_are_refused(self, siblings):
+        body = plex_remote.write_request_to_json(WriteRequest(7, [PART], [INTRO], [], 1, [], (1,), frozenset(), True))
+        with pytest.raises(ValueError):
+            plex_remote.write_request_from_json({**body, "siblings": siblings})
 
     @pytest.mark.parametrize("shown", list(Shown) + [None])
     def test_a_read_back_batch_round_trips_every_answer(self, shown):
@@ -1019,7 +1054,7 @@ class FakeDatabase:
         return True
 
 
-def _publisher(database, *, keep_plex=False, mappings=None, identity=None) -> PlexMarkerPublisher:
+def _publisher(database, *, keep_plex=False, mappings=None, identity=None, item_record=None) -> PlexMarkerPublisher:
     config = ServerConfig(
         id="plex-1",
         type=ServerType.PLEX,
@@ -1035,7 +1070,7 @@ def _publisher(database, *, keep_plex=False, mappings=None, identity=None) -> Pl
     server = MagicMock()
     server.get_server_status.return_value = {"plex_pass": True, "version": "1.43.4"}
     server.get_marker_detection_prefs.return_value = {"intro": "never", "credits": "never"}
-    return PlexMarkerPublisher(server, config, settings, db=database)
+    return PlexMarkerPublisher(server, config, settings, db=database, item_record=item_record)
 
 
 class TestThePublisherTalksToWhicheverDatabaseItWasGiven:
@@ -1096,13 +1131,51 @@ class TestThePublisherTalksToWhicheverDatabaseItWasGiven:
         assert ask.ours == [INTRO]  # Plex shows no recap: projected away before the database is asked
         assert ask.kept_types == frozenset({T.CREDITS})
         assert ask.item_files == ("/plexmedia/tv/S01E01.mkv",)
-        assert ask.keep_plex is False
         assert publisher.live_files("7") == ("/data/tv/S01E01.mkv",)
 
-    def test_the_read_back_asks_with_the_servers_keep_plexs_setting(self):
+    def test_the_write_carries_the_records_of_the_items_sharing_its_file_and_reports_theirs(self):
         database = FakeDatabase()
-        _publisher(database, keep_plex=True).shows_many([("7", [INTRO], frozenset(), None)])
-        assert database.asks[0].keep_plex is True
+        database.item = ItemRead(True, [PART], frozenset(), (8, 9))
+        recap = Marker(T.RECAP, 0, 1_000, ("chapters",))
+        records = {"8": ItemRecord([INTRO, recap], frozenset({T.CREDITS}), ("/plexmedia/tv/S01E01.mkv",))}
+        database.result = WriteResult(
+            True, [INTRO], frozenset(), frozenset(),
+            siblings=(SiblingResult(8, True, [INTRO], frozenset()), SiblingResult(9, False, [], frozenset({T.INTRO}))),
+        )  # fmt: skip
+        publisher = _publisher(database, item_record=records.get)
+
+        publisher.write("7", [INTRO], previous=[INTRO], duration_ms=1, canonical_path="/data/tv/S01E01.mkv")
+
+        # Item 9 has no record: the database half writes it as having none.
+        assert database.writes[0].siblings == (SiblingState(8, [INTRO], frozenset({T.CREDITS})),)
+        assert publisher.last_siblings == {"8": ([INTRO], frozenset()), "9": ([], frozenset({T.INTRO}))}
+
+    @pytest.mark.parametrize(
+        ("records", "sibling_shows", "shown"),
+        [
+            ({"8": True}, Shown.OURS, Shown.OURS),
+            ({"8": True}, Shown.MISSING, Shown.MISSING),
+            ({"8": True}, Shown.REPLACED, Shown.REPLACED),
+            ({"8": True}, None, Shown.OURS),  # a sibling's read that failed says nothing
+            ({}, None, Shown.MISSING),  # never written: an episode a write from before siblings left out
+        ],
+        ids=["ours", "missing", "replaced", "unreadable", "no-record"],
+    )
+    def test_an_item_showing_ours_is_answered_by_the_items_sharing_its_file(self, records, sibling_shows, shown):
+        database = FakeDatabase()
+        answers = [
+            ShownBatch([ShownAnswer(Shown.OURS, ("/plexmedia/tv/S01E01.mkv",), (8,))], False),
+            ShownBatch([ShownAnswer(sibling_shows, ("/plexmedia/tv/S01E01.mkv",))], False),
+        ]
+        database.shown_many = lambda items, **_kw: (database.asks.extend(items), answers.pop(0))[1]
+        record = ItemRecord([CREDITS], frozenset({T.INTRO}), ("/plexmedia/tv/S01E01.mkv",))
+        publisher = _publisher(database, item_record={k: record for k in records}.get)
+
+        assert publisher.shows_many([("7", [INTRO], frozenset(), None)]) == {"7": shown}
+        if records:
+            assert database.asks[1] == ShownAsk(8, [CREDITS], frozenset({T.INTRO}), ("/plexmedia/tv/S01E01.mkv",))
+        else:
+            assert len(database.asks) == 1  # nothing to compare it with: not read
 
     def test_the_publish_now_deadline_reaches_the_database_half(self):
         database = FakeDatabase()

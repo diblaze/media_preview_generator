@@ -31,7 +31,7 @@ from ..web.jobs import PRIORITY_LOW, Job, get_job_manager, is_live_retry_chain
 from .models import utcnow as _utcnow
 from .outcomes import NOT_IN_LIBRARY, ServerStatus
 from .ownership import marker_matches
-from .pipeline import RECHECK_AFTER, markers_for_path
+from .pipeline import RECHECK_AFTER, item_record_for, markers_for_path
 from .publishers.base import UNREADABLE_IN_A_ROW, CapabilityReport, MarkerPublisher, Shown, stopped_unreadable
 from .publishers.factory import publisher_for
 from .settings import load_server
@@ -114,7 +114,13 @@ def find_drift(
         name = cfg.name or cfg.id
         server = registry.get(cfg.id)
         publisher = (
-            publisher_for(server, cfg, sibling_markers=lambda path: markers_for_path(store, path), ui_details=False)
+            publisher_for(
+                server,
+                cfg,
+                sibling_markers=lambda path: markers_for_path(store, path),
+                item_record=lambda other, server_id=cfg.id: item_record_for(store, server_id, other),
+                ui_details=False,
+            )
             if server is not None
             else None
         )

@@ -366,10 +366,10 @@ class PlexItem:
         commit_guard = threading.Lock()
 
         def counting_write_item(publisher, *args, **kwargs):
-            changed, plan = real_write_item(publisher, *args, **kwargs)
+            changed, *planned = real_write_item(publisher, *args, **kwargs)
             with commit_guard:
                 self.commits += int(changed)
-            return changed, plan
+            return changed, *planned
 
         # Patched once for the whole test: runs on several threads must not patch and unpatch over each other.
         monkeypatch.setattr(plex_db, "shm_lock_held_elsewhere", lambda _db, **_kw: True)

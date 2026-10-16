@@ -142,7 +142,13 @@ from .publishers.base import (
     wait_cancelled,
 )
 from .publishers.factory import publisher_for, supported_types_for
-from .publishers.plex_db import STALE_READ_WAIT_S, WAIT_CANCELLED, WAIT_SLICE_S, WORKER_BUSY_TIMEOUT_S
+from .publishers.plex_db import (
+    STALE_READ_WAIT_S,
+    WAIT_CANCELLED,
+    WAIT_SLICE_S,
+    WORKER_BUSY_TIMEOUT_S,
+    ItemRecord,
+)
 from .season_cache import SeasonCache
 from .settings import GlobalMarkersSettings, ServerMarkersSettings, SourceSetting, get_global_settings, load_server
 from .source_counts import DecidedByTally, decided_groups
@@ -1042,6 +1048,23 @@ def markers_for_path(store: MarkerStore, canonical_path: str) -> dict[MarkerType
     if rec is None or not store.get_decisions(rec.id) or identity_changed(rec):
         return None
     return store.get_markers(rec.id)
+
+
+def item_record_for(store: MarkerStore, server_id: str, item_id: str) -> ItemRecord | None:
+    """markers.db's record of what this app last wrote to a server item (Plex: an item sharing another's file).
+
+    Args:
+        store: The markers store.
+        server_id: The server.
+        item_id: The server's item id.
+
+    Returns:
+        Its markers, kept types and version files; None when this app has no written record of it.
+    """
+    row = store.get_item_publish_state(server_id, item_id)
+    if row is None or row.status != "written":
+        return None
+    return ItemRecord(list(row.markers), row.kept_types, row.item_files)
 
 
 def _owning_servers(item: ProcessableItem, ctx: PipelineContext) -> list[_Owning]:
@@ -2495,6 +2518,7 @@ def _publish_to(
         owner.server,
         cfg,
         sibling_markers=lambda p: markers_for_path(store, p),
+        item_record=lambda other: item_record_for(store, cfg.id, other),
         settings_provider=lambda: _live_markers_settings(ctx, cfg),
         ui_details=False,  # Plex's own detection settings are for the Edit dialog: one more Plex request per check
         db_timeout_s=db_timeout_s,
@@ -2696,6 +2720,17 @@ def _publish_to(
             version = store.set_item_publish_state(
                 cfg.id, item_id, ours, "written", kept_types=kept, item_files=publisher.last_item_files
             )
+            # The other episodes of a multi-episode file were written with it: each keeps its own record, read back and
+            # passed to the next write like the item's.
+            for other, (other_ours, other_kept) in publisher.last_siblings.items():
+                store.set_item_publish_state(
+                    cfg.id,
+                    other,
+                    sorted(other_ours, key=lambda m: (m.start_ms, m.type.value)),
+                    "written",
+                    kept_types=other_kept,
+                    item_files=publisher.last_item_files,
+                )
         if not changed and _unchanged(version):
             return _up_to_date(kept)  # a forced run whose write changed nothing
         store.set_publish_basis(rec.id, cfg.id, decided_hash=decided_hash, item_version=version)

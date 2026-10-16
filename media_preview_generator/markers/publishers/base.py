@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -297,6 +298,10 @@ class MarkerPublisher(ABC):
     # Set by every ``write`` that read the item: the item's version files that write computed the marker set for. The
     # caller records them and passes them back to ``shows``. None where items have no shared versions (Jellyfin, Emby).
     last_item_files: tuple[str, ...] | None = None
+    # Set by every successful ``write``: per other item holding the written item's files (Plex: the other episodes of
+    # a multi-episode file), the markers of ours it shows and the types kept as the server's own. The caller records
+    # each as that item's own record. Empty elsewhere.
+    last_siblings: Mapping[str, tuple[list[Marker], frozenset[MarkerType]]] = MappingProxyType({})
 
     @abstractmethod
     def capability(self) -> CapabilityReport:

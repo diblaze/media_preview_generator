@@ -46,6 +46,8 @@ from .plex_db import (
     ShownAnswer,
     ShownAsk,
     ShownBatch,
+    SiblingResult,
+    SiblingState,
     WriteRequest,
     WriteResult,
     report_of_failure,
@@ -324,7 +326,30 @@ def write_request_to_json(request: WriteRequest) -> dict:
         "kept_types": _types_to_json(request.kept_types),
         "keep_plex": request.keep_plex,
         "limits": _limits_to_json(request.limits),
+        "siblings": [
+            {
+                "rating_key": s.rating_key,
+                "prior": [marker_to_json(m) for m in s.prior],
+                "kept_types": _types_to_json(s.kept_types),
+            }
+            for s in request.siblings
+        ],
     }
+
+
+def _keys_from_json(raw: Any) -> tuple[int, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("siblings must be a list")
+    return tuple(_as_int(key) for key in raw)
+
+
+def _sibling_states_from_json(raw: Any) -> tuple[SiblingState, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("siblings must be a list")
+    return tuple(
+        SiblingState(_as_int(s["rating_key"]), _markers_from_json(s["prior"]), _types_from_json(s.get("kept_types")))
+        for s in raw
+    )
 
 
 def write_request_from_json(raw: Any) -> WriteRequest:
@@ -347,6 +372,8 @@ def write_request_from_json(raw: Any) -> WriteRequest:
             kept_types=_types_from_json(raw.get("kept_types")),
             keep_plex=bool(raw.get("keep_plex")),
             limits=_limits_from_json(raw.get("limits")),
+            # An app older than this field has no records of them: the agent writes them as having none.
+            siblings=_sibling_states_from_json(raw.get("siblings") or []),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"not a write request: {exc}") from exc
@@ -360,6 +387,15 @@ def write_result_to_json(result: WriteResult) -> dict:
         "kept_types": _types_to_json(result.kept_types),
         "replaced_own": _types_to_json(result.replaced_own),
         "replaced_stale": _types_to_json(result.replaced_stale),
+        "siblings": [
+            {
+                "rating_key": s.rating_key,
+                "changed": s.changed,
+                "ours": [marker_to_json(m) for m in s.ours],
+                "kept_types": _types_to_json(s.kept_types),
+            }
+            for s in result.siblings
+        ],
     }
 
 
@@ -378,6 +414,16 @@ def write_result_from_json(raw: Any) -> WriteResult:
             _types_from_json(raw.get("kept_types")),
             _types_from_json(raw.get("replaced_own")),
             _types_from_json(raw.get("replaced_stale")),
+            # An agent older than this field writes no other item: nothing to record for them.
+            tuple(
+                SiblingResult(
+                    _as_int(s["rating_key"]),
+                    bool(s["changed"]),
+                    _markers_from_json(s["ours"]),
+                    _types_from_json(s.get("kept_types")),
+                )
+                for s in raw.get("siblings") or []
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"not a write result: {exc}") from exc
@@ -386,7 +432,13 @@ def write_result_from_json(raw: Any) -> WriteResult:
 def item_read_to_json(item: ItemRead) -> dict:
     """Serialise one item's parts, and which types' markers were made for an earlier file (None: not read)."""
     stale = None if item.stale_types is None else _types_to_json(item.stale_types)
-    return {"exists": item.exists, "parts": [part_to_json(p) for p in item.parts], "stale_types": stale}
+    siblings = None if item.siblings is None else list(item.siblings)
+    return {
+        "exists": item.exists,
+        "parts": [part_to_json(p) for p in item.parts],
+        "stale_types": stale,
+        "siblings": siblings,
+    }
 
 
 def item_read_from_json(raw: Any) -> ItemRead:
@@ -399,7 +451,8 @@ def item_read_from_json(raw: Any) -> ItemRead:
         raise ValueError("not an item")
     # An agent older than this field doesn't say: unknown, so the pipeline and "Keep Plex's" behave as before it.
     stale = None if raw.get("stale_types") is None else _types_from_json(raw["stale_types"])
-    return ItemRead(bool(raw.get("exists")), [part_from_json(p) for p in raw["parts"]], stale)
+    siblings = None if raw.get("siblings") is None else _keys_from_json(raw["siblings"])
+    return ItemRead(bool(raw.get("exists")), [part_from_json(p) for p in raw["parts"]], stale, siblings)
 
 
 def shown_ask_to_json(ask: ShownAsk) -> dict:
@@ -409,7 +462,6 @@ def shown_ask_to_json(ask: ShownAsk) -> dict:
         "ours": [marker_to_json(m) for m in ask.ours],
         "kept_types": _types_to_json(ask.kept_types),
         "item_files": None if ask.item_files is None else list(ask.item_files),
-        "keep_plex": ask.keep_plex,
     }
 
 
@@ -423,13 +475,11 @@ def shown_ask_from_json(raw: Any) -> ShownAsk:
         raise ValueError("read-back item must be an object")
     try:
         files = raw.get("item_files")
-        keep_plex = raw.get("keep_plex")
         return ShownAsk(
             _as_int(raw["rating_key"]),
             _markers_from_json(raw["ours"]),
             _types_from_json(raw.get("kept_types")),
             None if files is None else tuple(str(f) for f in files),
-            None if keep_plex is None else bool(keep_plex),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"not a read-back item: {exc}") from exc
@@ -439,7 +489,11 @@ def shown_batch_to_json(batch: ShownBatch) -> dict:
     """Serialise a read-back's answers."""
     return {
         "answers": [
-            {"shown": None if a.shown is None else a.shown.value, "version_files": list(a.version_files)}
+            {
+                "shown": None if a.shown is None else a.shown.value,
+                "version_files": list(a.version_files),
+                "siblings": list(a.siblings),
+            }
             for a in batch.answers
         ],
         "unreadable": batch.unreadable,
@@ -463,6 +517,7 @@ def shown_batch_from_json(raw: Any) -> ShownBatch:
             ShownAnswer(
                 None if shown is None else Shown(str(shown)),
                 tuple(str(f) for f in item.get("version_files") or ()),
+                _keys_from_json(item.get("siblings") or []),
             )
         )
     return ShownBatch(answers, bool(raw.get("unreadable")))

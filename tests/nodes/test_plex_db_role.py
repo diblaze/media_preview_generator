@@ -474,7 +474,7 @@ class TestItRefusesWhatTheInProcessWriterRefuses:
         assert response.status_code == 200 and response.get_json()["result"]["item"]["exists"] is False
 
 
-def _publisher_through(session, *, keep_plex=False, identity=None) -> PlexMarkerPublisher:
+def _publisher_through(session, *, keep_plex=False, identity=None, item_record=None) -> PlexMarkerPublisher:
     """The app's Plex publisher with no access to the database at all — only the agent."""
     config = ServerConfig(
         id="plex-1",
@@ -501,7 +501,11 @@ def _publisher_through(session, *, keep_plex=False, identity=None) -> PlexMarker
     server.get_server_status.return_value = {"plex_pass": True, "version": "1.43.4"}
     server.get_marker_detection_prefs.return_value = {"intro": "never", "credits": "never"}
     return PlexMarkerPublisher(
-        server, config, settings, db=RemotePlexDb(settings.agent_url, settings.agent_token, session=session)
+        server,
+        config,
+        settings,
+        db=RemotePlexDb(settings.agent_url, settings.agent_token, session=session),
+        item_record=item_record,
     )
 
 
@@ -533,12 +537,15 @@ class TestTheAppWritesPlexThroughTheAgent:
         conn.execute("INSERT INTO media_parts (id, media_item_id, file) VALUES (2, 2, '/data/tv/S01E01.mkv')")
         conn.commit()
         conn.close()
-        publisher = _publisher_through(FlaskSession(agent), keep_plex=True)
+        records: dict[str, plex_db.ItemRecord] = {}
+        publisher = _publisher_through(FlaskSession(agent), keep_plex=True, item_record=records.get)
 
         ours = publisher.write("7", [INTRO], previous=[], duration_ms=DUR, canonical_path="/data/tv/S01E01.mkv")
 
         assert _served(plex_config, 8) == _served(plex_config, 7) == [("intro", 11_000, 37_000)]
+        assert publisher.last_siblings == {"8": ([INTRO], frozenset())}
         files = publisher.last_item_files
+        records["8"] = plex_db.ItemRecord([INTRO], frozenset(), files)
         assert publisher.shows_many([("7", ours, frozenset(), files)]) == {"7": Shown.OURS}
         conn = sqlite3.connect(_db_file(plex_config))
         conn.execute("DELETE FROM taggings WHERE metadata_item_id=8")

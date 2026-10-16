@@ -4139,12 +4139,13 @@ OTHER_INTRO = Marker(T.INTRO, 50_000, 80_000, ("chapters",))
 NATIVE_INTRO_ROW = (T.INTRO, 990, 29_306)
 
 
-def _add_item(db, key, files, *, section=1):
+def _add_item(db, key, files, *, section=1, metadata_type=4):
     """Another item of the library: one media item and part per file (Plex's own copy of each part)."""
     _exec(
         db,
-        "INSERT INTO metadata_items (id, metadata_type, title, library_section_id) VALUES (?, 4, 'Ep', ?)",
+        "INSERT INTO metadata_items (id, metadata_type, title, library_section_id) VALUES (?, ?, 'Ep', ?)",
         key,
+        metadata_type,
         section,
     )
     part_ids = []
@@ -4164,25 +4165,59 @@ def _multi_episode_db(folder, episodes=(8,)):
     return db, parts
 
 
-def _write_shared(pub, markers, *, previous=(), kept_types=frozenset()):
-    prior = None if previous is None else list(previous)
-    return pub.write(
-        "7", list(markers), previous=prior, duration_ms=DUR, canonical_path=SHARED_FILE, kept_types=kept_types
-    )
+class _Records:
+    """markers.db's item records as a job keeps them: the written item's, and each sibling's from ``last_siblings``."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, plex_db.ItemRecord] = {}
+
+    def lookup(self, item_id: str) -> plex_db.ItemRecord | None:
+        return self.rows.get(item_id)
+
+    def write(self, pub, markers, *, previous=(), kept_types=None):
+        record = self.rows.get("7")
+        kept = (record.kept_types if record else frozenset()) if kept_types is None else kept_types
+        ours = pub.write(
+            "7",
+            list(markers),
+            previous=None if previous is None else list(previous),
+            duration_ms=DUR,
+            canonical_path=SHARED_FILE,
+            kept_types=kept,
+        )
+        self.rows["7"] = plex_db.ItemRecord(list(ours), pub.last_kept_types, pub.last_item_files)
+        for other, (other_ours, other_kept) in pub.last_siblings.items():
+            self.rows[other] = plex_db.ItemRecord(list(other_ours), other_kept, pub.last_item_files)
+        return ours
+
+    def shown(self, pub):
+        record = self.rows["7"]
+        return pub.shows_many([("7", record.markers, record.kept_types, record.item_files)])["7"]
+
+
+def _recording_publisher(tmp_path, folder, records, **kwargs):
+    pub = _publisher(tmp_path, folder, **kwargs)
+    pub._item_record = records.lookup
+    return pub
 
 
 class TestMultiEpisodeFile:
     """One file, several episodes: Plex gives each episode its own item and its own copy of the file's part, and
-    serves each item only its own marker rows, so each one is written the file's markers."""
+    serves each item only its own marker rows, so each one is written the file's markers and keeps its own record."""
 
     def test_every_episode_holding_the_file_is_written_in_the_one_transaction(self, tmp_path, sql_log):
         folder = tmp_path / "Plex Media Server"
         db, parts = _multi_episode_db(folder, episodes=(8, 9))
-        pub = _publisher(tmp_path, folder)
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
 
-        ours = _write_shared(pub, [INTRO, CREDITS_FINAL])
+        ours = records.write(pub, [INTRO, CREDITS_FINAL])
 
         assert (ours, pub.last_write_changed) == ([INTRO, CREDITS_FINAL], True)
+        assert pub.last_siblings == {
+            "8": ([INTRO, CREDITS_FINAL], frozenset()),
+            "9": ([INTRO, CREDITS_FINAL], frozenset()),
+        }
         for key in (7, 8, 9):
             assert _rows(
                 db,
@@ -4195,65 +4230,88 @@ class TestMultiEpisodeFile:
             ]
             assert _part_markers(db, parts[key], "pv:intros") == [{"startTimeOffset": 11_000, "endTimeOffset": 37_000}]
         assert [sql for sql in sql_log if sql.startswith(("BEGIN", "COMMIT"))] == ["BEGIN IMMEDIATE", "COMMIT"]
+        assert records.shown(pub) is Shown.OURS
 
-    def test_items_sharing_only_some_versions_or_in_another_library_are_left_alone(self, tmp_path):
+    def test_items_sharing_only_some_versions_or_of_another_kind_or_library_or_deleted_are_left_alone(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, _parts = _multi_episode_db(folder)
         _add_item(db, 10, [SHARED_FILE], section=2)  # the same folder in a second library
         _add_item(db, 11, [SHARED_FILE, "/data/tv/Show - S03E02 - Part Two.mkv"])  # one more version of its own
         _add_item(db, 12, ["/data/tv/Show - S03E03.mkv"])
+        _add_item(db, 13, [SHARED_FILE], metadata_type=1)  # a film item in the same library
+        _add_item(db, 14, [SHARED_FILE])
+        _exec(db, "UPDATE metadata_items SET deleted_at=1 WHERE id=14")  # in Plex's trash
+        pub = _publisher(tmp_path, folder)
 
-        _write_shared(_publisher(tmp_path, folder), [INTRO])
+        _write_one(pub, [INTRO], path=SHARED_FILE)
 
+        assert pub.last_siblings == {"8": ([INTRO], frozenset())}
         assert _served(db, 8) == [(T.INTRO, 11_000, 37_000)]
-        assert [_served(db, key) for key in (10, 11, 12)] == [[], [], []]
+        assert [_served(db, key) for key in (10, 11, 12, 13, 14)] == [[], [], [], [], []]
 
     def test_a_single_episode_file_writes_its_own_item_only(self, tmp_path, sql_log):
         folder = tmp_path / "Plex Media Server"
         db = _make_db(folder)
         _exec(db, "UPDATE metadata_items SET library_section_id=1 WHERE id=7")
         _add_item(db, 8, ["/data/tv/S01E02.mkv"])
+        pub = _publisher(tmp_path, folder)
 
-        _write_one(_publisher(tmp_path, folder), [INTRO])
+        _write_one(pub, [INTRO])
 
         inserts = [sql for sql in _writes(sql_log) if sql.startswith("INSERT INTO taggings")]
         assert len(inserts) == 1 and "VALUES (7,563," in inserts[0]
+        assert pub.last_siblings == {}
         assert _served(db, 8) == []
 
-    def test_the_read_back_notices_an_episode_missing_its_markers_and_the_write_fills_only_it(self, tmp_path, sql_log):
-        # The state a write from before episodes sharing a file were written left: the first episode only.
+    @pytest.mark.parametrize("record", ["none", "kept"], ids=["never-recorded", "recorded"])
+    def test_the_read_back_notices_an_episode_missing_its_markers_and_the_write_fills_only_it(
+        self, tmp_path, sql_log, record
+    ):
+        # never-recorded: what a write from before episodes sharing a file were written left (the first one only).
         folder = tmp_path / "Plex Media Server"
         db, parts = _multi_episode_db(folder)
-        pub = _publisher(tmp_path, folder)
-        ours = _write_shared(pub, [INTRO, CREDITS_FINAL])
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
+        ours = records.write(pub, [INTRO, CREDITS_FINAL])
         _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8")
         _set_part_extra(db, parts[8], None)
-        files = pub.last_item_files
+        if record == "none":
+            del records.rows["8"]
 
-        assert pub.shows_many([("7", ours, frozenset(), files)]) == {"7": Shown.MISSING}
+        assert records.shown(pub) is Shown.MISSING
 
         sql_log.clear()
-        assert _write_shared(pub, [INTRO, CREDITS_FINAL], previous=ours) == ours
+        assert records.write(pub, [INTRO, CREDITS_FINAL], previous=ours) == ours
         assert pub.last_write_changed is True
         assert _served(db, 8) == _served(db, 7) == [(T.INTRO, 11_000, 37_000), (T.CREDITS, 1_299_000, DUR)]
         written = _writes(sql_log)
         assert written and not [sql for sql in written if "metadata_item_id=7" in sql or "VALUES (7," in sql]
         part_updates = [sql for sql in written if sql.startswith("UPDATE media_parts")]
         assert len(part_updates) == 1 and part_updates[0].endswith(f"WHERE id={parts[8]}")
-        assert pub.shows_many([("7", ours, frozenset(), files)]) == {"7": Shown.OURS}
+        assert records.shown(pub) is Shown.OURS
 
         sql_log.clear()
-        _write_shared(pub, [INTRO, CREDITS_FINAL], previous=ours)
+        records.write(pub, [INTRO, CREDITS_FINAL], previous=ours)
         assert pub.last_write_changed is False
         assert not [sql for sql in sql_log if sql.startswith("BEGIN")]  # not even the write lock
+
+    def test_a_publisher_without_records_doesnt_read_the_episodes_back(self, tmp_path):
+        # The Inspector's reads: only a job's publisher has markers.db's records to compare an episode with.
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        pub = _publisher(tmp_path, folder)
+        ours = _write_one(pub, [INTRO], path=SHARED_FILE)
+        _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8")
+        assert pub.shows_many([("7", ours, frozenset(), pub.last_item_files)]) == {"7": Shown.OURS}
 
     def test_an_update_moves_every_episode(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, parts = _multi_episode_db(folder)
-        pub = _publisher(tmp_path, folder)
-        _write_shared(pub, [INTRO])
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
+        records.write(pub, [INTRO])
 
-        _write_shared(pub, [OTHER_INTRO], previous=[INTRO])
+        records.write(pub, [OTHER_INTRO], previous=[INTRO])
 
         for key in (7, 8):
             assert _served(db, key) == [(T.INTRO, 50_000, 80_000)]
@@ -4262,8 +4320,9 @@ class TestMultiEpisodeFile:
     def test_removal_clears_ours_from_every_episode_and_leaves_plexs_own_rows(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, parts = _multi_episode_db(folder)
-        pub = _publisher(tmp_path, folder)
-        ours = _write_shared(pub, [INTRO, CREDITS_FINAL])
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
+        ours = records.write(pub, [INTRO, CREDITS_FINAL])
         # Plex's own detection replaced our credits on the second episode since.
         _exec(
             db,
@@ -4272,10 +4331,11 @@ class TestMultiEpisodeFile:
             CREDITS_ROW_EXTRA,
         )
 
-        assert _write_shared(pub, [], previous=ours) == []
+        assert records.write(pub, [], previous=ours) == []
 
         assert _served(db, 7) == []
         assert _served(db, 8) == [(T.CREDITS, 1_156_521, 1_186_521)]
+        assert pub.last_siblings == {"8": ([], frozenset())}
         for key in (7, 8):
             assert _part_markers(db, parts[key], "pv:intros") is None
 
@@ -4285,72 +4345,83 @@ class TestMultiEpisodeFile:
         db, parts = _multi_episode_db(folder)
         _insert_taggings(db, (8, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
         _set_part_extra(db, parts[8], encode_extra_data({"pv:intros": NATIVE_INTROS}))
-        pub = _publisher(tmp_path, folder, redetect=redetect)
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect=redetect)
 
-        ours = _write_shared(pub, [INTRO, CREDITS_FINAL])
+        ours = records.write(pub, [INTRO, CREDITS_FINAL])
 
-        assert (ours, pub.last_kept_types) == ([INTRO, CREDITS_FINAL], frozenset())  # the item's own answer
-        assert _served(db, 7) == [(T.INTRO, 11_000, 37_000), (T.CREDITS, 1_299_000, DUR)]
         kept = redetect == "keep_plex"
+        assert (ours, pub.last_kept_types) == ([INTRO, CREDITS_FINAL], frozenset())  # the item's own answer
+        assert pub.last_siblings == {
+            "8": ([CREDITS_FINAL], frozenset({T.INTRO})) if kept else ([INTRO, CREDITS_FINAL], frozenset())
+        }
+        assert _served(db, 7) == [(T.INTRO, 11_000, 37_000), (T.CREDITS, 1_299_000, DUR)]
         assert _served(db, 8) == [NATIVE_INTRO_ROW if kept else (T.INTRO, 11_000, 37_000), (T.CREDITS, 1_299_000, DUR)]
         part_intros = json.loads(_rows(db, "SELECT extra_data FROM media_parts WHERE id=?", parts[8])[0][0])
         assert (part_intros["pv:intros"] == NATIVE_INTROS) is kept
-        # Read back as a write leaves it: a kept episode asks for no write, so no run rewrites it again and again.
-        assert pub.shows_many([("7", ours, frozenset(), pub.last_item_files)]) == {"7": Shown.OURS}
-        _write_shared(pub, [INTRO, CREDITS_FINAL], previous=ours)
+        # Read back against its own record: the kept episode asks for no write, so no run rewrites it again and again.
+        assert records.shown(pub) is Shown.OURS
+        records.write(pub, [INTRO, CREDITS_FINAL], previous=ours)
         assert pub.last_write_changed is False
 
     def test_plex_redetecting_an_episode_under_use_ours_is_noticed_and_put_back(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, _parts = _multi_episode_db(folder)
-        pub = _publisher(tmp_path, folder)
-        ours = _write_shared(pub, [INTRO])
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records)
+        ours = records.write(pub, [INTRO])
         _exec(db, "UPDATE taggings SET time_offset=990, end_time_offset=29306 WHERE metadata_item_id=8")
 
-        assert pub.shows_many([("7", ours, frozenset(), pub.last_item_files)]) == {"7": Shown.REPLACED}
-        _write_shared(pub, [INTRO], previous=ours)
+        assert records.shown(pub) is Shown.REPLACED
+        records.write(pub, [INTRO], previous=ours)
         assert _served(db, 8) == [(T.INTRO, 11_000, 37_000)]
+
+    def test_an_episode_still_showing_ours_follows_a_new_decision_while_plex_keeps_its_own_on_the_item(self, tmp_path):
+        # Plex re-detected the intro on the first episode only: that one is kept there, but the second episode's
+        # intro is still ours (its own record says so), so a new decision moves it.
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+        ours = records.write(pub, [INTRO])
+        _exec(db, "UPDATE taggings SET time_offset=990, end_time_offset=29306 WHERE metadata_item_id=7")
+        ours = records.write(pub, [INTRO], previous=ours)
+        assert (pub.last_kept_types, pub.last_siblings) == ({T.INTRO}, {"8": ([INTRO], frozenset())})
+
+        records.write(pub, [OTHER_INTRO], previous=ours)
+
+        assert _served(db, 7) == [NATIVE_INTRO_ROW]
+        assert _served(db, 8) == [(T.INTRO, 50_000, 80_000)]
+        assert records.shown(pub) is Shown.OURS
 
     def test_a_type_kept_on_the_item_goes_to_an_episode_without_plexs_rows_and_is_read_back_per_episode(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, _parts = _multi_episode_db(folder)
         _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
-        pub = _publisher(tmp_path, folder, redetect="keep_plex")
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
 
-        ours = _write_shared(pub, [INTRO, CREDITS_FINAL], previous=None)
+        ours = records.write(pub, [INTRO, CREDITS_FINAL], previous=None)
 
         assert (ours, pub.last_kept_types) == ([CREDITS_FINAL], {T.INTRO})
+        assert pub.last_siblings == {"8": ([INTRO, CREDITS_FINAL], frozenset())}
         assert _served(db, 7) == [NATIVE_INTRO_ROW, (T.CREDITS, 1_299_000, DUR)]
         assert _served(db, 8) == [(T.INTRO, 11_000, 37_000), (T.CREDITS, 1_299_000, DUR)]  # no Plex intro to keep
-        kept = frozenset({T.INTRO})
-        assert pub.shows_many([("7", ours, kept, pub.last_item_files)]) == {"7": Shown.OURS}
+        assert records.shown(pub) is Shown.OURS
         _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8 AND text='intro'")
-        assert pub.shows_many([("7", ours, kept, pub.last_item_files)]) == {"7": Shown.MISSING}
+        assert records.shown(pub) is Shown.MISSING
 
-    @pytest.mark.parametrize(
-        ("keep_plex", "episode", "shown"),
-        [
-            (False, "ours", Shown.OURS),
-            (False, "missing", Shown.MISSING),
-            (False, "plexs-own", Shown.REPLACED),
-            (True, "ours", Shown.OURS),
-            (True, "missing", Shown.MISSING),
-            (True, "plexs-own", Shown.OURS),  # a write keeps it there
-            # An app older than the field: only a missing type asks for a write.
-            (None, "ours", Shown.OURS),
-            (None, "missing", Shown.MISSING),
-            (None, "plexs-own", Shown.OURS),
-        ],
-    )
-    def test_what_an_episode_shows_is_judged_by_what_a_write_leaves(self, keep_plex, episode, shown):
-        served = {
-            "ours": {T.INTRO: [(11_000, 37_000)], T.CREDITS: []},
-            "missing": {T.INTRO: [], T.CREDITS: []},
-            "plexs-own": {T.INTRO: [(990, 29_306)], T.CREDITS: []},
-        }[episode]
-        assert plex_db._sibling_shown(served, [INTRO], frozenset(), keep_plex) is shown
+    def test_a_type_kept_on_the_item_and_not_decided_asks_nothing_of_an_episode_without_it(self, tmp_path):
+        # Plex's own intro on the first episode only, no intro decided: nothing to write to the second episode, and
+        # its own record keeps nothing, so the read-back never asks for a write that changes nothing.
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+        ours = records.write(pub, [CREDITS_FINAL], kept_types=frozenset({T.INTRO}))
 
-    @pytest.mark.parametrize("keep_plex", [True, False, None])
-    def test_a_kept_type_an_episode_has_no_rows_of_is_missing(self, keep_plex):
-        served = {T.INTRO: [(11_000, 37_000)], T.CREDITS: []}
-        assert plex_db._sibling_shown(served, [INTRO], frozenset({T.CREDITS}), keep_plex) is Shown.MISSING
+        assert records.shown(pub) is Shown.OURS
+        records.write(pub, [CREDITS_FINAL], previous=ours)
+        assert pub.last_write_changed is False
+        assert _served(db, 8) == [(T.CREDITS, 1_299_000, DUR)]

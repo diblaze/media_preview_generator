@@ -137,7 +137,7 @@ _REQUIRED_COLUMNS = {
     },
     "media_parts": {"id", "media_item_id", "file", "extra_data", "deleted_at", "updated_at"},
     "media_items": {"id", "metadata_item_id", "deleted_at", "proxy_type"},
-    "metadata_items": {"id", "library_section_id"},
+    "metadata_items": {"id", "library_section_id", "metadata_type", "deleted_at"},
 }
 # SQLite primary result codes (sqlite3.h): BUSY, LOCKED, PROTOCOL (a transient WAL race) / PERM, IOERR,
 # READONLY, CANTOPEN, AUTH, NOTADB / FULL / CORRUPT.
@@ -1190,26 +1190,6 @@ def _a_part_records(mtype: MarkerType, rows: list[_TaggingRow], parts: list[Part
     return False
 
 
-def _sibling_shown(
-    served: dict[MarkerType, list[tuple[int, int]]],
-    ours: list[Marker],
-    kept_types: frozenset[MarkerType],
-    keep_plex: bool | None,
-) -> Shown:
-    """What an item sharing a written item's files shows, judged by what a write leaves on it.
-
-    A write plans each sibling from its own rows (``LocalPlexDb._plans``), so it shows ours or, while the server keeps
-    Plex's, Plex's own rows of a type. Every type ours or kept must have rows there; under "Use ours" each of our types
-    must show exactly ours. With the setting unknown (an app older than ``ShownAsk.keep_plex``) only a missing type
-    counts, so the answer never asks for a write that would change nothing.
-    """
-    if any(not served.get(mtype) for mtype in kept_types):
-        return Shown.MISSING
-    if keep_plex is not False:
-        ours = [m for m in ours if not served.get(m.type)]
-    return compare_shown(ours, served, others_alongside=False)
-
-
 class ItemRead(NamedTuple):
     """One item as Plex's database has it right now."""
 
@@ -1218,6 +1198,33 @@ class ItemRead(NamedTuple):
     # Types whose rows were made for an earlier file at this path (``_types_not_made_for_file``); None when not read
     # (an agent older than this field).
     stale_types: frozenset[MarkerType] | None = None
+    # The other items holding exactly its files (``LocalPlexDb._sibling_items``); None from an agent older than this.
+    siblings: tuple[int, ...] | None = None
+
+
+class SiblingState(NamedTuple):
+    """What this app last left on an item sharing the written item's files (its own markers.db item record)."""
+
+    rating_key: int
+    prior: list[Marker]
+    kept_types: frozenset[MarkerType]
+
+
+class SiblingResult(NamedTuple):
+    """What one write left on an item sharing the written item's files."""
+
+    rating_key: int
+    changed: bool
+    ours: list[Marker]
+    kept_types: frozenset[MarkerType]
+
+
+class ItemRecord(NamedTuple):
+    """markers.db's record of a Plex item this app last wrote (``item_publish_state``), as a publisher reads it."""
+
+    markers: list[Marker]
+    kept_types: frozenset[MarkerType]
+    item_files: tuple[str, ...] | None
 
 
 class WriteRequest(NamedTuple):
@@ -1233,6 +1240,8 @@ class WriteRequest(NamedTuple):
     kept_types: frozenset[MarkerType]  # types the last write kept as Plex's own
     keep_plex: bool  # "Keep Plex's" is on for this server
     limits: FileLimits | None = None  # the file's limits a kept Plex marker must fit (None: not checked)
+    # The records of the items sharing its files this app has (``LocalPlexDb._plans`` says how one without is written)
+    siblings: tuple[SiblingState, ...] = ()
 
 
 class WriteResult(NamedTuple):
@@ -1243,6 +1252,7 @@ class WriteResult(NamedTuple):
     kept_types: frozenset[MarkerType]
     replaced_own: frozenset[MarkerType]
     replaced_stale: frozenset[MarkerType] = frozenset()  # an agent older than this field says nothing
+    siblings: tuple[SiblingResult, ...] = ()  # every item sharing its files that was planned; none from an older agent
 
 
 class ShownAsk(NamedTuple):
@@ -1252,9 +1262,6 @@ class ShownAsk(NamedTuple):
     ours: list[Marker]
     kept_types: frozenset[MarkerType]
     item_files: tuple[str, ...] | None
-    # "Keep Plex's" is on for this server, which lets an episode sharing the item's file show Plex's own rows of a
-    # type (``_sibling_shown``); None from an app older than this field.
-    keep_plex: bool | None = None
 
 
 class ShownAnswer(NamedTuple):
@@ -1262,6 +1269,7 @@ class ShownAnswer(NamedTuple):
 
     shown: Shown | None
     version_files: tuple[str, ...]
+    siblings: tuple[int, ...] = ()  # the items holding exactly its files (none from an agent older than this field)
 
 
 class ShownBatch(NamedTuple):
@@ -1486,10 +1494,11 @@ class LocalPlexDb(PlexDatabase):
             for row in conn.execute(
                 "SELECT DISTINCT mi.metadata_item_id FROM media_parts mp JOIN media_items mi ON mi.id = mp.media_item_id "
                 "JOIN metadata_items md ON md.id = mi.metadata_item_id "
+                "JOIN metadata_items own ON own.id = ? AND own.library_section_id IS md.library_section_id "
+                "AND own.metadata_type IS md.metadata_type "
                 f"WHERE mp.file IN ({marks}) AND mp.deleted_at IS NULL AND mi.deleted_at IS NULL "  # noqa: S608
-                "AND mi.metadata_item_id != ? "
-                "AND md.library_section_id IS (SELECT library_section_id FROM metadata_items WHERE id=?) ORDER BY 1",
-                (*files, rating_key, rating_key),
+                "AND md.deleted_at IS NULL AND md.id != own.id ORDER BY 1",
+                (rating_key, *files),
             )
         ]
         siblings = []
@@ -1648,7 +1657,8 @@ class LocalPlexDb(PlexDatabase):
                 tag_id = self._marker_tag_id(conn)
                 parts = self._item_parts(conn, rating_key)
                 stale = _types_not_made_for_file(self._item_rows(conn, rating_key, tag_id), parts)
-                return ItemRead(bool(parts) or self._item_exists(conn, rating_key), parts, stale)
+                siblings = tuple(key for key, _parts in self._sibling_items(conn, rating_key, parts))
+                return ItemRead(bool(parts) or self._item_exists(conn, rating_key), parts, stale, siblings)
         except sqlite3.Error as exc:
             raise publish_error_from_sqlite(exc) from exc
 
@@ -1656,8 +1666,9 @@ class LocalPlexDb(PlexDatabase):
         """Plan the item on a read-only snapshot first, and take Plex's write lock only for a real change.
 
         Every other item holding the same files (``_sibling_items``: the other episodes of a multi-episode file) is
-        written the same request in the same transaction, each planned from its own rows and parts, so "Keep Plex's"
-        keeps Plex's own rows per item. ``changed`` counts them too; the rest of the result is the item's own.
+        written the same markers in the same transaction, each planned from its own rows, parts and record
+        (``_plans``), so "Keep Plex's" keeps Plex's own rows per item. ``changed`` counts them too; ``siblings`` says
+        what each was left with, and the rest of the result is the item's own.
 
         Args:
             request: The item, the parts its markers were decided for, and those markers.
@@ -1689,12 +1700,14 @@ class LocalPlexDb(PlexDatabase):
                         request.kept_types,
                         request.keep_plex,
                         limits=request.limits,
+                        sibling_states=request.siblings,
                     )
             if same_files and all(_nothing_to_write(p) for p in (plan, *(p for _key, p in siblings))):
                 changed = False
+                written: set[int] = set()
             else:
                 with self._database(read_only=False, deadline=deadline) as conn:
-                    changed, plan = self._write_item(
+                    changed, plan, siblings, written = self._write_item(
                         conn,
                         deadline,
                         request.rating_key,
@@ -1707,10 +1720,18 @@ class LocalPlexDb(PlexDatabase):
                         request.kept_types,
                         request.keep_plex,
                         limits=request.limits,
+                        sibling_states=request.siblings,
                     )
         except sqlite3.Error as exc:
             raise publish_error_from_sqlite(exc) from exc
-        return WriteResult(changed, plan.ours, plan.kept_types, plan.replaced_own, plan.replaced_stale)
+        return WriteResult(
+            changed,
+            plan.ours,
+            plan.kept_types,
+            plan.replaced_own,
+            plan.replaced_stale,
+            tuple(SiblingResult(key, key in written, p.ours, p.kept_types) for key, p in siblings),
+        )
 
     def shown_many(
         self, items: list[ShownAsk], *, timeout_s: float, cancel_check: Callable[[], bool] | None = None
@@ -1742,9 +1763,10 @@ class LocalPlexDb(PlexDatabase):
                         self._check_schema_for_read(conn)
                         tag_id = self._marker_tag_id(conn)
                     shown, parts = self._shown_in(
-                        conn, tag_id, ask.rating_key, ask.ours, ask.kept_types, ask.item_files, ask.keep_plex
+                        conn, tag_id, ask.rating_key, ask.ours, ask.kept_types, ask.item_files
                     )
-                answers.append(ShownAnswer(shown, _version_files(parts)))
+                    siblings = tuple(key for key, _parts in self._sibling_items(conn, ask.rating_key, parts))
+                answers.append(ShownAnswer(shown, _version_files(parts), siblings))
             except PublishError as exc:
                 logger.debug("Plex {}: couldn't read {} item(s) back: {}", self._label, len(items) - position,
                              type(exc).__name__)  # fmt: skip
@@ -1790,24 +1812,29 @@ class LocalPlexDb(PlexDatabase):
         keep_plex: bool,
         *,
         limits: FileLimits | None = None,
+        sibling_states: tuple[SiblingState, ...] = (),
     ) -> tuple[_Plan, list[tuple[int, _Plan]]]:
         """The item's plan, and one per item sharing its files (``_sibling_items``), each from its own rows and parts.
 
-        A sibling has no record of its own: what this app left on the item (``prior``) and the types it kept are what
-        it left on every sibling, since they are written together. Its own copies of the calling parts are its
-        calling parts.
+        A sibling is planned from its own record (``sibling_states``): what this app last left on it and the types it
+        kept there, so its own rows tell ours from Plex's. One without a record (never written since this app wrote
+        siblings, or an app older than that) counts what this app left on the item as its own, since they are
+        written together, and nothing as kept. Its own copies of the calling parts are its calling parts.
         """
         plan = self._plan(
             conn, rating_key, tag_id, parts, wanted, prior, duration_ms, own_prior, calling_part_ids, kept_before,
             keep_plex, limits=limits,
         )  # fmt: skip
+        states = {state.rating_key: state for state in sibling_states}
         calling_files = {p.file for p in parts if p.id in calling_part_ids}
         siblings = []
         for key, sibling_parts in self._sibling_items(conn, rating_key, parts):
+            state = states.get(key)
+            sibling_prior, sibling_kept = (state.prior, state.kept_types) if state else (prior, frozenset())
             sibling_calling = {p.id for p in sibling_parts if p.file in calling_files}
             sibling_plan = self._plan(
-                conn, key, tag_id, sibling_parts, wanted, prior, duration_ms, own_prior, sibling_calling, kept_before,
-                keep_plex, limits=limits,
+                conn, key, tag_id, sibling_parts, wanted, sibling_prior, duration_ms, own_prior, sibling_calling,
+                sibling_kept, keep_plex, limits=limits,
             )  # fmt: skip
             siblings.append((key, sibling_plan))
         return plan, siblings
@@ -1956,11 +1983,13 @@ class LocalPlexDb(PlexDatabase):
         keep_plex: bool,
         *,
         limits: FileLimits | None = None,
-    ) -> tuple[bool, _Plan]:
-        """Write one item in one transaction.
+        sibling_states: tuple[SiblingState, ...] = (),
+    ) -> tuple[bool, _Plan, list[tuple[int, _Plan]], set[int]]:
+        """Write one item, and the items sharing its files (``_plans``), in one transaction.
 
         Returns:
-            Whether anything changed (False when everything already matched), and the plan made under the lock.
+            Whether anything changed (False when everything already matched), the item's plan and its siblings' made
+            under the lock, and the rating keys whose plan was written.
         """
         # BEGIN IMMEDIATE can wait the rest of the call's deadline — exactly while Plex is writing, often to this item.
         # Everything we merge is re-read after it, or Plex's fresh extra_data keys would be overwritten from a stale read.
@@ -1984,11 +2013,12 @@ class LocalPlexDb(PlexDatabase):
                 kept_before,
                 keep_plex,
                 limits=limits,
+                sibling_states=sibling_states,
             )
             to_write = [(key, p) for key, p in ((rating_key, plan), *siblings) if not _nothing_to_write(p)]
             if not to_write:
                 conn.execute("ROLLBACK")
-                return False, plan
+                return False, plan, siblings, set()
             created_at = int(time.time())
             for key, item_plan in to_write:
                 self._apply_plan(conn, key, tag_id, item_plan, created_at)
@@ -2000,7 +2030,7 @@ class LocalPlexDb(PlexDatabase):
                     "wrote their markers too",
                     self._label, ", ".join(map(str, also)), rating_key,
                 )  # fmt: skip
-            return True, plan
+            return True, plan, siblings, {key for key, _plan in to_write}
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -2048,13 +2078,10 @@ class LocalPlexDb(PlexDatabase):
         ours: list[Marker],
         kept_types: frozenset[MarkerType],
         item_files: tuple[str, ...] | None,
-        keep_plex: bool | None = None,
     ) -> tuple[Shown, list[Part]]:
         """One item's rows compared with ``ours`` on an open connection, and the item's live parts.
 
-        ``ours`` is already projected to the types this publisher writes (``ShownAsk``). An item showing ours is
-        answered by the first item sharing its files (``_sibling_items``) that doesn't (``_sibling_shown``): a write
-        gives them all the same markers.
+        ``ours`` is already projected to the types this publisher writes (``ShownAsk``).
         """
         if not self._item_exists(conn, rating_key):
             return Shown.GONE, []
@@ -2064,14 +2091,7 @@ class LocalPlexDb(PlexDatabase):
             return Shown.VERSIONS_CHANGED, parts
         if any(not served.get(mtype) for mtype in kept_types):
             return Shown.MISSING, parts
-        shown = compare_shown(ours, served, others_alongside=False)
-        if shown is not Shown.OURS:
-            return shown, parts
-        for key, _sibling_parts in self._sibling_items(conn, rating_key, parts):
-            sibling = _sibling_shown(self._served_on(conn, tag_id, key), ours, kept_types, keep_plex)
-            if sibling is not Shown.OURS:
-                return sibling, parts
-        return Shown.OURS, parts
+        return compare_shown(ours, served, others_alongside=False), parts
 
 
 class PlexMarkerPublisher(MarkerPublisher):
@@ -2090,6 +2110,7 @@ class PlexMarkerPublisher(MarkerPublisher):
         settings: ServerMarkersSettings,
         *,
         sibling_markers: Callable[[str], dict[MarkerType, Marker] | None] | None = None,
+        item_record: Callable[[str], ItemRecord | None] | None = None,
         settings_provider: Callable[[], ServerMarkersSettings] | None = None,
         mountinfo_path: str = "/proc/self/mountinfo",
         ui_details: bool = True,
@@ -2103,6 +2124,9 @@ class PlexMarkerPublisher(MarkerPublisher):
             config: That server's ``ServerConfig``.
             settings: That server's ``ServerMarkersSettings``.
             sibling_markers: Looks up decided markers for another local file (multi-version items).
+            item_record: Looks up markers.db's record of another Plex item (None when there is none), for the items
+                sharing a written item's files: the other episodes of a multi-episode file. Without it they are
+                written as having no record, and the read-back doesn't look at them.
             settings_provider: Returns the saved settings right now; when given, every check (and so every write)
                 reads the switch and the database-write confirmation from it instead of ``settings``.
             mountinfo_path: For tests.
@@ -2119,6 +2143,7 @@ class PlexMarkerPublisher(MarkerPublisher):
         self._settings = settings
         self._settings_provider = settings_provider
         self._sibling_markers = sibling_markers or (lambda _path: None)
+        self._item_record = item_record
         self._ui_details = ui_details
         self._db_timeout_s = db_timeout_s
         self._db = db or LocalPlexDb(self.db_path, label=config.name, mountinfo_path=mountinfo_path)
@@ -2374,6 +2399,7 @@ class PlexMarkerPublisher(MarkerPublisher):
         self.last_replaced_own_types = frozenset()
         self.last_replaced_stale_types = frozenset()
         self.last_item_files = None
+        self.last_siblings = {}
         keep_plex = self._live_settings().on_plex_redetect == "keep_plex"
         kept_before = frozenset(kept_types)
         # Until the item's rows are read, what was kept stays kept (or is released by the setting).
@@ -2419,6 +2445,7 @@ class PlexMarkerPublisher(MarkerPublisher):
                 kept_types=kept_before,
                 keep_plex=keep_plex,
                 limits=limits,
+                siblings=self._sibling_states(item.siblings or ()),
             ),
             deadline=deadline,
         )
@@ -2455,7 +2482,27 @@ class PlexMarkerPublisher(MarkerPublisher):
         self.last_write_changed = result.changed
         self.last_kept_types = result.kept_types
         self.last_replaced_own_types = result.replaced_own
+        self.last_siblings = {str(s.rating_key): (s.ours, s.kept_types) for s in result.siblings}
         return result.ours
+
+    def _sibling_states(self, keys: tuple[int, ...]) -> tuple[SiblingState, ...]:
+        """markers.db's records of the items sharing the written item's files (none for an item without one).
+
+        Raises:
+            PublishError: markers.db couldn't be read.
+        """
+        if self._item_record is None:
+            return ()
+        states = []
+        for key in keys:
+            try:
+                record = self._item_record(str(key))
+            except Exception as exc:
+                # markers.db's errors are ours, not Plex's: no capability state, so Plex's status isn't touched.
+                raise PublishError(f"Couldn't look up what this app left on Plex item {key}: {exc}") from exc
+            if record is not None:
+                states.append(SiblingState(key, self.project(record.markers), frozenset(record.kept_types)))
+        return tuple(states)
 
     def types_not_made_for_file(self, item_id: str) -> frozenset[MarkerType] | None:
         """The types whose markers on this item were made for an earlier file at its path.
@@ -2571,7 +2618,6 @@ class PlexMarkerPublisher(MarkerPublisher):
             return {item_id: None for item_id, *_ in items}
         asked: list[str] = []
         asks: list[ShownAsk] = []
-        keep_plex = self._live_settings().on_plex_redetect == "keep_plex"
         for item_id, ours, kept_types, item_files in items:
             try:
                 rating_key = _rating_key(item_id)
@@ -2579,7 +2625,7 @@ class PlexMarkerPublisher(MarkerPublisher):
                 out[item_id] = None
                 continue
             asked.append(item_id)
-            asks.append(ShownAsk(rating_key, self.project(ours), frozenset(kept_types), item_files, keep_plex))
+            asks.append(ShownAsk(rating_key, self.project(ours), frozenset(kept_types), item_files))
         batch = self._db.shown_many(asks, timeout_s=self._db_timeout(), cancel_check=cancel_check)
         for item_id, answer in zip(asked, batch.answers, strict=False):
             out[item_id] = answer.shown
@@ -2589,4 +2635,40 @@ class PlexMarkerPublisher(MarkerPublisher):
                 self._live_files[item_id] = self._local_files(answer.version_files)
         if batch.unreadable:
             out.update({item_id: None for item_id in asked[len(batch.answers) :]})
+        siblings = {
+            item_id: answer.siblings
+            for item_id, answer in zip(asked, batch.answers, strict=False)
+            if answer.shown is Shown.OURS and answer.siblings
+        }
+        if siblings and self._item_record is not None:
+            out.update(self._shown_by_siblings(siblings, cancel_check))
+        return out
+
+    def _shown_by_siblings(
+        self, siblings: dict[str, tuple[int, ...]], cancel_check: Callable[[], bool] | None
+    ) -> dict[str, Shown]:
+        """For items showing ours: the first item sharing their files that doesn't show its own record.
+
+        A write gives every one of them the file's markers, so one of them showing less is the item needing a write,
+        and one this app has no record of has never been written (an episode a write from before siblings left out).
+        A sibling whose read fails says nothing.
+        """
+        out: dict[str, Shown] = {}
+        asks: list[ShownAsk] = []
+        owners: list[str] = []
+        for item_id, keys in siblings.items():
+            for key in keys:
+                record = self._item_record(str(key))  # type: ignore[misc]  # checked by the caller
+                if record is None:
+                    out.setdefault(item_id, Shown.MISSING)
+                    continue
+                asks.append(
+                    ShownAsk(key, self.project(record.markers), frozenset(record.kept_types), record.item_files)
+                )
+                owners.append(item_id)
+        if asks:
+            batch = self._db.shown_many(asks, timeout_s=self._db_timeout(), cancel_check=cancel_check)
+            for item_id, answer in zip(owners, batch.answers, strict=False):
+                if answer.shown is not None and answer.shown is not Shown.OURS:
+                    out.setdefault(item_id, answer.shown)
         return out

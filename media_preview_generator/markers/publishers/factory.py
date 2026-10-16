@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ...servers.base import ServerConfig
     from ..models import Marker, MarkerType
     from ..settings import ServerMarkersSettings
+    from .plex_db import ItemRecord
 
 
 def publisher_for(
@@ -20,6 +21,7 @@ def publisher_for(
     config: ServerConfig,
     *,
     sibling_markers: Callable[[str], dict[MarkerType, Marker] | None] | None = None,
+    item_record: Callable[[str], ItemRecord | None] | None = None,
     settings: ServerMarkersSettings | None = None,
     settings_provider: Callable[[], ServerMarkersSettings] | None = None,
     ui_details: bool = True,
@@ -31,6 +33,8 @@ def publisher_for(
         server: Live client for ``config``.
         config: The server's ``ServerConfig``; its ``markers`` block becomes the publisher's settings.
         sibling_markers: Decided markers for another local file (Plex multi-version items).
+        item_record: markers.db's record of another item on this server (Plex: the other episodes of a multi-episode
+            file are written and read back with their own).
         settings: Use these settings instead of the stored block (the Edit tab checks a server as if it were on).
         settings_provider: The saved settings right now; Plex checks them before every database write, so a job
             started earlier can't write after Intro & Credits was turned off, nor through a Plex database node the
@@ -65,6 +69,7 @@ def publisher_for(
             config,
             settings,
             sibling_markers=sibling_markers,
+            item_record=item_record,
             settings_provider=settings_provider,
             ui_details=ui_details,
             db_timeout_s=db_timeout_s,

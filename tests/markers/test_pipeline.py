@@ -5848,8 +5848,9 @@ class TestRealPlexPublisher:
         server.get_server_status.assert_called_with()  # the capability check did reach Plex
         server.get_marker_detection_prefs.assert_not_called()
 
+    @pytest.mark.parametrize("left_by", ["plex", "a-run-before-this-fix"])
     def test_a_run_puts_back_an_episode_of_a_multi_episode_file_missing_its_markers(
-        self, store, media, tmp_path, monkeypatch
+        self, store, media, tmp_path, monkeypatch, left_by
     ):
         # One file, two episode items (each with its own copy of the part); the item id the job carries is the first.
         from media_preview_generator.markers.publishers import plex_db
@@ -5873,9 +5874,15 @@ class TestRealPlexPublisher:
 
         assert run()["status"] == ServerStatus.WRITTEN.value
         assert [row[0] for row in _served(db, 8)] == [row[0] for row in _served(db, 7)] == ["intro", "credits"]
-        # What a run from before this fix left: the first episode only.
+        episode = store.get_item_publish_state("plex-1", "8")
+        assert (episode.status, [m.type for m in episode.markers]) == ("written", [T.INTRO, T.CREDITS])
+        assert episode.item_files == store.get_item_publish_state("plex-1", "7").item_files == (media,)
         _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8")
         _exec(db, "UPDATE media_parts SET extra_data=NULL WHERE id=?", second_part)
+        if left_by == "a-run-before-this-fix":
+            # It wrote the first episode only, and kept no record of the second.
+            with store._tx() as conn:
+                conn.execute("DELETE FROM item_publish_state WHERE item_id='8'")
 
         assert run()["status"] == ServerStatus.WRITTEN.value
         assert [row[0] for row in _served(db, 8)] == ["intro", "credits"]
