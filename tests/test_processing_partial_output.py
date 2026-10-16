@@ -250,6 +250,7 @@ def run(mock_config, tmp_path):
                 patch(
                     "media_preview_generator.processing.generator._probe_max_keyframe_gap", return_value=keyframe_gap
                 ),
+                patch("media_preview_generator.processing.generator.display_turn", return_value=None),
                 patch(
                     "media_preview_generator.gpu.vulkan_probe.get_vulkan_device_info",
                     return_value=MagicMock(device="Real GPU", is_software=False),

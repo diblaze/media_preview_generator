@@ -1986,8 +1986,9 @@ def generate_images(
             f"GPU processing skipped (the GPU decodes greyscale H.264 into the wrong colours) for {video_file}",
             kind=FALLBACK_CODEC,
         )
-    # Only a GPU's frames need turning by the app: FFmpeg turns the CPU's itself.
-    shown_turn = display_turn(video_file) if gpu is not None else None
+    # Only frames kept as CUDA or VAAPI surfaces need turning by the app: FFmpeg turns frames in memory itself (the
+    # CPU's, VideoToolbox's and D3D11VA's), so no other worker pays for the probe.
+    shown_turn = display_turn(video_file) if gpu in ("NVIDIA", "INTEL", "AMD") else None
     fps_value = round(1 / config.plex_bif_frame_interval, 6)
 
     # Filter primitives.  The final vf chain is assembled inside

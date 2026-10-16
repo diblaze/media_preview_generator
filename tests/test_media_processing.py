@@ -3692,9 +3692,10 @@ class TestRotatedVideo:
         assert "-hwaccel_output_format" not in args
         assert vf.endswith(f",{CPU_SCALE}") and turn not in vf, vf
 
-    def test_a_cpu_worker_doesnt_probe_the_turn(self, mock_config):
+    @pytest.mark.parametrize("gpu", [None, "APPLE", "WINDOWS_GPU"], ids=["cpu", "videotoolbox", "d3d11va"])
+    def test_a_worker_whose_frames_are_in_memory_doesnt_probe_the_turn(self, mock_config, gpu):
         probes: list[list[str]] = []
-        self._command(mock_config, None, None, _matrix(0, -ONE, ONE, 0), probes=probes)
+        self._command(mock_config, gpu, None, _matrix(0, -ONE, ONE, 0), probes=probes)
 
         assert probes == []
 
@@ -3720,6 +3721,72 @@ class TestRotatedVideo:
 
         assert "-hwaccel_output_format" not in args
         assert "hwupload" in vf and turn not in vf, vf
+
+    @staticmethod
+    def _retried_commands(mock_config, gpu, device, matrix, hdr_fmt) -> list[list[str]]:
+        """Every FFmpeg command of a file whose every run fails with a tone-mapping error, through each retry tier to
+        the CPU hand-off."""
+        info = MagicMock()
+        info.video_tracks = [MagicMock(hdr_format=hdr_fmt, transfer_characteristics=None)]
+
+        def failed_run(*_args, **_kwargs):
+            proc = MagicMock()
+            proc.poll.side_effect = [None, 1]
+            proc.returncode = 1
+            return proc
+
+        def run(cmd, *args, **kwargs):
+            if "stream_side_data=displaymatrix" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=_ffprobe_side_data(matrix))
+            return MagicMock(returncode=0)
+
+        with (
+            patch("media_preview_generator.processing.generator.MediaInfo") as mediainfo,
+            patch("subprocess.Popen", side_effect=failed_run) as popen,
+            patch(
+                "media_preview_generator.gpu.vulkan_probe.get_vulkan_device_info",
+                return_value=VulkanProbeResult(device="Real GPU", is_software=False),
+            ),
+            patch("os.path.exists", return_value=False),
+            patch("builtins.open", new_callable=mock_open),
+            patch("time.sleep"),
+            patch("media_preview_generator.processing.generator.glob.glob", return_value=[]),
+            patch("subprocess.run", side_effect=run),
+            patch(
+                "media_preview_generator.processing.generator.classify_dv_safe_retry_reason",
+                return_value="Tone mapping failed",
+            ),
+        ):
+            mediainfo.parse.return_value = info
+            with pytest.raises(CodecNotSupportedError):
+                generate_images("/test/v.mkv", "/tmp/o", gpu, device, mock_config)
+        return [call.args[0] for call in popen.call_args_list]
+
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    @pytest.mark.parametrize(
+        ("gpu", "device"), [("NVIDIA", "cuda"), ("INTEL", "/dev/dri/renderD128")], ids=["cuda", "vaapi"]
+    )
+    def test_the_dv_safe_retry_keeps_the_turn_once(self, mock_config, gpu, device, matrix, turn, box):
+        commands = self._retried_commands(mock_config, gpu, device, matrix, "SMPTE ST 2086")
+        retry_vf = commands[-1][commands[-1].index("-vf") + 1]
+
+        assert len(commands) >= 2 and "tonemap" not in retry_vf
+        assert retry_vf.endswith(f"hwdownload,format=nv12,{turn},{CPU_SCALE}") or retry_vf.endswith(
+            f"hwdownload,format=nv12,scale=trunc(iw/2)*2:trunc(ih/2)*2,{turn},{CPU_SCALE}"
+        ), retry_vf
+        assert all(command[command.index("-vf") + 1].count(turn) == 1 for command in commands)
+
+    @pytest.mark.parametrize(("matrix", "turn", "box"), TURNS)
+    def test_dolby_vision_profile_5s_software_retry_leaves_the_turn_to_ffmpeg(self, mock_config, matrix, turn, box):
+        commands = self._retried_commands(mock_config, "INTEL", "/dev/dri/renderD128", matrix, "Dolby Vision")
+        software = [command for command in commands if "-hwaccel" not in command]
+        vfs = [command[command.index("-vf") + 1] for command in commands]
+
+        assert len(software) == 1, "the software decode + libplacebo tier ran"
+        software_vf = software[0][software[0].index("-vf") + 1]
+        assert "libplacebo" in software_vf and turn not in software_vf, "its frames are in memory: FFmpeg turns them"
+        assert vfs[0].endswith(f",{turn},{CPU_SCALE}"), "the OpenCL tier downloads surfaces and turns them"
+        assert vfs[-1].endswith(f",{turn},{CPU_SCALE}") and "tonemap" not in vfs[-1], "the DV-safe tier too"
 
 
 class TestFfmpegThreadFlags:
