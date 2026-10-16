@@ -159,8 +159,13 @@
 
     // "storage · Quadro P5000" for a node's device; just the device for this app's own.
     const deviceTitle = member => (member.node ? `${nodeName(member)} · ${deviceName(member)}` : deviceName(member));
-    const nodeChip = member => (member.node
-        ? `<span class="node-chip" title="${escapeHtml(`Runs on node ${nodeName(member)}`)}"><i class="bi bi-hdd-network" aria-hidden="true"></i>${escapeHtml(nodeName(member))}</span>` : '');
+    // Once any member runs on a node, this app's own members say "This app" so the two can be told apart; with none,
+    // a single-machine setup gets no chip at all.
+    const anyMemberOnNode = () => (snapshot?.groups || []).some(group => (group.members || []).some(member => member.node));
+    const nodeChip = member => {
+        if (member.node) return `<span class="node-chip" title="${escapeHtml(`Runs on node ${nodeName(member)}`)}"><i class="bi bi-hdd-network" aria-hidden="true"></i>${escapeHtml(nodeName(member))}</span>`;
+        return anyMemberOnNode() ? `<span class="node-chip" data-this-app-chip title="Runs on this app's machine"><i class="bi bi-house-door" aria-hidden="true"></i>This app</span>` : '';
+    };
 
     // "NVIDIA GeForce RTX 4090" -> "RTX 4090"; chips are narrow and the vendor adds nothing next to a model number.
     function shortDeviceName(member) {
