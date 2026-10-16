@@ -56,7 +56,14 @@ from loguru import logger
 from ...utils import redact_secrets, scratch_dir
 from ..locks import KeyedLocks
 from .cards import READ_SCALE
-from .devices import choose_ep_device, pin_env_to_gpu, worker_pci_bus_id
+from .devices import (
+    choose_ep_device,
+    drm_pci_bus_id,
+    i915_guc_submission,
+    pin_env_to_gpu,
+    sync_intel_submissions,
+    worker_pci_bus_id,
+)
 from .rule_j import Box
 
 MODULE = "media_preview_generator.markers.credits.textdet_helper"
@@ -751,6 +758,15 @@ def _package_version(name: str) -> str | None:
         return None
 
 
+def _intel_guc_field(key: str) -> dict[str, bool]:
+    """``{"intel_guc": ...}`` for an i915 render node whose GuC submission state sysfs shows, else nothing."""
+    try:
+        guc = i915_guc_submission(drm_pci_bus_id(key)) if key.startswith("/dev/dri/") else None
+    except OSError:
+        guc = None
+    return {} if guc is None else {"intel_guc": guc}
+
+
 def _vulkan_device_info() -> Any:
     from ...gpu.vulkan_probe import get_vulkan_device_info
 
@@ -775,6 +791,7 @@ class _GpuState:
         cpu_reason: Why its requests are read on the CPU now: the verdict's reason, or the start failure's.
         selftest: The self-test's counts when a mismatch gave the CPU verdict (``asdict(SelfTest)``), else None.
         selftest_reason: The helper's plain sentence for that mismatch (``SelfTest.cpu_reason``).
+        sync_logged: The line saying its helpers wait for each batch (``sync_intel_submissions``) was logged.
     """
 
     verdict: str | None = None
@@ -783,6 +800,7 @@ class _GpuState:
     cpu_reason: str = ""
     selftest: dict[str, Any] | None = None
     selftest_reason: str = ""
+    sync_logged: bool = False
 
 
 class TextDetectorPool:
@@ -1198,6 +1216,7 @@ class TextDetectorPool:
             **details,
             "vulkan": vulkan,
             "kernel": platform.release(),
+            **_intel_guc_field(key),
             "onnxruntime": _package_version("onnxruntime"),
             "webgpu_ep": _package_version("onnxruntime-ep-webgpu"),
         }
@@ -1226,9 +1245,21 @@ class TextDetectorPool:
         # Note N1: the EP device object picks the provider, not the GPU. This is what puts the helper on the
         # worker's own card, so two GPU workers don't both land on GPU 0.
         env = pin_env_to_gpu(env, pci_bus_id)
+        # Every start, not only the self-tested first one: a later helper serves without a self-test.
+        sync = i915_guc_submission(pci_bus_id) is False
+        if sync:
+            env = sync_intel_submissions(env)
         with self._guard:
-            state = self._gpus.get(key)
-            known = state is not None and state.verdict is not None
+            state = self._gpus.setdefault(key, _GpuState())
+            known = state.verdict is not None
+            log_sync = sync and not state.sync_logged
+            state.sync_logged |= sync
+        if log_sync:
+            logger.info(
+                "Credits on {}: this Intel GPU runs without GuC, so its credit work waits for each step to finish."
+                " A little slower; without it, Intel GPUs like this one read text wrong (#403).",
+                key,
+            )
         return HelperSpec(key, "webgpu", pci_bus_id, not known, env)
 
     # ---------------------------------------------------------------------------------------------------- CPU helpers

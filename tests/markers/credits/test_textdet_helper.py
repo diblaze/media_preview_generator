@@ -50,7 +50,9 @@ class Env:
             "worker_pci_bus_id",
             lambda gpu, path: WORKER_PCI.get(path) if gpu in ("NVIDIA", "INTEL", "AMD") else None,
         )
-        for name in ("VK_DRIVER_FILES", *PIN_ENV):
+        # Not the test machine's own sysfs: a test about Intel GPUs without GuC sets this itself.
+        monkeypatch.setattr(th, "i915_guc_submission", lambda pci: None)
+        for name in ("VK_DRIVER_FILES", "INTEL_DEBUG", *PIN_ENV):
             monkeypatch.delenv(name, raising=False)
 
         def command(spec):
@@ -211,6 +213,47 @@ class TestRouting:
             "Credit text detection on cuda:0: GPU (median 9.0 ms per frame, CPU 18.0 ms; GPU/CPU 0.5 per round), "
             "pinned to 0000:02:00.0" in loguru_caplog.text
         )
+
+    @pytest.mark.parametrize(
+        ("guc", "intel_debug"),
+        [(False, "sync"), (True, None), (None, None)],
+        ids=["i915-execlists", "i915-guc", "not-i915"],
+    )
+    def test_an_intel_gpu_without_guc_waits_for_each_batch_when_reading_credits(
+        self, envs, monkeypatch, loguru_caplog, guc, intel_debug
+    ):
+        # #403: on i915 without GuC submission the credit models read wrong unless each batch is waited on.
+        asked: list[str | None] = []
+        env = envs()
+        monkeypatch.setattr(th, "i915_guc_submission", lambda pci: asked.append(pci) or guc)
+        assert env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128") == ANSWER
+        assert asked == ["0000:00:02.0"]
+        assert env.specs[0].selftest is True  # the self-test runs the way the GPU will be used
+        assert env.started[0]["env"].get("INTEL_DEBUG") == intel_debug
+        assert env.started[0]["env"]["DRI_PRIME"] == "pci-0000_00_02_0"
+        assert ("runs without GuC" in loguru_caplog.text) is (guc is False)
+
+    def test_a_helper_started_again_after_the_verdict_still_waits_and_the_line_is_logged_once(
+        self, envs, monkeypatch, loguru_caplog
+    ):
+        # The later helper serves without a self-test, so it must run exactly as the self-tested one did.
+        env = envs(idle_exit_s=0.3)
+        monkeypatch.setattr(th, "i915_guc_submission", lambda pci: False)
+        assert env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128") == ANSWER
+        assert env.procs[0].wait(timeout=10) == th.IDLE_EXIT_CODE
+        assert env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128") == ANSWER
+        assert [spec.selftest for spec in env.specs] == [True, False]
+        assert [started["env"].get("INTEL_DEBUG") for started in env.started] == ["sync", "sync"]
+        assert loguru_caplog.text.count("runs without GuC") == 1
+
+    def test_a_gpu_that_keeps_failing_to_start_logs_the_wait_line_once(self, envs, clock, monkeypatch, loguru_caplog):
+        env = envs(modes={"webgpu": "crash-on-request"})
+        monkeypatch.setattr(th, "i915_guc_submission", lambda pci: False)
+        for _ in range(3):
+            env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128")
+            clock.advance(th.GPU_RETRY_MAX_S + 1)
+        assert len([s for s in env.specs if s.backend == "webgpu"]) == 3
+        assert loguru_caplog.text.count("runs without GuC") == 1
 
     @pytest.mark.parametrize("gpu", ["INTEL", "AMD"])
     def test_a_vaapi_worker_gets_no_nvidia_overrides(self, envs, gpu):
@@ -2246,6 +2289,19 @@ class TestWhatTheUserSees:
         assert details["failed"] == "crashed (exit code 9) while reading credits"
         assert details["error"].startswith("the helper exited (9)")
         assert {"vulkan", "kernel", "onnxruntime", "webgpu_ep"} <= details.keys()
+        assert "intel_guc" not in details  # not an Intel render node
+
+    @pytest.mark.parametrize("guc", [False, True])
+    def test_an_intel_gpus_details_say_whether_it_runs_with_guc(self, envs, monkeypatch, loguru_caplog, guc):
+        monkeypatch.setattr(
+            th, "drm_pci_bus_id", lambda node: "0000:00:02.0" if node == "/dev/dri/renderD128" else None
+        )
+        env = envs(modes={"webgpu": "crash-on-request"})
+        monkeypatch.setattr(th, "i915_guc_submission", lambda pci: guc if pci == "0000:00:02.0" else None)
+        env.pool.detect_boxes(PLANES, gpu="INTEL", gpu_device_path="/dev/dri/renderD128")
+        (details,) = _bug_report_details(loguru_caplog)
+        assert details["device"] == "/dev/dri/renderD128"
+        assert details["intel_guc"] is guc
 
     def test_only_the_first_failure_in_a_row_logs_the_details_the_rest_go_to_debug(self, envs, clock, loguru_caplog):
         env = envs(modes={"webgpu": "crash-on-request"})

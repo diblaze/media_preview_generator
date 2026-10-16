@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import platform
 import re
 import subprocess
 import threading
@@ -12,6 +14,10 @@ _PCI_RE = re.compile(r"^(?:([0-9a-fA-F]{1,8}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2}
 # The metadata key onnxruntime-ep-webgpu 0.3.0 puts a device's PCI address under (measured on a lab machine).
 PCI_METADATA_KEYS: tuple[str, ...] = ("pci_bus_id",)
 SYSFS_DRM = "/sys/class/drm"
+SYSFS_PCI_DEVICES = "/sys/bus/pci/devices"
+INTEL_DEBUG_ENV = "INTEL_DEBUG"
+# i915 has had the GuC SLPC sysfs file since Linux 6.5; on older kernels its absence says nothing.
+SLPC_SYSFS_KERNEL = (6, 5)
 
 # Which physical GPU a Vulkan process runs on is decided by Mesa's device-select implicit layer
 # (mesa-vulkan-drivers, in the app image), which the Vulkan loader applies to every ICD including NVIDIA's
@@ -65,6 +71,54 @@ def drm_pci_bus_id(render_node: str, *, sysfs_drm: str | None = None) -> str | N
         if found:
             return found
     return None
+
+
+def i915_guc_submission(
+    pci_bus_id: str | None, *, sysfs_pci: str | None = None, kernel: str | None = None
+) -> bool | None:
+    """Whether the i915 driver sends this GPU's work through its GuC firmware.
+
+    i915 creates a GT's ``slpc_ignore_eff_freq`` file only when GuC SLPC runs, and on Gen12+ SLPC runs exactly when
+    GuC submission does (``intel_gt_sysfs_pm.c``, ``intel_guc_slpc.c``). Tiger Lake and Alder Lake-S default to
+    execlists, Raptor Lake on a recent kernel to GuC. GPUs before Gen12 never run SLPC, so they read False: they run
+    execlists unless ``enable_guc=3`` forced GuC submission on a Gen11.
+
+    Args:
+        pci_bus_id: The GPU's normalised PCI address, or None.
+        sysfs_pci: The sysfs PCI devices folder (default ``SYSFS_PCI_DEVICES``).
+        kernel: The host's kernel release (default ``platform.release()``, the host's own inside a container).
+
+    Returns:
+        True or False for an i915 GPU whose sysfs shows it; None for another driver (``xe`` always uses GuC), a kernel
+        older than the file, or when sysfs doesn't say.
+    """
+    if pci_bus_id is None or _kernel_version(kernel or platform.release()) < SLPC_SYSFS_KERNEL:
+        return None
+    device = os.path.join(sysfs_pci or SYSFS_PCI_DEVICES, pci_bus_id)
+    if os.path.basename(os.path.realpath(os.path.join(device, "driver"))) != "i915":
+        return None
+    gts = glob.glob(os.path.join(device, "drm", "card*", "gt", "gt0"))
+    if not gts:
+        return None
+    return any(os.path.exists(os.path.join(gt, "slpc_ignore_eff_freq")) for gt in gts)
+
+
+def _kernel_version(release: str) -> tuple[int, int]:
+    """``6.18.54-Unraid`` as (6, 18); (0, 0) when the release doesn't start with a version."""
+    match = re.match(r"(\d+)\.(\d+)", release)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def sync_intel_submissions(env: Mapping[str, str]) -> dict[str, str]:
+    """A copy of ``env`` in which Mesa's Intel driver waits for each batch of GPU work before sending the next.
+
+    Issue #403: on i915 without GuC submission the credit models came back wrong on every run on Alder Lake-S, and
+    turning GuC on fixed Tiger Lake too; with ``INTEL_DEBUG=sync`` they matched the CPU exactly. Costs about a quarter
+    more GPU time per frame on a UHD 770. Older Intel GPUs get it too: they run the same execlists path, and the
+    self-test still decides whether the GPU reads credits.
+    """
+    flags = [flag for flag in env.get(INTEL_DEBUG_ENV, "").split(",") if flag]
+    return {**env, INTEL_DEBUG_ENV: ",".join([*flags, "sync"] if "sync" not in flags else flags)}
 
 
 _nvidia_ids: dict[str, str] | None = None

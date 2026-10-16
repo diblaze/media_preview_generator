@@ -243,3 +243,61 @@ class TestPinEnvToGpu:
         original = {"MESA_VK_DEVICE_SELECT": "10005:0"}
         devices.pin_env_to_gpu(original, "0000:02:00.0")
         assert original == {"MESA_VK_DEVICE_SELECT": "10005:0"}
+
+
+class TestI915GucSubmission:
+    """Whether i915 runs a GPU's work through GuC, read from sysfs the way a container sees it."""
+
+    @staticmethod
+    def _device(tmp_path, *, driver="i915", gt_files=(), with_gt=True):
+        drivers = tmp_path / "drivers" / driver
+        drivers.mkdir(parents=True)
+        device = tmp_path / "devices" / "0000:00:02.0"
+        device.mkdir(parents=True)
+        (device / "driver").symlink_to(drivers)
+        if with_gt:
+            gt = device / "drm" / "card1" / "gt" / "gt0"
+            gt.mkdir(parents=True)
+            for name in ("rps_act_freq_mhz", *gt_files):
+                (gt / name).write_text("0")
+        return str(tmp_path / "devices")
+
+    @pytest.fixture(autouse=True)
+    def _new_kernel(self, monkeypatch):
+        monkeypatch.setattr(devices.platform, "release", lambda: "6.18.54-Unraid")
+
+    def test_an_i915_gpu_with_guc_slpc_files_runs_with_guc(self, tmp_path):
+        sysfs = self._device(tmp_path, gt_files=("slpc_ignore_eff_freq", "slpc_power_profile"))
+        assert devices.i915_guc_submission("0000:00:02.0", sysfs_pci=sysfs) is True
+
+    def test_an_i915_gpu_without_them_runs_on_execlists(self, tmp_path):
+        sysfs = self._device(tmp_path)
+        assert devices.i915_guc_submission("0000:00:02.0", sysfs_pci=sysfs) is False
+
+    def test_the_xe_driver_is_not_asked_about(self, tmp_path):
+        sysfs = self._device(tmp_path, driver="xe")
+        assert devices.i915_guc_submission("0000:00:02.0", sysfs_pci=sysfs) is None
+
+    def test_an_i915_gpu_whose_sysfs_has_no_gt_folder_is_unknown(self, tmp_path):
+        sysfs = self._device(tmp_path, with_gt=False)
+        assert devices.i915_guc_submission("0000:00:02.0", sysfs_pci=sysfs) is None
+
+    @pytest.mark.parametrize(("kernel", "expected"), [("6.4.16", None), ("6.5.0-1-pve", False), ("7.0.0-38", False)])
+    def test_a_kernel_older_than_the_slpc_file_is_unknown(self, tmp_path, kernel, expected):
+        # Before Linux 6.5 i915 never made the file, so its absence doesn't mean execlists.
+        sysfs = self._device(tmp_path)
+        assert devices.i915_guc_submission("0000:00:02.0", sysfs_pci=sysfs, kernel=kernel) is expected
+
+    @pytest.mark.parametrize("pci_bus_id", [None, "0000:09:00.0"])
+    def test_no_address_or_an_unknown_device_is_unknown(self, tmp_path, pci_bus_id):
+        sysfs = self._device(tmp_path)
+        assert devices.i915_guc_submission(pci_bus_id, sysfs_pci=sysfs) is None
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [(None, "sync"), ("nocompact", "nocompact,sync"), ("sync", "sync"), ("nocompact,sync", "nocompact,sync")],
+)
+def test_sync_intel_submissions_adds_sync_once_and_keeps_other_flags(inherited, expected):
+    env = {"KEEP": "me"} if inherited is None else {"KEEP": "me", "INTEL_DEBUG": inherited}
+    assert devices.sync_intel_submissions(env) == {"KEEP": "me", "INTEL_DEBUG": expected}
