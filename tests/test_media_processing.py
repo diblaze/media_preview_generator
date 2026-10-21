@@ -2139,6 +2139,10 @@ class TestProactiveDVSkip:
             monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
         else:
             monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", caps)
+        # No NVIDIA driver mounted, whatever the test machine has: with one, the step depends on its graphics files.
+        monkeypatch.setattr(
+            "media_preview_generator.gpu.vulkan_probe._NVIDIA_SMI", "nvidia-smi-not-mounted-in-this-test"
+        )
         monkeypatch.setattr("media_preview_generator.processing.generator.is_node_mode", lambda: node)
         messages: list[str] = []
         sink_id = logger.add(lambda msg: messages.append(str(msg)), level="WARNING", format="{message}")

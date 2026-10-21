@@ -1840,7 +1840,7 @@ You don't have to do anything for these — the container handles them on startu
 >
 > **Fix:** add `-e NVIDIA_DRIVER_CAPABILITIES=all` to your `docker run` command (or set it in the `environment:` block of your compose file) and restart the container. `all` is what the official NVIDIA Vulkan images use. If you prefer minimum privilege, `compute,video,utility,graphics` works too.
 >
-> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out.
+> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out. If it already uses the NVIDIA runtime and the banner says none of NVIDIA's graphics driver files are in the container, the host's NVIDIA driver has no Vulkan part (some NAS driver packages, such as Synology's, leave it out).
 >
 > If the banner persists after that, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
 

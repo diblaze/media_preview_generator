@@ -45,7 +45,7 @@ docker run -d \
 
 In Docker Compose, set `NVIDIA_DRIVER_CAPABILITIES=all` under `environment:`. `compute,video,utility,graphics` also works if you prefer the minimum. Restart the container after changing it.
 
-If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out.
+If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out. If the container already uses the NVIDIA runtime and the dashboard says none of NVIDIA's graphics driver files are in it, the host's NVIDIA driver has no Vulkan part. Some NAS driver packages, such as Synology's, leave it out.
 
 Intel and AMD need no extra step beyond passing `/dev/dri`, which also brings the Mesa Vulkan driver.
 

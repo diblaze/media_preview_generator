@@ -95,11 +95,20 @@ _NVIDIA_CHECKS = {
         "didn't add NVIDIA's Vulkan driver.",
         "Set NVIDIA_DRIVER_CAPABILITIES=all and restart the container.",
     ),
+    "nvidia_graphics_libs_missing": (
+        "The container has none of NVIDIA's graphics driver files",
+        "NVIDIA_DRIVER_CAPABILITIES asks for graphics and CUDA works, but none of NVIDIA's graphics driver files "
+        "(nvidia_icd.json, libEGL_nvidia.so, libnvidia-glvkspirv.so) are inside the container.",
+        "If the container is started with --gpus all alone, also add --runtime=nvidia and restart. If it already uses "
+        "the NVIDIA runtime, the host's NVIDIA driver doesn't include its Vulkan part (some NAS driver packages, such "
+        "as Synology's, leave it out); install a full NVIDIA driver on the host to fix it.",
+    ),
     "nvidia_icd_missing": (
         "NVIDIA's Vulkan driver file is missing",
         "NVIDIA_DRIVER_CAPABILITIES asks for graphics, but nvidia_icd.json isn't inside the container.",
-        "Upgrade the host NVIDIA driver to 580 or newer (570 to 579 have a bug that leaves it out), or switch the "
-        'NVIDIA runtime to legacy mode (mode = "legacy" in /etc/nvidia-container-runtime/config.toml), then restart.',
+        "If the host NVIDIA driver is 570 to 579, upgrade it to 580 or newer (those versions leave the file out); "
+        'otherwise switch the NVIDIA runtime to legacy mode (mode = "legacy" in '
+        "/etc/nvidia-container-runtime/config.toml). Then restart.",
     ),
     "nvidia_spirv_missing": (
         "NVIDIA's Vulkan driver is missing a library",
@@ -152,7 +161,7 @@ def diagnose_nvidia_environment() -> dict[str, Any]:
     """Gather facts about the container's Vulkan configuration.
 
     Used by the web page to dispatch the pure-NVIDIA warning
-    branch into one of four sub-cases (A1 / A2 / A3 / A4) naming the
+    branch into one of five sub-cases (A1 / A1b / A2 / A3 / A4) naming the
     specific misconfiguration rather than a generic "upstream packaging
     issue" — and by the ``GET /api/system/vulkan/debug`` endpoint to
     produce a plain-text diagnostic bundle users can paste into GitHub
@@ -245,18 +254,26 @@ def diagnose_nvidia_environment() -> dict[str, Any]:
 
 
 def nvidia_cause(diag: dict[str, Any]) -> str:
-    """Which of the four NVIDIA container problems applies.
+    """Which of the five NVIDIA container problems applies.
 
     Args:
         diag: The container facts (``nvidia_capabilities_has_graphics``, ``nvidia_icd_json_path``,
-            ``libnvidia_glvkspirv_found``).
+            ``libnvidia_glvkspirv_found``, ``libegl_nvidia_found``).
 
     Returns:
-        ``nvidia_no_graphics_cap``, ``nvidia_icd_missing``, ``nvidia_spirv_missing`` or ``nvidia_loader_rejected``
-        (everything is in place and the loader still said no).
+        ``nvidia_no_graphics_cap``, ``nvidia_graphics_libs_missing``, ``nvidia_icd_missing``,
+        ``nvidia_spirv_missing`` or ``nvidia_loader_rejected`` (everything is in place and the loader still said no).
     """
     if not diag["nvidia_capabilities_has_graphics"]:
         return "nvidia_no_graphics_cap"
+    # Nothing from the graphics capability arrived at all (issue #419): the runtime wasn't asked, or the host driver
+    # has nothing to give. Only the JSON missing while the libraries are there is the toolkit bug nvidia_icd_missing names.
+    if (
+        diag["nvidia_icd_json_path"] is None
+        and not diag["libnvidia_glvkspirv_found"]
+        and not diag["libegl_nvidia_found"]
+    ):
+        return "nvidia_graphics_libs_missing"
     if diag["nvidia_icd_json_path"] is None:
         return "nvidia_icd_missing"
     if not diag["libnvidia_glvkspirv_found"]:

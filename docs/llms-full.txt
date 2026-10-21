@@ -432,6 +432,9 @@ docker run -d \
 > [!TIP]
 > **Why `NVIDIA_DRIVER_CAPABILITIES=all`?** Dolby Vision Profile 5 videos need the NVIDIA Vulkan driver to be tone-mapped; the `all` value is what makes that driver available inside the container. Without it, the app skips tone mapping for those files and their thumbnails come out with a green and purple tint. (The older `compute,video,utility` setting is fine for everything except Dolby Vision Profile 5.) If the dashboard still warns that those thumbnails will have the wrong colours, add `--runtime=nvidia` on Linux: with `--gpus all` alone, some Docker setups leave that driver out.
 
+> [!WARNING]
+> **Passing `/dev/nvidia*` as devices isn't enough.** Without `--gpus all` or the NVIDIA runtime (`runtime: nvidia` in compose), the container gets the GPU but not the driver, so the GPU isn't detected and the log warns that the NVIDIA driver isn't in the container.
+
 > [!TIP]
 > **Multi-GPU?** Hosts with two or more NVIDIA cards are detected automatically — each card appears as a separate row in **Settings → Processing options → GPU device tuning** with its own **FFmpeg threads per worker** setting. You choose which card each worker group uses in **Settings → Workers**.
 
@@ -1386,7 +1389,7 @@ docker run -d \
 
 In Docker Compose, set `NVIDIA_DRIVER_CAPABILITIES=all` under `environment:`. `compute,video,utility,graphics` also works if you prefer the minimum. Restart the container after changing it.
 
-If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out.
+If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out. If the container already uses the NVIDIA runtime and the dashboard says none of NVIDIA's graphics driver files are in it, the host's NVIDIA driver has no Vulkan part. Some NAS driver packages, such as Synology's, leave it out.
 
 Intel and AMD need no extra step beyond passing `/dev/dri`, which also brings the Mesa Vulkan driver.
 
@@ -3458,7 +3461,7 @@ You don't have to do anything for these — the container handles them on startu
 >
 > **Fix:** add `-e NVIDIA_DRIVER_CAPABILITIES=all` to your `docker run` command (or set it in the `environment:` block of your compose file) and restart the container. `all` is what the official NVIDIA Vulkan images use. If you prefer minimum privilege, `compute,video,utility,graphics` works too.
 >
-> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out.
+> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out. If it already uses the NVIDIA runtime and the banner says none of NVIDIA's graphics driver files are in the container, the host's NVIDIA driver has no Vulkan part (some NAS driver packages, such as Synology's, leave it out).
 >
 > If the banner persists after that, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -56,16 +57,27 @@ DV5_NO_VULKAN_EFFECT = (
 # What tells dv5_no_vulkan_fix which GPUs the container has.
 _RENDER_NODES_GLOB = "/dev/dri/renderD*"
 _NVIDIA_CONTROL_NODE = "/dev/nvidiactl"
+# The NVIDIA runtime (or --gpus all) mounts nvidia-smi in with the driver; the image ships none of its own.
+_NVIDIA_SMI = "nvidia-smi"
+
+
+def _nvidia_graphics_files_all_missing() -> bool:
+    """Whether NVIDIA_DRIVER_CAPABILITIES asked for graphics and not one NVIDIA graphics driver file arrived."""
+    from .vulkan_check import diagnose_nvidia_environment, nvidia_cause  # vulkan_check imports this module
+
+    return nvidia_cause(diagnose_nvidia_environment()) == "nvidia_graphics_libs_missing"
 
 
 def dv5_no_vulkan_fix() -> str:
     """How to give this container a hardware Vulkan driver, without telling it to set what it already has.
 
     With ``graphics`` (or ``all``) already asked for, ``--gpus all`` on a Docker that hands GPUs over through CDI
-    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it. The NVIDIA step is
-    only given with an NVIDIA GPU in the container (or no GPU at all), and passing /dev/dri only when it has no render
-    node: an Intel or AMD GPU that is already there and still has no Vulkan has a cause the per-GPU check names
-    (``gpu.vulkan_check``), such as a host kernel too old (issue #408).
+    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it. When the driver
+    *was* mounted (nvidia-smi is there) and still brought none of its graphics files, the host driver may have no
+    Vulkan part to give (Synology's, issue #419), so that is named too; any other NVIDIA cause is left to the per-GPU
+    check. The NVIDIA step is only given with an NVIDIA GPU in the container (or no GPU at all), and passing
+    /dev/dri only when it has no render node: an Intel or AMD GPU that is already there and still has no Vulkan has a
+    cause the per-GPU check names (``gpu.vulkan_check``), such as a host kernel too old (issue #408).
 
     Returns:
         The steps, or "" when there are none to give.
@@ -75,10 +87,19 @@ def dv5_no_vulkan_fix() -> str:
     if os.path.exists(_NVIDIA_CONTROL_NODE) or not has_render_node:
         caps = os.environ.get("NVIDIA_DRIVER_CAPABILITIES", "").lower()
         if caps == "all" or "graphics" in caps:
-            steps.append(
-                "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
-                "with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out) and restart"
-            )
+            if not shutil.which(_NVIDIA_SMI):
+                steps.append(
+                    "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the "
+                    "container with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out) "
+                    "and restart"
+                )
+            elif _nvidia_graphics_files_all_missing():
+                steps.append(
+                    "on NVIDIA, the container got the CUDA driver but not NVIDIA's Vulkan driver: if it's started with "
+                    "--gpus all alone, also add --runtime=nvidia and restart; if it already uses the NVIDIA runtime, "
+                    "the host's NVIDIA driver doesn't include Vulkan (some NAS driver packages, such as Synology's, "
+                    "leave it out)"
+                )
         else:
             steps.append("on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability) and restart")
     if not has_render_node:

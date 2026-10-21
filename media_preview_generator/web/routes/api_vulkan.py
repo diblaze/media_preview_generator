@@ -70,8 +70,14 @@ def gpus_with_vulkan(gpus: list[dict]) -> list[dict]:
     return [{**gpu, "vulkan": check.to_dict() if check else None} for gpu, check in zip(gpus, checks, strict=True)]
 
 
+def _in_icd_regression_range(driver_version: str) -> bool:
+    """Whether an NVIDIA driver version is one of the 570.x-579.x releases that leave nvidia_icd.json out."""
+    major = driver_version.split(".", 1)[0]
+    return major.isdigit() and 570 <= int(major) <= 579
+
+
 def _nvidia_body_html(cause: str, diag: dict, nvidia_name: str) -> str:
-    """The HTML explaining one NVIDIA Vulkan failure (cases A1-A4) and how to fix it.
+    """The HTML explaining one NVIDIA Vulkan failure (cases A1, A1b, A2-A4) and how to fix it.
 
     Args:
         cause: One of the ``nvidia_*`` causes from :func:`...gpu.vulkan_check.nvidia_cause`.
@@ -127,24 +133,80 @@ def _nvidia_body_html(cause: str, diag: dict, nvidia_name: str) -> str:
             "almost certainly fix it. After the restart those "
             "thumbnails come out with the right colours.</div>"
         )
+    elif cause == "nvidia_graphics_libs_missing":
+        # Case A1b (issue #419): graphics is asked for, CUDA works, but not one graphics file arrived — not the
+        # ICD JSON, not libEGL_nvidia, not glvkspirv. The runtime wasn't asked (--gpus all alone on a CDI Docker)
+        # or the host driver has no graphics part to give (Synology / NAS driver packages).
+        logger.debug(
+            "Vulkan warning: selected Case A1b (graphics cap set but no NVIDIA graphics files at all) for {!r}",
+            nvidia_name,
+        )
+        body = (
+            f"<strong>Your GPU:</strong> {nvidia_name_esc}"
+            "<br><br>"
+            "<code>NVIDIA_DRIVER_CAPABILITIES</code> asks for graphics and CUDA works, but none of NVIDIA's "
+            "graphics driver files (<code>nvidia_icd.json</code>, <code>libEGL_nvidia.so</code>, "
+            "<code>libnvidia-glvkspirv.so</code>) are inside the container, so there is no NVIDIA Vulkan "
+            "driver to use."
+            "<br><br>"
+            '<span class="small"><strong>Fix:</strong></span>'
+            '<ul class="small mb-0 mt-1">'
+            "<li>If you start the container with <code>--gpus all</code> alone, also add "
+            "<code>--runtime=nvidia</code> (Docker Compose: <code>runtime: nvidia</code>) and restart.</li>"
+            "<li>If it already uses the NVIDIA runtime, the host's NVIDIA driver doesn't include its Vulkan "
+            "part. Some NAS driver packages, such as Synology's, leave it out. Installing a full NVIDIA driver "
+            "on the host fixes it; otherwise this host can't tone map those thumbnails.</li>"
+            "</ul>"
+        )
     elif cause == "nvidia_icd_missing":
-        # Case A2: graphics capability is set but the ICD JSON is
-        # missing. Usually the driver 570-579 regression that's
-        # fixed in 580 (nvidia-container-toolkit#1041), or a CDI
-        # manifest bug (#1559).
+        # Case A2: graphics capability is set and NVIDIA's graphics libraries arrived, but the ICD JSON didn't.
+        # Driver 570-579 leave it out (nvidia-container-toolkit#1041); otherwise it's a CDI manifest bug (#1559).
         driver_version = diag["nvidia_driver_version"]
         logger.debug(
             "Vulkan warning: selected Case A2 (graphics cap set but nvidia_icd.json missing) for {!r}; driver_version={!r}",
             nvidia_name,
             driver_version,
         )
-        driver_line = ""
-        if driver_version:
-            driver_line = (
+        regression = (
+            "a known regression on NVIDIA driver versions "
+            "<strong>570.x – 579.x</strong> where the ICD is not "
+            "injected into containers "
+            '(<a href="https://github.com/NVIDIA/nvidia-container-toolkit/issues/1041" '
+            'target="_blank" rel="noopener">'
+            "nvidia-container-toolkit#1041</a>). "
+            "<strong>Fix:</strong> upgrade your host NVIDIA driver "
+            "to <strong>580 or newer</strong>, or downgrade to "
+            "<strong>550</strong>."
+        )
+        cdi = (
+            "your NVIDIA runtime is using the CDI mode and its CDI "
+            "manifest is missing Vulkan files "
+            '(<a href="https://github.com/NVIDIA/nvidia-container-toolkit/issues/1559" '
+            'target="_blank" rel="noopener">'
+            "nvidia-container-toolkit#1559</a>). Switch to legacy "
+            'mode by setting <code>mode = "legacy"</code> in '
+            "<code>/etc/nvidia-container-runtime/config.toml</code> "
+            "on the host."
+        )
+        if driver_version and not _in_icd_regression_range(driver_version):
+            causes = (
+                f'<span class="small"><strong>Likely cause:</strong> {cdi}</span>'
                 f'<div class="small mt-2">Detected host NVIDIA driver: '
-                f"<code>{html_escape.escape(driver_version)}</code>. "
-                "If that version is in the 570.x–579.x range, you're "
-                "almost certainly hitting this specific regression.</div>"
+                f"<code>{html_escape.escape(driver_version)}</code> (not one of the 570.x–579.x versions "
+                "that leave the file out).</div>"
+            )
+        else:
+            driver_line = ""
+            if driver_version:
+                driver_line = (
+                    f'<div class="small mt-2">Detected host NVIDIA driver: '
+                    f"<code>{html_escape.escape(driver_version)}</code>, one of the versions with this "
+                    "regression.</div>"
+                )
+            causes = (
+                f'<span class="small"><strong>Most likely cause:</strong> {regression}</span>'
+                f'<br><br><span class="small"><strong>Less likely cause:</strong> if {cdi}</span>'
+                f"{driver_line}"
             )
         body = (
             f"<strong>Your GPU:</strong> {nvidia_name_esc}"
@@ -155,26 +217,7 @@ def _nvidia_body_html(cause: str, diag: dict, nvidia_name: str) -> str:
             "the container. The NVIDIA Container Toolkit should "
             "have injected it and didn't."
             "<br><br>"
-            '<span class="small"><strong>Most likely cause:</strong> '
-            "a known regression on NVIDIA driver versions "
-            "<strong>570.x – 579.x</strong> where the ICD is not "
-            "injected into containers "
-            '(<a href="https://github.com/NVIDIA/nvidia-container-toolkit/issues/1041" '
-            'target="_blank" rel="noopener">'
-            "nvidia-container-toolkit#1041</a>). "
-            "<strong>Fix:</strong> upgrade your host NVIDIA driver "
-            "to <strong>580 or newer</strong>, or downgrade to "
-            "<strong>550</strong>.</span>"
-            '<br><br><span class="small"><strong>Less likely cause:</strong> '
-            "if your NVIDIA runtime is using the CDI mode, its CDI "
-            "manifest may be missing Vulkan libraries "
-            '(<a href="https://github.com/NVIDIA/nvidia-container-toolkit/issues/1559" '
-            'target="_blank" rel="noopener">'
-            "nvidia-container-toolkit#1559</a>). Switch to legacy "
-            'mode by setting <code>mode = "legacy"</code> in '
-            "<code>/etc/nvidia-container-runtime/config.toml</code> "
-            "on the host.</span>"
-            f"{driver_line}"
+            f"{causes}"
         )
     elif cause == "nvidia_spirv_missing":
         # Case A3: ICD JSON exists but the supporting library is
@@ -349,7 +392,7 @@ def _get_vulkan_info() -> dict:
     # Pure-NVIDIA takes precedence over dri_mapped: mounting /dev/dri on
     # a host with no Mesa-capable GPU does nothing on its own, so we
     # never send these users down the /dev/dri path. Instead, dispatch
-    # into one of four sub-cases (A1/A2/A3/A4) based on what
+    # into one of five sub-cases (A1/A1b/A2/A3/A4) based on what
     # _diagnose_vulkan_environment() tells us is actually broken, so the
     # warning names the specific fix and the user can act on it.
     if has_nvidia and not has_mesa_vendor:

@@ -28,6 +28,7 @@ def _diag(**overrides):
         "nvidia_capabilities_has_graphics": True,
         "nvidia_icd_json_path": "/etc/vulkan/icd.d/nvidia_icd.json",
         "libnvidia_glvkspirv_found": True,
+        "libegl_nvidia_found": True,
     }
     return base | overrides
 
@@ -214,7 +215,24 @@ class TestOtherCauses:
         ("diag", "cause"),
         [
             (_diag(nvidia_capabilities_has_graphics=False), "nvidia_no_graphics_cap"),
+            # Issue #419: CUDA arrived but not one graphics file — the runtime wasn't asked, or the host has none.
+            (
+                _diag(nvidia_icd_json_path=None, libnvidia_glvkspirv_found=False, libegl_nvidia_found=False),
+                "nvidia_graphics_libs_missing",
+            ),
             (_diag(nvidia_icd_json_path=None), "nvidia_icd_missing"),
+            # Any graphics library arriving means the toolkit did inject graphics, so it's the missing-JSON bug.
+            (_diag(nvidia_icd_json_path=None, libnvidia_glvkspirv_found=False), "nvidia_icd_missing"),
+            (_diag(nvidia_icd_json_path=None, libegl_nvidia_found=False), "nvidia_icd_missing"),
+            (
+                _diag(
+                    nvidia_capabilities_has_graphics=False,
+                    nvidia_icd_json_path=None,
+                    libnvidia_glvkspirv_found=False,
+                    libegl_nvidia_found=False,
+                ),
+                "nvidia_no_graphics_cap",
+            ),
             (_diag(libnvidia_glvkspirv_found=False), "nvidia_spirv_missing"),
             (_diag(), "nvidia_loader_rejected"),
         ],

@@ -110,6 +110,48 @@ class TestDetectAllGPUs:
         assert gpus == []
 
 
+class TestNvidiaDeviceWithoutDriver:
+    """Issue #419: /dev/nvidia* passed with --device but no NVIDIA runtime leaves the GPU undetected and unexplained."""
+
+    @pytest.mark.parametrize(
+        ("control_node", "smi", "warns"),
+        [
+            pytest.param(True, None, True, id="device-without-driver"),
+            pytest.param(True, "/usr/bin/nvidia-smi", False, id="runtime-in-use"),
+            pytest.param(False, None, False, id="no-nvidia-gpu"),
+        ],
+    )
+    def test_warns_to_add_the_nvidia_runtime_only_when_the_device_is_there_without_the_driver(
+        self, control_node, smi, warns, tmp_path, monkeypatch
+    ):
+        from loguru import logger
+
+        from media_preview_generator.gpu import detect
+
+        nvidiactl = tmp_path / "nvidiactl"
+        if control_node:
+            nvidiactl.touch()
+        monkeypatch.setattr(detect, "_NVIDIA_CONTROL_NODE", str(nvidiactl))
+        monkeypatch.setattr(detect.shutil, "which", lambda name: smi if name == "nvidia-smi" else None)
+        messages = []
+        sink_id = logger.add(lambda msg: messages.append(str(msg)), level="WARNING", format="{message}")
+        try:
+            with (
+                patch.object(detect, "_is_hwaccel_available", return_value=False),
+                patch.object(detect, "_get_gpu_devices", return_value=[]),
+                patch.object(detect, "_scan_dev_dri_render_devices", return_value=[]),
+            ):
+                assert detect._detect_linux_gpus() == []
+        finally:
+            logger.remove(sink_id)
+
+        hits = [m for m in messages if "NVIDIA driver isn't" in m]
+        assert len(hits) == (1 if warns else 0), messages
+        if warns:
+            assert "runtime: nvidia" in hits[0]
+            assert "--runtime=nvidia or --gpus all" in hits[0]
+
+
 class TestHwaccelAvailability:
     """Test hardware acceleration availability checking."""
 

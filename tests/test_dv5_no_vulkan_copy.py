@@ -41,6 +41,14 @@ def _capture_logs(level: str = "DEBUG") -> tuple[list[str], int]:
 
 
 @pytest.fixture(autouse=True)
+def _no_nvidia_driver_mounted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hold dv5_no_vulkan_fix to a container with no NVIDIA driver mounted, whatever the test machine has."""
+    from media_preview_generator.gpu import vulkan_probe
+
+    monkeypatch.setattr(vulkan_probe, "_NVIDIA_SMI", "nvidia-smi-not-mounted-in-this-test")
+
+
+@pytest.fixture(autouse=True)
 def _fresh_vulkan_cache():
     from media_preview_generator.web.routes import api_vulkan
 
@@ -215,6 +223,42 @@ class TestProbeLogs:
         assert "on Intel/AMD, pass /dev/dri into the container" in hit
 
 
+class TestTheNvidiaStepWhenTheDriverIsMounted:
+    """Issue #419: with the NVIDIA runtime already in use, "add --runtime=nvidia" alone sends users in circles."""
+
+    @pytest.mark.parametrize(
+        ("diag", "says_host_driver"),
+        [
+            pytest.param("graphics-files-all-missing", True, id="no-graphics-files"),
+            pytest.param("icd-present", False, id="icd-present"),
+            pytest.param("only-icd-missing", False, id="only-icd-missing"),
+        ],
+    )
+    def test_the_nvidia_step_names_the_host_driver_only_when_no_graphics_file_arrived(
+        self, diag: str, says_host_driver: bool, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from media_preview_generator.gpu import vulkan_check, vulkan_probe
+
+        monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
+        _container_gpus(monkeypatch, tmp_path, render_node=False, nvidia=True)
+        smi = tmp_path / "nvidia-smi"
+        smi.touch(mode=0o755)
+        monkeypatch.setattr(vulkan_probe, "_NVIDIA_SMI", str(smi))
+        facts = {
+            "graphics-files-all-missing": _diag(icd_path=None, glvkspirv=False, libegl=False),
+            "icd-present": _diag(),
+            "only-icd-missing": _diag(icd_path=None),
+        }[diag]
+        monkeypatch.setattr(vulkan_check, "diagnose_nvidia_environment", lambda: facts)
+
+        fix = vulkan_probe.dv5_no_vulkan_fix()
+
+        assert RUNTIME_FIX not in fix, fix
+        assert ("the host's NVIDIA driver doesn't include Vulkan" in fix) is says_host_driver, fix
+        assert ("--runtime=nvidia" in fix) is says_host_driver, fix
+        assert "on Intel/AMD, pass /dev/dri into the container" in fix, fix
+
+
 RUNTIME_FIX = (
     "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
     "with --runtime=nvidia"
@@ -258,16 +302,23 @@ def _first_probe_line(device: str | None, level: str) -> str:
     return hits[0]
 
 
-def _diag(*, has_graphics: bool = True, icd_path: str | None = "/etc/vulkan/icd.d/nvidia_icd.json", glvkspirv=True):
+def _diag(
+    *,
+    has_graphics: bool = True,
+    icd_path: str | None = "/etc/vulkan/icd.d/nvidia_icd.json",
+    glvkspirv=True,
+    libegl=True,
+    driver_version: str | None = "580.0.0",
+):
     return {
         "nvidia_capabilities": "all" if has_graphics else "compute,video,utility",
         "nvidia_capabilities_has_graphics": has_graphics,
         "nvidia_icd_json_path": icd_path,
         "libnvidia_glvkspirv_found": glvkspirv,
-        "libegl_nvidia_found": True,
+        "libegl_nvidia_found": libegl,
         "nvidia_egl_vendor_json_path": None,
         "nvidia_drm_loaded": True,
-        "nvidia_driver_version": "580.0.0",
+        "nvidia_driver_version": driver_version,
     }
 
 
@@ -277,7 +328,9 @@ INTEL = {"type": "INTEL", "device": "/dev/dri/renderD128", "name": "Intel UHD 77
 # Every branch of the warning builder — each renders its own body.
 WARNING_CASES = [
     pytest.param([NVIDIA], [], _diag(has_graphics=False), id="A1-no-graphics-capability"),
+    pytest.param([NVIDIA], [], _diag(icd_path=None, glvkspirv=False, libegl=False), id="A1b-no-graphics-files"),
     pytest.param([NVIDIA], [], _diag(icd_path=None), id="A2-icd-missing"),
+    pytest.param([NVIDIA], [], _diag(icd_path=None, driver_version="575.51.02"), id="A2-icd-missing-regression"),
     pytest.param([NVIDIA], [], _diag(glvkspirv=False), id="A3-glvkspirv-missing"),
     pytest.param([NVIDIA], [], _diag(), id="A4-loader-rejected"),
     pytest.param([NVIDIA, INTEL], [], None, id="B-nvidia-plus-mesa-no-dri"),
@@ -302,6 +355,41 @@ class TestDashboardWarning:
 
         _assert_describes_wrong_colours(warning)
         assert "software rendering, which" not in warning
+
+    @pytest.mark.parametrize(
+        ("driver_version", "blames_regression"),
+        [
+            pytest.param("575.51.02", True, id="in-570-579"),
+            pytest.param("595.99.02", False, id="issue-419-newer-driver"),
+            pytest.param("550.54.15", False, id="older-driver"),
+            pytest.param(None, True, id="unknown-version"),
+        ],
+    )
+    def test_the_icd_missing_case_blames_the_570_regression_only_for_those_drivers(
+        self, driver_version: str | None, blames_regression: bool
+    ) -> None:
+        from media_preview_generator.web.routes.api_vulkan import _nvidia_body_html
+
+        body = _nvidia_body_html("nvidia_icd_missing", _diag(icd_path=None, driver_version=driver_version), "RTX")
+
+        assert ("Most likely cause:</strong> a known regression" in body) is blames_regression, body
+        assert ("upgrade your host NVIDIA driver" in body) is blames_regression, body
+        assert "nvidia-container-toolkit#1559" in body, body
+        if driver_version:
+            assert driver_version in body, body
+
+    def test_the_no_graphics_files_case_names_the_runtime_and_the_host_driver(self) -> None:
+        from media_preview_generator.web.routes.api_vulkan import _nvidia_body_html
+
+        body = _nvidia_body_html(
+            "nvidia_graphics_libs_missing",
+            _diag(icd_path=None, glvkspirv=False, libegl=False, driver_version="595.99.02"),
+            "NVIDIA GeForce RTX 3050",
+        )
+
+        assert "570" not in body, body
+        assert "runtime: nvidia" in body, body
+        assert "host's NVIDIA driver doesn't include its Vulkan part" in body, body
 
     def test_loader_rejected_log_says_wrong_colours_when_nvidia_checks_pass(self) -> None:
         from media_preview_generator.web.routes.api_vulkan import _get_vulkan_info

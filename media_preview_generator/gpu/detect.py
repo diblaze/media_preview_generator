@@ -9,6 +9,7 @@ entry point; it fans out to per-OS detectors.
 
 import os
 import platform
+import shutil
 import subprocess
 from typing import Any, cast
 
@@ -32,6 +33,8 @@ from .ffmpeg_capabilities import (
     ffmpeg_binary,
 )
 from .vaapi_probe import _format_driver_label
+
+_NVIDIA_CONTROL_NODE = "/dev/nvidiactl"
 
 # GPU vendor to acceleration method mapping
 # This defines which acceleration methods to use for each GPU vendor
@@ -573,6 +576,17 @@ def _detect_linux_gpus() -> list[tuple[str, str, dict]]:
                         idx,
                         g["name"],
                     )
+
+    # Passing /dev/nvidia* with --device gives the container the GPU but not the driver (issue #419): without the
+    # NVIDIA runtime there's no nvidia-smi or libcuda, so the GPU is never found and nothing else says why.
+    if os.path.exists(_NVIDIA_CONTROL_NODE) and not shutil.which("nvidia-smi"):
+        logger.warning(
+            "An NVIDIA GPU is passed into this container (/dev/nvidiactl is here), but the NVIDIA driver isn't, so the "
+            "GPU can't be used and jobs run on the CPU. Fix: start the container with the NVIDIA runtime "
+            "(Docker Compose: runtime: nvidia; docker run: --runtime=nvidia or --gpus all), keep "
+            "NVIDIA_DRIVER_CAPABILITIES=all and recreate the container. Passing /dev/nvidia* with devices: / --device "
+            "alone isn't enough."
+        )
 
     # Enumerate physical GPUs from /dev/dri
     logger.debug("=== Enumerating Physical GPUs ===")
