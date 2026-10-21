@@ -38,9 +38,10 @@ def same_source(a: Sequence[int] | None, b: Sequence[int] | None) -> bool:
         b: Another, likewise.
 
     Returns:
-        True when both are present and their device, inode, size and modification time are equal.
+        True when both are present, have all five fields, and their device, inode, size and modification time are
+        equal.
     """
-    if not isinstance(a, tuple | list) or not isinstance(b, tuple | list) or len(a) < 4 or len(b) < 4:
+    if not isinstance(a, tuple | list) or not isinstance(b, tuple | list) or len(a) < 5 or len(b) < 5:
         return False
     return tuple(a[:4]) == tuple(b[:4])
 

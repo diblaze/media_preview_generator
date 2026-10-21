@@ -38,6 +38,7 @@ from media_preview_generator.servers import (
     ServerRegistry,
     ServerType,
 )
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 
 @pytest.fixture(autouse=True)
@@ -2833,6 +2834,93 @@ class TestPlexLocalPublishing:
             get_frame_cache().get(str(media_file), extraction_key=_frame_extraction_key(mock_config_for_processing))
             is None
         )
+
+
+class TestSourceChangesMidRun:
+    """A hard link, chmod or *arr re-import mid-run moves only the change time; a real change still stops the run."""
+
+    @staticmethod
+    def _run(tmp_path, config, monkeypatch, change, when):
+        import requests
+
+        from media_preview_generator.output.plex_bundle import PlexBundleAdapter
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        destination = tmp_path / "plex"
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="plex-1",
+                    server_type=ServerType.PLEX,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_file.parent),), enabled=True)],
+                    output={"adapter": "plex_bundle", "plex_config_folder": str(destination)},
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            requests.sessions.Session, "request", MagicMock(side_effect=requests.ConnectionError("Plex offline"))
+        )
+        changes, extracted = [], []
+
+        def change_once():
+            if not changes:
+                changes.append(when)
+                change(media_file)
+
+        def extract(video_file, output_folder, *args, **kwargs):
+            _populate_frames(output_folder, count=3)
+            extracted.append(True)
+            if when == "extracting":
+                change_once()
+            return (True, 3, "h264", 320, 30.0, None)
+
+        # Output paths are also resolved before extraction, for the freshness check; only the publish-time ones count.
+        for method, stage in (("compute_output_paths", "resolving"), ("publish", "publishing")):
+            real = getattr(PlexBundleAdapter, method)
+
+            def after(self, *args, _real=real, _stage=stage, **kwargs):
+                result = _real(self, *args, **kwargs)
+                if when == _stage and extracted:
+                    change_once()
+                return result
+
+            monkeypatch.setattr(PlexBundleAdapter, method, after)
+
+        with patch("media_preview_generator.processing.multi_server.generate_images", side_effect=extract):
+            result = process_canonical_path(canonical_path=str(media_file), registry=registry, config=config)
+        assert changes == [when]
+        return result
+
+    @pytest.mark.parametrize("when", ["extracting", "resolving", "publishing"])
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_metadata_only_change_still_publishes(
+        self, mock_config_for_processing, tmp_path, monkeypatch, queued_plex_refresh, how, when
+    ):
+        result = self._run(
+            tmp_path, mock_config_for_processing, monkeypatch, lambda path: change_ctime_only(path, how), when
+        )
+
+        assert result.status is MultiServerStatus.PUBLISHED, result.message
+        assert result.publishers[0].status is PublisherStatus.PUBLISHED
+
+    @pytest.mark.parametrize(
+        ("when", "message"),
+        [
+            ("extracting", "Source file changed during processing"),
+            ("resolving", "Source file changed while resolving preview output"),
+            ("publishing", "Source file changed while publishing previews"),
+        ],
+    )
+    @pytest.mark.parametrize("how", SOURCE_CHANGES)
+    def test_real_change_fails_the_run(
+        self, mock_config_for_processing, tmp_path, monkeypatch, queued_plex_refresh, how, when, message
+    ):
+        result = self._run(
+            tmp_path, mock_config_for_processing, monkeypatch, lambda path: change_source(path, how), when
+        )
+
+        assert result.status is MultiServerStatus.FAILED
+        assert message in " ".join([result.message or "", *(p.message or "" for p in result.publishers)])
 
 
 class TestOnARemoteNode:

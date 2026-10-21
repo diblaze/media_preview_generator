@@ -212,7 +212,7 @@ class TestSameSource:
         changed[field] += 1
         assert not plex_hash.same_source((1, 2, 3, 4, 5), changed)
 
-    @pytest.mark.parametrize("saved", [None, [1, 2, 3], {"a": 1}, "12345", 7], ids=str)
+    @pytest.mark.parametrize("saved", [None, [1, 2, 3], [1, 2, 3, 4], {"a": 1}, "12345", 7], ids=str)
     def test_false_for_missing_or_malformed_saved_values(self, saved):
         assert not plex_hash.same_source(saved, (1, 2, 3, 4, 5))
         assert not plex_hash.same_source((1, 2, 3, 4, 5), saved)
