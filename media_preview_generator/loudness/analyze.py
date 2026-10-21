@@ -287,6 +287,7 @@ def _run_command(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> str:
     """Run an analysis command under the existing pause, cancellation, and reader supervision.
 
@@ -298,6 +299,7 @@ def _run_command(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         ffmpeg's stderr.
@@ -318,7 +320,7 @@ def _run_command(
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
     # Its own session, so a pause stops ffmpeg's whole group and never the app's. Niced below previews; a node's
     # FFmpeg dies with the node.
-    run_args, preexec = dies_with_node(niced(args))
+    run_args, preexec = dies_with_node(niced(args, nice_level))
     try:
         proc = subprocess.Popen(
             run_args,
@@ -385,6 +387,7 @@ def run(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict[str, str]:
     """Analyse one stream and return its ``ln:*`` fields.
 
@@ -397,6 +400,7 @@ def run(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         The stream's ``ln:*`` fields.
@@ -415,6 +419,7 @@ def run(
         cancel_check=cancel_check,
         pause_check=pause_check,
         on_progress=on_progress,
+        nice_level=nice_level,
     )
     return ln_fields(parse(text))
 
@@ -427,6 +432,7 @@ def run_many(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict[int, dict[str, str] | LoudnessError]:
     """Analyse two or three streams in one input pass, validating each stream's report on its own.
 
@@ -437,6 +443,7 @@ def run_many(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         For each stream, its ``ln:*`` fields, or the (unraised) error for that stream alone.
@@ -457,6 +464,7 @@ def run_many(
         cancel_check=cancel_check,
         pause_check=pause_check,
         on_progress=on_progress,
+        nice_level=nice_level,
     )
     results: dict[int, dict[str, str] | LoudnessError] = {}
     for index, report in parse_many(text, indices).items():

@@ -141,6 +141,16 @@ class TestLoudness:
         assert (seen["codec"], seen["duration_ms"]) == ("eac3", 60000)
         assert ctx.progress_calls[-1] == {"percent": 50.0, "args": [30.0, 2.0]}
 
+    @pytest.mark.parametrize(("params", "expected"), [({"nice_level": 19}, 19), ({"nice_level": 0}, 0), ({}, 10)])
+    def test_the_nice_level_reaches_analyze_and_defaults_to_10(self, ctx, monkeypatch, params, expected):
+        seen = []
+        monkeypatch.setattr(analyze, "run", lambda *a, **k: seen.append(("run", k["nice_level"])) or {})
+        monkeypatch.setattr(analyze, "run_many", lambda *a, **k: seen.append(("many", k["nice_level"])) or {})
+        monkeypatch.setattr(analyze, "resolve_ffmpeg", lambda fallback: fallback)
+        ops.loudness_analyze(ctx, NODE_PATH, {"tracks": [[2, "aac", 1000]], "batch": False, **params})
+        ops.loudness_analyze(ctx, NODE_PATH, {"tracks": [[2, "aac", 1000]], "batch": True, **params})
+        assert seen == [("run", expected), ("many", expected)]
+
     def test_a_batch_returns_each_streams_fields_or_error(self, ctx, monkeypatch):
         def fake_many(ffmpeg, path, tracks, **kwargs):
             assert tracks == [(1, "aac", 1000), (3, "eac3", None)]

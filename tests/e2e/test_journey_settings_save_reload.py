@@ -250,6 +250,38 @@ class TestSettingsSaveAndReloadPersists:
         assert on_disk.get("thumbnail_interval") == 9, f"the save never reached {settings_path}"
         assert on_disk["webhook_retry_count"] == 0
 
+    def test_loudness_nice_level_loads_saves_and_reloads(
+        self,
+        backend_real_page: Page,
+        backend_real_app: tuple[str, str],
+    ) -> None:
+        """The level defaults to 10, and 0 (no nice) and 19 survive a save and a reload as they are."""
+        app_url, config_dir = backend_real_app
+        backend_real_page.goto(f"{app_url}/settings")
+        backend_real_page.wait_for_load_state("domcontentloaded")
+        expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("5", timeout=5000)
+        expect(backend_real_page.locator("#loudnessNiceLevel")).to_have_value("10")
+
+        settings_path = Path(config_dir) / "settings.json"
+        for level in ("19", "0"):
+            backend_real_page.locator("#loudnessNiceLevel").fill(level)
+            backend_real_page.evaluate("void saveAllSettings()")
+            on_disk: dict = {}
+            for _ in range(40):
+                try:
+                    on_disk = json.loads(settings_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    on_disk = {}
+                if on_disk.get("loudness_nice_level") == int(level):
+                    break
+                backend_real_page.wait_for_timeout(200)
+            assert on_disk.get("loudness_nice_level") == int(level), f"the save never reached {settings_path}"
+
+            backend_real_page.reload()
+            backend_real_page.wait_for_load_state("domcontentloaded")
+            expect(backend_real_page.locator("#thumbnailInterval")).to_have_value("5", timeout=5000)
+            expect(backend_real_page.locator("#loudnessNiceLevel")).to_have_value(level)
+
     def test_the_retry_count_field_shows_each_stored_value_as_it_is(
         self,
         backend_real_page: Page,

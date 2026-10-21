@@ -21,6 +21,7 @@ from media_preview_generator.utils import (
     format_display_title,
     is_docker_environment,
     is_windows,
+    niced,
     redact_secrets,
     redacted_traceback,
     sanitize_path,
@@ -1058,3 +1059,31 @@ class TestScratchDir:
         monkeypatch.delenv("MODE")
         monkeypatch.setenv("NODE_TEMP_DIR", "/elsewhere")  # a node's setting: the app has no use for it
         assert scratch_dir() == str(tmp_path)
+
+
+class TestNiced:
+    ARGS = ["ffmpeg", "-i", "a.mkv"]
+
+    def test_default_level_is_10(self):
+        with patch("media_preview_generator.utils.shutil.which", return_value="/usr/bin/nice"):
+            assert niced(self.ARGS) == ["/usr/bin/nice", "-n", "10", *self.ARGS]
+
+    def test_level_is_passed_to_nice(self):
+        with patch("media_preview_generator.utils.shutil.which", return_value="/usr/bin/nice"):
+            assert niced(self.ARGS, 15) == ["/usr/bin/nice", "-n", "15", *self.ARGS]
+
+    @pytest.mark.parametrize("level", [0, -1])
+    def test_level_zero_or_less_leaves_the_command_alone(self, level):
+        with patch("media_preview_generator.utils.shutil.which", return_value="/usr/bin/nice"):
+            assert niced(self.ARGS, level) == self.ARGS
+
+    def test_no_nice_on_path_leaves_the_command_alone(self):
+        with patch("media_preview_generator.utils.shutil.which", return_value=None):
+            assert niced(self.ARGS, 10) == self.ARGS
+
+    def test_windows_leaves_the_command_alone(self):
+        with (
+            patch("media_preview_generator.utils.os.name", "nt"),
+            patch("media_preview_generator.utils.shutil.which", return_value="C:/msys/nice.exe"),
+        ):
+            assert niced(self.ARGS, 10) == self.ARGS

@@ -213,6 +213,7 @@ def loudness_analyze(ctx: TaskContext, node_path: str, params: dict) -> dict:
 
     tracks = [(int(index), str(codec), None if ms is None else int(ms)) for index, codec, ms in params["tracks"]]
     ffmpeg = analyze.resolve_ffmpeg(_node_ffmpeg())
+    nice_level = int(params.get("nice_level", 10))
     reporter = _Reporter(ctx)
     longest_s = max(((ms or 0) / 1000 for _i, _c, ms in tracks), default=0.0)
 
@@ -229,6 +230,7 @@ def loudness_analyze(ctx: TaskContext, node_path: str, params: dict) -> dict:
                 cancel_check=ctx.cancel_check,
                 pause_check=ctx.pause_check,
                 on_progress=on_progress,
+                nice_level=nice_level,
             )
             return {
                 "results": [
@@ -248,6 +250,7 @@ def loudness_analyze(ctx: TaskContext, node_path: str, params: dict) -> dict:
             cancel_check=ctx.cancel_check,
             pause_check=ctx.pause_check,
             on_progress=on_progress,
+            nice_level=nice_level,
         )
     except analyze.LoudnessError as exc:
         raise _op_error(ctx, exc) from exc

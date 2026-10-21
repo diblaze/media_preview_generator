@@ -95,8 +95,8 @@ ffmpeg -i FILE -map 0:TRACK -af loudnorm=I=-16:TP=-1:LRA=9:print_format=json -f 
 and stores loudnorm's measurements in the track's `extra_data`, under the names Plex uses: `ln:loudness`, `ln:peak`,
 `ln:lra`, `ln:threshold`, `ln:gainOffset` and `ln:loudnessAnalysisVersion`. The values are the ones loudnorm prints,
 as Plex stores them, and the rest of the track's data is kept. Decoding audio gains nothing from a GPU, so the
-analysis runs only in CPU worker groups. Its FFmpeg runs under `nice -n 10`, so when the CPU is busy, preview and Intro &
-Credits FFmpeg get most of it. The entire audio track is measured; the source media is never rewritten.
+analysis runs only in CPU worker groups. Its FFmpeg runs at the "Loudness analysis nice level" setting (default 10), so when
+the CPU is busy, preview and Intro & Credits FFmpeg get most of it. The entire audio track is measured; the source media is never rewritten.
 Silent tracks and audio too short for an integrated measurement use Plex's observed `-inf` loudness and `inf` gain
 values, with the remaining fields validated. Invalid or incomplete reports are not stored.
 
