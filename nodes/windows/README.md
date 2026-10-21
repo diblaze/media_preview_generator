@@ -45,10 +45,13 @@ Options:
 
 * `-AtStartup` starts the node when Windows starts, before anyone signs in, instead of at logon. Use it when Plex
   runs as a Windows service (for example with PmsService) or starts at boot: without it, Plex runs after a reboot but
-  the node waits for someone to sign in. It asks for administrator rights once. Windows can't show its firewall
-  question to a program started before sign-in, so add `-AddFirewallRule` when the app runs on another machine.
+  the node waits for someone to sign in. The user must be an administrator on this PC (Windows only lets an
+  administrator start a task without a stored password), and it asks for administrator rights once. If you decline
+  that, the node keeps starting at logon. Windows can't show its firewall question to a program started before
+  sign-in, so add `-AddFirewallRule` when the app runs on another machine; Docker Desktop on the same PC needs no rule.
 * `-AddFirewallRule` asks for administrator rights once to let other machines on private and domain networks reach
-  the node (port 9494). Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
+  the node (port 9494). It also removes the block Windows adds for `PlexDbNode.exe` when its firewall question is
+  dismissed. Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
 * `-Port 9500` listens on another port.
 * `-PlexConfigDir "D:\PlexData\Plex Media Server"` names Plex's data folder. You rarely need it: the node finds the
   folder from Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
@@ -90,9 +93,11 @@ starts with Plex's own session, and can't reach anything that user can't.
 
 A Plex that runs as a service or starts at boot is up before anyone signs in. `-AtStartup` matches it with a
 scheduled task that starts at boot as the same user, logged on without a stored password (Windows calls it S4U). A
-task started that way can open files on this PC, which is all the node needs, but not network shares. A Windows
-service would run as `SYSTEM` (far more access than it needs, and a different user from Plex) or need that user's
-password stored.
+task started that way can open files on this PC, which is all the node needs, but not network shares. It runs with
+the user's full administrator rights, as a Plex started at boot does, because Windows only holds rights back for a
+user who signs in at the screen. The task is named after the user, so each user has their own, and uninstalling
+removes it. A Windows service would run as `SYSTEM` (far more access than it needs, and a different user from Plex) or
+need that user's password stored.
 
 ## Build
 

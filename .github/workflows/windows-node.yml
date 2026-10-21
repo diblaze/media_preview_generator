@@ -196,7 +196,7 @@ jobs:
           $key = -join ((1..32) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
           "::add-mask::$key"
           $env:NODE_KEY = $key
-          $taskName = "Media Preview Generator Plex database node"
+          $taskName = "Media Preview Generator Plex database node ($env:USERNAME)"
           $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
           # Plex's own registry values, which the task's process reads as this user: a moved data folder and its id.
           $plexKey = "HKCU:\Software\Plex, Inc.\Plex Media Server"

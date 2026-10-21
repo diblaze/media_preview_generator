@@ -48,8 +48,9 @@ $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\MediaPreviewGenerator\PlexDb
 $NodeDir = Join-Path $env:LOCALAPPDATA "MediaPreviewGenerator\node"
 $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $RunValue = "MediaPreviewGeneratorPlexDbNode"
-$RuleName = "Media Preview Generator Plex database node"
-$TaskName = "Media Preview Generator Plex database node"
+# Per user: each user's node is a program of its own, and one user mustn't replace or remove another user's.
+$RuleName = "Media Preview Generator Plex database node ($env:USERNAME)"
+$TaskName = "Media Preview Generator Plex database node ($env:USERNAME)"
 # Left in the program folder by -AtStartup: a task registered from an elevated prompt may be hidden from this user.
 $TaskMarker = "starts-at-boot"
 
@@ -60,8 +61,9 @@ function ConvertTo-Argument([string]$Value) {
 }
 
 function ConvertTo-Literal([string]$Value) {
-    # A single-quoted PowerShell string: a quote inside one (a user folder like O'Brien) is written twice.
-    "'" + $Value.Replace("'", "''") + "'"
+    # A single-quoted PowerShell string. PowerShell also ends one at a typographic quote (U+2018 to U+201B),
+    # so this escapes those too, not only the plain quote.
+    "'" + [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value) + "'"
 }
 
 function Invoke-Elevated([string]$Command, [string]$LogFile) {
@@ -84,6 +86,28 @@ function Invoke-Elevated([string]$Command, [string]$LogFile) {
     }
 }
 
+function Test-FirewallRule {
+    # Get-NetFirewallRule is "Access is denied" in a normal window; the firewall's COM object still lists the rules.
+    [bool]((New-Object -ComObject HNetCfg.FwPolicy2).Rules | Where-Object { $_.Name -eq $RuleName })
+}
+
+function Wait-TaskStopped {
+    # Stop-ScheduledTask returns before the process has gone, and a normal window can't even read that process's path.
+    for ($i = 0; $i -lt 20; $i++) {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $task -or $task.State -ne "Running") { return }
+        Start-Sleep -Milliseconds 500
+    }
+    # Its files would stay locked, and only Task Scheduler can stop it from here.
+    throw "The node's boot task didn't stop within 10 seconds, so nothing was changed. Run this again."
+}
+
+function Get-OwnNode {
+    # Only this user's copy: another Windows user's node isn't ours to stop, and its path can't even be read here.
+    Get-Process -Name "PlexDbNode", "PlexDbNode-debug" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith("$InstallDir\", [StringComparison]::OrdinalIgnoreCase) }
+}
+
 if (-not $Source) {
     $candidates = @(
         $PSScriptRoot,
@@ -94,16 +118,35 @@ if (-not $Source) {
     if (-not $Source) { throw "No built PlexDbNode folder found; run build.ps1 first or pass -Source." }
 }
 $Source = (Resolve-Path $Source).Path
+# Windows lets only an administrator register a task that starts at boot with no stored password, and only for their
+# own account: a standard user's elevation runs as another account. whoami lists the Administrators group even in a
+# normal window, where it is held back for elevation.
+if ($AtStartup -and -not ((whoami /groups) -match "S-1-5-32-544")) {
+    throw "-AtStartup needs $env:USERNAME to be an administrator on this PC: Windows only lets an administrator " +
+        "start their own program at boot without a stored password. Nothing was changed. Run this without -AtStartup " +
+        "(the node then starts at logon)."
+}
 if (-not (Test-Path (Join-Path $Source "PlexDbNode.exe"))) { throw "$Source has no PlexDbNode.exe." }
 
 $HadTask = (Test-Path (Join-Path $InstallDir $TaskMarker)) -or
     [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
 
-# A running copy holds its files open; stop it before replacing them. One the task started is this user's too.
-Get-Process -Name "PlexDbNode", "PlexDbNode-debug" -ErrorAction SilentlyContinue | Stop-Process -Force
+# A running copy holds its files open; stop it before replacing them. The task's copy runs with this user's full
+# administrator rights when the user has them (Windows applies UAC only to signed-in sessions), so a normal window
+# can't stop it directly; Task Scheduler stops it for the task's own user.
+if ($HadTask) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Wait-TaskStopped
+}
+Get-OwnNode | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 if ($Source -ne $InstallDir) {
+    # A stopped node's files stay locked for a moment after it exits.
+    for ($i = 0; (Test-Path $InstallDir) -and $i -lt 20; $i++) {
+        Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
+        if (Test-Path $InstallDir) { Start-Sleep -Milliseconds 500 }
+    }
     if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Recurse -Force (Join-Path $Source "*") $InstallDir
@@ -137,10 +180,23 @@ if ($env:NODE_KEY -and $env:NODE_KEY.Trim()) {
     [System.IO.File]::WriteAllText($identityFile, ($identity | ConvertTo-Json -Compress), $noBom)
 }
 
+# Never New-Item -Force on a key that exists: it deletes the key, and every other program's logon entry with it.
+if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey | Out-Null }
+# Even with -AtStartup: if the administrator step doesn't run, the node still starts at logon.
+Set-ItemProperty -Path $RunKey -Name $RunValue -Value ('{0} {1}' -f (ConvertTo-Argument $Exe), $Quoted)
+
 $elevated = @()
+# The firewall rule first: if it fails, the task step doesn't run.
+if ($AddFirewallRule) {
+    $elevated += "Remove-NetFirewallRule -DisplayName $(ConvertTo-Literal $RuleName) -ErrorAction SilentlyContinue"
+    # Dismissing Windows' own firewall question for the program leaves block rules for it, and a block beats any allow.
+    $elevated += "Get-NetFirewallApplicationFilter | Where-Object { `$_.Program -eq $(ConvertTo-Literal $Exe) } | " +
+        "Get-NetFirewallRule | Where-Object { `$_.Direction -eq 'Inbound' -and `$_.Action -eq 'Block' } | " +
+        "Remove-NetFirewallRule"
+    $elevated += "New-NetFirewallRule -DisplayName $(ConvertTo-Literal $RuleName) -Direction Inbound -Action Allow " +
+        "-Program $(ConvertTo-Literal $Exe) -Protocol TCP -LocalPort $Port -Profile Private,Domain | Out-Null"
+}
 if ($AtStartup) {
-    # One starter only: the logon entry would start a second copy that can't take the port.
-    Remove-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     # S4U runs it as this user with no password stored, with no sign-in needed; it reaches only this PC's files, which
     # is all the node opens. Priority 5 is normal: the default 7 would slow the writes Plex waits on.
@@ -151,30 +207,41 @@ if ($AtStartup) {
         "-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries " +
         "-ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 5) | Out-Null"
     $elevated += "Start-ScheduledTask -TaskName $(ConvertTo-Literal $TaskName)"
-} else {
-    # Never New-Item -Force on a key that exists: it deletes the key, and every other program's logon entry with it.
-    if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey | Out-Null }
-    Set-ItemProperty -Path $RunKey -Name $RunValue -Value ('{0} {1}' -f (ConvertTo-Argument $Exe), $Quoted)
-    if ($HadTask) {
-        $elevated += "Unregister-ScheduledTask -TaskName $(ConvertTo-Literal $TaskName) -Confirm:`$false " +
-            "-ErrorAction SilentlyContinue"
-    }
+} elseif ($HadTask) {
+    $elevated += "Unregister-ScheduledTask -TaskName $(ConvertTo-Literal $TaskName) -Confirm:`$false " +
+        "-ErrorAction SilentlyContinue"
 }
-if ($AddFirewallRule) {
-    $elevated += "Remove-NetFirewallRule -DisplayName $(ConvertTo-Literal $RuleName) -ErrorAction SilentlyContinue"
-    $elevated += "New-NetFirewallRule -DisplayName $(ConvertTo-Literal $RuleName) -Direction Inbound -Action Allow " +
-        "-Program $(ConvertTo-Literal $Exe) -Protocol TCP -LocalPort $Port -Profile Private,Domain | Out-Null"
-}
+$failure = $null
 if ($elevated) {
     New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
-    Invoke-Elevated ($elevated -join "; ") (Join-Path $NodeDir "install-elevated.log")
+    try {
+        Invoke-Elevated ($elevated -join "; ") (Join-Path $NodeDir "install-elevated.log")
+    } catch {
+        # Declined or failed: the logon entry stays the node's starter, and it starts now as it would at logon.
+        $failure = $_.Exception.Message
+    }
 }
+$KeptTask = $false
+if ($failure -and $HadTask) {
+    # The boot task from before is still registered: it stays the one starter, as it was.
+    try {
+        Start-ScheduledTask -TaskName $TaskName
+        $KeptTask = $true
+    } catch { }
+}
+$BootTask = ($AtStartup -and -not $failure) -or $KeptTask
 
-if ($AtStartup) {
-    Set-Content -LiteralPath (Join-Path $InstallDir $TaskMarker) -Value $TaskName
+if ($BootTask) {
+    # One starter only: the logon entry would start a second copy that can't take the port.
+    Remove-ItemProperty -Path $RunKey -Name $RunValue
 } else {
     # One quoted string: Windows PowerShell joins an argument array with bare spaces, splitting a path that has one.
     Start-Process -FilePath $Exe -ArgumentList $Quoted -WorkingDirectory $InstallDir
+}
+
+if ($BootTask -or ($failure -and $HadTask)) {
+    # Replacing the folder removed it, and a task that stays registered still needs it to be found again.
+    Set-Content -LiteralPath (Join-Path $InstallDir $TaskMarker) -Value $TaskName
 }
 
 $healthUrl = "http://127.0.0.1:$Port/v1/health"
@@ -187,12 +254,13 @@ for ($i = 0; $i -lt 60 -and -not $up; $i++) {
     } catch { }
 }
 if (-not $up) {
-    throw "The node didn't answer on $healthUrl; see $(Join-Path $NodeDir 'logs\node.log')."
+    $why = if ($failure) { " The administrator step didn't run either: $failure" } else { "" }
+    throw "The node didn't answer on $healthUrl; see $(Join-Path $NodeDir 'logs\node.log').$why"
 }
 
-$address = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+$address = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
-    Select-Object -First 1).IPAddress
+    Select-Object -First 1 -ExpandProperty IPAddress
 if (-not $address) { $address = $env:COMPUTERNAME }
 
 if (-not $key -and (Test-Path $identityFile)) {
@@ -200,7 +268,7 @@ if (-not $key -and (Test-Path $identityFile)) {
 }
 
 ""
-if ($AtStartup) {
+if ($BootTask) {
     "The Plex database node is running and starts when Windows starts, before anyone signs in, as $env:USERNAME."
 } else {
     "The Plex database node is running and starts at every logon of $env:USERNAME."
@@ -208,6 +276,20 @@ if ($AtStartup) {
 "  Address: http://${address}:$Port"
 if ($key) { "  Key:     $key" } else { "  Key:     see $(Join-Path $NodeDir 'node.json')" }
 "Paste both into the app: Settings -> Nodes -> Add node."
+if ($failure) {
+    Write-Warning "The administrator step didn't run: $failure"
+    if ($AtStartup -and -not $KeptTask) {
+        Write-Warning "The node starts at logon instead of at boot. Run this again to retry."
+    }
+    if ($KeptTask -and -not $AtStartup) {
+        Write-Warning "It still starts at boot: its boot task is still there. Run this again to switch to logon."
+    }
+    if ($HadTask -and -not $KeptTask -and -not $AtStartup) {
+        Write-Warning "Its boot task may still be there. Run this again to retry."
+    }
+    if ($AddFirewallRule -and -not (Test-FirewallRule)) { Write-Warning "No firewall rule was added." }
+    exit 1
+}
 if ($AtStartup -and -not $AddFirewallRule) {
     "Windows can't ask to let it through the firewall when it starts before sign-in. If the app can't reach it, run"
     "this again with -AtStartup -AddFirewallRule."
