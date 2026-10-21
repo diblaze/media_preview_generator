@@ -2378,6 +2378,23 @@ class TestSettingsAPI:
         assert resp.status_code == 200, resp.get_json()
         assert client.get("/api/settings", headers=_api_headers()).get_json()["incoming_job_priority"] == expected
 
+    def test_loudness_nice_level_defaults_to_10(self, client):
+        resp = client.get("/api/settings", headers=_api_headers())
+        assert resp.get_json()["loudness_nice_level"] == 10
+
+    @pytest.mark.parametrize("level", [0, 7, 19])
+    def test_save_loudness_nice_level_round_trips(self, client, level):
+        resp = client.post("/api/settings", headers=_api_headers(), json={"loudness_nice_level": level})
+        assert resp.status_code == 200, resp.get_json()
+        assert client.get("/api/settings", headers=_api_headers()).get_json()["loudness_nice_level"] == level
+
+    @pytest.mark.parametrize("bad", [20, -1, "x"])
+    def test_save_loudness_nice_level_rejects_out_of_range_or_non_numbers(self, client, bad):
+        resp = client.post("/api/settings", headers=_api_headers(), json={"loudness_nice_level": bad})
+        assert resp.status_code == 400, resp.get_json()
+        assert "loudness_nice_level" in resp.get_json()["error"]
+        assert client.get("/api/settings", headers=_api_headers()).get_json()["loudness_nice_level"] == 10
+
     @pytest.mark.parametrize("bad", [0, 4, -1, "urgent", "", None, True, 1.5])
     def test_save_incoming_priority_rejects_unknown_values(self, client, bad):
         """Reject rather than silently coerce to Normal.

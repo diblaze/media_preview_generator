@@ -24,6 +24,7 @@ from loguru import logger
 
 from ..markers.probe import ffprobe_path_for, kill_and_collect
 from ..processing.filter_chain import build_hdr10_zscale_chain
+from ..utils import niced
 
 MAX_FRAMES = 14
 STEP_MS = 1000
@@ -42,7 +43,6 @@ _KILL_WAIT_S = 1.0
 _REAPER = "inspector-frames-reaper"
 CACHE_MAX_BYTES = 64 * 1024 * 1024
 _CACHE_DIR_NAME = "media-preview-generator-inspector-frames"
-_NICE_LEVEL = "10"
 _STALE_WORK_S = 3600.0
 # Transfer characteristics ffprobe reports for HDR10 (PQ) and HLG: frames of these are tone-mapped to SDR.
 _HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
@@ -147,36 +147,35 @@ def video_filter(width: int, *, hdr: bool, tonemap: str = "hable") -> str:
 
 
 def _command(ffmpeg: str, path: str, start_ms: int, count: int, vf: str, out_dir: str) -> list[str]:
-    nice = shutil.which("nice")
-    prefix = [nice, "-n", _NICE_LEVEL] if nice else []
-    return [
-        *prefix,
-        ffmpeg,
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        # Before -i: a fast seek to the keyframe before, then decoded forward to the exact second.
-        "-ss",
-        f"{start_ms / 1000:.3f}",
-        # "file:" so a name can never be read as another ffmpeg protocol or an option.
-        "-i",
-        f"file:{path}",
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-dn",
-        "-vf",
-        vf,
-        "-frames:v",
-        str(count),
-        "-q:v",
-        "5",
-        "-f",
-        "image2",
-        os.path.join(out_dir, "%02d.jpg"),
-    ]
+    return niced(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            # Before -i: a fast seek to the keyframe before, then decoded forward to the exact second.
+            "-ss",
+            f"{start_ms / 1000:.3f}",
+            # "file:" so a name can never be read as another ffmpeg protocol or an option.
+            "-i",
+            f"file:{path}",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            vf,
+            "-frames:v",
+            str(count),
+            "-q:v",
+            "5",
+            "-f",
+            "image2",
+            os.path.join(out_dir, "%02d.jpg"),
+        ]
+    )
 
 
 def _run(cmd: list[str], *, timeout: float) -> tuple[int, bytes]:

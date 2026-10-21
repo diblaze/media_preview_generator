@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -261,6 +262,27 @@ def test_a_missing_file_an_import_webhook_deleted_gets_its_job_log_line(ctx, tmp
         outcome = job.check_item(_item(gone), ctx=ctx)
     assert outcome.outcome_key == job.SOURCE_GONE
     write_line.assert_called_once_with(f"Anna Pigeon S01E10: {outcome.message}")
+
+
+def _saved_nice_level(monkeypatch, saved) -> None:
+    settings = {} if saved is None else {"loudness_nice_level": saved}
+    monkeypatch.setattr(job, "get_settings_manager", lambda: SimpleNamespace(get=settings.get))
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [(None, 10), ("abc", 10), (25, 19), (-3, 0), (7, 7), ("5", 5), (0, 0)],
+)
+def test_the_nice_level_is_the_saved_one_clamped_to_0_19(monkeypatch, saved, expected):
+    _saved_nice_level(monkeypatch, saved)
+    assert job.loudness_nice_level() == expected
+
+
+def test_the_saved_nice_level_reaches_each_stream_run(ctx, db, media, monkeypatch):  # noqa: F811
+    _saved_nice_level(monkeypatch, 19)
+    with patch.object(job.analyze, "run", return_value=FIELDS) as run:
+        job.process_item(_item(media), ctx=ctx, gpu="intel")
+    assert [c.kwargs["nice_level"] for c in run.call_args_list] == [19, 19]
 
 
 def test_worker_analyses_each_stream_once_and_writes_it(ctx, db, media):  # noqa: F811
@@ -660,7 +682,8 @@ def test_batch_progress_spans_the_batch_once_and_estimates_later_streams():
 
 
 @pytest.mark.parametrize("extra_tracks", [0, 1])
-def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, media, extra_tracks):  # noqa: F811
+def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, media, extra_tracks, monkeypatch):  # noqa: F811
+    _saved_nice_level(monkeypatch, 19)
     tracks = [(1, "aac", 424000), (2, "aac", 424000)]
     expected_ids = [(11, 1), (12, 2)]
     if extra_tracks:
@@ -676,7 +699,12 @@ def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, 
         outcome = job.process_item(_item(media), ctx=ctx)
 
     assert run_many.call_args.args == (ctx.ffmpeg, media, tracks)
-    assert run_many.call_args.kwargs == {"cancel_check": None, "pause_check": None, "on_progress": None}
+    assert run_many.call_args.kwargs == {
+        "cancel_check": None,
+        "pause_check": None,
+        "on_progress": None,
+        "nice_level": 19,
+    }
     run.assert_not_called()
     assert outcome.outcome_key == job.WRITTEN
     stored = _streams(db)
@@ -968,6 +996,7 @@ def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, mo
         return {"results": [{"index": index, "fields": FIELDS} for index, _codec, _ms in params["tracks"]]}
 
     monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    _saved_nice_level(monkeypatch, 0)
     with (
         patch.object(job.analyze, "run_many") as run_many,
         patch.object(job.analyze, "run") as run,
@@ -980,7 +1009,7 @@ def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, mo
         (
             protocol.OP_LOUDNESS_ANALYZE,
             media,
-            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True},
+            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True, "nice_level": 0},
             None,
         )
     ]

@@ -66,6 +66,18 @@
                     </div>
                 </div>
 
+                <div class="setting-row">
+                    <div class="sr-label">
+                        <label for="loudnessNiceLevel" class="sr-title">Loudness analysis nice level
+                            <button type="button" class="info-icon ms-1" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="How much CPU loudness analysis gives way to previews and Intro &amp; Credits detection when the CPU is busy." data-explain-title="Loudness analysis nice level" data-explain-template="infoLoudnessNiceTpl"><i class="bi bi-info-circle"></i></button>
+                        </label>
+                        <div class="sr-hint">0–19. Higher lets previews and Intro &amp; Credits go first when the CPU is busy. Default 10.</div>
+                    </div>
+                    <div class="sr-control">
+                        <input type="number" class="form-control has-stepper" id="loudnessNiceLevel" min="0" max="19" step="1" value="10">
+                    </div>
+                </div>
+
                 <h3 class="settings-subheading"><i class="bi bi-arrow-repeat" aria-hidden="true"></i>Retry policy
                     <button type="button" class="info-icon ms-1" tabindex="0"
                             data-bs-toggle="tooltip" data-bs-placement="top"
@@ -970,6 +982,18 @@
         stay at whatever priority you give them, so leaving this on <strong>High</strong> is what makes
         new imports overtake a long regeneration run.</p>
 </template>
+<template id="infoLoudnessNiceTpl">
+    <p>Loudness analysis decodes every audio track of a file, which keeps a CPU core busy for minutes. This sets how readily it gives up the CPU when previews or Intro &amp; Credits detection need it. It's Linux's "nice" value.</p>
+    <p>Loudness's share when it and one preview compete for the same busy core:</p>
+    <ul>
+        <li><strong>0</strong> — even split, same priority as previews.</li>
+        <li><strong>5</strong> — about 25%.</li>
+        <li><strong>10</strong> (default) — about 10%.</li>
+        <li><strong>19</strong> — about 1%; it mostly runs on CPU time nothing else wants.</li>
+    </ul>
+    <p>It only matters when the CPU is fully busy. On an idle CPU, loudness runs at full speed at any level. It doesn't change how many loudness jobs run at once (that's your worker groups) or how fast files are read from disk.</p>
+    <p>Applies to remote worker nodes too, from the next file analysed.</p>
+</template>
 <template id="infoRetryPolicyTpl">
     <p>Global retry defaults for every job — webhook, scheduled, manual, recently-added.</p>
     <p>A file that can't be found on the media server (still indexing, transient API error) is retried this many times with this delay before being marked failed.</p>
@@ -1189,6 +1213,10 @@ async function loadSettings() {
             ? parseInt(settings.incoming_job_priority, 10)
             : 1;
         document.getElementById('incomingJobPriority').value = String(incomingPriority);
+
+        // 0 is a real level (no nice): only a missing or unreadable one falls back to the default.
+        const niceLevel = parseInt(settings.loudness_nice_level, 10);
+        document.getElementById('loudnessNiceLevel').value = Number.isNaN(niceLevel) ? 10 : Math.min(19, Math.max(0, niceLevel));
 
         // 0 is a real setting (retries off): only a missing or unreadable count falls back to the default.
         const retryCount = parseInt(settings.webhook_retry_count, 10);
@@ -1550,6 +1578,10 @@ async function saveAllSettings() {
             max_cache_disk_mb: parseInt(document.getElementById('frameReuseMaxDiskMb').value, 10) || 2048,
         },
         incoming_job_priority: parseInt(document.getElementById('incomingJobPriority').value, 10) || 1,
+        loudness_nice_level: (() => {
+            const level = parseInt(document.getElementById('loudnessNiceLevel').value, 10);
+            return Number.isNaN(level) ? 10 : Math.min(19, Math.max(0, level));
+        })(),
         webhook_retry_count: Math.min(
             10,
             Math.max(0, parseInt(document.getElementById('webhookRetryCount').value, 10) || 0),

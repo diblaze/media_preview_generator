@@ -86,6 +86,19 @@ class TestInfoIconRule:
         expect(authed_page.locator("#globalInfoTitle")).to_have_text("Incoming job priority")
         expect(authed_page.locator("#globalInfoBody")).to_contain_text("High lets a new episode jump ahead")
 
+    def test_the_loudness_nice_level_icon_explains_the_levels(self, authed_page: Page, app_url: str) -> None:
+        _open(authed_page, app_url, "/settings")
+        icon = authed_page.locator('label[for="loudnessNiceLevel"] .info-icon')
+        expect(icon).to_have_attribute(
+            "data-bs-original-title",
+            "How much CPU loudness analysis gives way to previews and Intro & Credits detection when the CPU is busy."
+            " Click for more.",
+        )
+        icon.click()
+        expect(authed_page.locator("#globalInfoModal")).to_be_visible(timeout=5000)
+        expect(authed_page.locator("#globalInfoTitle")).to_have_text("Loudness analysis nice level")
+        expect(authed_page.locator("#globalInfoBody")).to_contain_text("about 10%")
+
     def test_a_hover_only_icon_opens_nothing(self, authed_page: Page, app_url: str) -> None:
         _open(authed_page, app_url, "/settings")
         icon = authed_page.locator('label[for="logLevel"] .info-icon')

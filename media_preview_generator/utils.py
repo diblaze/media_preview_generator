@@ -259,6 +259,27 @@ def _setpriv() -> str | None:
     return path if tried.returncode == 0 else None
 
 
+def niced(args: list[str], level: int = 10) -> list[str]:
+    """``args`` behind ``nice -n level`` when ``nice`` is on PATH, for FFmpeg that should yield the CPU to previews.
+
+    Preview and Intro & Credits FFmpeg run at the app's own niceness, so under load they get most of the CPU while
+    this command still runs. GNU ``nice`` execs the command in place, so the process is the command's own pid.
+    Not on Windows: a Cygwin/MSYS ``nice.exe`` there starts the command as a child, so killing the pid would
+    orphan FFmpeg.
+
+    Args:
+        args: The command (FFmpeg's).
+        level: The nice increment; 0 or less leaves the command as it is.
+
+    Returns:
+        The command behind ``nice``, or as it is when ``level`` is 0 or less, on Windows, or with no ``nice``.
+    """
+    if level <= 0 or os.name == "nt":
+        return args
+    nice = shutil.which("nice")
+    return [nice, "-n", str(level), *args] if nice else args
+
+
 def dies_with_node(args: list[str]) -> tuple[list[str], Callable[[], None] | None]:
     """The command and ``preexec_fn`` that have a node's FFmpeg killed (SIGKILL) when the node dies, on Linux.
 

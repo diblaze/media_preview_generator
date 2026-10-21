@@ -233,7 +233,16 @@ class TestLoudness:
         assert fields == {"ln:loudness": "-20.00", "ln:peak": "-1.00"}
         assert seen == [(12.0, 3.0)]
         assert client.specs[0]["gpu"] is None
-        assert client.specs[0]["params"] == {"tracks": [[2, "aac", 24000]], "batch": False}
+        assert client.specs[0]["params"] == {"tracks": [[2, "aac", 24000]], "batch": False, "nice_level": 10}
+
+    def test_the_nice_level_goes_to_the_node_for_one_track_and_for_a_batch(self, media, monkeypatch):
+        client, _ = _node()
+        monkeypatch.setattr(analyze, "run", lambda *a, **k: {"ln:loudness": "-20.00"})
+        monkeypatch.setattr(analyze, "run_many", lambda *a, **k: {1: {"ln:lra": "5.00"}})
+        with _on_node():
+            remote_ops.loudness_run("/app/ffmpeg", media, 2, duration_ms=24000, codec="aac", nice_level=19)
+            remote_ops.loudness_run_many("/app/ffmpeg", media, [(1, "aac", 1000)], nice_level=0)
+        assert [spec["params"]["nice_level"] for spec in client.specs] == [19, 0]
 
     def test_run_many_gives_back_each_streams_fields_or_its_own_error_class(self, media, monkeypatch):
         _node()

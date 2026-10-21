@@ -216,11 +216,16 @@ def _run_loudness(
     cancel_check: Callable[[], bool] | None,
     pause_check: Callable[[], bool] | None,
     on_progress: Callable[[float, float | None], None] | None,
+    nice_level: int,
 ) -> dict:
     from ..loudness import analyze
 
     relay = None if on_progress is None else _Relay(lambda _percent, args: on_progress(*args))
-    params = {"tracks": [[int(i), str(c), None if ms is None else int(ms)] for i, c, ms in tracks], "batch": batch}
+    params = {
+        "tracks": [[int(i), str(c), None if ms is None else int(ms)] for i, c, ms in tracks],
+        "batch": batch,
+        "nice_level": nice_level,
+    }
     try:
         return run_on_node(
             protocol.OP_LOUDNESS_ANALYZE,
@@ -250,6 +255,7 @@ def loudness_run(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict[str, str]:
     """``loudness.analyze.run`` on the node (with its own loudness FFmpeg; ``ffmpeg`` is not sent)."""
     result = _run_loudness(
@@ -259,6 +265,7 @@ def loudness_run(
         cancel_check=cancel_check,
         pause_check=pause_check,
         on_progress=on_progress,
+        nice_level=nice_level,
     )
     return {str(k): str(v) for k, v in result["fields"].items()}
 
@@ -271,12 +278,19 @@ def loudness_run_many(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict:
     """``loudness.analyze.run_many`` on the node: each stream's fields, or its (unraised) ``LoudnessError``."""
     from ..loudness import analyze
 
     result = _run_loudness(
-        path, tracks, batch=True, cancel_check=cancel_check, pause_check=pause_check, on_progress=on_progress
+        path,
+        tracks,
+        batch=True,
+        cancel_check=cancel_check,
+        pause_check=pause_check,
+        on_progress=on_progress,
+        nice_level=nice_level,
     )
     errors = _loudness_errors()
     out: dict[int, dict[str, str] | analyze.LoudnessError] = {}

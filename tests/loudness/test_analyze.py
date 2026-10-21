@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from media_preview_generator import utils
 from media_preview_generator.loudness import analyze
 
 # Plex's transcoder and ffmpeg 8.1.2 printed this for Puffin Rock S01E34-E36 stream 1 (2026-09-29); Plex stored the
@@ -309,3 +310,64 @@ def test_a_missing_decoder_is_told_apart_from_other_ffmpeg_failures(monkeypatch,
     with pytest.raises(analyze.LoudnessError, match="ffmpeg exited 234") as raised:
         analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
     assert isinstance(raised.value, analyze.LoudnessNoDecoder) is (error is not None)
+
+
+@pytest.mark.parametrize(
+    ("nice", "node", "level", "expected"),
+    [
+        ("/usr/bin/nice", False, 10, ["/usr/bin/nice", "-n", "10", "ffmpeg", "-i", "/m/a.mkv"]),
+        ("/usr/bin/nice", False, 19, ["/usr/bin/nice", "-n", "19", "ffmpeg", "-i", "/m/a.mkv"]),
+        ("/usr/bin/nice", False, 0, ["ffmpeg", "-i", "/m/a.mkv"]),
+        (None, False, 10, ["ffmpeg", "-i", "/m/a.mkv"]),
+        (
+            "/usr/bin/nice",
+            True,
+            10,
+            ["/usr/bin/setpriv", "--pdeathsig", "KILL", "--", "/usr/bin/nice", "-n", "10", "ffmpeg", "-i", "/m/a.mkv"],
+        ),
+        (
+            None,
+            True,
+            10,
+            ["/usr/bin/setpriv", "--pdeathsig", "KILL", "--", "ffmpeg", "-i", "/m/a.mkv"],
+        ),
+    ],
+)
+def test_analysis_runs_at_the_given_nice_level(monkeypatch, nice, node, level, expected):
+    """Previews and Intro & Credits ffmpeg keep the app's niceness, so they get most of the CPU over a loudness backfill.
+
+    On a node, setpriv goes first so the parent-death signal it sets survives nice's exec into ffmpeg.
+    """
+    started = []
+
+    def popen(args, **kwargs):
+        started.append(args)
+        raise OSError(2, "No such file or directory")
+
+    if node:
+        monkeypatch.setattr(utils.sys, "platform", "linux")
+        monkeypatch.setenv("MODE", "node")
+        monkeypatch.setattr(utils, "_setpriv", lambda: "/usr/bin/setpriv")
+    else:
+        monkeypatch.delenv("MODE", raising=False)
+    monkeypatch.setattr(utils.shutil, "which", {"nice": nice}.get)
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessError):
+        analyze._run_command(
+            ["ffmpeg", "-i", "/m/a.mkv"], "/m/a.mkv", timeout_s=1, description="stream 1", nice_level=level
+        )
+    assert started == [expected]
+
+
+@pytest.mark.parametrize("runner", ["run", "run_many"])
+def test_run_and_run_many_pass_the_nice_level_on(monkeypatch, runner):
+    seen = {}
+    monkeypatch.setattr(analyze, "_run_command", lambda *a, **k: seen.update(k) or "")
+    monkeypatch.setattr(analyze, "ln_fields", lambda report: {})
+    monkeypatch.setattr(analyze, "parse", lambda text: None)
+    monkeypatch.setattr(analyze, "parse_many", lambda text, indices: {})
+    if runner == "run":
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000, nice_level=19)
+    else:
+        analyze.run_many("ffmpeg", "/m/a.mkv", [(1, "aac", 1000), (2, "aac", 1000)], nice_level=19)
+    assert seen["nice_level"] == 19

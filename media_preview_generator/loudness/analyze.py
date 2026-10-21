@@ -16,7 +16,7 @@ from loguru import logger
 from ..markers.freeze import Freeze
 from ..markers.probe import _count_stuck, kill_and_collect
 from ..markers.progress import read_progress
-from ..utils import dies_with_node
+from ..utils import dies_with_node, niced
 
 # The filter Plex Media Server 1.43 runs for each audio stream (``Plex Transcoder -i FILE -map 0:N -af ... -f null -``).
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1:LRA=9:print_format=json"
@@ -287,6 +287,7 @@ def _run_command(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> str:
     """Run an analysis command under the existing pause, cancellation, and reader supervision.
 
@@ -298,6 +299,7 @@ def _run_command(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         ffmpeg's stderr.
@@ -306,7 +308,8 @@ def _run_command(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded ``timeout_s``.
         LoudnessNoDecoder: ffmpeg has no decoder for the stream.
-        LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero.
+        LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero (behind ``nice``, a missing
+            ffmpeg is ``nice``'s exit 127).
     """
     name = os.path.basename(path)
     freeze = Freeze.of(pause_check)
@@ -315,8 +318,9 @@ def _run_command(
     freeze.hold(cancel_check=cancel_check, name=name)
     if cancel_check and cancel_check():
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
-    # Its own session, so a pause stops ffmpeg's whole group and never the app's.
-    run_args, preexec = dies_with_node(args)  # a node's FFmpeg dies with the node
+    # Its own session, so a pause stops ffmpeg's whole group and never the app's. Niced at the saved level (none at
+    # 0); a node's FFmpeg dies with the node.
+    run_args, preexec = dies_with_node(niced(args, nice_level))
     try:
         proc = subprocess.Popen(
             run_args,
@@ -383,6 +387,7 @@ def run(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict[str, str]:
     """Analyse one stream and return its ``ln:*`` fields.
 
@@ -395,6 +400,7 @@ def run(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         The stream's ``ln:*`` fields.
@@ -413,6 +419,7 @@ def run(
         cancel_check=cancel_check,
         pause_check=pause_check,
         on_progress=on_progress,
+        nice_level=nice_level,
     )
     return ln_fields(parse(text))
 
@@ -425,6 +432,7 @@ def run_many(
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | Freeze | None = None,
     on_progress: Callable[[float, float | None], None] | None = None,
+    nice_level: int = 10,
 ) -> dict[int, dict[str, str] | LoudnessError]:
     """Analyse two or three streams in one input pass, validating each stream's report on its own.
 
@@ -435,6 +443,7 @@ def run_many(
         cancel_check: Returns True when the job was cancelled.
         pause_check: Holds the process while paused.
         on_progress: Called with (seconds of audio processed, speed or None).
+        nice_level: The ``nice`` increment ffmpeg runs at (0 for none).
 
     Returns:
         For each stream, its ``ln:*`` fields, or the (unraised) error for that stream alone.
@@ -455,6 +464,7 @@ def run_many(
         cancel_check=cancel_check,
         pause_check=pause_check,
         on_progress=on_progress,
+        nice_level=nice_level,
     )
     results: dict[int, dict[str, str] | LoudnessError] = {}
     for index, report in parse_many(text, indices).items():

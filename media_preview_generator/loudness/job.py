@@ -112,6 +112,8 @@ CHECK_SHARE = 0.5
 RECHECK_S = 60.0
 # A batch uses one decoder and loudnorm filter per track concurrently; keep its peak CPU and memory bounded.
 MAX_AUDIO_BATCH = 3
+DEFAULT_NICE_LEVEL = 10
+MAX_NICE_LEVEL = 19
 
 
 @dataclass
@@ -206,6 +208,19 @@ class LoudnessContext:
                 else:
                     self._ready[cfg.id] = known
             return db, known[0]
+
+
+def loudness_nice_level() -> int:
+    """The saved ``loudness_nice_level``, read per analysis so a change applies to the next file.
+
+    Returns:
+        The level clamped to 0..19; 10 when it is missing or isn't a number (settings.json can be hand-edited).
+    """
+    try:
+        level = int(get_settings_manager().get("loudness_nice_level", DEFAULT_NICE_LEVEL))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_NICE_LEVEL
+    return max(0, min(MAX_NICE_LEVEL, level))
 
 
 def owners(canonical_path: str, registry, server_id: str | None = None) -> list[ServerConfig]:
@@ -503,6 +518,7 @@ def process_item(
                         [(index, same[0].codec, same[0].duration_ms) for index, same in group],
                         cancel_check=cancel_check,
                         pause_check=ctx.freeze_check or pause_check,
+                        nice_level=loudness_nice_level(),
                         on_progress=_batch_progress_reporter(
                             progress_callback,
                             first=start + 1,
@@ -554,6 +570,7 @@ def process_item(
                             codec=same[0].codec,
                             cancel_check=cancel_check,
                             pause_check=ctx.freeze_check or pause_check,
+                            nice_level=loudness_nice_level(),
                             on_progress=_stream_progress_reporter(
                                 progress_callback, n=n, streams=len(todo), durations_s=durations_s
                             ),

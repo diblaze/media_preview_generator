@@ -395,6 +395,7 @@ def get_settings():
             # so newly-imported media overtakes a running full scan
             # without the user having to demote the scan by hand.
             "incoming_job_priority": parse_priority(settings.get("incoming_job_priority", PRIORITY_HIGH)),
+            "loudness_nice_level": settings.get("loudness_nice_level", 10),
             # backup retention (count + max-age days). 0 max_age_days
             # disables age-based pruning so existing installs keep behaving
             # exactly as before until the user opts in.
@@ -445,6 +446,7 @@ _SAVE_SETTINGS_ALLOWED_FIELDS = (
     "auto_requeue_on_restart",
     "requeue_max_age_minutes",
     "incoming_job_priority",
+    "loudness_nice_level",
     "frame_reuse",
     "config_backup_keep",
     "config_backup_max_age_days",
@@ -462,6 +464,7 @@ _SAVE_SETTINGS_INT_RANGES = {
     "thumbnail_interval": (1, 60),
     "thumbnail_quality": (1, 10),
     "ffmpeg_threads": (0, 32),
+    "loudness_nice_level": (0, 19),
 }
 _VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -478,6 +481,7 @@ _SAVE_SETTINGS_INT_FIELDS = (
     "webhook_retry_count",
     "webhook_retry_delay",
     "requeue_max_age_minutes",
+    "loudness_nice_level",
     "config_backup_keep",
     "config_backup_max_age_days",
 )
