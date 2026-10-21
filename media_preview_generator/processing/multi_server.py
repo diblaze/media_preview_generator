@@ -32,7 +32,7 @@ import re
 import shutil
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -52,9 +52,8 @@ from ..output import BifBundle, EmbyBifAdapter, JellyfinTrickplayAdapter, PlexBu
 from ..output.base import OutputAdapter
 from ..output.journal import (
     clear_meta,
-    get_plex_refresh_pending,
-    mark_plex_refresh_pending,
     outputs_fresh_for_source,
+    outputs_have_content,
     write_meta,
 )
 from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint, same_source
@@ -82,7 +81,7 @@ from .generator import (
     gpu_fallback_announcement,
     working_folder_failure,
 )
-from .plex_refresh import enqueue_plex_refresh, wait_for_plex_refresh
+from .plex_refresh import enqueue_plex_refresh, plex_refresh_asked, wait_for_plex_refresh
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -810,9 +809,12 @@ def _try_reuse_existing_bif(
     one has BIF files, reuse them for the others regardless of when it
     was created, as long as the source files are the same."
 
-    "Same" = ``outputs_fresh_for_source`` returns True. That helper checks
-    the ``.meta`` sidecar's source mtime/inode fingerprint, so a re-encoded
-    source file invalidates the reuse path correctly. The BIF must also
+    "Same" = for Emby, ``outputs_fresh_for_source`` returns True: it checks
+    the ``.meta`` sidecar's source size/mtime fingerprint, so a re-encoded
+    source file invalidates the reuse path correctly. A Plex bundle needs no
+    note: its path is computed from the file's own content hash (not Plex's
+    stored hash, which is stale after a same-size replacement until Plex
+    rescans), so a BIF there was made from this content. The BIF must also
     have been made at the current interval: Plex's ``index-sd.bif`` path
     doesn't encode it, so after an interval change the old BIF still looks
     fresh. Its header interval is the only record; quality and tone map
@@ -849,7 +851,10 @@ def _try_reuse_existing_bif(
             continue
         try:
             item_id = resolve_item_id(server, item_id_hint)
-            paths = adapter.compute_output_paths(probe_bundle_factory(), server, item_id)
+            probe = probe_bundle_factory()
+            if adapter.content_addressed:
+                probe = replace(probe, trust_server_hash=False)
+            paths = adapter.compute_output_paths(probe, server, item_id)
         except Exception as exc:
             logger.debug(
                 "BIF reuse: compute_output_paths failed for {}/{} ({}: {}); skipping this publisher.",
@@ -867,7 +872,7 @@ def _try_reuse_existing_bif(
                 continue
             if not os.path.isfile(candidate_str):
                 continue
-            if not outputs_fresh_for_source([candidate], canonical_path, require_source_fingerprint=True):
+            if not _outputs_fresh(adapter, [candidate], canonical_path, require_source_fingerprint=True):
                 # The BIF exists but the source has changed since it was
                 # written — using these stale frames would give the user
                 # previews from the *previous* version of the file. Pass.
@@ -1311,17 +1316,17 @@ def _plex_library_id(server: PlexServer, canonical_path: str) -> str | None:
     return matches[0].library_id if matches else None
 
 
-def _log_held_refresh(server: PlexServer, canonical_path: str, library_id: str | None) -> None:
-    """Tell the job log when Plex's scheduled jobs make the app wait for its maintenance window.
+def _log_held_refresh(server: PlexServer, canonical_path: str, library_id: str | None) -> bool:
+    """Tell the job log when Plex's scheduled jobs make the app wait for its maintenance window; True when it did.
 
     Uses only settings the refresh worker has already read, so a slow or offline Plex never stalls publishing.
     """
     settings = cached_settings(server.id)
     if settings is None or window_open(settings, datetime.now()) or chapter_thumbnails_on(server.server_config):
-        return
+        return False
     jobs = held_jobs(settings, library_id)
     if not jobs:
-        return
+        return False
     logger.info(
         "{}: Plex runs {} as a scheduled task, so the app asks Plex to show this preview during its maintenance "
         "window ({})",
@@ -1329,6 +1334,24 @@ def _log_held_refresh(server: PlexServer, canonical_path: str, library_id: str |
         job_names(jobs),
         window_text(settings),
     )
+    return True
+
+
+def _outputs_fresh(
+    adapter: OutputAdapter,
+    paths: list[Path],
+    canonical_path: str,
+    *,
+    require_source_fingerprint: bool = False,
+) -> bool:
+    """Whether ``paths`` already hold current previews for ``canonical_path``.
+
+    A content-addressed output (Plex's bundle) is current wherever it exists with data, because
+    its path is a hash of the file's content. Other outputs also need their ``.meta`` note to match.
+    """
+    if adapter.content_addressed:
+        return outputs_have_content(paths)
+    return outputs_fresh_for_source(paths, canonical_path, require_source_fingerprint=require_source_fingerprint)
 
 
 def _refresh_after_publish(
@@ -1337,40 +1360,32 @@ def _refresh_after_publish(
     canonical_path: str,
     deleted_paths: list[str] | None,
     *,
-    output_paths: list[Path],
-    source_fingerprint: SourceFingerprint | None,
     new_output: bool = False,
 ) -> bool:
-    """Notify Plex only for newly written or durably pending previews."""
+    """Ask the server to pick up previews; for Plex, only for new output or a file Plex doesn't show previews for."""
     if server.type is ServerType.PLEX:
-        marker = mark_plex_refresh_pending if new_output else get_plex_refresh_pending
-        token = marker(output_paths, canonical_path, server.id, source_fingerprint=source_fingerprint)
-        if new_output or token is not None:
-            plex = cast("PlexServer", server)
+        plex = cast("PlexServer", server)
+        if new_output:
             library_id = _plex_library_id(plex, canonical_path)
-            if new_output:
-                _log_held_refresh(plex, canonical_path, library_id)
-            queued = enqueue_plex_refresh(
-                plex,
-                canonical_path,
-                item_id,
-                library_id=library_id,
-                output_paths=tuple(output_paths),
-                notification_token=token,
-                source_fingerprint=source_fingerprint,
-            )
-            if not queued:
-                plex_held_rereads.hold(
-                    plex.id,
-                    canonical_path,
-                    item_id=item_id,
-                    library_id=library_id,
-                    output_paths=tuple(output_paths),
-                    token=token,
-                    source_fingerprint=source_fingerprint,
-                )
+            _log_held_refresh(plex, canonical_path, library_id)
+            if not enqueue_plex_refresh(plex, canonical_path, item_id, library_id=library_id):
+                plex_held_rereads.hold(plex.id, canonical_path, item_id=item_id, library_id=library_id)
             return True
-        return False
+        target = plex.unshown_item(canonical_path, item_id)
+        if target is None or plex_refresh_asked(server.id, canonical_path, target):
+            return False
+        # True for a held re-read too: chapters must wait for the Analyze the maintenance-window flush sends.
+        if plex_held_rereads.is_held(server.id, canonical_path):
+            return True
+        library_id = _plex_library_id(plex, canonical_path)
+        if enqueue_plex_refresh(plex, canonical_path, target, library_id=library_id, quiet=True) and not (
+            _log_held_refresh(plex, canonical_path, library_id)
+        ):
+            logger.info(
+                "{} isn't showing the previews for {} yet; asking it to re-read the file", server.name, canonical_path
+            )
+        # True even when the queue is full: chapters must wait for the Analyze a later job sends.
+        return True
     try:
         server.trigger_refresh(item_id=item_id, remote_path=canonical_path, deleted_paths=deleted_paths)
     except Exception as exc:
@@ -1467,14 +1482,14 @@ def _publish_one(
             frame_source=frame_source,
         )
 
-    # Skip when every output exists AND the journal proves the source
-    # hasn't changed since the last publish. The journal check guards
+    # Skip when every output exists AND, for outputs that aren't content-addressed, the journal
+    # proves the source hasn't changed since the last publish. The journal check guards
     # against the "Sonarr quality upgrade" case: file replaced in place,
     # outputs still on disk, but stale — mtime+size mismatch forces
-    # regeneration. Falls through to publish if the meta is missing
-    # (older publishes pre-journal) or if it doesn't match.
-    if skip_if_exists and output_paths and outputs_fresh_for_source(output_paths, bundle.canonical_path):
-        # Plex retries only a persisted pending notification; ordinary fresh
+    # regeneration. A missing note counts as fresh (outputs from before
+    # the journal existed); a note that doesn't match falls through to publish.
+    if skip_if_exists and output_paths and _outputs_fresh(adapter, output_paths, bundle.canonical_path):
+        # Plex is asked to analyze only when it doesn't show previews for the file; ordinary fresh
         # outputs stay silent. Other servers retain their refresh behavior:
         #   (a) duplicate webhook for an already-published file with
         #       item_id known — fire trigger_refresh so the path-based
@@ -1499,8 +1514,6 @@ def _publish_one(
             item_id,
             bundle.canonical_path,
             deleted_paths,
-            output_paths=output_paths,
-            source_fingerprint=bundle.source_fingerprint,
         )
         if item_id is None and _server_needs_item_registration(server):
             # Registration still didn't fire — re-arm the retry so
@@ -1529,6 +1542,7 @@ def _publish_one(
             plex_refresh_requested=refresh_requested,
         )
 
+    replaced_plex_preview = adapter.content_addressed and outputs_have_content(output_paths)
     try:
         adapter.publish(bundle, output_paths, item_id)
         if bundle.source_fingerprint is not None and not same_source(
@@ -1554,24 +1568,29 @@ def _publish_one(
             frame_source=frame_source,
         )
 
-    # Stamp the journal so the next webhook for an unchanged source can
-    # short-circuit. Best-effort — see ``write_meta``.
-    write_meta(
-        output_paths,
-        bundle.canonical_path,
-        publisher=adapter.name,
-        source_fingerprint=bundle.source_fingerprint,
-    )
+    if adapter.content_addressed:
+        # Notes written by older versions beside a bundle BIF are no longer read.
+        clear_meta(output_paths)
+        if replaced_plex_preview:
+            # Plex keeps each preview's frame layout in memory and never re-reads a rewritten file; only a restart
+            # clears it (proven on Plex 1.43, #414).
+            logger.warning(
+                "Replaced the existing previews for {} on {}. If anyone viewed this video's previews since Plex "
+                "last started, Plex shows broken preview images for it until Plex is restarted.",
+                bundle.canonical_path,
+                server.name,
+            )
+    else:
+        # Stamp the journal so the next webhook for an unchanged source can
+        # short-circuit. Best-effort — see ``write_meta``.
+        write_meta(
+            output_paths,
+            bundle.canonical_path,
+            publisher=adapter.name,
+            source_fingerprint=bundle.source_fingerprint,
+        )
 
-    refresh_requested = _refresh_after_publish(
-        server,
-        item_id,
-        bundle.canonical_path,
-        deleted_paths,
-        output_paths=output_paths,
-        source_fingerprint=bundle.source_fingerprint,
-        new_output=True,
-    )
+    refresh_requested = _refresh_after_publish(server, item_id, bundle.canonical_path, deleted_paths, new_output=True)
 
     # When the server activates trickplay via per-item API but we
     # didn't have an item_id at publish time, the plugin-bridge /
@@ -1908,7 +1927,7 @@ def _process_canonical_path_previews(
             except Exception:
                 all_fresh = False
                 break
-            if not paths or not outputs_fresh_for_source(paths, canonical_path):
+            if not paths or not _outputs_fresh(adapter, paths, canonical_path):
                 all_fresh = False
                 break
             fresh_checks.append((server, adapter, item_id, paths))
@@ -1941,14 +1960,7 @@ def _process_canonical_path_previews(
                 # when the item's metadata is current.
                 refresh_requested = False
                 if server.type is ServerType.PLEX or _server_needs_item_registration(server) or deleted_paths:
-                    refresh_requested = _refresh_after_publish(
-                        server,
-                        item_id,
-                        canonical_path,
-                        deleted_paths,
-                        output_paths=paths,
-                        source_fingerprint=source_fingerprint,
-                    )
+                    refresh_requested = _refresh_after_publish(server, item_id, canonical_path, deleted_paths)
                 if needs_registration:
                     results.append(
                         PublisherResult(
@@ -2026,10 +2038,7 @@ def _process_canonical_path_previews(
         for server, adapter, item_id_hint in publishers:
             try:
                 item_id = resolve_item_id(server, item_id_hint)
-                clear_meta(
-                    adapter.compute_output_paths(_probe_bundle(server.id), server, item_id),
-                    preserve_plex_refresh_pending=True,
-                )
+                clear_meta(adapter.compute_output_paths(_probe_bundle(server.id), server, item_id))
             except Exception:
                 continue
 
@@ -2123,7 +2132,7 @@ def _process_canonical_path_previews(
             # unpack it into the frame cache instead of re-running
             # FFmpeg for the sibling that's missing its output. This
             # is the "all servers selected, one already has BIF →
-            # reuse for the others" path. We trust outputs_fresh_for_source
+            # reuse for the others" path. We trust the freshness check
             # for staleness so a re-encoded source file still triggers a
             # genuine re-extract.
             #
@@ -2666,15 +2675,12 @@ def process_canonical_path(
                     publisher.server_id,
                     result.canonical_path,
                     required=publisher.plex_refresh_requested,
+                    # A catch-up Analyze for a skipped preview queues behind the others; the file's chapters retry
+                    # later instead of holding this worker.
+                    timeout=30.0 if publisher.status is PublisherStatus.PUBLISHED else 0.0,
                     cancel_check=cancel_check,
                 )
-                pending = get_plex_refresh_pending(
-                    publisher.output_paths,
-                    result.canonical_path,
-                    publisher.server_id,
-                    source_fingerprint=plan.source_fingerprint,
-                )
-                if not refreshed or pending is not None:
+                if not refreshed:
                     outcome = ChapterOutcome(
                         "waiting", message="Waiting for Plex Analyze before chapter registration", retryable=True
                     )

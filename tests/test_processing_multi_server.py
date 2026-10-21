@@ -1345,10 +1345,6 @@ class TestCrossServerBifReuse:
             slot.mkdir(parents=True)
             for i in range(1, slot_leftovers + 1):
                 (slot / f"img-{i:06d}.jpg").write_bytes(buf.getvalue())
-        from media_preview_generator.output.journal import write_meta
-
-        write_meta([plex_bif], str(media_file), publisher="plex_bundle")
-
         library = Library(id="1", name="Movies", remote_paths=(str(media_root),), enabled=True)
         registry = ServerRegistry.from_settings(
             [
@@ -1695,8 +1691,8 @@ class TestCopiesSharingOnePlexBundle:
     bundle and one ``index-sd.bif`` between them, as Plex itself lays it out.
 
     Two copies sharing one bundle used to rebuild the shared BIF every night,
-    each copy finding the other's fingerprint on it. Each may build it once;
-    after that a scan must skip both.
+    each copy finding the other's fingerprint on it. The bundle path is the
+    content hash, so the first copy builds it and every later scan skips both.
     """
 
     _HASH = "7bd4b8cfed7b096007252de23fe3b71150b1c3af"
@@ -1759,7 +1755,12 @@ class TestCopiesSharingOnePlexBundle:
         first_night: list[str] = []
         results = self._scan(mock_config_for_processing, registry, [copy, original], first_night)
         assert [r.publishers[0].output_paths for r in results] == [[shared_bif], [shared_bif]]
-        assert first_night == [str(copy), str(original)]
+        assert first_night == [str(copy)], "the second copy found the bundle the first one built"
+        assert [r.publishers[0].status for r in results] == [
+            PublisherStatus.PUBLISHED,
+            PublisherStatus.SKIPPED_OUTPUT_EXISTS,
+        ]
+        assert not list(shared_bif.parent.glob("*.meta")), "a Plex bundle carries no note"
 
         second_night: list[str] = []
         results = self._scan(mock_config_for_processing, registry, [copy, original], second_night)
@@ -2741,64 +2742,55 @@ class TestPlexLocalPublishing:
             generate.assert_not_called()
             queued_plex_refresh.assert_not_called()
         else:
-            from media_preview_generator.output.journal import clear_plex_refresh_pending, get_plex_refresh_pending
-            from media_preview_generator.output.plex_hash import get_source_fingerprint
-
-            fingerprint = get_source_fingerprint(str(media_file))
-            token = get_plex_refresh_pending([expected], str(media_file), "plex-1", source_fingerprint=fingerprint)
-            assert token is not None
-            notification_kwargs = {
-                "library_id": "1",
-                "output_paths": (expected,),
-                "notification_token": token,
-                "source_fingerprint": fingerprint,
-            }
-            queued_plex_refresh.assert_called_once_with(
-                registry.get("plex-1"),
-                str(media_file),
-                item_hint,
-                **notification_kwargs,
-            )
+            plex = registry.get("plex-1")
+            queued_plex_refresh.assert_called_once_with(plex, str(media_file), item_hint, library_id="1")
             assert result.status is MultiServerStatus.PUBLISHED
             assert result.publishers[0].status is PublisherStatus.PUBLISHED
             assert result.publishers[0].output_paths == [expected]
+            assert result.publishers[0].plex_refresh_requested is True
             assert expected.is_file()
+            assert not list(expected.parent.glob("*.meta")), "a Plex bundle carries no note"
             assert generate.call_args.args[0] == str(media_file)
             assert generate.call_args.args[4] is mock_config_for_processing
             assert generate.call_args.kwargs["cancel_check"] is None
-            queued_plex_refresh.reset_mock()
-            with patch("media_preview_generator.processing.multi_server.generate_images") as second_generate:
-                second = process_canonical_path(
-                    canonical_path=str(media_file),
-                    registry=registry,
-                    config=mock_config_for_processing,
-                    check_only=True,
-                    item_id_by_server={"plex-1": item_hint} if item_hint else None,
-                )
-            assert second.status is MultiServerStatus.SKIPPED
-            second_generate.assert_not_called()
-            queued_plex_refresh.assert_called_once_with(
-                registry.get("plex-1"),
-                str(media_file),
-                item_hint,
-                **notification_kwargs,
-            )
-            clear_plex_refresh_pending([expected], str(media_file), "plex-1", token, source_fingerprint=fingerprint)
-            # Ordinary full-scan preflight and duplicate jobs must not Analyze
-            # already-acknowledged outputs again or fill the bounded queue.
-            for fresh_check_only in (True, False):
+
+            def rerun(*, check_only_run: bool):
                 queued_plex_refresh.reset_mock()
-                with patch("media_preview_generator.processing.multi_server.generate_images") as fresh_generate:
-                    fresh = process_canonical_path(
+                with patch("media_preview_generator.processing.multi_server.generate_images") as again:
+                    outcome = process_canonical_path(
                         canonical_path=str(media_file),
                         registry=registry,
                         config=mock_config_for_processing,
-                        check_only=fresh_check_only,
+                        check_only=check_only_run,
                         item_id_by_server={"plex-1": item_hint} if item_hint else None,
                     )
-                assert fresh.status is MultiServerStatus.SKIPPED
-                fresh_generate.assert_not_called()
+                again.assert_not_called()
+                assert outcome.status is MultiServerStatus.SKIPPED
+                return outcome
+
+            # The BIF is skipped with no note on disk; Plex is asked to analyze only when it shows no previews.
+            for check_only_run in (True, False):
+                with patch.object(PlexServer, "unshown_item", return_value="77") as unshown:
+                    outcome = rerun(check_only_run=check_only_run)
+                unshown.assert_called_once_with(str(media_file), item_hint)
+                queued_plex_refresh.assert_called_once_with(plex, str(media_file), "77", library_id="1", quiet=True)
+                assert outcome.publishers[0].plex_refresh_requested is True
+                with patch.object(PlexServer, "unshown_item", return_value=None):
+                    outcome = rerun(check_only_run=check_only_run)
                 queued_plex_refresh.assert_not_called()
+                assert outcome.publishers[0].plex_refresh_requested is False
+                # A file already queued for, or given, an Analyze since the app started isn't asked about again.
+                with (
+                    patch(
+                        "media_preview_generator.processing.multi_server.plex_refresh_asked", return_value=True
+                    ) as asked,
+                    patch.object(PlexServer, "unshown_item", return_value="77") as unshown,
+                ):
+                    outcome = rerun(check_only_run=check_only_run)
+                unshown.assert_called_once_with(str(media_file), item_hint)
+                asked.assert_called_once_with("plex-1", str(media_file), "77")
+                queued_plex_refresh.assert_not_called()
+                assert outcome.publishers[0].plex_refresh_requested is False
 
     def test_source_replaced_during_extraction_is_not_published(self, mock_config_for_processing, tmp_path):
         from media_preview_generator.processing.frame_cache import get_frame_cache
@@ -2999,29 +2991,257 @@ class TestOnARemoteNode:
             )
 
 
-def test_a_full_plex_queue_holds_the_refresh_for_the_scheduler(monkeypatch, tmp_path):
+def test_a_full_plex_queue_holds_a_new_previews_refresh_for_the_scheduler(monkeypatch):
     from media_preview_generator.processing import multi_server
 
     plex = SimpleNamespace(id="plex-1", name="Plex", type=multi_server.ServerType.PLEX)
-    outputs = [tmp_path / "index-sd.bif"]
-    fingerprint = (1, 2, 3, 4, 5)
-    monkeypatch.setattr(multi_server, "mark_plex_refresh_pending", lambda *_a, **_k: "tok")
     monkeypatch.setattr(multi_server, "_plex_library_id", lambda *_a: "7")
     monkeypatch.setattr(multi_server, "_log_held_refresh", lambda *_a: None)
     monkeypatch.setattr(multi_server, "enqueue_plex_refresh", lambda *_a, **_k: False)
     hold = MagicMock()
     monkeypatch.setattr(multi_server.plex_held_rereads, "hold", hold)
 
-    multi_server._refresh_after_publish(
-        plex, "42", "/media/a.mkv", None, output_paths=outputs, source_fingerprint=fingerprint, new_output=True
-    )
+    assert multi_server._refresh_after_publish(plex, "42", "/media/a.mkv", None, new_output=True) is True
 
-    hold.assert_called_once_with(
-        "plex-1",
-        "/media/a.mkv",
-        item_id="42",
-        library_id="7",
-        output_paths=tuple(outputs),
-        token="tok",
-        source_fingerprint=fingerprint,
+    hold.assert_called_once_with("plex-1", "/media/a.mkv", item_id="42", library_id="7")
+
+
+@pytest.mark.parametrize(
+    ("held", "queued", "window_closed"),
+    [(False, True, False), (False, False, False), (True, True, False), (False, True, True)],
+)
+def test_a_catch_up_refresh_respects_the_hold_and_isnt_held_when_the_queue_is_full(
+    monkeypatch, loguru_caplog, held, queued, window_closed
+):
+    """A file already waiting for Plex's maintenance window isn't asked about again, but its chapters still wait for
+    that Analyze; a catch-up the full queue turns away isn't held, since the next job re-reads Plex's flag anyway."""
+    from media_preview_generator.processing import multi_server
+
+    plex = SimpleNamespace(
+        id="plex-1", name="Plex", type=multi_server.ServerType.PLEX, unshown_item=MagicMock(return_value="42")
     )
+    monkeypatch.setattr(multi_server, "_plex_library_id", lambda *_a: "7")
+    monkeypatch.setattr(multi_server, "plex_refresh_asked", lambda *_a: False)
+    monkeypatch.setattr(multi_server.plex_held_rereads, "is_held", MagicMock(return_value=held))
+    enqueue = MagicMock(return_value=queued)
+    monkeypatch.setattr(multi_server, "enqueue_plex_refresh", enqueue)
+    hold = MagicMock()
+    monkeypatch.setattr(multi_server.plex_held_rereads, "hold", hold)
+    monkeypatch.setattr(multi_server, "_log_held_refresh", MagicMock(return_value=window_closed))
+
+    requested = multi_server._refresh_after_publish(plex, None, "/media/a.mkv", None)
+
+    multi_server.plex_held_rereads.is_held.assert_called_once_with("plex-1", "/media/a.mkv")
+    asking = [r for r in loguru_caplog.records if "asking it to re-read the file" in r.getMessage()]
+    if held:
+        enqueue.assert_not_called()
+    else:
+        enqueue.assert_called_once_with(plex, "/media/a.mkv", "42", library_id="7", quiet=True)
+    # A re-read that waits for the window says so instead of claiming Plex is being asked now.
+    assert len(asking) == (1 if queued and not held and not window_closed else 0)
+    assert requested is True
+    hold.assert_not_called()
+
+
+class TestPlexBundleNeedsNoNote:
+    """A Plex bundle's path is a hash of the file's content, so it is current wherever it exists; Emby and Jellyfin
+    outputs still need a note recording the source they were made from."""
+
+    @staticmethod
+    def _plex_server():
+        server = MagicMock()
+        server.type = ServerType.PLEX
+        server.id = "plex-1"
+        server.name = "Plex"
+        return server
+
+    @staticmethod
+    def _bundle(media_file: Path, frame_dir: Path, **kwargs):
+        from media_preview_generator.output import BifBundle
+
+        _populate_frames(frame_dir, count=3, real_images=False)
+        return BifBundle(
+            canonical_path=str(media_file), frame_dir=frame_dir, bif_path=None, frame_interval=10, width=320,
+            height=180, frame_count=3, **kwargs,
+        )  # fmt: skip
+
+    @pytest.mark.parametrize(
+        ("adapter_name", "expected_after_replacement"), [("plex", True), ("emby", False)], ids=["plex", "emby"]
+    )
+    def test_only_the_plex_bundle_is_fresh_without_a_matching_note(
+        self, tmp_path, adapter_name, expected_after_replacement
+    ):
+        from media_preview_generator.output import EmbyBifAdapter, PlexBundleAdapter
+        from media_preview_generator.output.journal import write_meta
+        from media_preview_generator.processing.multi_server import _outputs_fresh
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        adapter = PlexBundleAdapter(str(tmp_path / "plexcfg"), 10) if adapter_name == "plex" else EmbyBifAdapter()
+        output = tmp_path / "out.bif"
+        output.write_bytes(b"bif")
+        write_meta([output], str(media_file))
+        media_file.write_bytes(b"a different, longer replacement")
+
+        assert _outputs_fresh(adapter, [output], str(media_file)) is expected_after_replacement
+        output.write_bytes(b"")
+        assert _outputs_fresh(adapter, [output], str(media_file)) is False
+        assert _outputs_fresh(adapter, [], str(media_file)) is False
+
+    def test_publishing_a_bundle_writes_no_note_and_removes_one_an_older_version_left(self, tmp_path):
+        from media_preview_generator.output import PlexBundleAdapter
+        from media_preview_generator.output.journal import _meta_path_for
+        from media_preview_generator.processing.multi_server import _publish_one
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        adapter = PlexBundleAdapter(str(tmp_path / "plexcfg"), 10)
+        bundle = self._bundle(media_file, tmp_path / "frames")
+        (output,) = adapter.compute_output_paths(bundle, None, None)
+        output.parent.mkdir(parents=True)
+        _meta_path_for(output).write_text("{}")
+
+        result = _publish_one(self._plex_server(), adapter, bundle, "42", skip_if_exists=False)
+
+        assert result.status is PublisherStatus.PUBLISHED
+        assert output.stat().st_size > 0
+        assert not _meta_path_for(output).exists()
+
+    @pytest.mark.parametrize("existing", [False, True], ids=["new", "replaced"])
+    def test_replacing_a_plex_preview_warns_that_plex_may_need_a_restart(self, tmp_path, loguru_caplog, existing):
+        """Plex keeps a viewed preview's frame layout in memory and never re-reads a rewritten file (#414)."""
+        from media_preview_generator.output import PlexBundleAdapter
+        from media_preview_generator.processing.multi_server import _publish_one
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        adapter = PlexBundleAdapter(str(tmp_path / "plexcfg"), 10)
+        bundle = self._bundle(media_file, tmp_path / "frames")
+        (output,) = adapter.compute_output_paths(bundle, None, None)
+        if existing:
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"old preview")
+
+        result = _publish_one(self._plex_server(), adapter, bundle, "42", skip_if_exists=False)
+
+        assert result.status is PublisherStatus.PUBLISHED
+        warned = [r for r in loguru_caplog.records if "until Plex is restarted" in r.getMessage()]
+        assert len(warned) == (1 if existing else 0)
+        if existing:
+            assert warned[0].levelname == "WARNING"
+
+    @pytest.mark.parametrize("queued", [True, False], ids=["queued", "queue-full"])
+    @pytest.mark.parametrize(("item_id", "unshown"), [("42", "42"), ("42", None), (None, "77"), (None, None)])
+    def test_a_skipped_plex_bundle_asks_plex_to_analyze_only_when_it_shows_no_previews(
+        self, tmp_path, loguru_caplog, item_id, unshown, queued
+    ):
+        """The per-publisher skip (another server still needs work) reads Plex's flag like the all-fresh path."""
+        from media_preview_generator.output import PlexBundleAdapter
+        from media_preview_generator.processing.multi_server import _publish_one
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        adapter = PlexBundleAdapter(str(tmp_path / "plexcfg"), 10)
+        bundle = self._bundle(media_file, tmp_path / "frames")
+        (output,) = adapter.compute_output_paths(bundle, None, None)
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"existing preview")
+        server = self._plex_server()
+        type(server)._trigger_item_refresh = PlexServer._trigger_item_refresh
+        server.unshown_item.return_value = unshown
+
+        with (
+            patch("media_preview_generator.processing.multi_server.plex_refresh_asked", return_value=False),
+            patch(
+                "media_preview_generator.processing.multi_server.enqueue_plex_refresh", return_value=queued
+            ) as enqueue,
+        ):
+            result = _publish_one(server, adapter, bundle, item_id, skip_if_exists=True)
+
+        assert result.status is PublisherStatus.SKIPPED_OUTPUT_EXISTS
+        assert output.read_bytes() == b"existing preview"
+        server.unshown_item.assert_called_once_with(str(media_file), item_id)
+        asked = [r for r in loguru_caplog.records if "asking it to re-read the file" in r.getMessage()]
+        if unshown:
+            enqueue.assert_called_once_with(server, str(media_file), unshown, library_id=None, quiet=True)
+            assert len(asked) == (1 if queued else 0)
+        else:
+            enqueue.assert_not_called()
+            assert not asked
+        # Even when the queue is full: the chapters wait for the Analyze a later job sends.
+        assert result.plex_refresh_requested is bool(unshown)
+
+    def test_publishing_an_emby_bif_still_writes_its_note(self, tmp_path):
+        from media_preview_generator.output import EmbyBifAdapter
+        from media_preview_generator.output.journal import _meta_path_for, outputs_fresh_for_source
+        from media_preview_generator.processing.multi_server import _publish_one
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        adapter = EmbyBifAdapter()
+        bundle = self._bundle(media_file, tmp_path / "frames")
+        (output,) = adapter.compute_output_paths(bundle, None, None)
+        server = MagicMock()
+        server.type = ServerType.EMBY
+
+        result = _publish_one(server, adapter, bundle, "e1", skip_if_exists=False)
+
+        assert result.status is PublisherStatus.PUBLISHED
+        assert _meta_path_for(output).exists()
+        assert outputs_fresh_for_source([output], str(media_file), require_source_fingerprint=True)
+
+
+class TestBifReuseHashesTheFileItself:
+    """Plex's stored hash is stale after a same-size replacement until Plex rescans, so a BIF is reused for another
+    server only from the path the file's own content gives."""
+
+    @staticmethod
+    def _reuse(tmp_path, media_file: Path, server_hash: str):
+        from media_preview_generator.output import BifBundle, PlexBundleAdapter
+        from media_preview_generator.processing.multi_server import _try_reuse_existing_bif
+
+        server = MagicMock()
+        server.name = "Plex"
+        server.get_bundle_parts.return_value = [(server_hash, str(media_file), media_file.stat().st_size)]
+        adapter = PlexBundleAdapter(str(tmp_path / "plexcfg"), 10)
+
+        def probe() -> BifBundle:
+            return BifBundle(
+                canonical_path=str(media_file), frame_dir=Path(os.devnull), bif_path=None, frame_interval=10,
+                width=320, height=180, frame_count=0, trust_server_hash=True,
+            )  # fmt: skip
+
+        recovered = _try_reuse_existing_bif(
+            [(server, adapter, "42")],
+            str(media_file),
+            str(tmp_path / "slot"),
+            probe,
+            lambda _server, hint: hint,
+            frame_interval_ms=10_000,
+        )
+        return recovered, adapter
+
+    def test_a_bif_at_the_hash_plex_still_stores_is_not_reused(self, tmp_path):
+        from media_preview_generator.output.plex_hash import calculate_plex_hash
+        from tests.conftest import write_bif
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        stale_hash = "ab" * 20
+        assert stale_hash != calculate_plex_hash(str(media_file))
+        from media_preview_generator.output import PlexBundleAdapter
+
+        write_bif(PlexBundleAdapter.bundle_bif_path(str(tmp_path / "plexcfg"), stale_hash), frames=3)
+
+        recovered, _ = self._reuse(tmp_path, media_file, stale_hash)
+
+        assert recovered == 0
+
+    def test_a_bif_at_the_files_own_hash_is_reused_with_no_note(self, tmp_path):
+        from media_preview_generator.output import PlexBundleAdapter
+        from media_preview_generator.output.plex_hash import calculate_plex_hash
+        from tests.conftest import write_bif
+
+        media_file = _seed_canonical_file(tmp_path / "media")
+        own = calculate_plex_hash(str(media_file))
+        bif = PlexBundleAdapter.bundle_bif_path(str(tmp_path / "plexcfg"), own)
+        write_bif(bif, frames=3)
+        assert not list(bif.parent.glob("*.meta"))
+
+        recovered, _ = self._reuse(tmp_path, media_file, "ab" * 20)
+
+        assert recovered == 3

@@ -50,7 +50,7 @@ Sonarr and Radarr often call the webhook before your media server has scanned th
 
 - A file that isn't in a server's library yet, or whose preview hasn't been registered yet, is retried automatically.
 - The retries run as follow-up jobs covering only the files still waiting.
-- Work already done is not repeated. A companion file records the source file's size and modification time, so files with a current preview are skipped. Frames extracted in the last hour are reused if a second trigger arrives for the same file, such as Plex's own webhook after Sonarr's. See [Smart dedup](multi-server.md#smart-dedup-skipping-work-thats-already-done).
+- Work already done is not repeated. Plex previews are stored under a name made from the video's content, so an existing one is current; for Emby and Jellyfin a companion file records the source file's size and modification time. Files with a current preview are skipped. Frames extracted in the last hour are reused if a second trigger arrives for the same file, such as Plex's own webhook after Sonarr's. See [Smart dedup](multi-server.md#smart-dedup-skipping-work-thats-already-done).
 
 To shorten the wait, make sure the server notices new files quickly:
 

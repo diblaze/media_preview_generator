@@ -62,6 +62,10 @@ class OutputAdapter(ABC):
     etc.) and the adapter writes files to the locations that server expects.
     """
 
+    # The output path is derived from the source's content, so an output at that path was made from
+    # this content and needs no ``.meta`` note to prove it.
+    content_addressed: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

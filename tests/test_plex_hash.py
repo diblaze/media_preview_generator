@@ -218,6 +218,25 @@ class TestSameSource:
         assert not plex_hash.same_source((1, 2, 3, 4, 5), saved)
 
 
+class TestSameRecordedSource:
+    @pytest.mark.parametrize("field", [0, 1, 4], ids=["device", "inode", "ctime"])
+    def test_true_when_only_device_inode_or_change_time_differ(self, field):
+        changed = [1, 2, 3, 4, 5]
+        changed[field] += 1
+        assert plex_hash.same_recorded_source(changed, (1, 2, 3, 4, 5))
+
+    @pytest.mark.parametrize("field", [2, 3], ids=["size", "mtime"])
+    def test_false_when_size_or_mtime_differs(self, field):
+        changed = [1, 2, 3, 4, 5]
+        changed[field] += 1
+        assert not plex_hash.same_recorded_source(changed, (1, 2, 3, 4, 5))
+
+    @pytest.mark.parametrize("saved", [None, [1, 2, 3], [1, 2, 3, 4], {"a": 1}, "12345", 7], ids=str)
+    def test_false_for_missing_or_malformed_saved_values(self, saved):
+        assert not plex_hash.same_recorded_source(saved, (1, 2, 3, 4, 5))
+        assert not plex_hash.same_recorded_source((1, 2, 3, 4, 5), saved)
+
+
 @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
 def test_a_metadata_only_change_keeps_the_fingerprint_and_hash(tmp_path, how):
     source = tmp_path / "video.mkv"

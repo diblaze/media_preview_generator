@@ -17,8 +17,14 @@ from typing import IO, TYPE_CHECKING, cast
 from PIL import Image
 
 from ..bif_reader import BIF_MAGIC
-from ..output.journal import outputs_fresh_for_source
-from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint, same_source
+from ..output.journal import outputs_have_content
+from ..output.plex_hash import (
+    SourceFileChangedError,
+    SourceFingerprint,
+    calculate_plex_hash,
+    get_source_fingerprint,
+    same_source,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -219,7 +225,7 @@ def inspect_seek_index(
 
 
 def recover_bif_frame(plan: ChapterPlan, chapter: Chapter, output: Path) -> dict | None:
-    """Recover only an in-chapter JPEG whose journal binds it to this exact source.
+    """Recover only an in-chapter JPEG from a bundle BIF named by this exact source's content hash.
 
     Returns:
         Explicit original resolution/timestamp provenance, or None if no safe frame exists.
@@ -227,9 +233,12 @@ def recover_bif_frame(plan: ChapterPlan, chapter: Chapter, output: Path) -> dict
     bif = plan.folder.parent / "Indexes" / "index-sd.bif"
     if not same_source(get_source_fingerprint(plan.canonical_path), plan.source_fingerprint):
         raise SourceFileChangedError("Source changed during chapter recovery")
-    if not outputs_fresh_for_source([bif], plan.canonical_path, require_source_fingerprint=True):
+    if plan.target is None or not outputs_have_content([bif]):
         return None
     try:
+        # The bundle path is a hash of the content; Plex's stored hash can be stale after a same-size replacement.
+        if calculate_plex_hash(plan.canonical_path, fingerprint=plan.source_fingerprint) != plan.target.bundle_hash:
+            return None
         before = get_source_fingerprint(bif)
         with bif.open("rb") as stream:
             header = stream.read(64)

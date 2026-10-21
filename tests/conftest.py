@@ -331,6 +331,8 @@ def write_bif(
 CTIME_ONLY_CHANGES = ("hard_link", "chmod", "same_times")
 # Real changes to the file a preview was made from.
 SOURCE_CHANGES = ("mtime", "size", "inode")
+# The real changes a fingerprint saved by an earlier run still catches: a new inode alone is a move or remount (#414).
+RECORDED_SOURCE_CHANGES = ("mtime", "size")
 
 
 def change_ctime_only(path, how: str) -> None:

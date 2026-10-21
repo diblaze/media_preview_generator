@@ -163,21 +163,6 @@ def _analyzed(plex) -> list[str]:
     ]
 
 
-def _pending_output(tmp_path):
-    from media_preview_generator.output.journal import mark_plex_refresh_pending, write_meta
-    from media_preview_generator.output.plex_hash import get_source_fingerprint
-
-    source = tmp_path / "video.mkv"
-    source.write_bytes(b"source")
-    output = tmp_path / "index-sd.bif"
-    output.write_bytes(b"preview")
-    fingerprint = get_source_fingerprint(str(source))
-    write_meta([output], str(source), publisher="plex_bundle", source_fingerprint=fingerprint)
-    token = mark_plex_refresh_pending([output], str(source), "plex", source_fingerprint=fingerprint)
-    assert token is not None
-    return str(source), (output,), fingerprint, token
-
-
 def _join_worker(queue):
     worker = queue._worker
     if worker is not None:
@@ -186,13 +171,9 @@ def _join_worker(queue):
 
 
 @pytest.mark.parametrize("outcome", [True, False, "offline"])
-def test_only_successful_analyze_acknowledges_the_persisted_notification(tmp_path, outcome):
-    from media_preview_generator.output.journal import get_plex_refresh_pending
-
-    path, outputs, fingerprint, token = _pending_output(tmp_path)
-
+def test_a_waiting_chapter_publication_is_released_only_by_a_successful_analyze(outcome):
     def refresh(canonical_path, item_id):
-        assert (canonical_path, item_id) == (path, "42")
+        assert (canonical_path, item_id) == ("/media/video.mkv", "42")
         if outcome == "offline":
             raise ConnectionError("offline")
         return outcome
@@ -200,115 +181,189 @@ def test_only_successful_analyze_acknowledges_the_persisted_notification(tmp_pat
     server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=refresh)
     queue = PlexRefreshQueue(idle_seconds=0.01)
     try:
-        assert queue.enqueue(
-            server,
-            path,
-            "42",
-            output_paths=outputs,
-            notification_token=token,
-            source_fingerprint=fingerprint,
-        )
-        _join_worker(queue)
-        pending = get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint)
-        assert pending == (None if outcome is True else token)
+        assert queue.enqueue(server, "/media/video.mkv", "42")
+        assert queue.wait("plex", "/media/video.mkv", required=True) is (outcome is True)
     finally:
         queue.close()
 
 
-def test_overflow_notification_survives_queue_restart_and_retries(tmp_path):
-    from media_preview_generator.output.journal import get_plex_refresh_pending
-
-    path, outputs, fingerprint, token = _pending_output(tmp_path)
-    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=True))
-    full_queue = PlexRefreshQueue(capacity=0)
-    assert not full_queue.enqueue(
-        server,
-        path,
-        None,
-        output_paths=outputs,
-        notification_token=token,
-        source_fingerprint=fingerprint,
-    )
-    full_queue.close()
-    server.refresh_preview_metadata.assert_not_called()
-    persisted = get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint)
-    assert persisted == token
-    restarted = PlexRefreshQueue(idle_seconds=0.01)
+@pytest.mark.parametrize("required", [True, False])
+def test_an_earlier_failed_analyze_only_holds_chapters_that_need_one(required):
+    """A job that asked for no Analyze (Plex already shows the previews) mustn't wait on a failure from an earlier
+    job: with nothing queued after it, that request can't replace chapters registered now."""
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=False))
+    queue = PlexRefreshQueue(idle_seconds=0.01)
     try:
-        assert restarted.enqueue(
-            server,
-            path,
-            "42",
-            output_paths=outputs,
-            notification_token=persisted,
-            source_fingerprint=fingerprint,
-        )
-        _join_worker(restarted)
-        server.refresh_preview_metadata.assert_called_once_with(path, "42")
-        assert get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint) is None
+        assert queue.enqueue(server, "/media/video.mkv", "42")
+        assert queue.wait("plex", "/media/video.mkv", required=True) is False
+        assert queue.wait("plex", "/media/video.mkv", required=required) is (not required)
     finally:
-        restarted.close()
+        queue.close()
 
 
-def test_old_inflight_ack_does_not_clear_new_publication_token(tmp_path):
-    from media_preview_generator.output.journal import get_plex_refresh_pending, mark_plex_refresh_pending
+def test_a_request_the_full_queue_turns_away_holds_chapters_that_need_an_analyze():
+    """An earlier Analyze for the file doesn't stand in for the one a later job must send."""
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=True))
+    queue = PlexRefreshQueue(capacity=1, idle_seconds=0.01)
+    started, release = Event(), Event()
 
-    path, outputs, fingerprint, token = _pending_output(tmp_path)
-    first_started, release_first, second_started, release_second = Event(), Event(), Event(), Event()
-    calls = []
-
-    def refresh(canonical_path, item_id):
-        calls.append((canonical_path, item_id))
-        if len(calls) == 1:
-            first_started.set()
-            assert release_first.wait(2)
-        else:
-            second_started.set()
-            assert release_second.wait(2)
+    def busy(path, item_id):
+        started.set()
+        assert release.wait(2)
         return True
+
+    try:
+        assert queue.enqueue(server, "/media/video.mkv", "42")
+        assert queue.wait("plex", "/media/video.mkv", required=True)
+        other = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=busy)
+        assert queue.enqueue(other, "/media/running.mkv", "1")
+        assert started.wait(2)
+        assert queue.enqueue(other, "/media/queued.mkv", "2")
+        assert not queue.enqueue(server, "/media/video.mkv", "42")
+        assert queue.wait("plex", "/media/video.mkv", required=True, timeout=0) is False
+    finally:
+        release.set()
+        queue.close()
+
+
+@pytest.mark.parametrize("item_id", [None, "/library/metadata/42"])
+def test_an_analyze_sent_without_a_bare_item_id_is_remembered(item_id):
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=True))
+    queue = PlexRefreshQueue(idle_seconds=0.01)
+    try:
+        assert queue.enqueue(server, "/media/video.mkv", item_id)
+        assert queue.wait("plex", "/media/video.mkv", required=True)
+        assert queue.asked("plex", "/media/video.mkv", "42")
+        assert queue.asked("plex", "/media/video.mkv", "43") is (item_id is None)
+    finally:
+        queue.close()
+
+
+def test_a_file_whose_analyze_is_running_always_gets_its_follow_up():
+    """Turned away, the newer request would be held, and the running one would then release that hold and report a
+    completion the new preview never got."""
+    started, release = Event(), Event()
+
+    def refresh(path, item_id):
+        started.set()
+        assert release.wait(2)
+        return True
+
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=refresh)
+    queue = PlexRefreshQueue(capacity=1, idle_seconds=0.01)
+    try:
+        assert queue.enqueue(server, "/media/running.mkv", "1")
+        assert started.wait(2)
+        assert queue.enqueue(server, "/media/other.mkv", "2")
+        assert not queue.enqueue(server, "/media/third.mkv", "3")
+        assert queue.enqueue(server, "/media/running.mkv", "1")
+        release.set()
+        assert queue.wait("plex", "/media/running.mkv", required=True)
+    finally:
+        release.set()
+        queue.close()
+
+
+def test_a_held_file_never_queued_holds_chapters_that_need_an_analyze():
+    """A held re-read lives only in the held list until the flush sends it, so a required wait fails closed."""
+    queue = PlexRefreshQueue()
+    try:
+        assert queue.wait("plex", "/media/held.mkv", required=True, timeout=0) is False
+    finally:
+        queue.close()
+
+
+def test_catch_up_requests_fill_at_most_half_the_queue():
+    """A first scan after upgrade may find many unflagged files; newly written previews must still get a place."""
+    started, release = Event(), Event()
+
+    def refresh(path, item_id):
+        started.set()
+        assert release.wait(2)
+        return True
+
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=refresh)
+    queue = PlexRefreshQueue(capacity=4)
+    try:
+        assert queue.enqueue(server, "/media/running.mkv", "1")
+        assert started.wait(2)
+        assert queue.enqueue(server, "/media/q1.mkv", "2", quiet=True)
+        assert queue.enqueue(server, "/media/q2.mkv", "3", quiet=True)
+        assert not queue.enqueue(server, "/media/q3.mkv", "4", quiet=True)
+        assert queue.enqueue(server, "/media/new1.mkv", "5")
+        assert queue.enqueue(server, "/media/new2.mkv", "6")
+        assert not queue.enqueue(server, "/media/new3.mkv", "7")
+        # A new write for a file already queued as catch-up takes its place as a full request.
+        assert queue.enqueue(server, "/media/q1.mkv", "2")
+        assert queue._pending[("plex", "/media/q1.mkv")].quiet is False
+        assert queue.enqueue(server, "/media/q3.mkv", "4", quiet=False) is False
+    finally:
+        release.set()
+        queue.close()
+
+
+@pytest.mark.parametrize("outcome", [True, False, "offline"])
+def test_a_file_counts_as_asked_while_queued_and_after_plex_analyzed_it(outcome):
+    started, release = Event(), Event()
+
+    def refresh(path, item_id):
+        started.set()
+        assert release.wait(2)
+        if outcome == "offline":
+            raise ConnectionError("offline")
+        return outcome
 
     server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=refresh)
     queue = PlexRefreshQueue(idle_seconds=0.01)
     try:
-        assert queue.enqueue(
-            server,
-            path,
-            "42",
-            output_paths=outputs,
-            notification_token=token,
-            source_fingerprint=fingerprint,
-        )
-        assert first_started.wait(2)
-        newer = mark_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint)
-        assert newer and newer != token
-        assert queue.enqueue(
-            server,
-            path,
-            "42",
-            output_paths=outputs,
-            notification_token=newer,
-            source_fingerprint=fingerprint,
-        )
-        # Duplicate pending work coalesces without losing the latest token or hint.
-        assert queue.enqueue(
-            server,
-            path,
-            None,
-            output_paths=outputs,
-            notification_token=newer,
-            source_fingerprint=fingerprint,
-        )
-        release_first.set()
-        assert second_started.wait(2)
-        assert get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint) == newer
-        release_second.set()
-        _join_worker(queue)
-        assert calls == [(path, "42"), (path, "42")]
-        assert get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint) is None
+        assert not queue.asked("plex", "/media/video.mkv", "42")
+        assert queue.enqueue(server, "/media/video.mkv", "42")
+        assert started.wait(2)
+        # While a request for the file is out, no item holding it is asked about again.
+        assert queue.asked("plex", "/media/video.mkv", "42")
+        assert queue.asked("plex", "/media/video.mkv", "43")
+        release.set()
+        queue.wait("plex", "/media/video.mkv")
+        # Only an Analyze Plex ran is remembered, and only for that item: a failed request is asked again by a
+        # later job, and another library's copy of the file still gets its own.
+        assert queue.asked("plex", "/media/video.mkv", "42") is (outcome is True)
+        assert not queue.asked("plex", "/media/video.mkv", "43")
+        assert not queue.asked("other-plex", "/media/video.mkv", "42")
     finally:
-        release_first.set()
-        release_second.set()
+        release.set()
         queue.close()
+
+
+def _log_messages(level: str):
+    """Capture loguru records at exactly ``level`` while the caller runs; returns (sink id, messages)."""
+    from loguru import logger
+
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level=level,
+        filter=lambda record: record["level"].name == level,
+    )
+    return sink_id, messages
+
+
+@pytest.mark.parametrize(("quiet", "level", "other"), [(False, "WARNING", "DEBUG"), (True, "DEBUG", "WARNING")])
+def test_a_full_queue_logs_a_warning_unless_the_enqueue_is_quiet(quiet, level, other):
+    from loguru import logger
+
+    server = SimpleNamespace(id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=True))
+    queue = PlexRefreshQueue(capacity=0)
+    expected_id, expected = _log_messages(level)
+    unexpected_id, unexpected = _log_messages(other)
+    try:
+        assert not queue.enqueue(server, "/media/video.mkv", None, quiet=quiet)
+    finally:
+        logger.remove(expected_id)
+        logger.remove(unexpected_id)
+        queue.close()
+    assert any("/media/video.mkv" in message for message in expected)
+    assert not any("/media/video.mkv" in message for message in unexpected)
+    server.refresh_preview_metadata.assert_not_called()
 
 
 MULTI = "/tv/Show/Season 01/Show - S01E01-E02.mkv"
@@ -480,22 +535,14 @@ class TestHeldWhileScheduledJobsWait:
         )
         return server, plex_held_rereads, plex_refresh
 
-    def test_a_held_request_is_stored_and_plex_is_not_asked(self, monkeypatch, tmp_path):
-        from media_preview_generator.output.journal import get_plex_refresh_pending
-
+    @pytest.mark.parametrize("quiet", [False, True], ids=["new-previews", "catch-up"])
+    def test_a_held_request_is_stored_and_plex_is_not_asked(self, monkeypatch, quiet):
+        """A catch-up re-read starts Plex's scheduled jobs just like one for new previews, so it waits too."""
         server, held, refresh = self._run(monkeypatch, hold=True)
-        path, outputs, fingerprint, token = _pending_output(tmp_path)
+        path = "/media/a.mkv"
         queue = PlexRefreshQueue(idle_seconds=0.01)
         try:
-            assert queue.enqueue(
-                server,
-                path,
-                "42",
-                library_id="3",
-                output_paths=outputs,
-                notification_token=token,
-                source_fingerprint=fingerprint,
-            )
+            assert queue.enqueue(server, path, "42", library_id="3", quiet=quiet)
             assert queue.wait("plex", path, required=True) is False
             _join_worker(queue)
         finally:
@@ -504,10 +551,8 @@ class TestHeldWhileScheduledJobsWait:
         refresh.should_hold.assert_called_once_with(server, "3")
         server.refresh_preview_metadata.assert_not_called()
         [entry] = held.entries("plex")
-        assert (entry.canonical_path, entry.item_id, entry.library_id, entry.token) == (path, "42", "3", token)
-        assert entry.output_paths == tuple(str(p) for p in outputs)
-        assert entry.source_fingerprint == fingerprint
-        assert get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint) == token
+        assert (entry.canonical_path, entry.item_id, entry.library_id) == (path, "42", "3")
+        assert not queue.asked("plex", path, "42")
 
     @pytest.mark.parametrize("outcome", [True, False, "offline"])
     def test_a_sent_request_releases_the_held_entry(self, monkeypatch, tmp_path, outcome):
@@ -516,15 +561,7 @@ class TestHeldWhileScheduledJobsWait:
             server.refresh_preview_metadata.side_effect = ConnectionError("offline")
         else:
             server.refresh_preview_metadata.return_value = outcome
-        held.hold(
-            "plex",
-            "/media/a.mkv",
-            item_id="42",
-            library_id="3",
-            output_paths=(),
-            token=None,
-            source_fingerprint=None,
-        )
+        held.hold("plex", "/media/a.mkv", item_id="42", library_id="3")
         queue = PlexRefreshQueue(idle_seconds=0.01)
         try:
             assert queue.enqueue(server, "/media/a.mkv", "42", library_id="3")

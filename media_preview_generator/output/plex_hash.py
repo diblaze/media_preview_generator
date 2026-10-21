@@ -46,6 +46,27 @@ def same_source(a: Sequence[int] | None, b: Sequence[int] | None) -> bool:
     return tuple(a[:4]) == tuple(b[:4])
 
 
+def same_recorded_source(recorded: Sequence[int] | None, current: Sequence[int] | None) -> bool:
+    """Whether a fingerprint saved by an earlier run still describes the file now on disk.
+
+    Only size and modification time count. Device and inode numbers are not stable across runs: an rclone or
+    Unraid user-share remount renumbers both, and Unraid's mover copies files to a new inode, all with the content
+    untouched (#414). ``same_source`` keeps them for checks within one run, where they catch a mid-read swap.
+
+    Args:
+        recorded: A fingerprint saved earlier, usually as a JSON list.
+        current: A ``get_source_fingerprint`` result for the file now.
+
+    Returns:
+        True when both are present, have all five fields, and their size and modification time are equal.
+    """
+    if not isinstance(recorded, tuple | list) or not isinstance(current, tuple | list):
+        return False
+    if len(recorded) < 5 or len(current) < 5:
+        return False
+    return tuple(recorded[2:4]) == tuple(current[2:4])
+
+
 def _opened_is(opened: SourceFingerprint, expected: SourceFingerprint) -> bool:
     """Whether the file just opened (its ``os.fstat``) is the one ``expected`` (an ``os.stat``) describes."""
     return same_source(opened, expected)

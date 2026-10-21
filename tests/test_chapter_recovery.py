@@ -11,8 +11,7 @@ from PIL import Image
 from pymediainfo import MediaInfo
 
 from media_preview_generator.bif_reader import BIF_MAGIC
-from media_preview_generator.output.journal import write_meta
-from media_preview_generator.output.plex_hash import SourceFileChangedError, get_source_fingerprint
+from media_preview_generator.output.plex_hash import SourceFileChangedError, calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapter_recovery as recovery
 from media_preview_generator.processing import chapters
 
@@ -100,8 +99,12 @@ def bound_bif(tmp_path):
         entries.append(struct.pack("<II", stamp, offset))
         offset += len(jpeg)
     bif.write_bytes(header + b"".join(entries) + struct.pack("<II", 0xFFFFFFFF, offset) + b"".join(images))
-    plan = SimpleNamespace(folder=folder, canonical_path=str(source), source_fingerprint=get_source_fingerprint(source))
-    write_meta([bif], str(source), source_fingerprint=plan.source_fingerprint)
+    plan = SimpleNamespace(
+        folder=folder,
+        canonical_path=str(source),
+        source_fingerprint=get_source_fingerprint(source),
+        target=SimpleNamespace(bundle_hash=calculate_plex_hash(source)),
+    )
     return plan, bif, folder / "out.jpg"
 
 
@@ -123,13 +126,12 @@ def test_recovery_never_crosses_chapter_end_or_uses_a_frame_before_start(bound_b
     assert not output.exists()
 
 
-@pytest.mark.parametrize("damage", ["missing_journal", "stale_source", "sentinel", "offset", "timestamp", "jpeg"])
+@pytest.mark.parametrize("damage", ["stale_server_hash", "stale_source", "sentinel", "offset", "timestamp", "jpeg"])
 def test_untrusted_or_malformed_bif_is_never_recovered(bound_bif, damage):
     plan, bif, output = bound_bif
     data = bytearray(bif.read_bytes())
-    if damage == "missing_journal":
-        for meta in bif.parent.glob("*.meta"):
-            meta.unlink()
+    if damage == "stale_server_hash":
+        plan.target.bundle_hash = "0" * 40
     elif damage == "stale_source":
         source = Path(plan.canonical_path)
         source.write_bytes(b"replacement")
@@ -143,7 +145,7 @@ def test_untrusted_or_malformed_bif_is_never_recovered(bound_bif, damage):
     else:
         at = struct.unpack_from("<I", data, 76)[0]
         data[at : at + 10] = b"not a jpeg"
-    if damage not in {"missing_journal", "stale_source"}:
+    if damage not in {"stale_server_hash", "stale_source"}:
         bif.write_bytes(data)
     assert recovery.recover_bif_frame(plan, SimpleNamespace(start_ms=1000, end_ms=3000), output) is None
     assert not output.exists()
@@ -152,7 +154,14 @@ def test_untrusted_or_malformed_bif_is_never_recovered(bound_bif, damage):
 def test_proven_index_damage_bypasses_ffmpeg_even_when_it_would_return_success(bound_bif, monkeypatch):
     plan, _bif, _output = bound_bif
     chapter = SimpleNamespace(index=1, start_ms=1000, end_ms=3000, thumb_url="")
-    plan.target = SimpleNamespace(chapters=[chapter], machine_identifier="m", rating_key=1, media_id=2, part_id=3)
+    plan.target = SimpleNamespace(
+        chapters=[chapter],
+        machine_identifier="m",
+        rating_key=1,
+        media_id=2,
+        part_id=3,
+        bundle_hash=plan.target.bundle_hash,
+    )
     plan.profile = {}
     plan.server = MagicMock()
     plan.manifest_path = plan.folder / "chapter-thumbnails.mpg.json"
@@ -226,6 +235,7 @@ def test_one_failed_seek_switches_remaining_chapters_to_safe_recovery(bound_bif,
         rating_key=1,
         media_id=2,
         part_id=3,
+        bundle_hash=plan.target.bundle_hash,
     )
     plan.profile = {}
     plan.server = MagicMock()
@@ -261,11 +271,9 @@ def test_one_failed_seek_switches_remaining_chapters_to_safe_recovery(bound_bif,
     assert all(entry["recovery"]["cause"] == expected_cause for entry in chapters._fresh_images(plan).values())
 
 
-def test_known_bad_index_without_strong_bif_binding_stops_without_automatic_retry(bound_bif, monkeypatch):
-    plan, bif, _output = bound_bif
-    for meta in bif.parent.glob("*.meta"):
-        meta.unlink()
-    plan.target = SimpleNamespace(chapters=[SimpleNamespace(index=1, start_ms=1000, end_ms=3000)])
+def test_known_bad_index_without_a_bif_matching_the_content_hash_stops_without_automatic_retry(bound_bif, monkeypatch):
+    plan, _bif, _output = bound_bif
+    plan.target = SimpleNamespace(chapters=[SimpleNamespace(index=1, start_ms=1000, end_ms=3000)], bundle_hash="0" * 40)
     plan.profile = {}
     plan.manifest_path = plan.folder / "chapter-thumbnails.mpg.json"
     monkeypatch.setattr(

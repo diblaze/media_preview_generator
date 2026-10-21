@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, cast
 
 from loguru import logger
 
-from ..output.plex_hash import SourceFingerprint
 from ..servers.plex_scheduled_jobs import read_settings, should_hold
 
 if TYPE_CHECKING:
@@ -40,9 +39,6 @@ class HeldReread:
     canonical_path: str
     item_id: str | None
     library_id: str | None
-    output_paths: tuple[str, ...]
-    token: str | None
-    source_fingerprint: SourceFingerprint | None
     held_at: float
 
 
@@ -60,39 +56,18 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 def _from_row(server_id: str, canonical_path: str, payload: str, held_at: float) -> HeldReread:
     data = json.loads(payload)
-    fingerprint = data.get("source_fingerprint")
     return HeldReread(
         server_id=server_id,
         canonical_path=canonical_path,
         item_id=data.get("item_id"),
         library_id=data.get("library_id"),
-        output_paths=tuple(data.get("output_paths") or ()),
-        token=data.get("token"),
-        source_fingerprint=tuple(fingerprint) if fingerprint else None,
         held_at=held_at,
     )
 
 
-def hold(
-    server_id: str,
-    canonical_path: str,
-    *,
-    item_id: str | None,
-    library_id: str | None,
-    output_paths: tuple[Path, ...],
-    token: str | None,
-    source_fingerprint: SourceFingerprint | None,
-) -> None:
+def hold(server_id: str, canonical_path: str, *, item_id: str | None, library_id: str | None) -> None:
     """Remember a request to re-read ``canonical_path`` later, replacing any earlier one for it."""
-    payload = json.dumps(
-        {
-            "item_id": item_id,
-            "library_id": library_id,
-            "output_paths": [str(p) for p in output_paths],
-            "token": token,
-            "source_fingerprint": list(source_fingerprint) if source_fingerprint else None,
-        }
-    )
+    payload = json.dumps({"item_id": item_id, "library_id": library_id})
     with _lock, _connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO held (server_id, canonical_path, payload, held_at) VALUES (?, ?, ?, ?)",
@@ -122,6 +97,19 @@ def entries(server_id: str | None = None) -> list[HeldReread]:
             "Could not read {}: {}. Held Plex re-reads are forgotten; the next job asks again.", _DB_NAME, exc
         )
         return []
+
+
+def is_held(server_id: str, canonical_path: str) -> bool:
+    """Whether a request for this file waits for its server's maintenance window; an unreadable list says no."""
+    try:
+        with _lock, _connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM held WHERE server_id = ? AND canonical_path = ?", (server_id, canonical_path)
+            ).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("Could not read {}: {}", _DB_NAME, exc)
+        return False
+    return row is not None
 
 
 def held_paths(server_id: str) -> set[str]:
@@ -175,8 +163,5 @@ def flush_held_rereads() -> None:
                 entry.canonical_path,
                 entry.item_id,
                 library_id=entry.library_id,
-                output_paths=tuple(Path(p) for p in entry.output_paths),
-                notification_token=entry.token,
-                source_fingerprint=entry.source_fingerprint,
             )
         slots -= len(due)

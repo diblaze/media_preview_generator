@@ -20,7 +20,7 @@ from media_preview_generator.markers.publishers.base import PublishError
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, encode_extra_data
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
-from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
+from tests.conftest import CTIME_ONLY_CHANGES, RECORDED_SOURCE_CHANGES, change_ctime_only, change_source
 
 from .plex_fixture import SD_FLAG, FakeLocalDb, build_plex_db, write_bif
 
@@ -115,15 +115,7 @@ def test_a_made_preview_waiting_for_plexs_window_is_counted_waiting_not_not_show
     from media_preview_generator.processing import plex_held_rereads
 
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    plex_held_rereads.hold(
-        "s1",
-        "/m/b.mkv",
-        item_id="2",
-        library_id="1",
-        output_paths=(),
-        token=None,
-        source_fingerprint=None,
-    )
+    plex_held_rereads.hold("s1", "/m/b.mkv", item_id="2", library_id="1")
     write_bif(tmp_path / "plex", "bb22")
     write_bif(tmp_path / "plex", "cc33")
     items = [
@@ -143,9 +135,7 @@ def test_a_path_held_for_another_server_is_still_not_showing(monkeypatch, tmp_pa
     from media_preview_generator.processing import plex_held_rereads
 
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
-    plex_held_rereads.hold(
-        "other", "/m/b.mkv", item_id=None, library_id=None, output_paths=(), token=None, source_fingerprint=None
-    )
+    plex_held_rereads.hold("other", "/m/b.mkv", item_id=None, library_id=None)
     write_bif(tmp_path / "plex", "bb22")
 
     result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), [_movie("B", "/m/b.mkv", "bb22", None)])
@@ -546,7 +536,16 @@ def test_chapter_manifest_still_describes_a_file_whose_change_time_moved(tmp_pat
     assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "cant_do"
 
 
-@pytest.mark.parametrize("how", SOURCE_CHANGES)
+def test_chapter_manifest_still_describes_a_moved_file(tmp_path):
+    """Unraid's mover or a remount gives the file a new inode with the same bytes and mtime (#414)."""
+    media, part = _manifest_part(tmp_path)
+
+    change_source(media, "inode")
+
+    assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "cant_do"
+
+
+@pytest.mark.parametrize("how", RECORDED_SOURCE_CHANGES)
 def test_chapter_manifest_of_a_changed_file_is_a_to_do(tmp_path, how):
     media, part = _manifest_part(tmp_path)
 

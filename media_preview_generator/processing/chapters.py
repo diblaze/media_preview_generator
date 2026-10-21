@@ -26,6 +26,7 @@ from ..output.plex_hash import (
     SourceFingerprint,
     calculate_plex_hash,
     get_source_fingerprint,
+    same_recorded_source,
     same_source,
 )
 from .chapter_recovery import inspect_seek_index, recover_bif_frame
@@ -279,7 +280,10 @@ def _unsupported_stamp(plan: ChapterPlan) -> str | None:
     """Return the skip message when this exact file and profile were already found unsupported or failing."""
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if (
+            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
+            or manifest.get("profile") != plan.profile
+        ):
             return None
         reason = manifest.get("unsupported")
         if isinstance(reason, str) and reason:
@@ -323,7 +327,10 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
     target = cast("ChapterTarget", plan.target)
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if (
+            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
+            or manifest.get("profile") != plan.profile
+        ):
             return {}
         entries = manifest.get("images", {})
         fresh = {}
@@ -377,7 +384,10 @@ def _stamp_manifest(plan: ChapterPlan, proven: dict[str, tuple[dict, dict]]) -> 
         return
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if (
+            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
+            or manifest.get("profile") != plan.profile
+        ):
             return
         entries = manifest.get("images", {})
         changed = False
@@ -442,7 +452,10 @@ def _other_items_verified(plan: ChapterPlan, key: dict) -> list[dict]:
     """
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if (
+            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
+            or manifest.get("profile") != plan.profile
+        ):
             return []
         found = [manifest.get("verified"), *(manifest.get("also_verified") or [])]
     except (OSError, ValueError, AttributeError, TypeError):

@@ -18,7 +18,6 @@ from pymediainfo import MediaInfo
 from media_preview_generator.markers.publishers import plex_chapters as plex_chapters_module
 from media_preview_generator.markers.publishers import plex_db
 from media_preview_generator.markers.publishers.plex_chapters import LocalChapters
-from media_preview_generator.output.journal import write_meta
 from media_preview_generator.output.plex_bundle import PlexBundleAdapter
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapters
@@ -87,8 +86,8 @@ def steady_state(tmp_path, mock_config, monkeypatch):
             INSERT INTO taggings VALUES(2,1,9,2,1000,2000,'',NULL);
         """)
         conn.execute(
-            "INSERT INTO media_parts(id,media_item_id,file,hash,size,updated_at) VALUES(20,10,?,?,?,100)",
-            (str(source), bundle_hash, source.stat().st_size),
+            "INSERT INTO media_parts(id,media_item_id,file,hash,size,updated_at,extra_data) VALUES(20,10,?,?,?,100,?)",
+            (str(source), bundle_hash, source.stat().st_size, '{"mi:indexes":"sd"}'),
         )
         conn.commit()
     mountinfo = tmp_path / "mountinfo"
@@ -132,7 +131,6 @@ def steady_state(tmp_path, mock_config, monkeypatch):
     bif = PlexBundleAdapter.bundle_bif_path(str(plex_folder), bundle_hash)
     bif.parent.mkdir(parents=True)
     bif.write_bytes(b"existing BIF")
-    write_meta([bif], str(source), source_fingerprint=get_source_fingerprint(source))
 
     # Done chapter images and manifest, produced by the real publisher with extraction and registration stubbed.
     target = ChapterTarget(
@@ -221,7 +219,9 @@ def test_done_file_check_reads_little_when_nothing_is_left_to_do(steady_state):
     # the preview half's own stat after chapter planning (a file replaced meanwhile is judged as it is then).
     assert counts.source_stats <= 6
     assert counts.http == ["/identity", "/tree"]
-    assert (counts.db_connects, counts.guards, counts.schema_checks) == (1, 1, 1)
+    # Two connects: the chapter check's, and one read of Plex's part table for the skipped BIF's preview flag, which
+    # every file shares for five minutes (a real bulk scan makes that read anyway for part hashes; stubbed here).
+    assert (counts.db_connects, counts.guards, counts.schema_checks) == (2, 1, 1)
     assert counts.jpeg_decodes == 0
 
 
@@ -234,7 +234,8 @@ def test_second_file_reuses_plex_identity_and_database_checks(steady_state):
     assert counts.http == ["/identity", "/tree", "/tree"]
     assert (counts.guards, counts.schema_checks) == (1, 1)
     # The database is opened per file: holding it between files would block Plex's own writers.
-    assert counts.db_connects == 2
+    # Plus the one shared read of Plex's part table (see the test above).
+    assert counts.db_connects == 3
     assert counts.source_stats <= 12
     assert counts.jpeg_decodes == 0
 

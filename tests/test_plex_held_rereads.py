@@ -1,6 +1,5 @@
 """Held Plex re-reads: the durable list and the flush that sends them once Plex's window opens."""
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,13 +14,7 @@ def _config_dir(monkeypatch, tmp_path):
 
 
 def _hold(server_id="plex-1", path="/media/a.mkv", **kwargs):
-    fields = {
-        "item_id": "42",
-        "library_id": "1",
-        "output_paths": (Path("/out/index-sd.bif"),),
-        "token": "tok",
-        "source_fingerprint": (1, 2, 3, 4, 5),
-    }
+    fields = {"item_id": "42", "library_id": "1"}
     held.hold(server_id, path, **{**fields, **kwargs})
 
 
@@ -34,28 +27,48 @@ def test_hold_round_trips_every_field_through_the_file():
         "42",
         "1",
     )
-    assert entry.output_paths == ("/out/index-sd.bif",)
-    assert entry.token == "tok"
-    assert entry.source_fingerprint == (1, 2, 3, 4, 5)
     assert entry.held_at > 0
 
 
 def test_missing_optional_fields_round_trip_as_none():
-    _hold(item_id=None, library_id=None, token=None, source_fingerprint=None, output_paths=())
+    _hold(item_id=None, library_id=None)
     [entry] = held.entries()
-    assert (entry.item_id, entry.library_id, entry.token, entry.source_fingerprint, entry.output_paths) == (
-        None,
-        None,
-        None,
-        None,
-        (),
-    )
+    assert (entry.item_id, entry.library_id) == (None, None)
+
+
+def test_a_request_held_by_an_older_version_still_reads(tmp_path):
+    """Before #414 a held request also carried the Plex note's reminder; those fields are ignored now."""
+    import json
+    import sqlite3
+
+    old = {"item_id": "42", "library_id": "1", "output_paths": ["/o.bif"], "token": "t", "source_fingerprint": [1]}
+    with sqlite3.connect(tmp_path / "plex_held_rereads.db") as conn:
+        conn.execute(held._SCHEMA)
+        conn.execute("INSERT INTO held VALUES ('plex-1', '/media/a.mkv', ?, 1.0)", (json.dumps(old),))
+
+    [entry] = held.entries()
+    assert (entry.canonical_path, entry.item_id, entry.library_id) == ("/media/a.mkv", "42", "1")
+    assert held.is_held("plex-1", "/media/a.mkv")
 
 
 def test_hold_replaces_the_earlier_request_for_the_same_file():
-    _hold(token="old")
-    _hold(token="new")
-    assert [e.token for e in held.entries()] == ["new"]
+    _hold(item_id="1")
+    _hold(item_id="2")
+    assert [e.item_id for e in held.entries()] == ["2"]
+
+
+def test_is_held_is_per_server_and_file(tmp_path):
+    _hold("plex-1", "/media/a.mkv")
+    assert held.is_held("plex-1", "/media/a.mkv")
+    assert not held.is_held("plex-2", "/media/a.mkv")
+    assert not held.is_held("plex-1", "/media/b.mkv")
+    held.release("plex-1", "/media/a.mkv")
+    assert not held.is_held("plex-1", "/media/a.mkv")
+
+
+def test_an_unreadable_list_holds_nothing(tmp_path):
+    (tmp_path / "plex_held_rereads.db").write_text("not a database")
+    assert not held.is_held("plex-1", "/media/a.mkv")
 
 
 def test_release_forgets_only_that_file_and_ignores_unknown_ones():
@@ -127,12 +140,7 @@ def test_flush_sends_only_servers_whose_hold_no_longer_applies(monkeypatch):
     enqueue.assert_called_once()
     args, kwargs = enqueue.call_args
     assert (args[0].id, args[1], args[2]) == ("plex-1", "/media/a.mkv", "42")
-    assert kwargs == {
-        "library_id": "1",
-        "output_paths": (Path("/out/index-sd.bif"),),
-        "notification_token": "tok",
-        "source_fingerprint": (1, 2, 3, 4, 5),
-    }
+    assert kwargs == {"library_id": "1"}
     # The worker releases an entry once Plex answers, so the flush leaves both in place.
     assert held.held_paths("plex-2") == {"/media/b.mkv"}
     assert held.held_paths("plex-1") == {"/media/a.mkv"}

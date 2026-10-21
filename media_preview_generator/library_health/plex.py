@@ -29,9 +29,10 @@ from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
 from ..output.plex_bundle import PlexBundleAdapter
-from ..output.plex_hash import get_source_fingerprint, same_source
+from ..output.plex_hash import get_source_fingerprint, same_recorded_source
 from ..processing import plex_held_rereads
 from ..servers.base import MediaServer, ServerConfig
+from ..servers.plex import preview_flag_shown
 from .markers_db import path_key
 from .models import Cell, CellState, CheckCancelled, Feature, LibraryResult, ServerResult, TodoFile
 from .plex_rows import query_rows
@@ -49,8 +50,6 @@ _BIF_THREADS = 8
 _BIF_CHUNK = 2000
 _MOVIE = 1
 _EPISODE = 4
-_SD_FLAG = '"mi:indexes":"sd"'
-_SD_FLAG_URL_FORM = "mi%3Aindexes=sd"
 
 
 @dataclass
@@ -195,17 +194,6 @@ def _episode_title(show: str | None, season_index: int | None, index: int | None
     return f"{show} – S{season_index or 0:02d}E{index or 0:02d} – {title}"
 
 
-def _preview_flag_shown(extra_data: str) -> bool:
-    """Whether Plex's own flag says the item has previews (``mi:indexes`` is ``sd``)."""
-    if _SD_FLAG in extra_data:
-        return True
-    try:
-        data = json.loads(extra_data)
-    except ValueError:
-        return _SD_FLAG_URL_FORM in extra_data
-    return isinstance(data, dict) and data.get("mi:indexes") == "sd"
-
-
 def _bif_exists(plex_config_folder: str, bundle_hash: str) -> bool:
     try:
         return os.stat(PlexBundleAdapter.bundle_bif_path(plex_config_folder, bundle_hash)).st_size > 0
@@ -315,7 +303,9 @@ def _chapter_manifest_state(folder: str, part: _Part, missing: set[int]) -> str:
     )
     try:
         manifest = json.loads(manifest_path.read_text())
-        if not isinstance(manifest, dict) or not same_source(manifest.get("source"), get_source_fingerprint(part.path)):
+        if not isinstance(manifest, dict) or not same_recorded_source(
+            manifest.get("source"), get_source_fingerprint(part.path)
+        ):
             return "todo"
     except (OSError, ValueError):
         return "todo"
@@ -419,7 +409,7 @@ def _tally_library(
             cell.total += 1
             if part.bif_ok:
                 cell.done += 1
-                if not _preview_flag_shown(part.extra_data):
+                if not preview_flag_shown(part.extra_data):
                     if unicodedata.normalize("NFC", part.path) in held_paths:
                         cell.waiting += 1
                     else:

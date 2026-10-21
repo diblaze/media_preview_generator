@@ -15,7 +15,7 @@ import os
 import threading
 import time
 import unicodedata
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -66,12 +66,49 @@ _ANALYZE_RETRY_DELAY_S = 2.0
 
 # A bulk scan reads every part's bundle hash from Plex's database at once instead of asking /tree once per file: Plex
 # answers those one at a time (70-150 ms each under a scan's load, against 0.4 s to read a 117k-file library, sflix
-# 2026-10-15). Read again once older than this, so a file Plex re-hashes during a long job is seen within that time.
+# 2026-10-15). The same read gives each part's preview flag to any job that skips an existing BIF. Read again once
+# older than this, so a file Plex re-hashes during a long job is seen within that time.
 _BUNDLE_PARTS_READ_TTL_S = 300.0
 # Short: /tree answers while the database is busy (a marker write holding it), so nothing waits on it for long.
 _BUNDLE_PARTS_READ_DEADLINE_S = 2.0
 # Read to tell whether Plex's database is on a local disk (tests point it at their own).
 _MOUNTINFO_PATH = "/proc/self/mountinfo"
+
+_SD_FLAG = '"mi:indexes":"sd"'
+_SD_FLAG_URL_FORM = "mi%3Aindexes=sd"
+
+
+def preview_flag_shown(extra_data: str) -> bool:
+    """Whether Plex's own flag says the part has previews (``mi:indexes`` is ``sd``).
+
+    Args:
+        extra_data: A part's ``media_parts.extra_data`` value.
+
+    Returns:
+        True when the flag is set.
+    """
+    if _SD_FLAG in extra_data:
+        return True
+    try:
+        data = json.loads(extra_data)
+    except ValueError:
+        return _SD_FLAG_URL_FORM in extra_data
+    return isinstance(data, dict) and data.get("mi:indexes") == "sd"
+
+
+# ``preview_flag_shown`` in SQL, so a read of every part fetches a 0/1 instead of each part's ``extra_data``.
+# SQLite doesn't short-circuit AND, so json_extract sits behind a CASE: it raises on text that isn't JSON.
+_SQL_PREVIEW_FLAG = (
+    "CASE WHEN mp.extra_data IS NULL THEN 0"
+    ' WHEN instr(mp.extra_data, \'"mi:indexes":"sd"\') > 0 THEN 1'
+    " WHEN json_valid(mp.extra_data) THEN coalesce(json_extract(mp.extra_data, '$.\"mi:indexes\"') = 'sd', 0)"
+    " ELSE instr(mp.extra_data, 'mi%3Aindexes=sd') > 0 END"
+)
+
+
+def _flag_key(path: str) -> str:
+    """A part's file path in the form used to compare Plex's paths with ours."""
+    return unicodedata.normalize("NFC", path.replace("\\", "/"))
 
 
 def _pref_bool(value: Any) -> bool | None:
@@ -207,9 +244,11 @@ class PlexServer(MediaServer):
         self._hidden_types: dict[str, frozenset[str]] = {}
         self._hidden_locks: dict[str, threading.Lock] = {}
         self._hidden_guard = threading.Lock()
-        # Bulk scans' read of every part from Plex's database (``_parts_from_database``): None until read, or after a
-        # read that failed (then /tree answers until the next read is due).
+        # The read of every part from Plex's database (``_database_read``; part hashes for bulk scans, preview flags for
+        # any job): None until read, or after a read that failed (then /tree and the API answer until the next is due).
         self._db_parts: dict[str, list[tuple[str, str, int]]] | None = None
+        # The same read's preview flag per file path (NFC, forward slashes), then per ratingKey holding that file.
+        self._db_preview_flags: dict[str, dict[str, bool]] | None = None
         self._db_parts_read_at: float | None = None
         self._db_parts_reading = False
         self._db_parts_lock = threading.Lock()
@@ -2149,7 +2188,7 @@ class PlexServer(MediaServer):
         Every episode sharing the file is analyzed, and a request Plex skipped is sent once more.
         An item that already shows the previews is not analyzed again.
         Return True once Plex has run Analyze (it answers only after finishing, so chapter registration can
-        follow); unresolved items remain pending.
+        follow); False when the item can't be resolved yet, so a later job asks again.
         """
         if not item_id:
             self.trigger_refresh(item_id=None, remote_path=canonical_path)
@@ -2197,24 +2236,19 @@ class PlexServer(MediaServer):
         )
         return True
 
-    def _items_holding_file(self, plex: Any, bare_id: str, canonical_path: str) -> dict[str, bool]:
-        """Map each Plex item holding this file to whether its copy of the part carries the preview flag.
+    def _file_flag_reader(self, canonical_path: str) -> Callable[[Any], bool | None]:
+        """A reader of one Plex item's XML: whether its copy of this file's part carries the preview flag.
 
-        Plex keeps a separate item, with its own copy of the part, for each episode of a multi-episode file, and
-        Analyze on one episode leaves the others unflagged, so their previews never show. The item is missing
-        from the result when this file can't be told apart among its parts.
+        The reader gives None when this file can't be told apart among the item's parts.
         """
         from ..config.paths import expand_path_mapping_candidates
 
-        exact = {
-            unicodedata.normalize("NFC", path)
-            for path in expand_path_mapping_candidates(canonical_path, self.path_mappings)
-        }
+        exact = {_flag_key(path) for path in expand_path_mapping_candidates(canonical_path, self.path_mappings)}
         tail = "/".join(canonical_path.replace("\\", "/").rstrip("/").split("/")[-2:])
 
         def flagged(video: Any) -> bool | None:
             parts = list(video.iter("Part"))
-            files = [unicodedata.normalize("NFC", str(part.get("file") or "").replace("\\", "/")) for part in parts]
+            files = [_flag_key(str(part.get("file") or "")) for part in parts]
             mine = [part for part, file in zip(parts, files, strict=True) if file in exact]
             if not mine:
                 # Roots differ when no mapping is set up; folder + file name only counts when it picks one part,
@@ -2224,6 +2258,61 @@ class PlexServer(MediaServer):
                     return None
             return all(part.get("indexes") == "sd" for part in mine)
 
+        return flagged
+
+    def unshown_item(self, canonical_path: str, item_id: str | None) -> str | None:
+        """The Plex item holding this file whose previews Plex doesn't advertise yet, to send Analyze to.
+
+        A BIF written after Plex scanned an item is served, but Plex doesn't advertise it (no flag) until Analyze runs.
+        Plex's database answers when this client can read it; otherwise the item's own API record does, after a
+        lookup by path when no item id is known (webhook and path-only jobs).
+
+        Args:
+            canonical_path: The media file.
+            item_id: Plex item id when known.
+
+        Returns:
+            The bare item id when its part for this file has no preview flag; None when Plex shows the previews or it
+            can't be told.
+        """
+        from ..config.paths import expand_path_mapping_candidates
+
+        bare_id = str(item_id or "").rsplit("/", 1)[-1]
+        if not bare_id.isdecimal():
+            bare_id = ""
+        _parts, flags = self._database_read()
+        if flags is not None:
+            for candidate in expand_path_mapping_candidates(canonical_path, self.path_mappings):
+                items = flags.get(_flag_key(candidate))
+                if items is None:
+                    continue
+                if bare_id:
+                    if bare_id in items:
+                        return None if items[bare_id] else bare_id
+                    continue
+                # Analyze flags only the item it's sent to, so each item holding the file answers for itself.
+                dark = sorted((item for item, shown in items.items() if not shown), key=int)
+                return dark[0] if dark else None
+        try:
+            if not bare_id:
+                bare_id = str(self.resolve_remote_path_to_item_id(canonical_path) or "").rsplit("/", 1)[-1]
+                if not bare_id.isdecimal():
+                    return None
+            video = self._connect().query(f"/library/metadata/{bare_id}").find("Video")
+            shown = None if video is None else self._file_flag_reader(canonical_path)(video)
+        except Exception as exc:
+            logger.debug("Could not read Plex's preview flag for {}: {}", canonical_path, exc)
+            return None
+        return bare_id if shown is False else None
+
+    def _items_holding_file(self, plex: Any, bare_id: str, canonical_path: str) -> dict[str, bool]:
+        """Map each Plex item holding this file to whether its copy of the part carries the preview flag.
+
+        Plex keeps a separate item, with its own copy of the part, for each episode of a multi-episode file, and
+        Analyze on one episode leaves the others unflagged, so their previews never show. The item is missing
+        from the result when this file can't be told apart among its parts.
+        """
+        flagged = self._file_flag_reader(canonical_path)
         items: dict[str, bool] = {}
         video = plex.query(f"/library/metadata/{bare_id}").find("Video")
         if video is None or (own := flagged(video)) is None:
@@ -2312,27 +2401,45 @@ class PlexServer(MediaServer):
             Its parts with a hash; None when the item isn't in the read (added since) or the database can't be read,
             so the caller asks /tree.
         """
+        parts, _flags = self._database_read()
+        return None if parts is None else parts.get(bare_id)
+
+    def _database_read(
+        self,
+    ) -> tuple[dict[str, list[tuple[str, str, int]]] | None, dict[str, dict[str, bool]] | None]:
+        """This client's latest read of Plex's database, made again once ``_BUNDLE_PARTS_READ_TTL_S`` has passed.
+
+        Returns:
+            Parts per ratingKey and preview flags per file path, each None when the database can't be read.
+        """
         with self._db_parts_lock:
             started = time.monotonic()
             due = not self._db_parts_reading and (
                 self._db_parts_read_at is None or started - self._db_parts_read_at > _BUNDLE_PARTS_READ_TTL_S
             )
             self._db_parts_reading |= due
-            parts = self._db_parts
+            parts, flags = self._db_parts, self._db_preview_flags
         if due:
             # Read outside the lock: the other workers keep the last read (or ask /tree) meanwhile, never waiting on it.
+            parts = flags = None
             try:
-                parts = self._read_parts_from_database()
+                read = self._read_parts_from_database()
+                parts, flags = read if read is not None else (None, None)
             finally:
                 with self._db_parts_lock:
-                    self._db_parts, self._db_parts_read_at, self._db_parts_reading = parts, started, False
-        return None if parts is None else parts.get(bare_id)
+                    self._db_parts, self._db_preview_flags = parts, flags
+                    self._db_parts_read_at, self._db_parts_reading = started, False
+        return parts, flags
 
-    def _read_parts_from_database(self) -> dict[str, list[tuple[str, str, int]]] | None:
-        """Every item's live parts with a hash, keyed by ratingKey; None without a Plex config folder, when the database
-        isn't on a local disk or Plex doesn't hold it open through this same file (SQLite's shared index of a database in
-        use can't be kept right across machines or two cached views of one file: even a reader could damage Plex's),
-        or when it can't be read."""
+    def _read_parts_from_database(
+        self,
+    ) -> tuple[dict[str, list[tuple[str, str, int]]], dict[str, dict[str, bool]]] | None:
+        """Every item's live parts with a hash, keyed by ratingKey, and Plex's preview flag per item and file path.
+
+        Returns None without a Plex config folder, when the database isn't on a local disk or Plex doesn't hold it open
+        through this same file (SQLite's shared index of a database in use can't be kept right across machines or two
+        cached views of one file: even a reader could damage Plex's), or when it can't be read.
+        """
         folder = str(
             ((self._server_config.output or {}) if self._server_config else {}).get("plex_config_folder") or ""
         )
@@ -2356,7 +2463,8 @@ class PlexServer(MediaServer):
         try:
             with database._database(read_only=True, deadline=started + _BUNDLE_PARTS_READ_DEADLINE_S) as conn:
                 rows = conn.execute(
-                    "SELECT mi.metadata_item_id, mp.hash, mp.file, mp.size FROM media_parts mp "
+                    "SELECT mi.metadata_item_id, mp.hash, mp.file, mp.size, "
+                    f"{_SQL_PREVIEW_FLAG} FROM media_parts mp "
                     "JOIN media_items mi ON mi.id = mp.media_item_id "
                     "WHERE mp.deleted_at IS NULL AND mi.deleted_at IS NULL"
                 ).fetchall()
@@ -2364,13 +2472,17 @@ class PlexServer(MediaServer):
             logger.debug("[{}] Can't read part hashes from Plex's database ({}); asking Plex per file", self.name, exc)
             return None
         parts: dict[str, list[tuple[str, str, int]]] = {}
-        for item, bundle_hash, file_path, size in rows:
+        flags: dict[str, dict[str, bool]] = {}
+        for item, bundle_hash, file_path, size, flagged in rows:
             entry = parts.setdefault(str(item), [])
             if bundle_hash and file_path:
                 entry.append((str(bundle_hash), str(file_path), size if isinstance(size, int) else -1))
+            if file_path:
+                items = flags.setdefault(_flag_key(str(file_path)), {})
+                items[str(item)] = items.get(str(item), True) and bool(flagged)
         logger.debug("[{}] Read {} part hashes from Plex's database in {:.2f} s", self.name, len(rows),
                      time.monotonic() - started)  # fmt: skip
-        return parts
+        return parts, flags
 
     def get_external_ids(self, item_id: str) -> dict[str, Any] | None:
         """Plex guids (``includeGuids=1``).

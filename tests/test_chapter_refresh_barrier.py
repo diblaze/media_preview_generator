@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from media_preview_generator.output.journal import mark_plex_refresh_pending, write_meta
 from media_preview_generator.processing import chapters, multi_server
 from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.processing.multi_server import (
@@ -99,14 +98,14 @@ def test_queue_worker_cannot_wait_for_itself():
         queue.close()
 
 
-def _pipeline(plan, monkeypatch, *, required=True, outputs=()):
+def _pipeline(plan, monkeypatch, *, required=True, outputs=(), status=PublisherStatus.PUBLISHED):
     registry = _registry(plan)
     plan.server = registry.get("plex")
     publisher = PublisherResult(
         "plex",
         "Plex",
         "plex_bundle",
-        PublisherStatus.PUBLISHED,
+        status,
         output_paths=list(outputs),
         plex_refresh_requested=required,
     )
@@ -147,9 +146,9 @@ def test_delayed_analyze_then_fresh_registration_reuses_all_jpegs(plan, config, 
 
     def wait(server_id, path, **kwargs):
         assert (server_id, path) == ("plex", plan.canonical_path)
-        assert kwargs == {"required": True, "cancel_check": cancel_check}
+        assert kwargs == {"required": True, "timeout": 30.0, "cancel_check": cancel_check}
         waiting.set()
-        return queue.wait(server_id, path, timeout=2, **kwargs)
+        return queue.wait(server_id, path, **{**kwargs, "timeout": 2})
 
     monkeypatch.setattr(multi_server, "wait_for_plex_refresh", wait)
 
@@ -182,7 +181,7 @@ def test_delayed_analyze_then_fresh_registration_reuses_all_jpegs(plan, config, 
         queue.close()
 
 
-@pytest.mark.parametrize("condition", ["failed_request", "pending_journal", "source_changed"])
+@pytest.mark.parametrize("condition", ["failed_request", "source_changed"])
 def test_unconfirmed_refresh_never_publishes_chapters(plan, config, extraction, monkeypatch, condition):
     bif = plan.folder.parent / "index-sd.bif"
     bif.write_bytes(b"bif")
@@ -197,9 +196,6 @@ def test_unconfirmed_refresh_never_publishes_chapters(plan, config, extraction, 
         return condition != "failed_request"
 
     monkeypatch.setattr(multi_server, "wait_for_plex_refresh", wait)
-    if condition == "pending_journal":
-        write_meta([bif], plan.canonical_path, publisher="plex_bundle", source_fingerprint=plan.source_fingerprint)
-        assert mark_plex_refresh_pending([bif], plan.canonical_path, "plex", source_fingerprint=plan.source_fingerprint)
     result = multi_server.process_canonical_path(plan.canonical_path, registry, config)
     assert result.publishers[0] is publisher
     outcome = publisher.artifacts["chapters"]
@@ -207,6 +203,36 @@ def test_unconfirmed_refresh_never_publishes_chapters(plan, config, extraction, 
     assert outcome["retryable"]
     assert bif.read_bytes() == b"bif"
     extraction[0].assert_not_called()
+    extraction[1].assert_not_called()
+
+
+def test_a_catch_up_analyze_for_a_skipped_preview_doesnt_hold_the_worker(plan, config, extraction, monkeypatch):
+    """The catch-up Analyze queues behind newly written previews, so the chapters retry on a later run."""
+    registry, _previews, publisher = _pipeline(plan, monkeypatch, status=PublisherStatus.SKIPPED_OUTPUT_EXISTS)
+    monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
+    started, release = Event(), Event()
+
+    def analyze(path, item_id):
+        started.set()
+        assert release.wait(2)
+        return True
+
+    plan.server.refresh_preview_metadata = analyze
+    queue = PlexRefreshQueue(idle_seconds=0.01)
+    wait = MagicMock(wraps=queue.wait)
+    monkeypatch.setattr(multi_server, "wait_for_plex_refresh", wait)
+    try:
+        assert queue.enqueue(plan.server, plan.canonical_path, "1", quiet=True)
+        assert started.wait(2)
+        result = multi_server.process_canonical_path(plan.canonical_path, registry, config)
+    finally:
+        release.set()
+        queue.close()
+    assert wait.call_args.kwargs["timeout"] == 0.0
+    assert wait.call_args.kwargs["required"] is True
+    outcome = result.publishers[0].artifacts["chapters"]
+    assert outcome["status"] == "waiting"
+    assert outcome["retryable"]
     extraction[1].assert_not_called()
 
 

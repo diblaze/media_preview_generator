@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -112,7 +113,7 @@ def _plex_with_database(
     tmp_path: Path, monkeypatch, rows, *, folder: bool = True, fs: str = "ext4", plex_holds_it: bool = True
 ):
     """A real PlexServer whose Plex config folder holds a WAL database (as Plex's is) with these
-    ``(item, hash, file, size[, part deleted, item deleted])`` parts on a disk of type ``fs``, and whose /tree answers
+    ``(item, hash, file, size[, part deleted, item deleted, extra_data])`` parts on a disk of type ``fs``, and whose /tree answers
     every item with TREE_HASH (counting the requests)."""
     import sqlite3
     from xml.etree import ElementTree as ET
@@ -131,14 +132,14 @@ def _plex_with_database(
     conn.execute("CREATE TABLE media_items (id INTEGER PRIMARY KEY, metadata_item_id INTEGER, deleted_at INTEGER)")
     conn.execute(
         "CREATE TABLE media_parts (id INTEGER PRIMARY KEY, media_item_id INTEGER, hash TEXT, file TEXT, size INTEGER, "
-        "deleted_at INTEGER)"
+        "deleted_at INTEGER, extra_data TEXT)"
     )
-    for n, (item, bundle_hash, file_path, size, *deleted) in enumerate(rows, start=1):
-        part_deleted, item_deleted = (deleted + [False, False])[:2]
+    for n, (item, bundle_hash, file_path, size, *more) in enumerate(rows, start=1):
+        part_deleted, item_deleted, extra_data = (more + [False, False, ""])[:3]
         conn.execute("INSERT INTO media_items VALUES (?, ?, ?)", (n, item, 1 if item_deleted else None))
         conn.execute(
-            "INSERT INTO media_parts VALUES (?, ?, ?, ?, ?, ?)",
-            (n, n, bundle_hash, file_path, size, 1 if part_deleted else None),
+            "INSERT INTO media_parts VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (n, n, bundle_hash, file_path, size, 1 if part_deleted else None, extra_data),
         )
     conn.commit()
     conn.close()
@@ -326,3 +327,133 @@ class TestBundlePartsFromPlexDatabase:
         )[0]
         assert _bundle_hash(path) == PLEX_HASH
         tree.assert_not_called()
+
+
+FLAGGED = json.dumps({"mi:indexes": "sd"})
+FLAGGED_URL_FORM = "url=media%3A%2F%2F&mi%3Aindexes=sd"
+
+
+def _item_xml(file_path: str, indexes: str | None):
+    from xml.etree import ElementTree as ET
+
+    flag = f' indexes="{indexes}"' if indexes else ""
+    return ET.fromstring(
+        f'<MediaContainer><Video ratingKey="7" type="movie"><Media><Part file="{file_path}"{flag}/></Media></Video>'
+        "</MediaContainer>"
+    )
+
+
+class TestUnshownItem:
+    """The Plex item to send Analyze to when Plex doesn't advertise a file's previews: from Plex's database when this
+    client can read it, else from the item's API record (found by path when no item id is known)."""
+
+    @pytest.mark.parametrize(
+        ("extra_data", "expected"),
+        [
+            (FLAGGED, None),
+            (FLAGGED_URL_FORM, None),
+            ("{}", "7"),
+            ("", "7"),
+            (None, "7"),
+            # The URL form only counts in Plex's url text, not inside another JSON field; text that isn't JSON
+            # must not fail the whole read.
+            ('{"url": "x&mi%3Aindexes=sd"}', "7"),
+            ("not json", "7"),
+            ('{"mi:indexes": "hd"}', "7"),
+        ],
+    )
+    @pytest.mark.parametrize("item_id", ["7", "/library/metadata/7", None], ids=["id", "key", "path-only"])
+    def test_the_database_answers_without_asking_the_api(self, tmp_path, monkeypatch, extra_data, expected, item_id):
+        server, query = _plex_with_database(
+            tmp_path, monkeypatch, [(7, DB_HASH, "/m/a.mkv", 100, False, False, extra_data)]
+        )
+
+        assert server.unshown_item("/m/a.mkv", item_id) == expected
+        query.assert_not_called()
+
+    def test_each_item_holding_the_file_answers_for_itself(self, tmp_path, monkeypatch):
+        """The same file in two libraries is two items; Analyze flags only the one it's sent to, so judging an item
+        by the other library's copy would ask Plex again on every scan."""
+        rows = [(7, DB_HASH, "/m/a.mkv", 100, False, False, FLAGGED), (8, DB_HASH, "/m/a.mkv", 100, False, False, "{}")]
+        server, query = _plex_with_database(tmp_path, monkeypatch, rows)
+
+        assert server.unshown_item("/m/a.mkv", "7") is None
+        assert server.unshown_item("/m/a.mkv", "8") == "8"
+        # A path-only job sends Analyze to the item that isn't flagged.
+        assert server.unshown_item("/m/a.mkv", None) == "8"
+        query.assert_not_called()
+
+    def test_a_path_only_job_picks_the_lowest_unflagged_item_id(self, tmp_path, monkeypatch):
+        """Numerically lowest, so every scan picks the same item (as text "10" would sort before "9")."""
+        rows = [(10, DB_HASH, "/m/a.mkv", 100, False, False, "{}"), (9, DB_HASH, "/m/a.mkv", 100, False, False, "{}")]
+        server, _ = _plex_with_database(tmp_path, monkeypatch, rows)
+
+        assert server.unshown_item("/m/a.mkv", None) == "9"
+
+    def test_a_deleted_part_does_not_count(self, tmp_path, monkeypatch):
+        rows = [(7, DB_HASH, "/m/a.mkv", 100, True, False, "{}"), (7, DB_HASH, "/m/a.mkv", 100, False, False, FLAGGED)]
+        server, _ = _plex_with_database(tmp_path, monkeypatch, rows)
+
+        assert server.unshown_item("/m/a.mkv", "7") is None
+
+    def test_a_path_mapping_finds_the_plex_side_path(self, tmp_path, monkeypatch):
+        server, query = _plex_with_database(
+            tmp_path, monkeypatch, [(7, DB_HASH, "/plex/a.mkv", 100, False, False, "{}")]
+        )
+        server._config.path_mappings = [{"remote_prefix": "/plex", "local_prefix": "/data"}]
+
+        assert server.unshown_item("/data/a.mkv", None) == "7"
+        query.assert_not_called()
+
+    def test_the_database_is_read_once_per_interval(self, tmp_path, monkeypatch):
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [(7, DB_HASH, "/m/a.mkv", 100, False, False, FLAGGED)])
+        reads = MagicMock(wraps=server._read_parts_from_database)
+        monkeypatch.setattr(server, "_read_parts_from_database", reads)
+
+        for _ in range(3):
+            assert server.unshown_item("/m/a.mkv", "7") is None
+        assert server.get_bundle_parts("7", quiet=True)
+        reads.assert_called_once_with()
+
+    @pytest.mark.parametrize(("indexes", "expected"), [("sd", None), (None, "7")])
+    def test_without_the_database_the_items_api_record_answers(self, tmp_path, monkeypatch, indexes, expected):
+        server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        query.return_value = _item_xml("/m/a.mkv", indexes)
+
+        assert server.unshown_item("/m/a.mkv", "/library/metadata/7") == expected
+        query.assert_called_once_with("/library/metadata/7")
+
+    @pytest.mark.parametrize(("resolved", "expected"), [("7", "7"), (None, None)])
+    def test_without_the_database_or_an_id_the_item_is_found_by_path(self, tmp_path, monkeypatch, resolved, expected):
+        server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        query.return_value = _item_xml("/m/a.mkv", None)
+        resolve = MagicMock(return_value=resolved)
+        monkeypatch.setattr(server, "resolve_remote_path_to_item_id", resolve)
+
+        assert server.unshown_item("/m/a.mkv", None) == expected
+        resolve.assert_called_once_with("/m/a.mkv")
+        if resolved:
+            query.assert_called_once_with("/library/metadata/7")
+        else:
+            query.assert_not_called()
+
+    def test_a_file_missing_from_the_database_falls_back_to_the_api(self, tmp_path, monkeypatch):
+        server, query = _plex_with_database(
+            tmp_path, monkeypatch, [(7, DB_HASH, "/m/a.mkv", 100, False, False, FLAGGED)]
+        )
+        query.return_value = _item_xml("/m/new.mkv", None)
+
+        assert server.unshown_item("/m/new.mkv", "9") == "9"
+        query.assert_called_once_with("/library/metadata/9")
+
+    def test_plex_not_answering_gives_no_item(self, tmp_path, monkeypatch):
+        server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        query.side_effect = ConnectionError("offline")
+
+        assert server.unshown_item("/m/a.mkv", "7") is None
+
+    def test_a_file_not_among_the_items_parts_gives_no_item(self, tmp_path, monkeypatch):
+        server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        query.return_value = _item_xml("/elsewhere/other/b.mkv", None)
+
+        assert server.unshown_item("/m/a.mkv", "7") is None

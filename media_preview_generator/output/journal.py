@@ -15,43 +15,33 @@ higher-quality copy), the existing outputs are now stale. Plain
 BIF for a different source.
 
 The ``.meta`` JSON sidecar records each source file's identity, size and
-nanosecond modification/change times; freshness compares all but the change
-time (``same_source``). New journals detect replacement by its new inode even
-when an importer preserves the original mtime and size. Older journals
-retain their mtime/size checks for existing-output compatibility.
-Cross-publisher reuse requires a matching strong fingerprint so old frames
+nanosecond modification/change times; freshness compares only the size and
+nanosecond modification time (``same_recorded_source``). Device and inode
+numbers change on every FUSE remount and every move between disks, so they
+would rebuild unchanged files (#414). Older journals retain their
+mtime-in-seconds/size checks for existing-output compatibility.
+Cross-publisher reuse requires a recorded fingerprint so old frames
 cannot seed a newly calculated Plex bundle after a source replacement.
 
-One output can serve several source files. Plex names a bundle after a
-hash of the file's *content*, so two copies of the same video (a
-re-grab next to the original, one download filed under two events) get
-the same ``index-sd.bif``. The journal keeps a fingerprint per source in
-``sources``; with only the last publisher's fingerprint, each copy found
-the other's stamp every night and rebuilt the shared BIF.
+Plex bundles are content-addressed (the path is a hash of the file's
+content), so they carry no ``.meta``; only Emby and Jellyfin outputs do.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import threading
-import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
 from loguru import logger
 
-from .plex_hash import SourceFingerprint, get_source_fingerprint, same_source
+from .plex_hash import SourceFingerprint, get_source_fingerprint, same_recorded_source
 
 #: Bumped whenever the on-disk schema changes. A sidecar in another schema
 #: proves nothing either way, so its output is judged like one with no
 #: sidecar (fresh); the next publish rewrites it in the current schema.
 JOURNAL_SCHEMA_VERSION = 1
-
-#: Serialises the read-merge-write of ``.meta`` files. Copies sharing an output
-#: can publish at the same moment from different workers; without this, both
-#: read the old sources and the last write drops the other's entry.
-_WRITE_LOCK = threading.Lock()
 
 
 def _meta_path_for(output: Path) -> Path:
@@ -64,24 +54,24 @@ def _meta_path_for(output: Path) -> Path:
     return output.with_suffix(output.suffix + ".meta")
 
 
-def _has_content(output: Path) -> bool:
-    """Whether an output is on disk with data in it.
+def outputs_have_content(output_paths: Sequence[Path]) -> bool:
+    """Whether there is at least one output and every one is on disk with data in it.
 
     A 0-byte file is what a power loss leaves when the name reached the disk
     before the data did; it holds no preview, so it counts as missing.
+
+    Args:
+        output_paths: Output files to check.
+
+    Returns:
+        True when ``output_paths`` is non-empty and every file is non-empty.
     """
+    if not output_paths:
+        return False
     try:
-        return output.stat().st_size > 0
+        return all(output.stat().st_size > 0 for output in output_paths)
     except OSError:
         return False
-
-
-def _fingerprint(source: dict) -> tuple[int, int] | None:
-    """Return a recorded source's ``(mtime, size)``, or ``None`` when the entry is unusable."""
-    try:
-        return int(source.get("mtime", -1)), int(source.get("size", -1))
-    except (TypeError, ValueError):
-        return None
 
 
 def _read_meta(meta_path: Path) -> dict | None:
@@ -102,28 +92,8 @@ def _read_meta(meta_path: Path) -> dict | None:
     return data
 
 
-def _sources_from_meta(data: dict) -> list[dict]:
-    sources = data.get("sources")
-    if isinstance(sources, list):
-        return [s for s in sources if isinstance(s, dict)]
-    return [
-        {
-            "path": data.get("source_path", ""),
-            "mtime": data.get("source_mtime", -1),
-            "size": data.get("source_size", -1),
-            **({"source_fingerprint": data["source_fingerprint"]} if "source_fingerprint" in data else {}),
-        }
-    ]
-
-
-def _read_sources(meta_path: Path) -> list[dict] | None:
-    """Read source records, including the legacy single-source journal shape."""
-    data = _read_meta(meta_path)
-    return _sources_from_meta(data) if data is not None else None
-
-
 def _write_meta_document(meta_path: Path, payload: dict) -> None:
-    """Replace a journal atomically; callers hold ``_WRITE_LOCK``."""
+    """Replace a journal atomically."""
     tmp_path = meta_path.with_suffix(meta_path.suffix + ".tmp")
     try:
         with open(tmp_path, "w") as fh:
@@ -141,11 +111,6 @@ def _write_meta_document(meta_path: Path, payload: dict) -> None:
             pass
 
 
-def _pending_refreshes(data: dict) -> list[dict]:
-    entries = data.get("plex_refresh_pending")
-    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
-
-
 def write_meta(
     output_paths: Sequence[Path],
     canonical_path: str,
@@ -160,12 +125,6 @@ def write_meta(
     (e.g. user manually deleted the others) still carries the
     fingerprint and the dispatcher can make a correct freshness call.
 
-    Other sources already recorded on an output are kept when they are the
-    same size as this one: they share the output because their content
-    matches (see the module docstring), so the rebuilt file still serves
-    them. A different size means one of them has changed since, so its
-    entry is dropped and it regenerates on its next dispatch.
-
     Failures here never bubble — at worst we miss a future short-circuit
     and re-run FFmpeg.
     """
@@ -177,157 +136,31 @@ def write_meta(
         # source comes back.
         return
 
-    this_source = {
-        "path": canonical_path,
-        "mtime": fingerprint[3] // 1_000_000_000,
-        "size": fingerprint[2],
+    source_mtime = fingerprint[3] // 1_000_000_000
+    source_size = fingerprint[2]
+    payload = {
+        "schema": JOURNAL_SCHEMA_VERSION,
+        "source_path": canonical_path,
+        "source_mtime": source_mtime,
+        "source_size": source_size,
         "source_fingerprint": list(fingerprint),
+        "publisher": publisher or "",
+        # Older app versions read ``sources``; keep it so a downgrade still understands the note.
+        "sources": [
+            {
+                "path": canonical_path,
+                "mtime": source_mtime,
+                "size": source_size,
+                "source_fingerprint": list(fingerprint),
+            }
+        ],
     }
-
     for output in output_paths:
-        meta_path = _meta_path_for(output)
         try:
-            with _WRITE_LOCK:
-                copies = []
-                for source in _read_sources(meta_path) or []:
-                    recorded = _fingerprint(source)
-                    if source.get("path") != canonical_path and recorded and recorded[1] == this_source["size"]:
-                        copies.append(source)
-                payload = {
-                    "schema": JOURNAL_SCHEMA_VERSION,
-                    "source_path": canonical_path,
-                    "source_mtime": this_source["mtime"],
-                    "source_size": this_source["size"],
-                    "source_fingerprint": this_source["source_fingerprint"],
-                    "publisher": publisher or "",
-                    "sources": [*copies, this_source],
-                }
-                # A publication for another source/server must not erase an
-                # outstanding notification on this shared Plex bundle.
-                pending = _pending_refreshes(_read_meta(meta_path) or {})
-                if pending:
-                    payload["plex_refresh_pending"] = pending
-                _write_meta_document(meta_path, payload)
+            _write_meta_document(_meta_path_for(output), payload)
         except OSError as exc:
-            # Don't let a read or write failure here mask a successful publish.
+            # Don't let a write failure here mask a successful publish.
             logger.debug("Could not write journal meta for {}: {}", output, exc)
-
-
-def mark_plex_refresh_pending(
-    output_paths: Sequence[Path],
-    canonical_path: str,
-    server_id: str,
-    *,
-    source_fingerprint: SourceFingerprint | None = None,
-) -> str | None:
-    """Record one publication's notification; return its token if persisted.
-
-    A new token distinguishes regenerations of the same unchanged source, so
-    an older in-flight Analyze cannot acknowledge the newer publication.
-    Only a source already stamped on the output can acquire a marker.
-    """
-    try:
-        fingerprint = source_fingerprint or get_source_fingerprint(canonical_path)
-    except OSError:
-        return None
-    token = uuid.uuid4().hex
-    marker = {
-        "path": canonical_path,
-        "server_id": server_id,
-        "source_fingerprint": list(fingerprint),
-        "token": token,
-    }
-    persisted = False
-    for output in output_paths:
-        meta_path = _meta_path_for(output)
-        try:
-            with _WRITE_LOCK:
-                data = _read_meta(meta_path)
-                if data is None or not any(
-                    source.get("path") == canonical_path and same_source(source.get("source_fingerprint"), fingerprint)
-                    for source in _sources_from_meta(data)
-                ):
-                    continue
-                pending = [
-                    entry
-                    for entry in _pending_refreshes(data)
-                    if (entry.get("path"), entry.get("server_id")) != (canonical_path, server_id)
-                ]
-                data["plex_refresh_pending"] = [*pending, marker]
-                _write_meta_document(meta_path, data)
-                persisted = True
-        except OSError as exc:
-            logger.warning("Could not retain pending Plex notification for {}: {}", output, exc)
-    return token if persisted else None
-
-
-def get_plex_refresh_pending(
-    output_paths: Sequence[Path],
-    canonical_path: str,
-    server_id: str,
-    *,
-    source_fingerprint: SourceFingerprint | None = None,
-) -> str | None:
-    """Return a matching pending token; legacy/unmarked outputs need no Analyze."""
-    try:
-        fingerprint = source_fingerprint or get_source_fingerprint(canonical_path)
-    except OSError:
-        return None
-    with _WRITE_LOCK:
-        for output in output_paths:
-            data = _read_meta(_meta_path_for(output))
-            for entry in _pending_refreshes(data or {}):
-                if (
-                    entry.get("path") == canonical_path
-                    and entry.get("server_id") == server_id
-                    and same_source(entry.get("source_fingerprint"), fingerprint)
-                    and isinstance(entry.get("token"), str)
-                    and entry["token"]
-                ):
-                    return entry["token"]
-    return None
-
-
-def clear_plex_refresh_pending(
-    output_paths: Sequence[Path],
-    canonical_path: str,
-    server_id: str,
-    token: str,
-    *,
-    source_fingerprint: SourceFingerprint | None = None,
-) -> None:
-    """Acknowledge only the exact publication that an accepted Analyze covers."""
-    try:
-        fingerprint = source_fingerprint or get_source_fingerprint(canonical_path)
-    except OSError:
-        return
-    for output in output_paths:
-        meta_path = _meta_path_for(output)
-        try:
-            with _WRITE_LOCK:
-                data = _read_meta(meta_path)
-                if data is None:
-                    continue
-                pending = _pending_refreshes(data)
-                remaining = [
-                    entry
-                    for entry in pending
-                    if not (
-                        entry.get("path") == canonical_path
-                        and entry.get("server_id") == server_id
-                        and same_source(entry.get("source_fingerprint"), fingerprint)
-                        and entry.get("token") == token
-                    )
-                ]
-                if remaining == pending:
-                    continue
-                if remaining:
-                    data["plex_refresh_pending"] = remaining
-                else:
-                    data.pop("plex_refresh_pending", None)
-                _write_meta_document(meta_path, data)
-        except OSError as exc:
-            logger.debug("Could not acknowledge Plex notification for {}: {}", output, exc)
 
 
 def outputs_fresh_for_source(
@@ -345,25 +178,21 @@ def outputs_fresh_for_source(
       force a regeneration storm. The next successful publish stamps a
       ``.meta`` so subsequent calls go through the strict path.
     * If **any** ``.meta`` sidecar exists, at least one must record
-      a fingerprint matching the current source among its
-      ``sources``. Conversely, if no recorded fingerprint matches,
-      fresh is False — the source has been replaced (Sonarr quality
-      upgrade, manual swap) or a copy sharing the output published it,
-      so skip-if-exists should not fire.
+      a fingerprint matching the current source. Conversely, if no
+      recorded fingerprint matches, fresh is False — the source has been
+      replaced (Sonarr quality upgrade, manual swap), so skip-if-exists
+      should not fire.
 
     Schema mismatch and I/O errors on a particular ``.meta`` are
     ignored; they neither prove nor disprove freshness. The ``stat``
     of the source itself failing returns False — better to regenerate
     than gamble.
 
-    New records compare the full source fingerprint. Legacy records retain
+    New records compare size and nanosecond mtime. Legacy records retain
     mtime/size matching unless ``require_source_fingerprint`` is set; use
     that stricter check before transferring frames between publishers.
     """
-    if not output_paths:
-        return False
-
-    if not all(_has_content(p) for p in output_paths):
+    if not outputs_have_content(output_paths):
         return False
 
     try:
@@ -376,15 +205,14 @@ def outputs_fresh_for_source(
     saw_match = False
     saw_mismatch = False
     for output in output_paths:
-        sources = _read_sources(_meta_path_for(output))
-        if sources is None:
+        data = _read_meta(_meta_path_for(output))
+        if data is None:
             continue
-        if any(
-            same_source(source["source_fingerprint"], fingerprint)
-            if "source_fingerprint" in source
-            else not require_source_fingerprint and _fingerprint(source) == (src_mtime, src_size)
-            for source in sources
-        ):
+        if "source_fingerprint" in data:
+            matches = same_recorded_source(data["source_fingerprint"], fingerprint)
+        else:
+            matches = not require_source_fingerprint and _legacy_stamp(data) == (src_mtime, src_size)
+        if matches:
             saw_match = True
         else:
             saw_mismatch = True
@@ -399,25 +227,24 @@ def outputs_fresh_for_source(
     return not require_source_fingerprint
 
 
-def clear_meta(output_paths: list[Path], *, preserve_plex_refresh_pending: bool = False) -> None:
+def _legacy_stamp(data: dict) -> tuple[int, int] | None:
+    """Return a journal's recorded ``(mtime, size)``, or ``None`` when unusable."""
+    try:
+        return int(data.get("source_mtime", -1)), int(data.get("source_size", -1))
+    except (TypeError, ValueError):
+        return None
+
+
+def clear_meta(output_paths: Sequence[Path]) -> None:
     """Remove ``.meta`` sidecars for the given outputs.
 
     Used by force-regenerate flows so a stale fingerprint can't shortcut
-    a freshly-requested run. Regeneration can preserve pending notifications
-    belonging to other sources/servers sharing the output. Best-effort.
+    a freshly-requested run, and to drop the leftover note beside a Plex
+    bundle written by an older version. Best-effort.
     """
     for output in output_paths:
         try:
-            with _WRITE_LOCK:
-                meta_path = _meta_path_for(output)
-                pending = _pending_refreshes(_read_meta(meta_path) or {}) if preserve_plex_refresh_pending else []
-                if pending:
-                    _write_meta_document(
-                        meta_path,
-                        {"schema": JOURNAL_SCHEMA_VERSION, "sources": [], "plex_refresh_pending": pending},
-                    )
-                else:
-                    meta_path.unlink()
+            _meta_path_for(output).unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:

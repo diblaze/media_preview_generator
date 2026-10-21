@@ -20,7 +20,7 @@ from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.processing.multi_server import MultiServerStatus, PublisherStatus, process_canonical_path
 from media_preview_generator.servers import ServerRegistry
 from media_preview_generator.servers.plex_chapters import Chapter, ChapterError, ChapterTarget
-from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
+from tests.conftest import CTIME_ONLY_CHANGES, RECORDED_SOURCE_CHANGES, change_ctime_only, change_source
 
 
 @pytest.fixture
@@ -1393,7 +1393,7 @@ class TestMetadataOnlySourceChange:
 
         assert _prepare_for(plan, config, monkeypatch).outcome.status == "skipped"
 
-    @pytest.mark.parametrize("how", SOURCE_CHANGES)
+    @pytest.mark.parametrize("how", RECORDED_SOURCE_CHANGES)
     def test_a_real_change_fails_the_running_publish_and_reextracts_on_the_next(self, plan, config, extraction, how):
         run, _register = extraction
         assert chapters.publish_chapters(plan, config).status == "ready"
@@ -1406,3 +1406,17 @@ class TestMetadataOnlySourceChange:
         assert chapters._fresh_images(rescanned) == {}
         assert chapters.publish_chapters(rescanned, config).status == "ready"
         assert run.call_count == 2
+
+    def test_a_move_fails_the_running_publish_but_the_next_reuses_the_thumbnails(self, plan, config, extraction):
+        """Unraid's mover gives the file a new inode with the same bytes and mtime (#414)."""
+        run, _register = extraction
+        assert chapters.publish_chapters(plan, config).status == "ready"
+
+        change_source(plan.canonical_path, "inode")
+
+        assert chapters.publish_chapters(plan, config).status == "failed"
+        run.reset_mock()
+        rescanned = replace(plan, source_fingerprint=get_source_fingerprint(plan.canonical_path))
+        assert chapters._fresh_images(rescanned) != {}
+        assert chapters.publish_chapters(rescanned, config).status == "ready"
+        assert run.call_count == 0

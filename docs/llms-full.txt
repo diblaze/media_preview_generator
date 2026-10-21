@@ -1311,7 +1311,7 @@ Sonarr and Radarr often call the webhook before your media server has scanned th
 
 - A file that isn't in a server's library yet, or whose preview hasn't been registered yet, is retried automatically.
 - The retries run as follow-up jobs covering only the files still waiting.
-- Work already done is not repeated. A companion file records the source file's size and modification time, so files with a current preview are skipped. Frames extracted in the last hour are reused if a second trigger arrives for the same file, such as Plex's own webhook after Sonarr's. See [Smart dedup](https://mediapreviewgenerator.dev/multi-server/#smart-dedup-skipping-work-thats-already-done).
+- Work already done is not repeated. Plex previews are stored under a name made from the video's content, so an existing one is current; for Emby and Jellyfin a companion file records the source file's size and modification time. Files with a current preview are skipped. Frames extracted in the last hour are reused if a second trigger arrives for the same file, such as Plex's own webhook after Sonarr's. See [Smart dedup](https://mediapreviewgenerator.dev/multi-server/#smart-dedup-skipping-work-thats-already-done).
 
 To shorten the wait, make sure the server notices new files quickly:
 
@@ -4292,12 +4292,13 @@ server.
 After writing, a background queue requests analysis for a known item ID; without
 an ID, it first requests a scan and tries to resolve the file. Generation does
 not wait for that network work. The queue holds up to 128 pending files and
-coalesces duplicate notifications. Each output's tracking file records which
-Plex notifications are still pending. Failures, unresolved items, and a full
-queue leave that record intact, including across app restarts. A later
-generation request retries those pending notifications even if the preview is
-already present. Ordinary scans skip completed previews without sending
-unnecessary Analyze requests. There is no separate automatic retry timer.
+coalesces duplicate notifications. Nothing about a notification is saved: when a
+later job finds a preview already present, it reads Plex's own flag for that
+item and asks for analysis only when Plex isn't showing the previews yet (an
+earlier request failed, the queue was full, or the preview was written before
+an upgrade). Such catch-up requests use at most half the queue, and a file Plex
+has already analyzed since the app started isn't asked about again. There is no
+separate automatic retry timer.
 
 A written preview and Plex advertising it as available are separate steps:
 when Plex is offline or has not indexed the file, a later scan/analysis can be
@@ -4386,13 +4387,15 @@ Two layers prevent the same file being processed twice:
 
 1. **Short-term frame cache** — when a second webhook arrives for the same file shortly after the first (e.g. Sonarr and Plex both notify within minutes), the second one reuses the already-extracted JPGs instead of running FFmpeg again. The cache checks file identity (device and inode), size, and nanosecond modification time, so a replacement with preserved timestamps does not reuse the old frames. It holds the most recent files for a configurable window (default 1 hour). Concurrent webhooks for the same file (a "webhook storm") collapse into a single FFmpeg pass.
 
-2. **Long-term sidecar tracking** — every published output gets a small companion file (`<file>.bif.meta`) that records the source file's identity (device and inode), size, and last-modified time. On any later webhook, the app checks this companion file first — if every output already exists, isn't empty, and the source hasn't changed, extraction is skipped. Plex notification can still run in the background so a preview written during an outage can become advertised after the server returns.
+2. **Long-term tracking** — Plex needs no companion file: it stores each preview under a name made from the video's content, so a preview that exists there was made from that content. If a file is replaced by different content, the new content gets its own preview and the old one is left behind. On a later run the app skips extraction when the preview exists and isn't empty; if Plex doesn't show previews for that file yet (a preview written after Plex scanned it, or an Analyze that never ran), the app asks Plex to analyze it.
 
-   Plex keeps one preview for byte-identical copies of a video (a re-grab saved next to the original, say), so the companion file records every copy that uses it, and the copies don't take turns rebuilding it.
+   Emby and Jellyfin outputs get a small companion file (`<file>.bif.meta`) that records the source file's size and last-modified time. It deliberately ignores the file's device and inode numbers: a remount (rclone, an Unraid user share) or Unraid's mover changes those without touching the video, and checking them rebuilt every preview. On any later webhook, the app checks this companion file first — if every output already exists, isn't empty, and the source hasn't changed, extraction is skipped.
 
    When the source file *does* change (a Sonarr quality upgrade swaps the file in place), the comparison fails and FFmpeg re-runs automatically. To force regeneration manually (e.g. you changed the thumbnail quality), tick **Regenerate** when starting a job — that bypasses both layers.
 
-Outputs without a tracking file are treated as fresh on the next webhook, then stamped on the next publish. Older tracking files are not
+   Plex remembers where each preview image sits in a preview file the first time someone views it, and never re-reads a file that changes afterwards. So after **Regenerate** replaces a Plex preview that someone has viewed since Plex last started, Plex shows broken preview images for that video until Plex is restarted. The job log warns when this can happen.
+
+Emby and Jellyfin outputs without a tracking file are treated as fresh on the next webhook, then stamped on the next publish. Older tracking files are not
 used to copy frames into another server's missing output unless their source
 identity can be verified. BIF files are staged beside the destination and
 atomically replaced only after packing finishes; a failed write leaves the

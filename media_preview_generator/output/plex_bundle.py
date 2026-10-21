@@ -37,6 +37,8 @@ class PlexBundleAdapter(OutputAdapter):
             header so Plex spaces preview frames correctly during scrubbing.
     """
 
+    content_addressed = True
+
     def __init__(self, plex_config_folder: str, frame_interval: int) -> None:
         self._plex_config_folder = plex_config_folder
         self._frame_interval = int(frame_interval)
