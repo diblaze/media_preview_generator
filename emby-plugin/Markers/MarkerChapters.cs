@@ -88,7 +88,17 @@ namespace MediaPreviewBridge.Emby.Markers
         {
             try
             {
-                return string.IsNullOrEmpty(item.Path) || !File.Exists(item.Path) ? (long?)null : new FileInfo(item.Path).Length;
+                if (string.IsNullOrEmpty(item.Path)) return null;
+                var info = new FileInfo(item.Path);
+                if (!info.Exists) return null;
+                if ((info.Attributes & FileAttributes.ReparsePoint) == 0) return info.Length;
+
+                // FileInfo describes a symlink itself (a few bytes), and netstandard2.0 can't resolve links, so open
+                // the file to measure what the link points to, as the app's os.stat does. A dangling link throws.
+                using (var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1))
+                {
+                    return stream.Length;
+                }
             }
             catch (Exception)
             {

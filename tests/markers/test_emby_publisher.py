@@ -266,6 +266,17 @@ class TestWrite:
         assert emby.publisher.last_write_changed is True
         assert emby.publisher.last_kept_types == frozenset() and emby.publisher.last_item_files is None
 
+    def test_a_symlinked_file_sends_the_size_of_its_target(self, tmp_path):
+        # The plugin measures the link's target, so the link's own few bytes would flag every marker set stale (#415).
+        target = tmp_path / "target.mkv"
+        target.write_bytes(b"x" * 321)
+        link = tmp_path / "S01E01.mkv"
+        link.symlink_to(target)
+        fake = FakeEmby(str(link))
+        fake.publisher = _publisher(fake)
+        assert _write(fake, [INTRO]) == [INTRO]
+        assert fake.server.put_emby_markers.call_args.kwargs["file_size"] == 321
+
     def test_a_set_not_recorded_as_ours_is_posted_without_reading_the_plugin_first(self, emby):
         # A bulk first publish costs one item read, one POST and one chapter read per item: the plugin's store is read
         # only when previous says this very set is already ours.
