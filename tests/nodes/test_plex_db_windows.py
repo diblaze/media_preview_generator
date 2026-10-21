@@ -432,6 +432,20 @@ class TestTheInstaller:
         readme = (REPO_ROOT / "nodes" / "windows" / "README.md").read_text()
         assert r"$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1" in readme
 
+    def test_the_key_is_kept_before_the_node_starts(self):
+        # Neither the logon entry nor the boot task passes this session's NODE_KEY: a node started before node.json
+        # holds it would expect a key nobody was shown.
+        kept = self.SCRIPT.index("WriteAllText($identityFile")
+        assert kept < self.SCRIPT.index("Start-Process -FilePath $Exe")
+        assert kept < self.SCRIPT.index("Start-ScheduledTask")
+
+    def test_at_startup_is_the_only_starter(self):
+        # The logon entry beside the boot task would start a second copy that can't take the port.
+        at_startup = self.SCRIPT.split("if ($AtStartup) {", 1)[1].split("} else {", 1)[0]
+        assert "Remove-ItemProperty -Path $RunKey -Name $RunValue" in at_startup
+        assert "-LogonType S4U" in at_startup  # this user, no password stored
+        assert "New-ScheduledTaskTrigger -AtStartup" in at_startup
+
 
 class TestTheUninstaller:
     """uninstall.ps1 can't run here; ``windows-node.yml`` runs it. The loudness undo record is the only way to put
@@ -459,6 +473,13 @@ class TestTheUninstaller:
         left = self.SCRIPT.index("Set-Location $env:USERPROFILE")
         assert left < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
         assert "[Environment]::CurrentDirectory = $env:USERPROFILE" in self.SCRIPT
+
+    def test_it_removes_the_boot_task_install_marked(self):
+        installer = (REPO_ROOT / "nodes" / "windows" / "install.ps1").read_text()
+        marker = '"starts-at-boot"'
+        assert marker in installer and marker in self.SCRIPT
+        assert self.SCRIPT.index("Test-Path $TaskMarker") < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
+        assert "Unregister-ScheduledTask" in self.SCRIPT
 
     def test_it_says_where_the_kept_record_is(self):
         assert '" Its loudness undo record stays: $record"' in self.SCRIPT

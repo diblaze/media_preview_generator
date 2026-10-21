@@ -735,6 +735,10 @@ or the [Windows build](https://github.com/stevezau/media_preview_generator/blob/
 under **Settings → Nodes**, then pick it in **Servers → your Plex → Edit → Connection → Plex database**. A Plex
 marker agent you already set up is moved to the Nodes page on upgrade and keeps working.
 
+Plex on Windows with this app in Docker Desktop on the same PC needs the Windows node too; its address is
+`http://host.docker.internal:9494`. If Plex runs as a service or starts before anyone signs in, install the Windows
+node with `-AtStartup` so it starts at boot as well.
+
 ### One node with both roles
 
 On the machine that runs Plex, one container can be the worker and the Plex database node. Start the app's image
