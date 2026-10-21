@@ -18,7 +18,7 @@ from PIL import Image
 
 from ..bif_reader import BIF_MAGIC
 from ..output.journal import outputs_fresh_for_source
-from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint
+from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint, same_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -61,7 +61,7 @@ def _elements(data: bytes) -> Iterator[tuple[int, bytes]]:
 
 def _inspect_index(path: str, expected: SourceFingerprint, starts: list[int]) -> str | None:
     """Inspect only bounded headers/index bytes; uncertain formats are not corruption."""
-    if get_source_fingerprint(path) != expected:
+    if not same_source(get_source_fingerprint(path), expected):
         raise SourceFileChangedError("Source changed during seek-index inspection")
     result = None
     with open(path, "rb") as source:
@@ -149,7 +149,7 @@ def _inspect_index(path: str, expected: SourceFingerprint, starts: list[int]) ->
                 if source.read(4) != bytes.fromhex("1f43b675"):
                     result = "Matroska seek index points to invalid video Cluster data"
                     break
-    if get_source_fingerprint(path) != expected:
+    if not same_source(get_source_fingerprint(path), expected):
         raise SourceFileChangedError("Source changed during seek-index inspection")
     return result
 
@@ -176,7 +176,7 @@ def inspect_seek_index(
     """
     from .generator import CancellationError
 
-    if get_source_fingerprint(path) != expected_fingerprint:
+    if not same_source(get_source_fingerprint(path), expected_fingerprint):
         raise SourceFileChangedError("Source changed during seek-index inspection")
     if cancel_check and cancel_check():
         raise CancellationError("Chapter inspection cancelled")
@@ -200,7 +200,7 @@ def inspect_seek_index(
                 return None
             time.sleep(0.02)
         result = json.loads(cast(IO[bytes], proc.stdout).read(4096)) if proc.returncode == 0 else None
-        if get_source_fingerprint(path) != expected_fingerprint:
+        if not same_source(get_source_fingerprint(path), expected_fingerprint):
             raise SourceFileChangedError("Source changed during seek-index inspection")
         return result if isinstance(result, str) else None
     except SourceFileChangedError:
@@ -225,7 +225,7 @@ def recover_bif_frame(plan: ChapterPlan, chapter: Chapter, output: Path) -> dict
         Explicit original resolution/timestamp provenance, or None if no safe frame exists.
     """
     bif = plan.folder.parent / "Indexes" / "index-sd.bif"
-    if get_source_fingerprint(plan.canonical_path) != plan.source_fingerprint:
+    if not same_source(get_source_fingerprint(plan.canonical_path), plan.source_fingerprint):
         raise SourceFileChangedError("Source changed during chapter recovery")
     if not outputs_fresh_for_source([bif], plan.canonical_path, require_source_fingerprint=True):
         return None
@@ -275,7 +275,7 @@ def recover_bif_frame(plan: ChapterPlan, chapter: Chapter, output: Path) -> dict
         if get_source_fingerprint(bif) != before:
             output.unlink(missing_ok=True)
             return None
-        if get_source_fingerprint(plan.canonical_path) != plan.source_fingerprint:
+        if not same_source(get_source_fingerprint(plan.canonical_path), plan.source_fingerprint):
             raise SourceFileChangedError("Source changed during chapter recovery")
         return {"source": "bif", "timestamp_ms": timestamp, "original_dimensions": dimensions}
     except SourceFileChangedError:

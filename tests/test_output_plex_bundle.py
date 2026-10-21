@@ -17,6 +17,7 @@ from media_preview_generator.output.plex_hash import (
     get_source_fingerprint,
 )
 from media_preview_generator.servers import PlexServer
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 
 def _make_bundle(canonical_path: str, frame_dir: Path) -> BifBundle:
@@ -186,6 +187,27 @@ class TestPublish:
 
         assert output.read_bytes() == b"previous complete preview"
         assert sorted(path.name for path in tmp_path.iterdir()) == ["frames", "index-sd.bif", "movie.mkv"]
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_metadata_only_source_change_before_publishing_is_not_a_change(self, tmp_path, how):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"media")
+        bundle = replace(_make_bundle(str(source), tmp_path), source_fingerprint=get_source_fingerprint(source))
+
+        change_ctime_only(source, how)
+
+        PlexBundleAdapter._validate_source(bundle)
+
+    @pytest.mark.parametrize("how", SOURCE_CHANGES)
+    def test_real_source_change_before_publishing_is_rejected(self, tmp_path, how):
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"media")
+        bundle = replace(_make_bundle(str(source), tmp_path), source_fingerprint=get_source_fingerprint(source))
+
+        change_source(source, how)
+
+        with pytest.raises(SourceFileChangedError, match="changed before publishing"):
+            PlexBundleAdapter._validate_source(bundle)
 
     def test_creates_parent_dirs_and_writes_bif(self, tmp_path):
         # Arrange: a frame dir with three small JPGs.

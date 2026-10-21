@@ -28,7 +28,7 @@ from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
 from ..output.plex_bundle import PlexBundleAdapter
-from ..output.plex_hash import get_source_fingerprint
+from ..output.plex_hash import get_source_fingerprint, same_source
 from ..servers.base import MediaServer, ServerConfig
 from .markers_db import path_key
 from .models import Cell, CellState, CheckCancelled, Feature, LibraryResult, ServerResult, TodoFile
@@ -313,7 +313,7 @@ def _chapter_manifest_state(folder: str, part: _Part, missing: set[int]) -> str:
     )
     try:
         manifest = json.loads(manifest_path.read_text())
-        if not isinstance(manifest, dict) or manifest.get("source") != list(get_source_fingerprint(part.path)):
+        if not isinstance(manifest, dict) or not same_source(manifest.get("source"), get_source_fingerprint(part.path)):
             return "todo"
     except (OSError, ValueError):
         return "todo"

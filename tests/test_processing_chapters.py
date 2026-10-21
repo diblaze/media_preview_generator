@@ -20,6 +20,7 @@ from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.processing.multi_server import MultiServerStatus, PublisherStatus, process_canonical_path
 from media_preview_generator.servers import ServerRegistry
 from media_preview_generator.servers.plex_chapters import Chapter, ChapterError, ChapterTarget
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 
 @pytest.fixture
@@ -1357,3 +1358,51 @@ class TestOneFileSeveralPlexItems:
         manifest = json.loads(plan.manifest_path.read_text())
         assert (manifest["verified"]["item"], manifest["verified"]["media"]) == (1, 20)
         assert [(v["item"], v["media"]) for v in manifest["also_verified"]] == [(7, 8)]
+
+
+class TestMetadataOnlySourceChange:
+    """A hard link, chmod or *arr re-import moves the source's change time but not its content."""
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_a_publish_planned_before_the_change_isnt_failed(self, plan, config, extraction, how):
+        change_ctime_only(plan.canonical_path, how)
+
+        assert chapters.publish_chapters(plan, config).status == "ready"
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_the_next_scan_reuses_the_images(self, plan, config, extraction, how):
+        run, _register = extraction
+        assert chapters.publish_chapters(plan, config).status == "ready"
+        run.reset_mock()
+
+        change_ctime_only(plan.canonical_path, how)
+
+        rescanned = replace(plan, source_fingerprint=get_source_fingerprint(plan.canonical_path))
+        assert set(chapters._fresh_images(rescanned)) == {"1", "2"}
+        assert chapters.publish_chapters(rescanned, config).status == "ready"
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_an_unsupported_stamp_still_skips(self, plan, config, extraction, monkeypatch, how):
+        run, _register = extraction
+        run.side_effect = chapters.UnsupportedChapterFormatError("Unsupported Dolby Vision")
+        plan.folder = _prepare_for(plan, config, monkeypatch).folder
+        chapters.publish_chapters(plan, config)
+
+        change_ctime_only(plan.canonical_path, how)
+
+        assert _prepare_for(plan, config, monkeypatch).outcome.status == "skipped"
+
+    @pytest.mark.parametrize("how", SOURCE_CHANGES)
+    def test_a_real_change_fails_the_running_publish_and_reextracts_on_the_next(self, plan, config, extraction, how):
+        run, _register = extraction
+        assert chapters.publish_chapters(plan, config).status == "ready"
+
+        change_source(plan.canonical_path, how)
+
+        assert chapters.publish_chapters(plan, config).status == "failed"
+        run.reset_mock()
+        rescanned = replace(plan, source_fingerprint=get_source_fingerprint(plan.canonical_path))
+        assert chapters._fresh_images(rescanned) == {}
+        assert chapters.publish_chapters(rescanned, config).status == "ready"
+        assert run.call_count == 2

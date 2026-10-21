@@ -16,6 +16,7 @@ from media_preview_generator.loudness import job, resume
 from media_preview_generator.loudness.resume import CompletionLedger, source_fingerprint
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.web.jobs import JobStatus
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 from .conftest import Lifecycle
 
@@ -90,6 +91,46 @@ def test_saved_result_requires_current_source_and_native_readiness(tmp_path, sel
         remaining, state = restore(ledger, checked, check)
         assert remaining == [checked]
         assert state["successful"] == 0 and state["outcome_counts"] == {}
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+@pytest.mark.parametrize("when", ["before_resume", "during_analysis", "during_check"])
+def test_saved_result_survives_a_metadata_only_source_change(tmp_path, selected, how, when):
+    """A hard link, chmod or *arr re-import moves the change time, not the audio that was analysed."""
+    ledger = CompletionLedger(tmp_path, "resume")
+    before = source_fingerprint(selected)
+    if when == "during_analysis":
+        change_ctime_only(selected.canonical_path, how)
+    ledger.record(selected, outcome(), before)
+    check = MagicMock(return_value=outcome("loudness_up_to_date"))
+    if when == "before_resume":
+        change_ctime_only(selected.canonical_path, how)
+    elif when == "during_check":
+
+        def relinked(_item):
+            change_ctime_only(selected.canonical_path, how)
+            return outcome("loudness_up_to_date")
+
+        check.side_effect = relinked
+    try:
+        remaining, state = restore(ledger, selected, check)
+        assert remaining == []
+        assert state["successful"] == 1
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("how", SOURCE_CHANGES)
+def test_saved_result_is_not_reused_after_a_real_source_change(tmp_path, selected, how):
+    ledger = CompletionLedger(tmp_path, "resume")
+    ledger.record(selected, outcome(), source_fingerprint(selected))
+    change_source(selected.canonical_path, how)
+    try:
+        remaining, state = restore(ledger, selected)
+        assert remaining == [selected]
+        assert state["successful"] == 0
     finally:
         ledger.close()
 

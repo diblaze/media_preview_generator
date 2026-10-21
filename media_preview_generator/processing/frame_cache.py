@@ -19,8 +19,9 @@ cache is safe to share across the worker pool.
 Cache validity rules:
 
 - Entry is valid only when the source file's identity, size and nanosecond
-  modification/change times match. Replacing a file while preserving its
-  mtime must not reuse frames extracted from the old file.
+  modification time match (``same_source``; the change time doesn't count).
+  Replacing a file while preserving its mtime must not reuse frames
+  extracted from the old file.
 - Entry is valid only when the lookup's ``extraction_key`` (the settings
   that shape the frames: interval, JPEG quality, tone map) equals the
   one stored at ``put`` time. Frames made at a 10 s interval can't fill
@@ -52,7 +53,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from ..output.plex_hash import SourceFingerprint, get_source_fingerprint
+from ..output.plex_hash import SourceFingerprint, get_source_fingerprint, same_source
 
 _DEFAULT_TTL_SECONDS = 3600  # 1 hour — covers cross-vendor webhook arrivals (e.g. Plex
 # fires immediately, Jellyfin fires 15-30 min later for the same file once the user has
@@ -247,7 +248,7 @@ class FrameCache:
                 self._evict(key)
                 return None
 
-            if current_fingerprint != entry.source_fingerprint:
+            if not same_source(current_fingerprint, entry.source_fingerprint):
                 logger.info(
                     "Frame cache miss: source identity or change markers differ for {}; will re-extract",
                     canonical_path,

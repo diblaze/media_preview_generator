@@ -22,7 +22,7 @@ from loguru import logger
 from ..servers.base import MediaServer
 from ..utils import sanitize_path
 from .base import BifBundle, OutputAdapter
-from .plex_hash import SourceFileChangedError, calculate_plex_hash, get_source_fingerprint
+from .plex_hash import SourceFileChangedError, calculate_plex_hash, get_source_fingerprint, same_source
 
 _BUNDLE_HASH_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -141,9 +141,8 @@ class PlexBundleAdapter(OutputAdapter):
 
     @staticmethod
     def _validate_source(bundle: BifBundle) -> None:
-        if (
-            bundle.source_fingerprint is not None
-            and get_source_fingerprint(bundle.canonical_path) != bundle.source_fingerprint
+        if bundle.source_fingerprint is not None and not same_source(
+            get_source_fingerprint(bundle.canonical_path), bundle.source_fingerprint
         ):
             raise SourceFileChangedError(f"Media source changed before publishing: {bundle.canonical_path}")
 

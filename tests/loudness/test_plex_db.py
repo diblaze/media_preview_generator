@@ -13,6 +13,7 @@ import pytest
 from media_preview_generator.loudness import plex_db
 from media_preview_generator.markers.publishers.base import DatabaseBusyError, PublishError
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, encode_extra_data, plex_db_path
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 FIX = Path(__file__).resolve().parents[1] / "fixtures" / "markers"
 # A stream Plex analysed itself (production 1.43.4, Puffin Rock S01E34-E36 stream 1, 2026-09-29).
@@ -358,6 +359,30 @@ def test_source_bytes_changed_during_analysis_are_not_written(db, tmp_path):
     with pytest.raises(plex_db.SourceChangedError, match="source changed"):
         plex_db.write_stream(db, 11, FIELDS, deadline=1e12, source=fingerprint)
     assert _extra(db, 11) == BEFORE
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_a_metadata_only_change_during_analysis_still_verifies(tmp_path, how):
+    """A hard link, chmod or *arr re-import moves the change time, not the audio that was analysed."""
+    source = tmp_path / "local.mkv"
+    source.write_bytes(b"audio")
+    fingerprint = plex_db.SourceFingerprint.read(str(source))
+
+    change_ctime_only(source, how)
+
+    fingerprint.verify()
+
+
+@pytest.mark.parametrize("how", SOURCE_CHANGES)
+def test_a_real_change_during_analysis_fails_verification(tmp_path, how):
+    source = tmp_path / "local.mkv"
+    source.write_bytes(b"audio")
+    fingerprint = plex_db.SourceFingerprint.read(str(source))
+
+    change_source(source, how)
+
+    with pytest.raises(plex_db.SourceChangedError, match="source changed"):
+        fingerprint.verify()
 
 
 def test_item_mark_refuses_a_version_added_after_analysis_started(db):

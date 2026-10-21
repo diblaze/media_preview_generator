@@ -13,7 +13,7 @@ from loguru import logger
 
 from ..loudness.analyze import ANALYSIS_VERSION, valid_measurements
 from ..loudness.settings import loudness_matches
-from ..output.plex_hash import get_source_fingerprint
+from ..output.plex_hash import get_source_fingerprint, same_source
 from ..servers.base import ServerConfig, ServerType
 from ..servers.ownership import OwnershipMatch, apply_path_mappings
 from . import previews
@@ -156,7 +156,7 @@ def _server_loudness(
         after = get_source_fingerprint(path)
     except OSError:
         after = None
-    if after != before:
+    if not same_source(after, before):
         return _row(cfg, "unavailable", "This file changed while its loudness metadata was being read.")
     states = {stream["state"] for stream in streams}
     state = next(iter(states)) if len(states) == 1 else "partial"
