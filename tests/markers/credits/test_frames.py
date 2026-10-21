@@ -645,7 +645,7 @@ class TestRunDecode:
         ("exit_code", "hwaccel", "stderr", "message", "kind"),
         [
             # No exit code after the decoder's verdict: a run stopped at it would say the kill's.
-            (69, "cuda", AV1_ON_A_GPU_WITHOUT_AV1, "the GPU can't decode this file's AV1 video", "codec"),
+            (69, "cuda", AV1_ON_A_GPU_WITHOUT_AV1, "this GPU has no decoder for this file's AV1 video", "codec"),
             (
                 69,
                 "cuda",
@@ -665,14 +665,14 @@ class TestRunDecode:
                 218,
                 "cuda",
                 H264_HI10P_ON_NVDEC,
-                "the GPU can't decode this file's H.264 video (ffmpeg exited 218)",
+                "this GPU has no decoder for this file's H.264 video (ffmpeg exited 218)",
                 "codec",
             ),
             (
                 218,
                 "vaapi",
                 H264_HIGH_444_ON_VAAPI,
-                "the GPU can't decode this file's H.264 video (ffmpeg exited 218)",
+                "this GPU has no decoder for this file's H.264 video (ffmpeg exited 218)",
                 "codec",
             ),
             (
@@ -690,14 +690,14 @@ class TestRunDecode:
                 218,
                 "cuda",
                 _frames_refused(PRORES_STREAM),
-                "the GPU can't decode this file's ProRes video (ffmpeg exited 218)",
+                "this GPU has no decoder for this file's ProRes video (ffmpeg exited 218)",
                 "codec",
             ),
             (
                 218,
                 "vaapi",
                 _frames_refused(PRORES_STREAM),
-                "the GPU can't decode this file's ProRes video (ffmpeg exited 218)",
+                "this GPU has no decoder for this file's ProRes video (ffmpeg exited 218)",
                 "codec",
             ),
             (
@@ -1289,7 +1289,7 @@ class TestAGpuThatCantDecodeTheFile:
             )  # fmt: skip
         assert time.monotonic() - started < 5
         assert type(excinfo.value) is GpuDecodeError  # the worker's CPU rerun, not "the GPU read no frames"
-        assert str(excinfo.value) == "the GPU can't decode this file's AV1 video"
+        assert str(excinfo.value) == "this GPU has no decoder for this file's AV1 video"
         assert any(VERDICT in line for line in excinfo.value.stderr_tail)
         _assert_gone(pid_file)
 
@@ -1305,7 +1305,7 @@ class TestAGpuThatCantDecodeTheFile:
                 detect_boxes=lambda p: [()] * len(p),
                 name="Movie.mkv",
             )  # fmt: skip
-        assert str(excinfo.value) == "the GPU can't decode this file's AV1 video"
+        assert str(excinfo.value) == "this GPU has no decoder for this file's AV1 video"
         assert excinfo.value.stderr_tail == (
             "[av1 @ 0x5c0071e12a80] Hardware is lacking required capabilities",
             "[av1 @ 0x5c0071e12a80] Failed setup for format cuda: hwaccel initialisation returned error.",
@@ -1357,7 +1357,7 @@ class TestAGpuThatCantDecodeTheFile:
         # Across the edge of one read, and in a later read of the same look.
         pid_file = tmp_path / "ffmpeg.pid"
         head = "x" * (before - 1) + "\n" + cant_decode_lines("cuda")
-        with pytest.raises(GpuDecodeError, match="can't decode this file's AV1 video"):
+        with pytest.raises(GpuDecodeError, match="has no decoder for this file's AV1 video"):
             frames.run_decode(
                 fake_ffmpeg([], [], stderr_head=head, head_wait_s=30, pid_file=str(pid_file)),
                 hw_active=True,

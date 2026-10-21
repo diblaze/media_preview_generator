@@ -452,15 +452,8 @@ def _build_gpu_keeps_failing_notifications() -> list[dict[str, Any]]:
     """
     from markupsafe import escape
 
-    from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX
-
     cards = []
     for state in get_gpu_fallback_tracker().flagged():
-        # A GPU whose credits stay on the CPU for the process sends every credits file there by design, and its own
-        # card (self-test) or the Vulkan card says why; "check the GPU driver" is wrong for that. A streak whose last
-        # file fell back for another reason (a preview decode, a crashed helper that is retried) still gets this card.
-        if (state.last_reason or "").startswith(CREDITS_KEPT_ON_CPU_PREFIX):
-            continue
         node_id = _gpu_streak_node_id(state.key)
         if node_id is None:
             todo = "Check the GPU driver, and the GPU in Settings → Processing Options → GPU device tuning."

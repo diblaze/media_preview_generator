@@ -52,6 +52,69 @@ def _fresh_vulkan_cache():
     _gpu_cache["result"] = None
 
 
+def _container_gpus(monkeypatch: pytest.MonkeyPatch, tmp_path, *, render_node: bool, nvidia: bool) -> None:
+    """Give dv5_no_vulkan_fix a container with (or without) a render node and NVIDIA's control node."""
+    from media_preview_generator.gpu import vulkan_probe
+
+    dri = tmp_path / "dri"
+    dri.mkdir(exist_ok=True)
+    if render_node:
+        (dri / "renderD128").touch()
+    nvidiactl = tmp_path / "nvidiactl"
+    if nvidia:
+        nvidiactl.touch()
+    monkeypatch.setattr(vulkan_probe, "_RENDER_NODES_GLOB", str(dri / "renderD*"))
+    monkeypatch.setattr(vulkan_probe, "_NVIDIA_CONTROL_NODE", str(nvidiactl))
+
+
+@pytest.fixture
+def no_gpu_in_the_container(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    _container_gpus(monkeypatch, tmp_path, render_node=False, nvidia=False)
+
+
+class TestTheFixNamesOnlyTheGpusTheContainerHas:
+    @pytest.mark.parametrize(
+        ("render_node", "nvidia", "says_nvidia", "says_dev_dri"),
+        [
+            pytest.param(False, False, True, True, id="no-gpu-at-all"),
+            pytest.param(True, True, True, False, id="nvidia"),
+            # Issue #408: an Intel GPU that is there and still has no Vulkan (a host kernel too old) gets no step;
+            # the per-GPU check says why.
+            pytest.param(True, False, False, False, id="intel-or-amd-only"),
+            pytest.param(False, True, True, True, id="nvidia-without-a-render-node"),
+        ],
+    )
+    def test_each_step_is_given_only_for_a_gpu_that_needs_it(
+        self, render_node, nvidia, says_nvidia, says_dev_dri, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from media_preview_generator.gpu.vulkan_probe import dv5_no_vulkan_fix
+
+        monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        _container_gpus(monkeypatch, tmp_path, render_node=render_node, nvidia=nvidia)
+
+        fix = dv5_no_vulkan_fix()
+
+        assert ("NVIDIA_DRIVER_CAPABILITIES=all" in fix) is says_nvidia, fix
+        assert ("pass /dev/dri into the container" in fix) is says_dev_dri, fix
+        assert fix == "" or (fix.startswith("To fix: ") and fix.endswith(".")), fix
+
+    @pytest.mark.parametrize("device", [None, SOFTWARE_DEVICE], ids=["no-vulkan", "software"])
+    def test_an_intel_gpu_without_vulkan_is_sent_to_the_per_gpu_check_not_told_to_pass_dev_dri(
+        self, device, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.delenv("NVIDIA_DRIVER_CAPABILITIES", raising=False)
+        _container_gpus(monkeypatch, tmp_path, render_node=True, nvidia=False)
+
+        hit = _first_probe_line(device, "INFO" if device is None else "WARNING")
+
+        _assert_describes_wrong_colours(hit)
+        assert "/dev/dri" not in hit and "NVIDIA" not in hit, hit
+        assert "  " not in hit, hit
+        if device is not None:
+            assert "GPU device tuning in the dashboard says why each GPU can't use Vulkan" in hit, hit
+
+
+@pytest.mark.usefixtures("no_gpu_in_the_container")
 class TestProbeLogs:
     def test_launch_failure_warning_says_wrong_colours_when_ffmpeg_missing(self) -> None:
         from media_preview_generator.gpu.vulkan_probe import _run_vulkan_probe

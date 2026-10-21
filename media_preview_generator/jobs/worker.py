@@ -16,10 +16,11 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import ItemOutcome, normalize_outcome, outcome_value
-from ..markers.credits.textdet_helper import CREDITS_ON_CPU_PREFIX
+from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX, CREDITS_ON_CPU_PREFIX
 from ..nodes.executor import FileNotVisibleError, NodeRequeue, NodeUnavailableError, Placement, placed_on, requeue_for
 from ..processing.generator import (
     FALLBACK_CODEC,
+    GPU_LACKS_FORMAT,
     CancellationError,
     CodecNotSupportedError,
     ProcessingResult,
@@ -326,6 +327,10 @@ class Worker:
         # happened.
         self.fallback_active = False
         self.fallback_reason: str | None = None
+        # The fallback that counts towards this GPU's "GPU keeps failing" streak (``_blame_gpu_for``), or None.
+        self.gpu_blame_reason: str | None = None
+        # True once a step of this file went to the CPU for a format the GPU lacks: its GPU didn't decode that part.
+        self.gpu_lacked_format = False
         # True once the CPU decodes this file for a GPU worker (its CPU rerun, or a step that fell back to the CPU).
         # Credit text read on the CPU sets fallback_active only: the GPU still decodes the frames it reads.
         self.decoding_on_cpu = False
@@ -502,6 +507,8 @@ class Worker:
         self.task_start_time = time.time()
         self.fallback_active = False
         self.fallback_reason = None
+        self.gpu_blame_reason = None
+        self.gpu_lacked_format = False
         self.decoding_on_cpu = False
         self.last_task_cpu_fallback = False
         self.cancel_check = cancel_check
@@ -762,6 +769,7 @@ class Worker:
                         self.fallback_active = True
                         self.decoding_on_cpu = True
                         self.fallback_reason = reason
+                        self._blame_gpu_for(reason)
                         ctx_logger.warning(
                             "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}. {}",
                             self.display_name,
@@ -849,13 +857,26 @@ class Worker:
         self.last_task_requeue = requeue_for(exc)
         logger.warning("{} hands {} back to the queue: {}", self.display_name, display_name, exc)
 
+    def _blame_gpu_for(self, reason: str) -> None:
+        """Count this file's fallback against its GPU, unless the GPU only lacks the video's format or keeps credits
+        on the CPU by design: neither is a fault, and "GPU keeps failing" would send the user to a driver that's fine.
+
+        Args:
+            reason: Why the file, or a step of it, ran on the CPU.
+        """
+        if GPU_LACKS_FORMAT in reason:
+            self.gpu_lacked_format = True
+        elif not reason.startswith(CREDITS_KEPT_ON_CPU_PREFIX):
+            self.gpu_blame_reason = reason
+
     def _record_gpu_file(self, *, gpu_decoded: bool, cancelled: bool) -> None:
         """Count a finished file for this GPU's fallback streak and the job's CPU-fallback tally.
 
-        A file that needed the CPU counts as fallen back; one the GPU itself decoded counts as ok and ends a streak;
-        any other (frames from the cache, output already there, failed outright, cancelled) says nothing about the
-        GPU and is not recorded. CPU workers never record. Called after the file's counters and done event: nothing
-        here may stop the worker, so a tracker failure is logged and dropped.
+        A file whose fallback blames the GPU (``_blame_gpu_for``) counts as fallen back; one the GPU itself decoded
+        counts as ok and ends a streak; any other (frames from the cache, output already there, failed outright,
+        cancelled, or sent to the CPU for a format the GPU lacks) says nothing about the GPU and is not recorded. CPU
+        workers never record. Called after the file's counters and done event: nothing here may stop the worker, so a
+        tracker failure is logged and dropped.
 
         Args:
             gpu_decoded: The GPU decoded this file (not the CPU rerun).
@@ -864,7 +885,8 @@ class Worker:
         if self.worker_type != "GPU" or cancelled:
             return
         self.last_task_cpu_fallback = self.fallback_active
-        if not (self.fallback_active or gpu_decoded):
+        fell_back = self.gpu_blame_reason is not None
+        if not (fell_back or gpu_decoded):
             return
         device = self.gpu_device or self.gpu or "GPU"
         label = friendly_device_label({"name": self.gpu_name or ""}, self.gpu_device, self.gpu)
@@ -875,8 +897,8 @@ class Worker:
             get_gpu_fallback_tracker().record(
                 device,
                 label,
-                fell_back=self.fallback_active,
-                reason=self.fallback_reason,
+                fell_back=fell_back,
+                reason=self.gpu_blame_reason,
             )
         except Exception as exc:
             logger.debug("{}: the GPU fallback tracker failed: {}: {}", self.display_name, type(exc).__name__, exc)
@@ -932,6 +954,7 @@ class Worker:
                 self.fallback_active = True
                 self.decoding_on_cpu = self.decoding_on_cpu or not reason.startswith(CREDITS_ON_CPU_PREFIX)
                 self.fallback_reason = redact_secrets(reason) or "GPU processing failed"
+                self._blame_gpu_for(self.fallback_reason)
 
             def _run(gpu, gpu_device):
                 return self.process_fn(
@@ -974,6 +997,7 @@ class Worker:
                     self.decoding_on_cpu = True
                     cpu_rerun = True
                     self.fallback_reason = redact_secrets(str(exc)) or "GPU processing failed"
+                    self._blame_gpu_for(self.fallback_reason)
                     logger.warning(
                         "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}",
                         self.display_name,
@@ -1010,8 +1034,10 @@ class Worker:
                 self.failed += 1
             else:
                 self.completed += 1
-            # A kind doesn't say what the GPU decoded: a file it finished on this GPU counts as the GPU's.
-            self._record_gpu_file(gpu_decoded=not outcome.failed, cancelled=cancelled)
+            # A kind doesn't say what the GPU decoded: a file it finished on this GPU counts as the GPU's, unless the
+            # CPU reran it or decoded a step of it for a format the GPU lacks.
+            gpu_decoded = not (outcome.failed or cpu_rerun or self.gpu_lacked_format)
+            self._record_gpu_file(gpu_decoded=gpu_decoded, cancelled=cancelled)
             try:
                 raw_rows = list(outcome.publisher_rows or [])
             except Exception:

@@ -940,7 +940,14 @@ def _gpu_failure(returncode: int, stderr_lines: list[str], name: str, hwaccel: s
     stderr (an unsupported codec, a hardware accelerator error, an I/O error, a signal); a failure it names none of
     (a stall or a part-way stop can't come from here) quotes ffmpeg's error line.
     """
-    from ...processing.generator import FALLBACK_CODEC, FALLBACK_HWACCEL, FALLBACK_IO_ERROR, FALLBACK_SIGNAL
+    from ...processing.generator import (
+        FALLBACK_CODEC,
+        FALLBACK_HWACCEL,
+        FALLBACK_IO_ERROR,
+        FALLBACK_SIGNAL,
+        GPU_LACKS_FORMAT,
+        gpu_lacks_the_format,
+    )
 
     kind = _gpu_failure_kind(returncode, stderr_lines, hwaccel)
     said_cant_decode = any(GPU_CANT_DECODE_VERDICT in line for line in stderr_lines)
@@ -949,6 +956,8 @@ def _gpu_failure(returncode: int, stderr_lines: list[str], name: str, hwaccel: s
         video = f"{codec} video" if codec else "video"
         # No exit code after the decoder's verdict: a run stopped at it (``run_decode``) exits with the kill's.
         exited = "" if said_cant_decode else f" (ffmpeg exited {returncode})"
+        if gpu_lacks_the_format(stderr_lines, stderr_lines):
+            return f"{GPU_LACKS_FORMAT} this file's {video}{exited}"
         return f"the GPU can't decode this file's {video}{exited}"
     if kind == FALLBACK_HWACCEL:
         return f"the GPU's decoder hit a hardware or driver error (ffmpeg exited {returncode})"

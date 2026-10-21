@@ -547,7 +547,7 @@ class TestDecodeFrames:
         assert time.monotonic() - started < 5
         assert runs == [True, False]
         assert [t for t, _frame in got] == [33.5, 34.0]
-        assert len(flagged) == 1 and "the GPU can't decode this file's AV1 video" in flagged[0]
+        assert len(flagged) == 1 and "this GPU has no decoder for this file's AV1 video" in flagged[0]
         assert not os.path.exists(f"/proc/{pid_file.read_text()}")
 
     @pytest.mark.parametrize("said", [cant_decode_lines("cuda"), ""], ids=["verdict", "nothing"])

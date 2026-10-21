@@ -53,7 +53,7 @@ from ..config import Config
 from ..display_rotation import display_matrix, rotation_filter
 from ..shutdown import is_shutting_down
 from ..utils import cpu_workers_hint, debug_logging_hint, gpu_details_hint, is_node_mode, working_folder_hint
-from .ffmpeg_runner import GPU_CANT_DECODE_LINE, STALL_WATCHDOG_LINE
+from .ffmpeg_runner import GPU_CANT_DECODE_LINE, GPU_CANT_DECODE_VERDICT, STALL_WATCHDOG_LINE
 from .filter_chain import (
     DV5_PATH_INTEL_OPENCL,
     DV5_PATH_LIBPLACEBO,
@@ -279,6 +279,37 @@ FALLBACK_STOPPED_PART_WAY = "stopped_part_way"
 FALLBACK_IO_ERROR = "io_error"
 FALLBACK_STALL = "stall"
 FALLBACK_SIGNAL = "signal"
+# A hand-off's reason holds this when the GPU only lacks the video's format (``gpu_lacks_the_format``): no driver fault,
+# so the worker doesn't count it towards "GPU keeps failing".
+GPU_LACKS_FORMAT = "this GPU has no decoder for"
+
+
+def gpu_lacks_the_format(stderr_lines: list[str], stderr_lines_all: list[str]) -> bool:
+    """Whether a codec the GPU couldn't decode is one a working GPU may lack: anything but 8-bit 4:2:0 H.264.
+
+    Every GPU the app supports decodes 8-bit 4:2:0 H.264, so that failing points at the driver. Other formats (MPEG-1,
+    DivX, 10-bit, 4:2:2) some GPUs just don't have a decoder for, unless a run also shows a driver error. FFmpeg's
+    generic set-up failure line after the decoder's own verdict isn't one, as in ``_gpu_lacks_the_decoder``.
+
+    Args:
+        stderr_lines: The GPU run's stderr, with FFmpeg's listing of the input.
+        stderr_lines_all: Every run's stderr.
+
+    Returns:
+        True for any other video with no driver error; False for 8-bit 4:2:0 H.264, a driver error, and when the
+        listing is missing.
+    """
+    lines_all = stderr_lines_all
+    verdicts = (*_GPU_LACKS_CODEC_VERDICTS, GPU_CANT_DECODE_VERDICT.lower())
+    if any(verdict in " ".join(lines_all).lower() for verdict in verdicts):
+        lines_all = [line for line in lines_all if _HWACCEL_INIT_FAILED not in line.lower()]
+    if _detect_hwaccel_runtime_error(lines_all):
+        return False
+    for line in stderr_lines:
+        found = _INPUT_VIDEO_STREAM_RE.match(line)
+        if found is not None and "(attached pic)" not in line:
+            return not (found.group(1) == "h264" and found.group(2) in ("yuv420p", "yuvj420p"))
+    return False
 
 
 def _io_error_places() -> str:
@@ -2107,7 +2138,7 @@ def generate_images(
                 if vk_is_software or vk_device is None:
                     # A node has no dashboard: the fix is for its own container, so it is said here.
                     how_to_fix = (
-                        dv5_no_vulkan_fix()
+                        (dv5_no_vulkan_fix() or "The dashboard's Nodes page says why this node's GPU can't use Vulkan.")
                         if is_node_mode()
                         else "See the dashboard notification centre for steps to enable Vulkan."
                     )
@@ -2609,6 +2640,13 @@ def generate_images(
                         raise CodecNotSupportedError(
                             f"GPU processing failed ({disk[1]}) for {video_file} (exit code {rc})", kind=disk[0]
                         )
+                    lacks_format = gpu_lacks_the_format(stderr_lines, stderr_lines_all)
+                    if cut_off and cut_off[0] == FALLBACK_CODEC and lacks_format:
+                        raise CodecNotSupportedError(
+                            f"GPU processing failed ({GPU_LACKS_FORMAT} this video's format) for {video_file} "
+                            f"(exit code {rc})",
+                            kind=FALLBACK_CODEC,
+                        )
                     # With no other cause named, the simpler chain failed on the GPU too: its decoder or filters.
                     raise CodecNotSupportedError(
                         f"{diag_label} in GPU context for {video_file}",
@@ -2649,6 +2687,8 @@ def generate_images(
         )
         if hand_off is not None:
             fallback_kind, fallback_reason = hand_off
+            if fallback_kind == FALLBACK_CODEC and gpu_lacks_the_format(stderr_lines, stderr_lines_all):
+                fallback_reason = f"{GPU_LACKS_FORMAT} this video's format"
             # Log relevant stderr excerpt for debugging
             stderr_excerpt = "\n".join(stderr_lines[-5:]) if len(stderr_lines) > 0 else "No stderr output"
             logger.warning(
