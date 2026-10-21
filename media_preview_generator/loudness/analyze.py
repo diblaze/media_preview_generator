@@ -318,8 +318,8 @@ def _run_command(
     freeze.hold(cancel_check=cancel_check, name=name)
     if cancel_check and cancel_check():
         raise LoudnessCancelled(f"Loudness analysis of {name} cancelled")
-    # Its own session, so a pause stops ffmpeg's whole group and never the app's. Niced below previews; a node's
-    # FFmpeg dies with the node.
+    # Its own session, so a pause stops ffmpeg's whole group and never the app's. Niced at the saved level (none at
+    # 0); a node's FFmpeg dies with the node.
     run_args, preexec = dies_with_node(niced(args, nice_level))
     try:
         proc = subprocess.Popen(

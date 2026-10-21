@@ -218,7 +218,7 @@ def loudness_nice_level() -> int:
     """
     try:
         level = int(get_settings_manager().get("loudness_nice_level", DEFAULT_NICE_LEVEL))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_NICE_LEVEL
     return max(0, min(MAX_NICE_LEVEL, level))
 

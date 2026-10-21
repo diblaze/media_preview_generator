@@ -682,7 +682,8 @@ def test_batch_progress_spans_the_batch_once_and_estimates_later_streams():
 
 
 @pytest.mark.parametrize("extra_tracks", [0, 1])
-def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, media, extra_tracks):  # noqa: F811
+def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, media, extra_tracks, monkeypatch):  # noqa: F811
+    _saved_nice_level(monkeypatch, 19)
     tracks = [(1, "aac", 424000), (2, "aac", 424000)]
     expected_ids = [(11, 1), (12, 2)]
     if extra_tracks:
@@ -702,7 +703,7 @@ def test_worker_batches_two_or_three_missing_streams_by_absolute_index(ctx, db, 
         "cancel_check": None,
         "pause_check": None,
         "on_progress": None,
-        "nice_level": 10,
+        "nice_level": 19,
     }
     run.assert_not_called()
     assert outcome.outcome_key == job.WRITTEN
@@ -995,6 +996,7 @@ def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, mo
         return {"results": [{"index": index, "fields": FIELDS} for index, _codec, _ms in params["tracks"]]}
 
     monkeypatch.setattr(remote_ops, "run_on_node", run_on_node)
+    _saved_nice_level(monkeypatch, 0)
     with (
         patch.object(job.analyze, "run_many") as run_many,
         patch.object(job.analyze, "run") as run,
@@ -1007,7 +1009,7 @@ def test_a_remote_worker_measures_on_its_node_and_writes_here(ctx, db, media, mo
         (
             protocol.OP_LOUDNESS_ANALYZE,
             media,
-            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True, "nice_level": 10},
+            {"tracks": [[1, "aac", 424000], [2, "aac", 424000]], "batch": True, "nice_level": 0},
             None,
         )
     ]

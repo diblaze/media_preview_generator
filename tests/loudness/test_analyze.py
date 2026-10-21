@@ -333,7 +333,7 @@ def test_a_missing_decoder_is_told_apart_from_other_ffmpeg_failures(monkeypatch,
         ),
     ],
 )
-def test_analysis_runs_under_nice_when_nice_is_found(monkeypatch, nice, node, level, expected):
+def test_analysis_runs_at_the_given_nice_level(monkeypatch, nice, node, level, expected):
     """Previews and Intro & Credits ffmpeg keep the app's niceness, so they get most of the CPU over a loudness backfill.
 
     On a node, setpriv goes first so the parent-death signal it sets survives nice's exec into ffmpeg.
