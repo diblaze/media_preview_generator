@@ -3166,6 +3166,11 @@
                 const r = await api('POST', `/api/servers/${encoded}/plex-loudness-analysis`, {});
                 return { ok: !!(r.data && r.data.ok) && r.ok, error: r.data && r.data.error, status: r.status };
             }
+            case 'set_plex_jobs_for_previews': {
+                // Plex's scheduled jobs to the values that let new previews show without waiting for its window.
+                const r = await api('POST', `/api/servers/${encoded}/plex-scheduled-jobs`, {});
+                return { ok: !!(r.data && r.data.ok) && r.ok, error: r.data && r.data.error, status: r.status };
+            }
             case 'set_scheduled_trickplay': {
                 // Toggle the Emby/Jellyfin daily Generate-Trickplay-Images
                 // scheduled task. Body shape mirrors the backend route:

@@ -1,5 +1,6 @@
 """Background Plex notification capacity, coalescing and Analyze API contracts."""
 
+from datetime import datetime
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -397,6 +398,24 @@ class TestAnalyzeIsConfirmed:
 
         assert _analyzed(fake) == ["41"]
 
+    def test_an_item_already_showing_is_not_analyzed_again(self, mock_config, no_sleep):
+        movie = _movie("/m/Film/Film.mkv")
+        movie["flagged"].add("/m/Film/Film.mkv")
+        fake = _FakePlex({"5": movie})
+
+        assert self._server(mock_config, fake).refresh_preview_metadata("/m/Film/Film.mkv", "5") is True
+
+        assert _analyzed(fake) == []
+
+    def test_a_showing_episode_is_skipped_but_its_dark_sibling_is_analyzed(self, mock_config, no_sleep):
+        first = _episode(MULTI)
+        first["flagged"].add(MULTI)
+        fake = _FakePlex({"41": first, "42": _episode(MULTI)})
+
+        assert self._server(mock_config, fake).refresh_preview_metadata(MULTI, "41") is True
+
+        assert _analyzed(fake) == ["42"]
+
     def test_a_movie_never_lists_a_season(self, mock_config, no_sleep):
         fake = _FakePlex({"5": _movie("/m/Film/Film.mkv")})
 
@@ -444,3 +463,131 @@ class TestAnalyzeIsConfirmed:
         assert self._server(mock_config, fake).refresh_preview_metadata("/m/Film/Film.mkv", "5") is True
 
         assert _analyzed(fake) == ["5"]
+
+
+class TestHeldWhileScheduledJobsWait:
+    @pytest.fixture(autouse=True)
+    def _config_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+
+    def _run(self, monkeypatch, *, hold, refresh_result=True):
+        from media_preview_generator.processing import plex_held_rereads, plex_refresh
+
+        monkeypatch.setattr(plex_refresh, "should_hold", MagicMock(return_value=hold))
+        monkeypatch.setattr(plex_refresh, "read_settings", MagicMock(return_value=None))
+        server = SimpleNamespace(
+            id="plex", name="Plex", refresh_preview_metadata=MagicMock(return_value=refresh_result)
+        )
+        return server, plex_held_rereads, plex_refresh
+
+    def test_a_held_request_is_stored_and_plex_is_not_asked(self, monkeypatch, tmp_path):
+        from media_preview_generator.output.journal import get_plex_refresh_pending
+
+        server, held, refresh = self._run(monkeypatch, hold=True)
+        path, outputs, fingerprint, token = _pending_output(tmp_path)
+        queue = PlexRefreshQueue(idle_seconds=0.01)
+        try:
+            assert queue.enqueue(
+                server,
+                path,
+                "42",
+                library_id="3",
+                output_paths=outputs,
+                notification_token=token,
+                source_fingerprint=fingerprint,
+            )
+            assert queue.wait("plex", path, required=True) is False
+            _join_worker(queue)
+        finally:
+            queue.close()
+
+        refresh.should_hold.assert_called_once_with(server, "3")
+        server.refresh_preview_metadata.assert_not_called()
+        [entry] = held.entries("plex")
+        assert (entry.canonical_path, entry.item_id, entry.library_id, entry.token) == (path, "42", "3", token)
+        assert entry.output_paths == tuple(str(p) for p in outputs)
+        assert entry.source_fingerprint == fingerprint
+        assert get_plex_refresh_pending(outputs, path, "plex", source_fingerprint=fingerprint) == token
+
+    @pytest.mark.parametrize("outcome", [True, False, "offline"])
+    def test_a_sent_request_releases_the_held_entry(self, monkeypatch, tmp_path, outcome):
+        server, held, _refresh = self._run(monkeypatch, hold=False)
+        if outcome == "offline":
+            server.refresh_preview_metadata.side_effect = ConnectionError("offline")
+        else:
+            server.refresh_preview_metadata.return_value = outcome
+        held.hold(
+            "plex",
+            "/media/a.mkv",
+            item_id="42",
+            library_id="3",
+            output_paths=(),
+            token=None,
+            source_fingerprint=None,
+        )
+        queue = PlexRefreshQueue(idle_seconds=0.01)
+        try:
+            assert queue.enqueue(server, "/media/a.mkv", "42", library_id="3")
+            _join_worker(queue)
+        finally:
+            queue.close()
+
+        server.refresh_preview_metadata.assert_called_once_with("/media/a.mkv", "42")
+        assert held.entries("plex") == []
+
+    def test_free_slots_counts_what_is_still_waiting(self):
+        queue = PlexRefreshQueue(capacity=3)
+        assert queue.free_slots() == 3
+        queue.close()
+
+
+def test_the_job_log_says_when_scheduled_jobs_make_plex_wait(monkeypatch):
+    from loguru import logger
+
+    from media_preview_generator.processing import multi_server
+    from media_preview_generator.servers import plex_scheduled_jobs as jobs
+
+    server = SimpleNamespace(id="plex-1", server_config=SimpleNamespace(output={}))
+    settings = jobs.PlexJobSettings(
+        server={"GenerateIntroMarkerBehavior": "scheduled", "LoudnessAnalysisBehavior": "scheduled"},
+        libraries={},
+        window_start=2,
+        window_end=5,
+    )
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(str(m)), level="INFO")
+    try:
+        monkeypatch.setattr(multi_server, "cached_settings", lambda _id: settings)
+        monkeypatch.setattr(multi_server, "datetime", SimpleNamespace(now=lambda: datetime(2026, 10, 21, 12)))
+        multi_server._log_held_refresh(server, "/media/Film/Film.mkv", "1")
+        assert len(messages) == 1
+        assert "Film.mkv: Plex runs intro markers and loudness analysis as a scheduled task" in messages[0]
+        assert "(2:00–5:00)" in messages[0]
+
+        messages.clear()
+        monkeypatch.setattr(multi_server, "datetime", SimpleNamespace(now=lambda: datetime(2026, 10, 21, 3)))
+        multi_server._log_held_refresh(server, "/media/Film/Film.mkv", "1")
+        monkeypatch.setattr(multi_server, "cached_settings", lambda _id: None)
+        multi_server._log_held_refresh(server, "/media/Film/Film.mkv", "1")
+        assert messages == []
+
+        # Chapter thumbnails never hold, so the log must not say the preview waits.
+        monkeypatch.setattr(multi_server, "cached_settings", lambda _id: settings)
+        monkeypatch.setattr(multi_server, "datetime", SimpleNamespace(now=lambda: datetime(2026, 10, 21, 12)))
+        chapters = SimpleNamespace(id="plex-1", server_config=SimpleNamespace(output={"chapter_thumbnails": True}))
+        multi_server._log_held_refresh(chapters, "/media/Film/Film.mkv", "1")
+        assert messages == []
+    finally:
+        logger.remove(sink)
+
+
+def test_is_queued_covers_pending_and_inflight_files():
+    queue = PlexRefreshQueue()
+    queue._pending[("plex", "/a")] = object()
+    queue._inflight.add(("plex", "/b"))
+    assert queue.is_queued("plex", "/a")
+    assert queue.is_queued("plex", "/b")
+    assert not queue.is_queued("plex", "/c")
+    assert not queue.is_queued("other", "/a")
+    queue._pending.clear()
+    queue.close()

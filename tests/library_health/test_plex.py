@@ -111,6 +111,58 @@ def test_counts_previews_loudness_markers(monkeypatch, tmp_path):
     assert [t.path for t in flagged] == ["/m/b.mkv"]
 
 
+def test_a_made_preview_waiting_for_plexs_window_is_counted_waiting_not_not_showing(monkeypatch, tmp_path):
+    from media_preview_generator.processing import plex_held_rereads
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    plex_held_rereads.hold(
+        "s1",
+        "/m/b.mkv",
+        item_id="2",
+        library_id="1",
+        output_paths=(),
+        token=None,
+        source_fingerprint=None,
+    )
+    write_bif(tmp_path / "plex", "bb22")
+    write_bif(tmp_path / "plex", "cc33")
+    items = [
+        _movie("B", "/m/b.mkv", "bb22", '{"ma:container":"mkv"}'),
+        _movie("C", "/m/c.mkv", "cc33", '{"ma:container":"mkv"}'),
+    ]
+
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), items)
+
+    previews = _cell(result, "1", Feature.PREVIEWS)
+    assert (previews.total, previews.done, previews.waiting, previews.not_showing) == (2, 2, 1, 1)
+    flagged = [t.path for t in result.todo if t.feature == Feature.PREVIEWS and t.not_showing]
+    assert flagged == ["/m/c.mkv"]
+
+
+def test_a_path_held_for_another_server_is_still_not_showing(monkeypatch, tmp_path):
+    from media_preview_generator.processing import plex_held_rereads
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    plex_held_rereads.hold(
+        "other", "/m/b.mkv", item_id=None, library_id=None, output_paths=(), token=None, source_fingerprint=None
+    )
+    write_bif(tmp_path / "plex", "bb22")
+
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib()]), [_movie("B", "/m/b.mkv", "bb22", None)])
+
+    previews = _cell(result, "1", Feature.PREVIEWS)
+    assert (previews.waiting, previews.not_showing) == (0, 1)
+
+
+def test_cell_results_saved_before_waiting_existed_read_as_zero():
+    from media_preview_generator.library_health.models import Cell
+
+    old = {"state": "counted", "total": 3, "done": 2, "not_showing": 1}
+    cell = Cell.from_dict(old)
+    assert cell.waiting == 0
+    assert Cell.from_dict(Cell(CellState.COUNTED, waiting=4).to_dict()).waiting == 4
+
+
 def test_incomplete_native_loudness_is_todo(monkeypatch, tmp_path):
     items = [_movie("A", "/m/a.mkv", audio=[_NATIVE_PARTIAL])]
 

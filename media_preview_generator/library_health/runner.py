@@ -292,6 +292,7 @@ class HealthRunner:
                 cell.done = old_cell.done
                 cell.nothing_found = old_cell.nothing_found
                 cell.not_showing = old_cell.not_showing
+                cell.waiting = old_cell.waiting
                 library.total = max(library.total, old_library.total)
                 result.todo.extend(self._store.todo_for(result.server_id, library.library_id, feature))
 

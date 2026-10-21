@@ -241,6 +241,11 @@ class PlexServer(MediaServer):
                 self._plex = _build_plex(self._config)
         return self._plex
 
+    @property
+    def server_config(self) -> ServerConfig | None:
+        """The saved server config; None for a client built from the legacy single-server Config."""
+        return self._server_config
+
     def _has_credentials(self) -> bool:
         return bool((self._config.plex_url or "").strip() and self._config.plex_token)
 
@@ -949,6 +954,26 @@ class PlexServer(MediaServer):
                 results[f":{pref_id}"] = f"error: {redact_secrets(str(exc))}"
         return results
 
+    def _hold_previews_check(self, prefs: dict[str, Any]) -> dict[str, Any] | None:
+        """The Setup Health row for scheduled Plex jobs that delay new previews; None when there is nothing to say."""
+        config = self._server_config
+        from . import plex_scheduled_jobs
+
+        if config is None or not prefs or plex_scheduled_jobs.chapter_thumbnails_on(config):
+            return None
+
+        try:
+            return plex_scheduled_jobs.readiness_check(
+                prefs,
+                plex_scheduled_jobs.read_library_prefs(self),
+                [lib.id for lib in config.libraries if lib.enabled],
+                plex_scheduled_jobs.app_jobs(config),
+                can_write=config.enabled,
+            )
+        except Exception as exc:
+            logger.debug("Plex job settings probe failed for {!r}: {}", self.name, exc)
+            return None
+
     def previews_readiness(self) -> dict[str, Any]:
         """Unified readiness payload for the Previews readiness card.
 
@@ -1081,6 +1106,13 @@ class PlexServer(MediaServer):
         loudness_section = loudness_readiness_section(self, self._server_config, current_by_id)
         if loudness_section is not None:
             sections.append(loudness_section)
+
+        hold_check = self._hold_previews_check(current_by_id)
+        if hold_check is not None:
+            library_checks.append(hold_check)
+            library_section_ok = False
+            if library_severity != "critical":
+                library_severity = "recommended"
 
         for pref_id, label, recommended, severity, rationale in self._PLEX_RECOMMENDED_PREFS:
             current = current_by_id.get(pref_id)
@@ -2115,6 +2147,7 @@ class PlexServer(MediaServer):
         Paths without an item hint get a best-effort scan and lookup first;
         failure here never prevents local generation or publication.
         Every episode sharing the file is analyzed, and a request Plex skipped is sent once more.
+        An item that already shows the previews is not analyzed again.
         Return True once Plex has run Analyze (it answers only after finishing, so chapter registration can
         follow); unresolved items remain pending.
         """
@@ -2135,9 +2168,13 @@ class PlexServer(MediaServer):
         targets = [bare_id]
         try:
             before = self._items_holding_file(plex, bare_id, canonical_path)
+            if before.get(bare_id):
+                targets = []
             targets += [key for key, shown in before.items() if key != bare_id and not shown]
         except Exception as exc:
             logger.debug("Could not list the other episodes in {} for Plex Analyze: {}", canonical_path, exc)
+        if not targets:
+            return True
         for attempt in range(_ANALYZE_ATTEMPTS):
             if attempt:
                 time.sleep(_ANALYZE_RETRY_DELAY_S)
@@ -2585,6 +2622,24 @@ class PlexServer(MediaServer):
             logger.warning("Could not set Plex's own loudness analysis to Never on {!r}: {}", self.name, error)
             return error
         logger.info("Set {} to never on {!r}", PLEX_LOUDNESS_PREF, self.name)
+        return None
+
+    def set_jobs_for_previews(self, prefs: dict[str, str]) -> str | None:
+        """Set Plex's server-wide job settings (``{pref id: value}``) in one ``PUT /:/prefs``.
+
+        Returns:
+            None on success, otherwise why not.
+        """
+        from urllib.parse import urlencode
+
+        try:
+            plex = self._connect()
+            plex.query(f"/:/prefs?{urlencode(prefs)}", method=plex._session.put)
+        except Exception as exc:
+            error = redact_secrets(str(exc))
+            logger.warning("Could not set Plex's scheduled jobs on {!r}: {}", self.name, error)
+            return error
+        logger.info("Set {} on {!r}", ", ".join(f"{pref}={value}" for pref, value in prefs.items()), self.name)
         return None
 
     def hidden_marker_types(self, library_id: str) -> frozenset[str] | None:

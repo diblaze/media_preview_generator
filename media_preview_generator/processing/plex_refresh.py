@@ -15,6 +15,8 @@ from loguru import logger
 
 from ..output.journal import clear_plex_refresh_pending
 from ..output.plex_hash import SourceFingerprint
+from ..servers.plex_scheduled_jobs import read_settings, should_hold, window_text
+from . import plex_held_rereads
 
 if TYPE_CHECKING:
     from ..servers.plex import PlexServer
@@ -25,6 +27,7 @@ class _Refresh:
     server: PlexServer
     canonical_path: str
     item_id: str | None
+    library_id: str | None
     output_paths: tuple[Path, ...]
     notification_token: str | None
     source_fingerprint: SourceFingerprint | None
@@ -54,6 +57,7 @@ class PlexRefreshQueue:
         canonical_path: str,
         item_id: str | None,
         *,
+        library_id: str | None = None,
         output_paths: tuple[Path, ...] = (),
         notification_token: str | None = None,
         source_fingerprint: SourceFingerprint | None = None,
@@ -66,7 +70,7 @@ class PlexRefreshQueue:
             if key not in self._pending and len(self._pending) >= self._capacity:
                 logger.warning(
                     "Plex notification queue is full; previews for {} were saved, but {} must scan/analyze "
-                    "the file later to advertise them to clients. Pending notifications retry on the next job.",
+                    "the file later to advertise them to clients. The app sends it again within about 10 minutes.",
                     canonical_path,
                     server.name,
                 )
@@ -77,6 +81,7 @@ class PlexRefreshQueue:
                 server,
                 canonical_path,
                 item_id or (previous.item_id if previous else None),
+                library_id,
                 output_paths,
                 notification_token,
                 source_fingerprint,
@@ -86,6 +91,17 @@ class PlexRefreshQueue:
                 self._worker.start()
             self._condition.notify_all()
             return True
+
+    def is_queued(self, server_id: str, canonical_path: str) -> bool:
+        """Whether a notification for this file is waiting or being sent."""
+        key = (server_id, canonical_path)
+        with self._condition:
+            return key in self._pending or key in self._inflight
+
+    def free_slots(self) -> int:
+        """How many more files can be queued before the queue is full."""
+        with self._condition:
+            return self._capacity - len(self._pending)
 
     def wait(
         self,
@@ -129,7 +145,12 @@ class PlexRefreshQueue:
                 key, request = self._pending.popitem(last=False)
                 self._inflight.add(key)
             notified = False
+            held = False
             try:
+                held = should_hold(request.server, request.library_id)
+                if held:
+                    self._hold(request)
+                    continue
                 notified = request.server.refresh_preview_metadata(request.canonical_path, request.item_id)
                 if notified is True and request.notification_token is not None:
                     clear_plex_refresh_pending(
@@ -147,6 +168,8 @@ class PlexRefreshQueue:
                     exc,
                 )
             finally:
+                if not held:
+                    plex_held_rereads.release(request.server.id, request.canonical_path)
                 with self._condition:
                     self._inflight.discard(key)
                     self._completed[key] = notified is True
@@ -154,6 +177,25 @@ class PlexRefreshQueue:
                     while len(self._completed) > max(256, self._capacity):
                         self._completed.popitem(last=False)
                     self._condition.notify_all()
+
+    @staticmethod
+    def _hold(request: _Refresh) -> None:
+        """Keep the request for Plex's maintenance window; the journal marker stays so a failure still retries."""
+        settings = read_settings(request.server)
+        logger.info(
+            "Holding Plex's re-read of {} until its maintenance window ({})",
+            request.canonical_path,
+            window_text(settings) if settings else "unknown hours",
+        )
+        plex_held_rereads.hold(
+            request.server.id,
+            request.canonical_path,
+            item_id=request.item_id,
+            library_id=request.library_id,
+            output_paths=request.output_paths,
+            token=request.notification_token,
+            source_fingerprint=request.source_fingerprint,
+        )
 
     def close(self) -> None:
         """Discard memory work; journal markers retry on a later job after restart."""
@@ -172,6 +214,7 @@ def enqueue_plex_refresh(
     canonical_path: str,
     item_id: str | None,
     *,
+    library_id: str | None = None,
     output_paths: tuple[Path, ...] = (),
     notification_token: str | None = None,
     source_fingerprint: SourceFingerprint | None = None,
@@ -181,10 +224,21 @@ def enqueue_plex_refresh(
         server,
         canonical_path,
         item_id,
+        library_id=library_id,
         output_paths=output_paths,
         notification_token=notification_token,
         source_fingerprint=source_fingerprint,
     )
+
+
+def is_plex_refresh_queued(server_id: str, canonical_path: str) -> bool:
+    """Whether a notification for this file is waiting or being sent."""
+    return _queue.is_queued(server_id, canonical_path)
+
+
+def free_plex_refresh_slots() -> int:
+    """How many more files the notification queue has room for."""
+    return _queue.free_slots()
 
 
 def wait_for_plex_refresh(

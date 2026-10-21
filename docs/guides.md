@@ -533,6 +533,12 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
   seconds each, so thousands take hours. No previews are made again. A re-read clears chapter thumbnails, so if those
   are on, a preview job adds them back afterwards. The bell at the top of every page shows the same notice
   with a link to the fix; dismiss it there if a few never clear. A failed check shows in the bell too.
+- **"N show in Plex after its maintenance window."** Asking Plex to show a new preview also starts every Plex job set
+  to "As a scheduled task": intro markers, credits markers, loudness analysis, voice activity detection and chapter
+  thumbnails. So the app waits for Plex's maintenance window (Plex Settings → Scheduled Tasks) and asks then. Nothing
+  to fix. To see new previews within a minute, set those jobs to "As a scheduled task and when media is added";
+  Setup Health offers the change. A server this app makes chapter thumbnails for is asked straight away, because
+  those need Plex to re-read the file first.
 
 ### Production Server
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2747,6 +2748,7 @@ class TestPlexLocalPublishing:
             token = get_plex_refresh_pending([expected], str(media_file), "plex-1", source_fingerprint=fingerprint)
             assert token is not None
             notification_kwargs = {
+                "library_id": "1",
                 "output_paths": (expected,),
                 "notification_token": token,
                 "source_fingerprint": fingerprint,
@@ -2995,3 +2997,31 @@ class TestOnARemoteNode:
             process_canonical_path(
                 canonical_path=str(media_file), registry=self._registry(tmp_path), config=mock_config_for_processing
             )
+
+
+def test_a_full_plex_queue_holds_the_refresh_for_the_scheduler(monkeypatch, tmp_path):
+    from media_preview_generator.processing import multi_server
+
+    plex = SimpleNamespace(id="plex-1", name="Plex", type=multi_server.ServerType.PLEX)
+    outputs = [tmp_path / "index-sd.bif"]
+    fingerprint = (1, 2, 3, 4, 5)
+    monkeypatch.setattr(multi_server, "mark_plex_refresh_pending", lambda *_a, **_k: "tok")
+    monkeypatch.setattr(multi_server, "_plex_library_id", lambda *_a: "7")
+    monkeypatch.setattr(multi_server, "_log_held_refresh", lambda *_a: None)
+    monkeypatch.setattr(multi_server, "enqueue_plex_refresh", lambda *_a, **_k: False)
+    hold = MagicMock()
+    monkeypatch.setattr(multi_server.plex_held_rereads, "hold", hold)
+
+    multi_server._refresh_after_publish(
+        plex, "42", "/media/a.mkv", None, output_paths=outputs, source_fingerprint=fingerprint, new_output=True
+    )
+
+    hold.assert_called_once_with(
+        "plex-1",
+        "/media/a.mkv",
+        item_id="42",
+        library_id="7",
+        output_paths=tuple(outputs),
+        token="tok",
+        source_fingerprint=fingerprint,
+    )

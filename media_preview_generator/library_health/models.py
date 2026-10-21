@@ -40,6 +40,7 @@ class Cell:
     done: int = 0
     nothing_found: int = 0
     not_showing: int = 0  # Plex previews only
+    waiting: int = 0  # Plex previews only: shown after Plex's maintenance window
     cant_do: int = 0  # Plex chapters only: files the chapter step can never finish
     reason: str = ""  # shown for OFF / NOT_APPLICABLE / UNAVAILABLE / ERROR
 
@@ -56,6 +57,7 @@ class Cell:
             "done": self.done,
             "nothing_found": self.nothing_found,
             "not_showing": self.not_showing,
+            "waiting": self.waiting,
             "cant_do": self.cant_do,
             "reason": self.reason,
             "todo": self.todo,
@@ -70,6 +72,7 @@ class Cell:
             done=data.get("done", 0),
             nothing_found=data.get("nothing_found", 0),
             not_showing=data.get("not_showing", 0),
+            waiting=data.get("waiting", 0),
             cant_do=data.get("cant_do", 0),
             reason=data.get("reason", ""),
         )

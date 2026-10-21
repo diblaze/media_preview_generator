@@ -806,3 +806,16 @@ def test_each_episode_of_a_shared_file_gets_its_own_job(monkeypatch):
         {"/m/e1-e2": {"p": "42"}},
     ]
     assert [o["webhook_paths"] for _id, o in started] == [["/m/e1-e2", "/m/solo"], ["/m/e1-e2"]]
+
+
+def test_failed_library_carries_the_waiting_count_too(store, monkeypatch, plex_server):
+    good = _good_two_libraries()
+    good.libraries[0].cells[Feature.PREVIEWS].waiting = 3
+    store.replace_server(good)
+    monkeypatch.setattr(runner_module.plex_counter, "count_plex", _count_failing_everywhere)
+    runner = _make_runner(store, FakeRegistry([(_cfg("a"), plex_server)]))
+    runner.start_check()
+    runner.wait(5)
+
+    movies = store.load()[0].libraries[0].cells[Feature.PREVIEWS]
+    assert (movies.state, movies.waiting) == (CellState.ERROR, 3)

@@ -1623,6 +1623,35 @@ def set_plex_loudness_analysis_never(server_id: str):
     return jsonify({"ok": not error, "error": error or ""}), 200
 
 
+@api.route("/servers/<server_id>/plex-scheduled-jobs", methods=["POST"])
+@setup_or_auth_required
+def set_plex_scheduled_jobs(server_id: str):
+    """Set Plex's scheduled jobs so new previews show without waiting for its maintenance window.
+
+    The values are worked out here from Plex's current settings, never taken from the request. Returns
+    ``{"ok": bool, "error": str}`` like the other readiness actions.
+    """
+    from ...servers import plex_scheduled_jobs
+
+    cfg, refused = _plex_marker_target(server_id)
+    if refused is not None:
+        return refused
+    cfg = cast(ServerConfig, cfg)
+    live = _instantiate_for_probe(cfg)
+    if live is None or not hasattr(live, "set_jobs_for_previews"):
+        return jsonify({"ok": False, "error": "could not instantiate server client"}), 400
+    try:
+        prefs = plex_scheduled_jobs.wanted_prefs(live, cfg)
+        if not prefs:
+            return jsonify({"ok": False, "error": "No Plex jobs are waiting on a maintenance window"}), 409
+        error = live.set_jobs_for_previews(prefs)
+    except Exception as exc:
+        logger.warning("Setting Plex's scheduled jobs on {!r} raised: {}", cfg.name or cfg.id, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+    plex_scheduled_jobs.invalidate(live.id)
+    return jsonify({"ok": not error, "error": error or ""}), 200
+
+
 @api.route("/servers/<server_id>/scheduled-trickplay", methods=["POST"])
 @setup_or_auth_required
 def set_scheduled_trickplay(server_id: str):

@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
 from ..output.plex_bundle import PlexBundleAdapter
 from ..output.plex_hash import get_source_fingerprint, same_source
+from ..processing import plex_held_rereads
 from ..servers.base import MediaServer, ServerConfig
 from .markers_db import path_key
 from .models import Cell, CellState, CheckCancelled, Feature, LibraryResult, ServerResult, TodoFile
@@ -402,6 +404,7 @@ def _tally_library(
     *,
     folder: str = "",
     parts_per_media: Counter[int] | None = None,
+    held_paths: frozenset[str] = frozenset(),
 ) -> tuple[LibraryResult, list[TodoFile]]:
     cells = _fixed_cells(scope, lambda: Cell(CellState.COUNTED))
     counted = {feature for feature, fixed in scope.features.items() if fixed is None}
@@ -417,8 +420,11 @@ def _tally_library(
             if part.bif_ok:
                 cell.done += 1
                 if not _preview_flag_shown(part.extra_data):
-                    cell.not_showing += 1
-                    add_todo(Feature.PREVIEWS, part, not_showing=True)
+                    if unicodedata.normalize("NFC", part.path) in held_paths:
+                        cell.waiting += 1
+                    else:
+                        cell.not_showing += 1
+                        add_todo(Feature.PREVIEWS, part, not_showing=True)
             else:
                 add_todo(Feature.PREVIEWS, part)
         if Feature.CHAPTERS in counted:
@@ -499,6 +505,7 @@ def _count_from_db(
     ]
     _stat_bifs(folder, wanted, cancel_check=cancel_check, progress=progress)
     parts_per_media = Counter(row[-1] for row in rows.parts)
+    held_paths = frozenset(unicodedata.normalize("NFC", path) for path in plex_held_rereads.held_paths(cfg.id))
 
     libraries: list[LibraryResult] = []
     todo: list[TodoFile] = []
@@ -511,6 +518,7 @@ def _count_from_db(
                 nothing_found,
                 folder=folder,
                 parts_per_media=parts_per_media,
+                held_paths=held_paths,
             )
         except Exception as exc:  # noqa: BLE001 - one library failing must not hide the others
             logger.warning("Library health: could not count {} on {}: {}", scope.name, cfg.name, exc)

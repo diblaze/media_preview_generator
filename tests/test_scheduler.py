@@ -2376,6 +2376,7 @@ class TestStartRemovesLeftoverScheduleJobs:
             "not-a-schedule-cron": run_markers_check_servers_daily,
             "__library_health_nightly": jobs["__library_health_nightly"],
             "__markers_check_servers_daily": run_markers_check_servers_daily,
+            "__plex_held_rereads": jobs["__plex_held_rereads"],
         }
 
     def test_nothing_is_removed_when_schedules_json_failed_to_load(self, tmp_path):
@@ -2646,7 +2647,7 @@ class TestPausedIntroCreditsJobsAfterAScheduleChanges:
 def test_nothing_is_scheduled_after_a_fresh_start(tmp_path):
     """A new install has no user schedule; the only jobs are the internal ``__`` ones.
 
-    The internal ``__`` jobs (library-health nightly, daily Check servers) are not user schedules.
+    The internal ``__`` jobs (library-health nightly, daily Check servers, held Plex re-reads) are not user schedules.
     """
     manager = ScheduleManager(config_dir=str(tmp_path / "config"), run_job_callback=None)
     manager.start()
@@ -2656,6 +2657,7 @@ def test_nothing_is_scheduled_after_a_fresh_start(tmp_path):
         assert sorted(j.id for j in manager.scheduler.get_jobs()) == [
             "__library_health_nightly",
             "__markers_check_servers_daily",
+            "__plex_held_rereads",
         ]
     finally:
         manager.stop()

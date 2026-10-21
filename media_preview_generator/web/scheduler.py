@@ -10,7 +10,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from apscheduler.events import (
@@ -62,6 +62,7 @@ _QUIET_HOURS_RESUME_PREFIX = "__qh_resume_"
 _QUIET_HOURS_RECHECK = "__qh_recheck"
 _LIBRARY_HEALTH_NIGHTLY = "__library_health_nightly"
 _MARKERS_CHECK_SERVERS_DAILY = "__markers_check_servers_daily"
+_PLEX_HELD_REREADS = "__plex_held_rereads"
 
 # APScheduler day_of_week names (Mon-first). Order matters for cron
 # strings — keep these literal so a typo in the JS payload can't slip
@@ -1703,6 +1704,7 @@ class ScheduleManager:
             self._remove_orphaned_schedule_jobs()
             self._register_library_health_nightly()
             self._register_markers_check_servers_daily()
+            self._register_plex_held_rereads()
 
     def _remove_retired_schedule_jobs(self) -> None:
         """Drop the jobstore entries (start cron and stop cron) of schedules deleted at load."""
@@ -1756,6 +1758,24 @@ class ScheduleManager:
             )
         except Exception:
             logger.warning("Could not register the daily Check servers run", exc_info=True)
+
+    def _register_plex_held_rereads(self) -> None:
+        """Add the internal job that sends held Plex re-reads once Plex's maintenance window opens."""
+        try:
+            from ..processing.plex_held_rereads import flush_held_rereads
+
+            self.scheduler.add_job(
+                flush_held_rereads,
+                IntervalTrigger(minutes=10),
+                id=_PLEX_HELD_REREADS,
+                # Soon after start too, so Plex's job settings are cached before the first preview is published.
+                next_run_time=datetime.now() + timedelta(minutes=1),
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+        except Exception:
+            logger.warning("Could not register the held Plex re-reads job", exc_info=True)
 
     def _register_library_health_nightly(self) -> None:
         """Add the internal 03:00 library-health check; hidden from user schedules by its ``__`` id."""

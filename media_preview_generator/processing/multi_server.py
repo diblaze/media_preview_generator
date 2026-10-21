@@ -33,6 +33,7 @@ import shutil
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -59,6 +60,15 @@ from ..output.journal import (
 from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint, same_source
 from ..servers.base import LibraryNotYetIndexedError, MediaServer, ServerConfig, ServerType
 from ..servers.ownership import find_library_matches
+from ..servers.plex_scheduled_jobs import (
+    cached_settings,
+    chapter_thumbnails_on,
+    held_jobs,
+    job_names,
+    window_open,
+    window_text,
+)
+from . import plex_held_rereads
 from .frame_cache import get_frame_cache
 from .generator import (
     FALLBACK_CODEC,
@@ -1292,6 +1302,35 @@ def _server_needs_item_registration(server: MediaServer) -> bool:
     return True
 
 
+def _plex_library_id(server: PlexServer, canonical_path: str) -> str | None:
+    """The Plex library holding this file, from the saved library folders; None when none is known."""
+    config = server.server_config
+    if config is None:
+        return None
+    matches = [m for m in find_library_matches(canonical_path, [config]) if m.server_id == server.id]
+    return matches[0].library_id if matches else None
+
+
+def _log_held_refresh(server: PlexServer, canonical_path: str, library_id: str | None) -> None:
+    """Tell the job log when Plex's scheduled jobs make the app wait for its maintenance window.
+
+    Uses only settings the refresh worker has already read, so a slow or offline Plex never stalls publishing.
+    """
+    settings = cached_settings(server.id)
+    if settings is None or window_open(settings, datetime.now()) or chapter_thumbnails_on(server.server_config):
+        return
+    jobs = held_jobs(settings, library_id)
+    if not jobs:
+        return
+    logger.info(
+        "{}: Plex runs {} as a scheduled task, so the app asks Plex to show this preview during its maintenance "
+        "window ({})",
+        os.path.basename(canonical_path),
+        job_names(jobs),
+        window_text(settings),
+    )
+
+
 def _refresh_after_publish(
     server: MediaServer,
     item_id: str | None,
@@ -1307,14 +1346,29 @@ def _refresh_after_publish(
         marker = mark_plex_refresh_pending if new_output else get_plex_refresh_pending
         token = marker(output_paths, canonical_path, server.id, source_fingerprint=source_fingerprint)
         if new_output or token is not None:
-            enqueue_plex_refresh(
-                cast("PlexServer", server),
+            plex = cast("PlexServer", server)
+            library_id = _plex_library_id(plex, canonical_path)
+            if new_output:
+                _log_held_refresh(plex, canonical_path, library_id)
+            queued = enqueue_plex_refresh(
+                plex,
                 canonical_path,
                 item_id,
+                library_id=library_id,
                 output_paths=tuple(output_paths),
                 notification_token=token,
                 source_fingerprint=source_fingerprint,
             )
+            if not queued:
+                plex_held_rereads.hold(
+                    plex.id,
+                    canonical_path,
+                    item_id=item_id,
+                    library_id=library_id,
+                    output_paths=tuple(output_paths),
+                    token=token,
+                    source_fingerprint=source_fingerprint,
+                )
             return True
         return False
     try:
