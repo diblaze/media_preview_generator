@@ -15,6 +15,7 @@ import pytest
 from media_preview_generator.inspector import previews
 from media_preview_generator.servers.plex import PlexServer
 from media_preview_generator.web.settings_manager import get_settings_manager
+from tests.conftest import CTIME_ONLY_CHANGES, change_ctime_only
 from tests.test_api_inspector import (  # noqa: F401 - shared route fixtures
     _emby_entry,
     _reset_singletons,
@@ -162,7 +163,7 @@ def test_native_values_states_and_json_safety(authed_client, film, native, chang
         "missing_id",
         "duplicate",
         "changed_file",
-        "changed_same_size",
+        "replaced_same_size",
         "offline",
     ],
 )
@@ -185,13 +186,15 @@ def test_mismatched_or_unavailable_metadata_never_verified(authed_client, film, 
             return native.data
 
         native.query.side_effect = change
-    elif problem == "changed_same_size":
+    elif problem == "replaced_same_size":
 
         def change(_url):
             before = os.stat(film)
-            with open(film, "r+b") as output:
-                output.write(b"X")
-            os.utime(film, ns=(before.st_atime_ns, before.st_mtime_ns))
+            replacement = f"{film}.new"
+            with open(film, "rb") as original, open(replacement, "wb") as output:
+                output.write(b"X" + original.read()[1:])
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.replace(replacement, film)
             return native.data
 
         native.query.side_effect = change
@@ -201,6 +204,20 @@ def test_mismatched_or_unavailable_metadata_never_verified(authed_client, film, 
     assert row["state"] == "unavailable"
     assert row["streams"] == []
     assert "private-plex-token" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_metadata_only_change_while_reading_keeps_values(authed_client, film, native, how):
+    """A hard link, chmod or *arr re-import moves the change time, not the audio Plex measured."""
+
+    def relinked(_url):
+        change_ctime_only(film, how)
+        return native.data
+
+    native.query.side_effect = relinked
+    row = _read(authed_client, film)[0]
+    assert row["state"] == "available"
+    assert [stream["stream_id"] for stream in row["streams"]] == ["77"]
 
 
 def test_unauthenticated_or_outside_library_never_queries_plex(client, authed_client, film, media, native):

@@ -12,13 +12,11 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from collections.abc import Sequence
 from functools import lru_cache
 
 SourceFingerprint = tuple[int, int, int, int, int]
 _BLOCK_SIZE = 65_536
-# Windows (Python 3.12+) fills os.stat's st_ctime with the file's creation time but os.fstat's with its last change,
-# so there an opened file is matched to a path's fingerprint on the other fields.
-_FSTAT_CTIME_DIFFERS = os.name == "nt"
 
 
 class SourceFileChangedError(OSError):
@@ -29,11 +27,28 @@ def _fingerprint(info: os.stat_result) -> SourceFingerprint:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
+def same_source(a: Sequence[int] | None, b: Sequence[int] | None) -> bool:
+    """Whether two source fingerprints describe the same, unchanged file.
+
+    The change time (the fifth field) never counts: a hard link, chmod or *arr re-import moves it without touching
+    the content.
+
+    Args:
+        a: A ``get_source_fingerprint`` result, or one saved as a JSON list.
+        b: Another, likewise.
+
+    Returns:
+        True when both are present, have all five fields, and their device, inode, size and modification time are
+        equal.
+    """
+    if not isinstance(a, tuple | list) or not isinstance(b, tuple | list) or len(a) < 5 or len(b) < 5:
+        return False
+    return tuple(a[:4]) == tuple(b[:4])
+
+
 def _opened_is(opened: SourceFingerprint, expected: SourceFingerprint) -> bool:
     """Whether the file just opened (its ``os.fstat``) is the one ``expected`` (an ``os.stat``) describes."""
-    if _FSTAT_CTIME_DIFFERS:
-        return opened[:4] == expected[:4]
-    return opened == expected
+    return same_source(opened, expected)
 
 
 def get_source_fingerprint(path: str | os.PathLike[str]) -> SourceFingerprint:
@@ -71,7 +86,7 @@ def _hash_stable_source(path: str, expected: SourceFingerprint) -> str:
             if len(last) != _BLOCK_SIZE:
                 raise SourceFileChangedError(f"Media source changed while hashing: {path}")
             signature += hashlib.sha1(last, usedforsecurity=False).hexdigest()
-        if _fingerprint(os.fstat(source.fileno())) != opened:
+        if not same_source(_fingerprint(os.fstat(source.fileno())), opened):
             raise SourceFileChangedError(f"Media source changed while hashing: {path}")
     if size < _BLOCK_SIZE:
         return signature
@@ -105,6 +120,6 @@ def calculate_plex_hash(path: str | os.PathLike[str], *, fingerprint: SourceFing
         return _hash_stable_source(filename, fingerprint)
     expected = get_source_fingerprint(filename)
     result = _hash_stable_source(filename, expected)
-    if get_source_fingerprint(filename) != expected:
+    if not same_source(get_source_fingerprint(filename), expected):
         raise SourceFileChangedError(f"Media source changed while hashing: {filename}")
     return result

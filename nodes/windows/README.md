@@ -43,8 +43,15 @@ You don't need it when:
 
 Options:
 
+* `-AtStartup` starts the node when Windows starts, before anyone signs in, instead of at logon. Use it when Plex
+  runs as a Windows service (for example with PmsService) or starts at boot: without it, Plex runs after a reboot but
+  the node waits for someone to sign in. The user must be an administrator on this PC (Windows only lets an
+  administrator start a task without a stored password), and it asks for administrator rights once. If you decline
+  that, the node keeps starting at logon. Windows can't show its firewall question to a program started before
+  sign-in, so add `-AddFirewallRule` when the app runs on another machine; Docker Desktop on the same PC needs no rule.
 * `-AddFirewallRule` asks for administrator rights once to let other machines on private and domain networks reach
-  the node (port 9494). Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
+  the node (port 9494). It also removes the block Windows adds for `PlexDbNode.exe` when its firewall question is
+  dismissed. Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
 * `-Port 9500` listens on another port.
 * `-PlexConfigDir "D:\PlexData\Plex Media Server"` names Plex's data folder. You rarely need it: the node finds the
   folder from Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
@@ -57,7 +64,7 @@ The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\Medi
 (`$env:NODE_KEY = "..."`); the installer saves it in `node.json`, so it still works after a reboot.
 
 To update it, download the newest release, unzip it and run `install.ps1` again as the same user, with the options
-you installed with (`-Port`, `-PlexConfigDir`). It replaces the program and keeps the key and the undo record.
+you installed with (`-Port`, `-PlexConfigDir`, `-AtStartup`). It replaces the program and keeps the key and the undo record.
 
 To remove it:
 `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"`.
@@ -77,13 +84,20 @@ Stop Plex, then in PowerShell:
 from its own record, also when you installed with `-PlexConfigDir`. What it restores and what it leaves alone is in
 [Undoing it](../../docs/plex-loudness-normalization.md#undoing-it).
 
-## Why it starts at logon instead of as a Windows service
+## Why it starts at logon, or with a task, instead of as a Windows service
 
 The node has to run **as the same Windows user as Plex**: Plex's database files belong to that user, and the node
 must be able to open them for writing without being given rights over anyone else's files. The standard Plex install
-also runs at that user's logon, not as a service. A service would run as `SYSTEM` (far more access than it needs, and
-a different user from Plex) or need that user's password stored in the service settings. A per-user logon entry needs
-no administrator rights, starts and stops with Plex's own session, and can't reach anything that user can't.
+runs at that user's logon, so by default the node does too: a per-user logon entry needs no administrator rights,
+starts with Plex's own session, and can't reach anything that user can't.
+
+A Plex that runs as a service or starts at boot is up before anyone signs in. `-AtStartup` matches it with a
+scheduled task that starts at boot as the same user, logged on without a stored password (Windows calls it S4U). A
+task started that way can open files on this PC, which is all the node needs, but not network shares. It runs with
+the user's full administrator rights, as a Plex started at boot does, because Windows only holds rights back for a
+user who signs in at the screen. The task is named after the user, so each user has their own, and uninstalling
+removes it. A Windows service would run as `SYSTEM` (far more access than it needs, and a different user from Plex) or
+need that user's password stored.
 
 ## Build
 
@@ -100,5 +114,6 @@ database role's few libraries are bundled (`requirements-windows.txt`); nothing 
 libraries) is.
 
 `smoke_test.py` starts a build against a throwaway Plex folder and checks it answers and sees the database held open;
-`.github/workflows/windows-node.yml` runs it on every change. A `marker-agent-v*` tag builds it the same way and attaches
+`.github/workflows/windows-node.yml` runs it on every change, then installs the build for the runner's user both
+ways (logon entry and `-AtStartup`), calls it and uninstalls it. A `marker-agent-v*` tag builds it the same way and attaches
 `PlexDbNode-windows.zip` to that tag's release (`.github/workflows/marker-agent.yml`).

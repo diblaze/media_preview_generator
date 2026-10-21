@@ -16,7 +16,9 @@ from media_preview_generator.jobs.gpu_fallback import (
     notification_id,
 )
 from media_preview_generator.jobs.worker import Worker, WorkerPool
+from media_preview_generator.markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX
 from media_preview_generator.processing import CancellationError, CodecNotSupportedError
+from media_preview_generator.processing.generator import GPU_LACKS_FORMAT
 from media_preview_generator.processing.multi_server import PublisherResult, PublisherStatus
 from media_preview_generator.processing.types import ProcessableItem
 from tests.conftest import _ms, _pi
@@ -313,6 +315,105 @@ class TestWorkerFeedsTheTracker:
         _fallbacks(get_gpu_fallback_tracker(), "cuda:0", 5)
         _run_custom(worker, lambda item, **kwargs: ItemOutcome("markers_published"))
         assert get_gpu_fallback_tracker().flagged() == []
+
+
+LACKS_FORMAT = f"GPU processing failed ({GPU_LACKS_FORMAT} this video's format) for f.mpg (exit code 218)"
+KEPT_ON_CPU = f"{CREDITS_KEPT_ON_CPU_PREFIX}: Vulkan reports no hardware GPU"
+
+
+class TestOnlyAFaultCountsAgainstTheGpu:
+    """Issue #408: a GPU sends some files to the CPU by design; "GPU keeps failing, check the driver" is wrong there."""
+
+    def test_a_preview_file_handed_to_the_cpu_for_a_format_the_gpu_lacks_is_not_recorded(self):
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+        _fallbacks(get_gpu_fallback_tracker(), "/dev/dri/renderD128", 4)
+
+        def lacks_the_format(*args, gpu=None, **kwargs):
+            if gpu is not None:
+                raise CodecNotSupportedError(LACKS_FORMAT)
+            return _published("extracted")
+
+        for _ in range(3):
+            _run_preview(worker, lacks_the_format)
+        (state,) = get_gpu_fallback_tracker().states()
+        assert (state.streak, state.last_reason) == (4, "hevc")  # neither added to nor reset
+        assert worker.last_task_cpu_fallback is True  # the job's tally still says it ran on the CPU
+        _run_preview(worker, _gpu_then_cpu)
+        assert [s.streak for s in get_gpu_fallback_tracker().flagged()] == [5]
+
+    def test_a_kinds_whole_item_rerun_for_a_format_the_gpu_lacks_is_not_recorded(self):
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+        _fallbacks(get_gpu_fallback_tracker(), "/dev/dri/renderD128", 4)
+
+        def process(item, **kwargs):
+            if kwargs["gpu"] is not None:
+                raise CodecNotSupportedError(LACKS_FORMAT)
+            return ItemOutcome("markers_published")
+
+        _run_custom(worker, process)
+        (state,) = get_gpu_fallback_tracker().states()
+        assert state.streak == 4  # a CPU rerun isn't the GPU decoding, so it doesn't end the streak either
+        assert worker.last_task_cpu_fallback is True
+
+    def test_a_kinds_file_whose_credits_are_kept_on_the_cpu_counts_as_the_gpus(self):
+        # The GPU still decodes the frames whose text the CPU reads, so a file it finished ends a streak.
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+
+        def process(item, **kwargs):
+            kwargs["fallback_callback"](KEPT_ON_CPU)
+            return ItemOutcome("markers_published")
+
+        for _ in range(5):
+            _run_custom(worker, process)
+        assert get_gpu_fallback_tracker().flagged() == []
+        _fallbacks(get_gpu_fallback_tracker(), "/dev/dri/renderD128", 5)
+        _run_custom(worker, process)
+        assert get_gpu_fallback_tracker().flagged() == []
+        assert worker.last_task_cpu_fallback is True
+
+    def test_a_kinds_step_decoded_on_the_cpu_for_a_format_the_gpu_lacks_is_not_recorded(self):
+        # The GPU didn't decode that step, so the file says nothing about it: no count, and no end to a streak.
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+        reason = (
+            "The end-picture check couldn't decode t.mkv on the GPU and decoded it on the CPU: "
+            f"{GPU_LACKS_FORMAT} this file's MPEG-1 video (ffmpeg exited 218)"
+        )
+
+        def process(item, **kwargs):
+            kwargs["fallback_callback"](reason)
+            return ItemOutcome("markers_published")
+
+        _fallbacks(get_gpu_fallback_tracker(), "/dev/dri/renderD128", 5)
+        for _ in range(3):
+            _run_custom(worker, process)
+        assert [s.streak for s in get_gpu_fallback_tracker().flagged()] == [5]
+        assert worker.last_task_cpu_fallback is True
+
+    def test_a_fault_beside_a_by_design_step_still_counts_with_the_faults_reason(self):
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+
+        def process(item, **kwargs):
+            kwargs["fallback_callback"]("decoded t.mkv on the CPU: the GPU read no frames")
+            kwargs["fallback_callback"](KEPT_ON_CPU)
+            return ItemOutcome("markers_published")
+
+        for _ in range(5):
+            _run_custom(worker, process)
+        (state,) = get_gpu_fallback_tracker().flagged()
+        assert (state.streak, state.last_reason) == (5, "decoded t.mkv on the CPU: the GPU read no frames")
+
+    def test_the_next_file_starts_without_the_last_ones_fault(self):
+        worker = Worker(0, "GPU", "intel", "/dev/dri/renderD128", 0, "GPU A")
+        _run_preview(worker, _gpu_then_cpu)
+
+        def lacks_the_format(*args, gpu=None, **kwargs):
+            if gpu is not None:
+                raise CodecNotSupportedError(LACKS_FORMAT)
+            return _published("extracted")
+
+        _run_preview(worker, lacks_the_format)
+        (state,) = get_gpu_fallback_tracker().states()
+        assert state.streak == 1
 
 
 class TestTrackerFailureNeverStopsTheWorker:

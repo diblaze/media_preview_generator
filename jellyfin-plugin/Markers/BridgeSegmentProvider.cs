@@ -51,6 +51,12 @@ public class BridgeSegmentProvider : IMediaSegmentProvider
         try
         {
             var info = new FileInfo(item.Path);
+            // FileInfo describes a symlink itself (a few bytes), so measure what it points to, as the app's os.stat does.
+            if (info.LinkTarget is not null && info.ResolveLinkTarget(returnFinalTarget: true) is FileInfo target)
+            {
+                info = target;
+            }
+
             return info.Exists ? info.Length : null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or SecurityException)

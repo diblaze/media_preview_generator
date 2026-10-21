@@ -56,7 +56,7 @@ from ..output.journal import (
     outputs_fresh_for_source,
     write_meta,
 )
-from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint
+from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, get_source_fingerprint, same_source
 from ..servers.base import LibraryNotYetIndexedError, MediaServer, ServerConfig, ServerType
 from ..servers.ownership import find_library_matches
 from .frame_cache import get_frame_cache
@@ -1383,9 +1383,8 @@ def _publish_one(
 
     try:
         output_paths = adapter.compute_output_paths(bundle, server, item_id)
-        if (
-            bundle.source_fingerprint is not None
-            and get_source_fingerprint(bundle.canonical_path) != bundle.source_fingerprint
+        if bundle.source_fingerprint is not None and not same_source(
+            get_source_fingerprint(bundle.canonical_path), bundle.source_fingerprint
         ):
             raise SourceFileChangedError("Source file changed while resolving preview output")
     except LibraryNotYetIndexedError as exc:
@@ -1478,9 +1477,8 @@ def _publish_one(
 
     try:
         adapter.publish(bundle, output_paths, item_id)
-        if (
-            bundle.source_fingerprint is not None
-            and get_source_fingerprint(bundle.canonical_path) != bundle.source_fingerprint
+        if bundle.source_fingerprint is not None and not same_source(
+            get_source_fingerprint(bundle.canonical_path), bundle.source_fingerprint
         ):
             raise SourceFileChangedError("Source file changed while publishing previews")
     except (TypeError, ValueError, OSError, RuntimeError, requests.RequestException) as exc:
@@ -1782,7 +1780,7 @@ def _process_canonical_path_previews(
 
     def _source_changed() -> bool:
         try:
-            return get_source_fingerprint(canonical_path) != source_fingerprint
+            return not same_source(get_source_fingerprint(canonical_path), source_fingerprint)
         except OSError:
             return True
 
@@ -2627,7 +2625,7 @@ def process_canonical_path(
                         "waiting", message="Waiting for Plex Analyze before chapter registration", retryable=True
                     )
                 else:
-                    if get_source_fingerprint(result.canonical_path) != plan.source_fingerprint:
+                    if not same_source(get_source_fingerprint(result.canonical_path), plan.source_fingerprint):
                         raise SourceFileChangedError("Source changed while waiting for Plex Analyze")
                     # Analyze replaces chapter references. Its completed request
                     # must precede both the guarded snapshot and registration.

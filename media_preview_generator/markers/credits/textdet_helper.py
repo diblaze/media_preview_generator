@@ -74,7 +74,7 @@ DEFAULT_REC_MODEL_PATH = "/app/models/latin_PP-OCRv5_rec_mobile.onnx"
 CPU_KEY = "cpu"
 CREDITS_ON_CPU_PREFIX = "Credits read on the CPU"
 # For a device whose credits stay on the CPU for the process (no WebGPU path, software Vulkan, failed self-test). The
-# GPU-streak card keys on it, since a remote node's verdict lives in the node's own pool, not this one.
+# worker leaves such files out of the "GPU keeps failing" streak by this prefix, which reaches it from a node's run too.
 CREDITS_KEPT_ON_CPU_PREFIX = "Credits read on the CPU until restart"
 # ONNX Runtime threads per helper. Each CPU worker's request gets a helper of its own, so a small number keeps the
 # total in line with the worker count the user chose.

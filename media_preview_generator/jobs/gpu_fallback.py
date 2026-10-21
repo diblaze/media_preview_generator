@@ -1,9 +1,10 @@
 """Per-GPU count of files in a row that needed the CPU fallback, kept for the life of the process.
 
-A GPU worker records every file it finishes (``Worker._record_gpu_file``): "fell back" when the file needed the CPU
-(a whole-file rerun or a step that fell back inside a kind's own run), otherwise "ok". ``GPU_FALLBACK_STREAK`` fallen-back
-files in a row flag the GPU; the bell shows one card per flagged GPU (``web.notifications``), and the next ok file on
-that GPU clears the flag and the count. Cancelled files and CPU workers never count.
+A GPU worker records the files it finishes (``Worker._record_gpu_file``): "fell back" when the file needed the CPU (a
+whole-file rerun or a step that fell back inside a kind's own run) for a reason that blames the GPU, "ok" when the GPU
+decoded it. ``GPU_FALLBACK_STREAK`` fallen-back files in a row flag the GPU; the bell shows one card per flagged GPU
+(``web.notifications``), and the next ok file on that GPU clears the flag and the count. Cancelled files, files sent to
+the CPU by design (a format the GPU lacks, credits kept on the CPU) and CPU workers never count.
 
 Workers are threads and several can share one GPU, so every record takes the lock. The key is the GPU's ``device``
 from ``gpu_config`` (the worker's ``gpu_device``), the same identity Settings → GPU uses.

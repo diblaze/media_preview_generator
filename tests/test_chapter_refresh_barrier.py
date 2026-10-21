@@ -18,6 +18,7 @@ from media_preview_generator.processing.multi_server import (
     PublisherStatus,
 )
 from media_preview_generator.processing.plex_refresh import PlexRefreshQueue
+from tests.conftest import CTIME_ONLY_CHANGES, change_ctime_only
 from tests.test_processing_chapters import _registry
 from tests.test_processing_chapters import config as _config_fixture
 from tests.test_processing_chapters import extraction as _extraction_fixture
@@ -207,6 +208,24 @@ def test_unconfirmed_refresh_never_publishes_chapters(plan, config, extraction, 
     assert bif.read_bytes() == b"bif"
     extraction[0].assert_not_called()
     extraction[1].assert_not_called()
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_metadata_only_change_while_waiting_for_analyze_still_publishes_chapters(
+    plan, config, extraction, monkeypatch, how
+):
+    """A hard link, chmod or *arr re-import moves the change time, not the chapter frames' source."""
+    registry, _previews, publisher = _pipeline(plan, monkeypatch)
+    monkeypatch.setattr(chapters, "prepare_chapters", lambda *_a, **_kw: plan)
+
+    def wait(*_args, **_kwargs):
+        change_ctime_only(plan.canonical_path, how)
+        return True
+
+    monkeypatch.setattr(multi_server, "wait_for_plex_refresh", wait)
+    multi_server.process_canonical_path(plan.canonical_path, registry, config)
+    assert publisher.artifacts["chapters"]["status"] == "ready"
+    assert extraction[1].call_count == 1
 
 
 @pytest.mark.parametrize("requested", [False, True])

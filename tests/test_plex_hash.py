@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from media_preview_generator.output import plex_hash
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 
 @pytest.mark.parametrize(
@@ -153,7 +154,7 @@ def test_missing_source_rejected(tmp_path: Path) -> None:
 
 
 class _OtherCtime:
-    """``os.fstat`` as Windows' Python 3.12+ answers it: its st_ctime is the last change, not the creation time."""
+    """``os.fstat`` answering with another ``st_ctime``, as Windows' Python 3.12+ does (there it is the last change)."""
 
     def __init__(self, real_fstat, shift_ns: int) -> None:
         self.real_fstat, self.shift_ns = real_fstat, shift_ns
@@ -167,34 +168,21 @@ class _OtherCtime:
 
 
 @pytest.mark.parametrize("size", [5, 70000], ids=["small", "large"])
-def test_on_windows_an_opened_files_other_ctime_isnt_a_change(tmp_path, monkeypatch, size):
+def test_an_opened_files_other_ctime_isnt_a_change(tmp_path, monkeypatch, size):
     source = tmp_path / "video.mkv"
     source.write_bytes(b"a" * size)
     expected = plex_hash.calculate_plex_hash(source)
     plex_hash._hash_stable_source.cache_clear()
-    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", True, raising=False)
     monkeypatch.setattr(plex_hash.os, "fstat", _OtherCtime(os.fstat, 1_000_000_000))
 
     assert plex_hash.calculate_plex_hash(source) == expected
     plex_hash._hash_stable_source.cache_clear()
 
 
-def test_elsewhere_an_opened_file_with_another_ctime_was_changed(tmp_path, monkeypatch):
+def test_a_file_changed_while_hashing_is_rejected_whatever_its_ctime(tmp_path, monkeypatch):
     source = tmp_path / "video.mkv"
     source.write_bytes(b"a" * 70000)
     plex_hash._hash_stable_source.cache_clear()
-    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", False)
-    monkeypatch.setattr(plex_hash.os, "fstat", _OtherCtime(os.fstat, 1_000_000_000))
-
-    with pytest.raises(plex_hash.SourceFileChangedError, match="changed before hashing"):
-        plex_hash.calculate_plex_hash(source)
-
-
-def test_on_windows_a_file_changed_while_hashing_is_still_rejected(tmp_path, monkeypatch):
-    source = tmp_path / "video.mkv"
-    source.write_bytes(b"a" * 70000)
-    plex_hash._hash_stable_source.cache_clear()
-    monkeypatch.setattr(plex_hash, "_FSTAT_CTIME_DIFFERS", True)
     real_fstat, calls = os.fstat, []
 
     def grows_after_opening(fd):
@@ -208,3 +196,67 @@ def test_on_windows_a_file_changed_while_hashing_is_still_rejected(tmp_path, mon
 
     with pytest.raises(plex_hash.SourceFileChangedError, match="changed while hashing"):
         plex_hash.calculate_plex_hash(source)
+
+
+class TestSameSource:
+    def test_true_when_only_the_change_time_differs(self):
+        assert plex_hash.same_source((1, 2, 3, 4, 5), (1, 2, 3, 4, 6))
+
+    def test_compares_a_saved_json_list_with_a_live_tuple(self):
+        assert plex_hash.same_source([1, 2, 3, 4, 5], (1, 2, 3, 4, 9))
+        assert plex_hash.same_source((1, 2, 3, 4, 5), [1, 2, 3, 4, 9])
+
+    @pytest.mark.parametrize("field", range(4), ids=["device", "inode", "size", "mtime"])
+    def test_false_when_device_inode_size_or_mtime_differs(self, field):
+        changed = [1, 2, 3, 4, 5]
+        changed[field] += 1
+        assert not plex_hash.same_source((1, 2, 3, 4, 5), changed)
+
+    @pytest.mark.parametrize("saved", [None, [1, 2, 3], [1, 2, 3, 4], {"a": 1}, "12345", 7], ids=str)
+    def test_false_for_missing_or_malformed_saved_values(self, saved):
+        assert not plex_hash.same_source(saved, (1, 2, 3, 4, 5))
+        assert not plex_hash.same_source((1, 2, 3, 4, 5), saved)
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_a_metadata_only_change_keeps_the_fingerprint_and_hash(tmp_path, how):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * 70000)
+    plex_hash._hash_stable_source.cache_clear()
+    before = plex_hash.get_source_fingerprint(source)
+
+    change_ctime_only(source, how)
+
+    assert plex_hash.same_source(before, plex_hash.get_source_fingerprint(source))
+    assert plex_hash.calculate_plex_hash(source, fingerprint=before) == plex_hash.calculate_plex_hash(source)
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_a_metadata_only_change_while_hashing_isnt_rejected(tmp_path, monkeypatch, how):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * 70000)
+    plex_hash._hash_stable_source.cache_clear()
+    real_hash = plex_hash._hash_stable_source
+
+    def relinked_after_read(path, fingerprint):
+        result = real_hash(path, fingerprint)
+        change_ctime_only(source, how)
+        return result
+
+    monkeypatch.setattr(plex_hash, "_hash_stable_source", relinked_after_read)
+
+    assert plex_hash.calculate_plex_hash(source)
+
+
+@pytest.mark.parametrize("how", SOURCE_CHANGES)
+def test_a_real_change_still_invalidates_the_fingerprint(tmp_path, how):
+    source = tmp_path / "video.mkv"
+    source.write_bytes(b"a" * 70000)
+    plex_hash._hash_stable_source.cache_clear()
+    before = plex_hash.get_source_fingerprint(source)
+
+    change_source(source, how)
+
+    assert not plex_hash.same_source(before, plex_hash.get_source_fingerprint(source))
+    with pytest.raises(plex_hash.SourceFileChangedError, match="changed before hashing"):
+        plex_hash.calculate_plex_hash(source, fingerprint=before)

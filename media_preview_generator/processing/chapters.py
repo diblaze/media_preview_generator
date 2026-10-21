@@ -21,7 +21,13 @@ from ..config.paths import expand_path_mapping_candidates
 from ..markers.probe import ProbeError, ProbeStalledError, ProbeTimeoutError, ffprobe_path_for, probe_media
 from ..markers.publishers.base import Capability, PublishError
 from ..output.plex_bundle import PlexBundleAdapter
-from ..output.plex_hash import SourceFileChangedError, SourceFingerprint, calculate_plex_hash, get_source_fingerprint
+from ..output.plex_hash import (
+    SourceFileChangedError,
+    SourceFingerprint,
+    calculate_plex_hash,
+    get_source_fingerprint,
+    same_source,
+)
 from .chapter_recovery import inspect_seek_index, recover_bif_frame
 from .ffmpeg_runner import (
     ACTIVE_TIMEOUT_LINE,
@@ -273,7 +279,7 @@ def _unsupported_stamp(plan: ChapterPlan) -> str | None:
     """Return the skip message when this exact file and profile were already found unsupported or failing."""
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
             return None
         reason = manifest.get("unsupported")
         if isinstance(reason, str) and reason:
@@ -290,7 +296,7 @@ def _unsupported_stamp(plan: ChapterPlan) -> str | None:
 
 
 def _check_source(plan: ChapterPlan) -> None:
-    if get_source_fingerprint(plan.canonical_path) != plan.source_fingerprint:
+    if not same_source(get_source_fingerprint(plan.canonical_path), plan.source_fingerprint):
         raise SourceFileChangedError("Source changed during chapter processing; retry when the file is stable.")
 
 
@@ -317,7 +323,7 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
     target = cast("ChapterTarget", plan.target)
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
             return {}
         entries = manifest.get("images", {})
         fresh = {}
@@ -371,7 +377,7 @@ def _stamp_manifest(plan: ChapterPlan, proven: dict[str, tuple[dict, dict]]) -> 
         return
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
             return
         entries = manifest.get("images", {})
         changed = False
@@ -436,7 +442,7 @@ def _other_items_verified(plan: ChapterPlan, key: dict) -> list[dict]:
     """
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if manifest.get("source") != list(plan.source_fingerprint) or manifest.get("profile") != plan.profile:
+        if not same_source(manifest.get("source"), plan.source_fingerprint) or manifest.get("profile") != plan.profile:
             return []
         found = [manifest.get("verified"), *(manifest.get("also_verified") or [])]
     except (OSError, ValueError, AttributeError, TypeError):

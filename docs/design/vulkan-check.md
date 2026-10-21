@@ -91,8 +91,9 @@ Cache the per-GPU result keyed by (probe device, GPU device list); re-scan GPUs 
   GPU in that set whose last reason is a credits one. **Replace with a reason prefix**, because a node GPU's verdict
   lives in the node's own pool: add `CREDITS_KEPT_ON_CPU_PREFIX = "Credits read on the CPU until restart"` (starts
   with `CREDITS_ON_CPU_PREFIX`); `_ask` reports with it when the device's verdict is `cpu` (no WebGPU path, software
-  Vulkan, failed self-test), and with the plain prefix for a failure that is retried (crash, cool-down). The streak
-  card skips any GPU (local or node) whose last reason starts with `CREDITS_KEPT_ON_CPU_PREFIX`; drop
+  Vulkan, failed self-test), and with the plain prefix for a failure that is retried (crash, cool-down). The worker
+  doesn't count a fallback whose reason starts with `CREDITS_KEPT_ON_CPU_PREFIX` towards the streak
+  (`Worker._blame_gpu_for`, local or node GPU; it once was a card-side check on the streak's last reason only); drop
   `cpu_verdict_keys`/`credits_cpu_verdict_keys` and the pool lookup in the card. Keep the tests' intent.
 
 ## Tests (mirror existing files)

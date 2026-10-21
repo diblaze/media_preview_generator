@@ -432,6 +432,40 @@ class TestTheInstaller:
         readme = (REPO_ROOT / "nodes" / "windows" / "README.md").read_text()
         assert r"$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1" in readme
 
+    def test_the_key_is_kept_before_the_node_starts(self):
+        # Neither the logon entry nor the boot task passes this session's NODE_KEY: a node started before node.json
+        # holds it would expect a key nobody was shown.
+        kept = self.SCRIPT.index("WriteAllText($identityFile")
+        assert kept < self.SCRIPT.index("Start-Process -FilePath $Exe")
+        assert kept < self.SCRIPT.index("Start-ScheduledTask")
+
+    def test_at_startup_registers_a_boot_task_for_this_user(self):
+        task = self.SCRIPT.split("if ($AtStartup) {", 1)[1].split("} elseif ($HadTask) {", 1)[0]
+        assert "-LogonType S4U" in task  # this user, no password stored
+        assert "New-ScheduledTaskTrigger -AtStartup" in task
+
+    def test_the_logon_entry_goes_only_once_the_task_is_registered(self):
+        # Removed first, a declined administrator prompt would leave the node with nothing to start it. Kept beside the
+        # task, it would start a second copy that can't take the port.
+        assert "$BootTask = ($AtStartup -and -not $failure) -or $KeptTask" in self.SCRIPT
+        took = self.SCRIPT.split("if ($BootTask) {", 1)[1].split("} else {", 1)[0]
+        assert "Remove-ItemProperty -Path $RunKey -Name $RunValue" in took
+        assert self.SCRIPT.count("Remove-ItemProperty -Path $RunKey") == 1
+
+    def test_the_firewall_rule_also_clears_windows_own_block_rules(self):
+        # Dismissing Windows' firewall question blocks the program, and a block beats the rule this adds.
+        firewall = self.SCRIPT.split("if ($AddFirewallRule) {", 1)[1].split("\n}\n", 1)[0]
+        assert "`$_.Action -eq 'Block'" in firewall and "Remove-NetFirewallRule" in firewall
+        assert "`$_.Program -eq $(ConvertTo-Literal $Exe)" in firewall
+
+    def test_a_boot_task_it_could_not_change_stays_the_only_starter(self):
+        # Declined while updating: the old task is still registered, so the logon entry would start a second copy, and
+        # the marker the uninstaller needs (the folder was replaced) has to be written again.
+        kept = self.SCRIPT.split("if ($failure -and $HadTask) {", 1)[1].split("$BootTask =", 1)[0]
+        assert "Start-ScheduledTask -TaskName $TaskName" in kept and "$KeptTask = $true" in kept
+        marker = self.SCRIPT.split("if ($BootTask -or ($failure -and $HadTask)) {", 1)[1].split("}", 1)[0]
+        assert "Set-Content -LiteralPath (Join-Path $InstallDir $TaskMarker)" in marker
+
 
 class TestTheUninstaller:
     """uninstall.ps1 can't run here; ``windows-node.yml`` runs it. The loudness undo record is the only way to put
@@ -460,8 +494,39 @@ class TestTheUninstaller:
         assert left < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
         assert "[Environment]::CurrentDirectory = $env:USERPROFILE" in self.SCRIPT
 
+    def test_it_removes_the_boot_task_install_marked(self):
+        installer = (REPO_ROOT / "nodes" / "windows" / "install.ps1").read_text()
+        marker = '"starts-at-boot"'
+        assert marker in installer and marker in self.SCRIPT
+        assert self.SCRIPT.index("Test-Path $TaskMarker") < self.SCRIPT.index("Remove-Item -Recurse -Force $InstallDir")
+        assert "Unregister-ScheduledTask" in self.SCRIPT
+
     def test_it_says_where_the_kept_record_is(self):
         assert '" Its loudness undo record stays: $record"' in self.SCRIPT
+
+    def test_a_normal_window_still_finds_the_firewall_rule(self):
+        # Get-NetFirewallRule is "Access is denied" without elevation, so the rule was left behind.
+        assert "if (Get-NetFirewallRule" not in self.SCRIPT
+        assert "HNetCfg.FwPolicy2" in self.SCRIPT
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "uninstall.ps1"])
+def test_it_waits_for_the_task_not_for_a_process_it_cannot_see(name):
+    # A normal window can't read the path of the task's elevated node, so a wait on it ended at once and the copy
+    # hit files the node still held.
+    script = (REPO_ROOT / "nodes" / "windows" / name).read_text()
+    wait = script[script.index("function Wait-TaskStopped") :]
+    wait = wait[: wait.index("\n}\n")]
+    assert 'if (-not $task -or $task.State -ne "Running") { return }' in wait
+    stop = script.index("Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue")
+    assert script.index("Wait-TaskStopped", stop) < script.index("Get-OwnNode | Stop-Process", stop)
+
+
+@pytest.mark.parametrize("name", ["install.ps1", "uninstall.ps1"])
+def test_it_never_reads_a_property_of_a_task_that_may_not_exist(name):
+    # Strict mode stops the script there when there's no task: every plain logon install failed to uninstall.
+    script = (REPO_ROOT / "nodes" / "windows" / name).read_text()
+    assert "-ErrorAction SilentlyContinue).State" not in script
 
 
 def test_off_windows_the_preferences_file_beside_the_database_names_plex(tmp_path, monkeypatch):

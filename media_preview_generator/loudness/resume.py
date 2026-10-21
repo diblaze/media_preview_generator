@@ -146,7 +146,7 @@ class CompletionLedger:
         after = source_fingerprint(item)
         payload = {
             "version": 1,
-            "source": list(after) if before is not None and before == after else None,
+            "source": list(after) if after is not None and before is not None and before.matches(after) else None,
             "server_id": item.server_id,
             "item_id_by_server": item.item_id_by_server,
             "outcome": result.outcome_key,
@@ -185,7 +185,7 @@ class CompletionLedger:
                 and candidate.get("version") == 1
                 and candidate.get("outcome") in _SUCCESS
                 and fingerprint is not None
-                and candidate.get("source") == list(fingerprint)
+                and fingerprint.matches(candidate.get("source"))
                 and candidate.get("server_id") == item.server_id
                 and candidate.get("item_id_by_server") == item.item_id_by_server
                 and _valid_servers(candidate.get("servers"))
@@ -243,7 +243,7 @@ class CompletionLedger:
                             and {server.get("server_id") for server in current.publisher_rows}
                             == {server.get("server_id") for server in candidate["servers"]}
                             and fingerprint is not None
-                            and candidate.get("source") == list(fingerprint)
+                            and fingerprint.matches(candidate.get("source"))
                         ):
                             row = candidate
                     if row is None:

@@ -25,11 +25,17 @@ from PIL import Image
 from media_preview_generator.processing import ffmpeg_runner
 from media_preview_generator.processing.ffmpeg_runner import create_ffmpeg_runner
 from media_preview_generator.processing.filter_chain import DV5_PATH_LIBPLACEBO
-from media_preview_generator.processing.generator import _was_interrupted, gpu_fallback_announcement
+from media_preview_generator.processing.generator import (
+    GPU_LACKS_FORMAT,
+    _was_interrupted,
+    gpu_fallback_announcement,
+    gpu_lacks_the_format,
+)
 from media_preview_generator.processing.hwaccel import hwaccel_decode_args
 from tests.test_processing_partial_output import (
     EXPECTED,
     FFMPEG_SIGNALLED,
+    RAW_SIGSEGV,
     RAW_SIGTERM,
     STALL_KILLED,
     _warned,
@@ -739,6 +745,91 @@ VERDICT_THEN_FRAMES_REFUSED = [
 ]
 
 
+class TestAFormatAWorkingGpuMayLack:
+    """Issue #408: only 8-bit 4:2:0 H.264 failing points at the GPU's driver; every GPU the app supports decodes it."""
+
+    @pytest.mark.parametrize(
+        ("stream", "lacks"),
+        [
+            pytest.param("h264 (High), yuv420p(tv, bt709, progressive), 1920x1080", False, id="h264-8-bit-4-2-0"),
+            pytest.param("h264 (High) (avc1 / 0x31637661), yuvj420p(pc, progressive), 720x1280", False, id="h264-jpeg"),
+            pytest.param("h264 (High 10), yuv420p10le(tv, progressive), 1920x1080", True, id="h264-10-bit"),
+            pytest.param("h264 (High 4:2:2), yuv422p(tv, progressive), 1920x1080", True, id="h264-4-2-2"),
+            pytest.param("h264 (High), gray(tv, progressive), 1920x1080", True, id="h264-greyscale"),
+            pytest.param("hevc (Main), yuv420p(tv, progressive), 1920x1080", True, id="hevc"),
+            pytest.param("mpeg1video, yuv420p(tv), 352x240", True, id="mpeg-1"),
+            pytest.param("mpeg4 (Advanced Simple Profile) (DX50 / 0x30355844), yuv420p, 640x480", True, id="divx"),
+        ],
+    )
+    def test_only_8_bit_4_2_0_h264_blames_the_gpu(self, stream, lacks):
+        lines = [f"  Stream #0:0: Video: {stream}"]
+        assert gpu_lacks_the_format(lines, lines) is lacks
+
+    def test_the_cover_art_is_not_the_video(self):
+        lines = [
+            "  Stream #0:0: Video: mjpeg (Baseline), yuvj444p(pc), 600x900 (attached pic)",
+            "  Stream #0:1: Video: h264 (High), yuv420p(tv, progressive), 1920x1080",
+        ]
+        assert gpu_lacks_the_format(lines, lines) is False
+
+    def test_a_run_stopped_at_the_verdict_names_the_format_the_gpu_lacks(self, run):  # noqa: F811
+        stopped = (FFMPEG_SIGNALLED, 0, *INPUT_DUMP, *_av1_block("cuda"), ffmpeg_runner.GPU_CANT_DECODE_LINE)
+        outcome = run([stopped], gpu="NVIDIA")
+
+        assert_handed_to_cpu(outcome)
+        assert GPU_LACKS_FORMAT in str(outcome.result), outcome.result
+
+    def test_the_simpler_chains_retry_names_the_format_the_gpu_lacks_too(self, run):  # noqa: F811
+        stopped = (FFMPEG_SIGNALLED, 0, *INPUT_DUMP, *_av1_block("cuda"), ffmpeg_runner.GPU_CANT_DECODE_LINE)
+        outcome = run([(RAW_SIGSEGV, 0), stopped], gpu="NVIDIA", dv5=True)
+
+        assert outcome.tiers == ["primary", "dv-safe"]
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert GPU_LACKS_FORMAT in str(outcome.result), outcome.result
+
+    def test_without_the_listing_the_gpu_is_blamed(self):
+        assert gpu_lacks_the_format(["Conversion failed!"], ["Conversion failed!"]) is False
+
+    @pytest.mark.parametrize(
+        "driver_error",
+        [
+            "[hevc @ 0x1] Failed to sync surface 0x5 (operation failed).",
+            "[AVHWFramesContext @ 0x1] Failed to create surface: 2 (resource allocation failed).",
+        ],
+        ids=["surface-sync", "surface-create"],
+    )
+    def test_a_driver_error_beside_any_format_blames_the_gpu(self, driver_error):
+        lines = ["  Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, progressive), 3840x2160", driver_error]
+        assert gpu_lacks_the_format(lines, lines) is False
+
+    def test_the_generic_set_up_line_after_the_decoders_verdict_is_no_driver_error(self):
+        lines = _verdict_then_frames_refused(
+            "hevc (Main 4:2:2 10), yuv422p10le(tv, progressive), 1920x1080",
+            "hevc",
+            "No support for codec hevc profile 4.",
+            "vaapi",
+        )
+        assert gpu_lacks_the_format(lines, lines) is True
+
+    def test_an_8_bit_h264_the_driver_says_it_lacks_is_still_handed_off_as_the_gpus_fault(self, run):  # noqa: F811
+        stderr = _verdict_then_frames_refused(
+            "h264 (High), yuv420p(tv, progressive), 1920x1080, 23.98 fps",
+            "h264",
+            "No support for codec h264 profile 100.",
+            "vaapi",
+        )
+        with patch(
+            "media_preview_generator.processing.ffmpeg_runner.subprocess.Popen",
+            side_effect=_fake_ffmpeg(stderr, [], exit_code=SOFTWARE_FRAMES_EXIT),
+        ):
+            outcome = run([], gpu="INTEL", keyframe_gap=1.0, runner_factory=create_ffmpeg_runner)
+
+        assert_handed_to_cpu(outcome)
+        assert outcome.result.kind == "codec"
+        assert GPU_LACKS_FORMAT not in str(outcome.result), outcome.result
+
+
 class TestAGpuWithoutTheDecoderIsAQuietHandOff:
     """A ProRes, WMV, DivX 3, H.263 or VP8 file on a GPU worker is a normal CPU fallback ("No action needed").
 
@@ -784,6 +875,8 @@ class TestAGpuWithoutTheDecoderIsAQuietHandOff:
 
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "codec"
+        # A format a working GPU may lack: the worker doesn't count it towards "GPU keeps failing".
+        assert GPU_LACKS_FORMAT in str(outcome.result), outcome.result
         assert len(procs) == 1, "a full-frame rerun decodes in software the same way"
         assert not [line for line in records if line.startswith("ERROR|")], records
         assert not _warned(outcome, "unusual exit code"), outcome.warnings

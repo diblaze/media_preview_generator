@@ -327,6 +327,67 @@ def write_bif(
     return str(path)
 
 
+# Metadata-only changes: an *arr re-import that re-hardlinks the file, a chmod, a touch that keeps its times.
+CTIME_ONLY_CHANGES = ("hard_link", "chmod", "same_times")
+# Real changes to the file a preview was made from.
+SOURCE_CHANGES = ("mtime", "size", "inode")
+
+
+def change_ctime_only(path, how: str) -> None:
+    """Move ``path``'s change time while its device, inode, size and modification time stay the same.
+
+    Args:
+        path: An existing regular file.
+        how: One of ``CTIME_ONLY_CHANGES``.
+    """
+    import time
+
+    before = os.stat(path)
+    for _ in range(200):
+        if how == "hard_link":
+            link = f"{path}.link"
+            os.link(path, link)
+            os.unlink(link)
+        elif how == "chmod":
+            os.chmod(path, before.st_mode)
+        else:
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = os.stat(path)
+        if after.st_ctime_ns != before.st_ctime_ns:
+            break
+        time.sleep(0.005)  # a coarse filesystem clock may not have ticked yet
+    assert after.st_ctime_ns != before.st_ctime_ns
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def change_source(path, how: str) -> None:
+    """Change ``path`` the way a re-encode or replacement does, keeping every other identity field where it can.
+
+    Args:
+        path: An existing regular file.
+        how: One of ``SOURCE_CHANGES``: a new modification time, a new size at the old time, or the same bytes and
+            time under a new inode (a replaced file).
+    """
+    before = os.stat(path)
+    if how == "mtime":
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    elif how == "size":
+        with open(path, "ab") as f:
+            f.write(b"more")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    else:
+        replacement = f"{path}.replacement"
+        shutil.copyfile(path, replacement)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+        assert os.stat(path).st_ino != before.st_ino
+
+
 @pytest.fixture
 def mock_auth_config(tmp_path, monkeypatch):
     """Point the auth module and settings singleton at ``tmp_path``."""

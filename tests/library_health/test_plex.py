@@ -20,6 +20,7 @@ from media_preview_generator.markers.publishers.base import PublishError
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, encode_extra_data
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 from .plex_fixture import SD_FLAG, FakeLocalDb, build_plex_db, write_bif
 
@@ -474,6 +475,32 @@ def test_chapter_manifest_marks_failed_files_and_real_past_end(monkeypatch, tmp_
     cell = _cell(result, "1", Feature.CHAPTERS)
     assert (cell.done, cell.cant_do, cell.todo) == (1, 1, 2)
     assert sorted(t.title for t in result.todo if t.feature == Feature.CHAPTERS) == ["open", "stale"]
+
+
+def _manifest_part(tmp_path):
+    media = tmp_path / "failed.mkv"
+    media.write_bytes(b"video")
+    _write_manifest(tmp_path, "f1", media, failed="decoder crashed")
+    return media, plex._Part("1", 1, 1, str(media), "failed", "f1", "")
+
+
+@pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+def test_chapter_manifest_still_describes_a_file_whose_change_time_moved(tmp_path, how):
+    """A hard link, chmod or *arr re-import moves the change time, not the content the manifest describes."""
+    media, part = _manifest_part(tmp_path)
+
+    change_ctime_only(media, how)
+
+    assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "cant_do"
+
+
+@pytest.mark.parametrize("how", SOURCE_CHANGES)
+def test_chapter_manifest_of_a_changed_file_is_a_to_do(tmp_path, how):
+    media, part = _manifest_part(tmp_path)
+
+    change_source(media, how)
+
+    assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "todo"
 
 
 def test_chapters_off_skips_the_chapter_queries(monkeypatch, tmp_path):

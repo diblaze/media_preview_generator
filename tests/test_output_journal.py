@@ -15,6 +15,7 @@ from media_preview_generator.output.journal import (
     write_meta,
 )
 from media_preview_generator.output.plex_hash import get_source_fingerprint
+from tests.conftest import CTIME_ONLY_CHANGES, SOURCE_CHANGES, change_ctime_only, change_source
 
 
 class TestMetaPath:
@@ -811,3 +812,50 @@ class TestPlexPendingNotifications:
         assert first and second and first != second
         assert get_plex_refresh_pending([output], str(source), "plex-a") == first
         assert get_plex_refresh_pending([output], str(source), "plex-b") == second
+
+
+class TestMetadataOnlySourceChange:
+    """A hard link, chmod or *arr re-import moves the source's change time but not its content."""
+
+    @pytest.fixture
+    def published(self, tmp_path):
+        from media_preview_generator.output.journal import mark_plex_refresh_pending
+
+        source = tmp_path / "movie.mkv"
+        source.write_bytes(b"video")
+        output = tmp_path / "index-sd.bif"
+        output.write_bytes(b"frames")
+        write_meta([output], str(source), publisher="plex_bundle")
+        token = mark_plex_refresh_pending([output], str(source), "plex")
+        assert token
+        return source, output, token
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_output_stays_fresh_and_keeps_its_pending_refresh(self, published, how):
+        from media_preview_generator.output.journal import (
+            clear_plex_refresh_pending,
+            get_plex_refresh_pending,
+            mark_plex_refresh_pending,
+        )
+
+        source, output, token = published
+
+        change_ctime_only(source, how)
+
+        assert outputs_fresh_for_source([output], str(source), require_source_fingerprint=True) is True
+        assert get_plex_refresh_pending([output], str(source), "plex") == token
+        assert mark_plex_refresh_pending([output], str(source), "plex-b")
+        clear_plex_refresh_pending([output], str(source), "plex", token)
+        assert get_plex_refresh_pending([output], str(source), "plex") is None
+
+    @pytest.mark.parametrize("how", SOURCE_CHANGES)
+    def test_a_real_change_still_makes_the_output_stale(self, published, how):
+        from media_preview_generator.output.journal import get_plex_refresh_pending, mark_plex_refresh_pending
+
+        source, output, _token = published
+
+        change_source(source, how)
+
+        assert outputs_fresh_for_source([output], str(source), require_source_fingerprint=True) is False
+        assert get_plex_refresh_pending([output], str(source), "plex") is None
+        assert mark_plex_refresh_pending([output], str(source), "plex-b") is None

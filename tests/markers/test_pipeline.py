@@ -5654,7 +5654,8 @@ class TestWorkerStageWaits:
         ctx.busy_writes_retried = True
         other_check = ctx._capability_locks.setdefault(sid, threading.Lock())
         other_check.acquire()
-        release = threading.Timer(0.2, other_check.release)
+        # Held well past the worker's 0.05 s wait: a slow CI runner reached the lock after a 0.2 s hold had ended.
+        release = threading.Timer(2.0, other_check.release)
         release.start()
         try:
             out, _ = _run(ctx, media, {sid: ready_publisher()}, stage=stage, probe=_probe(CHAPTERS_BOTH))

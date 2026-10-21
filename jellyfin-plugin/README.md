@@ -98,7 +98,7 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src mcr.m
     dotnet build -c Release -p:JellyfinAbi=12.0 -o out/12.0
 ```
 
-Copy `out/<abi>/Jellyfin.Plugin.MediaPreviewBridge.dll` into `<jellyfin-config>/plugins/MediaPreviewBridge_<version>/` (`10.11.1.0` or `12.0.1.0`) and restart Jellyfin.
+Copy `out/<abi>/Jellyfin.Plugin.MediaPreviewBridge.dll` into `<jellyfin-config>/plugins/MediaPreviewBridge_<version>/` (`10.11.1.1` or `12.0.1.1`) and restart Jellyfin.
 
 `<jellyfin-config>` is wherever Jellyfin stores its config:
 

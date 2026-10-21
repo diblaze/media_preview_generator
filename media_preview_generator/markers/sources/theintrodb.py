@@ -1,7 +1,7 @@
-"""TheIntroDB v3 client. The user key is optional; failures must degrade gracefully.
+"""TheIntroDB v4 client. The user key is optional; failures must degrade gracefully.
 
-``GET /v3/media?tmdb_id|tvdb_id|imdb_id&season&episode&duration_ms``: each segment type is an array (several entries
-are normal); ``start_ms: null`` means the start of the file and ``end_ms: null`` the end of the file. The API returns
+``GET /v4/media?tmdb_id|tvdb_id|imdb_id&season&episode&duration_ms``: answers are keyed by ``tvdb_id`` (no ``tmdb_id``
+in the body); each segment type is an array (several entries are normal); ``start_ms: null`` means the start of the file and ``end_ms: null`` the end of the file. The API returns
 its closest stored version for ``duration_ms`` and never rejects a different cut (measured: the same body
 for 1444574 ms and 2400000 ms), so its answers only count as agreement, never alone. A lookup
 without the file's duration is still never sent.
@@ -20,7 +20,7 @@ from ..models import Candidate, MarkerType, MediaIds, Source
 from .online import LookupResult, confidence_value, http_session, ms_value, paced_get_json, result_from, valid_imdb
 from .ratelimit import SourceLimiter, get_limiter
 
-BASE_URL = "https://api.theintrodb.org/v3/media"
+BASE_URL = "https://api.theintrodb.org/v4/media"
 _LABEL = "TheIntroDB"
 # Bump when parsing changes what a stored answer would hold, so files are asked again.
 PARSER_VERSION = 1
@@ -205,14 +205,15 @@ def _has_echo_fields(body: dict[str, Any], ids: MediaIds) -> bool:
 
 
 def _answer_matches(body: dict[str, Any], ids: MediaIds, params: dict[str, object]) -> bool:
-    """The answer's echoed type/ids agree with the request (``tmdb_id`` only when we sent one).
+    """The answer's echoed type/ids agree with the request (``tvdb_id`` only when we sent one).
 
     TMDB movie and TV ids are separate number spaces (the same number can name a movie and a show), so a type or id
-    mismatch means the times belong to another title.
+    mismatch means the times belong to another title. A tmdb or imdb lookup's ``tvdb_id`` is the API's own resolution,
+    which the server's tvdb id may not match, so it isn't compared.
     """
     if body["type"] != _API_TYPES[ids.kind]:
         return False
-    if "tmdb_id" in params and body.get("tmdb_id") is not None and str(body["tmdb_id"]) != str(params["tmdb_id"]):
+    if "tvdb_id" in params and body.get("tvdb_id") is not None and str(body["tvdb_id"]) != str(params["tvdb_id"]):
         return False
     if ids.is_episode:
         for key in ("season", "episode"):

@@ -15,7 +15,7 @@ RM_S01E01 = MediaIds("episode", tmdb="60625", imdb="tt2861424", tvdb="275274", s
 TOY_STORY = MediaIds("movie", tmdb="862", imdb="tt0114709")
 SECRET = "tidb-SECRET-9f8e7d6c"
 # Echo fields every real 200 carries.
-TIDB_EP = {"tmdb_id": 60625, "type": "tv", "season": 1, "episode": 1}
+TIDB_EP = {"tvdb_id": 275274, "type": "tv", "season": 1, "episode": 1}
 IDB_EP = {"imdb_id": "tt2861424", "season": 1, "episode": 1, "intro": None, "recap": None, "outro": None}
 
 
@@ -46,7 +46,7 @@ class TestTheIntroDb:
         session.get.return_value = _resp(
             200,
             {
-                "tmdb_id": 60625,
+                "tvdb_id": 275274,
                 "type": "tv",
                 "season": 1,
                 "episode": 1,
@@ -60,7 +60,7 @@ class TestTheIntroDb:
         lim = _limiter()
         result = TheIntroDbClient("", limiter=lim, session=session).lookup(RM_S01E01, duration_ms=1_321_472, priority=2)
         args, kwargs = session.get.call_args
-        assert args[0] == "https://api.theintrodb.org/v3/media"
+        assert args[0] == "https://api.theintrodb.org/v4/media"
         assert kwargs["params"] == {"tmdb_id": "60625", "season": 1, "episode": 1, "duration_ms": 1_321_472}
         assert "Authorization" not in kwargs["headers"] and kwargs["timeout"] == 15
         lim.acquire.assert_called_once()
@@ -348,10 +348,13 @@ class TestTheIntroDb:
         ("ids", "body"),
         [
             (RM_S01E01, {**TIDB_EP, "type": "movie", "intro": [{"start_ms": 0, "end_ms": 30000}]}),
-            (TOY_STORY, {"tmdb_id": 862, "type": "tv", "intro": [{"start_ms": 0, "end_ms": 30000}]}),
+            (TOY_STORY, {"tvdb_id": 252, "type": "tv", "intro": [{"start_ms": 0, "end_ms": 30000}]}),
             (RM_S01E01, {**TIDB_EP, "season": 2, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
             (RM_S01E01, {**TIDB_EP, "episode": 7, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
-            (RM_S01E01, {**TIDB_EP, "tmdb_id": 1399, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
+            (
+                MediaIds("episode", tvdb="275274", season=1, episode=1),
+                {**TIDB_EP, "tvdb_id": 121361, "intro": [{"start_ms": 0, "end_ms": 30000}]},
+            ),
         ],
     )
     def test_answer_for_a_different_item_is_not_used(self, ids, body):
@@ -362,14 +365,21 @@ class TestTheIntroDb:
         assert "different" in result.detail
 
     def test_matching_echo_fields_are_accepted_for_a_movie(self):
-        body = {"tmdb_id": 862, "type": "movie", "season": None, "credits": [{"start_ms": 4_700_000, "end_ms": None}]}
+        body = {"tvdb_id": 252, "type": "movie", "season": None, "credits": [{"start_ms": 4_700_000, "end_ms": None}]}
         result = TheIntroDbClient(limiter=_limiter(), session=_session(_resp(200, body))).lookup(
             TOY_STORY, duration_ms=4_866_050, priority=2
         )
         assert result.candidates == (Candidate(T.CREDITS, 4_700_000, None, Source.THEINTRODB),)
 
-    def test_tmdb_echo_is_not_compared_when_queried_by_another_id(self):
-        body = {**TIDB_EP, "tmdb_id": 60625, "intro": [{"start_ms": 0, "end_ms": 30000}]}
+    def test_tvdb_echo_is_not_compared_when_queried_by_another_id(self):
+        body = {**TIDB_EP, "tvdb_id": 121361, "intro": [{"start_ms": 0, "end_ms": 30000}]}
+        result = TheIntroDbClient(limiter=_limiter(), session=_session(_resp(200, body))).lookup(
+            RM_S01E01, duration_ms=1_321_000, priority=2
+        )
+        assert result.status == "ok"
+
+    def test_matching_tvdb_echo_is_accepted_when_queried_by_tvdb(self):
+        body = {**TIDB_EP, "intro": [{"start_ms": 0, "end_ms": 30000}]}
         ids = MediaIds("episode", tvdb="275274", season=1, episode=1)
         result = TheIntroDbClient(limiter=_limiter(), session=_session(_resp(200, body))).lookup(
             ids, duration_ms=1_321_000, priority=2
@@ -383,9 +393,9 @@ class TestTheIntroDb:
             (RM_S01E01, {"error": "x"}),
             (TOY_STORY, {}),
             (TOY_STORY, {"error": "x", "credits": [{"start_ms": 4_700_000, "end_ms": None}]}),
-            (RM_S01E01, {"tmdb_id": 60625, "season": 1, "episode": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
-            (RM_S01E01, {"tmdb_id": 60625, "type": "tv", "episode": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
-            (RM_S01E01, {"tmdb_id": 60625, "type": "tv", "season": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
+            (RM_S01E01, {"tvdb_id": 275274, "season": 1, "episode": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
+            (RM_S01E01, {"tvdb_id": 275274, "type": "tv", "episode": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
+            (RM_S01E01, {"tvdb_id": 275274, "type": "tv", "season": 1, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
             (RM_S01E01, {**TIDB_EP, "season": None, "intro": [{"start_ms": 0, "end_ms": 30000}]}),
         ],
     )

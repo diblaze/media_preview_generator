@@ -3961,7 +3961,9 @@ class TestReadBackMany:
             return real_shown(self, *args)
 
         monkeypatch.setattr(LocalPlexDb, "_shown_in", slow)
-        monkeypatch.setattr(plex_db, "BUSY_TIMEOUT_S", 0.5)  # the write gives up if it never gets the lock
+        # The write gives up if it never gets the lock. Only the write: a read-back that waited 0.5 s for a slow
+        # runner's commit would give up its other items and end before the write did.
+        writer._db_timeout_s = 0.5
         finished = {}
 
         def read_back():

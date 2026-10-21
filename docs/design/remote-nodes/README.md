@@ -78,8 +78,11 @@ released.
 * **Still open:**
   - The image name `plex-marker-agent` and tag prefix `marker-agent-v*` are unchanged; renaming is a release-time
     decision.
-  - The Windows node has never touched a real Plex on Windows, and Docker Desktop reaching a native node via
-    `host.docker.internal` is untested. Test steps went to the #407 reporter on 2026-10-16.
+  - The #407 reporter ran the Windows node beside a real Plex 1.43.5 (Windows 10, Plex as a service via PmsService,
+    6.6 GB database) with the app in Docker Desktop reaching it at `host.docker.internal` (2026-10-17): Library
+    Health read the database through it (380,300 files in 336 s), no warnings in node.log. Marker, chapter and
+    loudness writes on a real Windows Plex are still only proven on a GitHub runner. Their Plex starts at boot, so
+    `install.ps1 -AtStartup` (a boot-time S4U task, 2026-10-21) keeps the node up before anyone signs in.
   - Nodes in a different time zone from the app weren't tried in the lab (all ran one zone).
   - A worker node must run the app's exact version, so every app update means updating each worker node.
 

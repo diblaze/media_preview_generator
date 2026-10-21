@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from ..markers.publishers.base import Capability, PublishError
@@ -104,9 +104,27 @@ class SourceFingerprint(NamedTuple):
             ) from exc
         return cls(path, *fingerprint)
 
+    def matches(self, other: Sequence[Any] | None) -> bool:
+        """Whether ``other``, a fingerprint or one saved as a JSON list, is this same path's unchanged file.
+
+        Args:
+            other: The fingerprint to compare, or None.
+
+        Returns:
+            True for the same path and, by ``plex_hash.same_source``, the same file content.
+        """
+        from ..output.plex_hash import same_source
+
+        return (
+            isinstance(other, tuple | list)
+            and bool(other)
+            and other[0] == self.path
+            and same_source(self[1:], other[1:])
+        )
+
     def verify(self) -> None:
         """Refuse results computed from bytes that have changed."""
-        if self.read(self.path) != self:
+        if not self.read(self.path).matches(self):
             raise SourceChangedError("The audio source changed during analysis; retry after Plex scans it")
 
 

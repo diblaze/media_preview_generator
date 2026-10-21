@@ -170,6 +170,17 @@ def test_write_posts_all_types_in_ticks_with_file_size(tmp_path):
     server.delete_bridge_markers.assert_not_called()
 
 
+def test_write_sends_the_size_of_the_file_a_symlink_points_to(tmp_path):
+    # The plugin measures the link's target, so the link's own few bytes would flag every marker set stale (#415).
+    server = _server()
+    server.put_bridge_markers.return_value = _resp(200, {"stored": 1})
+    server.get_media_segments.return_value = _core(INTRO)
+    link = tmp_path / "linked.mkv"
+    link.symlink_to(_media(tmp_path, size=4321))
+    _pub(server).write("abc", [INTRO_MARKER], previous=[], duration_ms=1_321_472, canonical_path=str(link))
+    server.put_bridge_markers.assert_called_once_with("abc", [INTRO], file_size=4321)
+
+
 @pytest.mark.parametrize(
     ("plugin_state", "posts"),
     [

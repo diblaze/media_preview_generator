@@ -27,6 +27,7 @@ from media_preview_generator.processing.multi_server import (
     process_canonical_path,
 )
 from media_preview_generator.servers import ServerRegistry
+from tests.conftest import CTIME_ONLY_CHANGES, change_ctime_only
 
 _DURATION_S = 100  # length of the fake video the FFmpeg stand-ins "extract" from
 _SETTING_LABEL = {"plex_bif_frame_interval": "interval", "thumbnail_quality": "quality", "tonemap_algorithm": "tonemap"}
@@ -217,6 +218,21 @@ class TestCacheValidity:
 
         assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is None
         assert not slot.exists()
+
+    @pytest.mark.parametrize("how", CTIME_ONLY_CHANGES)
+    def test_metadata_only_source_change_keeps_the_entry(self, tmp_path, how):
+        """A hard link, chmod or *arr re-import moves the change time, not the frames' source content."""
+        cache = FrameCache(tmp_path / "cache")
+        media = tmp_path / "media.mkv"
+        media.write_bytes(b"x")
+        slot = cache.frame_dir_for(str(media))
+        _populate_real_jpgs(slot, count=1)
+        cache.put(str(media), frame_dir=slot, frame_count=1, extraction_key=_EXTRACTION_KEY)
+
+        change_ctime_only(media, how)
+
+        assert cache.get(str(media), extraction_key=_EXTRACTION_KEY) is not None
+        assert slot.exists()
 
     def test_old_entry_without_fingerprint_is_not_reused(self, tmp_path):
         cache = FrameCache(tmp_path / "cache")

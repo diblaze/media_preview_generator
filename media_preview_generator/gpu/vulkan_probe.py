@@ -53,31 +53,52 @@ DV5_NO_VULKAN_EFFECT = (
 )
 
 
+# What tells dv5_no_vulkan_fix which GPUs the container has.
+_RENDER_NODES_GLOB = "/dev/dri/renderD*"
+_NVIDIA_CONTROL_NODE = "/dev/nvidiactl"
+
+
 def dv5_no_vulkan_fix() -> str:
     """How to give this container a hardware Vulkan driver, without telling it to set what it already has.
 
     With ``graphics`` (or ``all``) already asked for, ``--gpus all`` on a Docker that hands GPUs over through CDI
-    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it.
+    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it. The NVIDIA step is
+    only given with an NVIDIA GPU in the container (or no GPU at all), and passing /dev/dri only when it has no render
+    node: an Intel or AMD GPU that is already there and still has no Vulkan has a cause the per-GPU check names
+    (``gpu.vulkan_check``), such as a host kernel too old (issue #408).
+
+    Returns:
+        The steps, or "" when there are none to give.
     """
-    caps = os.environ.get("NVIDIA_DRIVER_CAPABILITIES", "").lower()
-    if caps == "all" or "graphics" in caps:
-        nvidia = (
-            "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
-            "with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out)"
-        )
-    else:
-        nvidia = "on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability)"
-    return (
-        f"To fix: {nvidia} and restart; on Intel/AMD, pass /dev/dri into the container so it can use a hardware "
-        "Vulkan driver."
-    )
+    has_render_node = bool(glob.glob(_RENDER_NODES_GLOB))
+    steps = []
+    if os.path.exists(_NVIDIA_CONTROL_NODE) or not has_render_node:
+        caps = os.environ.get("NVIDIA_DRIVER_CAPABILITIES", "").lower()
+        if caps == "all" or "graphics" in caps:
+            steps.append(
+                "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
+                "with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out) and restart"
+            )
+        else:
+            steps.append("on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability) and restart")
+    if not has_render_node:
+        steps.append("on Intel/AMD, pass /dev/dri into the container so it can use a hardware Vulkan driver")
+    return f"To fix: {'; '.join(steps)}." if steps else ""
+
+
+def _sentences(*parts: str) -> str:
+    """The non-empty parts, one space apart."""
+    return " ".join(part for part in parts if part)
 
 
 # A node has no dashboard and its diagnostic bundle isn't shown anywhere; its console has the loader's lines at DEBUG.
-_NODE_VULKAN_HELP = "If that doesn't help, file a GitHub issue with this node's docker logs taken at LOG_LEVEL=DEBUG."
+_NODE_VULKAN_HELP = (
+    "The dashboard's Nodes page says why this node's GPU can't use Vulkan; for more help, file a GitHub issue with "
+    "this node's docker logs taken at LOG_LEVEL=DEBUG."
+)
 
 _DASHBOARD_VULKAN_HELP = (
-    "If that doesn't help, open Settings → Processing Options → GPU device tuning in the dashboard: it says why "
+    "Settings → Processing Options → GPU device tuning in the dashboard says why "
     "each GPU can't use Vulkan and has a 'Copy diagnostic bundle' button ({size} bytes captured) for a GitHub issue."
 )
 
@@ -595,11 +616,9 @@ def _probe_vulkan_device() -> str | None:
         more_help = _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
     tried = " even after trying NVIDIA-specific fixes" if nvidia_icd or nvidia_egl_vendor else ""
     logger.warning(
-        "Vulkan hardware setup couldn't be detected on this container{}. {} {} {}",
+        "Vulkan hardware setup couldn't be detected on this container{}. {}",
         tried,
-        DV5_NO_VULKAN_EFFECT,
-        dv5_no_vulkan_fix(),
-        more_help,
+        _sentences(DV5_NO_VULKAN_EFFECT, dv5_no_vulkan_fix(), more_help),
     )
     if _VULKAN_DEBUG_BUFFER:
         # Surface the last few informative lines to the main log at
@@ -630,21 +649,15 @@ def _run_first_vulkan_probe() -> None:
     #   - INFO on no-Vulkan (informational, harmless)
     probe_device = _VULKAN_DEVICE_CACHE
     if probe_device is None:
-        logger.info(
-            "Vulkan not available in this container. {} {}",
-            DV5_NO_VULKAN_EFFECT,
-            dv5_no_vulkan_fix(),
-        )
+        logger.info("Vulkan not available in this container. {}", _sentences(DV5_NO_VULKAN_EFFECT, dv5_no_vulkan_fix()))
     elif _is_software_vulkan_device(probe_device):
         more_help = (
             _NODE_VULKAN_HELP if is_node_mode() else _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
         )
         logger.warning(
-            "Vulkan picked a software rasterizer ({}) instead of your GPU. {} {} {}",
+            "Vulkan picked a software rasterizer ({}) instead of your GPU. {}",
             probe_device,
-            DV5_NO_VULKAN_EFFECT,
-            dv5_no_vulkan_fix(),
-            more_help,
+            _sentences(DV5_NO_VULKAN_EFFECT, dv5_no_vulkan_fix(), more_help),
         )
     else:
         via = ""

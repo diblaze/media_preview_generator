@@ -15,7 +15,8 @@ higher-quality copy), the existing outputs are now stale. Plain
 BIF for a different source.
 
 The ``.meta`` JSON sidecar records each source file's identity, size and
-nanosecond modification/change times. New journals detect replacement even
+nanosecond modification/change times; freshness compares all but the change
+time (``same_source``). New journals detect replacement by its new inode even
 when an importer preserves the original mtime and size. Older journals
 retain their mtime/size checks for existing-output compatibility.
 Cross-publisher reuse requires a matching strong fingerprint so old frames
@@ -40,7 +41,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from .plex_hash import SourceFingerprint, get_source_fingerprint
+from .plex_hash import SourceFingerprint, get_source_fingerprint, same_source
 
 #: Bumped whenever the on-disk schema changes. A sidecar in another schema
 #: proves nothing either way, so its output is judged like one with no
@@ -243,7 +244,7 @@ def mark_plex_refresh_pending(
             with _WRITE_LOCK:
                 data = _read_meta(meta_path)
                 if data is None or not any(
-                    source.get("path") == canonical_path and source.get("source_fingerprint") == list(fingerprint)
+                    source.get("path") == canonical_path and same_source(source.get("source_fingerprint"), fingerprint)
                     for source in _sources_from_meta(data)
                 ):
                     continue
@@ -279,7 +280,7 @@ def get_plex_refresh_pending(
                 if (
                     entry.get("path") == canonical_path
                     and entry.get("server_id") == server_id
-                    and entry.get("source_fingerprint") == list(fingerprint)
+                    and same_source(entry.get("source_fingerprint"), fingerprint)
                     and isinstance(entry.get("token"), str)
                     and entry["token"]
                 ):
@@ -314,7 +315,7 @@ def clear_plex_refresh_pending(
                     if not (
                         entry.get("path") == canonical_path
                         and entry.get("server_id") == server_id
-                        and entry.get("source_fingerprint") == list(fingerprint)
+                        and same_source(entry.get("source_fingerprint"), fingerprint)
                         and entry.get("token") == token
                     )
                 ]
@@ -379,7 +380,7 @@ def outputs_fresh_for_source(
         if sources is None:
             continue
         if any(
-            source["source_fingerprint"] == list(fingerprint)
+            same_source(source["source_fingerprint"], fingerprint)
             if "source_fingerprint" in source
             else not require_source_fingerprint and _fingerprint(source) == (src_mtime, src_size)
             for source in sources

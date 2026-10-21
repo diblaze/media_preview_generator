@@ -189,6 +189,77 @@ jobs:
           ./nodes/windows/uninstall.ps1 -RemoveUndoRecord
           if (Test-Path $undoRecord) { throw "uninstall.ps1 -RemoveUndoRecord left the loudness undo record" }
           "ok   -RemoveUndoRecord deleted the loudness undo record"
+      - name: Install to start at boot (a scheduled task, no sign-in), switch back to logon, uninstall
+        if: steps.ready.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $key = -join ((1..32) | ForEach-Object { "{0:x}" -f (Get-Random -Maximum 16) })
+          "::add-mask::$key"
+          $env:NODE_KEY = $key
+          $taskName = "Media Preview Generator Plex database node ($env:USERNAME)"
+          $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          # Plex's own registry values, which the task's process reads as this user: a moved data folder and its id.
+          $plexKey = "HKCU:\Software\Plex, Inc.\Plex Media Server"
+          $moved = Join-Path $env:RUNNER_TEMP "boot-plex"
+          $plex = Join-Path $moved "Plex Media Server"
+          New-Item -ItemType Directory -Force $plex | Out-Null
+          New-Item -Path $plexKey -Force | Out-Null
+          Set-ItemProperty -Path $plexKey -Name LocalAppDataPath -Value $moved
+          Set-ItemProperty -Path $plexKey -Name ProcessedMachineIdentifier -Value "ci-boot-machine"
+          function Wait-Node {
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                return Invoke-RestMethod http://127.0.0.1:9496/v1/info -Headers @{
+                  Authorization = "Bearer $key"; "X-MPG-Node-Protocol" = "1"
+                }
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            throw "the node didn't answer on port 9496 with the installed key"
+          }
+
+          ./dist/PlexDbNode-windows/install.ps1 -Port 9496 -AtStartup
+          $task = Get-ScheduledTask -TaskName $taskName
+          if ($task.Principal.LogonType -ne "S4U") { throw "the task logs on as $($task.Principal.LogonType), not S4U" }
+          if ($task.Principal.UserId -notlike "*$env:USERNAME") { throw "the task runs as $($task.Principal.UserId)" }
+          if ($task.Triggers.CimClass.CimClassName -ne "MSFT_TaskBootTrigger") { throw "the task doesn't start at boot" }
+          if ($task.State -ne "Running") { throw "the task isn't running the node: $($task.State)" }
+          if (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue) {
+            throw "-AtStartup left the logon entry, which would start a second copy"
+          }
+          "ok   -AtStartup registered a boot task (S4U, this user) that is running the node"
+          $info = Wait-Node
+          if ($info.plex_db.config_dir.TrimEnd("\") -ne $plex) {
+            throw "the task's node serves '$($info.plex_db.config_dir)', not the registry's '$plex'"
+          }
+          if ($info.plex_db.machine_identifier -ne "ci-boot-machine") {
+            throw "the task's node reads Plex's id as '$($info.plex_db.machine_identifier)'"
+          }
+          "ok   the task's node reads this user's registry: Plex's moved folder and its id"
+          if (-not (Test-Path (Join-Path $env:LOCALAPPDATA "MediaPreviewGenerator\node\node.json"))) {
+            throw "the task's node keeps its key somewhere other than this user's LOCALAPPDATA"
+          }
+          "ok   a first install's NODE_KEY works from the task, kept in this user's node.json"
+
+          ./dist/PlexDbNode-windows/install.ps1 -Port 9496
+          if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            throw "installing without -AtStartup left the boot task"
+          }
+          if (-not (Get-ItemProperty $runKey -Name MediaPreviewGeneratorPlexDbNode -ErrorAction SilentlyContinue)) {
+            throw "installing without -AtStartup left no logon entry"
+          }
+          Wait-Node | Out-Null
+          "ok   installing again without -AtStartup goes back to the logon entry"
+
+          ./dist/PlexDbNode-windows/install.ps1 -Port 9496 -AtStartup
+          Wait-Node | Out-Null
+          $installedUninstaller = Join-Path $env:LOCALAPPDATA "Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"
+          Push-Location (Split-Path $installedUninstaller)
+          & $installedUninstaller -RemoveData -RemoveUndoRecord
+          Pop-Location
+          if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { throw "uninstall.ps1 left the task" }
+          if (Get-Process -Name PlexDbNode -ErrorAction SilentlyContinue) { throw "uninstall.ps1 left the node running" }
+          "ok   uninstall.ps1 removed the boot task and stopped its node"
+          Remove-Item -Path $plexKey -Recurse
       - name: Upload the build
         if: steps.ready.outputs.run == 'true'
         uses: actions/upload-artifact@v4
