@@ -142,26 +142,27 @@ def flush_held_rereads() -> None:
     from .plex_refresh import enqueue_plex_refresh, free_plex_refresh_slots, is_plex_refresh_queued
 
     registry = ServerRegistry.from_settings(list(get_settings_manager().get("media_servers") or []))
+    servers: dict[str, PlexServer] = {}
     for config in registry.configs():
         server = registry.get(config.id)
         if config.enabled and config.type is ServerType.PLEX and server is not None:
-            read_settings(cast("PlexServer", server), fresh=True)
+            servers[config.id] = cast("PlexServer", server)
+            read_settings(servers[config.id], fresh=True)
     held = entries()
     if not held:
         return
     slots = free_plex_refresh_slots() - _QUEUE_HEADROOM
     ready: dict[str, list[HeldReread]] = {}
     for entry in held:
-        config = registry.get_config(entry.server_id)
-        server = registry.get(entry.server_id)
-        if server is None or config is None or not config.enabled:
+        server = servers.get(entry.server_id)
+        if server is None:
             release(entry.server_id, entry.canonical_path)
         elif not should_hold(server, entry.library_id) and not is_plex_refresh_queued(
             entry.server_id, entry.canonical_path
         ):
             ready.setdefault(entry.server_id, []).append(entry)
     for server_id, due in ready.items():
-        server = registry.get(server_id)
+        server = servers[server_id]
         due = due[: max(slots, 0)]
         if not due:
             continue

@@ -87,11 +87,16 @@ def test_an_unreadable_file_counts_as_empty(tmp_path):
 
 def _flush_with(monkeypatch, *, servers, hold_answers, slots, queued=()):
     """Run the flush with a registry of ``servers`` ({id: enabled}) and per-server should_hold answers."""
+    from media_preview_generator.servers import ServerType
+
     live = {sid: SimpleNamespace(id=sid, name=f"Plex {sid}") for sid in servers}
     registry = MagicMock()
     registry.get.side_effect = live.get
-    registry.get_config.side_effect = lambda sid: SimpleNamespace(enabled=servers[sid]) if sid in servers else None
+    registry.configs.return_value = [
+        SimpleNamespace(id=sid, enabled=enabled, type=ServerType.PLEX) for sid, enabled in servers.items()
+    ]
     enqueue = MagicMock(return_value=True)
+    monkeypatch.setattr(held, "read_settings", lambda *_a, **_k: None)
     monkeypatch.setattr("media_preview_generator.servers.ServerRegistry.from_settings", lambda _raw: registry)
     monkeypatch.setattr(
         "media_preview_generator.web.settings_manager.get_settings_manager",
