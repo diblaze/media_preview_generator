@@ -2,6 +2,7 @@
 # imports (markers/publishers/plex_db.py, plex_chapters.py, plex_remote.py and the node server), at the versions the
 # app itself is tested with; gunicorn is replaced by waitress, which runs on Windows. Nothing of the worker role
 # (numpy, FFmpeg bindings, GPU libraries) belongs here: the build bundles whatever this file installs.
+# Keep pillow at or above the app's own floor in pyproject.toml: it decodes untrusted images.
 flask==3.1.3
 werkzeug==3.1.9
 loguru==0.7.3
