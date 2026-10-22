@@ -51,8 +51,8 @@ dependencies = [
     # Pillow is used by JellyfinTrickplayAdapter to pack frame JPGs into
     # 10x10 tile sheets (Jellyfin 10.9+ native trickplay format), and with numpy to check a GPU run's thumbnails for
     # lost colours (processing/generator.py).
-    # >=12.2.0 covers CVE-2026-25990 and CVE-2026-40192.
-    "pillow>=12.2.0,<14",
+    # >=13.0.0 covers the 2026-10 decoder advisories (JPEG/TIFF/GIF/PDF/EPS out-of-bounds and recursion).
+    "pillow>=13.0.0,<14",
     # numpy vectorises the season intro matcher (markers/audio/matcher.py); imported only by Intro & Credits and,
     # once a GPU run has made thumbnails, by the previews' colour check.
     "numpy>=2.0,<3",

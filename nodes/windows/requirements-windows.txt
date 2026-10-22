@@ -9,5 +9,5 @@ waitress==3.0.2
 requests==2.33.0
 urllib3==2.8.0
 defusedxml==0.7.1
-pillow==12.3.0
+pillow==13.0.0
 pyinstaller==6.22.3
