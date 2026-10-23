@@ -34,7 +34,7 @@ runs:
         DEBS: ${{ steps.key.outputs.dir }}
       run: |
         mkdir -p "$DEBS/partial"
-        ls "$DEBS"/*.deb 2>/dev/null | wc -l | xargs echo "cached .debs:"
+        echo "cached .debs: $(find "$DEBS" -name '*.deb' | wc -l)"
         sudo apt-get update -qq -o Acquire::Retries=3
         # $PACKAGES is a word list on purpose.
         # shellcheck disable=SC2086
