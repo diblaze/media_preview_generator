@@ -23,6 +23,20 @@ _AUTH_JSON_HEADERS = {"X-Auth-Token": "e2e-test-token", "Content-Type": "applica
 _API_TIMEOUT = 60
 
 
+# A webhook makes a preview job only for a file in a library with Previews on, so the server holds /data/TV.
+_SERVERS = [
+    {
+        "id": "jf-1",
+        "type": "jellyfin",
+        "name": "Jellyfin",
+        "enabled": True,
+        "url": "http://127.0.0.1:9",
+        "auth": {"method": "api_key", "api_key": "k"},
+        "libraries": [{"id": "1", "name": "TV", "remote_paths": ["/data/TV"], "enabled": True}],
+    }
+]
+
+
 def _post_sonarr_webhook(app_url: str, file_path: str, series_title: str = "Test Series"):
     """POST a minimal valid Sonarr Download payload."""
     payload = {
@@ -51,7 +65,11 @@ class TestWebhookToDashboard:
     # first GET sees it (Playwright roundtrip + JSON parse can exceed
     # 1s on a loaded runner), turning the assertion into a Heisenbug.
     # The test calls fire-now to skip the wait anyway, so 30s is harmless.
-    @pytest.mark.parametrize("backend_real_app", [{"webhook_delay": 30}], indirect=True)
+    @pytest.mark.parametrize(
+        "backend_real_app",
+        [{"webhook_delay": 30, "media_servers": _SERVERS, "cpu_threads": 1}],  # a worker to run the job
+        indirect=True,
+    )
     def test_sonarr_webhook_creates_pending_batch_then_fire_now_dispatches(
         self,
         backend_real_app: tuple[str, str],
@@ -139,14 +157,14 @@ class TestWebhookToDashboard:
         )
 
         # 5. The job must settle: either a terminal status, or an armed retry
-        #    chain. Both are "the dispatcher finished with it" — with no
-        #    servers configured the orchestrator marks the path unresolved,
-        #    and ``upsert_retry_chain_job`` may then re-arm this same row as a
-        #    chain head (status back to PENDING with a retry_eta). Polling for
+        #    chain. Both are "the dispatcher finished with it" — the file is
+        #    not on disk, so the orchestrator schedules a retry,
+        #    and ``upsert_retry_chain_job`` re-arms this same row as a
+        #    chain head (status back to PENDING with progress.retry_eta). Polling for
         #    a terminal status alone is racy: the row oscillates, and a 0.25s
         #    poll can straddle the terminal instant and never see it again.
         # 10s budget — global pytest timeout is 30s; steps 1-4 already
-        # consumed ~5-10s. Empty-server jobs settle in <1s typically.
+        # consumed ~5-10s. The job settles in <1s typically.
         deadline = time.monotonic() + 10
         settled = None
         while time.monotonic() < deadline:
@@ -160,7 +178,7 @@ class TestWebhookToDashboard:
                 cfg = body.get("config") or {}
                 if body.get("status") in ("completed", "failed", "cancelled"):
                     settled = f"terminal:{body.get('status')}"
-                elif cfg.get("is_retry_chain") and body.get("retry_eta"):
+                elif cfg.get("is_retry_chain") and (body.get("progress") or {}).get("retry_eta"):
                     settled = "retry-chain-armed"
             if settled:
                 break
@@ -169,6 +187,7 @@ class TestWebhookToDashboard:
             f"Job {job_id} created from webhook neither reached a terminal state nor was armed as a retry chain."
         )
 
+    @pytest.mark.parametrize("backend_real_app", [{"media_servers": _SERVERS}], indirect=True)
     def test_natural_debounce_fires_without_explicit_fire_now(
         self,
         backend_real_app: tuple[str, str],
