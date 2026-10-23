@@ -83,7 +83,7 @@ def test_picker_lists_this_app_first_then_each_node_with_its_state(
     page.locator('[data-edit="cpu-night"]').click()
     picker = page.locator('[data-member="m-cpu"] [data-pick]')
     labels = picker.locator("optgroup").evaluate_all("groups => groups.map(g => g.label)")
-    assert labels == ["This app", "storage · Ready", "nuc · Access problem"]
+    assert labels == ["Main", "storage · Ready", "nuc · Access problem"]
     storage = picker.locator('optgroup[label="storage · Ready"] option')
     expect(storage).to_have_text(["storage · Quadro P5000", "storage · CPU (24 cores)"])
     picker.select_option("node:storage:gpu:cuda:0")
@@ -218,7 +218,7 @@ def test_dashboard_shows_node_chip_zero_reason_and_offline_worker_card(
     expect(card.locator("[data-status-badge]")).to_have_text("Node offline")
     expect(card.locator("[data-status-badge]")).to_have_class("pill bad")
     local = authed_page.locator('[data-member-block="gpu-video:m-gpu"] .mem-h')
-    expect(local.locator(".node-chip")).to_have_text("This app")
+    expect(local.locator(".node-chip")).to_have_text("Main")
 
 
 def test_an_offline_nodes_line_doesnt_say_other_devices_keep_working_when_none_do(
@@ -476,7 +476,7 @@ def test_with_a_worker_on_a_node_this_apps_worker_cards_say_this_app(
     authed_page.route("**/api/jobs/workers", lambda route: route.fulfill(json={"workers": workers}))
     authed_page.goto(app_url + "/")
     local = authed_page.locator('[data-worker-key="GPU_1"] [data-node-chip]')
-    expect(local).to_have_text("This app")
+    expect(local).to_have_text("Main")
     expect(local).not_to_have_attribute("hidden", "")
     expect(local).to_have_attribute("title", "Runs on this app's machine")
     remote = authed_page.locator('[data-worker-key="GPU_4"] [data-node-chip]')
@@ -486,7 +486,7 @@ def test_with_a_worker_on_a_node_this_apps_worker_cards_say_this_app(
     expect(authed_page.locator("#workerGroupLiveRows")).to_have_class(re.compile(r"\bwg-dense\b"))
     head = authed_page.locator('[data-member-block="gpu-video:m-gpu"] .mem-h .node-chip')
     expect(head).to_be_visible()
-    expect(head).to_have_text("This app")
+    expect(head).to_have_text("Main")
     expect(head).to_have_attribute("title", "Runs on this app's machine")
     expect(head.locator("i")).to_have_class("bi bi-house-door")
     expect(authed_page.locator('[data-member-block="gpu-video:m-laptop"] .mem-h .node-chip')).to_have_text("old-laptop")
@@ -508,4 +508,4 @@ def test_without_a_worker_on_a_node_worker_cards_have_no_machine_chip(
     head = authed_page.locator('[data-member-block="gpu-video:m-gpu"] .mem-h')
     expect(head).to_be_visible()
     expect(head.locator(".node-chip")).to_have_count(0)
-    expect(authed_page.get_by_text("This app", exact=True)).to_have_count(0)
+    expect(authed_page.get_by_text("Main", exact=True)).to_have_count(0)

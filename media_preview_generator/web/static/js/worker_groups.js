@@ -159,12 +159,12 @@
 
     // "storage · Quadro P5000" for a node's device; just the device for this app's own.
     const deviceTitle = member => (member.node ? `${nodeName(member)} · ${deviceName(member)}` : deviceName(member));
-    // Once any member runs on a node, this app's own members say "This app" so the two can be told apart; with none,
+    // Once any member runs on a node, this app's own members say "Main" so the two can be told apart; with none,
     // a single-machine setup gets no chip at all.
     const anyMemberOnNode = () => (snapshot?.groups || []).some(group => (group.members || []).some(member => member.node));
     const nodeChip = member => {
         if (member.node) return `<span class="node-chip" title="${escapeHtml(`Runs on node ${nodeName(member)}`)}"><i class="bi bi-hdd-network" aria-hidden="true"></i>${escapeHtml(nodeName(member))}</span>`;
-        return anyMemberOnNode() ? `<span class="node-chip" data-this-app-chip title="Runs on this app's machine"><i class="bi bi-house-door" aria-hidden="true"></i>This app</span>` : '';
+        return anyMemberOnNode() ? `<span class="node-chip" data-this-app-chip title="Runs on this app's machine"><i class="bi bi-house-door" aria-hidden="true"></i>Main</span>` : '';
     };
 
     // "NVIDIA GeForce RTX 4090" -> "RTX 4090"; chips are narrow and the vendor adds nothing next to a model number.
@@ -919,11 +919,11 @@
         return null;
     }
 
-    // Every device the picker offers, in sections: "This app" first, then each node by name with its state.
+    // Every device the picker offers, in sections: "Main" first, then each node by name with its state.
     function pickerChoices(member) {
         const gpus = (snapshot.hardware || []).filter(item => item.device);
         const sections = [{
-            label: 'This app',
+            label: 'Main',
             options: [
                 { value: 'cpu', label: 'CPU', resource: 'cpu', device: null, node: null },
                 ...gpus.map(gpu => ({ value: gpu.device, label: (gpu.name || gpu.device) + (gpu.status === 'failed' ? ' (unavailable)' : ''), resource: 'gpu', device: gpu.device, node: null })),
