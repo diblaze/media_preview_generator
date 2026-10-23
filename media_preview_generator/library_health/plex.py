@@ -457,7 +457,8 @@ def _tally_library(
                 cell.done += 1
             elif chapter_state == "none":
                 cell.nothing_found += 1
-            elif chapter_state == "cant_do":
+            # Chapter thumbnails come from the same decode as previews: a video no job could read can't have them.
+            elif chapter_state == "cant_do" or path_key(part.path) in unreadable.get(Feature.PREVIEWS, ()):
                 cell.cant_do += 1
             else:
                 add_todo(Feature.CHAPTERS, part)

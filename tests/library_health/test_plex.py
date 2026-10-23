@@ -594,6 +594,21 @@ def test_files_a_job_found_it_can_never_do_count_as_cant_not_todo(monkeypatch, t
         assert [t.path for t in result.todo if t.feature == feature] == ["/tv/b.mkv"], feature
 
 
+def test_a_video_no_job_could_decode_counts_its_chapter_thumbnails_as_cant(monkeypatch, tmp_path):
+    items = [
+        _with_chapters(_movie("A", "/m/a.mkv"), [(0, _THUMB), (60_000, "")]),
+        _with_chapters(_movie("B", "/m/b.mkv"), [(0, _THUMB), (60_000, "")]),
+    ]
+
+    result = _run(
+        monkeypatch, tmp_path, _chapters_cfg(tmp_path), items, unreadable={Feature.PREVIEWS: frozenset({"/m/a.mkv"})}
+    )
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    assert (cell.cant_do, cell.todo) == (1, 1)
+    assert [t.path for t in result.todo if t.feature == Feature.CHAPTERS] == ["/m/b.mkv"]
+
+
 def test_an_unreadable_file_that_already_has_its_preview_is_done(monkeypatch, tmp_path):
     write_bif(tmp_path / "plex", "aa11")
     items = [_movie("A", "/m/a.mkv", "aa11", SD_FLAG, [None])]

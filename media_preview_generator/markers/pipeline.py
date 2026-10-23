@@ -28,6 +28,8 @@ from loguru import logger
 from ..config.paths import is_path_excluded
 from ..job_kinds import ItemOutcome, KindHandlers
 from ..jobs.worker import JOB_LOG_SKIP
+from ..library_health.failures import NO_DURATION_MESSAGE, clear_failure, record_failure
+from ..library_health.models import Feature
 from ..processing.multi_server import source_replaced_reason
 from ..processing.types import ProcessableItem
 from ..servers.base import ServerConfig, ServerType
@@ -3102,7 +3104,7 @@ def _attempt(
         )  # fmt: skip
     _mark_refreshed(ctx, path, Source.CHAPTERS)
     if not rec.duration_ms:
-        return ItemOutcome(FileOutcome.FAILED.value, "Couldn't read the file's duration")
+        return ItemOutcome(FileOutcome.FAILED.value, NO_DURATION_MESSAGE)
     # Season step for chapters (finding F1): an intro chapter far longer than the season's others needs a second source.
     # Siblings are compared before any detector can hand this file to a worker.
     intro_limit = None
@@ -3903,7 +3905,7 @@ def check_item(
     """
     # Never frozen here: the detectors that run on a checking thread are the cheap ones (a season step from cached
     # fingerprints), and a job frozen by its schedule's stop time would otherwise keep checking threads other jobs need.
-    return _run(item, ctx, local=False, cancel_check=cancel_check)
+    return _told_library_health(item.canonical_path, _run(item, ctx, local=False, cancel_check=cancel_check))
 
 
 def process_item(
@@ -3951,7 +3953,7 @@ def process_item(
     Returns:
         The item's outcome.
     """
-    return cast(
+    outcome = cast(
         ItemOutcome,
         _run(
             item,
@@ -3970,6 +3972,34 @@ def process_item(
             worker_name=worker_name,
         ),
     )
+    _told_library_health(item.canonical_path, outcome)
+    return outcome
+
+
+# Outcomes that prove intro & credits ran on the file, so its length was read; the others (skipped, waiting, no owners,
+# file gone) never got that far.
+_RAN_OUTCOMES = frozenset({FileOutcome.PUBLISHED.value, FileOutcome.UP_TO_DATE.value, FileOutcome.NO_MARKERS.value})
+
+
+def _told_library_health(path: str, outcome: ItemOutcome | None) -> ItemOutcome | None:
+    """Tell Library Health when intro and credits can't be done for a file (no readable length), or now can be.
+
+    Both stages decide files: a file the check stage settles never reaches a worker.
+
+    Args:
+        path: The file.
+        outcome: The stage's outcome; None (handed to a worker) says nothing yet.
+
+    Returns:
+        ``outcome``, unchanged.
+    """
+    if outcome is None:
+        return None
+    if outcome.failed and outcome.message == NO_DURATION_MESSAGE:
+        record_failure((Feature.INTRO, Feature.CREDITS), path, NO_DURATION_MESSAGE)
+    elif outcome.outcome_key in _RAN_OUTCOMES:
+        clear_failure((Feature.INTRO, Feature.CREDITS), path)
+    return outcome
 
 
 def kind_handlers(ctx: PipelineContext) -> KindHandlers:
