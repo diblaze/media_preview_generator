@@ -55,7 +55,8 @@ def test_resolve_ffmpeg_uses_only_an_executable_bundled_analyser(monkeypatch, ex
 
 def test_command_is_plexs_own_on_the_cpu():
     assert analyze.command("ffmpeg", "/m/a.mkv", 3) == [
-        "ffmpeg", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", "/m/a.mkv", "-map", "0:3",
+        "ffmpeg", "-hide_banner", "-nostats", "-progress", "pipe:1", "-reinit_filter", "0", "-i", "/m/a.mkv",
+        "-map", "0:3",
         "-af", "loudnorm=I=-16:TP=-1:LRA=9:print_format=json", "-f", "null", "-",
     ]  # fmt: skip
 
@@ -65,6 +66,37 @@ def test_eac3_is_decoded_without_drc_as_plexs_dolby_decoder_does(codec, no_drc):
     cmd = analyze.command("ffmpeg", "/m/a.mkv", 1, codec)
     assert (cmd[5:7] == ["-drc_scale", "0"]) is no_drc
     assert cmd[-9:] == ["-i", "/m/a.mkv", "-map", "0:1", "-af", analyze.LOUDNORM_FILTER, "-f", "null", "-"]
+
+
+def _proc(returncode: int, stderr: bytes) -> MagicMock:
+    proc = MagicMock(returncode=returncode)
+    proc.stdout = io.BytesIO(b"")
+    proc.stderr = io.BytesIO(stderr)
+    return proc
+
+
+_FORMAT_CHANGED = b"[af#0:0] Changing audio frame properties on the fly is not supported.\n"
+
+
+@pytest.mark.parametrize("dropped", [0, 1, analyze.MAX_DROPPED_FRAMES])
+def test_a_format_change_is_measured_again_dropping_the_changed_frames(monkeypatch, dropped):
+    retry = REPORT.encode() + f"\nTotal changed input frames dropped : {dropped}\n".encode()
+    popen = MagicMock(side_effect=[_proc(234, _FORMAT_CHANGED), _proc(0, retry)])
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    assert analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000) == PLEX_FIELDS
+    second = popen.call_args_list[1].args[0]
+    assert second[second.index("-i") - 2 : second.index("-i")] == ["-drop_changed", "1"]
+    assert "-reinit_filter" not in second
+
+
+@pytest.mark.parametrize(
+    "dropped", [f"\nTotal changed input frames dropped : {analyze.MAX_DROPPED_FRAMES + 1}\n".encode(), b""]
+)
+def test_a_format_change_that_drops_many_frames_is_refused(monkeypatch, dropped):
+    popen = MagicMock(side_effect=[_proc(234, _FORMAT_CHANGED), _proc(0, REPORT.encode() + dropped)])
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessError, match="not stored"):
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
 
 
 def test_report_maps_to_plexs_fields_verbatim():
@@ -322,10 +354,12 @@ def test_a_missing_decoder_is_told_apart_from_other_ffmpeg_failures(monkeypatch,
     proc = MagicMock(returncode=234)
     proc.stdout = io.BytesIO(b"")
     proc.stderr = io.BytesIO(stderr)
-    monkeypatch.setattr(analyze.subprocess, "Popen", MagicMock(return_value=proc))
+    popen = MagicMock(return_value=proc)
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
     with pytest.raises(analyze.LoudnessError, match="ffmpeg exited 234") as raised:
         analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
     assert isinstance(raised.value, analyze.LoudnessNoDecoder) is (error is not None)
+    assert popen.call_count == 1
 
 
 @pytest.mark.parametrize(

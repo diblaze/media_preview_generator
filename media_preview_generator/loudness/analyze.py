@@ -57,6 +57,12 @@ def resolve_ffmpeg(fallback: str) -> str:
 
 # ffmpeg's wording when it has no decoder for the audio stream it read (ffmpeg 7+, then older builds).
 _NO_DECODER_HINTS = ("no decoder found for", "not found for input stream")
+# Under -reinit_filter 0, ffmpeg's wording when the decoded audio format changes mid-stream.
+_FORMAT_CHANGED_HINT = "Changing audio frame properties on the fly is not supported"
+_DROPPED_FRAMES = re.compile(r"Total changed input frames dropped : (\d+)")
+# Counted in frames (about 32 ms each for AC3 and DTS, whose last frame is where a stray format change was seen). One
+# stray frame is harmless, but -drop_changed drops frames without a warning, so past a handful the track is unmeasured.
+MAX_DROPPED_FRAMES = 10
 
 
 class LoudnessError(Exception):
@@ -67,6 +73,10 @@ class LoudnessNoDecoder(LoudnessError):
     """ffmpeg has no decoder for the audio stream; no FFmpeg build this app ships can measure it."""
 
 
+class LoudnessFormatChanged(LoudnessError):
+    """The audio format changed mid-stream, which one filter graph can't measure."""
+
+
 class LoudnessCancelled(LoudnessError):
     """The job was cancelled while analysing audio."""
 
@@ -75,7 +85,7 @@ class LoudnessTimeout(LoudnessError):
     """ffmpeg exceeded its unpaused analysis time limit."""
 
 
-def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
+def command(ffmpeg: str, path: str, index: int, codec: str = "", *, drop_changed: bool = False) -> list[str]:
     """The ffmpeg command for one stream: Plex's own, on the CPU (audio decoding gains nothing from a GPU).
 
     Args:
@@ -83,6 +93,7 @@ def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
         path: The media file.
         index: The stream's index in the file (Plex's ``media_streams.index``).
         codec: The stream's codec (``media_streams.codec``); EAC3 is decoded without DRC, as Plex's decoder does.
+        drop_changed: Drop frames whose audio format differs from the first, instead of failing on them.
 
     Returns:
         The argument list.
@@ -100,6 +111,10 @@ def command(ffmpeg: str, path: str, index: int, codec: str = "") -> list[str]:
         "-progress",
         "pipe:1",
         *(["-drc_scale", "0"] if codec in NO_DRC_CODECS else []),
+        # Rebuilding the graph on a mid-stream change (even AC3 downmix metadata) restarts loudnorm, whose second
+        # report then covers only the tail. run() retries with -drop_changed (FFmpeg 8, as bundled) only when the
+        # audio format really changed.
+        *(["-drop_changed", "1"] if drop_changed else ["-reinit_filter", "0"]),
         "-i",
         path,
         "-map",
@@ -123,7 +138,7 @@ def command_many(ffmpeg: str, path: str, tracks: list[tuple[int, str, int | None
     for index, codec, _duration_ms in tracks:
         if codec in NO_DRC_CODECS:
             args.extend((f"-drc_scale:{index}", "0"))
-    args.extend(("-i", path))
+    args.extend(("-reinit_filter", "0", "-i", path))
     for index in indices:
         args.extend(
             (
@@ -312,6 +327,7 @@ def _run_command(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded ``timeout_s``.
         LoudnessNoDecoder: ffmpeg has no decoder for the stream.
+        LoudnessFormatChanged: the audio format changed mid-stream, which ``-reinit_filter 0`` refuses.
         LoudnessError: ffmpeg could not start, kept its output open, or exited non-zero (behind ``nice``, a missing
             ffmpeg is ``nice``'s exit 127).
     """
@@ -377,6 +393,8 @@ def _run_command(
         message = f"ffmpeg exited {proc.returncode} analysing {name} {description}: {text.strip()[-200:]}"
         if any(hint in text for hint in _NO_DECODER_HINTS):
             raise LoudnessNoDecoder(message)
+        if _FORMAT_CHANGED_HINT in text:
+            raise LoudnessFormatChanged(message)
         raise LoudnessError(message)
     return text
 
@@ -413,18 +431,38 @@ def run(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded its time limit.
         LoudnessNoDecoder: ffmpeg has no decoder for the stream.
-        LoudnessError: ffmpeg failed or printed no usable report.
+        LoudnessError: ffmpeg failed, printed no usable report, or dropped too many frames of a changed format.
     """
-    text = _run_command(
-        command(ffmpeg, path, index, codec),
-        path,
-        timeout_s=timeout_for(duration_ms),
-        description=f"stream {index}",
-        cancel_check=cancel_check,
-        pause_check=pause_check,
-        on_progress=on_progress,
-        nice_level=nice_level,
-    )
+
+    def measure(drop_changed: bool) -> str:
+        return _run_command(
+            command(ffmpeg, path, index, codec, drop_changed=drop_changed),
+            path,
+            timeout_s=timeout_for(duration_ms),
+            description=f"stream {index}",
+            cancel_check=cancel_check,
+            pause_check=pause_check,
+            on_progress=on_progress,
+            nice_level=nice_level,
+        )
+
+    try:
+        text = measure(drop_changed=False)
+    except LoudnessFormatChanged:
+        text = measure(drop_changed=True)
+        found = _DROPPED_FRAMES.search(text)
+        dropped = int(found[1]) if found else None
+        if dropped is None or dropped > MAX_DROPPED_FRAMES:
+            raise LoudnessError(
+                "the audio format changed mid-stream and ffmpeg dropped "
+                f"{'an unknown number of' if dropped is None else dropped} frames; not stored"
+            ) from None
+        logger.info(
+            "Loudness of {} stream {}: dropped {} frame(s) of a changed audio format",
+            os.path.basename(path),
+            index,
+            dropped,
+        )
     return ln_fields(parse(text))
 
 
@@ -456,6 +494,7 @@ def run_many(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded the sum of its tracks' time limits.
         LoudnessNoDecoder: ffmpeg has no decoder for one of the streams.
+        LoudnessFormatChanged: an audio format changed mid-stream; the job retries each stream on its own.
         LoudnessError: The batch is invalid, ffmpeg failed, or its reports can't be attributed.
     """
     args = command_many(ffmpeg, path, tracks)
