@@ -4297,6 +4297,77 @@ class TestMultiEpisodeFile:
         assert pub.last_write_changed is False
         assert not [sql for sql in sql_log if sql.startswith("BEGIN")]  # not even the write lock
 
+    def test_an_intro_kept_as_plexs_on_one_episode_is_copied_to_a_sibling_without_one(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+
+        records.write(pub, [CREDITS_FINAL], previous=None, kept_types=frozenset({T.INTRO}))
+
+        assert (T.INTRO, 990, 29_306) in _served(db, 8)
+        assert (T.INTRO, 990, 29_306) in _served(db, 7)
+        assert pub.last_kept_types == {T.INTRO}
+        assert pub.last_siblings["8"][1] == frozenset()
+
+        # Later runs change nothing, and the copy goes once the first episode's Plex intro is gone.
+        records.write(pub, [CREDITS_FINAL], previous=[CREDITS_FINAL])
+        assert pub.last_write_changed is False
+        _exec(db, "DELETE FROM taggings WHERE metadata_item_id=7 AND text='intro'")
+        records.write(pub, [CREDITS_FINAL], previous=[CREDITS_FINAL])
+        assert T.INTRO not in [row[0] for row in _served(db, 8)]
+
+    def test_writes_from_either_episode_leave_the_copied_intro_alone(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+        records.write(pub, [CREDITS_FINAL], previous=None, kept_types=frozenset({T.INTRO}))
+        shown = [_served(db, 7), _served(db, 8)]
+
+        def write_second_episode() -> None:
+            record = records.rows["8"]
+            ours = pub.write(
+                "8",
+                [CREDITS_FINAL],
+                previous=list(record.markers),
+                duration_ms=DUR,
+                canonical_path=SHARED_FILE,
+                kept_types=record.kept_types,
+            )
+            records.rows["8"] = plex_db.ItemRecord(list(ours), pub.last_kept_types, pub.last_item_files)
+            for other, (other_ours, other_kept) in pub.last_siblings.items():
+                records.rows[other] = plex_db.ItemRecord(list(other_ours), other_kept, pub.last_item_files)
+
+        for _ in range(2):
+            write_second_episode()
+            assert pub.last_write_changed is False
+            records.write(pub, [CREDITS_FINAL], previous=[CREDITS_FINAL])
+            assert pub.last_write_changed is False
+            assert [_served(db, 7), _served(db, 8)] == shown
+
+        _exec(db, "DELETE FROM taggings WHERE metadata_item_id=7 AND text='intro'")
+        write_second_episode()
+        assert T.INTRO not in [row[0] for row in _served(db, 8)]
+
+    def test_a_sibling_with_its_own_intro_keeps_it_when_the_other_episode_keeps_plexs(self, tmp_path):
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        _insert_taggings(
+            db,
+            (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA),
+            (8, 563, 0, "intro", 2_000, 20_000, INTRO_ROW_EXTRA),
+        )
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+
+        records.write(pub, [CREDITS_FINAL], previous=None, kept_types=frozenset({T.INTRO}))
+
+        assert (T.INTRO, 2_000, 20_000) in _served(db, 8)
+        assert (T.INTRO, 990, 29_306) not in _served(db, 8)
+
     def test_a_publisher_without_records_doesnt_read_the_episodes_back(self, tmp_path):
         # The Inspector's reads: only a job's publisher has markers.db's records to compare an episode with.
         folder = tmp_path / "Plex Media Server"
@@ -4445,9 +4516,11 @@ class TestMultiEpisodeFile:
         _exec(db, "DELETE FROM taggings WHERE metadata_item_id=8 AND text='intro'")
         assert records.shown(pub) is Shown.MISSING
 
-    def test_a_type_kept_on_the_item_and_not_decided_asks_nothing_of_an_episode_without_it(self, tmp_path):
-        # Plex's own intro on the first episode only, no intro decided: nothing to write to the second episode, and
-        # its own record keeps nothing, so the read-back never asks for a write that changes nothing.
+    def test_a_type_kept_on_the_item_and_not_decided_is_copied_once_and_then_asks_nothing_of_the_episode(
+        self, tmp_path
+    ):
+        # Plex's own intro on the first episode only, no intro decided: the second episode shows a copy of it, and its
+        # own record lists it as ours, so the read-back never asks for a write that changes nothing.
         folder = tmp_path / "Plex Media Server"
         db, _parts = _multi_episode_db(folder)
         _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
@@ -4458,4 +4531,4 @@ class TestMultiEpisodeFile:
         assert records.shown(pub) is Shown.OURS
         records.write(pub, [CREDITS_FINAL], previous=ours)
         assert pub.last_write_changed is False
-        assert _served(db, 8) == [(T.CREDITS, 1_299_000, DUR)]
+        assert _served(db, 8) == [NATIVE_INTRO_ROW, (T.CREDITS, 1_299_000, DUR)]

@@ -1107,6 +1107,22 @@ def _kept_types(
     return frozenset(kept)
 
 
+def _borrowed_markers(
+    plex_markers: list[Marker], rows: list[_TaggingRow], prior: list[Marker], kept: frozenset[MarkerType]
+) -> list[Marker]:
+    """The Plex markers (of items keeping them) an item should show: its type has no rows, or only ones we left.
+
+    An item keeping the type itself (``kept``), or with a row of its own (Plex's), is left alone; rows we left are included so the next run rewrites
+    nothing, follows a changed Plex marker, and removes the copy once the item's Plex marker is gone.
+    """
+    borrowed = []
+    for mtype in {m.type for m in plex_markers} - kept:
+        current = [(s, e) for s, e, _final in _rows_served_with_final(rows, mtype)]
+        if not current or current == _served_of(prior, mtype):
+            borrowed.extend(m for m in plex_markers if m.type is mtype)
+    return borrowed
+
+
 def _plex_rows_cant_be_right(
     mtype: MarkerType,
     current: list[tuple[int, int]],
@@ -1816,28 +1832,65 @@ class LocalPlexDb(PlexDatabase):
     ) -> tuple[_Plan, list[tuple[int, _Plan]]]:
         """The item's plan, and one per item sharing its files (``_sibling_items``), each from its own rows and parts.
 
+        A type the item keeps as Plex's own (not detected by us) is copied to each item holding the file that has none of it, whichever is written, so
+        every episode of the file shows the intro or credits Plex found (``_borrowed_markers``).
+
         A sibling is planned from its own record (``sibling_states``): what this app last left on it and the types it
         kept there, so its own rows tell ours from Plex's. One without a record (never written since this app wrote
         siblings, or an app older than that) counts what this app left on the item as its own, since they are
         written together, and nothing as kept. Its own copies of the calling parts are its calling parts.
         """
-        plan = self._plan(
-            conn, rating_key, tag_id, parts, wanted, prior, duration_ms, own_prior, calling_part_ids, kept_before,
-            keep_plex, limits=limits,
-        )  # fmt: skip
         states = {state.rating_key: state for state in sibling_states}
         calling_files = {p.file for p in parts if p.id in calling_part_ids}
-        siblings = []
+        # (key, parts, prior, calling part ids, kept before) per item holding the file, the written item first.
+        items = [(rating_key, parts, prior, calling_part_ids, kept_before)]
         for key, sibling_parts in self._sibling_items(conn, rating_key, parts):
             state = states.get(key)
             sibling_prior, sibling_kept = (state.prior, state.kept_types) if state else (prior, frozenset())
             sibling_calling = {p.id for p in sibling_parts if p.file in calling_files}
-            sibling_plan = self._plan(
-                conn, key, tag_id, sibling_parts, wanted, sibling_prior, duration_ms, own_prior, sibling_calling,
-                sibling_kept, keep_plex, limits=limits,
+            items.append((key, sibling_parts, sibling_prior, sibling_calling, sibling_kept))
+
+        def plan_item(item: tuple, item_wanted: list[Marker]) -> _Plan:
+            key, item_parts, item_prior, item_calling, item_kept = item
+            return self._plan(
+                conn, key, tag_id, item_parts, item_wanted, item_prior, duration_ms, own_prior, item_calling,
+                item_kept, keep_plex, limits=limits,
             )  # fmt: skip
-            siblings.append((key, sibling_plan))
-        return plan, siblings
+
+        plans = [plan_item(item, wanted) for item in items]
+        plex_markers = self._plex_markers_kept(conn, tag_id, items, plans, wanted)
+        for index, item in enumerate(items):
+            borrowed = _borrowed_markers(
+                plex_markers, self._item_rows(conn, item[0], tag_id), item[2], plans[index].kept_types
+            )
+            if borrowed:
+                plans[index] = plan_item(item, wanted + borrowed)
+        return plans[0], [(item[0], plan) for item, plan in zip(items[1:], plans[1:], strict=True)]
+
+    def _plex_markers_kept(
+        self,
+        conn: sqlite3.Connection,
+        tag_id: int,
+        items: list[tuple],
+        plans: list[_Plan],
+        wanted: list[Marker],
+    ) -> list[Marker]:
+        """Plex's rows of the types an item keeps as Plex's own, for types we have no answer of our own for.
+
+        One item's rows per type: the first (the written item's) that keeps it.
+        """
+        have = {m.type for m in wanted}
+        source: dict[MarkerType, int] = {}
+        for item, plan in zip(items, plans, strict=True):
+            for mtype in plan.kept_types - have:
+                source.setdefault(mtype, item[0])
+        out = []
+        for mtype, key in source.items():
+            rows = self._item_rows(conn, key, tag_id)
+            out.extend(
+                Marker(mtype, start, end, ("plex",)) for start, end, _final in _rows_served_with_final(rows, mtype)
+            )
+        return out
 
     def _plan(
         self,
