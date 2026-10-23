@@ -64,7 +64,13 @@ def webhook_app(emby_credentials, media_root, tmp_path, monkeypatch, live_config
                         "name": "Movies",
                         "remote_paths": ["/em-media/Movies"],
                         "enabled": True,
-                    }
+                    },
+                    {
+                        "id": "tv",
+                        "name": "TV Shows",
+                        "remote_paths": ["/em-media/TV Shows"],
+                        "enabled": True,
+                    },
                 ],
                 "path_mappings": [{"remote_prefix": "/em-media", "local_prefix": str(media_root)}],
                 "output": {"adapter": "emby_sidecar", "width": 320, "frame_interval": 5},
