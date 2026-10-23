@@ -141,21 +141,11 @@ jobs:
         uses: ./.github/actions/install-actionlint
 
       - name: Install FFmpeg + mediainfo
-        # Plain apt-get rather than awalsh128/cache-apt-pkgs-action: the
-        # cache action restored ffmpeg's transitive deps (libblas3,
-        # liblapack3) as raw tar extractions that bypass dpkg's trigger
-        # pass — /etc/ld.so.cache stayed stale on cache HIT and ffmpeg
-        # failed every time with "error while loading shared libraries:
-        # libblas.so.3". Three escalations couldn't fix it (adding the
-        # transitive deps, ``execute_install_scripts: true``, an explicit
-        # ``sudo ldconfig`` step). Plain apt-get always runs the trigger
-        # pass; the ~25 s we lose vs the cache is worth a deterministic
-        # build. apt-get's own download cache is on the runner anyway.
         # It normally takes ~15 s; one runner once hung here for 14+ min, so fail fast and re-run.
         timeout-minutes: 5
-        run: |
-          sudo apt-get update -qq -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 ffmpeg mediainfo
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ffmpeg mediainfo
 
       - name: Install dependencies
         run: pip install -e ".[test]"
@@ -422,13 +412,14 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install FFmpeg + mediainfo
-        # Plain apt-get, as in the unit job: the cache action's restore leaves
-        # /usr/bin/ffmpeg without libblas.so.3, and the integration fixtures
-        # call /usr/bin/ffmpeg directly. Time limit and retries as in the unit job.
+        # The integration fixtures call /usr/bin/ffmpeg directly.
         timeout-minutes: 5
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ffmpeg mediainfo
+
+      - name: Show FFmpeg + mediainfo versions
         run: |
-          sudo apt-get update -qq -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 ffmpeg mediainfo
           /usr/bin/ffmpeg -version | head -1
           mediainfo --Version | head -1
 

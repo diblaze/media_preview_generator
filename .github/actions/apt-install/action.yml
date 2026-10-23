@@ -1,0 +1,54 @@
+name: apt-get install (cached .debs)
+description: >-
+  Installs packages with plain apt-get, but keeps the downloaded .deb files in the Actions cache.
+  The runner's Azure Ubuntu mirror sometimes serves at ~40 KB/s, so downloading ffmpeg's ~100
+  packages timed out the step on most runs. A real apt-get install (not awalsh128/cache-apt-pkgs-action,
+  which unpacks files without dpkg's triggers and left ffmpeg unable to find libblas.so.3) still runs on
+  every job; only the downloads come from the cache. The key follows the runner image, so a new image
+  restores the previous set and fetches just the packages that changed.
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        echo "dir=$RUNNER_TEMP/apt-debs" >> "$GITHUB_OUTPUT"
+        echo "pkgs=$(echo "$PACKAGES" | tr -s ' \n' '\n' | sort | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
+        restore-keys: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-
+
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        DEBS: ${{ steps.key.outputs.dir }}
+      run: |
+        mkdir -p "$DEBS/partial"
+        ls "$DEBS"/*.deb 2>/dev/null | wc -l | xargs echo "cached .debs:"
+        sudo apt-get update -qq -o Acquire::Retries=3
+        # $PACKAGES is a word list on purpose.
+        # shellcheck disable=SC2086
+        sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+          -o Dir::Cache::Archives="$DEBS" -o APT::Keep-Downloaded-Packages=true -o APT::Sandbox::User=root \
+          $PACKAGES
+        # apt leaves a root-only lock file; the cache save runs as the runner user.
+        sudo rm -rf "$DEBS/lock" "$DEBS/partial"
+        sudo chown -R "$(id -u):$(id -g)" "$DEBS"
+
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      # Parallel shards race to save the same key; the losers only log a warning.
+      continue-on-error: true
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
