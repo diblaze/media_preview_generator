@@ -15,6 +15,7 @@ one caller's :data:`REQUEST_BYTES_PER_CALLER` of it.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import select
 import signal
@@ -262,6 +263,36 @@ def _limited_channels(listen_map: dict) -> Any:
     return accept
 
 
+class QueueDepthWarnings(logging.Filter):
+    """Lets waitress's "Task queue depth" warning through at most once every :data:`REFUSED_WARNING_S`; the next one let
+    through says how many were held back since the last.
+
+    waitress warns once per request that arrives with every thread taken, and an app's workers send a few dozen at once:
+    thousands of lines for a queue that empties in moments.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._warned_at = -REFUSED_WARNING_S - 1
+        self._held_back = 0
+        self._deepest = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        depth = record.args[0] if isinstance(record.args, tuple) and record.args else 0
+        with self._lock:
+            self._deepest = max(self._deepest, depth if isinstance(depth, int) else 0)
+            now = time.monotonic()
+            if now - self._warned_at <= REFUSED_WARNING_S:
+                self._held_back += 1
+                return False
+            if self._held_back:
+                record.msg = "Task queue depth is %d (%d more such warnings since the last one, deepest %d)"
+                record.args = (depth, self._held_back, self._deepest)
+            self._warned_at, self._held_back, self._deepest = now, 0, 0
+            return True
+
+
 def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: str = "mpg-node") -> Any:
     """The waitress server for a node app, with the limits that keep slow or oversized requests from tying it up.
 
@@ -282,6 +313,9 @@ def create_node_server(app: Any, *, host: str, port: int, threads: int, ident: s
     """
     from waitress import create_server
 
+    queue_logger = logging.getLogger("waitress.queue")
+    if not any(isinstance(f, QueueDepthWarnings) for f in queue_logger.filters):
+        queue_logger.addFilter(QueueDepthWarnings())
     config = getattr(app, "config", None)
     if isinstance(config, dict):
         # The Plex database role leaves some of them free for the requests that never wait on Plex (plex_db.py).

@@ -3,6 +3,7 @@ its reason, keeps answering while connections hold half-sent requests, and stops
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import socket
@@ -596,3 +597,35 @@ def test_a_request_sent_a_line_at_a_time_is_closed_after_the_read_limit(served):
     finally:
         conn.close()
     assert time.monotonic() - started < 5
+
+
+def test_waitress_queue_warnings_come_once_a_minute_with_how_many_were_held_back(monkeypatch):
+    from media_preview_generator.nodes.server import wsgi
+
+    now = [1000.0]
+    monkeypatch.setattr(wsgi.time, "monotonic", lambda: now[0])
+    queue_filter = wsgi.QueueDepthWarnings()
+
+    def warning(depth: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            "waitress.queue", logging.WARNING, __file__, 1, "Task queue depth is %d", (depth,), None
+        )
+
+    assert queue_filter.filter(warning(3)) is True
+    assert [queue_filter.filter(warning(depth)) for depth in (5, 29, 4)] == [False, False, False]
+    now[0] += wsgi.REFUSED_WARNING_S + 1
+    record = warning(2)
+    assert queue_filter.filter(record) is True
+    assert record.getMessage() == "Task queue depth is 2 (3 more such warnings since the last one, deepest 29)"
+
+
+def test_every_node_server_holds_back_waitress_queue_warnings():
+    from flask import Flask
+
+    from media_preview_generator.nodes.server import wsgi
+
+    for _ in range(2):
+        server = wsgi.create_node_server(Flask(__name__), host="127.0.0.1", port=0, threads=2)
+        server.close()
+    filters = logging.getLogger("waitress.queue").filters
+    assert sum(isinstance(f, wsgi.QueueDepthWarnings) for f in filters) == 1

@@ -91,10 +91,12 @@ MAX_PATH_CHARS = 32768
 LOUDNESS_OPERATIONS = frozenset({"file_checks", "check", "streams", "snapshot", "write", "mark"})
 DEFAULT_PORT = 9494
 # Each request here can wait minutes for Plex's database on one of the server's threads (a nightly Optimize or a big
-# scan holds its write lock), so at most half the threads run them: the rest keep the node's health check, the app's
-# checks and a worker node's task polls answered. A request that finds them all taken waits for one only while the
-# longest-running has run under SLOT_WAIT_S (a burst of quick ones); past that they are stuck on the database, and it
-# is answered "full" at once (``plex_remote.NodeFullError``): the app waits and asks again, holding none of ours.
+# scan holds its write lock), so at most half the threads run them. A request that finds them all taken waits for one
+# only while the longest-running has run under SLOT_WAIT_S (a burst of quick ones); past that they are stuck on the
+# database, and it is answered "full" at once (``plex_remote.NodeFullError``): the app waits and asks again, holding
+# none of ours. A waiting request holds a thread too, so only as many wait as leave one thread free (``wait_limit``)
+# and the rest are answered "full" as well: waitress hands out threads in arrival order, and with every thread taken
+# the node's health check, the app's checks and a worker node's task polls would queue behind everything the app sent.
 SLOT_WAIT_S = 2.0
 # Library Health's rows are packed and sent in pieces of about this many characters (``_streamed_rows``).
 ROWS_CHUNK_CHARS = 64 * 1024
@@ -229,22 +231,31 @@ class RequestSlots:
     def __init__(self) -> None:
         self._changed = threading.Condition()
         self._started: dict[object, float] = {}
+        self._waiting = 0
 
-    def take(self, limit: int | None) -> object | None:
+    def take(self, limit: int | None, waiters: int | None = None) -> object | None:
         """A slot for one request, or None when the node is full.
 
         Args:
             limit: How many may run at once; None: no limit.
+            waiters: How many may wait for a slot at once; None: no limit.
 
         Returns:
             The slot to give back once the request is answered, or None.
         """
         with self._changed:
-            while limit is not None and len(self._started) >= limit:
-                left = min(self._started.values()) + SLOT_WAIT_S - time.monotonic()
-                if left <= 0:
+            if limit is not None and len(self._started) >= limit:
+                if waiters is not None and self._waiting >= waiters:
                     return None
-                self._changed.wait(left)
+                self._waiting += 1
+                try:
+                    while len(self._started) >= limit:
+                        left = min(self._started.values()) + SLOT_WAIT_S - time.monotonic()
+                        if left <= 0:
+                            return None
+                        self._changed.wait(left)
+                finally:
+                    self._waiting -= 1
             slot = object()
             self._started[slot] = time.monotonic()
             return slot
@@ -259,6 +270,12 @@ class RequestSlots:
 def slot_limit(threads: Any) -> int | None:
     """How many of this role's requests may run at once on a server with ``threads`` threads (None: not known)."""
     return max(1, threads // 2) if type(threads) is int and threads > 0 else None
+
+
+def wait_limit(threads: Any) -> int | None:
+    """How many of this role's requests may wait for a slot at once: all the threads left but one (None: not known)."""
+    limit = slot_limit(threads)
+    return None if limit is None else max(0, threads - limit - 1)
 
 
 def info_block(plex_config_dir: str | None = None) -> dict:
@@ -598,11 +615,12 @@ def register_plex_db(
             return _bad_request("The request body must be a JSON object")
         if request.path == "/v1/ping":
             return None  # it never opens the database
-        limit = slot_limit(current_app.config.get(SERVER_THREADS))
-        slot = slots.take(limit)
+        threads = current_app.config.get(SERVER_THREADS)
+        limit = slot_limit(threads)
+        slot = slots.take(limit, wait_limit(threads))
         if slot is None:
             message = (
-                f"Plex's database is busy: {limit} requests on the Plex database node are waiting for it already; "
+                "Plex's database is busy: the Plex database node has as many requests waiting for it as it takes; "
                 f"{NEXT_RUN}"
             )
             answer, status = _refused(plex_remote.NodeFullError(message, state=Capability.UNREACHABLE))
