@@ -20,7 +20,7 @@ from typing import Any
 
 from ..servers._embyish import _NO_BOXSET_COLLAPSE, EmbyApiClient
 from ..servers.base import ServerConfig
-from ._shared import _MediaServerProcessor
+from ._shared import _MediaServerProcessor, previews_library_ids
 from .types import ProcessableItem
 
 
@@ -53,8 +53,11 @@ class _EmbyishProcessor(_MediaServerProcessor):
             "Limit": 500,
             **_NO_BOXSET_COLLAPSE,
         }
-        if library_ids:
-            params["ParentId"] = ",".join(library_ids)
+        wanted = previews_library_ids(server_config, library_ids)
+        if wanted == []:
+            return
+        if wanted:
+            params["ParentId"] = ",".join(wanted)
 
         cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
 

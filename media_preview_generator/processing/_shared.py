@@ -26,6 +26,25 @@ from ..servers.ownership import apply_path_mappings
 from .types import ProcessableItem
 
 
+def previews_library_ids(server_config: ServerConfig, library_ids: list[str] | None) -> list[str] | None:
+    """The libraries a recently-added preview scan walks: ``library_ids`` (or every library) with Previews on.
+
+    Args:
+        server_config: The server being scanned.
+        library_ids: The libraries the job asked for, or None for all.
+
+    Returns:
+        Library ids to walk (possibly empty), or None for every library — a server with no saved library list
+        walks them all, as a full scan does.
+    """
+    if not server_config.libraries:
+        return library_ids
+    previews_on = [str(lib.id) for lib in server_config.libraries if lib.enabled]
+    if library_ids:
+        return [lib_id for lib_id in library_ids if lib_id in previews_on]
+    return previews_on
+
+
 class _MediaServerProcessor:
     """Reusable base for processors that wrap a :class:`MediaServer`.
 

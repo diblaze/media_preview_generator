@@ -353,3 +353,69 @@ class TestPlexProcessorRecentlyAdded:
         assert results[0].item_id_by_server == {"srv-plex": "54321"}
         assert results[0].canonical_path == "/l/recent.mkv"
         assert results[0].title == "Recent Movie"
+
+
+class TestRecentlyAddedSkipsPreviewsOffLibraries:
+    """A recently-added preview scan walks only libraries with Previews on, as a full scan does."""
+
+    _LIBS = (
+        Library(id="1", name="TV", remote_paths=("/r/tv",), enabled=False),
+        Library(id="2", name="Movies", remote_paths=("/r/movies",), enabled=True),
+    )
+
+    @pytest.mark.parametrize(
+        ("libraries", "library_ids", "walked"),
+        [
+            (_LIBS, None, ["2"]),
+            (_LIBS, ["1", "2"], ["2"]),
+            (_LIBS, ["1"], []),
+            ((), None, ["1", "2"]),  # no saved library list: every library, as a full scan does
+        ],
+        ids=["all", "asked-for-both", "asked-for-off-only", "no-saved-list"],
+    )
+    def test_plex_walks_only_previews_on_sections(self, libraries, library_ids, walked):
+        from dataclasses import replace
+
+        cfg = replace(_config("srv-plex", ServerType.PLEX), libraries=libraries)
+        sections = []
+        for key in ("1", "2"):
+            section = MagicMock()
+            section.key = key
+            section.METADATA_TYPE = "movie"
+            section.search.return_value = []
+            sections.append(section)
+
+        with patch("media_preview_generator.processing.plex.PlexServer") as klass:
+            klass.return_value._connect.return_value.library.sections.return_value = sections
+            list(PlexProcessor().scan_recently_added(cfg, lookback_hours=1, library_ids=library_ids))
+
+        assert [s.key for s in sections if s.search.called] == walked
+
+    @pytest.mark.parametrize(
+        ("libraries", "library_ids", "parent_id"),
+        [
+            (_LIBS, None, "2"),
+            (_LIBS, ["1", "2"], "2"),
+            ((), None, None),  # no saved library list: every library, as a full scan does
+        ],
+        ids=["all", "asked-for-both", "no-saved-list"],
+    )
+    def test_emby_queries_only_previews_on_libraries(self, libraries, library_ids, parent_id):
+        from dataclasses import replace
+
+        cfg = replace(_config("srv-x", ServerType.EMBY), libraries=libraries)
+        with patch("media_preview_generator.processing.emby.EmbyServer") as klass:
+            klass.return_value.query_items.return_value = []
+            list(EmbyProcessor().scan_recently_added(cfg, lookback_hours=24, library_ids=library_ids))
+
+        assert klass.return_value.query_items.call_args.args[0].get("ParentId") == parent_id
+
+    def test_emby_asked_only_for_a_previews_off_library_queries_nothing(self):
+        from dataclasses import replace
+
+        cfg = replace(_config("srv-x", ServerType.EMBY), libraries=self._LIBS)
+        with patch("media_preview_generator.processing.emby.EmbyServer") as klass:
+            items = list(EmbyProcessor().scan_recently_added(cfg, lookback_hours=24, library_ids=["1"]))
+
+        assert items == []
+        klass.return_value.query_items.assert_not_called()

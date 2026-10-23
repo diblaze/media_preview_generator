@@ -616,8 +616,12 @@ def _resolve_publishers(
     # when the registry's library path-prefix matcher disagrees (common
     # when the test suite stubs Plex without populating library remote
     # paths, or when a user opens a one-off webhook with a path outside
-    # the configured library roots).
-    candidate_ids = list(matched_ids | set(item_id_hints.keys()))
+    # the configured library roots). A hinted server whose library holds the path with Previews off is the user's
+    # choice, though, not a stale cache, so it doesn't publish.
+    hinted_ids = set(item_id_hints.keys()) - matched_ids
+    if hinted_ids:
+        hinted_ids -= {match.server_id for match in find_library_matches(canonical_path, registry.configs())}
+    candidate_ids = list(matched_ids | hinted_ids)
 
     for sid in candidate_ids:
         server = registry.get(sid)
@@ -1745,7 +1749,7 @@ def _process_canonical_path_previews(
         publishers = [p for p in publishers if p[0].id == server_id_filter]
         if before and not publishers:
             logger.info(
-                "Dispatch pinned to server {!r} but that server doesn't own {} — skipping. "
+                "Dispatch pinned to server {!r} but no library with Previews on there holds {} — skipping. "
                 "(Other servers own this file but the job/webhook is scoped to one server only.)",
                 server_id_filter,
                 canonical_path,

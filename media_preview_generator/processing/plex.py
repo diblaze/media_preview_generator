@@ -20,7 +20,7 @@ from loguru import logger
 from ..plex_client import _build_episode_title, _extract_item_locations, retry_plex_call
 from ..servers.base import MediaServer, ServerConfig, ServerType
 from ..servers.plex import PlexServer, _plex_item_id
-from ._shared import _MediaServerProcessor
+from ._shared import _MediaServerProcessor, previews_library_ids
 from .registry import register_processor
 from .types import ProcessableItem
 
@@ -69,7 +69,10 @@ class PlexProcessor(_MediaServerProcessor):
             )
             return
 
-        wanted_ids: set[str] | None = set(library_ids) if library_ids else None
+        wanted = previews_library_ids(server_config, library_ids)
+        if wanted == []:
+            return
+        wanted_ids: set[str] | None = set(wanted) if wanted is not None else None
         cutoff = datetime.now(UTC) - timedelta(hours=lookback_hours)
         cutoff_naive = cutoff.replace(tzinfo=None)
 

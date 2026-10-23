@@ -799,6 +799,57 @@ class TestMultiServerGuards:
             "webhook for a paused server can again burn CPU on it."
         )
 
+    @pytest.mark.parametrize(
+        ("plex_libraries", "expected"),
+        [
+            ([("/data/movies-4k", False)], ["jf-1"]),  # #422: Plex's library is off
+            ([("/data/movies-4k", True)], ["plex-1", "jf-1"]),
+            ([("/elsewhere", True)], ["plex-1", "jf-1"]),  # no library holds it: the hint is trusted
+            ([("/data/movies-4k", False), ("/data", True)], ["plex-1", "jf-1"]),  # another library holds it with it on
+        ],
+        ids=["hinted-library-off", "hinted-library-on", "hinted-no-library", "hinted-overlap-one-on"],
+    )
+    def test_resolve_publishers_skips_hinted_server_whose_library_has_previews_off(self, plex_libraries, expected):
+        """A Plex webhook names the file's item on Plex; Previews off for that Plex library still means no publish."""
+        from media_preview_generator.processing.multi_server import _resolve_publishers
+        from media_preview_generator.servers import ServerRegistry
+
+        registry = ServerRegistry.from_settings(
+            [
+                {
+                    "id": "plex-1",
+                    "type": "plex",
+                    "name": "Plex",
+                    "enabled": True,
+                    "url": "http://plex:32400",
+                    "auth": {"method": "token", "token": "t"},
+                    "libraries": [
+                        {"id": str(n), "name": f"Lib {n}", "remote_paths": [path], "enabled": on}
+                        for n, (path, on) in enumerate(plex_libraries, start=1)
+                    ],
+                    "output": {"adapter": "plex_bundle", "plex_config_folder": "/config/plex", "frame_interval": 5},
+                },
+                {
+                    "id": "jf-1",
+                    "type": "jellyfin",
+                    "name": "Jellyfin",
+                    "enabled": True,
+                    "url": "http://jelly:8096",
+                    "auth": {"method": "api_key", "api_key": "k"},
+                    "libraries": [{"id": "1", "name": "4K", "remote_paths": ["/data/movies-4k"], "enabled": True}],
+                    "output": {"adapter": "jellyfin_trickplay", "width": 320, "frame_interval": 5},
+                },
+            ],
+        )
+
+        publishers = _resolve_publishers(
+            "/data/movies-4k/Casino Royale (2006)/Casino Royale (2006).mkv",
+            registry,
+            item_id_by_server={"plex-1": "123"},
+        )
+
+        assert sorted(server.id for server, _adapter, _hint in publishers) == sorted(expected)
+
     def test_webhook_path_no_owners_fast_skips(self, tmp_path):
         """No enabled server claims the path → orchestrator fast-skips
         with no worker pickup. Without this gate the path would still hit
