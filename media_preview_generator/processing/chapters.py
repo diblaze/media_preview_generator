@@ -26,7 +26,6 @@ from ..output.plex_hash import (
     SourceFingerprint,
     calculate_plex_hash,
     get_source_fingerprint,
-    same_recorded_source,
     same_source,
 )
 from .chapter_recovery import inspect_seek_index, recover_bif_frame
@@ -158,7 +157,7 @@ def _failure(exc: Exception, completed: int = 0, total: int = 0) -> ChapterOutco
     from ..utils import redact_secrets
 
     code = getattr(exc, "code", "")
-    if code in {"unsupported_source", "other_version"}:
+    if code in {"unsupported_source", "other_version", "several_items"}:
         return ChapterOutcome("skipped", completed, total, redact_secrets(str(exc)), False)
     if code == "no_chapters":
         return ChapterOutcome("none", message="No chapters")
@@ -210,6 +209,9 @@ def prepare_chapters(
         source_fingerprint: The caller's own stat of this file, when it just took one; saves a second stat.
         reuse_recent_checks: Covers only the read-side checks (a recent Plex identity and database check are reused);
             writes (``register_chapters`` / ``LocalChapters.register``) always prove identity again.
+
+    Raises:
+        ChapterError: ``several_items`` when no item id was given and Plex lists the file as several items.
     """
     from ..servers.plex_chapters import ChapterError, resolve_chapter_target
 
@@ -271,19 +273,19 @@ def prepare_chapters(
     except CancellationError:
         raise
     except (PublishError, ProbeError, OSError, ValueError, RuntimeError) as exc:
+        if getattr(exc, "code", "") == "several_items":
+            raise
         plan.target = None
         plan.outcome = _failure(exc)
     return plan
 
 
 def _unsupported_stamp(plan: ChapterPlan) -> str | None:
-    """Return the skip message when this exact file and profile were already found unsupported or failing."""
+    """Return the skip message when this content (this bundle folder) and profile were already found unsupported or
+    failing."""
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if (
-            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
-            or manifest.get("profile") != plan.profile
-        ):
+        if manifest.get("profile") != plan.profile:
             return None
         reason = manifest.get("unsupported")
         if isinstance(reason, str) and reason:
@@ -292,7 +294,7 @@ def _unsupported_stamp(plan: ChapterPlan) -> str | None:
         if isinstance(failed, str) and failed:
             return (
                 f"Chapter thumbnails skipped: this file failed before ({failed}); "
-                "it will be retried when the file changes"
+                "it will be retried when the file is replaced, or on Regenerate"
             )
         return None
     except (OSError, ValueError, TypeError, AttributeError):
@@ -327,10 +329,7 @@ def _fresh_images(plan: ChapterPlan) -> dict[str, dict]:
     target = cast("ChapterTarget", plan.target)
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if (
-            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
-            or manifest.get("profile") != plan.profile
-        ):
+        if manifest.get("profile") != plan.profile:
             return {}
         entries = manifest.get("images", {})
         fresh = {}
@@ -384,10 +383,7 @@ def _stamp_manifest(plan: ChapterPlan, proven: dict[str, tuple[dict, dict]]) -> 
         return
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if (
-            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
-            or manifest.get("profile") != plan.profile
-        ):
+        if manifest.get("profile") != plan.profile:
             return
         entries = manifest.get("images", {})
         changed = False
@@ -452,10 +448,7 @@ def _other_items_verified(plan: ChapterPlan, key: dict) -> list[dict]:
     """
     try:
         manifest = json.loads(plan.manifest_path.read_text())
-        if (
-            not same_recorded_source(manifest.get("source"), plan.source_fingerprint)
-            or manifest.get("profile") != plan.profile
-        ):
+        if manifest.get("profile") != plan.profile:
             return []
         found = [manifest.get("verified"), *(manifest.get("also_verified") or [])]
     except (OSError, ValueError, AttributeError, TypeError):
@@ -494,6 +487,8 @@ def _write_manifest(
     unsupported: str | None = None,
     failed: str | None = None,
 ) -> None:
+    # The images are current while the profile matches: Plex names this folder after the file's content, so a
+    # changed file gets a new folder, and identical copies share this one. "source" is only read by older versions.
     payload = {"source": list(plan.source_fingerprint), "profile": plan.profile, "images": images}
     if unsupported:
         payload["unsupported"] = unsupported
@@ -681,7 +676,7 @@ def extract_chapter_frame(
 
 
 def _remember_failure(plan: ChapterPlan, images: dict[str, dict], reason: str) -> None:
-    """Stamp the manifest so later scans skip this file until its fingerprint changes."""
+    """Stamp the manifest so later scans skip this file until its content changes or it is regenerated."""
     try:
         _write_manifest(plan, images, failed=reason)
     except OSError as exc:

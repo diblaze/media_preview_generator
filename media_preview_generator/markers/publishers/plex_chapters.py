@@ -348,7 +348,8 @@ class LocalChapters:
         if not rows:
             raise ChapterError("Plex has not indexed this source yet", code="pending_index")
         if len(rows) != 1:
-            raise ChapterError("Plex has more than one matching source", code="unsupported_source")
+            # One file in two libraries, or a double episode: the caller names each item in turn.
+            raise ChapterError("Plex lists this file as more than one item", code="several_items")
         row = rows[0]
         live_parts = conn.execute(
             "SELECT mi.id, mp.id FROM media_parts mp JOIN media_items mi ON mi.id=mp.media_item_id "

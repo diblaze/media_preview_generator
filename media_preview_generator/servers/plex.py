@@ -2044,7 +2044,13 @@ class PlexServer(MediaServer):
         return [(bare, f) for f in files]
 
     def _resolve_one_path(self, server_view_path: str, *, library_ids: Collection[str] | None = None) -> str | None:
-        """Return the Plex ratingKey for the file at ``server_view_path``.
+        """The first Plex ratingKey :meth:`_items_at_path` finds for ``server_view_path``, or None."""
+        return next((key for key, _file in self._items_at_path(server_view_path, library_ids=library_ids)), None)
+
+    def _items_at_path(
+        self, server_view_path: str, *, library_ids: Collection[str] | None = None
+    ) -> Iterator[tuple[str, str]]:
+        """Yield ``(ratingKey, file)`` for each item holding the file at ``server_view_path``.
 
         Uses Plex's per-section ``type=<media_type>&file=<basename>``
         filter — an indexed equality lookup against MediaPart.file
@@ -2061,9 +2067,10 @@ class PlexServer(MediaServer):
 
         Verifies via the trailing two path components (parent dir +
         basename) so two unrelated files with the same basename don't
-        collide. Returns ``None`` when no match exists or the API call
+        collide. Yields nothing when no match exists or the API call
         fails; the dispatcher then routes the publisher to the
         slow-backoff retry queue (the file may not yet be indexed).
+        A file in two libraries, or a multi-episode file, yields each item.
         The base class :meth:`MediaServer.resolve_remote_path_to_item_id`
         loops mapped candidates through this hook so callers can pass
         canonical paths.
@@ -2078,11 +2085,11 @@ class PlexServer(MediaServer):
         from ..plex_client import _resolve_item_media_type, retry_plex_call
 
         if not server_view_path:
-            return None
+            return
 
         basename = _os.path.basename(server_view_path)
         if not basename:
-            return None
+            return
         target_tail = "/".join(server_view_path.rstrip("/").split("/")[-2:]).replace("\\", "/")
 
         try:
@@ -2090,7 +2097,7 @@ class PlexServer(MediaServer):
             sections = retry_plex_call(plex.library.sections)
         except Exception as exc:
             logger.debug("Plex reverse-lookup: section enumeration failed: {}", exc)
-            return None
+            return
 
         # Plex's file= filter is scoped per (section_key, type_id). Movie
         # libraries use type=1, TV libraries use type=4 (episodes); other
@@ -2147,16 +2154,17 @@ class PlexServer(MediaServer):
                 )
                 continue
             for item in items:
-                for media in getattr(item, "media", None) or []:
-                    for part in getattr(media, "parts", None) or []:
-                        file_path = str(getattr(part, "file", None) or "").replace("\\", "/")
-                        if not file_path:
-                            continue
-                        if _os.path.basename(file_path) == basename and file_path.endswith(target_tail):
-                            rating_key = getattr(item, "ratingKey", None)
-                            if rating_key is not None:
-                                return str(rating_key)
-        return None
+                rating_key = getattr(item, "ratingKey", None)
+                files = (
+                    str(getattr(part, "file", None) or "").replace("\\", "/")
+                    for media in getattr(item, "media", None) or []
+                    for part in getattr(media, "parts", None) or []
+                )
+                match = next(
+                    (file for file in files if _os.path.basename(file) == basename and file.endswith(target_tail)), None
+                )
+                if rating_key is not None and match:
+                    yield str(rating_key), match
 
     def _trigger_path_refresh(self, server_view_path: str) -> None:
         """Trigger a partial Plex library scan for one server-view path.
@@ -2294,23 +2302,49 @@ class PlexServer(MediaServer):
                 dark = sorted((item for item, shown in items.items() if not shown), key=int)
                 return dark[0] if dark else None
         try:
-            if not bare_id:
-                bare_id = str(self.resolve_remote_path_to_item_id(canonical_path) or "").rsplit("/", 1)[-1]
-                if not bare_id.isdecimal():
-                    return None
-            video = self._connect().query(f"/library/metadata/{bare_id}").find("Video")
-            shown = None if video is None else self._file_flag_reader(canonical_path)(video)
+            plex = self._connect()
+            flagged = self._file_flag_reader(canonical_path)
+            for item in [bare_id] if bare_id else [str(item) for item in self.items_holding_file(canonical_path)]:
+                video = plex.query(f"/library/metadata/{item}").find("Video")
+                if video is not None and flagged(video) is False:
+                    return item
         except Exception as exc:
             logger.debug("Could not read Plex's preview flag for {}: {}", canonical_path, exc)
-            return None
-        return bare_id if shown is False else None
+        return None
+
+    def items_holding_file(self, canonical_path: str) -> list[int]:
+        """Every Plex item holding this file: one per library it's in, and one per episode of a multi-episode file.
+
+        Plex's database answers when this client can read it and already lists the file (in any library); otherwise
+        a lookup by path in the preview libraries does, keeping only items whose part is this exact path.
+
+        Args:
+            canonical_path: The media file.
+
+        Returns:
+            The item ids in ascending order; empty when Plex can't be asked or hasn't indexed the file.
+        """
+        from ..config.paths import expand_path_mapping_candidates
+
+        _parts, flags = self._database_read()
+        if flags is not None:
+            for candidate in expand_path_mapping_candidates(canonical_path, self.path_mappings):
+                items = flags.get(_flag_key(candidate))
+                if items:
+                    return sorted(int(item) for item in items)
+        for candidate in expand_path_mapping_candidates(canonical_path, self.path_mappings):
+            exact = candidate.replace("\\", "/")
+            items = {int(key) for key, file in self._items_at_path(candidate) if key.isdecimal() and file == exact}
+            if items:
+                return sorted(items)
+        return []
 
     def _items_holding_file(self, plex: Any, bare_id: str, canonical_path: str) -> dict[str, bool]:
         """Map each Plex item holding this file to whether its copy of the part carries the preview flag.
 
-        Plex keeps a separate item, with its own copy of the part, for each episode of a multi-episode file, and
-        Analyze on one episode leaves the others unflagged, so their previews never show. The item is missing
-        from the result when this file can't be told apart among its parts.
+        Plex keeps a separate item, with its own copy of the part, for each episode of a multi-episode file and for
+        each library the file is in, and Analyze on one item leaves the others unflagged, so their previews never
+        show. The item is missing from the result when this file can't be told apart among its parts.
         """
         flagged = self._file_flag_reader(canonical_path)
         items: dict[str, bool] = {}
@@ -2324,6 +2358,10 @@ class PlexServer(MediaServer):
                 key = str(sibling.get("ratingKey") or "")
                 shown = flagged(sibling)
                 if key.isdecimal() and key != bare_id and shown is not None:
+                    items[key] = shown
+        for key in map(str, self.items_holding_file(canonical_path)):
+            if key not in items and (other := plex.query(f"/library/metadata/{key}").find("Video")) is not None:
+                if (shown := flagged(other)) is not None:
                     items[key] = shown
         return items
 

@@ -423,19 +423,25 @@ class TestUnshownItem:
         assert server.unshown_item("/m/a.mkv", "/library/metadata/7") == expected
         query.assert_called_once_with("/library/metadata/7")
 
-    @pytest.mark.parametrize(("resolved", "expected"), [("7", "7"), (None, None)])
-    def test_without_the_database_or_an_id_the_item_is_found_by_path(self, tmp_path, monkeypatch, resolved, expected):
+    @pytest.mark.parametrize(("found", "expected"), [([("7", "/m/a.mkv")], "7"), ([], None)])
+    def test_without_the_database_or_an_id_the_item_is_found_by_path(self, tmp_path, monkeypatch, found, expected):
         server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
         query.return_value = _item_xml("/m/a.mkv", None)
-        resolve = MagicMock(return_value=resolved)
-        monkeypatch.setattr(server, "resolve_remote_path_to_item_id", resolve)
+        lookup = MagicMock(side_effect=lambda _path: iter(found))
+        monkeypatch.setattr(server, "_items_at_path", lookup)
 
         assert server.unshown_item("/m/a.mkv", None) == expected
-        resolve.assert_called_once_with("/m/a.mkv")
-        if resolved:
-            query.assert_called_once_with("/library/metadata/7")
-        else:
-            query.assert_not_called()
+        lookup.assert_called_once_with("/m/a.mkv")
+        assert query.call_args_list == [((f"/library/metadata/{item}",),) for item, _file in found]
+
+    def test_without_the_database_each_item_by_path_answers_for_itself(self, tmp_path, monkeypatch):
+        """The same file in two libraries: Analyze went to item 7 only, so item 8 is the one to send it to."""
+        server, query = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        query.side_effect = lambda key: _item_xml("/m/a.mkv", "sd" if key.endswith("/7") else None)
+        monkeypatch.setattr(server, "_items_at_path", lambda _path: iter([("8", "/m/a.mkv"), ("7", "/m/a.mkv")]))
+
+        assert server.unshown_item("/m/a.mkv", None) == "8"
+        assert server.unshown_item("/m/a.mkv", "7") is None
 
     def test_a_file_missing_from_the_database_falls_back_to_the_api(self, tmp_path, monkeypatch):
         server, query = _plex_with_database(
@@ -457,3 +463,51 @@ class TestUnshownItem:
         query.return_value = _item_xml("/elsewhere/other/b.mkv", None)
 
         assert server.unshown_item("/m/a.mkv", "7") is None
+
+
+class TestItemsHoldingFile:
+    """Every Plex item holding a file, for chapter jobs that don't name one (#420): each item has its own chapters."""
+
+    def test_the_database_lists_each_library_copy(self, tmp_path, monkeypatch):
+        rows = [
+            (10, DB_HASH, "/m/a.mkv", 100, False, False, FLAGGED),
+            (8, DB_HASH, "/m/a.mkv", 100, False, False, "{}"),
+        ]
+        server, query = _plex_with_database(tmp_path, monkeypatch, rows)
+
+        assert server.items_holding_file("/m/a.mkv") == [8, 10]
+        query.assert_not_called()
+
+    def test_a_path_mapping_finds_the_plex_side_path(self, tmp_path, monkeypatch):
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [(7, DB_HASH, "/plex/a.mkv", 100, False, False, "{}")])
+        server._config.path_mappings = [{"remote_prefix": "/plex", "local_prefix": "/data"}]
+
+        assert server.items_holding_file("/data/a.mkv") == [7]
+
+    def test_a_file_missing_from_the_database_is_found_by_path(self, tmp_path, monkeypatch):
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [(7, DB_HASH, "/m/a.mkv", 100, False, False, "{}")])
+        found = [("70", "/m/new.mkv"), ("9", "/m/new.mkv"), ("70", "/m/new.mkv")]
+        monkeypatch.setattr(server, "_items_at_path", lambda _path: iter(found))
+
+        assert server.items_holding_file("/m/new.mkv") == [9, 70]
+
+    def test_by_path_only_this_exact_file_counts(self, tmp_path, monkeypatch):
+        """Plex's lookup matches folder and file name; the same names under another root are another file."""
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        found = [("7", "/movies/Film/Film.mkv"), ("8", "/movies-4k/Film/Film.mkv"), ("9", "/movies/Film/Film.mkv")]
+        monkeypatch.setattr(server, "_items_at_path", lambda _path: iter(found))
+
+        assert server.items_holding_file("/movies/Film/Film.mkv") == [7, 9]
+
+    def test_a_path_mapping_is_tried_for_the_lookup_by_path(self, tmp_path, monkeypatch):
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        server._config.path_mappings = [{"remote_prefix": "/plex", "local_prefix": "/data"}]
+        monkeypatch.setattr(server, "_items_at_path", lambda path: iter([("7", path)] if path == "/plex/a.mkv" else []))
+
+        assert server.items_holding_file("/data/a.mkv") == [7]
+
+    def test_an_unindexed_file_or_plex_not_answering_gives_none(self, tmp_path, monkeypatch):
+        server, _ = _plex_with_database(tmp_path, monkeypatch, [], folder=False)
+        monkeypatch.setattr(server, "_items_at_path", lambda _path: iter([]))
+
+        assert server.items_holding_file("/m/a.mkv") == []

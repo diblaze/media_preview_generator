@@ -135,3 +135,52 @@ def test_full_scan_submits_requested_order(
             assert query["SortOrder"] == ("Descending" if sort_by == "newest" else "Ascending")
         else:
             assert "SortBy" not in query and "SortOrder" not in query
+
+
+@pytest.mark.parametrize("route", ["single_plex", "multi_server"])
+def test_a_file_in_two_plex_libraries_is_sent_once_naming_no_item(monkeypatch: pytest.MonkeyPatch, route: str) -> None:
+    """Each of its two Plex items has its own chapters, so the one job handles both (#420)."""
+    server_cfg = ServerConfig(id="server", type=ServerType.PLEX, name="Test", enabled=True, url="http://test", auth={})
+    client = PlexServer(server_cfg)
+    libraries = [Library(id=key, name=key, enabled=True, remote_paths=("/media",)) for key in ("1", "2")]
+    monkeypatch.setattr(client, "list_libraries", lambda: libraries)
+    monkeypatch.setattr(get_processor_for(ServerType.PLEX), "_make_client", lambda cfg: client)
+    sections = []
+    for library in libraries:
+        section = MagicMock(key=library.id, title=library.name, METADATA_TYPE="movie")
+        section.search.return_value = [
+            SimpleNamespace(ratingKey=f"{library.id}0", title="Film", locations=["/media/Film.mkv"]),
+            SimpleNamespace(ratingKey=f"{library.id}1", title="Other", locations=[f"/media/Other{library.id}.mkv"]),
+        ]
+        sections.append(section)
+    connection = MagicMock()
+    connection.library.sections.return_value = sections
+    monkeypatch.setattr(client, "_connect", lambda: connection)
+    registry = MagicMock()
+    registry.configs.return_value = [server_cfg]
+    config = SimpleNamespace(sort_by=None, plex_library_ids=None)
+
+    if route == "single_plex":
+        dispatch = MagicMock(return_value={"completed": 3, "failed": 0, "cancelled": False})
+        orchestrator._run_plex_full_scan_phase(
+            config,
+            registry,
+            dispatch_items=dispatch,
+            progress_callback=None,
+            cancel_check=None,
+            totals={"processed": 0, "successful": 0, "failed": 0, "cancelled": False},
+            aggregate_outcome={},
+        )
+        items = dispatch.call_args.args[0]
+    else:
+        monkeypatch.setattr(orchestrator, "_build_multi_server_registry", lambda: registry)
+        dispatch = MagicMock(return_value={})
+        monkeypatch.setattr(orchestrator, "_dispatch_processable_items", dispatch)
+        orchestrator._run_full_scan_multi_server(config, selected_gpus=[])
+        items = [item for cfg, item in dispatch.call_args.args[0]]
+
+    assert [(item.canonical_path, item.server_id, item.item_id_by_server) for item in items] == [
+        ("/media/Film.mkv", "server", {}),
+        ("/media/Other1.mkv", "server", {"server": "11"}),
+        ("/media/Other2.mkv", "server", {"server": "21"}),
+    ]

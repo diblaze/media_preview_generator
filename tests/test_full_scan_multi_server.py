@@ -1288,6 +1288,83 @@ class TestMultiPlexDeduping:
         assert merged.get("jf-1") == "jf-id", merged
 
 
+class TestOneEntryPerFile:
+    """A scan sends each file once; who it publishes to and which items it names follow from who listed it (#420)."""
+
+    PATH = "/data/Show/S01E01.mkv"
+
+    @staticmethod
+    def _entries(*listed):
+        from types import SimpleNamespace
+
+        from media_preview_generator.jobs.orchestrator import _one_entry_per_file
+        from media_preview_generator.jobs.worker import resolve_per_item_pin
+
+        configs = {
+            "plex-1": SimpleNamespace(id="plex-1", type=ServerType.PLEX),
+            "jf-1": SimpleNamespace(id="jf-1", type=ServerType.JELLYFIN),
+            "emby-1": SimpleNamespace(id="emby-1", type=ServerType.EMBY),
+        }
+        registry = MagicMock()
+        registry.get_config.side_effect = configs.get
+        items = [
+            (
+                configs[server_id],
+                ProcessableItem(canonical_path=path, server_id=server_id, item_id_by_server={server_id: item_id}),
+            )
+            for path, server_id, item_id in listed
+        ]
+        return [
+            (
+                item.canonical_path,
+                item.item_id_by_server,
+                resolve_per_item_pin(SimpleNamespace(server_id_filter=None), item, registry),
+            )
+            for _cfg, item in _one_entry_per_file(items)
+        ]
+
+    def test_a_file_one_server_lists_once_is_unchanged(self):
+        assert self._entries((self.PATH, "jf-1", "J")) == [(self.PATH, {"jf-1": "J"}, "jf-1")]
+
+    @pytest.mark.parametrize("first", ["plex-1", "jf-1", "emby-1"])
+    def test_a_file_several_servers_list_publishes_to_all_of_them(self, first):
+        """With Jellyfin or Emby listed first, the merged entry used to be pinned to that server, skipping Plex."""
+        listed = {
+            "plex-1": (self.PATH, "plex-1", "1"),
+            "jf-1": (self.PATH, "jf-1", "J"),
+            "emby-1": (self.PATH, "emby-1", "E"),
+        }
+        order = [first, *(server_id for server_id in listed if server_id != first)]
+
+        assert self._entries(*(listed[server_id] for server_id in order)) == [
+            (self.PATH, {"plex-1": "1", "jf-1": "J", "emby-1": "E"}, None)
+        ]
+
+    @pytest.mark.parametrize("plex_first", [True, False])
+    def test_a_file_plex_lists_twice_names_no_plex_item(self, plex_first):
+        """One file in two Plex libraries, or a double episode: the job handles every Plex item holding it."""
+        plex = [(self.PATH, "plex-1", "1"), (self.PATH, "plex-1", "2")]
+        jellyfin = [(self.PATH, "jf-1", "J")]
+
+        entries = self._entries(*(plex + jellyfin if plex_first else jellyfin + plex))
+
+        assert entries == [(self.PATH, {"jf-1": "J"}, None)]
+
+    @pytest.mark.parametrize("server_id", ["emby-1", "jf-1"])
+    def test_a_file_emby_or_jellyfin_lists_twice_stays_theirs_naming_no_item(self, server_id):
+        """With no item named, the server is asked by path, as for a webhook."""
+        assert self._entries((self.PATH, server_id, "A"), (self.PATH, server_id, "B")) == [(self.PATH, {}, server_id)]
+
+    def test_a_plex_only_double_episode_fans_out(self):
+        assert self._entries((self.PATH, "plex-1", "1"), (self.PATH, "plex-1", "2")) == [(self.PATH, {}, None)]
+
+    def test_other_files_keep_their_order_and_items(self):
+        other = "/data/Show/S01E02.mkv"
+        entries = self._entries((self.PATH, "plex-1", "1"), (other, "plex-1", "3"), (self.PATH, "plex-1", "2"))
+
+        assert entries == [(self.PATH, {}, None), (other, {"plex-1": "3"}, None)]
+
+
 class TestRealEndToEndMultiServerFullScan:
     """Boundary-only end-to-end test: real ``_run_full_scan_multi_server`` →
     real ``_dispatch_processable_items`` → real ``process_canonical_path`` →

@@ -1,11 +1,13 @@
 """Tests for library_health.plex."""
 
 import json
+import os
 import time
 import tracemalloc
 import unicodedata
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,7 +22,7 @@ from media_preview_generator.markers.publishers.base import PublishError
 from media_preview_generator.markers.publishers.plex_db import LocalPlexDb, encode_extra_data
 from media_preview_generator.markers.publishers.plex_remote import RemotePlexDb
 from media_preview_generator.servers.base import Library, ServerConfig, ServerType
-from tests.conftest import CTIME_ONLY_CHANGES, RECORDED_SOURCE_CHANGES, change_ctime_only, change_source
+from tests.conftest import CTIME_ONLY_CHANGES, change_ctime_only, change_source
 
 from .plex_fixture import SD_FLAG, FakeLocalDb, build_plex_db, write_bif
 
@@ -499,24 +501,23 @@ def test_chapters_count_done_none_todo_and_cant_do(monkeypatch, tmp_path):
 
 
 def test_chapter_manifest_marks_failed_files_and_real_past_end(monkeypatch, tmp_path):
-    media = {name: tmp_path / f"{name}.mkv" for name in ("failed", "past", "stale", "open")}
+    media = {name: tmp_path / f"{name}.mkv" for name in ("failed", "past", "open", "new")}
     for path in media.values():
         path.write_bytes(b"video")
     _write_manifest(tmp_path, "f1", media["failed"], failed="decoder crashed")
     _write_manifest(tmp_path, "p1", media["past"], images={"2": {"past_end": True}})
-    _write_manifest(tmp_path, "s1", media["stale"], source=[0, 0, 0, 0, 0], unsupported="old file")
     _write_manifest(tmp_path, "o1", media["open"], images={"2": {"sha256": "x"}})
     bare = [(0, _THUMB), (590_000, "")]
     items = [
         _with_chapters(_movie(name, str(path), bundle_hash), bare)
-        for (name, path), bundle_hash in zip(media.items(), ("f1", "p1", "s1", "o1"), strict=True)
+        for (name, path), bundle_hash in zip(media.items(), ("f1", "p1", "o1", "n1"), strict=True)
     ]
 
     result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
 
     cell = _cell(result, "1", Feature.CHAPTERS)
     assert (cell.done, cell.cant_do, cell.todo) == (1, 1, 2)
-    assert sorted(t.title for t in result.todo if t.feature == Feature.CHAPTERS) == ["open", "stale"]
+    assert sorted(t.title for t in result.todo if t.feature == Feature.CHAPTERS) == ["new", "open"]
 
 
 def _manifest_part(tmp_path):
@@ -545,13 +546,21 @@ def test_chapter_manifest_still_describes_a_moved_file(tmp_path):
     assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "cant_do"
 
 
-@pytest.mark.parametrize("how", RECORDED_SOURCE_CHANGES)
-def test_chapter_manifest_of_a_changed_file_is_a_to_do(tmp_path, how):
+def test_chapter_manifest_describes_an_identical_copy_with_another_modified_time(tmp_path):
+    """Plex names the folder after the content, so a copy shares it, as the chapter step reads it (#420)."""
     media, part = _manifest_part(tmp_path)
+    copy = tmp_path / "copy.mkv"
+    copy.write_bytes(media.read_bytes())
+    os.utime(copy, ns=(1_000_000_000, 1_000_000_000))
 
-    change_source(media, how)
+    assert plex._chapter_manifest_state(str(tmp_path / "plex"), replace(part, path=str(copy)), set()) == "cant_do"
 
-    assert plex._chapter_manifest_state(str(tmp_path / "plex"), part, set()) == "todo"
+
+def test_a_changed_file_is_a_to_do_in_its_new_folder(tmp_path):
+    """A changed file gets a new Plex hash, so a new folder with no manifest yet."""
+    _media, part = _manifest_part(tmp_path)
+
+    assert plex._chapter_manifest_state(str(tmp_path / "plex"), replace(part, bundle_hash="f2"), set()) == "todo"
 
 
 def test_chapters_off_skips_the_chapter_queries(monkeypatch, tmp_path):

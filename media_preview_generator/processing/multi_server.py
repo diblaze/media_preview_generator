@@ -35,6 +35,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -84,6 +85,8 @@ from .generator import (
 from .plex_refresh import enqueue_plex_refresh, plex_refresh_asked, wait_for_plex_refresh
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..config import Config
     from ..servers.plex import PlexServer
     from ..servers.registry import ServerRegistry
@@ -2603,37 +2606,64 @@ def process_canonical_path(
     if not enabled:
         return _process_canonical_path_previews(canonical_path, registry, config, **options)
 
-    from .chapters import ChapterOutcome, _failure, chapter_work_needed, prepare_chapters, publish_chapters
+    from ..servers.plex_chapters import ChapterError
+    from .chapters import (
+        ChapterOutcome,
+        ChapterPlan,
+        _failure,
+        chapter_work_needed,
+        prepare_chapters,
+        publish_chapters,
+    )
 
-    plans = {}
+    # Per server: the job's (Plex item id, plan), or one per item when the job names none and the file is several.
+    plans: dict[str, list[tuple[int | None, ChapterPlan]]] = {}
     planning_failures = {}
+
+    def each_item(
+        server: MediaServer, path: str, item_id: int | None, read: Callable[[int | None], ChapterPlan]
+    ) -> list[tuple[int | None, ChapterPlan]]:
+        """``read`` for the job's item; for a job that names none and a file Plex lists as several (two libraries, a
+        double episode), for each of them, since each has its own chapter references."""
+        try:
+            return [(item_id, read(item_id))]
+        except ChapterError as exc:
+            if exc.code != "several_items" or item_id is not None:
+                raise
+            item_ids = cast("PlexServer", server).items_holding_file(path)
+            if not item_ids:
+                raise
+            return [(each, read(each)) for each in item_ids]
 
     def preparing_chapters() -> None:
         if chapter_progress_callback:
             chapter_progress_callback({"stage": "preparing", "processed": 0, "total": 0, "ready": 0, "failed": 0})
 
     def prepare(path: str, fingerprint: SourceFingerprint | None = None) -> None:
+        def plan_item(server: MediaServer, item_id: int | None) -> ChapterPlan:
+            return prepare_chapters(
+                server,
+                enabled[server.id],
+                path,
+                config,
+                item_id_hint=item_id,
+                cancel_check=cancel_check,
+                trust_server_hash=_is_bulk_scan(source, config),
+                regenerate=regenerate,
+                source_fingerprint=fingerprint,
+                reuse_recent_checks=True,
+            )
+
         preparing_chapters()
         for server, _adapter, hint in _resolve_publishers(path, registry, item_id_by_server=item_id_by_server):
             if server.id not in enabled:
                 continue
             try:
                 bare_hint = int(str(hint).rsplit("/", 1)[-1]) if hint else None
-                plans[server.id] = prepare_chapters(
-                    server,
-                    enabled[server.id],
-                    path,
-                    config,
-                    item_id_hint=bare_hint,
-                    cancel_check=cancel_check,
-                    trust_server_hash=_is_bulk_scan(source, config),
-                    regenerate=regenerate,
-                    source_fingerprint=fingerprint,
-                    reuse_recent_checks=True,
-                )
+                plans[server.id] = each_item(server, path, bare_hint, partial(plan_item, server))
             except CancellationError:
                 raise
-            except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+            except (ChapterError, OSError, ValueError, RuntimeError, requests.RequestException) as exc:
                 planning_failures[server.id] = _failure(exc)
 
     # One stat serves the file-exists check and chapter planning. A path that cannot be stat'ed as a regular file
@@ -2668,7 +2698,11 @@ def process_canonical_path(
         prepare(result.canonical_path)
     if plans:
         preparing_chapters()
-    needs_chapters = any(chapter_work_needed(plan, regenerate=regenerate) for plan in plans.values())
+    needs_chapters = any(
+        chapter_work_needed(plan, regenerate=regenerate)
+        for item_plans in plans.values()
+        for _item_id, plan in item_plans
+    )
     if check_only and not needs_chapters:
         needs_chapters = any(
             publisher.plex_refresh_requested
@@ -2684,25 +2718,90 @@ def process_canonical_path(
         )
     if cancel_check and cancel_check():
         raise CancellationError("Chapter processing cancelled")
+
+    def checked(plan: ChapterPlan) -> ChapterOutcome:
+        if plan.target is None or not plan.target.chapters:
+            return plan.outcome
+        return ChapterOutcome("ready", len(plan.target.chapters), len(plan.target.chapters), "Chapter thumbnails ready")
+
+    def publish_server(
+        server_id: str, item_plans: list[tuple[int | None, ChapterPlan]]
+    ) -> list[tuple[ChapterOutcome, bool]]:
+        """Each item's (outcome, whether its chapters changed). The items share one folder, so a regeneration
+        re-extracts the images once and the later items reuse them."""
+
+        def reread(server: MediaServer, item_id: int | None) -> ChapterPlan:
+            # Analyze replaces chapter references. Its completed request
+            # must precede both the guarded snapshot and registration.
+            return prepare_chapters(
+                server,
+                enabled[server_id],
+                result.canonical_path,
+                config,
+                item_id_hint=item_id,
+                cancel_check=cancel_check,
+                trust_server_hash=_is_bulk_scan(source, config),
+                regenerate=regenerate,
+            )
+
+        published = []
+        regenerated = False
+        for item_id, plan in item_plans:
+            try:
+                if not same_source(get_source_fingerprint(result.canonical_path), plan.source_fingerprint):
+                    raise SourceFileChangedError("Source changed while waiting for Plex Analyze")
+                # A file that became several items after planning (a new double episode Plex had not indexed yet).
+                fresh = each_item(plan.server, result.canonical_path, item_id, partial(reread, plan.server))
+            except CancellationError:
+                raise
+            except (ChapterError, OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+                published.append((_failure(exc), False))
+                continue
+            for _each, fresh_plan in fresh:
+                redo = regenerate and not regenerated
+                try:
+                    had_work = chapter_work_needed(fresh_plan, regenerate=redo)
+                    outcome = publish_chapters(
+                        fresh_plan,
+                        config,
+                        regenerate=redo,
+                        cancel_check=cancel_check,
+                        pause_check=pause_check,
+                        ffmpeg_threads_override=ffmpeg_threads_override,
+                        chapter_progress_callback=chapter_progress_callback,
+                    )
+                except CancellationError:
+                    raise
+                except (ChapterError, OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+                    published.append((_failure(exc), False))
+                    continue
+                # Only an item with chapters extracts them; one Plex skipped leaves the regeneration to the next.
+                regenerated = regenerated or (
+                    redo and fresh_plan.target is not None and bool(fresh_plan.target.chapters)
+                )
+                published.append((outcome, had_work and outcome.status == "ready"))
+        return published
+
+    def combined(outcomes: list[ChapterOutcome]) -> ChapterOutcome:
+        """The file's chapter outcome: an item still needing work (one that will be retried first), else a ready one."""
+        unfinished = [outcome for outcome in outcomes if outcome.status in {"waiting", "pending", "failed"}]
+        if unfinished:
+            return next((outcome for outcome in unfinished if outcome.retryable), unfinished[0])
+        return next((outcome for outcome in outcomes if outcome.status == "ready"), outcomes[0])
+
     changed = False
     incomplete = False
     for publisher in result.publishers:
         publisher_changed = False
-        plan = plans.get(publisher.server_id)
-        if plan is None and publisher.server_id not in planning_failures:
+        item_plans = plans.get(publisher.server_id)
+        if item_plans is None and publisher.server_id not in planning_failures:
             continue
         if publisher.status not in _PUBLISHED_LIKE_STATUSES | {PublisherStatus.SKIPPED_OUTPUT_EXISTS}:
             continue
-        if plan is None:
+        if item_plans is None:
             outcome = planning_failures[publisher.server_id]
         elif check_only:
-            outcome = (
-                plan.outcome
-                if plan.target is None or not plan.target.chapters
-                else ChapterOutcome(
-                    "ready", len(plan.target.chapters), len(plan.target.chapters), "Chapter thumbnails ready"
-                )
-            )
+            outcome = combined([checked(plan) for _item_id, plan in item_plans])
         else:
             if phase_callback:
                 phase_callback(f"Chapter thumbnails for {publisher.server_name}…")
@@ -2717,40 +2816,19 @@ def process_canonical_path(
                     timeout=30.0 if publisher.status is PublisherStatus.PUBLISHED else 0.0,
                     cancel_check=cancel_check,
                 )
+            except CancellationError:
+                raise
+            except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+                outcome = _failure(exc)
+            else:
                 if not refreshed:
                     outcome = ChapterOutcome(
                         "waiting", message="Waiting for Plex Analyze before chapter registration", retryable=True
                     )
                 else:
-                    if not same_source(get_source_fingerprint(result.canonical_path), plan.source_fingerprint):
-                        raise SourceFileChangedError("Source changed while waiting for Plex Analyze")
-                    # Analyze replaces chapter references. Its completed request
-                    # must precede both the guarded snapshot and registration.
-                    plan = prepare_chapters(
-                        plan.server,
-                        enabled[publisher.server_id],
-                        result.canonical_path,
-                        config,
-                        item_id_hint=plan.target.rating_key if plan.target else None,
-                        cancel_check=cancel_check,
-                        trust_server_hash=_is_bulk_scan(source, config),
-                        regenerate=regenerate,
-                    )
-                    had_work = chapter_work_needed(plan, regenerate=regenerate)
-                    outcome = publish_chapters(
-                        plan,
-                        config,
-                        regenerate=regenerate,
-                        cancel_check=cancel_check,
-                        pause_check=pause_check,
-                        ffmpeg_threads_override=ffmpeg_threads_override,
-                        chapter_progress_callback=chapter_progress_callback,
-                    )
-                    publisher_changed = had_work and outcome.status == "ready"
-            except CancellationError:
-                raise
-            except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
-                outcome = _failure(exc)
+                    published = publish_server(publisher.server_id, item_plans)
+                    outcome = combined([item_outcome for item_outcome, _ in published])
+                    publisher_changed = any(item_changed for _, item_changed in published)
             changed = changed or publisher_changed
         publisher.artifacts = {
             "bif": {"status": publisher.status.value},

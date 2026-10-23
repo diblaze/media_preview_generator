@@ -755,6 +755,23 @@ class TestResolveOnePath:
 
         assert result == "222", "expected the movies-folder item, not the TV-folder collision"
 
+    def test_every_item_holding_the_file_is_found(self, plex_wrapper):
+        """A file in two libraries, or a double episode, is several Plex items: each has its own chapters (#420)."""
+        plex = MagicMock()
+        plex.library.sections.return_value = [self._section(key="1"), self._section(key="2")]
+        plex.fetchItems.side_effect = [
+            [
+                self._item(rating_key="5", file_path="/media/tv/Show/S01E01-E02.mkv"),
+                self._item(rating_key="6", file_path="/media/tv/Show/S01E01-E02.mkv"),
+                self._item(rating_key="9", file_path="/media/tv/Other/S01E01-E02.mkv"),
+            ],
+            [self._item(rating_key="70", file_path="/media/tv/Show/S01E01-E02.mkv")],
+        ]
+        plex_wrapper._plex = plex
+
+        file = "/media/tv/Show/S01E01-E02.mkv"
+        assert list(plex_wrapper._items_at_path(file)) == [("5", file), ("6", file), ("70", file)]
+
     def test_empty_path_returns_none_without_querying(self, plex_wrapper):
         plex = MagicMock()
         plex_wrapper._plex = plex

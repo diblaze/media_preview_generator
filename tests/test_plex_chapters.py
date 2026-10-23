@@ -289,6 +289,25 @@ def test_version_split_into_multiple_files_is_unsupported_source(backend):
     assert caught.value.code == "unsupported_source"
 
 
+def test_a_file_in_two_items_needs_the_item_named_and_each_reads_its_own_chapters(backend):
+    """One file in two Plex libraries, or a double episode: two items, each with its own chapter rows (#420)."""
+    mutate(backend, "INSERT INTO media_items VALUES(11,7,NULL,NULL,NULL)")
+    mutate(
+        backend,
+        "INSERT INTO media_parts(id,media_item_id,file,hash,size,updated_at,deleted_at) VALUES(21,11,?,?,65536,100,NULL)",
+        (SOURCE, HASH),
+    )
+    mutate(backend, "INSERT INTO taggings VALUES(4,7,9,1,0,10000,'','chapter data')")
+
+    with pytest.raises(ChapterError) as caught:
+        read(backend)
+    assert caught.value.code == "several_items"
+    first = backend.read(SOURCE, MACHINE, VERSION, item_id_hint=1, deadline=time.monotonic() + 3)
+    second = backend.read(SOURCE, MACHINE, VERSION, item_id_hint=7, deadline=time.monotonic() + 3)
+    assert (first.rating_key, first.media_id, [c.row_id for c in first.chapters]) == (1, 10, [1, 2])
+    assert (second.rating_key, second.media_id, [c.row_id for c in second.chapters]) == (7, 11, [4])
+
+
 def test_multi_version_without_chapters_is_no_chapters(backend):
     add_second_version(backend)
     mutate(backend, "DELETE FROM taggings")
@@ -363,7 +382,7 @@ def test_register_refuses_when_another_version_claimed_the_rows_meanwhile(backen
     assert rows(backend) == before
 
 
-@pytest.mark.parametrize("code", ["unsupported_source", "other_version", "no_chapters"])
+@pytest.mark.parametrize("code", ["unsupported_source", "other_version", "no_chapters", "several_items"])
 def test_new_codes_survive_the_agent_error_codec(code):
     rebuilt = error_from_json(error_to_json(ChapterError("refused", code=code)))
     assert isinstance(rebuilt, ChapterError) and rebuilt.code == code

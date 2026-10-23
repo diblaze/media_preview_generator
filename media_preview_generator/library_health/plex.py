@@ -29,7 +29,6 @@ from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
 from ..output.plex_bundle import PlexBundleAdapter
-from ..output.plex_hash import get_source_fingerprint, same_recorded_source
 from ..processing import plex_held_rereads
 from ..servers.base import MediaServer, ServerConfig
 from ..servers.plex import preview_flag_shown
@@ -290,9 +289,10 @@ def _loudness_done(part_id: int, part_hash: str, rows: _PlexRows) -> bool:
 def _chapter_manifest_state(folder: str, part: _Part, missing: set[int]) -> str:
     """Refine a to-do from this app's chapter manifest (``todo``, ``done`` or ``cant_do``).
 
-    A manifest only counts while it still describes the file on disk. It records files the chapter step gave up on
-    (unsupported, or a failure it won't retry until the file changes) and chapters that start after the video really
-    ends, which Plex's duration can miss.
+    The manifest sits in the file's bundle, which Plex names after the file's content, so it describes this file
+    (as the chapter step reads it). It records files the chapter step gave up on (unsupported, or a failure it won't
+    retry until the content changes) and chapters that start after the video really ends, which Plex's duration can
+    miss.
     """
     if not part.bundle_hash:
         return "todo"
@@ -303,9 +303,7 @@ def _chapter_manifest_state(folder: str, part: _Part, missing: set[int]) -> str:
     )
     try:
         manifest = json.loads(manifest_path.read_text())
-        if not isinstance(manifest, dict) or not same_recorded_source(
-            manifest.get("source"), get_source_fingerprint(part.path)
-        ):
+        if not isinstance(manifest, dict):
             return "todo"
     except (OSError, ValueError):
         return "todo"

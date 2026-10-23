@@ -23,13 +23,12 @@ class ProcessableItem:
         canonical_path: Absolute LOCAL filesystem path of the source media file
             (already resolved from the server's remote_path via path_mappings).
             This is what FFmpeg reads from disk.
-        server_id: Identifier of the server this item was enumerated from.
-            Used to scope publishing to the originating server when relevant
-            (e.g. a Plex full-scan should publish to that Plex server first,
-            then fan out to other owners).
+        server_id: Identifier of the server this item was enumerated from, or
+            "" when several servers list the file (it then publishes to every
+            server that owns it, see ``resolve_per_item_pin``).
         item_id_by_server: Optional ``{server_id: vendor_item_id}`` hint that
-            avoids the per-publisher item-id lookup. Always contains at least
-            ``{server_id: <originating server's item id>}`` when available.
+            avoids the per-publisher item-id lookup. A server that lists the
+            file as several items has no entry: each of its items is handled.
         title: Display string for logs / progress (e.g. "Show - S01E01" or
             "Movie Title").
         library_id: Source library identifier on the originating server, when

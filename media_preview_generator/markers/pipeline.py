@@ -3523,9 +3523,10 @@ def _server_result(
 
 def _listed_title(item: ProcessableItem) -> str:
     """The title a server's library listing gave the item; "" for a file a sender or the store named (its title is its
-    file name) or a listing that had no title (its path, or "<unknown>")."""
+    file name) or a listing that had no title (its path, or "<unknown>"). A file several servers list has no single
+    server, but its listing still named a library."""
     title = (item.title or "").strip()
-    if not item.server_id or not title or title.startswith("<") or "/" in title or "\\" in title:
+    if not (item.server_id or item.library_id) or not title or title.startswith("<") or "/" in title or "\\" in title:
         return ""
     return "" if title == os.path.basename(item.canonical_path) else title
 

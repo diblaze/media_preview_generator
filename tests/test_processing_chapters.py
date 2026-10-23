@@ -1,6 +1,7 @@
 """Chapter artifact lifecycles, separate from an already completed BIF."""
 
 import json
+import os
 import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import replace
@@ -13,6 +14,7 @@ from loguru import logger
 from PIL import Image
 from pymediainfo import MediaInfo
 
+from media_preview_generator.markers.publishers.base import Capability
 from media_preview_generator.output.plex_bundle import PlexBundleAdapter
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapters, multi_server
@@ -20,7 +22,7 @@ from media_preview_generator.processing.generator import CancellationError
 from media_preview_generator.processing.multi_server import MultiServerStatus, PublisherStatus, process_canonical_path
 from media_preview_generator.servers import ServerRegistry
 from media_preview_generator.servers.plex_chapters import Chapter, ChapterError, ChapterTarget
-from tests.conftest import CTIME_ONLY_CHANGES, RECORDED_SOURCE_CHANGES, change_ctime_only, change_source
+from tests.conftest import CTIME_ONLY_CHANGES, change_ctime_only, change_source
 
 
 @pytest.fixture
@@ -892,6 +894,36 @@ def _prepare_for(plan, config, monkeypatch, **kwargs):
     )
 
 
+@pytest.mark.parametrize("item_id", [None, 7], ids=["no-item", "item-named"])
+def test_a_file_plex_lists_as_several_items_asks_the_caller_to_name_one(plan, config, monkeypatch, item_id):
+    """Only "several items" reaches the caller, which then names each item; every other Plex refusal is an outcome."""
+
+    def read(*_args, item_id_hint=None, **_kwargs):
+        if item_id_hint is None:
+            raise ChapterError("Plex lists this file as more than one item", code="several_items")
+        return plan.target
+
+    _prepare_for(plan, config, monkeypatch)
+    monkeypatch.setattr("media_preview_generator.servers.plex_chapters.resolve_chapter_target", read)
+    plex_config = Path(plan.canonical_path).parent / "plex"
+
+    def prepare():
+        return chapters.prepare_chapters(
+            plan.server,
+            SimpleNamespace(output={"plex_config_folder": str(plex_config)}),
+            plan.canonical_path,
+            config,
+            item_id_hint=item_id,
+        )
+
+    if item_id is None:
+        with pytest.raises(ChapterError) as raised:
+            prepare()
+        assert raised.value.code == "several_items"
+    else:
+        assert prepare().target is plan.target
+
+
 def test_unsupported_format_is_stamped_and_next_prepare_skips_all_work(plan, config, extraction, monkeypatch):
     run, register = extraction
     run.side_effect = chapters.UnsupportedChapterFormatError("Chapter thumbnails do not yet support Dolby Vision")
@@ -1088,7 +1120,7 @@ class TestRememberedChapterFailures:
         assert again.target is None
         assert again.outcome.status == "skipped"
         assert "failed before (FFmpeg produced excessive diagnostic output)" in again.outcome.message
-        assert "retried when the file changes" in again.outcome.message
+        assert "retried when the file is replaced" in again.outcome.message
         assert chapters.chapter_work_needed(again) is False
         run.assert_not_called()
         register.assert_not_called()
@@ -1360,6 +1392,179 @@ class TestOneFileSeveralPlexItems:
         assert [(v["item"], v["media"]) for v in manifest["also_verified"]] == [(7, 8)]
 
 
+class TestEveryPlexItemOfAFile:
+    """A job that names no Plex item, for a file Plex lists as several items, handles each item (#420)."""
+
+    @pytest.fixture
+    def two_items(self, plan, config, extraction, monkeypatch):
+        """Items 1 and 7 share the file; both registered, then Plex's Analyze of item 1 wiped its references."""
+        chapters.publish_chapters(plan, config)
+        second = TestOneFileSeveralPlexItems._as_item(plan, 7, 8, 9)
+        chapters.publish_chapters(second, config)
+        wiped = replace(plan.target, chapters=tuple(replace(c, thumb_url="") for c in plan.target.chapters))
+        by_item = {1: replace(plan, target=wiped), 7: second}
+        prepared = []
+
+        def prepare(server, *_args, item_id_hint=None, **_kwargs):
+            prepared.append(item_id_hint)
+            if item_id_hint is None:
+                if None in by_item:  # one read as a single item, before Plex lists the rest
+                    return replace(by_item.pop(None), server=server)
+                raise ChapterError("Plex lists this file as more than one item", code="several_items")
+            return replace(by_item[item_id_hint], server=server)
+
+        monkeypatch.setattr(chapters, "prepare_chapters", prepare)
+        registry = _registry(plan)
+        bif = PlexBundleAdapter.bundle_bif_path(
+            registry.get_config("plex").output["plex_config_folder"], plan.target.bundle_hash
+        )
+        bif.parent.mkdir(parents=True)
+        bif.write_bytes(b"existing BIF")
+        holding = MagicMock(return_value=[1, 7])
+        monkeypatch.setattr("media_preview_generator.servers.plex.PlexServer.items_holding_file", holding)
+        extraction[0].reset_mock()
+        extraction[1].reset_mock()
+        return registry, prepared, holding, by_item
+
+    def test_a_job_naming_no_item_restores_the_wiped_item(self, plan, mock_config, extraction, two_items):
+        registry, prepared, holding, _by_item = two_items
+        run, register = extraction
+
+        result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+        assert {call.args for call in holding.call_args_list} == {(plan.canonical_path,)}
+        assert prepared == [None, 1, 7, 1, 7]  # planned, then each read again after Plex's Analyze
+        run.assert_not_called()  # the images are shared and still current
+        register.assert_called_once()
+        assert register.call_args.args[1].rating_key == 1
+        assert result.publishers[0].artifacts["chapters"]["status"] == "ready"
+        assert result.publishers[0].artifacts["chapters"]["updated"] is True
+
+    def test_a_file_that_becomes_several_items_after_planning_restores_each(
+        self, plan, mock_config, extraction, two_items
+    ):
+        """A new double episode: planned while Plex had one item, read again after Analyze as two."""
+        registry, prepared, holding, by_item = two_items
+        _run, register = extraction
+        by_item[None] = replace(by_item[1], target=None, outcome=chapters.ChapterOutcome("waiting", retryable=True))
+
+        result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+        assert prepared == [None, None, 1, 7]
+        register.assert_called_once()
+        assert register.call_args.args[1].rating_key == 1
+        assert result.publishers[0].artifacts["chapters"]["status"] == "ready"
+
+    def test_a_regeneration_extracts_the_shared_images_once(
+        self, plan, mock_config, extraction, two_items, monkeypatch
+    ):
+        registry, _prepared, _holding, _by_item = two_items
+        run, register = extraction
+        previews = multi_server._process_canonical_path_previews
+        monkeypatch.setattr(  # the scrubber BIF is kept: only the chapter half is under test
+            multi_server,
+            "_process_canonical_path_previews",
+            lambda *args, **kwargs: previews(*args, **{**kwargs, "regenerate": False}),
+        )
+
+        process_canonical_path(plan.canonical_path, registry, mock_config, regenerate=True)
+
+        assert run.call_count == len(plan.target.chapters)
+        assert sorted(call.args[1].rating_key for call in register.call_args_list) == [1, 7]
+
+    def test_a_regeneration_skips_past_an_item_without_chapters(
+        self, plan, mock_config, extraction, two_items, monkeypatch
+    ):
+        registry, _prepared, _holding, by_item = two_items
+        run, _register = extraction
+        by_item[1] = replace(
+            by_item[1], target=None, outcome=chapters.ChapterOutcome("skipped", message="Other version")
+        )
+        previews = multi_server._process_canonical_path_previews
+        monkeypatch.setattr(
+            multi_server,
+            "_process_canonical_path_previews",
+            lambda *args, **kwargs: previews(*args, **{**kwargs, "regenerate": False}),
+        )
+
+        process_canonical_path(plan.canonical_path, registry, mock_config, regenerate=True)
+
+        assert run.call_count == len(plan.target.chapters)  # item 7 still re-extracts them
+
+    def test_a_job_naming_its_item_handles_only_that_item(self, plan, mock_config, extraction, two_items):
+        registry, prepared, holding, _by_item = two_items
+        _run, register = extraction
+
+        process_canonical_path(plan.canonical_path, registry, mock_config, item_id_by_server={"plex": "7"})
+
+        holding.assert_not_called()
+        assert prepared == [7, 7]
+        register.assert_not_called()  # item 7 is still registered
+
+    def test_a_retryable_item_keeps_the_file_retrying(self, plan, mock_config, extraction, two_items):
+        registry, _prepared, _holding, by_item = two_items
+        _run, register = extraction
+        by_item[7] = replace(
+            by_item[7],
+            target=replace(
+                by_item[7].target, chapters=tuple(replace(c, thumb_url="") for c in by_item[7].target.chapters)
+            ),
+        )
+
+        def refuse(_server, target, *_args, **_kwargs):
+            if target.rating_key == 1:
+                raise ChapterError("Plex metadata is unsupported", code="unsupported")
+            raise ChapterError("Plex is busy", state=Capability.UNREACHABLE)
+
+        register.side_effect = refuse
+
+        result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+        chapters_artifact = result.publishers[0].artifacts["chapters"]
+        assert (chapters_artifact["status"], chapters_artifact["retryable"]) == ("failed", True)
+        assert result.publishers[0].status is PublisherStatus.PUBLISHED_CHAPTERS_FAILED
+
+    def test_plex_not_listing_the_items_keeps_the_old_skip(self, plan, mock_config, extraction, two_items):
+        registry, prepared, holding, _by_item = two_items
+        holding.return_value = []
+
+        result = process_canonical_path(plan.canonical_path, registry, mock_config)
+
+        assert prepared == [None]
+        assert result.publishers[0].artifacts["chapters"]["status"] == "skipped"
+        extraction[1].assert_not_called()
+
+
+class TestIdenticalCopies:
+    """Identical copies at two paths share Plex's chapter folder; their own modified times must not matter."""
+
+    def test_copies_with_different_modified_times_settle(self, plan, config, extraction, tmp_path):
+        run, register = extraction
+        copy = tmp_path / "copy.mkv"
+        shutil.copyfile(plan.canonical_path, copy)
+        os.utime(copy, ns=(1_000_000_000, 1_000_000_000))
+        chapters.publish_chapters(plan, config)
+        first = TestOneFileSeveralPlexItems._as_item(plan, 1, 2, 3)
+        other = TestOneFileSeveralPlexItems._as_item(plan, 7, 8, 9)
+        other = replace(
+            other,
+            canonical_path=str(copy),
+            source_fingerprint=get_source_fingerprint(copy),
+            target=replace(other.target, source_path=str(copy)),
+        )
+        chapters.publish_chapters(other, config)
+        run.reset_mock()
+        register.reset_mock()
+
+        for _scan in range(2):
+            for copy_plan in (first, other):
+                assert not chapters.chapter_work_needed(copy_plan)
+                assert chapters.publish_chapters(copy_plan, config).status == "ready"
+
+        run.assert_not_called()
+        register.assert_not_called()
+
+
 class TestMetadataOnlySourceChange:
     """A hard link, chmod or *arr re-import moves the source's change time but not its content."""
 
@@ -1393,26 +1598,37 @@ class TestMetadataOnlySourceChange:
 
         assert _prepare_for(plan, config, monkeypatch).outcome.status == "skipped"
 
-    @pytest.mark.parametrize("how", RECORDED_SOURCE_CHANGES)
-    def test_a_real_change_fails_the_running_publish_and_reextracts_on_the_next(self, plan, config, extraction, how):
+    def test_a_changed_file_waits_for_plexs_new_folder_and_gets_new_images(self, plan, config, extraction, monkeypatch):
+        """Plex names the chapter folder after the file's content: a changed file gets a new, empty folder."""
         run, _register = extraction
+        plan.folder = _prepare_for(plan, config, monkeypatch).folder
         assert chapters.publish_chapters(plan, config).status == "ready"
 
-        change_source(plan.canonical_path, how)
+        change_source(plan.canonical_path, "size")
 
         assert chapters.publish_chapters(plan, config).status == "failed"
+        assert _prepare_for(plan, config, monkeypatch).outcome.status == "waiting"  # Plex still has the old hash
         run.reset_mock()
-        rescanned = replace(plan, source_fingerprint=get_source_fingerprint(plan.canonical_path))
+        plan.target = replace(
+            plan.target,
+            bundle_hash=calculate_plex_hash(plan.canonical_path),
+            source_size=Path(plan.canonical_path).stat().st_size,
+        )
+        rescanned = _prepare_for(plan, config, monkeypatch)
+        assert rescanned.folder != plan.folder
         assert chapters._fresh_images(rescanned) == {}
         assert chapters.publish_chapters(rescanned, config).status == "ready"
         assert run.call_count == 2
 
-    def test_a_move_fails_the_running_publish_but_the_next_reuses_the_thumbnails(self, plan, config, extraction):
-        """Unraid's mover gives the file a new inode with the same bytes and mtime (#414)."""
+    @pytest.mark.parametrize("how", ["mtime", "inode"])
+    def test_same_bytes_fail_the_running_publish_but_the_next_reuses_the_thumbnails(
+        self, plan, config, extraction, how
+    ):
+        """A touched file, or Unraid's mover giving it a new inode (#414), keeps its content and so its folder."""
         run, _register = extraction
         assert chapters.publish_chapters(plan, config).status == "ready"
 
-        change_source(plan.canonical_path, "inode")
+        change_source(plan.canonical_path, how)
 
         assert chapters.publish_chapters(plan, config).status == "failed"
         run.reset_mock()

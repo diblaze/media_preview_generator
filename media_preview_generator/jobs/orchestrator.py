@@ -653,10 +653,11 @@ def _dispatch_processable_items(
     ``items`` is ``[(server_config, ProcessableItem), ...]``; only the
     ProcessableItem is forwarded — the per-item publish pin is resolved from
     ``config.server_id_filter`` + ``item.server_id`` inside the worker /
-    checking stage (:func:`jobs.worker.resolve_per_item_pin`), equivalent to
-    the old per-tuple ``server_cfg.type`` logic since ``item.server_id ==
-    server_cfg.id`` for enumerated items. ``server_id_filter`` is accepted for
-    signature compatibility and is already carried on ``config``.
+    checking stage (:func:`jobs.worker.resolve_per_item_pin`). A file several
+    servers list carries no ``item.server_id``, so it publishes to every server
+    that owns it.
+    ``server_id_filter`` is accepted for signature compatibility and is already
+    carried on ``config``.
 
     Returns the tracker's per-file ProcessingResult outcome counts
     (``generated`` / ``skipped_bif_exists`` / …) — the same per-item scheme the
@@ -762,6 +763,50 @@ def _dispatch_processable_items(
     return tracker.get_result() if return_result else tracker.get_result()["outcome"]
 
 
+def _one_entry_per_file(listed: list) -> list:
+    """A scan's ``(server_config, ProcessableItem)`` list with one entry per file, in first-listed order.
+
+    The entry keeps each server's item id for the file, so publishing skips a lookup. Two cases differ:
+
+    * A file several servers list has no single origin, so it publishes to every server that owns it, as a webhook
+      for it would (an origin of Emby or Jellyfin would pin it to that server alone, see ``resolve_per_item_pin``).
+    * A file one server lists twice (in two libraries, or a double episode) names none of that server's items:
+      each item has its own chapter references and preview flag, and a job that names no item handles every item
+      holding the file.
+    """
+    from ..processing.types import ProcessableItem
+
+    by_path: dict[str, list] = {}
+    for server_cfg, item in listed:
+        by_path.setdefault(item.canonical_path, []).append((server_cfg, item))
+    entries = []
+    for path, group in by_path.items():
+        if len(group) == 1:
+            entries.append(group[0])
+            continue
+        ids: dict[str, set[str]] = {}
+        for _cfg, item in group:
+            for server_id, item_id in (item.item_id_by_server or {}).items():
+                ids.setdefault(server_id, set()).add(item_id)
+        first_cfg, first = group[0]
+        origins = {item.server_id for _cfg, item in group}
+        entries.append(
+            (
+                first_cfg,
+                ProcessableItem(
+                    canonical_path=path,
+                    server_id=first.server_id if len(origins) == 1 else "",
+                    item_id_by_server={
+                        server_id: next(iter(found)) for server_id, found in ids.items() if len(found) == 1
+                    },
+                    title=next((item.title for _cfg, item in group if item.title), ""),
+                    library_id=first.library_id,
+                ),
+            )
+        )
+    return entries
+
+
 def _enumerate_items_for_servers(
     candidates,
     *,
@@ -799,7 +844,6 @@ def _enumerate_items_for_servers(
 
     all_items: list = []
     enumeration_errors: list[tuple[str, str]] = []
-    by_canonical: dict[str, int] = {}  # canonical_path → index in all_items
 
     for server_cfg in candidates:
         try:
@@ -814,7 +858,7 @@ def _enumerate_items_for_servers(
             continue
         if cancel_check and cancel_check():
             logger.info("Cancellation requested while enumerating items — aborting {}.", label)
-            return all_items, enumeration_errors
+            return _one_entry_per_file(all_items), enumeration_errors
         # Surface a "Querying…" status BEFORE the per-server walk so the UI
         # progress bar shows the system is alive during the slow library
         # enumeration phase (Emby/Jellyfin TV libraries can take 10–60s
@@ -834,36 +878,9 @@ def _enumerate_items_for_servers(
             for item in enumerate_one(processor, server_cfg):
                 if cancel_check and cancel_check():
                     logger.info("Cancellation requested mid-enumeration — aborting {}.", label)
-                    return all_items, enumeration_errors
+                    return _one_entry_per_file(all_items), enumeration_errors
 
-                # When the same canonical_path appears on more
-                # than one server (typical: Plex+Jellyfin sharing media,
-                # or two Plex servers with shared storage), keep ONE
-                # ProcessableItem and merge every server's vendor item-id
-                # hint into it. The publish-side fan-out (_resolve_publishers)
-                # already targets every owning server; deduping here just
-                # avoids dispatching the same path twice.
-                existing_index = by_canonical.get(item.canonical_path)
-                if existing_index is None:
-                    by_canonical[item.canonical_path] = len(all_items)
-                    all_items.append((server_cfg, item))
-                else:
-                    existing_cfg, existing_item = all_items[existing_index]
-                    merged_hints = dict(existing_item.item_id_by_server or {})
-                    merged_hints.update(item.item_id_by_server or {})
-                    if merged_hints != (existing_item.item_id_by_server or {}):
-                        from ..processing.types import ProcessableItem
-
-                        all_items[existing_index] = (
-                            existing_cfg,
-                            ProcessableItem(
-                                canonical_path=existing_item.canonical_path,
-                                server_id=existing_item.server_id,
-                                item_id_by_server=merged_hints,
-                                title=existing_item.title or item.title,
-                                library_id=existing_item.library_id,
-                            ),
-                        )
+                all_items.append((server_cfg, item))
         except Exception as exc:
             logger.warning(
                 "Enumeration on {} server {!r} failed ({}: {}). Continuing with the next server in scope.",
@@ -879,7 +896,7 @@ def _enumerate_items_for_servers(
                 )
             )
 
-    return all_items, enumeration_errors
+    return _one_entry_per_file(all_items), enumeration_errors
 
 
 def _build_multi_server_registry():
@@ -1909,6 +1926,7 @@ def _run_plex_full_scan_phase(
     if not all_media_items:
         logger.info("No matching media items found across selected libraries")
         return True
+    all_media_items = [item for _cfg, item in _one_entry_per_file([(None, item) for item in all_media_items])]
 
     # When sort_by is "random", shuffle the combined cross-library list so
     # parallel workers statistically pull from multiple physical disks at

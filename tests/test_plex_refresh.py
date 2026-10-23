@@ -442,6 +442,17 @@ class TestAnalyzeIsConfirmed:
         assert _analyzed(fake) == ["41", "42"]
         no_sleep.assert_not_called()
 
+    def test_the_same_file_in_another_library_is_analyzed_too(self, mock_config, no_sleep):
+        """Two libraries, two items: Analyze flags only the one it's sent to, and each has its own chapters (#420)."""
+        film = "/m/Film/Film.mkv"
+        fake = _FakePlex({"5": _movie(film), "6": _movie(film), "7": _movie("/m/Other/Film.mkv")})
+
+        with patch.object(PlexServer, "items_holding_file", return_value=[5, 6]) as holding:
+            assert self._server(mock_config, fake).refresh_preview_metadata(film, "5") is True
+
+        assert _analyzed(fake) == ["5", "6"]
+        holding.assert_called_with(film)
+
     @pytest.mark.parametrize("sibling", ["shown", "own-file"])
     def test_an_episode_already_showing_or_in_its_own_file_is_left_alone(self, mock_config, no_sleep, sibling):
         second = _episode(MULTI if sibling == "shown" else "/tv/Show/Season 01/Show - S01E02.mkv")
