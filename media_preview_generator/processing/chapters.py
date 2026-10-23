@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 _WIDTH = 1280
 _QUALITY = 4
+# How close to the video's reported end a chapter with no frame gets the retry one second earlier: MediaInfo's video
+# duration ran 1.4 s past the last frame on a Blu-ray rip (The Originals S01E02 on sflix), so one second wasn't enough.
+_END_SLACK_MS = 2000
 _LOCKS = tuple(threading.Lock() for _ in range(64))
 
 
@@ -532,6 +535,22 @@ def _source_duration_ms(media_info) -> float:
     return 0
 
 
+def _no_frame(rc: int, stderr_text: str, output: Path) -> bool:
+    """Whether FFmpeg reached the end of the video without a frame to write (``stderr_text`` lower-cased).
+
+    A seek past the last frame either reports no filtered frames or, when the encoder never got a frame to open
+    with, says so and that nothing was written. Both lines together, so another failure that writes nothing isn't
+    mistaken for the end of the video.
+    """
+    return (
+        "no filtered frames" in stderr_text
+        or (
+            "could not open encoder before eof" in stderr_text and "nothing was written into output file" in stderr_text
+        )
+        or (rc == 0 and not output.exists())
+    )
+
+
 def _past_end_error(start_ms: int, source_duration_ms: float) -> ChapterPastEndError:
     where = (
         f"is outside the current video's duration ({source_duration_ms:.0f}ms)"
@@ -627,7 +646,7 @@ def extract_chapter_frame(
     _check_fatal_extraction(rc, stderr, start_ms)
     stderr_text = "\n".join(stderr).lower()
     premature_end = "file ended prematurely" in stderr_text
-    no_frame = "no filtered frames" in stderr_text or (rc == 0 and not output.exists())
+    no_frame = _no_frame(rc, stderr_text, output)
     try:
         duration_ms = float(track.duration)
     except (AttributeError, TypeError, ValueError):
@@ -642,7 +661,12 @@ def extract_chapter_frame(
         raise _past_end_error(start_ms, source_duration_ms)
     # Plex can round a final chapter past the last video frame. Seek at most
     # one second before the chapter; container duration can extend past video.
-    if no_frame and not premature_end and 1000 <= duration_ms < float("inf") and abs(start_ms - duration_ms) <= 1000:
+    if (
+        no_frame
+        and not premature_end
+        and 1000 <= duration_ms < float("inf")
+        and abs(start_ms - duration_ms) <= _END_SLACK_MS
+    ):
         fallback_ms = max(0, start_ms - 1000)
         if fallback_ms < start_ms:
             if cancel_check and cancel_check():
@@ -652,7 +676,7 @@ def extract_chapter_frame(
             _check_fatal_extraction(rc, stderr, fallback_ms)
             stderr_text = "\n".join(stderr).lower()
             premature_end = "file ended prematurely" in stderr_text
-            no_frame = "no filtered frames" in stderr_text or (rc == 0 and not output.exists())
+            no_frame = _no_frame(rc, stderr_text, output)
     # The video stream can end before the container duration MediaInfo reports, so a final chapter in
     # the last second may have no frame even after the fallback seek.
     if (

@@ -213,3 +213,54 @@ def test_no_frame_before_the_final_second_stays_a_failure(extraction):
     config = SimpleNamespace(tonemap_algorithm="hable", ffmpeg_threads=2, thumbnail_quality=2)
     with pytest.raises(RuntimeError, match="FFmpeg exit 234"):
         chapters.extract_chapter_frame("movie.mkv", 6705400, output, config, media_info=media)
+
+
+# What FFmpeg prints when a seek lands past the last frame and the JPEG encoder never gets one to open with.
+_NOTHING_WRITTEN = [
+    "[enc:mjpeg @ 0x1] Could not open encoder before EOF",
+    "[out#0/image2 @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.",
+    "Conversion failed!",
+]
+
+
+def test_final_chapter_1_3s_before_mediainfo_end_falls_back_to_a_real_frame(extraction):
+    # The Originals S01E02: MediaInfo says the video lasts 2542.96s, its last frame is at 2541.497s, the last chapter
+    # starts at 2541.62s, and FFmpeg reports "nothing was written" rather than "no filtered frames".
+    track, factory, extract, success, _ = extraction
+    track.duration = "2542960"
+    last_frame_ms = 2541497
+
+    def runner_for_seek(**options):
+        if options["chapter_start_ms"] > last_frame_ms:
+            return lambda **kwargs: (234, 0, "", _NOTHING_WRITTEN)
+        return success
+
+    factory.side_effect = runner_for_seek
+    extract(2541620)
+    assert [call.kwargs["chapter_start_ms"] for call in factory.call_args_list] == [2541620, 2540620]
+
+
+def test_nothing_written_after_the_retry_too_stays_a_failure_before_the_final_second(extraction):
+    track, factory, extract, _, _ = extraction
+    track.duration = "10000"
+    factory.return_value = lambda **kwargs: (234, 0, "", _NOTHING_WRITTEN)
+    with pytest.raises(RuntimeError, match="FFmpeg exit 234"):
+        extract(8500)
+    assert [call.kwargs["chapter_start_ms"] for call in factory.call_args_list] == [8500, 7500]
+
+
+def test_nothing_written_mid_file_is_still_a_failure(extraction):
+    _, factory, extract, _, _ = extraction
+    factory.return_value = lambda **kwargs: (234, 0, "", _NOTHING_WRITTEN)
+    with pytest.raises(RuntimeError, match="FFmpeg exit 234"):
+        extract(5000)
+    assert factory.call_count == 1
+
+
+def test_nothing_written_without_the_encoder_eof_line_is_not_taken_for_the_end(extraction):
+    track, factory, extract, _, _ = extraction
+    track.duration = "10000"
+    factory.return_value = lambda **kwargs: (234, 0, "", [_NOTHING_WRITTEN[1], "Conversion failed!"])
+    with pytest.raises(RuntimeError, match="FFmpeg exit 234"):
+        extract(9500)
+    assert factory.call_count == 1
