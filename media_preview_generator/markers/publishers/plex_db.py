@@ -1875,14 +1875,19 @@ class LocalPlexDb(PlexDatabase):
         plans: list[_Plan],
         wanted: list[Marker],
     ) -> list[Marker]:
-        """Plex's rows of the types an item keeps as Plex's own, for types we have no answer of our own for.
+        """Plex's own rows of the types we have no answer of our own for: kept ones, and ones we never wrote at all.
 
-        One item's rows per type: the first (the written item's) that keeps it.
+        Plex's intro on one episode with none decided by us is never "kept" (``_kept_types`` keeps only a type we'd
+        show), but it stays on that episode all the same. Rows we left on an item (its ``prior``, a copy made here
+        included) are never a source. One item's rows per type: the first (the written item's) that has them.
         """
         have = {m.type for m in wanted}
         source: dict[MarkerType, int] = {}
         for item, plan in zip(items, plans, strict=True):
-            for mtype in plan.kept_types - have:
+            rows = self._item_rows(conn, item[0], tag_id)
+            ours = {m.type for m in item[2]}
+            plex_own = {mtype for mtype, text in _TYPE_TEXT.items() if any(r.text == text for r in rows)} - ours
+            for mtype in (plan.kept_types | plex_own) - have:
                 source.setdefault(mtype, item[0])
         out: list[Marker] = []
         for mtype, key in source.items():
