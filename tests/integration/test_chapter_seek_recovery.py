@@ -19,7 +19,6 @@ from PIL import Image, ImageChops
 
 from media_preview_generator.bif_reader import read_bif_frame
 from media_preview_generator.config import _resolve_ffmpeg_path
-from media_preview_generator.output.journal import write_meta
 from media_preview_generator.output.plex_hash import calculate_plex_hash, get_source_fingerprint
 from media_preview_generator.processing import chapters
 from media_preview_generator.processing.generator import generate_bif
@@ -176,8 +175,11 @@ def test_corrupt_cluster_cannot_return_a_wrong_successful_frame(synthetic_movie,
 
 
 @pytest.mark.parametrize("damage", ["seekhead", "cluster"])
-@pytest.mark.parametrize("bound_to_source", [True, False])
-def test_damaged_index_reuses_only_source_bound_bif(synthetic_movie, tmp_path, monkeypatch, damage, bound_to_source):
+@pytest.mark.parametrize("own_folder", [True, False])
+def test_damaged_index_reuses_only_the_bif_in_its_own_folder(
+    synthetic_movie, tmp_path, monkeypatch, damage, own_folder
+):
+    """Plex names a bundle after the file's content, so only a BIF in this file's own folder describes it (#414)."""
     from media_preview_generator.processing.chapter_recovery import _inspect_index
 
     valid, config = synthetic_movie
@@ -214,13 +216,11 @@ def test_damaged_index_reuses_only_source_bound_bif(synthetic_movie, tmp_path, m
     bif = folder.parent / "Indexes" / "index-sd.bif"
     bif.parent.mkdir(parents=True)
     generate_bif(str(bif), str(frames), config)
-    if bound_to_source:
-        write_meta([bif], str(source), publisher="plex", source_fingerprint=fingerprint)
     target = ChapterTarget(
         1,
         2,
         3,
-        calculate_plex_hash(source),
+        calculate_plex_hash(source) if own_folder else "0" * 40,
         str(source),
         source.stat().st_size,
         100,
@@ -245,7 +245,7 @@ def test_damaged_index_reuses_only_source_bound_bif(synthetic_movie, tmp_path, m
 
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
     assert hashlib.sha256(bif.read_bytes()).hexdigest() == bif_hash
-    if not bound_to_source:
+    if not own_folder:
         assert (result.status, result.completed, result.total, result.retryable) == ("failed", 0, 1, False)
         register.assert_not_called()
         assert not (folder / "chapter1.jpg").exists()
