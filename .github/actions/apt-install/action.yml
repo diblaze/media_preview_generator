@@ -20,13 +20,15 @@ runs:
       run: |
         echo "dir=$RUNNER_TEMP/apt-debs" >> "$GITHUB_OUTPUT"
         echo "pkgs=$(echo "$PACKAGES" | tr -s ' \n' '\n' | sort | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+        # Runner-image variables are process env only; the `env` context doesn't see them.
+        echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
     - id: restore
       uses: actions/cache/restore@v4
       with:
         path: ${{ steps.key.outputs.dir }}
-        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
-        restore-keys: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-
+        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ steps.key.outputs.image }}
+        restore-keys: apt-debs-${{ steps.key.outputs.pkgs }}-
 
     - shell: bash
       env:
@@ -51,4 +53,4 @@ runs:
       continue-on-error: true
       with:
         path: ${{ steps.key.outputs.dir }}
-        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
+        key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ steps.key.outputs.image }}
