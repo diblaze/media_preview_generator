@@ -86,12 +86,28 @@ def test_silent_and_short_streams_preserve_plexs_verified_sentinels(peak):
     assert analyze.valid_measurements(fields)
 
 
+def test_a_near_silent_stream_gets_plexs_infinite_gain_offset():
+    # Deep Impact's mute AC3 track, as the bundled analyser measured it on sflix.
+    report = {
+        **analyze.parse(REPORT),
+        "input_i": "-inf",
+        "input_tp": "-80.16",
+        "input_lra": "0.00",
+        "input_thresh": "-70.00",
+        "target_offset": "8.82",
+    }
+    fields = analyze.ln_fields(report)
+    assert fields["ln:loudness"] == "-inf"
+    assert fields["ln:peak"] == "-80.16"
+    assert fields["ln:gainOffset"] == "inf"
+    assert analyze.valid_measurements(fields)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
         {"input_i": "nan"},
         {"input_tp": "inf"},
-        {"input_i": "-inf"},
         {"target_offset": "inf"},
         {"input_i": "-inf", "target_offset": "inf", "input_lra": "inf"},
     ],

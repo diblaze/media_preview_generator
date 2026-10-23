@@ -220,6 +220,10 @@ def ln_fields(report: dict[str, str]) -> dict[str, str]:
         if math.isnan(value):
             raise LoudnessError(f"loudnorm measured no usable {key}")
         fields[name] = str(report[key])
+    if fields["ln:loudness"] == "-inf":
+        # A near-silent track (a mute commentary, say) has no integrated loudness, but loudnorm still prints a finite
+        # target_offset from its own normalised output. Plex stores +inf beside -inf loudness every time, so do too.
+        fields["ln:gainOffset"] = "inf"
     if not valid_measurements(fields):
         raise LoudnessError("loudnorm reported unsupported loudness measurements")
     return fields
