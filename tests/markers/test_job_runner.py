@@ -139,12 +139,45 @@ class TestBuildItems:
         assert list(seen) == ["plex-1"]
         filters = seen["plex-1"].pop("filters")
         assert filters == ScanFilters(now=filters.now) and not filters.active
-        assert seen["plex-1"] == {"library_ids": ["1", "2"], "cancel_check": cancel, "progress_callback": progress}
+        assert seen["plex-1"] == {
+            "library_ids": ["1", "2"],
+            "sort_by": None,
+            "cancel_check": cancel,
+            "progress_callback": progress,
+        }
         assert (
             enum.call_args.kwargs["cancel_check"] is cancel and enum.call_args.kwargs["progress_callback"] is progress
         )
         assert [i.canonical_path for i in items] == ["/media/plex-1/a.mkv"]
         assert warnings == ["Couldn't list JF-1: TimeoutError: slow"]
+
+    @pytest.mark.parametrize("sort_by", [None, "default", "newest", "oldest", "random"])
+    def test_a_listing_keeps_the_picked_order_else_groups_each_season(self, sort_by):
+        reg = FakeRegistry(
+            {"plex-1": server_config("plex-1", ServerType.PLEX, libraries=[Library("1", "TV", ("/m",))])}
+        )
+        a1, a2, b1, b2 = "/m/A/S01/e1.mkv", "/m/A/S01/e2.mkv", "/m/B/S01/e1.mkv", "/m/B/S01/e2.mkv"
+        listed = [a1, b2, a2, b1, a1]
+        seen = {}
+
+        def fake_enumerate(candidates, *, enumerate_one, cancel_check=None, label, progress_callback=None):
+            processor = MagicMock()
+            processor.list_canonical_paths.side_effect = lambda cfg, **kw: (
+                seen.update(kw) or [ProcessableItem(path, cfg.id) for path in listed]
+            )
+            return [(cfg, item) for cfg in candidates for item in enumerate_one(processor, cfg)], []
+
+        shuffled = MagicMock(side_effect=lambda seq: seq.reverse())
+        with (
+            patch("media_preview_generator.jobs.orchestrator._enumerate_items_for_servers", side_effect=fake_enumerate),
+            patch.object(job_runner.random, "Random", return_value=MagicMock(shuffle=shuffled)),
+        ):
+            items, _, _ = job_runner.build_items({"libraries": []}, registry=reg, sort_by=sort_by)
+        paths = [i.canonical_path for i in items]
+        assert seen["sort_by"] == sort_by
+        assert shuffled.called == (sort_by == "random")
+        expected = {"random": [a1, b1, a2, b2], "newest": [a1, b2, a2, b1], "oldest": [a1, b2, a2, b1]}
+        assert paths == expected.get(sort_by, [a1, a2, b1, b2])
 
     def test_library_enumeration_honours_the_jobs_scan_filters_but_explicit_paths_ignore_them(self):
         reg = FakeRegistry(

@@ -841,6 +841,7 @@ def _run_loudness_pass(job_id: str) -> bool | None:
                         enabled=lambda server: server.type is ServerType.PLEX and load_server_loudness(server).enabled,
                         libraries=loudness_libraries,
                         label=LABEL,
+                        sort_by=cfg.get("sort_by"),
                     )
                     if not cancel_check():
                         completion_ledger.save_selection(items, warnings, sender_paths)
@@ -1142,6 +1143,7 @@ def create_loudness_job(
     parent_schedule_id: str = "",
     scan_filters: dict | None = None,
     webhook_files: bool = False,
+    sort_by: str | None = None,
 ):
     """Create and start a loudness job.
 
@@ -1163,6 +1165,8 @@ def create_loudness_job(
             other keys are ignored. Not used with ``file_paths``.
         webhook_files: A webhook's job: files later webhooks from the same sender report join it until it runs
             (``markers.triggers``).
+        sort_by: Processing Order for a library listing: ``newest``, ``oldest`` or ``random``; None keeps the
+            season-folder order. Not used with ``file_paths``.
 
     Returns:
         The created job.
@@ -1177,6 +1181,8 @@ def create_loudness_job(
     }
     if server_id:
         config["server_id"] = server_id
+    if sort_by:
+        config["sort_by"] = sort_by
     if retry_attempt:
         config["retry_attempt"] = int(retry_attempt)
     if webhook_files:

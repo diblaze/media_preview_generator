@@ -3802,18 +3802,20 @@ function _jobDefaultPriority() {
     return _jobKindIsPreviews() ? '2' : '3';
 }
 
-// Processing mode and order belong to Previews alone (Intro & Credits has a "re-check" switch instead). Scan filters
-// apply to every type. A schedule on Recently added has no filters or order: it only looks at the newest files.
+// Processing mode belongs to Previews alone (Intro & Credits has a "re-check" switch instead). Order is for Previews,
+// and for loudness in Start new job; Intro & Credits keeps a season together. Scan filters apply to every type. A
+// schedule on Recently added has no filters or order: it only looks at the newest files.
 function _showJobKindControls(prefix = 'job') {
     const markers = _jobKindIsMarkers(prefix);
     const previews = _jobKindIsPreviews(prefix);
+    const loudnessOrder = prefix === 'job' && _jobKindIsLoudness(prefix);
     const recentlyAdded = !!document.getElementById(`${prefix}FilesRecent`)?.checked;
     const toggle = function (id, hidden) {
         const el = document.getElementById(id);
         if (el) el.hidden = hidden;
     };
     toggle(`${prefix}ProcessingModeGroup`, !previews);
-    toggle(`${prefix}SortByGroup`, !previews || recentlyAdded);
+    toggle(`${prefix}SortByGroup`, !(previews || loudnessOrder) || recentlyAdded);
     toggle(`${prefix}MarkersForceGroup`, !markers);
     toggle(`${prefix}ScanFiltersGroup`, recentlyAdded);
     _updateJobScopeBadge(prefix);
@@ -3947,6 +3949,8 @@ function _buildLoudnessJob() {
         priority: parseInt(document.getElementById('jobPriority').value, 10) || 3,
         library_name: `Plex loudness: ${label}`,
     };
+    const sortBy = document.getElementById('jobSortBy')?.value;
+    if (sortBy && sortBy !== 'default') payload.sort_by = sortBy;
     if (Object.keys(scanFilters).length) payload.scan_filters = scanFilters;
     return { url: '/api/loudness/jobs', payload, message: 'Plex loudness job has been started', name: 'Plex loudness' };
 }

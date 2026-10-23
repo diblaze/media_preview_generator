@@ -382,6 +382,23 @@ def test_create_stores_a_retrys_due_time_and_pin(monkeypatch):
     assert config["server_id"] == "plex1" and config["retry_attempt"] == 2 and config["retry_not_before"]
 
 
+def test_a_jobs_processing_order_reaches_its_file_listing(run, monkeypatch):
+    run["jm"].get_job.return_value.config = {"source": "manual", "libraries": [], "sort_by": "random"}
+    seen = {}
+    monkeypatch.setattr(job, "build_items", lambda cfg, **kw: seen.update(kw) or ([], [], {}))
+    job.run_loudness_job("j1")
+    assert seen["sort_by"] == "random"
+
+
+@pytest.mark.parametrize(("sort_by", "stored"), [("random", "random"), ("newest", "newest"), (None, None)])
+def test_create_stores_the_processing_order_only_when_one_is_picked(monkeypatch, sort_by, stored):
+    jm = MagicMock()
+    monkeypatch.setattr(job, "get_job_manager", lambda: jm)
+    monkeypatch.setattr(job, "start_loudness_job_async", lambda job_id: None)
+    job.create_loudness_job(library_name="TV", priority=3, source="manual", sort_by=sort_by)
+    assert jm.create_job.call_args.kwargs["config"].get("sort_by") == stored
+
+
 def test_create_stores_scan_filters_and_the_schedule_that_made_it(monkeypatch):
     jm = MagicMock()
     monkeypatch.setattr(job, "get_job_manager", lambda: jm)

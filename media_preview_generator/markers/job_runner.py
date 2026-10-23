@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import random
 import threading
 import time
 from collections import Counter
@@ -598,6 +599,7 @@ def build_items(
     enabled: Callable[[ServerConfig], bool] = lambda cfg: load_server(cfg.markers, cfg.type.value).enabled,
     libraries: Callable[[ServerConfig], list] = marker_libraries,
     label: str = "Intro & Credits",
+    sort_by: str | None = None,
 ) -> tuple[list[ProcessableItem], list[str], dict[str, str]]:
     """Files for a job: explicit paths (webhook, manual, Inspector) or library enumeration.
 
@@ -609,10 +611,13 @@ def build_items(
         enabled: Whether the feature is on for a server (default: Intro & Credits' ``markers.enabled``).
         libraries: The libraries the feature goes to on a server.
         label: The feature's name, for warnings and the enumeration banner.
+        sort_by: Start new job's Processing Order: ``newest``/``oldest`` (date added, within each library) or
+            ``random``; anything else keeps the season-folder order.
 
     Returns:
-        Items sorted by season folder then path (a season's episodes run together), warnings for the job, and for
-        explicit paths the path each item was given as (a sender's view, before path mapping); empty for a listing.
+        Items in ``sort_by`` order, else sorted by season folder then path (a season's episodes run together), warnings
+        for the job, and for explicit paths the path each item was given as (a sender's view, before path mapping);
+        empty for a listing.
     """
     from ..jobs import orchestrator
     from ..plex_client import _expand_directory_to_media_files
@@ -692,6 +697,7 @@ def build_items(
             enumerate_one=lambda processor, cfg: processor.list_canonical_paths(
                 cfg,
                 library_ids=library_ids[cfg.id],
+                sort_by=sort_by,
                 filters=filters,
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
@@ -702,8 +708,13 @@ def build_items(
         )
         items = [item for _cfg, item in pairs]
         warnings.extend(f"Couldn't list {name}: {err}" for name, err in errors)
+    if sort_by == "random":
+        # One show's episodes usually sit on one disk; mixed up, parallel workers read from several disks at once.
+        random.Random().shuffle(items)
+    elif sort_by not in ("newest", "oldest"):
+        items.sort(key=lambda i: (os.path.dirname(i.canonical_path), i.canonical_path))
     unique: dict[str, ProcessableItem] = {}
-    for item in sorted(items, key=lambda i: (os.path.dirname(i.canonical_path), i.canonical_path)):
+    for item in items:
         unique.setdefault(item.canonical_path, item)
     return list(unique.values()), warnings, sender_paths
 

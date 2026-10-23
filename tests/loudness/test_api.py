@@ -195,8 +195,23 @@ def test_job_route_starts_a_library_job(client, created):
             "libraries": [{"server_id": "plex-1", "library_id": "4"}],
             "file_paths": [],
             "scan_filters": {},
+            "sort_by": None,
         }
     ]
+
+
+@pytest.mark.parametrize(("sent", "passed"), [("random", "random"), ("oldest", "oldest"), ("default", None)])
+def test_job_route_passes_the_processing_order(client, created, sent, passed):
+    body = {"libraries": [{"server_id": "plex-1", "library_id": "4"}], "sort_by": sent}
+    resp = client.post("/api/loudness/jobs", json=body, headers=api_headers())
+    assert resp.status_code == 201, resp.get_json()
+    assert created[0]["sort_by"] == passed
+
+
+def test_job_route_rejects_an_unknown_processing_order(client, created):
+    body = {"libraries": [{"server_id": "plex-1", "library_id": "4"}], "sort_by": "shuffle"}
+    resp = client.post("/api/loudness/jobs", json=body, headers=api_headers())
+    assert resp.status_code == 400 and created == []
 
 
 def test_job_route_refuses_libraries_and_files_together(client, created):

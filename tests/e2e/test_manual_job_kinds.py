@@ -150,7 +150,7 @@ def test_clear_all_clears_chips_and_pasted_paths(creation_page: tuple[Page, list
     assert writes == []
 
 
-def test_start_dialog_keeps_the_filters_for_every_kind_and_hides_the_preview_only_order(
+def test_start_dialog_keeps_the_filters_for_every_kind_and_the_order_for_previews_and_loudness(
     creation_page: tuple[Page, list[dict]],
 ) -> None:
     page, writes = creation_page
@@ -162,11 +162,14 @@ def test_start_dialog_keeps_the_filters_for_every_kind_and_hides_the_preview_onl
     page.locator("#jobScanFiltersGroup summary").click()
     expect(page.locator("#jobAddedFilter")).to_be_visible()
     page.locator("#jobSortBy").select_option("random")
-    for radio in ("jobKindMarkers", "jobKindLoudness"):
+    for radio, order in (("jobKindMarkers", "hidden"), ("jobKindLoudness", "visible")):
         pick_job_kind(page, radio)
         expect(page.locator("#jobScanFiltersGroup")).to_be_visible()
         expect(page.locator("#jobScanFilters")).to_be_visible()
-        expect(page.locator("#jobSortByGroup")).to_be_hidden()
+        if order == "visible":
+            expect(page.locator("#jobSortByGroup")).to_be_visible()
+        else:
+            expect(page.locator("#jobSortByGroup")).to_be_hidden()
     pick_job_kind(page, "jobKindPreviews")
     expect(page.locator("#jobSortByGroup")).to_be_visible()
     expect(page.locator("#jobSortBy")).to_have_value("random")

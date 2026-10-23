@@ -84,11 +84,11 @@ def test_job_combines_shared_tv_and_movie_filters(filter_page: Page) -> None:
 
 @pytest.mark.e2e
 @pytest.mark.parametrize(
-    ("kind_id", "endpoint"),
-    [("jobKindMarkers", "/api/markers/jobs"), ("jobKindLoudness", "/api/loudness/jobs")],
+    ("kind_id", "endpoint", "sort_by"),
+    [("jobKindMarkers", "/api/markers/jobs", None), ("jobKindLoudness", "/api/loudness/jobs", "random")],
 )
 def test_intro_credits_and_loudness_jobs_keep_the_filters_and_post_them_as_scan_filters(
-    filter_page: Page, kind_id: str, endpoint: str
+    filter_page: Page, kind_id: str, endpoint: str, sort_by: str | None
 ) -> None:
     page = filter_page
     page.locator("#jobAddedFilter").select_option("last_days")
@@ -96,14 +96,17 @@ def test_intro_credits_and_loudness_jobs_keep_the_filters_and_post_them_as_scan_
     page.locator("#jobSortBy").select_option("random")
     pick_job_kind(page, kind_id)
     expect(page.locator("#jobScanFilters")).to_be_visible()
-    expect(page.locator("#jobSortByGroup")).to_be_hidden()
+    if sort_by:
+        expect(page.locator("#jobSortByGroup")).to_be_visible()
+    else:
+        expect(page.locator("#jobSortByGroup")).to_be_hidden()
     page.route(f"**{endpoint}", lambda route: _fulfill_json(route, {"id": "other", "job_id": "other"}))
     with page.expect_request(lambda request: request.url.endswith(endpoint) and request.method == "POST") as sent:
         page.locator("#newJobModal .modal-footer .btn-primary").click()
     body = sent.value.post_data_json
     assert body["scan_filters"] == {"added_filter": "last_days", "added_last_days": 7}
     assert "config" not in body
-    assert "sort_by" not in body
+    assert body.get("sort_by") == sort_by
 
 
 @pytest.mark.e2e

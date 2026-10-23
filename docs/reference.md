@@ -295,7 +295,9 @@ selected. **Clear** restores unrestricted selection.
 These options apply only to whole-library jobs. **Process a file or folder** file/folder
 jobs, webhooks and **Recently Added** schedules keep their own selection rules. `POST /api/markers/jobs` and
 `POST /api/loudness/jobs` take the same keys in an optional `scan_filters` object. Relative windows on scheduled
-runs are recalculated for each execution; a saved date range stays fixed. `sort_by` applies to Previews only.
+runs are recalculated for each execution; a saved date range stays fixed. `sort_by` applies to Previews, and to
+loudness jobs started from **Start new job** (`POST /api/loudness/jobs` takes it too); Intro & Credits keeps each
+season together.
 
 ### Frame Reuse Cache (frame_reuse)
 
@@ -978,7 +980,7 @@ the webhook delay, as soon as a loudness worker is free. File outcomes:
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/loudness/jobs` | Start a job. Body: `libraries` or `file_paths` (inside `MEDIA_ROOT`), `priority` (1-3 or high/normal/low, default low), `library_name`, `scan_filters` (the [media filters](#per-job-media-filters)). `201` with the job. |
+| `POST` | `/api/loudness/jobs` | Start a job. Body: `libraries` or `file_paths` (inside `MEDIA_ROOT`), `priority` (1-3 or high/normal/low, default low), `library_name`, `scan_filters` (the [media filters](#per-job-media-filters)), `sort_by` (`default`, `newest`, `oldest` or `random`). `201` with the job. |
 
 ## Path Mappings
 

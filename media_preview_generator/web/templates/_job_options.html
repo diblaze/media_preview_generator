@@ -22,6 +22,6 @@
         <option value="oldest">Oldest added first</option>
         <option value="random">Random</option>
     </select>
-    <div class="ov-hint">Which preview files are processed first.</div>
+    <div class="ov-hint">{% if prefix == 'job' %}Which preview and loudness files are processed first. Intro &amp; Credits keeps each season together.{% else %}Which preview files are processed first.{% endif %}</div>
 </div>
 <div id="{{ prefix }}ScanFiltersGroup">{% with filter_prefix=prefix %}{% include '_scan_filters.html' %}{% endwith %}</div>

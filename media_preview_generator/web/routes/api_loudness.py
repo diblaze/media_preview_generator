@@ -8,6 +8,8 @@ from ..auth import api_token_required
 from . import api
 from .api_markers import job_title, parse_job_request, parse_scan_filters
 
+SORT_ORDERS = ("default", "newest", "oldest", "random")
+
 
 @api.route("/loudness/jobs", methods=["POST"])
 @api_token_required
@@ -16,7 +18,8 @@ def create_loudness_job_route():
 
     Body: ``libraries`` (``[{"server_id", "library_id"}]``) or ``file_paths`` (files or folders inside ``MEDIA_ROOT``)
     (neither means every library loudness goes to); ``priority`` (1-3 or high/normal/low, default low);
-    ``library_name`` (job title); ``scan_filters`` (added date, seasons, release year: which library files to list).
+    ``library_name`` (job title); ``scan_filters`` (added date, seasons, release year: which library files to list);
+    ``sort_by`` (``default``, ``newest``, ``oldest`` or ``random``: the order library files are checked in).
 
     Returns:
         201 with the job, 400 for an invalid body, 503 when the config directory isn't writable.
@@ -30,6 +33,9 @@ def create_loudness_job_route():
     scan_filters, bad_filters = parse_scan_filters(data)
     if bad_filters is not None:
         return bad_filters
+    sort_by = data.get("sort_by") or "default"
+    if sort_by not in SORT_ORDERS:
+        return jsonify({"error": f"sort_by must be one of {', '.join(SORT_ORDERS)}"}), 400
     job = create_loudness_job(
         library_name=job_title("Plex loudness", library_name, libraries, resolved_paths),
         priority=priority,
@@ -37,5 +43,6 @@ def create_loudness_job_route():
         libraries=libraries,
         file_paths=resolved_paths,
         scan_filters=scan_filters,
+        sort_by=None if sort_by == "default" else sort_by,
     )
     return jsonify(job.to_dict()), 201

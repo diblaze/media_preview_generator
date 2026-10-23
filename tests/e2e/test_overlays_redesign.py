@@ -215,10 +215,24 @@ class TestStartNewJob:
         page.locator("#jobKindLoudness").check()
         page.locator("#jobKindPreviews").uncheck()
         expect(page.locator("#jobProcessingModeGroup")).to_be_hidden()
-        expect(page.locator("#jobSortByGroup")).to_be_hidden()
+        expect(page.locator("#jobSortByGroup")).to_be_visible()
         expect(page.locator("#jobScanFiltersGroup")).to_be_visible()
         expect(page.locator("#jobPriority")).to_have_value("3")
         expect(page.locator("#jobStartLabel")).to_have_text("Start loudness job")
+        page.locator("#jobKindMarkers").check()
+        page.locator("#jobKindLoudness").uncheck()
+        expect(page.locator("#jobSortByGroup")).to_be_hidden()
+
+    def test_a_loudness_job_posts_the_picked_processing_order(self, overlay_page) -> None:
+        page, writes = overlay_page
+        _open_start(page)
+        page.locator("#jobKindLoudness").check()
+        page.locator("#jobKindPreviews").uncheck()
+        page.locator("#jobSortBy").select_option("random")
+        page.locator("#jobStartButton").click()
+        expect(page.locator("#newJobModal")).to_be_hidden()
+        (body,) = [w["body"] for w in writes if w["url"] == "loudness/jobs"]
+        assert body["sort_by"] == "random"
 
 
 class TestManualTrigger:

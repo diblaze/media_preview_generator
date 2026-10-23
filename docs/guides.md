@@ -145,7 +145,8 @@ The same filters are available for Intro & Credits and Plex loudness jobs, and o
 scheduled **Whole library** runs. A "last 30 days" schedule moves its window forward
 on every run; a date range stays fixed. Webhooks, **Recently Added** schedules, and
 **Process a file or folder** selections continue to use their own selection rules.
-Processing order applies to Previews only.
+Processing order applies to Previews, and to Plex loudness jobs from **Start new job**. Intro & Credits
+always checks a season's episodes together.
 
 ### Letting new imports jump the queue
 
