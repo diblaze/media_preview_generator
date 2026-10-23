@@ -111,6 +111,8 @@ jobs:
     # (~15% spread) that a time-based split isn't worth the extra complexity.
     name: unit (${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
+    # A shard takes ~5 min; without a limit a hung step sits for GitHub's 6 h default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -149,9 +151,11 @@ jobs:
         # ``sudo ldconfig`` step). Plain apt-get always runs the trigger
         # pass; the ~25 s we lose vs the cache is worth a deterministic
         # build. apt-get's own download cache is on the runner anyway.
+        # It normally takes ~15 s; one runner once hung here for 14+ min, so fail fast and re-run.
+        timeout-minutes: 5
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg mediainfo
+          sudo apt-get update -qq -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 ffmpeg mediainfo
 
       - name: Install dependencies
         run: pip install -e ".[test]"
@@ -420,10 +424,11 @@ jobs:
       - name: Install FFmpeg + mediainfo
         # Plain apt-get, as in the unit job: the cache action's restore leaves
         # /usr/bin/ffmpeg without libblas.so.3, and the integration fixtures
-        # call /usr/bin/ffmpeg directly.
+        # call /usr/bin/ffmpeg directly. Time limit and retries as in the unit job.
+        timeout-minutes: 5
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg mediainfo
+          sudo apt-get update -qq -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 ffmpeg mediainfo
           /usr/bin/ffmpeg -version | head -1
           mediainfo --Version | head -1
 
