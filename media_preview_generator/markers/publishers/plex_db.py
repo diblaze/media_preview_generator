@@ -1115,7 +1115,7 @@ def _borrowed_markers(
     An item keeping the type itself (``kept``), or with a row of its own (Plex's), is left alone; rows we left are included so the next run rewrites
     nothing, follows a changed Plex marker, and removes the copy once the item's Plex marker is gone.
     """
-    borrowed = []
+    borrowed: list[Marker] = []
     for mtype in {m.type for m in plex_markers} - kept:
         current = [(s, e) for s, e, _final in _rows_served_with_final(rows, mtype)]
         if not current or current == _served_of(prior, mtype):
@@ -1884,7 +1884,7 @@ class LocalPlexDb(PlexDatabase):
         for item, plan in zip(items, plans, strict=True):
             for mtype in plan.kept_types - have:
                 source.setdefault(mtype, item[0])
-        out = []
+        out: list[Marker] = []
         for mtype, key in source.items():
             rows = self._item_rows(conn, key, tag_id)
             out.extend(
