@@ -258,7 +258,13 @@ class TestLoudness:
 
     @pytest.mark.parametrize(
         "cls",
-        [analyze.LoudnessTimeout, analyze.LoudnessNoDecoder, analyze.LoudnessFormatChanged, analyze.LoudnessError],
+        [
+            analyze.LoudnessTimeout,
+            analyze.LoudnessNoDecoder,
+            analyze.LoudnessFormatChanged,
+            analyze.LoudnessTooManyDropped,
+            analyze.LoudnessError,
+        ],
     )
     def test_a_raised_error_comes_back_as_the_same_class(self, media, monkeypatch, cls):
         _node()

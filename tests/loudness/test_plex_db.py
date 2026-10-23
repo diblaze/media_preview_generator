@@ -476,3 +476,37 @@ def test_cancellation_after_transaction_admission_prevents_mutation(db, tmp_path
     assert _item_extra(db) is None
     assert _extra(db, 11) == (BEFORE if operation == "stream" else PLEX_ANALYSED)
     assert (log.read_text() if log.exists() else "") == before_log
+
+
+SILENT = {**FIELDS, "ln:loudness": "-inf", "ln:gainOffset": "inf"}
+
+
+@pytest.mark.parametrize(
+    "stored, replace_silent, replaced",
+    [
+        (SILENT, True, True),  # a stream measured again over its whole length
+        (SILENT, False, False),  # an ordinary write never touches stored loudness
+        (FIELDS, True, False),  # only -inf is replaced, never a real measurement
+    ],
+)
+def test_stored_loudness_is_replaced_only_when_it_is_silent_and_asked_to(db, stored, replace_silent, replaced):
+    assert plex_db.write_stream(db, 11, stored, deadline=1e12) is True
+    measured = {**FIELDS, "ln:loudness": "-21.75"}
+
+    assert plex_db.write_stream(db, 11, measured, deadline=1e12, replace_silent=replace_silent) is replaced
+
+    now = plex_db.decode_extra_data(_extra(db, 11))[0]
+    assert now["ln:loudness"] == ("-21.75" if replaced else stored["ln:loudness"])
+    assert now["ma:audioChannelLayout"] == "stereo"  # the row's other fields are kept either way
+
+
+def test_a_plex_database_node_is_never_asked_to_replace_stored_loudness():
+    node = MagicMock()
+    with pytest.raises(PublishError, match="can't replace stored loudness"):
+        plex_db.write_stream(node, 11, FIELDS, deadline=1e12, replace_silent=True)
+    node.write_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("fields, silent", [(SILENT, True), (FIELDS, False), ({}, False)])
+def test_silent_loudness_is_told_from_a_measurement_and_from_none(fields, silent):
+    assert plex_db.has_silent_loudness(encode_extra_data(fields)) is silent

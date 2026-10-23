@@ -89,14 +89,40 @@ def test_a_format_change_is_measured_again_dropping_the_changed_frames(monkeypat
     assert "-reinit_filter" not in second
 
 
-@pytest.mark.parametrize(
-    "dropped", [f"\nTotal changed input frames dropped : {analyze.MAX_DROPPED_FRAMES + 1}\n".encode(), b""]
-)
-def test_a_format_change_that_drops_many_frames_is_refused(monkeypatch, dropped):
+def test_a_format_change_that_drops_many_frames_is_refused_for_good(monkeypatch):
+    dropped = f"\nTotal changed input frames dropped : {analyze.MAX_DROPPED_FRAMES + 1}\n".encode()
     popen = MagicMock(side_effect=[_proc(234, _FORMAT_CHANGED), _proc(0, REPORT.encode() + dropped)])
     monkeypatch.setattr(analyze.subprocess, "Popen", popen)
-    with pytest.raises(analyze.LoudnessError, match="not stored"):
+    with pytest.raises(analyze.LoudnessTooManyDropped, match="would drop 11 frames; not stored") as raised:
         analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
+    assert isinstance(raised.value, analyze.LoudnessCantMeasure)  # the job remembers it
+
+
+def test_a_retry_that_doesnt_say_how_many_frames_it_dropped_is_tried_again_next_time(monkeypatch):
+    popen = MagicMock(side_effect=[_proc(234, _FORMAT_CHANGED), _proc(0, REPORT.encode())])
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessError, match="didn't say how many frames") as raised:
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
+    assert not isinstance(raised.value, analyze.LoudnessCantMeasure)
+
+
+def test_a_retry_that_fails_is_an_ordinary_failure(monkeypatch):
+    popen = MagicMock(
+        side_effect=[_proc(234, _FORMAT_CHANGED), _proc(1, b"Invalid data found when processing input\n")]
+    )
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessError, match="ffmpeg exited 1") as raised:
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000)
+    assert type(raised.value) is analyze.LoudnessError
+    assert popen.call_count == 2
+
+
+def test_a_job_cancelled_during_the_first_pass_isnt_measured_again(monkeypatch):
+    popen = MagicMock(side_effect=[_proc(234, _FORMAT_CHANGED), _proc(0, REPORT.encode())])
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessCancelled):
+        analyze.run("ffmpeg", "/m/a.mkv", 1, duration_ms=1000, cancel_check=lambda: popen.call_count >= 1)
+    assert popen.call_count == 1
 
 
 def test_report_maps_to_plexs_fields_verbatim():

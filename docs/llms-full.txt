@@ -1594,11 +1594,6 @@ For every audio track that Plex has no loudness for yet, the app uses the loudno
 ffmpeg -reinit_filter 0 -i FILE -map 0:TRACK -af loudnorm=I=-16:TP=-1:LRA=9:print_format=json -f null -
 ```
 
-`-reinit_filter 0` keeps one filter graph for the whole track. Without it, a change mid-track (even just AC3 downmix
-metadata) restarts loudnorm, and its last report covers only the tail. If the track's audio format really changes, the
-track is measured again with `-drop_changed 1`. The result is stored only when FFmpeg dropped at most 10 frames of the
-new format.
-
 and stores loudnorm's measurements in the track's `extra_data`, under the names Plex uses: `ln:loudness`, `ln:peak`,
 `ln:lra`, `ln:threshold`, `ln:gainOffset` and `ln:loudnessAnalysisVersion`. The values are the ones loudnorm prints,
 as Plex stores them, and the rest of the track's data is kept. Decoding audio gains nothing from a GPU, so the
@@ -1606,6 +1601,12 @@ analysis runs only in CPU worker groups. Its FFmpeg runs at the "Loudness analys
 the CPU is busy, preview and Intro & Credits FFmpeg get most of it. The entire audio track is measured; the source media is never rewritten.
 Silent tracks and audio too short for an integrated measurement use Plex's observed `-inf` loudness and `inf` gain
 values, with the remaining fields validated. Invalid or incomplete reports are not stored.
+
+`-reinit_filter 0` keeps one filter graph for the whole track. Without it, a change mid-track (even just AC3 downmix
+metadata) restarts loudnorm, and its last report covers only the tail. If the track's audio format really changes, the
+track is measured again with `-drop_changed 1`, and the result is stored only when FFmpeg dropped at most 10 frames of
+the new format. Older releases stored `-inf` for some of these tracks, so a track holding `-inf` is measured once more
+when the app reaches its Plex database directly (not through a Plex database node).
 
 Once every original indexed audio track of a movie or episode (across its live versions) has loudness, the app also marks the item itself, as
 Plex does: `ln:loudnessAnalysisVersion` in the item's `extra_data` (`metadata_items`). Plex checks that mark, not the
@@ -1619,7 +1620,8 @@ different decoder builds, so measurements need not be identical for every codec 
 Tracks Plex (or an earlier job) already analysed are skipped: a file whose tracks and item are all done never reaches
 a worker, and one whose tracks are done but whose item isn't marked yet is only marked.
 The same file listed twice in Plex is analysed once and written to both.
-Tracks FFmpeg can't decode (for example AV3A "Audio Vivid") are skipped, remembered, and don't count as to do in Library Health.
+Tracks FFmpeg can't decode (for example AV3A "Audio Vivid"), and tracks whose audio format changes for too long to
+measure, are skipped, remembered, and don't count as to do in Library Health.
 Existing partial or unrecognised loudness metadata is also preserved. Such a track reports a failure with advice to
 run Plex's native analysis, instead of overwriting data the app cannot verify.
 

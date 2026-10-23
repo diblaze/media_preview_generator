@@ -62,7 +62,7 @@ from ..web.jobs import JobLogSink, JobStatus, get_job_manager
 from ..web.routes._helpers import _ensure_gpu_cache
 from ..web.routes.job_runner import _build_selected_gpus, _inflight_jobs, _inflight_lock
 from ..web.settings_manager import get_settings_manager
-from . import analyze, chain, undecodable
+from . import analyze, chain, silent, undecodable
 from .deleted_sources import confirmed_deleted_paths
 from .guard import GuardedLoudnessDb, RemoteLoudnessDb, create_loudness_db
 from .inputs import load_file_input
@@ -72,6 +72,7 @@ from .plex_db import (
     NotAnalysedError,
     SourceChangedError,
     SourceFingerprint,
+    has_silent_loudness,
     mark_item,
     needs_analysis,
     read_item_snapshot,
@@ -144,6 +145,9 @@ class LoudnessContext:
     # What this ffmpeg can't decode, read from loudness.db on first use and kept current as this job records more.
     _undecodable: frozenset[tuple[str, int, str]] | None = None
     _undecodable_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Streams already measured silent over their whole length (``silent``), read and kept current the same way.
+    _silent: frozenset[tuple[str, int, str]] | None = None
+    _silent_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def undecodable_keys(self) -> frozenset[tuple[str, int, str]]:
         """The ``(part hash, stream index, codec)`` keys this job's ffmpeg can't decode, read once per job."""
@@ -165,6 +169,22 @@ class LoudnessContext:
                 return frozenset()  # unreadable: not remembered, so the next file reads it again
             self._undecodable = read
         return self._undecodable
+
+    def silent_keys(self) -> frozenset[tuple[str, int, str]]:
+        """The ``(part hash, stream index, codec)`` keys already measured silent over their whole length."""
+        with self._silent_lock:
+            if self._silent is None:
+                read = silent.read_keys()
+                if read is None:
+                    return frozenset()  # unreadable: the next file reads it again
+                self._silent = read
+            return self._silent
+
+    def note_silent(self, streams: list[AudioStream]) -> None:
+        """Add streams this job just recorded as silent."""
+        with self._silent_lock:
+            if self._silent is not None:
+                self._silent = self._silent | {(s.part_hash, s.index, s.codec) for s in streams if s.part_hash}
 
     def request_plex_scan(self, cfg: ServerConfig, path: str) -> None:
         """Ask Plex to scan the file's folder, once per folder in the job, so a file it hasn't added yet turns up before
@@ -282,7 +302,8 @@ def _lookup(
     *,
     trust_server_hash: bool = False,
 ) -> tuple[dict | None, list[AudioStream], list[AudioStream]]:
-    """The file's audio streams in the server's Plex and those without loudness yet; or, instead, the server's row when
+    """The file's audio streams in the server's Plex and those to measure (without loudness yet, or stored as ``-inf``
+    and not measured again since, ``_remeasure_silent``); or, instead, the server's row when
     there's nothing to analyse there (not in Plex yet, no audio track, the database unreadable just then).
 
     ``source`` is the file's identity the caller already read; the one re-stat at the end proves it didn't change.
@@ -306,7 +327,11 @@ def _lookup(
             ):
                 raise SourceChangedError("Plex's indexed source differs from the file; retry after its scan")
         skipped = ctx.undecodable_keys()
-        needed = [s for s in streams if needs_analysis(s) and not undecodable.is_skipped(s, skipped)]
+        needed = [
+            s
+            for s in streams
+            if not undecodable.is_skipped(s, skipped) and (needs_analysis(s) or _remeasure_silent(ctx, db, s))
+        ]
         if (
             streams
             and not needed
@@ -335,24 +360,37 @@ def _lookup(
     return None, streams, needed
 
 
+def _remeasure_silent(ctx: LoudnessContext, db: LocalPlexDb | RemoteLoudnessDb, stream: AudioStream) -> bool:
+    """Whether a stream stored as ``-inf`` gets measured again: once per file, on a local Plex database only, since a
+    Plex database node can't replace stored loudness. Older releases stored ``-inf`` for audio that changed near its
+    end (``silent``)."""
+    return (
+        not isinstance(db, RemoteLoudnessDb)
+        and has_silent_loudness(stream.extra_data)
+        and (stream.part_hash, stream.index, stream.codec) not in ctx.silent_keys()
+    )
+
+
 def _skip_undecodable(
-    path: str, index: int, same: list[AudioStream], exc: analyze.LoudnessNoDecoder, ffmpeg: str
+    path: str, index: int, same: list[AudioStream], exc: analyze.LoudnessCantMeasure, ffmpeg: str
 ) -> tuple[bool, str]:
-    """Remember a stream this ffmpeg can't decode so it isn't tried again.
+    """Remember a stream this ffmpeg can't measure so it isn't tried again until the file or the ffmpeg changes.
 
     Returns:
         Whether every row of the stream was remembered, and the text for the outcome row.
     """
     codec = same[0].codec
+    if isinstance(exc, analyze.LoudnessNoDecoder):
+        why, what = "FFmpeg can't decode it", f"ffmpeg can't decode audio track {index} ({codec})"
+    else:
+        why, what = "its audio format changes mid-track", f"audio track {index} ({codec}) changes format mid-track"
     identity = undecodable.ffmpeg_identity(ffmpeg)
     remembered = all(undecodable.record(s.part_hash, s.index, s.codec, str(exc), identity) for s in same)
     if not remembered:
-        return False, f"stream {index} ({codec}): ffmpeg can't decode it and that couldn't be remembered: {exc}"
-    write_line(f"{display_name(path)}: ffmpeg can't decode audio track {index} ({codec}); loudness skips it")
-    logger.bind(**{JOB_LOG_SKIP: True}).info(
-        "{}: ffmpeg can't decode audio track {} ({}); loudness skips it", os.path.basename(path), index, codec
-    )
-    return True, f"stream {index} ({codec}) skipped: FFmpeg can't decode it"
+        return False, f"stream {index} ({codec}): {why} and that couldn't be remembered: {exc}"
+    write_line(f"{display_name(path)}: {what}; loudness skips it")
+    logger.bind(**{JOB_LOG_SKIP: True}).info("{}: {}; loudness skips it", os.path.basename(path), what)
+    return True, f"stream {index} ({codec}) skipped: {why}"
 
 
 def _not_on_disk(path: str, ctx: LoudnessContext) -> ItemOutcome:
@@ -502,6 +540,12 @@ def process_item(
             rows.append(_row(cfg, WAITING if exc.state is Capability.UNREACHABLE else FAILED, str(exc)))
             continue
         ordered = sorted(todo.items())
+        for index, same in ordered:
+            if has_silent_loudness(same[0].extra_data):
+                write_line(
+                    f"{display_name(path)}: audio track {index} ({same[0].codec}) was stored as silent; "
+                    "measuring it again over the whole track"
+                )
         durations_s = [(same[0].duration_ms or 0) / 1000 for _index, same in ordered]
         stop_analysis = False
         for start in range(0, len(ordered), MAX_AUDIO_BATCH):
@@ -589,7 +633,12 @@ def process_item(
                                 expected=stream,
                                 source=source,
                                 cancel_check=cancel_check,
+                                replace_silent=has_silent_loudness(stream.extra_data),
                             )
+                    if fields["ln:loudness"] == "-inf" and all(
+                        silent.record(s.part_hash, s.index, s.codec) for s in same
+                    ):
+                        ctx.note_silent(same)
                     if progress_callback and (not batch_fields or offset == len(group) - 1):
                         try:
                             progress_callback(n / len(todo) * 100, durations_s[n - 1], durations_s[n - 1], None, 0.0)
@@ -599,7 +648,7 @@ def process_item(
                     waiting.append(f"stream {index} ({same[0].codec}): {exc}")
                     stop_analysis = True
                     break
-                except analyze.LoudnessNoDecoder as exc:
+                except analyze.LoudnessCantMeasure as exc:
                     remembered, text = _skip_undecodable(path, index, same, exc, ctx.ffmpeg)
                     if remembered:
                         ctx.note_undecodable(same)

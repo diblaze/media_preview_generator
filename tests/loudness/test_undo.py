@@ -307,3 +307,12 @@ def test_the_documented_command_uses_the_interpreter_the_images_ship():
     commands = [line for line in page.splitlines() if "media_preview_generator.loudness.undo" in line]
     assert commands and all("python3 -m" in line for line in commands), commands
     assert "python3 -m media_preview_generator.loudness.undo" in (undo_module.__doc__ or "")
+
+
+def test_a_silent_stream_measured_again_is_undone_back_to_before_the_first_write(db, tmp_path):  # noqa: F811
+    plex_db.write_stream(db, 11, {**FIELDS, "ln:loudness": "-inf", "ln:gainOffset": "inf"}, deadline=1e12)
+    plex_db.write_stream(db, 11, FIELDS, deadline=1e12, replace_silent=True)
+    assert _extra(db._path(), 11) == PLEX_ANALYSED
+
+    assert undo(["--db", db._path(), "--log", str(tmp_path / "loudness-writes.jsonl")]) == 0
+    assert _extra(db._path(), 11) == BEFORE

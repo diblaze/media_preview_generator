@@ -60,8 +60,9 @@ _NO_DECODER_HINTS = ("no decoder found for", "not found for input stream")
 # Under -reinit_filter 0, ffmpeg's wording when the decoded audio format changes mid-stream.
 _FORMAT_CHANGED_HINT = "Changing audio frame properties on the fly is not supported"
 _DROPPED_FRAMES = re.compile(r"Total changed input frames dropped : (\d+)")
-# Counted in frames (about 32 ms each for AC3 and DTS, whose last frame is where a stray format change was seen). One
-# stray frame is harmless, but -drop_changed drops frames without a warning, so past a handful the track is unmeasured.
+# Counted in frames: about 32 ms each for AC3 and EAC3, about 11 ms for DTS, whose last frame is where a stray format
+# change was seen. One stray frame is harmless, but -drop_changed drops frames without a warning, so past a handful the
+# track is unmeasured.
 MAX_DROPPED_FRAMES = 10
 
 
@@ -69,12 +70,20 @@ class LoudnessError(Exception):
     """ffmpeg failed, timed out, was cancelled, or printed no loudnorm report."""
 
 
-class LoudnessNoDecoder(LoudnessError):
+class LoudnessCantMeasure(LoudnessError):
+    """This ffmpeg can never measure the stream whole; the job remembers it until the file or the ffmpeg changes."""
+
+
+class LoudnessNoDecoder(LoudnessCantMeasure):
     """ffmpeg has no decoder for the audio stream; no FFmpeg build this app ships can measure it."""
 
 
 class LoudnessFormatChanged(LoudnessError):
     """The audio format changed mid-stream, which one filter graph can't measure."""
+
+
+class LoudnessTooManyDropped(LoudnessCantMeasure):
+    """The audio format changes for more than ``MAX_DROPPED_FRAMES`` frames, too many to measure the track without."""
 
 
 class LoudnessCancelled(LoudnessError):
@@ -431,7 +440,8 @@ def run(
         LoudnessCancelled: The job was cancelled.
         LoudnessTimeout: ffmpeg exceeded its time limit.
         LoudnessNoDecoder: ffmpeg has no decoder for the stream.
-        LoudnessError: ffmpeg failed, printed no usable report, or dropped too many frames of a changed format.
+        LoudnessTooManyDropped: the audio format changes for too many frames to measure the track without them.
+        LoudnessError: ffmpeg failed, printed no usable report, or didn't say how many frames it dropped.
     """
 
     def measure(drop_changed: bool) -> str:
@@ -449,13 +459,23 @@ def run(
     try:
         text = measure(drop_changed=False)
     except LoudnessFormatChanged:
+        logger.info(
+            "Loudness of {} stream {}: the audio format changes mid-stream; measuring it again without the changed "
+            "frames",
+            os.path.basename(path),
+            index,
+        )
         text = measure(drop_changed=True)
         found = _DROPPED_FRAMES.search(text)
-        dropped = int(found[1]) if found else None
-        if dropped is None or dropped > MAX_DROPPED_FRAMES:
+        if found is None:
+            # Retried next time: an ffmpeg that words its count differently mustn't get every such track remembered.
             raise LoudnessError(
-                "the audio format changed mid-stream and ffmpeg dropped "
-                f"{'an unknown number of' if dropped is None else dropped} frames; not stored"
+                "the audio format changed mid-stream and ffmpeg didn't say how many frames it dropped; not stored"
+            ) from None
+        dropped = int(found[1])
+        if dropped > MAX_DROPPED_FRAMES:
+            raise LoudnessTooManyDropped(
+                f"the audio format changes mid-stream and measuring it would drop {dropped} frames; not stored"
             ) from None
         logger.info(
             "Loudness of {} stream {}: dropped {} frame(s) of a changed audio format",

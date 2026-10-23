@@ -282,6 +282,11 @@ def needs_analysis(stream: AudioStream) -> bool:
     return not has_analysis(stream.extra_data)
 
 
+def has_silent_loudness(extra_data: str | None) -> bool:
+    """Whether a stream's stored loudness is ``-inf``: silent, or measured from only its tail by an older release."""
+    return decode_extra_data(extra_data)[0].get("ln:loudness") == "-inf"
+
+
 def _optimized_copy(file: str, proxy_type: object) -> bool:
     # As the markers publisher tells them (``_is_optimized_copy``): a proxy_type and a "Plex Versions" folder.
     return bool(proxy_type) and "Plex Versions" in str(file).replace("\\", "/").split("/")
@@ -382,8 +387,10 @@ def write_stream(
     expected: AudioStream | None = None,
     source: SourceFingerprint | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    replace_silent: bool = False,
 ) -> bool:
-    """Add ``fields`` to one stream's extra_data, keeping its other fields, unless it already has loudness.
+    """Add ``fields`` to one stream's extra_data, keeping its other fields, unless it already has loudness (other than
+    ``-inf`` with ``replace_silent``).
 
     Args:
         db: The server's Plex database (through its Plex database node, the same function runs there).
@@ -393,6 +400,8 @@ def write_stream(
         expected: Indexed stream captured before analysis; checked under the write lock.
         source: Local file fingerprint captured before analysis.
         cancel_check: Checked again inside the transaction before changing the row.
+        replace_silent: Also replace loudness the row holds when it is ``-inf`` (``has_silent_loudness``): a stream
+            measured again over its whole length. Only a local database does this.
 
     Returns:
         True when written; False when the stream already had loudness (Plex, or another job, got there first).
@@ -404,6 +413,8 @@ def write_stream(
     if set(fields) != MEASUREMENT_FIELDS | {VERSION_FIELD} or not has_analysis(encode_extra_data(fields)):
         raise PublishError("Refusing an incomplete loudness measurement")
     if not isinstance(db, LocalPlexDb):
+        if replace_silent:
+            raise PublishError("A Plex database node can't replace stored loudness")
         return db.write_stream(
             stream_id, fields, deadline=deadline, expected=expected, source=source, cancel_check=cancel_check
         )
@@ -426,7 +437,7 @@ def write_stream(
                     raise PublishError(f"Plex's audio stream {stream_id} is gone")
                 before = row[0]
                 existing, url_form = decode_extra_data(before)
-                if has_analysis(before):
+                if has_analysis(before) and not (replace_silent and has_silent_loudness(before)):
                     conn.execute("ROLLBACK")
                     return False
                 if cancel_check and cancel_check():
