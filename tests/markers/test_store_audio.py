@@ -225,6 +225,16 @@ class TestEndPictures:
         assert store.get_end_picture(EndPictureKey(a.id, b.id, 0, 30_000, 500), 1) is None
         assert store.get_end_picture(EndPictureKey(b.id, a.id, 0, 30_000, 500), 1) is None
 
+    def test_the_fingerprint_sweep_keeps_a_file_moved_since_it_was_listed(self, store):
+        # Its row went with it (``missing.adopt_moved``) while the sweep checked the old path.
+        a, b = _file(store, "/m/a.mkv"), _file(store, "/m/b.mkv")
+        _fp(store, a), _fp(store, b)
+        _share(store, a, b, 1.0)
+        (check_a, _check_b) = store.fingerprint_checks(10)
+        store.move_file(a.id, "/m/a.mkv", "/n/a.mkv")
+        assert store.finish_fingerprint_checks(check_a.file_id, [check_a]) == 0
+        assert store.get_end_picture(EndPictureKey(a.id, b.id, 0, 30_000, 500), 1) == CachedShare(1.0)
+
     def test_a_replaced_fingerprint_keeps_the_shares(self, store):
         # A share compares pictures at given times; a fingerprint made another way changes neither.
         a, b = _file(store, "/m/a.mkv"), _file(store, "/m/b.mkv")

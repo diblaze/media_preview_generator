@@ -90,7 +90,7 @@ from .job_log import (
 )
 from .locks import FILE_RUN_LOCKS
 from .locks import KeyedLocks as _KeyedLocks
-from .missing import gone_now, mark_if_missing
+from .missing import adopt_moved, gone_now, mark_if_missing
 from .models import (
     SERVER_SOURCES,
     STALE_SERVER_MARKERS_DETAIL,
@@ -3028,7 +3028,7 @@ def _attempt(
         return ItemOutcome(FileOutcome.FILE_NOT_FOUND.value, "File not found on disk")
 
     refresh_probe = _refreshing(ctx, path, Source.CHAPTERS)
-    existing = ctx.store.get_file(path)
+    existing = ctx.store.get_file(path) or adopt_moved(ctx.store, path, st.st_size, st.st_mtime_ns)
     if existing is not None and existing.missing_since is not None:
         ctx.store.clear_missing(existing.id)  # on disk again, even if this run stops before storing it
     unchanged = existing is not None and (existing.size, existing.mtime_ns) == (st.st_size, st.st_mtime_ns)

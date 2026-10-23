@@ -91,6 +91,7 @@ _SCHEMA = (
         updated_at TEXT NOT NULL,
         missing_since TEXT)""",
     "CREATE INDEX IF NOT EXISTS idx_files_season ON files(season_key)",
+    "CREATE INDEX IF NOT EXISTS idx_files_identity ON files(size, mtime_ns)",
     """CREATE TABLE IF NOT EXISTS fingerprints (
         file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
         window TEXT NOT NULL,
@@ -1081,8 +1082,9 @@ class MarkerStore:
         }
 
     def moved_here(self, rec: FileRecord) -> bool:
-        """Whether a file's identity (size and mtime) is another path's row too: it was moved here from there (a
-        rename keeps both), so it didn't replace this path's earlier file."""
+        """Whether a file's identity (size and mtime) is another path's row too: it was moved here from there (a move
+        keeps both rows when its row couldn't go with it, ``missing.adopt_moved``), so it didn't replace this path's
+        earlier file."""
         with self._reading() as conn:
             return (
                 conn.execute(
@@ -1091,6 +1093,54 @@ class MarkerStore:
                 ).fetchone()
                 is not None
             )
+
+    def same_identity(self, size: int, mtime_ns: int, *, other_than: str) -> list[FileRecord]:
+        """The rows of other paths with this size and mtime: where a file first seen at ``other_than`` may have been
+        moved from.
+
+        Args:
+            size: The file's size.
+            mtime_ns: Its modified time.
+            other_than: Its path, left out.
+
+        Returns:
+            Their records, the one looked at last first.
+        """
+        with self._reading() as conn:
+            rows = conn.execute(
+                "SELECT * FROM files WHERE size=? AND mtime_ns=? AND canonical_path != ? "
+                "ORDER BY updated_at DESC, id DESC",
+                (size, mtime_ns, other_than),
+            ).fetchall()
+        return [self._file(r) for r in rows]
+
+    def move_file(self, file_id: int, old_path: str, new_path: str) -> FileRecord | None:
+        """Give a moved file's row its new path, keeping everything stored for it (and its failures kept by path). It is
+        on disk there, so a missing mark comes off, and an episode's season is its new folder.
+
+        Args:
+            file_id: The row.
+            old_path: The path it is stored under.
+            new_path: Where the file is now.
+
+        Returns:
+            The moved record; None when the row isn't at ``old_path`` any more or ``new_path`` already has a row.
+        """
+        with self._tx() as conn:
+            if conn.execute("SELECT 1 FROM files WHERE canonical_path=?", (new_path,)).fetchone():
+                return None
+            if not conn.execute(
+                "UPDATE files SET canonical_path=?, missing_since=NULL, "
+                "season_key=CASE WHEN season_key IS NULL THEN NULL ELSE ? END WHERE id=? AND canonical_path=?",
+                (new_path, os.path.dirname(new_path), file_id, old_path),
+            ).rowcount:
+                return None
+            for table in _IDENTITY_FAILURE_TABLES:
+                conn.execute(
+                    f"UPDATE OR IGNORE {table} SET canonical_path=? WHERE canonical_path=?", (new_path, old_path)
+                )
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        return self._file(row)
 
     def replaced_in_place(self, file_id: int) -> list[PreviousDecision]:
         """What a file's earlier identities at its path last decided, per type (the carry-over).
@@ -1439,8 +1489,9 @@ class MarkerStore:
         """Record a file another file's season step probed, with its chapters and frame rate, in one transaction.
 
         A file the store never saw is added. A known file is refreshed only while its row still has the identity that
-        was probed: the season step never changes another file's identity, which only that file's own run (holding its
-        path lock) may do.
+        was probed: the season step never changes another file's identity (size and mtime), which only that file's own
+        run (holding its path lock) may do. It may give a moved sibling its old row first (``missing.adopt_moved``),
+        which keeps the identity.
 
         Args:
             identity: The identity the file had when it was probed.
@@ -2081,8 +2132,9 @@ class MarkerStore:
 
         A gone file's fingerprints, the matcher runs cached with them, its end-picture shares and failures, and its
         unreadable-member entries go. Its ``files`` row stays, with the decisions, locked markers and publish records tied to it. A file
-        whose row has another identity than when it was listed is left alone: a new file came to that path, and its own
-        run may already have fingerprinted it.
+        whose row has another identity or path than when it was listed is left alone: a new file came to that path, and its
+        own run may already have fingerprinted it, or the file was moved and its row went with it
+        (``missing.adopt_moved``).
 
         Args:
             checked_up_to: The id of the last file checked (``fingerprint_checks`` order); the next sweep starts after it.
@@ -2099,8 +2151,8 @@ class MarkerStore:
             )
             for check in gone:
                 unchanged = conn.execute(
-                    "SELECT 1 FROM files WHERE id=? AND size=? AND mtime_ns=?",
-                    (check.file_id, check.size, check.mtime_ns),
+                    "SELECT 1 FROM files WHERE id=? AND size=? AND mtime_ns=? AND canonical_path=?",
+                    (check.file_id, check.size, check.mtime_ns, check.canonical_path),
                 ).fetchone()
                 if unchanged is None:
                     continue

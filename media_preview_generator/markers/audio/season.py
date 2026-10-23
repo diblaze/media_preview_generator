@@ -37,7 +37,7 @@ from ...shutdown import is_shutting_down
 from ..decide import intro_chapter_length_ms, intro_chapter_limit_ms
 from ..external_ids import FolderNames, ids_from_path, is_extra, same_show_names, season_folder_number
 from ..freeze import Freeze
-from ..missing import library_folders
+from ..missing import adopt_moved, library_folders
 from ..models import Candidate, FileIdentity, MarkerType, Source
 from ..probe import MediaProbe, ProbeError, ProbeStalledError, probe_media
 from ..progress import StepProgress, WorkerProgress
@@ -891,7 +891,8 @@ def _member_record(ctx: PipelineContext, path: str, *, with_frame_rate: bool = T
     (its own run reads it again), or can't be probed. A file that couldn't be probed isn't probed again for a day while
     its identity stays the same, except by a forced re-detect; one stored before frame rates were read, with current
     chapters, stays in meanwhile at an unknown speed. The season step holds only its own file's path lock, so the store
-    refuses to change another file's identity (``record_member``).
+    refuses to change another file's identity (``record_member``); a sibling moved from another path gets its old row
+    back first, which keeps its identity (``missing.adopt_moved``).
 
     Raises:
         ProbeStalledError: Earlier ffprobes are still stuck on their files, so this one wasn't read (and nothing is
@@ -899,6 +900,8 @@ def _member_record(ctx: PipelineContext, path: str, *, with_frame_rate: bool = T
     """
     identity = _disk_identity(path)
     rec = ctx.store.get_file(path)
+    if rec is None and identity is not None:
+        rec = adopt_moved(ctx.store, path, *identity)
     if identity is None or (rec is not None and identity != (rec.size, rec.mtime_ns)):
         return None
     read = (

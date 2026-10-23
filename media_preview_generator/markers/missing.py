@@ -200,6 +200,53 @@ def gone_now(rec: FileRecord, configs: Sequence[ServerConfig]) -> bool | None:
     return answer[0] if answer else None
 
 
+def adopt_moved(store: MarkerStore, path: str, size: int, mtime_ns: int) -> FileRecord | None:
+    """Give a file first seen at ``path`` the row it had where it was moved from, so nothing found for it is looked for
+    again: of the other rows with its size and mtime whose paths hold nothing now, the one looked at last (a file moved
+    again before this was kept has a row at each earlier path). Never raises.
+
+    Unlike marking a file missing, an empty or unmounted folder at the old path doesn't hold this back: the file at
+    ``path`` has the same size and modified time, to the nanosecond, so what was found for it holds there. A copy that
+    turns up at the old path again is run as a new file.
+
+    The old path's run lock is only tried, so two runs can't wait on each other; a row stored at ``path`` meanwhile
+    leaves the old one where it is (``MarkerStore.move_file``).
+
+    Args:
+        store: The markers store.
+        path: Where the file is now, with no row of its own.
+        size: Its size.
+        mtime_ns: Its modified time.
+
+    Returns:
+        The moved record, or the row another run stored at ``path`` meanwhile; None when no row matches, each one's
+        path still holds a file, or the disk didn't answer in ``CHECK_TIMEOUT_S`` (a stalled share).
+    """
+    try:
+        old = None
+        candidates = store.same_identity(size, mtime_ns, other_than=path)
+        if candidates:
+            found: list[FileRecord | None] = []
+            _within(
+                lambda _stop: found.append(next((rec for rec in candidates if not _on_disk(rec.canonical_path)), None)),
+                CHECK_TIMEOUT_S,
+            )
+            old = found[0] if found else None
+        if old is not None:
+            with FILE_RUN_LOCKS.try_hold(old.canonical_path, 0) as held:
+                moved = store.move_file(old.id, old.canonical_path, path) if held else None
+            if moved is not None:
+                logger.info(
+                    "{} was moved from {}; Intro & Credits keeps what it found for it", path, old.canonical_path
+                )
+                return moved
+        # Another run (a sibling's season step) may have given it its row meanwhile.
+        return store.get_file(path)
+    except Exception as exc:
+        logger.warning("Couldn't look for where {} was moved from in markers.db: {}", path, exc)
+        return None
+
+
 def mark_missing_files(store: MarkerStore, paths: Iterable[str], configs: Sequence[ServerConfig]) -> int:
     """Mark the files among ``paths`` that are missing from disk, checking for at most ``LIST_BUDGET_S``, and log how
     many. A file a job is running is skipped. Never raises.
