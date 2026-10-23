@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -42,6 +44,8 @@ def test_command_many_uses_absolute_indices_and_only_disables_eac3_drc():
         "-filter_threads",
         "1",
         "-drc_scale:3",
+        "0",
+        "-reinit_filter",
         "0",
         "-i",
         "/m/movie.mkv",
@@ -162,3 +166,14 @@ def test_run_many_returns_fields_for_valid_streams_and_an_error_for_a_missing_on
     assert results[1] == analyze.ln_fields(_REPORT)
     assert isinstance(results[3], analyze.LoudnessError)
     assert "omitted" in str(results[3])
+
+
+def test_a_batch_format_change_raises_for_the_per_stream_retry(monkeypatch):
+    proc = MagicMock(returncode=234)
+    proc.stdout = io.BytesIO(b"")
+    proc.stderr = io.BytesIO(b"Changing audio frame properties on the fly is not supported.\n")
+    popen = MagicMock(return_value=proc)
+    monkeypatch.setattr(analyze.subprocess, "Popen", popen)
+    with pytest.raises(analyze.LoudnessFormatChanged):
+        analyze.run_many("ffmpeg", "/m/movie.mkv", [(1, "aac", 1000), (3, "ac3", 1000)])
+    assert popen.call_count == 1

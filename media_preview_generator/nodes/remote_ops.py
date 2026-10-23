@@ -206,6 +206,7 @@ def _loudness_errors() -> dict[str, Rebuild]:
         for cls in (
             analyze.LoudnessError,
             analyze.LoudnessNoDecoder,
+            analyze.LoudnessFormatChanged,
             analyze.LoudnessCancelled,
             analyze.LoudnessTimeout,
         )

@@ -1591,8 +1591,13 @@ For every audio track that Plex has no loudness for yet, the app uses the loudno
 1.43.4:
 
 ```
-ffmpeg -i FILE -map 0:TRACK -af loudnorm=I=-16:TP=-1:LRA=9:print_format=json -f null -
+ffmpeg -reinit_filter 0 -i FILE -map 0:TRACK -af loudnorm=I=-16:TP=-1:LRA=9:print_format=json -f null -
 ```
+
+`-reinit_filter 0` keeps one filter graph for the whole track. Without it, a change mid-track (even just AC3 downmix
+metadata) restarts loudnorm, and its last report covers only the tail. If the track's audio format really changes, the
+track is measured again with `-drop_changed 1`. The result is stored only when FFmpeg dropped at most 10 frames of the
+new format.
 
 and stores loudnorm's measurements in the track's `extra_data`, under the names Plex uses: `ln:loudness`, `ln:peak`,
 `ln:lra`, `ln:threshold`, `ln:gainOffset` and `ln:loudnessAnalysisVersion`. The values are the ones loudnorm prints,

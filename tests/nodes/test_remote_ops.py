@@ -256,7 +256,10 @@ class TestLoudness:
         assert results[1] == {"ln:lra": "5.00"}
         assert type(results[4]) is analyze.LoudnessNoDecoder and str(results[4]) == "no decoder for 4"
 
-    @pytest.mark.parametrize("cls", [analyze.LoudnessTimeout, analyze.LoudnessNoDecoder, analyze.LoudnessError])
+    @pytest.mark.parametrize(
+        "cls",
+        [analyze.LoudnessTimeout, analyze.LoudnessNoDecoder, analyze.LoudnessFormatChanged, analyze.LoudnessError],
+    )
     def test_a_raised_error_comes_back_as_the_same_class(self, media, monkeypatch, cls):
         _node()
 
