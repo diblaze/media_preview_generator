@@ -322,7 +322,7 @@ class TestAGpuThatCantStartTheDecode:
 
         assert_handed_to_cpu(outcome)
         assert outcome.result.kind == "hwaccel"
-        assert _warned(outcome, "retrying it on the CPU", "check the GPU driver"), outcome.warnings
+        assert _warned(outcome, "another GPU or the CPU takes it", "check the GPU driver"), outcome.warnings
 
 
 # A real NVIDIA GPU (Quadro P5000) on an H.264 High 10 file: NVDEC has no decoder for that profile, the driver is fine.

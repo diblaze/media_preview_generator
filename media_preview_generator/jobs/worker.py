@@ -20,6 +20,8 @@ from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX, CREDITS
 from ..nodes.executor import FileNotVisibleError, NodeRequeue, NodeUnavailableError, Placement, placed_on, requeue_for
 from ..processing.generator import (
     FALLBACK_CODEC,
+    FALLBACK_IO_ERROR,
+    FALLBACK_STALL,
     GPU_LACKS_FORMAT,
     CancellationError,
     CodecNotSupportedError,
@@ -251,6 +253,15 @@ class Worker:
         # Set when the last task gave its file back without an outcome (its node dropped, or can't see the file);
         # the dispatcher queues it again or fails it, and the worker's counters say nothing about it.
         self.last_task_requeue: NodeRequeue | None = None
+        # Set when the last task's GPU couldn't run its file and another GPU can (the GPU's error): the dispatcher
+        # queues it again for a worker on another GPU, and the worker's counters say nothing about it.
+        self.last_task_handed_off: CodecNotSupportedError | None = None
+        # The GPUs (``group_resource`` -> name) that couldn't run the current file before, this GPU's own error when it
+        # was one of them, and the pool's check for a worker on any other GPU that runs the file's kind; all set per
+        # task by the dispatcher.
+        self.gpus_refused: dict[str, str] = {}
+        self.gpu_error: CodecNotSupportedError | None = None
+        self.other_gpu_runs: Callable[[Collection[str]], bool] | None = None
         # When the last task's thread was seen finished (time.monotonic()); 0: never.
         self.task_ended_at = 0.0
 
@@ -436,6 +447,9 @@ class Worker:
         process_fn: Callable[..., ItemOutcome] | None = None,
         outcome_keys: tuple[str, ...] | None = None,
         pickup_fn: Callable[[Any, str], None] | None = None,
+        gpus_refused: dict[str, str] | None = None,
+        gpu_error: CodecNotSupportedError | None = None,
+        other_gpu_runs: Callable[[Collection[str]], bool] | None = None,
     ) -> None:
         """Assign a :class:`ProcessableItem` to this worker.
 
@@ -462,6 +476,13 @@ class Worker:
             outcome_keys: Valid outcome keys for ``process_fn``'s kind.
             pickup_fn: ``process_fn``'s kind's own "picked up" line
                 (``KindHandlers.pickup_fn``); None logs the generic one.
+            gpus_refused: The GPUs (``group_resource`` -> name) that couldn't
+                run this file before.
+            gpu_error: This GPU's error when it couldn't run this file before:
+                the file goes straight to the CPU rerun (or another GPU).
+            other_gpu_runs: Whether a worker on a GPU outside the given
+                ``group_resource`` set runs this file's kind; None never hands
+                the file to another GPU.
         """
         # Pre-claimed workers (is_busy=True but no current_task yet) are
         # acceptable — _find_available_worker(claim=True) atomically reserves
@@ -481,6 +502,10 @@ class Worker:
         self.current_phase = ""
         self.chapter_progress = None
         self.last_task_requeue = None
+        self.last_task_handed_off = None
+        self.gpus_refused = dict(gpus_refused or {})
+        self.gpu_error = gpu_error
+        self.other_gpu_runs = other_gpu_runs
 
         self.is_busy = True
         self.current_task = item.canonical_path
@@ -549,8 +574,10 @@ class Worker:
         Dispatches into ``process_canonical_path`` (the per-vendor publisher
         funnel) and translates its :class:`MultiServerResult` into the
         :class:`ProcessingResult` counters the WorkerPool accounting consumes.
-        Handles in-place GPU→CPU fallback on :class:`CodecNotSupportedError`.
-        A task assigned with ``process_fn`` (a non-preview kind) runs
+        Handles GPU→CPU fallback on :class:`CodecNotSupportedError`: the file
+        goes to another GPU first when one can take it
+        (:meth:`_hand_off_to_another_gpu`), else this worker reruns it on its
+        CPU in place. A task assigned with ``process_fn`` (a non-preview kind) runs
         :meth:`_process_custom_item` instead.
         """
         if self.process_fn is not None:
@@ -743,6 +770,7 @@ class Worker:
             cancelled = False
             gpu_decoded = False
             try:
+                self._skip_gpu_that_failed_it()
                 ms_result = _run_once(self.gpu, self.gpu_device)
                 gpu_decoded = self.gpu is not None and _extracted_frames(ms_result)
                 _capture_publishers(ms_result)
@@ -761,11 +789,11 @@ class Worker:
                 _persist(ProcessingResult.FAILED, "cancelled by user")
             except CodecNotSupportedError as e:
                 if self.worker_type == "GPU":
-                    # In-place GPU→CPU fallback: the GPU path couldn't
-                    # finish this item (unsupported codec on HW decoder,
-                    # HW-accel runtime failure, signal-killed FFmpeg);
-                    # retry on CPU using this same worker and surface
-                    # the reason to the UI + logs.
+                    # The GPU path couldn't finish this item (unsupported
+                    # codec on HW decoder, HW-accel runtime failure,
+                    # signal-killed FFmpeg): it goes to another GPU, or
+                    # this worker reruns it on its CPU and surfaces the
+                    # reason to the UI + logs.
                     reason = str(e) or "GPU processing failed"
                     if self.cancel_check and self.cancel_check():
                         ctx_logger.info("{} cancelled before CPU fallback for {}", self.display_name, display_name)
@@ -773,17 +801,18 @@ class Worker:
                         self.outcome_counts["failed"] += 1
                         self.failed += 1
                         _persist(ProcessingResult.FAILED, "cancelled before CPU fallback")
-                    else:
+                    elif not self._hand_off_to_another_gpu(e, reason, display_name):
                         self.fallback_active = True
                         self.decoding_on_cpu = True
                         self.fallback_reason = reason
                         self._blame_gpu_for(reason)
                         ctx_logger.warning(
-                            "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}. {}",
+                            "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}. {}{}",
                             self.display_name,
                             display_name,
                             reason,
                             gpu_fallback_advice(getattr(e, "kind", FALLBACK_CODEC)),
+                            self._no_other_gpu_note(),
                         )
                         try:
                             ms_result = _run_once(None, None)
@@ -850,7 +879,8 @@ class Worker:
                 # Counters are final by here; the dispatcher reads them once this thread has exited.
                 if self._done_event is not None:
                     self._done_event.set()
-                # A file given back says nothing about the GPU, as a cancelled one doesn't.
+                # A file a node gave back says nothing about the GPU, as a cancelled one doesn't. One handed to another
+                # GPU counts against this GPU like a CPU fallback (``_hand_off_to_another_gpu`` blamed it).
                 self._record_gpu_file(
                     gpu_decoded=gpu_decoded, cancelled=cancelled or self.last_task_requeue is not None
                 )
@@ -864,6 +894,60 @@ class Worker:
         """
         self.last_task_requeue = requeue_for(exc)
         logger.warning("{} hands {} back to the queue: {}", self.display_name, display_name, exc)
+
+    @property
+    def gpu_label(self) -> str:
+        """This worker's GPU as people know it ("Quadro M1200"), with its node's name in front on a node."""
+        label = friendly_device_label({"name": self.gpu_name or ""}, self.gpu_device, self.gpu)
+        return f"{self.node_name} {label}" if self.node_id is not None else label
+
+    def _hand_off_to_another_gpu(self, exc: CodecNotSupportedError, reason: str, display_name: str) -> bool:
+        """Give the file back for a worker on another GPU, when this GPU couldn't run it and another runs its kind.
+
+        A disk that stalled or failed a read isn't the GPU's doing, so another GPU wouldn't help: the CPU rerun takes
+        it as before. Once every GPU that runs the kind has failed the file, the last one reruns it on its CPU.
+
+        Args:
+            exc: Why the GPU run stopped.
+            reason: The reason as the job log shows it.
+            display_name: The file, for the job log.
+
+        Returns:
+            True when the file was given back; the caller then records no outcome for it.
+        """
+        if self.other_gpu_runs is None or getattr(exc, "kind", FALLBACK_CODEC) in (FALLBACK_IO_ERROR, FALLBACK_STALL):
+            return False
+        if not self.other_gpu_runs({*self.gpus_refused, self.group_resource}):
+            return False
+        self._blame_gpu_for(reason)
+        # A fresh error without the traceback: the file can wait a long time, and the stack's frames would wait with it.
+        self.last_task_handed_off = CodecNotSupportedError(str(exc), kind=getattr(exc, "kind", FALLBACK_CODEC))
+        logger.warning(
+            "{} couldn't process {} on the GPU and hands it to another GPU. Reason: {}",
+            self.display_name,
+            display_name,
+            reason,
+        )
+        return True
+
+    def _skip_gpu_that_failed_it(self) -> None:
+        """Raise this GPU's earlier error again when it already couldn't run the file, rather than run it again.
+
+        The file came back here because the GPU it waited for went away (removed, outside its hours, or on a node that
+        can't take it); the error's handling then sends it to another GPU or to this worker's CPU.
+
+        Raises:
+            CodecNotSupportedError: This GPU couldn't run the file before.
+        """
+        if self.gpu_error is not None:
+            raise CodecNotSupportedError(str(self.gpu_error), kind=getattr(self.gpu_error, "kind", FALLBACK_CODEC))
+
+    def _no_other_gpu_note(self) -> str:
+        """The CPU rerun's note naming the other GPUs that couldn't run the file either, or ``""`` when none tried."""
+        others = [name for resource, name in self.gpus_refused.items() if resource != self.group_resource]
+        if not others:
+            return ""
+        return f" No other GPU left to try ({' and '.join(others)} couldn't either)."
 
     def _blame_gpu_for(self, reason: str) -> None:
         """Count this file's fallback against its GPU, unless the GPU only lacks the video's format or keeps credits
@@ -893,14 +977,16 @@ class Worker:
         if self.worker_type != "GPU" or cancelled:
             return
         self.last_task_cpu_fallback = self.fallback_active
+        if self.gpu_error is not None:
+            return  # the GPU didn't run the file this time; its first try already counted
         fell_back = self.gpu_blame_reason is not None
         if not (fell_back or gpu_decoded):
             return
         device = self.gpu_device or self.gpu or "GPU"
-        label = friendly_device_label({"name": self.gpu_name or ""}, self.gpu_device, self.gpu)
+        label = self.gpu_label
         if self.node_id is not None:
             # Two nodes can have the same device path; each node's GPU keeps its own streak.
-            device, label = f"node:{self.node_id}:{device}", f"{self.node_name} {label}"
+            device = f"node:{self.node_id}:{device}"
         try:
             get_gpu_fallback_tracker().record(
                 device,
@@ -994,23 +1080,34 @@ class Worker:
 
             cancelled = False
             try:
+                self._skip_gpu_that_failed_it()
                 outcome = _run(self.gpu, self.gpu_device)
             except CancellationError:
                 cancelled = True
                 outcome = ItemOutcome("failed", "cancelled by user")
             except CodecNotSupportedError as exc:
                 cancelled = bool(self.cancel_check and self.cancel_check())
+                reason = redact_secrets(str(exc)) or "GPU processing failed"
+                if (
+                    self.worker_type == "GPU"
+                    and not cancelled
+                    and self._hand_off_to_another_gpu(exc, reason, display_name)
+                ):
+                    self._record_gpu_file(gpu_decoded=False, cancelled=False)
+                    return
                 if self.worker_type == "GPU" and not cancelled:
                     self.fallback_active = True
                     self.decoding_on_cpu = True
                     cpu_rerun = True
-                    self.fallback_reason = redact_secrets(str(exc)) or "GPU processing failed"
+                    self.fallback_reason = reason
                     self._blame_gpu_for(self.fallback_reason)
+                    note = self._no_other_gpu_note()
                     logger.warning(
-                        "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}",
+                        "{} couldn't process {} on the GPU and is retrying on CPU. Reason: {}{}",
                         self.display_name,
                         display_name,
                         self.fallback_reason,
+                        f".{note}" if note else "",
                     )
                     try:
                         outcome = _run(None, None)
@@ -1484,6 +1581,35 @@ class WorkerPool:
             return any(
                 not worker._pending_removal
                 and getattr(worker, "node_id", None) not in exclude_nodes
+                and self._worker_supports_kind(worker, kind, budget=False)
+                for worker in self.workers
+            )
+
+    def runs_kind_on_other_gpu(
+        self,
+        kind: str,
+        exclude_gpus: Collection[str],
+        exclude_nodes: Collection[str] = (),
+        frozen_jobs: Collection[str] = (),
+    ) -> bool:
+        """Whether a worker on a GPU outside ``exclude_gpus`` and ``exclude_nodes`` runs ``kind`` now, busy or not.
+
+        Like :meth:`runs_kind_outside`: a member outside its hours has no worker that runs now, so a file waiting for
+        one could wait hours; it goes to the CPU instead. So does one whose only such worker is busy on a frozen job.
+
+        Args:
+            kind: The job kind.
+            exclude_gpus: GPUs (``group_resource``) that couldn't run the file.
+            exclude_nodes: Nodes the file can't go to (``dispatcher._nodes_off``): a GPU there can't take it.
+            frozen_jobs: Jobs whose running files are frozen until their schedule's window opens again.
+        """
+        with self._workers_lock:
+            return any(
+                worker.worker_type == "GPU"
+                and not worker._pending_removal
+                and worker.group_resource not in exclude_gpus
+                and getattr(worker, "node_id", None) not in exclude_nodes
+                and not (worker.is_busy and worker.current_job_id in frozen_jobs)
                 and self._worker_supports_kind(worker, kind, budget=False)
                 for worker in self.workers
             )
@@ -2025,6 +2151,7 @@ class WorkerPool:
         claim: bool = False,
         kind: str = "previews",
         exclude_nodes: Collection[str] = (),
+        exclude_gpus: Collection[str] = (),
     ) -> Optional["Worker"]:
         """Find an available worker.
 
@@ -2040,6 +2167,8 @@ class WorkerPool:
             exclude_nodes: Node ids whose workers are skipped (nodes that couldn't see the item's file). This app's
                 own workers have no node and are never skipped. Workers on a node that just dropped a file
                 (:meth:`mark_node_suspect`) are skipped too.
+            exclude_gpus: GPUs (``group_resource``) that couldn't run the item. When given, only a worker on another
+                GPU is found: the CPU waits until no other GPU runs the kind (:meth:`runs_kind_on_other_gpu`).
 
         Returns:
             An available worker matching criteria, GPU workers before CPU workers, or None
@@ -2052,6 +2181,8 @@ class WorkerPool:
                     continue
                 node_id = getattr(worker, "node_id", None)
                 if node_id is not None and (node_id in exclude_nodes or self._is_suspect(node_id, now)):
+                    continue
+                if exclude_gpus and (worker.worker_type != "GPU" or worker.group_resource in exclude_gpus):
                     continue
                 if worker.is_available() and self._worker_supports_kind(worker, kind):
                     if claim:

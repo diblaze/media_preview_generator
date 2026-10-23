@@ -23,7 +23,7 @@
 - title: One GPU pass per file
   body: >-
     FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and
-    tone-maps HDR. If the GPU can't decode a file, the same worker tries again on the CPU.
+    tone-maps HDR. If the GPU can't decode a file, your other GPUs try it, then the CPU.
   image: tour-extract.webp
   alt: "Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line"
   path: /

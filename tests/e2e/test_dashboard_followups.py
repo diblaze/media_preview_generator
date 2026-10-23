@@ -398,6 +398,14 @@ class TestQueueColumns:
         expect(cell.locator(".queue-phase")).to_have_text("Checking Plex loudness")
         assert "124896" not in cell.inner_text()
 
+    def test_progress_cell_shows_files_waiting_for_another_gpu_beside_the_count(
+        self, authed_page: Page, app_url: str
+    ) -> None:
+        self._open(authed_page, app_url, "1 file waiting for another GPU · 382/124896 completed")
+        cell = authed_page.locator(".job-row .queue-progress-cell")
+        expect(cell.locator(".queue-items")).to_have_text("382 / 124,896")
+        expect(cell.locator(".queue-phase")).to_have_text("1 file waiting for another GPU")
+
     @pytest.mark.parametrize(
         ("message", "expected"),
         [

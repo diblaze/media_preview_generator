@@ -2258,8 +2258,8 @@ def _process_canonical_path_previews(
                     slow_path_callback=_note_slow_path,
                 )
             except CodecNotSupportedError as exc:
-                # Re-raised so callers can fall back to CPU; not a publisher failure. Worded by the real cause: a stall
-                # or an I/O error is the disk's, not a codec the GPU doesn't support.
+                # Re-raised so the worker sends the file to another GPU or the CPU; not a publisher failure. Worded by the
+                # real cause: a stall or an I/O error is the disk's, not a codec the GPU doesn't support.
                 logger.info("{}", gpu_fallback_announcement(getattr(exc, "kind", FALLBACK_CODEC), canonical_path))
                 raise
             except CancellationError:

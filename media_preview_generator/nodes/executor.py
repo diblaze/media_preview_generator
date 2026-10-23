@@ -820,7 +820,8 @@ def run_on_node(
     Raises:
         NodeUnavailableError: The node didn't start the task (``started`` False), stopped answering, or forgot it.
         FileNotVisibleError: The node can't see the file as the app sees it.
-        CodecNotSupportedError: The node's GPU couldn't run the op (the worker reruns it on the node's CPU).
+        CodecNotSupportedError: The node's GPU couldn't run the op (it goes to another GPU, or the worker reruns it on
+            the node's CPU).
         NodeTaskCancelledError: The job was cancelled, or the app is stopping.
         NodeTaskError: The op failed on the node.
         OSError: The app can't stat ``app_path``.

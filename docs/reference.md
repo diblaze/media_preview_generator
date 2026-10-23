@@ -315,7 +315,8 @@ Frames are reused only when they were extracted with the current thumbnail inter
 
 > [!NOTE]
 > When a GPU worker can't process a file (unsupported codec,
-> hardware-accelerator error, driver crash), the same worker retries
+> hardware-accelerator error, driver crash), the file goes to another
+> GPU that hasn't tried it. Once no GPU is left, the last worker retries
 > on CPU in-place and the UI shows a warning badge with the reason.
 > There is no separate fallback pool.
 

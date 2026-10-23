@@ -404,7 +404,17 @@ is needed. If FFmpeg fails on the GPU for any of the common reasons:
 - FFmpeg stopped from outside (out of memory, a stalled or failing read) wherever it was
 - A crash (segfault) before it wrote 95% of the thumbnails (past that, the thumbnails it wrote are published)
 
-…the same worker retries the file on CPU in-place.  The job log records
+…the file goes to another GPU first, when one has workers for that job type
+that haven't tried it. Handy when your GPUs decode different formats, say an
+older NVIDIA card without HEVC next to an Intel iGPU with it. The file waits at
+the front of the queue for that GPU's next free worker, and the job's other
+files keep going meanwhile. The job shows **1 file waiting for another GPU**
+while it waits, or **Waiting for another GPU** if nothing else of the job is
+left. A failed read or a stalled disk isn't the GPU's
+fault, so that file stays on its worker.
+
+Once no other GPU is left to try, the worker holding the file retries it on
+its CPU in-place.  The job log records
 the specific reason ("Dolby Vision Profile 5 rejected by Intel VAAPI",
 "signal kill (signal 11)", etc.) and the dashboard shows a yellow
 "CPU fallback" badge on the affected worker card along with a toast.

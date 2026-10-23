@@ -36,7 +36,7 @@
 - q: Do I need a GPU to use Media Preview Generator?
   a: >-
     No. Without one it runs on CPU workers; set how many in Settings, Workers. With a GPU,
-    decoding moves off the CPU, and a file the GPU can't decode is retried on the CPU by the same worker.
+    decoding moves off the CPU. A file one GPU can't decode goes to your other GPUs first, then the CPU.
 - q: Does it run on Windows or Unraid?
   a: >-
     Yes, in Docker. There is an Unraid Community Applications template. On Windows (Docker Desktop with

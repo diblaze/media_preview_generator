@@ -833,7 +833,8 @@ def create_ffmpeg_runner(
         )
         if gpu_lacks_decoder:
             logger.info(
-                "The GPU can't decode the video of {} (FFmpeg exit code {}); the CPU makes its thumbnails instead.",
+                "The GPU can't decode the video of {} (FFmpeg exit code {}); another GPU or the CPU makes its "
+                "thumbnails instead.",
                 video_file,
                 proc.returncode,
             )

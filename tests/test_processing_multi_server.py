@@ -2722,8 +2722,10 @@ class TestGpuHandOffAnnouncementNamesItsCause:
                 )
         finally:
             logger.remove(sink)
-        (announced,) = [line for line in lines if "retrying on CPU" in line]
+        (announced,) = [line for line in lines if said[0] in line]
         assert all(fragment in announced for fragment in said) and str(media_file) in announced, announced
+        # The worker says where the file goes next: another GPU, or its CPU (#424).
+        assert "CPU" not in announced.replace("the CPU run too", ""), announced
         if not_said:
             assert not_said not in announced
 

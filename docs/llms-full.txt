@@ -26,7 +26,7 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 
 1. **Trigger.** Sonarr, Radarr, Plex (needs Plex Pass), Emby (needs Emby Premiere), Jellyfin or any JSON `{"path": ...}` can post to one webhook URL that detects the sender; Sportarr, Tdarr and FileFlows have their own URLs. Also: Recently Added polling, cron or interval schedules, or a manual pick.
 2. **Resolve.** Each path is mapped to what the container sees, then every configured server whose enabled libraries hold the file is found.
-3. **Extract.** One FFmpeg run per file on a GPU worker: hardware decode, key-frame-only decoding when the file allows it, GPU scaling, HDR-to-SDR tone mapping. If the GPU can't decode the file, the same worker retries on the CPU.
+3. **Extract.** One FFmpeg run per file on a GPU worker: hardware decode, key-frame-only decoding when the file allows it, GPU scaling, HDR-to-SDR tone mapping. If the GPU can't decode the file, your other GPUs try it, then the CPU.
 4. **Publish.** Plex: `index-sd.bif` in Plex's data folder. Emby: `<video>-<width>-<interval>.bif` next to the video. Jellyfin 10.10+: trickplay tiles next to the video, or in Jellyfin's data folder with the companion plugin. Each server is then asked to pick them up.
 5. **Retry and skip.** A server that hasn't indexed a new file yet is retried after 1, 2, 5, 15 and 60 minutes by default. A small companion file records each source's size and date, so later triggers skip current previews and redo replaced files.
 
@@ -59,13 +59,13 @@ Media Preview Generator makes Plex, Emby and Jellyfin preview thumbnails on your
 
 1. **A new file arrives.** Sonarr, Radarr, Tdarr or the media server itself sends a webhook when a file lands, to the URL the Automation page gives it. Scheduled scans and a hand-picked list work too.
 2. **It finds every server with that file.** The path Sonarr reports is mapped to the path the container sees. Then every Plex, Emby and Jellyfin library that holds the file is found.
-3. **One GPU pass per file.** FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and tone-maps HDR. If the GPU can't decode a file, the same worker tries again on the CPU.
+3. **One GPU pass per file.** FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and tone-maps HDR. If the GPU can't decode a file, your other GPUs try it, then the CPU.
 4. **Each server gets its own format.** A BIF in Plex's data folder, a BIF next to the video for Emby, trickplay tiles for Jellyfin. Then each server is told to pick them up.
 5. **It waits for slow servers.** A server that hasn't indexed the new file yet gets another try after 1, 2, 5, 15 and 60 minutes by default. Next time, files whose previews are current are skipped.
 
 ## Features
 
-- **GPU first, CPU when needed.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed in, and a file the GPU can't decode is retried on the CPU by the same worker.
+- **GPU first, CPU when needed.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed in, and a file one GPU can't decode goes to your other GPUs first, then the CPU.
 - **Starts per file.** Sonarr, Radarr, Sportarr, Tdarr, FileFlows, Plex, Emby and Jellyfin webhooks, or any JSON with a path. A new episode gets its previews without waiting for a nightly task.
 - **One decode, every server.** With Plex and Jellyfin on the same library, each file is read once and both servers get their own output.
 - **Skips what's already done.** A small file next to each preview records the source's size and date. A quality upgrade from Radarr is redone; an untouched file is skipped.
@@ -99,7 +99,7 @@ Yes. Add a webhook in Sonarr or Radarr for import and upgrade. The app waits for
 The frames were grabbed without tone mapping, so HDR colours land in an ordinary picture. This app tone-maps HDR10, HLG and HDR10+, and uses the HDR10 layer of Dolby Vision profiles 7 and 8. Profile 5 needs a GPU with a hardware Vulkan driver in the container. [More](https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/)
 
 **Do I need a GPU to use Media Preview Generator?**
-No. Without one it runs on CPU workers; set how many in Settings, Workers. With a GPU, decoding moves off the CPU, and a file the GPU can't decode is retried on the CPU by the same worker.
+No. Without one it runs on CPU workers; set how many in Settings, Workers. With a GPU, decoding moves off the CPU. A file one GPU can't decode goes to your other GPUs first, then the CPU.
 
 **Does it run on Windows or Unraid?**
 Yes, in Docker. There is an Unraid Community Applications template. On Windows (Docker Desktop with WSL2) only NVIDIA GPUs are used; Intel and AMD GPUs there, and everything on macOS, run on the CPU. [More](https://mediapreviewgenerator.dev/getting-started/#windows)
@@ -955,7 +955,7 @@ If that is fast enough, stop here. The built-in needs no extra software.
 
 [Media Preview Generator](https://mediapreviewgenerator.dev/comparison/) is a free, MIT-licensed Docker app. It makes the same BIF files Plex would, using FFmpeg with GPU decoding (NVIDIA, Intel or AMD). It then writes them into Plex's data folder, where Plex serves them to its apps. A full scan can run for hours while new imports, set to **High** priority, jump ahead of it. It differs from the built-in in several ways:
 
-- **It uses the GPU.** Decoding and downscaling happen on the GPU. If a file won't decode there, the same worker redoes it on the CPU ([CPU fallback](https://mediapreviewgenerator.dev/guides/#automatic-gpu--cpu-fallback)).
+- **It uses the GPU.** Decoding and downscaling happen on the GPU. If a file won't decode there, another GPU tries it, then the CPU ([CPU fallback](https://mediapreviewgenerator.dev/guides/#automatic-gpu--cpu-fallback)).
 - **It works on several files at once.** You set up worker groups: a group holds the GPUs and CPU you choose, each with its own worker count and allowed jobs, and the group has its hours.
 - **It works per file, when the file arrives.** Triggers include Sonarr and Radarr webhooks, Plex's own webhook (Plex Pass), a "Recently Added" poll (no Plex Pass), schedules, or a manual pick. See [Previews as soon as Sonarr or Radarr imports a file](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/).
 - **It can use another machine's GPU.** Add that machine as a [worker node](https://mediapreviewgenerator.dev/guides/#remote-nodes), or run the app there with network access to Plex and the Plex data folder mounted read-write.
@@ -1220,7 +1220,7 @@ Emby's built-in video preview thumbnail extraction has no GPU option. Emby staff
 ## How Media Preview Generator makes Emby BIFs
 
 1. A trigger arrives: a webhook, a schedule, a "Recently Added" poll, or a manual pick.
-2. FFmpeg decodes the file on a GPU worker, and downscales and tone-maps HDR there. If the GPU can't decode a file, the same worker redoes it on the CPU.
+2. FFmpeg decodes the file on a GPU worker, and downscales and tone-maps HDR there. If the GPU can't decode a file, your other GPUs try it, then the CPU.
 3. The frames are packed into a BIF named `<video name>-<width>-<interval>.bif` and saved next to the video. Width defaults to 320, and the interval is your frame interval (default 10 seconds).
 4. The app tells Emby the file changed so Emby picks it up.
 
@@ -2063,7 +2063,17 @@ is needed. If FFmpeg fails on the GPU for any of the common reasons:
 - FFmpeg stopped from outside (out of memory, a stalled or failing read) wherever it was
 - A crash (segfault) before it wrote 95% of the thumbnails (past that, the thumbnails it wrote are published)
 
-…the same worker retries the file on CPU in-place.  The job log records
+…the file goes to another GPU first, when one has workers for that job type
+that haven't tried it. Handy when your GPUs decode different formats, say an
+older NVIDIA card without HEVC next to an Intel iGPU with it. The file waits at
+the front of the queue for that GPU's next free worker, and the job's other
+files keep going meanwhile. The job shows **1 file waiting for another GPU**
+while it waits, or **Waiting for another GPU** if nothing else of the job is
+left. A failed read or a stalled disk isn't the GPU's
+fault, so that file stays on its worker.
+
+Once no other GPU is left to try, the worker holding the file retries it on
+its CPU in-place.  The job log records
 the specific reason ("Dolby Vision Profile 5 rejected by Intel VAAPI",
 "signal kill (signal 11)", etc.) and the dashboard shows a yellow
 "CPU fallback" badge on the affected worker card along with a toast.
@@ -4903,7 +4913,8 @@ Frames are reused only when they were extracted with the current thumbnail inter
 
 > [!NOTE]
 > When a GPU worker can't process a file (unsupported codec,
-> hardware-accelerator error, driver crash), the same worker retries
+> hardware-accelerator error, driver crash), the file goes to another
+> GPU that hasn't tried it. Once no GPU is left, the last worker retries
 > on CPU in-place and the UI shows a warning badge with the reason.
 > There is no separate fallback pool.
 

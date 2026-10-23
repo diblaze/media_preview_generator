@@ -563,7 +563,7 @@ except Exception:
 
 
 class CodecNotSupportedError(Exception):
-    """A GPU run couldn't produce the preview; the same worker runs the file again on the CPU.
+    """A GPU run couldn't produce the preview; the file goes to another GPU, or the same worker reruns it on the CPU.
 
     Attributes:
         kind: Why (``FALLBACK_*``): an unsupported codec (the default, and the usual cause), a hardware accelerator
@@ -626,7 +626,7 @@ def folder_write_fix(code: int | None) -> str:
 
 
 def gpu_fallback_announcement(kind: str, video_file: str) -> str:
-    """The INFO line saying a file is retried on the CPU, worded by why its GPU run was handed off.
+    """The INFO line saying a file's GPU run stopped, worded by why; the worker then logs where the file goes next.
 
     Args:
         kind: ``CodecNotSupportedError.kind``.
@@ -637,23 +637,22 @@ def gpu_fallback_announcement(kind: str, video_file: str) -> str:
     """
     if kind == FALLBACK_STALL:
         return (
-            f"FFmpeg stopped making progress on {video_file} on the GPU — retrying on CPU automatically. If this keeps "
-            "happening, check the disk or network share the file is on: a stalled read stalls the CPU run too."
+            f"FFmpeg stopped making progress on {video_file} on the GPU. If this keeps happening, check the disk or "
+            "network share the file is on: a stalled read stalls the CPU run too."
         )
     if kind == FALLBACK_IO_ERROR:
         return (
-            f"FFmpeg hit an I/O error on {video_file} on the GPU — retrying on CPU automatically. If this keeps "
-            f"happening, check {_io_error_places()}."
+            f"FFmpeg hit an I/O error on {video_file} on the GPU. If this keeps happening, check {_io_error_places()}."
         )
     if kind == FALLBACK_STOPPED_PART_WAY:
-        return f"The GPU run for {video_file} stopped part-way — retrying on CPU automatically, from the start."
+        return f"The GPU run for {video_file} stopped part-way."
     if kind == FALLBACK_SIGNAL:
-        return f"FFmpeg was stopped by a signal on the GPU for {video_file} — retrying on CPU automatically."
+        return f"FFmpeg was stopped by a signal on the GPU for {video_file}."
     if kind == FALLBACK_HWACCEL:
-        return f"The GPU's decoder or filters failed on {video_file} — retrying on CPU automatically."
+        return f"The GPU's decoder or filters failed on {video_file}."
     return (
-        f"Hardware acceleration could not handle the codec for {video_file} — retrying on CPU automatically. "
-        "No action needed; this is a normal fallback for codecs your GPU doesn't support."
+        f"Hardware acceleration could not handle the codec for {video_file}. "
+        "No action needed; this is normal for codecs your GPU doesn't support."
     )
 
 
@@ -2044,7 +2043,8 @@ def generate_images(
         # NVDEC decodes H.264 greyscale into coloured stripes and FFmpeg reports success (a Quadro P5000 and a TITAN
         # RTX; Intel's VAAPI decodes it right), so it's a codec the GPU lacks, known before any GPU run.
         logger.info(
-            "{} is greyscale H.264, which this GPU decodes into the wrong colours; the CPU makes its thumbnails instead.",
+            "{} is greyscale H.264, which this GPU decodes into the wrong colours; another GPU or the CPU makes its "
+            "thumbnails instead.",
             video_file,
         )
         raise CodecNotSupportedError(
@@ -2644,7 +2644,7 @@ def generate_images(
                 )
                 disk = cut_off if cut_off and cut_off[0] in (FALLBACK_STALL, FALLBACK_IO_ERROR) else None
                 if gpu is not None:
-                    # Still failing on GPU even with DV-safe filter -> the same worker retries on the CPU.
+                    # Still failing on GPU even with DV-safe filter -> another GPU or the CPU takes it.
                     _clean_output_images(output_folder)
                     if disk is not None:
                         raise CodecNotSupportedError(
@@ -2702,8 +2702,7 @@ def generate_images(
             # Log relevant stderr excerpt for debugging
             stderr_excerpt = "\n".join(stderr_lines[-5:]) if len(stderr_lines) > 0 else "No stderr output"
             logger.warning(
-                "GPU processing failed for {} (reason: {}, exit code {}) — retrying it on the CPU on this same "
-                "worker. {}",
+                "GPU processing failed for {} (reason: {}, exit code {}) — another GPU or the CPU takes it. {}",
                 video_file,
                 fallback_reason,
                 rc,
@@ -2731,7 +2730,7 @@ def generate_images(
     if image_count > 0 and gpu is not None and _thumbnails_lost_their_colour(output_folder):
         logger.info(
             "The GPU decoded {} without its colours (every thumbnail came out green), so its decoder can't handle this "
-            "video; the CPU makes its thumbnails instead.",
+            "video; another GPU or the CPU makes its thumbnails instead.",
             video_file,
         )
         _clean_output_images(output_folder)
