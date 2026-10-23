@@ -2010,10 +2010,19 @@ class TestExecuteScheduledMultiKind:
         )  # fmt: skip
         env.loudness.assert_called_once_with(
             library_name="Plex loudness: All", priority=1, source="schedule", libraries=[], server_id=None,
-            parent_schedule_id=schedule["id"], scan_filters=filters,
+            parent_schedule_id=schedule["id"], scan_filters=filters, sort_by=None,
         )  # fmt: skip
         env.recent.assert_not_called()
         assert schedule["last_run"] is not None
+
+    @pytest.mark.parametrize("sort_by", ["random", "newest", None])
+    def test_loudness_gets_the_schedules_processing_order(self, scheduler_manager, env, sort_by):
+        config = {"job_kinds": ["loudness"], "job_type": "full_library"}
+        if sort_by:
+            config["sort_by"] = sort_by
+        self._tick(scheduler_manager, config)
+
+        assert env.loudness.call_args.kwargs["sort_by"] == sort_by
 
     def test_loudness_defaults_to_low_priority(self, scheduler_manager, env):
         self._tick(scheduler_manager, {"job_kinds": ["loudness"]})
@@ -2030,7 +2039,7 @@ class TestExecuteScheduledMultiKind:
 
         env.loudness.assert_called_once_with(
             library_name="Plex loudness: All", priority=3, source="schedule", libraries=[], server_id=None,
-            parent_schedule_id=schedule["id"], scan_filters={},
+            parent_schedule_id=schedule["id"], scan_filters={}, sort_by=None,
         )  # fmt: skip
         env.intro.assert_called_once_with(
             library_name="Intro & Credits: All", priority=3, source="schedule", libraries=[],
@@ -2192,7 +2201,7 @@ class TestScheduleExactLibraryPicks:
 
         env.loudness.assert_called_once_with(
             library_name="Plex loudness: Picks", priority=3, source="schedule", libraries=self.ONE_SERVER,
-            server_id="plex-1", parent_schedule_id=schedule["id"], scan_filters={},
+            server_id="plex-1", parent_schedule_id=schedule["id"], scan_filters={}, sort_by=None,
         )  # fmt: skip
 
     def test_loudness_on_two_servers_gets_the_pairs_unpinned(self, scheduler_manager, env):
@@ -2200,7 +2209,7 @@ class TestScheduleExactLibraryPicks:
 
         env.loudness.assert_called_once_with(
             library_name="Plex loudness: Picks", priority=3, source="schedule", libraries=self.TWO_SERVERS,
-            server_id=None, parent_schedule_id=schedule["id"], scan_filters={},
+            server_id=None, parent_schedule_id=schedule["id"], scan_filters={}, sort_by=None,
         )  # fmt: skip
 
     def test_intro_credits_on_one_server_is_pinned_to_it(self, scheduler_manager, env):
@@ -2234,7 +2243,7 @@ class TestScheduleExactLibraryPicks:
 
         env.loudness.assert_called_once_with(
             library_name="Plex loudness: Picks", priority=3, source="schedule", libraries=self.ONE_SERVER,
-            server_id="plex-1", parent_schedule_id=schedule["id"], scan_filters={},
+            server_id="plex-1", parent_schedule_id=schedule["id"], scan_filters={}, sort_by=None,
         )  # fmt: skip
 
     def test_legacy_loudness_with_ids_on_two_servers_still_starts_nothing(self, scheduler_manager, env):

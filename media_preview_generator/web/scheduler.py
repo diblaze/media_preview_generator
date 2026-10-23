@@ -659,6 +659,7 @@ def _start_scheduled_loudness_job(
     server_id: str | None,
     scan_filters: dict | None = None,
     pairs: list[dict] | None = None,
+    sort_by: str | None = None,
 ) -> bool:
     """Create the loudness job for a schedule tick (LOW unless the schedule sets a priority).
 
@@ -692,6 +693,7 @@ def _start_scheduled_loudness_job(
                     server_id=None,
                     parent_schedule_id=schedule_id,
                     scan_filters=scan_filters,
+                    sort_by=sort_by,
                 )
                 return True
             server_id = _pin_server_for_libraries(schedule_id, "loudness", library_ids, server_id)
@@ -706,6 +708,7 @@ def _start_scheduled_loudness_job(
                 server_id=server_id,
                 parent_schedule_id=schedule_id,
                 scan_filters=scan_filters,
+                sort_by=sort_by,
             )
             return True
         except Exception:
@@ -1000,7 +1003,14 @@ def execute_scheduled_job(
                 )
             elif kind == JOB_KIND_LOUDNESS:
                 queued |= _start_scheduled_loudness_job(
-                    schedule_id, library_ids, library_name, priority, server_id, scan_filters, pairs=pairs
+                    schedule_id,
+                    library_ids,
+                    library_name,
+                    priority,
+                    server_id,
+                    scan_filters,
+                    pairs=pairs,
+                    sort_by=cfg.get("sort_by"),
                 )
         except Exception:
             logger.exception(

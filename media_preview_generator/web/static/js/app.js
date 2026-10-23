@@ -3802,20 +3802,20 @@ function _jobDefaultPriority() {
     return _jobKindIsPreviews() ? '2' : '3';
 }
 
-// Processing mode belongs to Previews alone (Intro & Credits has a "re-check" switch instead). Order is for Previews,
-// and for loudness in Start new job; Intro & Credits keeps a season together. Scan filters apply to every type. A
-// schedule on Recently added has no filters or order: it only looks at the newest files.
+// Processing mode belongs to Previews alone (Intro & Credits has a "re-check" switch instead). Order is for Previews
+// and loudness; Intro & Credits keeps a season together. Scan filters apply to every type. A schedule on Recently
+// added has no filters or order: it only looks at the newest files.
 function _showJobKindControls(prefix = 'job') {
     const markers = _jobKindIsMarkers(prefix);
     const previews = _jobKindIsPreviews(prefix);
-    const loudnessOrder = prefix === 'job' && _jobKindIsLoudness(prefix);
+    const loudness = _jobKindIsLoudness(prefix);
     const recentlyAdded = !!document.getElementById(`${prefix}FilesRecent`)?.checked;
     const toggle = function (id, hidden) {
         const el = document.getElementById(id);
         if (el) el.hidden = hidden;
     };
     toggle(`${prefix}ProcessingModeGroup`, !previews);
-    toggle(`${prefix}SortByGroup`, !(previews || loudnessOrder) || recentlyAdded);
+    toggle(`${prefix}SortByGroup`, !(previews || loudness) || recentlyAdded);
     toggle(`${prefix}MarkersForceGroup`, !markers);
     toggle(`${prefix}ScanFiltersGroup`, recentlyAdded);
     _updateJobScopeBadge(prefix);

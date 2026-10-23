@@ -145,8 +145,8 @@ The same filters are available for Intro & Credits and Plex loudness jobs, and o
 scheduled **Whole library** runs. A "last 30 days" schedule moves its window forward
 on every run; a date range stays fixed. Webhooks, **Recently Added** schedules, and
 **Process a file or folder** selections continue to use their own selection rules.
-Processing order applies to Previews, and to Plex loudness jobs from **Start new job**. Intro & Credits
-always checks a season's episodes together.
+Processing order applies to Previews and Plex loudness. Intro & Credits always checks a season's
+episodes together.
 
 ### Letting new imports jump the queue
 
@@ -214,7 +214,7 @@ The Dashboard shows the next scheduled run in **Job statistics**, and **Run next
 - **Files** — **Whole library**, or **Recently added** (see [Auto-trigger from Plex](#auto-trigger-from-plex-no-sonarrradarr)). Recently added makes previews only if Previews is ticked, then queues the other ticked types for the files it finds.
 - **Schedule type** — **Specific Time**, **Interval** or **Cron Expression**
 - **Stop time** (optional) — pauses the schedule's running jobs at that time of day
-- **Job Priority**, and for a whole library **Processing Order** (Previews) and the same media filters as **Start new job**
+- **Job Priority**, and for a whole library **Processing Order** (Previews and loudness) and the same media filters as **Start new job**
 
 **Check servers** is not a schedule: it runs by itself every day at 04:30 whenever Intro & Credits is on for a server. During quiet hours or Pause All it waits in the queue until processing resumes.
 

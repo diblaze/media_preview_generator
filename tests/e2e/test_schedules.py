@@ -405,7 +405,7 @@ class TestScheduleMultiKind:
         assert (body["library_ids"], body["server_id"]) == ([], "")
         assert "libraries" not in body["config"]
 
-    def test_without_previews_the_order_is_hidden_the_filters_stay_and_no_sort_is_saved(
+    def test_intro_credits_alone_hides_the_order_keeps_the_filters_and_saves_no_sort(
         self, authed_page: Page, app_url: str
     ) -> None:
         _seed_servers_for_schedule_modal(authed_page)
@@ -422,6 +422,25 @@ class TestScheduleMultiKind:
         assert captured[0][1]["config"] == {
             "job_kinds": ["intro_credits"],
             "job_type": "full_library",
+            "added_filter": "all",
+        }
+
+    def test_a_loudness_only_schedule_shows_and_saves_the_order(self, authed_page: Page, app_url: str) -> None:
+        _seed_servers_for_schedule_modal(authed_page)
+        captured = _capture_schedule_writes(authed_page, [])
+        _open_new_schedule(authed_page, app_url)
+        authed_page.locator("#scheduleName").fill("Loudness nightly")
+        authed_page.locator("#scheduleKindLoudness").check()
+        authed_page.locator("#scheduleKindPreviews").uncheck()
+
+        expect(authed_page.locator("#scheduleSortByGroup")).to_be_visible()
+        authed_page.locator("#scheduleSortBy").select_option("random")
+        _save_schedule(authed_page, "/api/schedules")
+
+        assert captured[0][1]["config"] == {
+            "job_kinds": ["loudness"],
+            "job_type": "full_library",
+            "sort_by": "random",
             "added_filter": "all",
         }
 

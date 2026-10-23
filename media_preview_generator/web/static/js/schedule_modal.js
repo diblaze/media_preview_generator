@@ -413,10 +413,10 @@ async function saveSchedule() {
         const scanFilters = MediaScanFilters.read('schedule');
         if (scanFilters === null) return;
         Object.assign(scheduleConfig, scanFilters);
-        // Processing order is a Previews option.
+        // Processing order is for Previews and loudness; Intro & Credits keeps each season together.
         const sortByEl = document.getElementById('scheduleSortBy');
         const sortBy = sortByEl ? sortByEl.value : '';
-        if (jobKinds.includes('previews') && sortBy && sortBy !== 'inherit') {
+        if ((jobKinds.includes('previews') || jobKinds.includes('loudness')) && sortBy && sortBy !== 'inherit') {
             scheduleConfig.sort_by = sortBy;
         }
     }
