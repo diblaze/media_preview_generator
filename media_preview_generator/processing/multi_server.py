@@ -2755,7 +2755,8 @@ def process_canonical_path(
                 if not same_source(get_source_fingerprint(result.canonical_path), plan.source_fingerprint):
                     raise SourceFileChangedError("Source changed while waiting for Plex Analyze")
                 # A file that became several items after planning (a new double episode Plex had not indexed yet).
-                fresh = each_item(plan.server, result.canonical_path, item_id, partial(reread, plan.server))
+                server = cast("MediaServer", plan.server)
+                fresh = each_item(server, result.canonical_path, item_id, partial(reread, server))
             except CancellationError:
                 raise
             except (ChapterError, OSError, ValueError, RuntimeError, requests.RequestException) as exc:

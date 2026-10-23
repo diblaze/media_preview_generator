@@ -2329,14 +2329,14 @@ class PlexServer(MediaServer):
         _parts, flags = self._database_read()
         if flags is not None:
             for candidate in expand_path_mapping_candidates(canonical_path, self.path_mappings):
-                items = flags.get(_flag_key(candidate))
-                if items:
-                    return sorted(int(item) for item in items)
+                flagged = flags.get(_flag_key(candidate))
+                if flagged:
+                    return sorted(int(item) for item in flagged)
         for candidate in expand_path_mapping_candidates(canonical_path, self.path_mappings):
             exact = candidate.replace("\\", "/")
-            items = {int(key) for key, file in self._items_at_path(candidate) if key.isdecimal() and file == exact}
-            if items:
-                return sorted(items)
+            found = {int(key) for key, file in self._items_at_path(candidate) if key.isdecimal() and file == exact}
+            if found:
+                return sorted(found)
         return []
 
     def _items_holding_file(self, plex: Any, bare_id: str, canonical_path: str) -> dict[str, bool]:
