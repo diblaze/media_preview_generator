@@ -2096,6 +2096,46 @@ class TestNoFrames:
         assert message_says in result.message
         assert any("produced no preview frames" in line for line in warnings) is second_warning, warnings
 
+    @pytest.mark.parametrize("summary", [NO_DECODER_SUMMARY, "Conversion failed!"], ids=["no-decoder", "no-frames"])
+    def test_a_file_that_yields_no_frames_is_recorded_for_library_health_until_it_works(
+        self, mock_config_for_processing, tmp_path, monkeypatch, summary
+    ):
+        from media_preview_generator.library_health import failures
+        from media_preview_generator.library_health.models import Feature
+        from media_preview_generator.library_health.store import HealthStore
+
+        store = HealthStore(str(tmp_path / "health.db"))
+        monkeypatch.setattr(failures, "default_store", lambda: store)
+        media_dir = tmp_path / "data" / "movies"
+        media_file = _seed_canonical_file(media_dir)
+        registry = ServerRegistry.from_settings(
+            [
+                _server_config(
+                    server_id="emby-1",
+                    server_type=ServerType.EMBY,
+                    libraries=[Library(id="1", name="Movies", remote_paths=(str(media_dir),), enabled=True)],
+                )
+            ],
+        )
+
+        with patch(
+            "media_preview_generator.processing.multi_server.generate_images",
+            return_value=(False, 0, False, 0.1, "0.0x", summary),
+        ):
+            process_canonical_path(canonical_path=str(media_file), registry=registry, config=mock_config_for_processing)
+
+        assert failures.unreadable_paths(store) == {Feature.PREVIEWS: frozenset({str(media_file)})}
+
+        store.clear_failure(Feature.PREVIEWS, str(media_file))
+        failures.record_failure((Feature.PREVIEWS,), str(media_file), "x")
+        with patch(
+            "media_preview_generator.processing.multi_server.generate_images",
+            return_value=(True, 3, "h264", 0.5, 30.0, ""),
+        ):
+            process_canonical_path(canonical_path=str(media_file), registry=registry, config=mock_config_for_processing)
+
+        assert failures.unreadable_paths(store) == {}
+
     @pytest.mark.parametrize("keyframe_gap", [1.0, None], ids=["keyframe", "full-decode"])
     def test_ffmpegs_own_no_decoder_failure_ends_the_file_without_a_second_report(
         self, mock_config_for_processing, tmp_path, keyframe_gap

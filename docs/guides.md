@@ -516,7 +516,9 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
   nobody has looked yet; many shows have no intro. The striped part of the bar is files with nothing left to do: for
   Intro and Credits, the app looked and found none; for Chapters, files with no chapters in the video, plus files that
   can't get thumbnails (a chapter that starts after the video ends, a version split across several files, or one the
-  chapter step gave up on until the file changes). Loudness doesn't count files with no audio.
+  chapter step gave up on until the file changes, or a title Plex shows from another version). Previews, Intro and
+  Credits count **can't be read** for a file a job found broken (a protected or unknown video codec, no frames, no
+  readable length); it counts again once the file changes. Loudness doesn't count files with no audio.
 - **Other cell text.** **Off for this library** means the feature is turned off in Servers. **Not used for films**
   is Intro on a movie library. **Plex only** is Loudness on Emby or Jellyfin.
 - **Click a number** to list those files. From the list you can open a file in the Inspector, or start the matching
@@ -524,6 +526,9 @@ thumbnails, loudness or Intro & Credits. There is one card per server and one ro
   library. Chapters starts preview jobs for exactly those files; previews that already exist are skipped.
 - **Checking only reads.** It never changes your servers or your files.
 - **When it runs.** **Check now** runs it. It also runs every night at 3:00 AM.
+- **Nightly catch-up.** After the nightly check, a Plex library with up to 500 files still missing previews or
+  chapter thumbnails gets one low-priority job for exactly those files (for example, chapter thumbnails Plex
+  dropped when it re-read an upgraded file). A library with more is left to your own scan or schedule.
 - **How long it takes.** Plex with access to its database, directly or through a Plex database node, takes
   seconds, even for 100,000+ files. Without it (for example, Plex's folder on a network share such as Docker
   Desktop's mount of a Windows folder), only previews are counted. Jellyfin Intro and

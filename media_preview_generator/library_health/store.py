@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -25,6 +26,15 @@ _SCHEMA = (
     # Review & fix finds and clears the "not showing" rows by item; without this each one scanned every
     # to-do row, and clearing 1,661 items among 225,000 rows held the store lock for many minutes.
     "CREATE INDEX IF NOT EXISTS idx_todo_not_showing ON todo(server_id, not_showing, item_id)",
+    # Files a feature failed on in a way no retry fixes; kept apart from ``todo`` because a check replaces that.
+    """CREATE TABLE IF NOT EXISTS permanent_failures (
+        feature TEXT NOT NULL,
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        recorded_at REAL NOT NULL,
+        PRIMARY KEY (feature, path))""",
 )
 
 _MAX_LIMIT = 500
@@ -49,6 +59,12 @@ class HealthStore:
         with self._lock, self._conn:
             for statement in _SCHEMA:
                 self._conn.execute(statement)
+            # A job clears a failure after every file that works and nearly none has a record, so those calls check
+            # this copy under their own lock: never a database write, and never a wait behind a check's long writes.
+            self._failure_keys = {
+                (r[0], r[1]) for r in self._conn.execute("SELECT feature, path FROM permanent_failures")
+            }
+        self._failure_lock = threading.Lock()
 
     @contextmanager
     def _locked(self) -> Iterator[sqlite3.Connection]:
@@ -113,6 +129,34 @@ class HealthStore:
                 if cell is not None:
                     cell["not_showing"] = remaining.get(library["library_id"], 0)
             conn.execute("UPDATE servers SET json = ? WHERE server_id = ?", (json.dumps(data), server_id))
+
+    def record_failure(self, feature: Feature, path: str, size: int, mtime_ns: int, reason: str) -> None:
+        """Remember that ``feature`` can't be done for this file as it is now (its size and mtime)."""
+        with self._locked() as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO permanent_failures (feature, path, size, mtime_ns, reason, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (feature.value, path, size, mtime_ns, reason, time.time()),
+            )
+        with self._failure_lock:
+            self._failure_keys.add((feature.value, path))
+
+    def clear_failure(self, feature: Feature, path: str) -> None:
+        """Forget a recorded failure, as when the feature has since worked for the file."""
+        key = (feature.value, path)
+        with self._failure_lock:
+            if key not in self._failure_keys:
+                return
+        with self._locked() as conn, conn:
+            conn.execute("DELETE FROM permanent_failures WHERE feature = ? AND path = ?", key)
+        with self._failure_lock:
+            self._failure_keys.discard(key)
+
+    def failures(self) -> dict[tuple[Feature, str], tuple[int, int]]:
+        """Every recorded failure as ``(feature, path) -> (size, mtime_ns)``."""
+        with self._locked() as conn:
+            rows = conn.execute("SELECT feature, path, size, mtime_ns FROM permanent_failures").fetchall()
+        return {(Feature(r[0]), r[1]): (r[2], r[3]) for r in rows}
 
     def load(self) -> list[ServerResult]:
         """All stored servers, oldest-inserted first; their ``todo`` lists are left empty."""

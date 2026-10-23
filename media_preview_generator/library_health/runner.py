@@ -13,15 +13,19 @@ from ..servers.base import ServerConfig, ServerType
 from ..servers.registry import ServerRegistry
 from . import embyish as embyish_counter
 from . import plex as plex_counter
+from .failures import unreadable_paths
 from .markers_db import markers_db_path as default_markers_db_path
 from .markers_db import nothing_found
-from .models import CellState, CheckCancelled, CheckProgress, ServerResult
+from .models import CellState, CheckCancelled, CheckProgress, Feature, LibraryResult, ServerResult
 from .store import HealthStore, default_store
 
 REREAD_INTERVAL_S = 0.5  # Plex analyzes before it answers; the pause leaves it room for everything else
 FILES_PER_JOB = 1000
 # Re-read items whose chapter thumbnails go back per job, so they're missing minutes, not hours.
 RESTORE_EVERY = 200  # the same cap the page uses before it switches to a whole-library job
+# A nightly catch-up only mops up stragglers. A library with more files to do is a fresh install or a newly enabled
+# feature, which belongs to the user's own scan or schedule, not to a job nobody asked for.
+CATCH_UP_MAX_FILES = 500
 
 _BUSY_MESSAGE = "A check or re-read is already running"
 _NO_REGISTRY_MESSAGE = "Could not read your media servers"
@@ -55,7 +59,7 @@ class HealthRunner:
             markers_db_path: Returns the path of the markers database.
             sleep: Pause function used between re-read calls (replaced in tests).
             start_files_job: Starts preview jobs for ``(server, [(path, Plex item id)], title)``; used after a
-                re-read to put back the chapter thumbnails Plex drops when it re-reads an item. None skips that.
+                re-read (to put back the chapter thumbnails Plex drops) and by the nightly catch-up. None skips both.
         """
         self._store = store
         self._registry_factory = registry_factory
@@ -82,7 +86,7 @@ class HealthRunner:
             if self._current is not None:
                 return False, replace(self._current)
             progress = self._begin("check", reason)
-            self._launch(lambda: self._check_servers(None, reason=reason, registry=None))
+            self._launch(lambda: self._check_then_catch_up(reason))
             return True, replace(progress)
 
     def start_reread(self, server_id: str) -> tuple[bool, CheckProgress | RereadRefusal]:
@@ -205,6 +209,56 @@ class HealthRunner:
                 self._current.done = 0
                 self._current.total = 0
 
+    def _check_then_catch_up(self, reason: str) -> None:
+        """Count every server; after a nightly check, start the catch-up jobs (a manual check never starts jobs)."""
+        registry = self._registry_factory()
+        self._check_servers(None, reason=reason, registry=registry)
+        if reason == "nightly" and registry is not None and self._start_files_job is not None:
+            self._catch_up(registry)
+
+    def _catch_up(self, registry: ServerRegistry) -> None:
+        """Start one low-priority job per Plex library for the few files the check found still to do."""
+        saved = {result.server_id: result for result in self._store.load()}
+        for cfg in registry.configs():
+            result = saved.get(cfg.id)
+            if not cfg.enabled or cfg.type is not ServerType.PLEX or result is None or self.server_error(cfg.id):
+                continue
+            for library in result.libraries:
+                if self._is_cancelled():
+                    raise CheckCancelled
+                try:
+                    self._catch_up_library(cfg, library)
+                except Exception:
+                    logger.exception("Could not start the catch-up for {} on {}", library.name, cfg.name)
+
+    def _catch_up_library(self, cfg: ServerConfig, library: LibraryResult) -> None:
+        """Previews (including "not showing") and chapter thumbnails a library still lacks, as one job."""
+        features = [Feature.PREVIEWS]
+        if cfg.output.get("chapter_thumbnails") is True:
+            features.append(Feature.CHAPTERS)
+        files: dict[tuple[str, str], None] = {}
+        for feature in features:
+            cell = library.cells.get(feature)
+            if cell is None or cell.state is not CellState.COUNTED:
+                continue
+            for entry in self._store.todo_for(cfg.id, library.library_id, feature):
+                files[(entry.path, entry.item_id)] = None
+        if not files:
+            return
+        if len(files) > CATCH_UP_MAX_FILES:
+            logger.info(
+                "Library health: not catching up {} on {}: {} files is a backfill, not stragglers",
+                library.name,
+                cfg.name,
+                len(files),
+            )
+            return
+        title = f"Catch-up for {library.name}"
+        if catch_up_in_progress(cfg, title):
+            return
+        assert self._start_files_job is not None
+        self._start_files_job(cfg, list(files), title)
+
     def _check_servers(self, server_ids: list[str] | None, *, reason: str, registry: ServerRegistry | None) -> None:
         """Count the given servers (all enabled ones when None) and save what succeeded."""
         if registry is None:
@@ -239,7 +293,12 @@ class HealthRunner:
                 raise RuntimeError("This server type isn't supported")
             if cfg.type is ServerType.PLEX:
                 result: ServerResult = plex_counter.count_plex(
-                    cfg, server, nothing_found=found, cancel_check=self._is_cancelled, progress=self._report
+                    cfg,
+                    server,
+                    nothing_found=found,
+                    cancel_check=self._is_cancelled,
+                    progress=self._report,
+                    unreadable=unreadable_paths(self._store),
                 )
             else:
                 result = embyish_counter.count_embyish(
@@ -293,6 +352,7 @@ class HealthRunner:
                 cell.nothing_found = old_cell.nothing_found
                 cell.not_showing = old_cell.not_showing
                 cell.waiting = old_cell.waiting
+                cell.cant_do = old_cell.cant_do
                 library.total = max(library.total, old_library.total)
                 result.todo.extend(self._store.todo_for(result.server_id, library.library_id, feature))
 
@@ -437,6 +497,18 @@ def start_files_job(cfg: ServerConfig, files: list[tuple[str, str]], title: str)
             server_type=cfg.type.value,
         )
         _start_job_async(job.id, {**config, "server_id": cfg.id})
+
+
+def catch_up_in_progress(cfg: ServerConfig, title: str) -> bool:
+    """Whether an earlier catch-up job (named by ``title``) for this server is still queued or running."""
+    from ..web.jobs import JobStatus, get_job_manager
+
+    return any(
+        job.server_id == cfg.id
+        and job.status in (JobStatus.PENDING, JobStatus.RUNNING)
+        and (job.library_name or "").startswith(f"{title}:")
+        for job in get_job_manager().get_all_jobs()
+    )
 
 
 def nightly_check() -> None:

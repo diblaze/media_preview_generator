@@ -25,6 +25,7 @@ from ..loudness.plex_db import has_analysis
 from ..loudness.undecodable import ffmpeg_identity, skipped_count_by_part_hash
 from ..markers.fs import filesystem_type, is_network_filesystem
 from ..markers.publishers.base import PublishError
+from ..markers.publishers.plex_chapters import other_version_refusal, own_chapter_starts
 from ..markers.publishers.plex_db import LocalPlexDb, PlexMarkerPublisher
 from ..markers.publishers.plex_remote import RemotePlexDb, plex_database
 from ..markers.settings import load_server
@@ -68,10 +69,12 @@ class _Part:
 
 @dataclass
 class _Chapters:
-    """One item's chapters: how many, and (index, start ms) of each one Plex has no thumbnail for."""
+    """One item's chapters: how many, (index, start ms) of each one Plex has no thumbnail for, and the version rule's input."""
 
     count: int
     missing: list[tuple[int, int]]
+    starts: list[int] | None = None  # None for a single-version title, or from a node that predates the rule
+    shown_from: set[int] = field(default_factory=set)  # media ids Plex's chapter thumbnails point at
 
 
 @dataclass
@@ -85,6 +88,7 @@ class _PlexRows:
     markers: dict[int, set[str]] = field(default_factory=dict)
     chapters: dict[int, _Chapters] = field(default_factory=dict)
     durations: dict[int, int] = field(default_factory=dict)
+    media_by_item: dict[int, set[int]] = field(default_factory=dict)
 
 
 def _open_db(cfg: ServerConfig) -> LocalPlexDb | RemotePlexDb | None:
@@ -132,6 +136,7 @@ def count_plex(
     nothing_found: dict[str, set[Feature]],
     cancel_check: Callable[[], bool],
     progress: Callable[[str, int, int], None],
+    unreadable: Mapping[Feature, frozenset[str]] | None = None,
 ) -> ServerResult:
     """Count previews, loudness and intro/credits for every library of a Plex server.
 
@@ -141,6 +146,8 @@ def count_plex(
         nothing_found: Canonical path -> features whose marker search ended with nothing (from markers.db).
         cancel_check: Returns True when the user cancelled the check.
         progress: Called as ``progress(step, done, total)``.
+        unreadable: Per feature, the paths a job found it can never do (``failures.unreadable_paths``); counted as
+            "can't" rather than to do.
 
     Returns:
         The server's per-library cells and the files still to do.
@@ -155,7 +162,13 @@ def count_plex(
     refused = _node_refusal(db) if isinstance(db, RemotePlexDb) else ""
     if db is not None and share is None and not refused:
         libraries, todo = _count_from_db(
-            cfg, db, scopes, nothing_found=nothing_found, cancel_check=cancel_check, progress=progress
+            cfg,
+            db,
+            scopes,
+            nothing_found=nothing_found,
+            cancel_check=cancel_check,
+            progress=progress,
+            unreadable=unreadable,
         )
         access = ACCESS_NODE if isinstance(db, RemotePlexDb) else ACCESS_DIRECT
     else:
@@ -240,6 +253,16 @@ def _rows_from(raw: Mapping[str, Iterable[Sequence[Any]]], undecodable: dict[str
             rows.markers.setdefault(item_id, set()).add(text)
         for item_id, count, missing in raw["chapters"]:
             rows.chapters[item_id] = _Chapters(count, _parse_missing(missing))
+        # Absent from a Plex database node that predates the version rule: those titles keep today's count.
+        for item_id, starts, shown_from in raw.get("chapter_versions", ()):
+            chapters = rows.chapters.get(item_id)
+            if chapters is not None:
+                chapters.starts = [int(start) for start in (starts or "").split(",") if start]
+                chapters.shown_from = {
+                    int(media_id) for media_id in (shown_from or "").split(",") if media_id.isdigit()
+                }
+        for part_row in rows.parts:
+            rows.media_by_item.setdefault(part_row[1], set()).add(part_row[-1])
         rows.durations = {item_id: duration for item_id, duration in raw["durations"] if duration}
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Library Health rows in an unexpected shape: {exc}") from exc
@@ -329,6 +352,13 @@ def _chapter_state(folder: str, part: _Part, rows: _PlexRows, parts_per_media: C
     if not needed:
         # Every chapter starting after the video ends leaves no frame to show: the chapter step fails those.
         return "cant_do" if len(chapters.missing) >= chapters.count else "done"
+    other_versions = rows.media_by_item.get(part.item_id, set()) - {part.media_id}
+    if other_versions and chapters.starts is not None:
+        # The chapter step refuses a title Plex shows from another version; it would never finish these.
+        if other_version_refusal(
+            part.media_id, other_versions, chapters.shown_from, own_chapter_starts(part.extra_data), chapters.starts
+        ):
+            return "cant_do"
     return _chapter_manifest_state(folder, part, needed)
 
 
@@ -393,7 +423,9 @@ def _tally_library(
     folder: str = "",
     parts_per_media: Counter[int] | None = None,
     held_paths: frozenset[str] = frozenset(),
+    unreadable: Mapping[Feature, frozenset[str]] | None = None,
 ) -> tuple[LibraryResult, list[TodoFile]]:
+    unreadable = unreadable or {}
     cells = _fixed_cells(scope, lambda: Cell(CellState.COUNTED))
     counted = {feature for feature, fixed in scope.features.items() if fixed is None}
     todo: list[TodoFile] = []
@@ -413,6 +445,8 @@ def _tally_library(
                     else:
                         cell.not_showing += 1
                         add_todo(Feature.PREVIEWS, part, not_showing=True)
+            elif path_key(part.path) in unreadable.get(Feature.PREVIEWS, ()):
+                cell.cant_do += 1
             else:
                 add_todo(Feature.PREVIEWS, part)
         if Feature.CHAPTERS in counted:
@@ -443,6 +477,8 @@ def _tally_library(
                 cell.done += 1
             elif feature in nothing_found.get(path_key(part.path), ()):
                 cell.nothing_found += 1
+            elif path_key(part.path) in unreadable.get(feature, ()):
+                cell.cant_do += 1
             else:
                 add_todo(feature, part)
     return LibraryResult(scope.library_id, scope.name, scope.kind, len(parts), cells), todo
@@ -456,6 +492,7 @@ def _count_from_db(
     nothing_found: dict[str, set[Feature]],
     cancel_check: Callable[[], bool],
     progress: Callable[[str, int, int], None],
+    unreadable: Mapping[Feature, frozenset[str]] | None = None,
 ) -> tuple[list[LibraryResult], list[TodoFile]]:
     if cancel_check():
         raise CheckCancelled()
@@ -507,6 +544,7 @@ def _count_from_db(
                 folder=folder,
                 parts_per_media=parts_per_media,
                 held_paths=held_paths,
+                unreadable=unreadable,
             )
         except Exception as exc:  # noqa: BLE001 - one library failing must not hide the others
             logger.warning("Library health: could not count {} on {}: {}", scope.name, cfg.name, exc)

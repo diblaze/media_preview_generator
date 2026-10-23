@@ -819,3 +819,167 @@ def test_failed_library_carries_the_waiting_count_too(store, monkeypatch, plex_s
 
     movies = store.load()[0].libraries[0].cells[Feature.PREVIEWS]
     assert (movies.state, movies.waiting) == (CellState.ERROR, 3)
+
+
+def _catch_up_result(server_id, *, previews=2, chapters=1, library_id="1", name="TV Shows"):
+    todo = [TodoFile(Feature.PREVIEWS, f"/tv/p{i}.mkv", f"p{i}", str(i), False, library_id) for i in range(previews)]
+    todo += [
+        TodoFile(Feature.CHAPTERS, f"/tv/c{i}.mkv", f"c{i}", str(100 + i), False, library_id) for i in range(chapters)
+    ]
+    cells = {
+        Feature.PREVIEWS: Cell(CellState.COUNTED, total=previews + 5, done=5),
+        Feature.CHAPTERS: Cell(CellState.COUNTED, total=chapters + 5, done=5),
+    }
+    return ServerResult(
+        server_id, f"name-{server_id}", "plex", [LibraryResult(library_id, name, "show", 9, cells)], todo
+    )
+
+
+def _catch_up_runner(store, monkeypatch, result, *, chapter_thumbnails=True, in_progress=False, server_type=None):
+    cfg = _cfg("a", server_type or ServerType.PLEX)
+    cfg.output = {"chapter_thumbnails": chapter_thumbnails}
+    monkeypatch.setattr(runner_module.plex_counter, "count_plex", lambda *_a, **_kw: result)
+    monkeypatch.setattr(runner_module, "unreadable_paths", lambda _store: {})
+    monkeypatch.setattr(runner_module, "catch_up_in_progress", lambda _cfg, _title: in_progress)
+    started = []
+    runner = HealthRunner(
+        store,
+        registry_factory=lambda: FakeRegistry([(cfg, MagicMock())]),
+        markers_db_path=lambda: "/nope",
+        start_files_job=lambda cfg_, files, title: started.append((cfg_.id, sorted(files), title)),
+    )
+    return runner, started
+
+
+def _check(runner, reason):
+    runner.start_check(reason)
+    runner.wait(5)
+
+
+def test_a_nightly_check_starts_one_catch_up_for_previews_and_chapters(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"))
+
+    _check(runner, "nightly")
+
+    assert started == [
+        (
+            "a",
+            [("/tv/c0.mkv", "100"), ("/tv/p0.mkv", "0"), ("/tv/p1.mkv", "1")],
+            "Catch-up for TV Shows",
+        )
+    ]
+
+
+def test_a_manual_check_never_starts_jobs(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"))
+
+    _check(runner, "manual")
+
+    assert started == []
+
+
+def test_catch_up_leaves_chapters_out_when_chapter_thumbnails_are_off(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"), chapter_thumbnails=False)
+
+    _check(runner, "nightly")
+
+    assert [path for _id, files, _title in started for path, _item in files] == ["/tv/p0.mkv", "/tv/p1.mkv"]
+
+
+def test_catch_up_skips_a_library_with_more_than_the_straggler_limit(store, monkeypatch):
+    big = _catch_up_result("a", previews=runner_module.CATCH_UP_MAX_FILES + 1, chapters=0)
+    runner, started = _catch_up_runner(store, monkeypatch, big)
+
+    _check(runner, "nightly")
+
+    assert started == []
+
+
+def test_catch_up_skips_a_library_whose_last_catch_up_is_still_going(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"), in_progress=True)
+
+    _check(runner, "nightly")
+
+    assert started == []
+
+
+def test_catch_up_is_for_plex_servers_only(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"), server_type=ServerType.EMBY)
+    monkeypatch.setattr(runner_module.embyish_counter, "count_embyish", lambda *_a, **_kw: _catch_up_result("a"))
+
+    _check(runner, "nightly")
+
+    assert started == []
+
+
+def test_catch_up_skips_a_server_whose_check_failed(store, monkeypatch):
+    runner, started = _catch_up_runner(store, monkeypatch, _catch_up_result("a"))
+    monkeypatch.setattr(runner_module.plex_counter, "count_plex", MagicMock(side_effect=RuntimeError("down")))
+
+    _check(runner, "nightly")
+
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    ("status", "server_id", "name", "expected"),
+    [
+        ("pending", "a", "Catch-up for TV Shows: 3 files", True),
+        ("running", "a", "Catch-up for TV Shows: 3 files", True),
+        ("completed", "a", "Catch-up for TV Shows: 3 files", False),
+        ("running", "b", "Catch-up for TV Shows: 3 files", False),
+        ("running", "a", "Catch-up for Movies: 3 files", False),
+    ],
+)
+def test_catch_up_in_progress_looks_for_a_live_job_of_that_library(monkeypatch, status, server_id, name, expected):
+    from media_preview_generator.web import jobs as jobs_module
+
+    job = SimpleNamespace(server_id=server_id, status=jobs_module.JobStatus(status), library_name=name)
+    monkeypatch.setattr(jobs_module, "get_job_manager", lambda: SimpleNamespace(get_all_jobs=lambda: [job]))
+
+    assert runner_module.catch_up_in_progress(_cfg("a"), "Catch-up for TV Shows") is expected
+
+
+def test_the_catch_up_title_matches_the_job_name_start_files_job_creates(monkeypatch):
+    """A running catch-up job is found by the title ``_catch_up_library`` passes; a finished one isn't."""
+    from media_preview_generator.web import jobs as jobs_module
+
+    created = []
+
+    class FakeJobManager:
+        def create_job(self, *, library_name, **kwargs):
+            job = SimpleNamespace(
+                id="j1", server_id=kwargs["server_id"], status=jobs_module.JobStatus.RUNNING, library_name=library_name
+            )
+            created.append(job)
+            return job
+
+        def get_all_jobs(self):
+            return created
+
+    manager = FakeJobManager()
+    monkeypatch.setattr(jobs_module, "get_job_manager", lambda: manager)
+    monkeypatch.setattr("media_preview_generator.web.routes.job_runner._start_job_async", lambda *_a, **_kw: None)
+    cfg = _cfg("a")
+    cfg.output = {}
+    titles = []
+
+    def start(cfg_, files, title):
+        titles.append(title)
+        runner_module.start_files_job(cfg_, files, title)
+
+    runner = HealthRunner(
+        MagicMock(),
+        registry_factory=lambda: None,
+        markers_db_path=lambda: "/nope",
+        start_files_job=start,
+    )
+    runner._store.todo_for.return_value = [TodoFile(Feature.PREVIEWS, "/tv/p.mkv", "p", "1", False, "1")]
+    library = _catch_up_result("a").libraries[0]
+
+    runner._catch_up_library(cfg, library)
+
+    assert titles == ["Catch-up for TV Shows"]
+    assert runner_module.catch_up_in_progress(cfg, titles[0]) is True
+    created[0].status = jobs_module.JobStatus.COMPLETED
+    assert runner_module.catch_up_in_progress(cfg, titles[0]) is False

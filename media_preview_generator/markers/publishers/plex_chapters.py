@@ -211,7 +211,7 @@ def chapter_url(media_id: int, index: int, revision: str) -> str:
     return f"/library/media/{media_id}/chapterImages/{index}?mpgChapter={revision}"
 
 
-def _own_chapter_starts(extra_data: Any) -> list[int] | None:
+def own_chapter_starts(extra_data: Any) -> list[int] | None:
     """Read a part's own chapter starts (ms) from Plex's ``pv:chapters``, or None if unreadable."""
     try:
         chapter_list = json.loads(json.loads(extra_data)["pv:chapters"])["Chapters"].get("Chapter", [])
@@ -222,11 +222,35 @@ def _own_chapter_starts(extra_data: Any) -> list[int] | None:
         return None
 
 
-def _chapters_match(own_starts: list[int] | None, shared_rows: list[tuple]) -> bool:
+def chapters_match(own_starts: list[int] | None, shared_starts: list[int]) -> bool:
     """True when a part's own chapters are the shared rows (starts within 1s, rounding aside)."""
-    if not own_starts or len(own_starts) != len(shared_rows):
+    if not own_starts or len(own_starts) != len(shared_starts):
         return False
-    return all(abs(own - row[1]) <= 1000 for own, row in zip(own_starts, shared_rows, strict=True))
+    return all(abs(own - shared) <= 1000 for own, shared in zip(own_starts, shared_starts, strict=True))
+
+
+def other_version_refusal(
+    media_id: int,
+    other_versions: set[int],
+    shown_from: set[int],
+    own_starts: list[int] | None,
+    shared_starts: list[int],
+) -> str:
+    """Why a title with several versions can't take this version's chapter thumbnails, or "" when it can.
+
+    Args:
+        media_id: This version's media id.
+        other_versions: The title's other live versions' media ids.
+        shown_from: Media ids the shared chapter rows' thumbnails point at.
+        own_starts: This part's own chapter starts (``own_chapter_starts``).
+        shared_starts: The shared chapter rows' starts, in order.
+    """
+    if shown_from & other_versions:
+        return "Plex shows this title's chapter thumbnails from another version"
+    # Plex shows the thumbnails of the version whose own chapters it picked for the shared rows.
+    if media_id not in shown_from and not chapters_match(own_starts, shared_starts):
+        return "Plex's chapter list for this title comes from another version"
+    return ""
 
 
 class LocalChapters:
@@ -372,15 +396,11 @@ class LocalChapters:
             if not chapters:
                 raise ChapterError("No chapters", code="no_chapters")
             shown_from = {int(m.group(1)) for c in chapters if (m := _THUMB_MEDIA_ID.search(c[3]))}
-            if shown_from & other_versions:
-                raise ChapterError(
-                    "Plex shows this title's chapter thumbnails from another version", code="other_version"
-                )
-            # Plex shows the thumbnails of the version whose own chapters it picked for the shared rows.
-            if row[1] not in shown_from and not _chapters_match(_own_chapter_starts(row[7]), chapters):
-                raise ChapterError(
-                    "Plex's chapter list for this title comes from another version", code="other_version"
-                )
+            refusal = other_version_refusal(
+                row[1], other_versions, shown_from, own_chapter_starts(row[7]), [c[1] for c in chapters]
+            )
+            if refusal:
+                raise ChapterError(refusal, code="other_version")
         try:
             target = ChapterTarget(
                 row[0],

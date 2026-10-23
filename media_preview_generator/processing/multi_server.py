@@ -45,6 +45,8 @@ from loguru import logger
 from ..bif_reader import read_bif_metadata, unpack_bif_to_jpegs
 from ..config import resolve_frame_interval
 from ..config.paths import expand_path_mapping_candidates
+from ..library_health.failures import clear_failure, record_failure
+from ..library_health.models import Feature
 from ..markers.external_ids import ids_from_path, is_extra
 from ..markers.fs import gone_from_disk
 from ..markers.missing import disk_roots, library_folders
@@ -2317,6 +2319,7 @@ def _process_canonical_path_previews(
 
         if frame_count == 0 and isinstance(gen_result, tuple) and gen_result[-1] == NO_DECODER_SUMMARY:
             # Already logged, once, by the FFmpeg run that found it.
+            record_failure((Feature.PREVIEWS,), canonical_path, NO_DECODER_SUMMARY)
             return MultiServerResult(
                 canonical_path=canonical_path, status=MultiServerStatus.NO_FRAMES, message=NO_DECODER_SUMMARY
             )
@@ -2338,11 +2341,14 @@ def _process_canonical_path_previews(
                 "confirm it's intact. Other files in the queue keep processing; this one is skipped.",
                 canonical_path,
             )
+            record_failure((Feature.PREVIEWS,), canonical_path, ms_message)
             return MultiServerResult(
                 canonical_path=canonical_path,
                 status=MultiServerStatus.NO_FRAMES,
                 message=ms_message,
             )
+
+        clear_failure((Feature.PREVIEWS,), canonical_path)
 
         if _source_changed():
             return _source_changed_result()

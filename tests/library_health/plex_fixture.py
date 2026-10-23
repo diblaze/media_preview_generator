@@ -35,7 +35,7 @@ def build_plex_db(path: str | Path, items: list[dict[str, Any]]) -> None:
         items: One dict per movie/episode with ``section`` (int), ``type`` (1 movie, 4 episode), ``title`` and
             ``parts`` (list of dicts: ``file``, ``hash``, ``extra_data`` and ``audio``, a list of stream
             ``extra_data`` values). Optional: ``show``, ``season_index``, ``index`` (episodes), ``tags``
-            (``"intro"`` / ``"credits"``), ``duration`` (ms) and ``chapters`` (``(start_ms, thumb_url)`` pairs).
+            (``"intro"`` / ``"credits"``), ``more_versions`` (further versions of the title: one parts list each), ``duration`` (ms) and ``chapters`` (``(start_ms, thumb_url)`` pairs).
     """
     conn = sqlite3.connect(str(path))
     conn.executescript(_SCHEMA)
@@ -70,22 +70,23 @@ def build_plex_db(path: str | Path, items: list[dict[str, Any]]) -> None:
             "INSERT INTO metadata_items VALUES (?, ?, ?, ?, ?, ?, NULL)",
             (item_id, item["section"], item["type"], parent_id, item["title"], item.get("index", 1)),
         )
-        media_id = take("media")
-        conn.execute("INSERT INTO media_items VALUES (?, ?, NULL, 0, ?)", (media_id, item_id, item.get("duration")))
-        for part in item["parts"]:
-            part_id = take("part")
-            conn.execute(
-                "INSERT INTO media_parts VALUES (?, ?, ?, ?, ?, NULL)",
-                (part_id, media_id, part["file"], part.get("hash"), part.get("extra_data")),
-            )
-            for stream_extra in part.get("audio", []):
+        for version_parts in [item["parts"], *item.get("more_versions", [])]:
+            media_id = take("media")
+            conn.execute("INSERT INTO media_items VALUES (?, ?, NULL, 0, ?)", (media_id, item_id, item.get("duration")))
+            for part in version_parts:
+                part_id = take("part")
                 conn.execute(
-                    "INSERT INTO media_streams VALUES (?, ?, 2, ?, 1)", (take("stream"), part_id, stream_extra)
+                    "INSERT INTO media_parts VALUES (?, ?, ?, ?, ?, NULL)",
+                    (part_id, media_id, part["file"], part.get("hash"), part.get("extra_data")),
                 )
-            for stream_extra in part.get("unindexed_audio", []):
-                conn.execute(
-                    "INSERT INTO media_streams VALUES (?, ?, 2, ?, NULL)", (take("stream"), part_id, stream_extra)
-                )
+                for stream_extra in part.get("audio", []):
+                    conn.execute(
+                        "INSERT INTO media_streams VALUES (?, ?, 2, ?, 1)", (take("stream"), part_id, stream_extra)
+                    )
+                for stream_extra in part.get("unindexed_audio", []):
+                    conn.execute(
+                        "INSERT INTO media_streams VALUES (?, ?, 2, ?, NULL)", (take("stream"), part_id, stream_extra)
+                    )
         for tag in item.get("tags", []):
             conn.execute(
                 "INSERT INTO taggings (id, metadata_item_id, tag_id, text) VALUES (?, ?, 1, ?)",

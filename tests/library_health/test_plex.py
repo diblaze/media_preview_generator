@@ -76,12 +76,17 @@ def _episode(title, file, section=2, tags=(), bundle_hash=None):
     }
 
 
-def _run(monkeypatch, tmp_path, cfg, items, nothing_found=None, cancel=lambda: False):
+def _run(monkeypatch, tmp_path, cfg, items, nothing_found=None, cancel=lambda: False, unreadable=None):
     db_path = tmp_path / "plex.db"
     build_plex_db(db_path, items)
     monkeypatch.setattr(plex, "_open_db", lambda _cfg: FakeLocalDb(db_path))
     return plex.count_plex(
-        cfg, MagicMock(), nothing_found=nothing_found or {}, cancel_check=cancel, progress=lambda *_: None
+        cfg,
+        MagicMock(),
+        nothing_found=nothing_found or {},
+        cancel_check=cancel,
+        progress=lambda *_: None,
+        unreadable=unreadable,
     )
 
 
@@ -571,3 +576,120 @@ def test_chapters_off_skips_the_chapter_queries(monkeypatch, tmp_path):
     cell = _cell(result, "1", Feature.CHAPTERS)
     assert cell.state == CellState.OFF and cell.total == 0
     assert not [t for t in result.todo if t.feature == Feature.CHAPTERS]
+
+
+def test_files_a_job_found_it_can_never_do_count_as_cant_not_todo(monkeypatch, tmp_path):
+    items = [_episode("A", "/tv/a.mkv"), _episode("B", "/tv/b.mkv")]
+    unreadable = {
+        Feature.PREVIEWS: frozenset({"/tv/a.mkv"}),
+        Feature.INTRO: frozenset({"/tv/a.mkv"}),
+        Feature.CREDITS: frozenset({"/tv/a.mkv"}),
+    }
+
+    result = _run(monkeypatch, tmp_path, _cfg(tmp_path, [_lib("2", "TV", "show")]), items, unreadable=unreadable)
+
+    for feature in (Feature.PREVIEWS, Feature.INTRO, Feature.CREDITS):
+        cell = _cell(result, "2", feature)
+        assert (cell.total, cell.cant_do, cell.todo) == (2, 1, 1), feature
+        assert [t.path for t in result.todo if t.feature == feature] == ["/tv/b.mkv"], feature
+
+
+def test_an_unreadable_file_that_already_has_its_preview_is_done(monkeypatch, tmp_path):
+    write_bif(tmp_path / "plex", "aa11")
+    items = [_movie("A", "/m/a.mkv", "aa11", SD_FLAG, [None])]
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        _cfg(tmp_path, [_lib()]),
+        items,
+        unreadable={Feature.PREVIEWS: frozenset({"/m/a.mkv"})},
+    )
+
+    cell = _cell(result, "1", Feature.PREVIEWS)
+    assert (cell.done, cell.cant_do, cell.todo) == (1, 0, 0)
+
+
+def _two_versions(own_first, own_second, thumbs, file_prefix="/m/x"):
+    """One title with two versions (media ids 1 and 2): each version's own chapters, and the shared rows' thumbnails."""
+
+    def own(starts):
+        chapter_list = {"Chapters": {"Chapter": [{"start": str(start)} for start in starts]}}
+        return json.dumps({"pv:chapters": json.dumps(chapter_list)})
+
+    first = {"file": f"{file_prefix}1.mkv", "hash": None, "extra_data": own(own_first), "audio": []}
+    second = {"file": f"{file_prefix}2.mkv", "hash": None, "extra_data": own(own_second), "audio": []}
+    item = _movie("X", "", parts=[first])
+    item["more_versions"] = [[second]]
+    return _with_chapters(item, [(0, thumbs[0]), (60_000, thumbs[1])])
+
+
+def test_chapters_shown_from_another_version_are_cant_for_the_other_version_only(monkeypatch, tmp_path):
+    # Plex shows version 2's thumbnail on chapter 1; chapter 2 has none.
+    other = "/library/media/2/chapterImages/1?mpgChapter=abc"
+    items = [_two_versions([0, 60], [0, 60], (other, ""))]
+
+    result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    assert (cell.total, cell.cant_do, cell.todo) == (2, 1, 1)
+    assert [t.path for t in result.todo if t.feature == Feature.CHAPTERS] == ["/m/x2.mkv"]
+
+
+def test_chapters_the_shared_rows_took_from_another_version_are_cant_for_this_one(monkeypatch, tmp_path):
+    # No thumbnails yet; version 1's own chapters are the shared rows, version 2's differ.
+    items = [_two_versions([0, 60], [0, 300], ("", ""))]
+
+    result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
+
+    cell = _cell(result, "1", Feature.CHAPTERS)
+    assert (cell.total, cell.cant_do, cell.todo) == (2, 1, 1)
+    assert [t.path for t in result.todo if t.feature == Feature.CHAPTERS] == ["/m/x1.mkv"]
+
+
+def test_a_title_with_one_version_ignores_the_version_rule(monkeypatch, tmp_path):
+    items = [_with_chapters(_movie("A", "/m/a.mkv"), [(0, ""), (60_000, "")])]
+
+    result = _run(monkeypatch, tmp_path, _chapters_cfg(tmp_path), items)
+
+    assert _cell(result, "1", Feature.CHAPTERS).cant_do == 0
+
+
+def test_an_older_node_without_chapter_version_rows_skips_the_version_rule():
+    raw = {
+        "parts": [
+            [1, 10, 1, 100, "/m/x1.mkv", None, None, "X", None, None, 1, None, 1],
+            [1, 10, 1, 101, "/m/x2.mkv", None, None, "X", None, None, 1, None, 2],
+        ],
+        "audio_counts": [],
+        "loudness_streams": [],
+        "markers": [],
+        "durations": [],
+        "chapters": [[10, 2, "1:0,2:60000"]],
+    }
+
+    rows = plex._rows_from(raw, {})
+    part = plex._Part("1", 10, 100, "/m/x1.mkv", "X", "", "", 1)
+
+    assert rows.chapters[10].starts is None
+    assert plex._chapter_state("", part, rows, plex.Counter({1: 1, 2: 1})) == "todo"
+
+
+def test_a_chapter_versions_row_with_a_non_numeric_media_id_is_ignored_not_fatal():
+    raw = {
+        "parts": [
+            [1, 10, 1, 100, "/m/x1.mkv", None, None, "X", None, None, 1, None, 1],
+            [1, 10, 1, 101, "/m/x2.mkv", None, None, "X", None, None, 1, None, 2],
+        ],
+        "audio_counts": [],
+        "loudness_streams": [],
+        "markers": [],
+        "durations": [],
+        "chapters": [[10, 2, "1:0,2:60000"]],
+        "chapter_versions": [[10, "0,60000", "2,abc"]],
+    }
+
+    rows = plex._rows_from(raw, {})
+
+    assert rows.chapters[10].starts == [0, 60000]
+    assert rows.chapters[10].shown_from == {2}

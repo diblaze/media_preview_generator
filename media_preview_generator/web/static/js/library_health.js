@@ -214,18 +214,19 @@
             : `<span class="lh-done"><i class="bi bi-check2" aria-hidden="true"></i> ${DONE_TEXT[feature]}</span>`;
         const bar = `<div class="lh-bar lh-bar-${feature}" aria-hidden="true"><i class="lh-fill" style="width:${donePct.toFixed(2)}%"></i><i class="lh-hatch" style="width:${nonePct.toFixed(2)}%"></i></div>`;
         let note = '';
+        const cantRead = cell.cant_do ? ` · ${n(cell.cant_do)} can't be read` : '';
         if (feature === 'chapters') {
             note = `${n(cell.done)} done`
                 + (cell.nothing_found ? ` · ${n(cell.nothing_found)} have no chapters in the file` : '')
                 + (cell.cant_do ? ` · ${n(cell.cant_do)} can't get thumbnails` : '');
         } else if (HAVE_TEXT[feature]) {
-            note = `${n(cell.done)} ${HAVE_TEXT[feature]}` + (cell.nothing_found ? ` · ${n(cell.nothing_found)} ${NONE_TEXT[feature]}` : '');
+            note = `${n(cell.done)} ${HAVE_TEXT[feature]}` + (cell.nothing_found ? ` · ${n(cell.nothing_found)} ${NONE_TEXT[feature]}` : '') + cantRead;
         } else if (cell.todo > 0) {
             const pct = Math.min(99, Math.round(donePct));
-            note = `${n(cell.done)} of ${n(total)} done · ${pct}%`;
+            note = `${n(cell.done)} of ${n(total)} done · ${pct}%${cantRead}`;
         } else {
             // Keeps a done cell as tall as a to-do one, so "not showing in Plex" sits on the same line in every row.
-            note = `${n(cell.done)} done`;
+            note = `${n(cell.done)} done${cantRead}`;
         }
         const noteHtml = note ? `<span class="lh-note">${note}</span>` : '';
         const warn = feature === 'previews' && server.type === 'plex' && cell.not_showing > 0

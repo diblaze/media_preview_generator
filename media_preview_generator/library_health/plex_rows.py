@@ -51,6 +51,25 @@ JOIN metadata_items mi ON mi.id = t.metadata_item_id
 WHERE mi.library_section_id IN ({ids}) AND mi.metadata_type IN (1, 4) AND mi.deleted_at IS NULL
 GROUP BY t.metadata_item_id
 """
+# For a title with more than one version only: every chapter's start in order, and the media ids its thumbnails point
+# at ('/library/media/<id>/chapterImages/...', the id starting at character 16), which is what the chapter step reads
+# to tell this version's chapters from another's. A separate key, not more CHAPTERS_SQL columns, so an app and a Plex
+# database node of different releases each ignore the rows they don't know.
+CHAPTER_VERSIONS_SQL = """
+SELECT metadata_item_id, GROUP_CONCAT(COALESCE(time_offset, 0)),
+       GROUP_CONCAT(DISTINCT CASE WHEN thumb_url GLOB '/library/media/[0-9]*/chapterImages/*'
+           THEN substr(thumb_url, 16, instr(substr(thumb_url, 16), '/') - 1) END)
+FROM (
+    SELECT t.metadata_item_id, t.time_offset, t.thumb_url
+    FROM taggings t JOIN tags ON tags.id = t.tag_id AND tags.tag_type = 9
+    JOIN metadata_items mi ON mi.id = t.metadata_item_id
+    WHERE mi.library_section_id IN ({ids}) AND mi.metadata_type IN (1, 4) AND mi.deleted_at IS NULL
+      AND (SELECT COUNT(*) FROM media_items mdi WHERE mdi.metadata_item_id = mi.id AND mdi.deleted_at IS NULL
+           AND COALESCE(mdi.proxy_type, 0) = 0) > 1
+    ORDER BY t.metadata_item_id, t."index", t.id
+)
+GROUP BY metadata_item_id
+"""
 DURATIONS_SQL = """
 SELECT mdi.metadata_item_id, MAX(mdi.duration) FROM media_items mdi
 JOIN metadata_items mi ON mi.id = mdi.metadata_item_id
@@ -77,8 +96,8 @@ def query_rows(
         want_chapters: Also read chapters and the items' durations.
 
     Returns:
-        ``{"parts", "audio_counts", "loudness_streams", "markers", "chapters", "durations"}``, each SQLite's row
-        tuples (``markers``/``chapters``/``durations`` empty when not wanted).
+        ``{"parts", "audio_counts", "loudness_streams", "markers", "chapters", "chapter_versions", "durations"}``,
+        each SQLite's row tuples (``markers``/``chapters``/``chapter_versions``/``durations`` empty when not wanted).
     """
     marks = ",".join("?" * len(section_ids))
 
@@ -91,6 +110,7 @@ def query_rows(
         "loudness_streams": rows(LOUDNESS_STREAMS_SQL, section_ids),
         "markers": rows(MARKERS_SQL, []) if want_markers else iter(()),
         "chapters": rows(CHAPTERS_SQL, section_ids) if want_chapters else iter(()),
+        "chapter_versions": rows(CHAPTER_VERSIONS_SQL, section_ids) if want_chapters else iter(()),
         "durations": rows(DURATIONS_SQL, section_ids) if want_chapters else iter(()),
     }
 
