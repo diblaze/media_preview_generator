@@ -19,7 +19,9 @@ import os
 from flask import jsonify
 from loguru import logger
 
+from ...gpu.detect import NVIDIA_DRIVER_MISSING_FIX, NVIDIA_DRIVER_MISSING_WHY, nvidia_gpu_without_driver
 from ...gpu.vulkan_check import diagnose_nvidia_environment, get_vulkan_checks, nvidia_cause
+from ...gpu.vulkan_probe import NVIDIA_GRAPHICS_FILES_DOCS
 from ..auth import setup_or_auth_required
 from . import api
 from ._helpers import _ensure_gpu_cache
@@ -135,8 +137,8 @@ def _nvidia_body_html(cause: str, diag: dict, nvidia_name: str) -> str:
         )
     elif cause == "nvidia_graphics_libs_missing":
         # Case A1b (issue #419): graphics is asked for, CUDA works, but not one graphics file arrived — not the
-        # ICD JSON, not libEGL_nvidia, not glvkspirv. The runtime wasn't asked (--gpus all alone on a CDI Docker)
-        # or the host driver has no graphics part to give (Synology / NAS driver packages).
+        # ICD JSON, not libEGL_nvidia, not glvkspirv. The host driver has no graphics part, or its container setup
+        # doesn't pass it on (a Synology/ARC driver had the files on the host and still sent none).
         logger.debug(
             "Vulkan warning: selected Case A1b (graphics cap set but no NVIDIA graphics files at all) for {!r}",
             nvidia_name,
@@ -145,17 +147,20 @@ def _nvidia_body_html(cause: str, diag: dict, nvidia_name: str) -> str:
             f"<strong>Your GPU:</strong> {nvidia_name_esc}"
             "<br><br>"
             "<code>NVIDIA_DRIVER_CAPABILITIES</code> asks for graphics and CUDA works, but none of NVIDIA's "
-            "graphics driver files (<code>nvidia_icd.json</code>, <code>libEGL_nvidia.so</code>, "
-            "<code>libnvidia-glvkspirv.so</code>) are inside the container, so there is no NVIDIA Vulkan "
+            "graphics driver files (<code>libGLX_nvidia.so</code>, <code>libEGL_nvidia.so</code>, "
+            "<code>libnvidia-glvkspirv.so</code>) reached the container, so there is no NVIDIA Vulkan "
             "driver to use."
             "<br><br>"
-            '<span class="small"><strong>Fix:</strong></span>'
+            '<span class="small"><strong>Fix:</strong> look for those files on the host (not in this '
+            "container):</span>"
+            "<div class=\"small mt-1\"><code>find / -xdev -name 'libGLX_nvidia.so*' 2&gt;/dev/null</code></div>"
             '<ul class="small mb-0 mt-1">'
-            "<li>If you start the container with <code>--gpus all</code> alone, also add "
-            "<code>--runtime=nvidia</code> (Docker Compose: <code>runtime: nvidia</code>) and restart.</li>"
-            "<li>If it already uses the NVIDIA runtime, the host's NVIDIA driver doesn't include its Vulkan "
-            "part. Some NAS driver packages, such as Synology's, leave it out. Installing a full NVIDIA driver "
-            "on the host fixes it; otherwise this host can't tone map those thumbnails.</li>"
+            "<li><strong>It finds them:</strong> the host's NVIDIA container setup isn't passing them in. "
+            "Mount them into the container yourself; "
+            f'<a href="{NVIDIA_GRAPHICS_FILES_DOCS}" target="_blank" rel="noopener">this guide</a> '
+            "has the lines to add. It's also worth telling whoever provides your NVIDIA driver package.</li>"
+            "<li><strong>It finds nothing:</strong> the host's NVIDIA driver was installed without its graphics "
+            "part. Install the full driver.</li>"
             "</ul>"
         )
     elif cause == "nvidia_icd_missing":
@@ -494,6 +499,15 @@ def _get_vulkan_info() -> dict:
             "node's group (usually <code>render</code> or "
             "<code>video</code>) needs to be readable by that user.</li>"
             "</ul>"
+        )
+    elif nvidia_gpu_without_driver():
+        # Case E1 (issue #419): /dev/nvidia* passed in without the NVIDIA runtime, so no GPU was detected.
+        logger.debug("Vulkan warning: selected Case E1 (NVIDIA GPU passed in without its driver)")
+        body = (
+            f"{html_escape.escape(NVIDIA_DRIVER_MISSING_WHY)}"
+            "<br><br>"
+            '<span class="small"><strong>Fix:</strong> '
+            f"{html_escape.escape(NVIDIA_DRIVER_MISSING_FIX)}</span>"
         )
     else:
         # No GPU detected at all.

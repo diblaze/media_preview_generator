@@ -2087,6 +2087,21 @@ function _renderCpuFallbackLine(count) {
         + `${files} on the CPU because the GPU failed</div>`;
 }
 
+// Job-details note for files fully decoded because their built-in snapshot frames sit further apart than the
+// thumbnail interval (progress.slow_path_files / slow_path_interval, JobTracker). Nothing when none did.
+function _renderSlowPathNote(job) {
+    const progress = (job && job.progress) || {};
+    const n = Number(progress.slow_path_files) || 0;
+    if (n <= 0) return '';
+    const interval = escapeHtml(String(Number(progress.slow_path_interval) || ''));
+    const lead = n === 1
+        ? '1 file needed a full decode, which is much slower: its built-in snapshot frames are'
+        : `${escapeHtml(n.toLocaleString())} files needed a full decode, which is much slower: their built-in snapshot frames are`;
+    return `<div class="alert alert-info small mt-2 mb-0 slow-path-note" role="status">${lead} further apart than `
+        + `your ${interval}-second thumbnail interval. A longer interval (the default is 10 seconds) lets more files `
+        + `take the fast path.</div>`;
+}
+
 function _renderPublishersBlock(job, options) {
     // D12 — per-server aggregate (one row per registered server with
     // status counts), NOT per-file. Per-file × per-server attribution

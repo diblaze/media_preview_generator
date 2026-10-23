@@ -2093,7 +2093,7 @@ class TestProactiveDVSkip:
             pytest.param(
                 True,
                 "all",
-                "start the container with --runtime=nvidia",
+                "start it with the NVIDIA runtime (Docker Compose: runtime: nvidia; docker run: --runtime=nvidia",
                 "set NVIDIA_DRIVER_CAPABILITIES",
                 id="node-caps-all",
             ),

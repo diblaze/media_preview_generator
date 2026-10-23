@@ -224,7 +224,8 @@ class TestProbeLogs:
 
 
 class TestTheNvidiaStepWhenTheDriverIsMounted:
-    """Issue #419: with the NVIDIA runtime already in use, "add --runtime=nvidia" alone sends users in circles."""
+    """Issue #419: with the NVIDIA runtime already in use, "add --runtime=nvidia" sends users in circles; a host that
+    has the graphics files but doesn't pass them on needs the host check and the mount steps instead."""
 
     @pytest.mark.parametrize(
         ("diag", "says_host_driver"),
@@ -254,14 +255,16 @@ class TestTheNvidiaStepWhenTheDriverIsMounted:
         fix = vulkan_probe.dv5_no_vulkan_fix()
 
         assert RUNTIME_FIX not in fix, fix
-        assert ("the host's NVIDIA driver doesn't include Vulkan" in fix) is says_host_driver, fix
-        assert ("--runtime=nvidia" in fix) is says_host_driver, fix
+        assert "--runtime=nvidia" not in fix, fix
+        assert ("find / -xdev -name 'libGLX_nvidia.so*'" in fix) is says_host_driver, fix
+        assert ("#nvidia-graphics-files-missing-from-the-container" in fix) is says_host_driver, fix
+        assert ("install the host's full NVIDIA driver" in fix) is says_host_driver, fix
         assert "on Intel/AMD, pass /dev/dri into the container" in fix, fix
 
 
 RUNTIME_FIX = (
-    "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the container "
-    "with --runtime=nvidia"
+    "on NVIDIA, the NVIDIA driver isn't in the container: start it with the NVIDIA runtime (Docker Compose: "
+    "runtime: nvidia; docker run: --runtime=nvidia or --gpus all)"
 )
 
 
@@ -378,7 +381,9 @@ class TestDashboardWarning:
         if driver_version:
             assert driver_version in body, body
 
-    def test_the_no_graphics_files_case_names_the_runtime_and_the_host_driver(self) -> None:
+    def test_the_no_graphics_files_case_has_the_host_check_and_both_outcomes(self) -> None:
+        """Issue #419: the reporter's host had the files and still sent none, so "the host driver has no Vulkan" was
+        wrong; and --gpus all does bring the files, so blaming it was wrong too."""
         from media_preview_generator.web.routes.api_vulkan import _nvidia_body_html
 
         body = _nvidia_body_html(
@@ -388,8 +393,34 @@ class TestDashboardWarning:
         )
 
         assert "570" not in body, body
-        assert "runtime: nvidia" in body, body
-        assert "host's NVIDIA driver doesn't include its Vulkan part" in body, body
+        assert "--gpus all" not in body, body
+        assert "find / -xdev -name 'libGLX_nvidia.so*' 2&gt;/dev/null" in body, body
+        assert "isn't passing them in" in body, body
+        assert (
+            'href="https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/'
+            '#nvidia-graphics-files-missing-from-the-container"' in body
+        ), body
+        assert "installed without its graphics part" in body, body
+
+    @pytest.mark.parametrize("without_driver", [True, False], ids=["device-without-driver", "no-nvidia-device"])
+    def test_no_gpu_names_the_nvidia_runtime_when_an_nvidia_device_came_without_its_driver(
+        self, without_driver: bool
+    ) -> None:
+        from media_preview_generator.web.routes.api_vulkan import _get_vulkan_info
+
+        _gpu_cache["result"] = []
+        with (
+            patch("media_preview_generator.gpu.vulkan_probe._probe_vulkan_device", return_value=SOFTWARE_DEVICE),
+            patch("media_preview_generator.web.routes.api_vulkan.glob.glob", return_value=[]),
+            patch(
+                "media_preview_generator.web.routes.api_vulkan.nvidia_gpu_without_driver", return_value=without_driver
+            ),
+        ):
+            warning = _get_vulkan_info()["warning"]
+
+        assert ("no nvidia-smi" in warning) is without_driver, warning
+        assert ("runtime: nvidia" in warning) is without_driver, warning
+        assert ("No GPU detected in this container" in warning) is not without_driver, warning
 
     def test_loader_rejected_log_says_wrong_colours_when_nvidia_checks_pass(self) -> None:
         from media_preview_generator.web.routes.api_vulkan import _get_vulkan_info

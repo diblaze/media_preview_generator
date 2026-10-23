@@ -549,6 +549,8 @@ async function showLogsModal(jobId) {
         _hdr.innerHTML = _job ? _renderPublishersBlock(_job, { filterLinks: true }) : '';
         _initBootstrapTooltips(_hdr);
     }
+    const slowPathNote = document.getElementById('jobSlowPathNote');
+    if (slowPathNote) slowPathNote.innerHTML = _job ? _renderSlowPathNote(_job) : '';
     const resultDetails = document.getElementById('jobServerResults');
     if (resultDetails) {
         resultDetails.hidden = !_hdr?.textContent.trim();

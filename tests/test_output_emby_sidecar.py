@@ -135,6 +135,98 @@ class TestPublish:
             adapter.publish(bundle, [])
 
 
+class TestSupersededSidecarsRemoved:
+    """Issue #419: changing the thumbnail interval writes ``-320-6.bif`` and used to leave ``-320-10.bif`` beside it."""
+
+    @staticmethod
+    def _publish(tmp_path: Path, adapter: EmbyBifAdapter, video: str = "Movie (2024).mkv") -> Path:
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir(exist_ok=True)
+        for i in range(3):
+            (frame_dir / f"{i:05d}.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 100)
+        media = tmp_path / "media" / video
+        media.parent.mkdir(exist_ok=True)
+        media.write_bytes(b"x")
+        bundle = _make_bundle(str(media), frame_dir)
+        adapter.publish(bundle, adapter.compute_output_paths(bundle, None, None))
+        return media.parent
+
+    @staticmethod
+    def _ours(folder: Path, name: str) -> Path:
+        """A sidecar this app wrote: it has the .meta journal beside it."""
+        sidecar = folder / name
+        sidecar.write_bytes(b"old")
+        (folder / f"{name}.meta").write_text("{}")
+        return sidecar
+
+    def test_an_earlier_interval_or_width_this_app_wrote_is_removed_with_its_journal(self, tmp_path):
+        folder = tmp_path / "media"
+        folder.mkdir()
+        old_interval = self._ours(folder, "Movie (2024)-320-10.bif")
+        old_width = self._ours(folder, "Movie (2024)-480-6.bif")
+
+        self._publish(tmp_path, EmbyBifAdapter(width=320, frame_interval=6))
+
+        assert (folder / "Movie (2024)-320-6.bif").is_file()
+        for gone in (old_interval, old_width):
+            assert not gone.exists()
+            assert not Path(f"{gone}.meta").exists()
+
+    def test_sidecars_it_didnt_write_another_servers_and_other_videos_are_kept(self, tmp_path):
+        folder = tmp_path / "media"
+        folder.mkdir()
+        embys_own = folder / "Movie (2024)-320-10.bif"  # no .meta: Emby's own, or from before the journal
+        embys_own.write_bytes(b"emby")
+        other_server = self._ours(folder, "Movie (2024)-480-10.bif")
+        other_video = self._ours(folder, "Movie (2024) - Extended-320-10.bif")
+        longer_name = self._ours(folder, "Movie (2024)-Part2-320-10.bif")
+        not_a_size = self._ours(folder, "Movie (2024)-320-ten.bif")
+
+        self._publish(tmp_path, EmbyBifAdapter(width=320, frame_interval=6, keep_sizes=frozenset({(480, 10)})))
+
+        for kept in (embys_own, other_server, other_video, longer_name, not_a_size):
+            assert kept.is_file(), kept
+
+    def test_names_with_glob_characters_match_only_their_own_sidecars(self, tmp_path):
+        """Sonarr/Radarr names carry [quality] and {edition} tags; unescaped, [1080p] would be a character class."""
+        folder = tmp_path / "media"
+        folder.mkdir()
+        old = self._ours(folder, "Movie [1080p] {edition-X}-320-10.bif")
+        lookalike = self._ours(folder, "Movie 1-320-10.bif")
+        odd_digits = self._ours(folder, "Movie [1080p] {edition-X}-\u00b2-10.bif")
+
+        self._publish(tmp_path, EmbyBifAdapter(width=320, frame_interval=6), video="Movie [1080p] {edition-X}.mkv")
+
+        assert (folder / "Movie [1080p] {edition-X}-320-6.bif").is_file()
+        assert not old.exists()
+        assert lookalike.is_file()
+        assert odd_digits.is_file()
+
+    def test_nothing_is_removed_when_the_new_sidecar_could_not_be_written(self, tmp_path, monkeypatch):
+        folder = tmp_path / "media"
+        folder.mkdir()
+        old = self._ours(folder, "Movie (2024)-320-10.bif")
+
+        def _fail(*_args, **_kwargs):
+            raise OSError(errno.EIO, "disk error", str(folder / "Movie (2024)-320-6.bif"))
+
+        monkeypatch.setattr("media_preview_generator.processing.generator.generate_bif", _fail)
+        with pytest.raises(OSError):
+            self._publish(tmp_path, EmbyBifAdapter(width=320, frame_interval=6))
+
+        assert old.is_file()
+
+    def test_republishing_the_same_size_keeps_its_own_sidecar(self, tmp_path):
+        adapter = EmbyBifAdapter(width=320, frame_interval=6)
+        folder = self._publish(tmp_path, adapter)
+        (folder / "Movie (2024)-320-6.bif.meta").write_text("{}")
+
+        self._publish(tmp_path, adapter)
+
+        assert (folder / "Movie (2024)-320-6.bif").is_file()
+        assert (folder / "Movie (2024)-320-6.bif.meta").is_file()
+
+
 class TestStaticHelpers:
     def test_sidecar_path(self):
         assert EmbyBifAdapter.sidecar_path(
@@ -427,3 +519,68 @@ class TestInterruptedWriteTempsSwept:
         assert (same_name_dir / "keep.jpg").read_bytes() == b"user"
         assert file_link.is_symlink() and outside_file.read_bytes() == b"user"
         assert dir_link.is_symlink() and (outside_dir / "keep.jpg").read_bytes() == b"user"
+
+
+def test_every_configured_emby_servers_size_is_kept_and_other_formats_are_ignored():
+    """Two Emby servers on one media folder each keep their own sidecar; a disabled one keeps its too."""
+    from media_preview_generator.processing.multi_server import _adapter_for_server, _emby_sidecar_sizes
+
+    def _cfg(sid: str, kind: ServerType, output: dict, enabled: bool = True) -> ServerConfig:
+        return ServerConfig(id=sid, type=kind, name=sid, enabled=enabled, url="http://x", auth={}, output=output)
+
+    registry = MagicMock()
+    registry.configs.return_value = [
+        _cfg("emby-a", ServerType.EMBY, {"frame_interval": 6}),
+        _cfg("emby-b", ServerType.EMBY, {"width": 480, "frame_interval": 10}, enabled=False),
+        _cfg("jf", ServerType.JELLYFIN, {"width": 640, "frame_interval": 2}),
+        _cfg("plex", ServerType.PLEX, {"frame_interval": 5}),
+    ]
+
+    sizes = _emby_sidecar_sizes(registry)
+
+    assert sizes == frozenset({(320, 6), (480, 10)})
+    adapter = _adapter_for_server(registry.configs.return_value[0], sizes)
+    assert isinstance(adapter, EmbyBifAdapter)
+    assert adapter._keep_sizes == sizes
+
+
+def test_two_emby_servers_on_one_folder_keep_each_others_sidecars_through_a_real_publish(mock_config, tmp_path):
+    """Without the configured sizes reaching the adapters, each server's publish would delete the other's sidecar and
+    every scan would make both again. A size no server uses any more is still removed."""
+    from unittest.mock import patch
+
+    from media_preview_generator.processing.multi_server import MultiServerStatus, process_canonical_path
+    from media_preview_generator.servers import Library, ServerRegistry
+    from tests.test_processing_multi_server import _populate_frames, _seed_canonical_file, _server_config
+
+    mock_config.working_tmp_folder = str(tmp_path / "tmp")
+    mock_config.plex_bif_frame_interval = 6
+    folder = tmp_path / "data" / "movies" / "Test (2024)"
+    media_file = _seed_canonical_file(folder)
+    stale = folder / "Test (2024)-480-10.bif"
+    stale.write_bytes(b"old")
+    (folder / "Test (2024)-480-10.bif.meta").write_text("{}")
+    libraries = [Library(id="1", name="Movies", remote_paths=(str(tmp_path / "data" / "movies"),), enabled=True)]
+    registry = ServerRegistry.from_settings(
+        [
+            _server_config(
+                server_id=sid,
+                server_type=ServerType.EMBY,
+                libraries=libraries,
+                output={"adapter": "emby_sidecar", "width": 320, "frame_interval": interval},
+            )
+            for sid, interval in (("emby-a", 10), ("emby-b", 6))
+        ]
+    )
+
+    def extract(video_file, output_folder, *args, **kwargs):
+        _populate_frames(output_folder, count=3, real_images=False)
+        return (True, 3, False, 1.0, "1.0x", None)
+
+    with patch("media_preview_generator.processing.multi_server.generate_images", side_effect=extract):
+        result = process_canonical_path(canonical_path=str(media_file), registry=registry, config=mock_config)
+
+    assert result.status is MultiServerStatus.PUBLISHED
+    assert (folder / "Test (2024)-320-10.bif").is_file()
+    assert (folder / "Test (2024)-320-6.bif").is_file()
+    assert not stale.exists()

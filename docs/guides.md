@@ -679,8 +679,7 @@ docker run -d --name media-preview-node -p 9494:9494 \
 - Mount your media read-only. At the same path as in the app's container, the mappings Add node fills in work as
   they are.
 - Pass the GPU the same way you pass it to the app: for NVIDIA, `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`
-  (Dolby Vision tone mapping needs the second; if the node's log still says Dolby Vision Profile 5 thumbnails will
-  have the wrong colours, also add `--runtime=nvidia`). Keep `--device /dev/dri:/dev/dri` only
+  (Dolby Vision tone mapping needs the second). Keep `--device /dev/dri:/dev/dri` only
   if the machine has an Intel or AMD GPU: on a machine without `/dev/dri` the container doesn't start ("error
   gathering device information").
 - The node makes its own key, printed once in `docker logs`. To pick your own, add `-e NODE_KEY=...` with a key
@@ -1840,7 +1839,7 @@ You don't have to do anything for these — the container handles them on startu
 >
 > **Fix:** add `-e NVIDIA_DRIVER_CAPABILITIES=all` to your `docker run` command (or set it in the `environment:` block of your compose file) and restart the container. `all` is what the official NVIDIA Vulkan images use. If you prefer minimum privilege, `compute,video,utility,graphics` works too.
 >
-> If those thumbnails are still tinted, or the in-app warning banner still shows, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose): with `--gpus all` alone, some Docker setups leave that driver out. If it already uses the NVIDIA runtime and the banner says none of NVIDIA's graphics driver files are in the container, the host's NVIDIA driver has no Vulkan part (some NAS driver packages, such as Synology's, leave it out).
+> If NVIDIA's Vulkan driver arrives without the small config files that point to it (as with `--gpus all` on some Docker setups), the app writes them itself. If the banner says none of NVIDIA's graphics driver files are in the container, see [NVIDIA graphics files missing from the container](hdr-dolby-vision-thumbnails.md#nvidia-graphics-files-missing-from-the-container).
 >
 > If the banner persists after that, you may be hitting a less-common cause (a driver-version regression, a missing library in the container runtime config, or an ICD file in the wrong place). The banner will name the specific cause; `GET /api/system/vulkan/debug` returns a plain-text diagnostic bundle you can attach to a GitHub issue.
 

@@ -145,11 +145,12 @@ class TestNvidiaDeviceWithoutDriver:
         finally:
             logger.remove(sink_id)
 
-        hits = [m for m in messages if "NVIDIA driver isn't" in m]
+        hits = [m for m in messages if "passed into this container" in m]
         assert len(hits) == (1 if warns else 0), messages
         if warns:
             assert "runtime: nvidia" in hits[0]
             assert "--runtime=nvidia or --gpus all" in hits[0]
+            assert "NVIDIA_DRIVER_CAPABILITIES=all" in hits[0]
 
 
 class TestHwaccelAvailability:
@@ -1911,6 +1912,13 @@ class TestProbeVulkanDevice:
 
         _reset_vulkan_device_cache()
 
+    @pytest.fixture(autouse=True)
+    def _no_host_libglx_nvidia(self, monkeypatch):
+        """Strategy 2d looks for libGLX_nvidia on disk; a test box with an NVIDIA driver must not change these tests."""
+        from media_preview_generator.gpu import vulkan_probe
+
+        monkeypatch.setattr(vulkan_probe, "_LIBGLX_NVIDIA_GLOBS", ())
+
     @patch(
         "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
         return_value=True,
@@ -2357,6 +2365,118 @@ class TestProbeVulkanDevice:
         assert device == "llvmpipe (software) (0x0)"
         assert mock_run.call_count == 2
         assert get_vulkan_env_overrides() == {}
+
+    @patch(
+        "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
+        return_value=True,
+    )
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libglx_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json")
+    @patch("media_preview_generator.gpu.vulkan_probe.subprocess.run")
+    def test_strategy_2d_writes_the_icd_json_when_only_the_driver_library_arrived(
+        self, mock_run, mock_find_icd, mock_find_egl, mock_find_libegl, mock_find_libglx, _mock_vk, tmp_path
+    ):
+        """Issue #419: --gpus all without the NVIDIA runtime brings libGLX_nvidia (NVIDIA's Vulkan driver) but no
+        nvidia_icd.json. Verified on a real container: the EGL vendor JSON alone (2c) still gets llvmpipe; the ICD
+        JSON plus the EGL vendor JSON together get the GPU. The probe writes both and keeps them for FFmpeg."""
+        from media_preview_generator.gpu import _probe_vulkan_device, get_vulkan_env_overrides
+
+        mock_find_icd.return_value = None
+        mock_find_egl.return_value = None
+        mock_find_libegl.return_value = "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0"
+        mock_find_libglx.return_value = "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0"
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)")),
+            MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)")),
+            MagicMock(returncode=0, stderr=self._stderr_with_device("Quadro P5000 (discrete) (0x1bb0)")),
+        ]
+
+        with patch("media_preview_generator.utils.tempfile.gettempdir", return_value=str(tmp_path)):
+            device = _probe_vulkan_device()
+
+        assert device == "Quadro P5000 (discrete) (0x1bb0)"
+        assert mock_run.call_count == 3
+        icd_path = tmp_path / "plex_previews_nvidia_icd.json"
+        vendor_path = tmp_path / "plex_previews_nvidia_egl_vendor.json"
+        assert json.loads(icd_path.read_text()) == {
+            "file_format_version": "1.0.1",
+            "ICD": {"library_path": "libGLX_nvidia.so.0", "api_version": "1.3.0"},
+        }
+        expected_env = {"VK_DRIVER_FILES": str(icd_path), "__EGL_VENDOR_LIBRARY_FILENAMES": str(vendor_path)}
+        env_arg = mock_run.call_args_list[2].kwargs.get("env") or {}
+        assert {key: env_arg.get(key) for key in expected_env} == expected_env
+        assert get_vulkan_env_overrides() == expected_env
+
+    @patch(
+        "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
+        return_value=True,
+    )
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libglx_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json")
+    @patch("media_preview_generator.gpu.vulkan_probe.subprocess.run")
+    def test_strategy_2d_failing_leaves_no_override_and_the_capture_uses_its_files(
+        self, mock_run, mock_find_icd, mock_find_egl, mock_find_libegl, mock_find_libglx, _mock_vk, tmp_path
+    ):
+        """A written ICD JSON that still gets software Vulkan isn't kept for FFmpeg, and the diagnostic capture runs
+        with it so the bundle shows why NVIDIA's driver refused."""
+        from media_preview_generator.gpu import _probe_vulkan_device, get_vulkan_env_overrides
+
+        mock_find_icd.return_value = None
+        mock_find_egl.return_value = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        mock_find_libegl.return_value = None
+        mock_find_libglx.return_value = "/usr/lib/libGLX_nvidia.so.0"
+        software = MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)"))
+        mock_run.side_effect = [software, software, software, software]
+
+        with patch("media_preview_generator.utils.tempfile.gettempdir", return_value=str(tmp_path)):
+            device = _probe_vulkan_device()
+
+        assert device == "llvmpipe (software) (0x0)"
+        # Strategy 1, 2 (real vendor JSON), 2d, 3.
+        assert mock_run.call_count == 4
+        assert get_vulkan_env_overrides() == {}
+        env_2d = mock_run.call_args_list[2].kwargs.get("env") or {}
+        assert env_2d.get("__EGL_VENDOR_LIBRARY_FILENAMES") == "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        capture_env = mock_run.call_args_list[3].kwargs.get("env") or {}
+        assert capture_env.get("VK_DRIVER_FILES") == str(tmp_path / "plex_previews_nvidia_icd.json")
+        assert capture_env.get("VK_LOADER_DEBUG") == "all"
+
+    @patch(
+        "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",
+        return_value=True,
+    )
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libglx_nvidia")
+    @patch("media_preview_generator.gpu.vulkan_probe._find_libegl_nvidia", return_value=None)
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_egl_vendor_json", return_value=None)
+    @patch("media_preview_generator.gpu.vulkan_probe._find_nvidia_icd_json")
+    @patch("media_preview_generator.gpu.vulkan_probe.subprocess.run")
+    @pytest.mark.parametrize(
+        ("icd", "libglx"),
+        [
+            pytest.param("/etc/vulkan/icd.d/nvidia_icd.json", "/usr/lib/libGLX_nvidia.so.0", id="real-icd-present"),
+            pytest.param(None, None, id="no-driver-library"),
+        ],
+    )
+    def test_strategy_2d_writes_nothing_when_it_isnt_needed_or_cant_help(
+        self, mock_run, mock_find_icd, _egl, _libegl, mock_find_libglx, _mock_vk, icd, libglx, tmp_path
+    ):
+        """A real nvidia_icd.json is used as it is (Strategy 2b), and without libGLX_nvidia there's no driver for a
+        written JSON to point at."""
+        from media_preview_generator.gpu import _probe_vulkan_device
+
+        mock_find_icd.return_value = icd
+        mock_find_libglx.return_value = libglx
+        mock_run.return_value = MagicMock(returncode=0, stderr=self._stderr_with_device("llvmpipe (software) (0x0)"))
+
+        with patch("media_preview_generator.utils.tempfile.gettempdir", return_value=str(tmp_path)):
+            _probe_vulkan_device()
+
+        assert not (tmp_path / "plex_previews_nvidia_icd.json").exists()
+        assert all("plex_previews_nvidia_icd.json" not in str(c.kwargs.get("env")) for c in mock_run.call_args_list)
 
     @patch(
         "media_preview_generator.gpu.vulkan_probe._is_hwaccel_available",

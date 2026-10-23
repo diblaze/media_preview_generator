@@ -337,6 +337,9 @@ class Worker:
         # True once the last finished file needed the CPU fallback (cancelled files stay False); the dispatcher
         # folds it into the job's "N files ran on the CPU because the GPU failed" tally.
         self.last_task_cpu_fallback = False
+        # The thumbnail interval when the last finished file was fully decoded because its snapshot frames were too
+        # far apart (else None); the dispatcher folds it into the job's slow-path tally.
+        self.last_task_slow_path_interval: int | None = None
 
         # Per-worker removal flag set by reconcile_gpu_workers for busy
         # workers that should be retired after completing their current task.
@@ -511,6 +514,7 @@ class Worker:
         self.gpu_lacked_format = False
         self.decoding_on_cpu = False
         self.last_task_cpu_fallback = False
+        self.last_task_slow_path_interval = None
         self.cancel_check = cancel_check
         self.pause_check = pause_check
         self.process_fn = process_fn
@@ -731,6 +735,10 @@ class Worker:
                         }
                     )
                 self.last_publishers = rows
+                # Frames from the cache or an output already on disk never count, whatever an earlier run did.
+                self.last_task_slow_path_interval = (
+                    getattr(ms_result_obj, "slow_path_interval", None) if _extracted_frames(ms_result_obj) else None
+                )
 
             cancelled = False
             gpu_decoded = False

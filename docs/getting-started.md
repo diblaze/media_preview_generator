@@ -324,7 +324,7 @@ docker run -d \
 ```
 
 > [!TIP]
-> **Why `NVIDIA_DRIVER_CAPABILITIES=all`?** Dolby Vision Profile 5 videos need the NVIDIA Vulkan driver to be tone-mapped; the `all` value is what makes that driver available inside the container. Without it, the app skips tone mapping for those files and their thumbnails come out with a green and purple tint. (The older `compute,video,utility` setting is fine for everything except Dolby Vision Profile 5.) If the dashboard still warns that those thumbnails will have the wrong colours, add `--runtime=nvidia` on Linux: with `--gpus all` alone, some Docker setups leave that driver out.
+> **Why `NVIDIA_DRIVER_CAPABILITIES=all`?** Dolby Vision Profile 5 videos need the NVIDIA Vulkan driver to be tone-mapped; the `all` value is what makes that driver available inside the container. Without it, the app skips tone mapping for those files and their thumbnails come out with a green and purple tint. (The older `compute,video,utility` setting is fine for everything except Dolby Vision Profile 5.) If the dashboard still warns that those thumbnails will have the wrong colours, it says what is missing; see [HDR and Dolby Vision](hdr-dolby-vision-thumbnails.md#the-one-setup-step-nvidia-and-dolby-vision-profile-5).
 
 > [!WARNING]
 > **Passing `/dev/nvidia*` as devices isn't enough.** Without `--gpus all` or the NVIDIA runtime (`runtime: nvidia` in compose), the container gets the GPU but not the driver, so the GPU isn't detected and the log warns that the NVIDIA driver isn't in the container.

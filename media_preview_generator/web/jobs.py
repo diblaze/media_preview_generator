@@ -464,6 +464,10 @@ class JobProgress:
     marker_sources: dict[str, dict[str, int]] | None = None
     # Files a GPU worker finished on the CPU because its GPU failed (JobTracker.cpu_fallback_files).
     cpu_fallback_files: int = 0
+    # Files fully decoded because their snapshot frames were further apart than the thumbnail interval
+    # (JobTracker.slow_path_files), and that interval in seconds.
+    slow_path_files: int = 0
+    slow_path_interval: int = 0
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""
@@ -2479,6 +2483,24 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job:
                 job.progress.cpu_fallback_files = count
+            return job
+
+    def set_job_slow_path_files(self, job_id: str, count: int, interval: int) -> Optional["Job"]:
+        """Store how many of a job's files needed a full decode, and the thumbnail interval they ran with.
+
+        Args:
+            job_id: Job identifier.
+            count: Files so far (``JobTracker.slow_path_files``).
+            interval: The thumbnail interval in seconds (``JobTracker.slow_path_interval``).
+
+        Returns:
+            The job, or None when there's no such job.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.progress.slow_path_files = count
+                job.progress.slow_path_interval = interval
             return job
 
     def set_marker_sources(self, job_id: str, counts: dict[str, dict[str, int]]) -> Optional["Job"]:

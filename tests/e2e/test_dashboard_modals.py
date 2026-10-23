@@ -519,6 +519,46 @@ class TestJobModalFilesTabStickiness:
 
 
 @pytest.mark.e2e
+class TestJobModalSlowPathNote:
+    """Issue #419: a job whose files needed a full decode says so, naming the user's thumbnail interval."""
+
+    _TAIL = (
+        "further apart than your 6-second thumbnail interval. "
+        "A longer interval (the default is 10 seconds) lets more files take the fast path."
+    )
+
+    def _open(self, page: Page, progress: dict) -> None:
+        page.route("**/api/jobs/*/logs**", lambda r: _fulfill_json(r, {"logs": [], "total_lines": 0}))
+        page.evaluate(
+            """progress => {
+                jobs = [{id: 'job-S', library_name: 'Movies', status: 'completed', config: {}, publishers: [],
+                         progress}];
+                showLogsModal('job-S');
+            }""",
+            progress,
+        )
+        expect(page.locator("#logsModal")).to_be_visible(timeout=2000)
+
+    def test_plural_count_names_the_interval(self, dashboard_page: Page) -> None:
+        self._open(dashboard_page, {"slow_path_files": 3, "slow_path_interval": 6})
+        note = dashboard_page.locator("#jobSlowPathNote .alert-info")
+        expect(note).to_have_text(
+            "3 files needed a full decode, which is much slower: their built-in snapshot frames are " + self._TAIL
+        )
+
+    def test_single_file_uses_the_singular_wording(self, dashboard_page: Page) -> None:
+        self._open(dashboard_page, {"slow_path_files": 1, "slow_path_interval": 6})
+        expect(dashboard_page.locator("#jobSlowPathNote .alert-info")).to_have_text(
+            "1 file needed a full decode, which is much slower: its built-in snapshot frames are " + self._TAIL
+        )
+
+    @pytest.mark.parametrize("progress", [{}, {"slow_path_files": 0, "slow_path_interval": 6}])
+    def test_nothing_shows_without_slow_files(self, dashboard_page: Page, progress: dict) -> None:
+        self._open(dashboard_page, progress)
+        expect(dashboard_page.locator("#jobSlowPathNote .alert-info")).to_have_count(0)
+
+
+@pytest.mark.e2e
 class TestJobLogsPanelShowsIntroCreditsBlocks:
     """An Intro & Credits file's lines are separate log records, each with its own time and level; the detail lines
     start with two spaces after the level. The Logs panel shows every record as its own line and keeps that indent."""

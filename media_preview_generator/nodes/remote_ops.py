@@ -114,6 +114,7 @@ def generate_images(
     ffmpeg_threads_override: int | None = None,
     cancel_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
+    slow_path_callback: Callable[[], None] | None = None,
 ) -> tuple[bool, int, bool, float, str, str | None]:
     """``processing.generator.generate_images`` on the node: its JPEGs land in ``output_folder`` as they would here.
 
@@ -180,6 +181,9 @@ def generate_images(
             protocol.relayed_text(str(failure.get("reason") or "")),
             protocol.relayed_text(str(failure.get("worker_type") or "")),
         )
+    # A node older than this field never sends it: the file counts as fast.
+    if result.get("slow_path") and slow_path_callback is not None:
+        slow_path_callback()
     success, image_count, hw_used, seconds, speed, error_summary = result["generate_images"]
     return (
         bool(success),

@@ -57,6 +57,7 @@ def park_if_unavailable(dispatcher, tracker, manager, job_id: str, kind: str, bo
     )
     manager.set_job_outcome(job_id, state["outcome_counts"])
     manager.set_job_cpu_fallback_files(job_id, state["cpu_fallback_files"])
+    manager.set_job_slow_path_files(job_id, state.get("slow_path_files", 0), state.get("slow_path_interval", 0))
     manager.set_publishers(job_id, list(state["publishers_aggregate"].values()))
     previous = (job.config or {}).get("parked_checkpoint")
     reference = None

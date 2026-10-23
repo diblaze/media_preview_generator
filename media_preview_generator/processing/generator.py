@@ -2008,6 +2008,7 @@ def generate_images(
     ffmpeg_threads_override: int | None = None,
     cancel_check=None,
     pause_check=None,
+    slow_path_callback: Callable[[], None] | None = None,
 ) -> tuple[bool, int, bool, float, str, str | None]:
     """Generate thumbnail images from ``video_file`` using FFmpeg.
 
@@ -2025,6 +2026,9 @@ def generate_images(
         config: Processing config.
         progress_callback: Optional progress callback for UI updates.
         cancel_check: Optional callable returning ``True`` when the job is cancelled.
+        slow_path_callback: Optional callable invoked when this file's snapshot frames are too far apart for the
+            interval, so it is fully decoded (decided up front, or after the fast pass produced duplicate thumbnails).
+            Not for a file whose layout couldn't be read: the interval isn't why that one is slow.
 
     Returns:
         Tuple of ``(success, image_count, hw_used, seconds, speed, error_summary)``.
@@ -2292,6 +2296,10 @@ def generate_images(
             raise WorkingFolderError(refused, _FOLDER_WRITE_TEXT[refused][0], output_folder)
         return rc, seconds, speed, run_stderr
 
+    def _report_slow_path() -> None:
+        if slow_path_callback is not None:
+            slow_path_callback()
+
     # DV Profile 5 paths cannot use -skip_frame (RPU side-data has
     # inter-frame dependencies). Everything else attempts skip_frame
     # first and falls back via the retry below if the decoder rejects it.
@@ -2357,6 +2365,7 @@ def generate_images(
                 interval,
             )
             use_skip_initial = False
+            _report_slow_path()
         else:
             logger.debug(
                 "keyframe-probe: file='{}' max_gap={:.2f}s interval={}s gap_limit={:.2f}s → keep -skip_frame nokey",
@@ -2514,6 +2523,7 @@ def generate_images(
                 os.path.basename(video_file),
             )
             _clean_output_images(output_folder)
+            _report_slow_path()
             retry_rc, seconds, speed, retry_stderr_lines = _run_ffmpeg(use_skip=False, init_vulkan=use_libplacebo)
             rc = retry_rc
             stderr_lines = retry_stderr_lines

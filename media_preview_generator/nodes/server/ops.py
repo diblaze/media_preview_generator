@@ -166,6 +166,12 @@ def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
     gpu, device = ctx.gpu or (None, None)
     reporter = _Reporter(ctx)
     threads = params.get("ffmpeg_threads_override")
+    slow_path = False
+
+    def note_slow_path() -> None:
+        nonlocal slow_path
+        slow_path = True
+
     # A scope of its own, so generate_images' failure records land somewhere and go back to the app's job.
     with failure_scope(f"node-task-{uuid.uuid4().hex}"):
         try:
@@ -179,6 +185,7 @@ def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
                 ffmpeg_threads_override=None if threads is None else int(threads),
                 cancel_check=ctx.cancel_check,
                 pause_check=ctx.pause_check,
+                slow_path_callback=note_slow_path,
             )
             failures = get_failures()
         except CodecNotSupportedError as exc:
@@ -200,6 +207,7 @@ def preview_frames(ctx: TaskContext, node_path: str, params: dict) -> dict:
     return {
         "generate_images": _jsonable(list(result)),
         "frames": len(names),
+        "slow_path": slow_path,
         "failures": [
             {"exit_code": f.get("exit_code", 0), "reason": f.get("reason", ""), "worker_type": f.get("worker_type", "")}
             for f in failures

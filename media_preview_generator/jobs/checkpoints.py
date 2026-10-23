@@ -33,7 +33,7 @@ def _validate_accounting(snapshot: dict) -> None:
     state = snapshot.get("state")
     if not isinstance(state, dict):
         raise ValueError("Invalid checkpoint accounting")
-    for key in ("successful", "failed", "cpu_fallback_files", "total_items"):
+    for key in ("successful", "failed", "cpu_fallback_files", "slow_path_files", "slow_path_interval", "total_items"):
         value = state.get(key, 0)
         if type(value) is not int or value < 0:
             raise ValueError("Invalid checkpoint counter")

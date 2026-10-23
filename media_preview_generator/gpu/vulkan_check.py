@@ -22,6 +22,7 @@ from typing import Any
 from loguru import logger
 
 from .vulkan_probe import (
+    NVIDIA_GRAPHICS_FILES_DOCS,
     VulkanProbeResult,
     _is_nvidia_vulkan_device,
     get_vulkan_debug_buffer,
@@ -96,12 +97,14 @@ _NVIDIA_CHECKS = {
         "Set NVIDIA_DRIVER_CAPABILITIES=all and restart the container.",
     ),
     "nvidia_graphics_libs_missing": (
-        "The container has none of NVIDIA's graphics driver files",
+        "NVIDIA's graphics driver files aren't in the container",
         "NVIDIA_DRIVER_CAPABILITIES asks for graphics and CUDA works, but none of NVIDIA's graphics driver files "
-        "(nvidia_icd.json, libEGL_nvidia.so, libnvidia-glvkspirv.so) are inside the container.",
-        "If the container is started with --gpus all alone, also add --runtime=nvidia and restart. If it already uses "
-        "the NVIDIA runtime, the host's NVIDIA driver doesn't include its Vulkan part (some NAS driver packages, such "
-        "as Synology's, leave it out); install a full NVIDIA driver on the host to fix it.",
+        "(libGLX_nvidia.so, libEGL_nvidia.so, libnvidia-glvkspirv.so) reached the container, so there is no NVIDIA "
+        "Vulkan driver to use.",
+        "Look for them on the host: find / -xdev -name 'libGLX_nvidia.so*' 2>/dev/null. If that finds them, the "
+        "host's NVIDIA container setup isn't passing them in: mount them into the container yourself ("
+        f"{NVIDIA_GRAPHICS_FILES_DOCS} has the lines to add). If it finds nothing, the host's NVIDIA driver was "
+        "installed without its graphics part: install the full driver.",
     ),
     "nvidia_icd_missing": (
         "NVIDIA's Vulkan driver file is missing",
@@ -266,8 +269,9 @@ def nvidia_cause(diag: dict[str, Any]) -> str:
     """
     if not diag["nvidia_capabilities_has_graphics"]:
         return "nvidia_no_graphics_cap"
-    # Nothing from the graphics capability arrived at all (issue #419): the runtime wasn't asked, or the host driver
-    # has nothing to give. Only the JSON missing while the libraries are there is the toolkit bug nvidia_icd_missing names.
+    # Nothing from the graphics capability arrived at all (issue #419): the host driver has no graphics part, or its
+    # container setup doesn't pass it on. Only the JSON missing while the libraries are there is what nvidia_icd_missing
+    # names (and with no other GPU, the probe writes that JSON itself first).
     if (
         diag["nvidia_icd_json_path"] is None
         and not diag["libnvidia_glvkspirv_found"]

@@ -6,9 +6,9 @@ in :mod:`gpu_detection`:
 * :class:`VulkanProbeResult` — frozen dataclass returned by
   :func:`get_vulkan_device_info`, consumed by
   :mod:`media_processing` and ``web/routes/api_system``.
-* Strategy branches 1 / 2 / 2c / 2b / 3 that walk through default
+* Strategy branches 1 / 2 / 2c / 2d / 2b / 3 that walk through default
   → ``__EGL_VENDOR_LIBRARY_FILENAMES`` → synthesised GLVND vendor JSON
-  → ``VK_DRIVER_FILES`` → ``VK_LOADER_DEBUG=all`` diagnostic capture,
+  → synthesised NVIDIA ICD JSON → ``VK_DRIVER_FILES`` → ``VK_LOADER_DEBUG=all`` diagnostic capture,
   short-circuiting as soon as a usable hardware device appears.
 * NVIDIA-name detection hints used by :func:`_retry_is_useful` to
   avoid accepting a dual-GPU host's Intel iGPU when the caller really
@@ -54,6 +54,11 @@ DV5_NO_VULKAN_EFFECT = (
 )
 
 
+# Where the steps for a host whose NVIDIA graphics files don't reach the container live (issue #419).
+NVIDIA_GRAPHICS_FILES_DOCS = (
+    "https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/#nvidia-graphics-files-missing-from-the-container"
+)
+
 # What tells dv5_no_vulkan_fix which GPUs the container has.
 _RENDER_NODES_GLOB = "/dev/dri/renderD*"
 _NVIDIA_CONTROL_NODE = "/dev/nvidiactl"
@@ -71,11 +76,11 @@ def _nvidia_graphics_files_all_missing() -> bool:
 def dv5_no_vulkan_fix() -> str:
     """How to give this container a hardware Vulkan driver, without telling it to set what it already has.
 
-    With ``graphics`` (or ``all``) already asked for, ``--gpus all`` on a Docker that hands GPUs over through CDI
-    still leaves NVIDIA's Vulkan driver out (no ``nvidia_icd.json``); the NVIDIA runtime adds it. When the driver
-    *was* mounted (nvidia-smi is there) and still brought none of its graphics files, the host driver may have no
-    Vulkan part to give (Synology's, issue #419), so that is named too; any other NVIDIA cause is left to the per-GPU
-    check. The NVIDIA step is only given with an NVIDIA GPU in the container (or no GPU at all), and passing
+    With ``graphics`` (or ``all``) already asked for and no nvidia-smi, the NVIDIA driver never reached the container
+    at all (``/dev/nvidia*`` passed as devices without the NVIDIA runtime or ``--gpus all``). When the driver *was*
+    mounted (nvidia-smi is there) and still brought none of its graphics files, the host either has none or doesn't
+    pass them on (issue #419), so the host check is named; any other NVIDIA cause is left to the per-GPU check (on a
+    host with no other GPU, a missing ``nvidia_icd.json`` alone the probe fixes itself). The NVIDIA step is only given with an NVIDIA GPU in the container (or no GPU at all), and passing
     /dev/dri only when it has no render node: an Intel or AMD GPU that is already there and still has no Vulkan has a
     cause the per-GPU check names (``gpu.vulkan_check``), such as a host kernel too old (issue #408).
 
@@ -89,16 +94,14 @@ def dv5_no_vulkan_fix() -> str:
         if caps == "all" or "graphics" in caps:
             if not shutil.which(_NVIDIA_SMI):
                 steps.append(
-                    "on NVIDIA, NVIDIA_DRIVER_CAPABILITIES already asks for the Vulkan driver, so also start the "
-                    "container with --runtime=nvidia (with --gpus all alone, some Docker setups leave that driver out) "
-                    "and restart"
+                    "on NVIDIA, the NVIDIA driver isn't in the container: start it with the NVIDIA runtime (Docker "
+                    "Compose: runtime: nvidia; docker run: --runtime=nvidia or --gpus all) and restart"
                 )
             elif _nvidia_graphics_files_all_missing():
                 steps.append(
-                    "on NVIDIA, the container got the CUDA driver but not NVIDIA's Vulkan driver: if it's started with "
-                    "--gpus all alone, also add --runtime=nvidia and restart; if it already uses the NVIDIA runtime, "
-                    "the host's NVIDIA driver doesn't include Vulkan (some NAS driver packages, such as Synology's, "
-                    "leave it out)"
+                    "on NVIDIA, the container got the CUDA driver but none of NVIDIA's graphics driver files: if the "
+                    "host has them (find / -xdev -name 'libGLX_nvidia.so*'), mount them in as "
+                    f"{NVIDIA_GRAPHICS_FILES_DOCS} shows; if it has none, install the host's full NVIDIA driver"
                 )
         else:
             steps.append("on NVIDIA, set NVIDIA_DRIVER_CAPABILITIES=all (adds the 'graphics' capability) and restart")
@@ -313,6 +316,37 @@ def _find_libegl_nvidia() -> str | None:
     return None
 
 
+# Glob patterns for ``libGLX_nvidia.so*``, NVIDIA's Vulkan driver itself (nvidia_icd.json only points the loader at
+# it). Strategy 2d writes that JSON when the library arrived without it.
+_LIBGLX_NVIDIA_GLOBS = (
+    "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so*",
+    "/usr/lib/aarch64-linux-gnu/libGLX_nvidia.so*",
+    "/usr/lib/libGLX_nvidia.so*",
+    "/usr/lib64/libGLX_nvidia.so*",
+)
+
+
+def _find_libglx_nvidia() -> str | None:
+    """Return the first path to ``libGLX_nvidia.so*`` if the library is present, else None."""
+    for pattern in _LIBGLX_NVIDIA_GLOBS:
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+    return None
+
+
+def _write_scratch_json(filename: str, payload: dict) -> str | None:
+    """Write ``payload`` to ``filename`` in the scratch folder and return its path, or None when it can't be written."""
+    path = os.path.join(scratch_dir(), filename)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError as exc:
+        logger.debug("Vulkan probe: could not write {}: {}", path, exc)
+        return None
+    return path
+
+
 def _run_vulkan_probe(
     env_overrides: dict | None = None,
 ) -> tuple[str | None, str]:
@@ -416,6 +450,14 @@ def _probe_vulkan_device() -> str | None:
     ``vkCreateInstance``. The env var forces GLVND to pick the NVIDIA
     vendor, and the ICD wakes up. Verified empirically on an NVIDIA
     GPU + driver 590.48.01 + linuxserver/ffmpeg 8.0.1-cli-ls56.
+
+    **Strategy 2c** — no EGL vendor JSON on disk but ``libEGL_nvidia.so``
+    is: write the vendor JSON ourselves and retry as in Strategy 2.
+
+    **Strategy 2d** — no ``nvidia_icd.json`` but ``libGLX_nvidia.so`` (the
+    driver it points at) is there, as under ``--gpus all`` without the
+    NVIDIA runtime: write the ICD JSON ourselves and retry with
+    ``VK_DRIVER_FILES`` at it plus the EGL vendor JSON.
 
     **Strategy 2b** — if the EGL vendor JSON is not present but the
     NVIDIA ICD JSON is (or if Strategy 2 ran but did not fix things),
@@ -555,17 +597,16 @@ def _probe_vulkan_device() -> str | None:
     # does).  Gated on ``libEGL_nvidia.so*`` actually being present in
     # the container so we don't fabricate a pointer to a file that
     # doesn't exist.
+    synth_vendor_path: str | None = None
+    synth_icd_path: str | None = None
     if nvidia_egl_vendor is None:
         libegl_nvidia = _find_libegl_nvidia()
         if libegl_nvidia:
-            synth_vendor_path = os.path.join(scratch_dir(), "plex_previews_nvidia_egl_vendor.json")
-            synth_payload = {
-                "file_format_version": "1.0.0",
-                "ICD": {"library_path": "libEGL_nvidia.so.0"},
-            }
-            try:
-                with open(synth_vendor_path, "w", encoding="utf-8") as fh:
-                    json.dump(synth_payload, fh)
+            synth_vendor_path = _write_scratch_json(
+                "plex_previews_nvidia_egl_vendor.json",
+                {"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}},
+            )
+            if synth_vendor_path:
                 logger.debug(
                     "Vulkan probe (strategy 2c): synthesised GLVND NVIDIA EGL vendor JSON at {} (libEGL_nvidia.so found at {}); retrying probe",
                     synth_vendor_path,
@@ -582,17 +623,55 @@ def _probe_vulkan_device() -> str | None:
                     _VULKAN_ENV_OVERRIDES = dict(retry_env)
                     return retry_device
                 logger.debug(
-                    "Vulkan probe (strategy 2c): synthesised vendor JSON probe still returned {!r}; trying Strategy 2b.",
+                    "Vulkan probe (strategy 2c): synthesised vendor JSON probe still returned {!r}; trying Strategy 2d.",
                     retry_device,
-                )
-            except OSError as exc:
-                logger.debug(
-                    "Vulkan probe (strategy 2c): could not write {}: {}; trying Strategy 2b.", synth_vendor_path, exc
                 )
         else:
             logger.debug(
                 "Vulkan probe: no libEGL_nvidia.so* found in standard library paths ({}); skipping Strategy 2c.",
                 _LIBEGL_NVIDIA_GLOBS,
+            )
+
+    # Strategy 2d: NVIDIA's Vulkan driver (libGLX_nvidia) is in the container but nvidia_icd.json, the file that
+    # tells the loader about it, isn't. Docker's --gpus all (and Compose's GPU reservation) without the NVIDIA
+    # runtime does exactly this, as do drivers 570-579 and some CDI setups. Write the JSON ourselves and point the
+    # loader at it, with the EGL vendor JSON alongside: NVIDIA's driver refuses to start without both (verified on
+    # a --gpus all container, issue #419). 1.3 is the Vulkan version FFmpeg asks for.
+    if nvidia_icd is None:
+        libglx_nvidia = _find_libglx_nvidia()
+        if libglx_nvidia:
+            synth_icd_path = _write_scratch_json(
+                "plex_previews_nvidia_icd.json",
+                {"file_format_version": "1.0.1", "ICD": {"library_path": "libGLX_nvidia.so.0", "api_version": "1.3.0"}},
+            )
+            if synth_icd_path:
+                retry_env = {"VK_DRIVER_FILES": synth_icd_path}
+                egl_vendor = nvidia_egl_vendor or synth_vendor_path
+                if egl_vendor:
+                    retry_env["__EGL_VENDOR_LIBRARY_FILENAMES"] = egl_vendor
+                logger.debug(
+                    "Vulkan probe (strategy 2d): synthesised NVIDIA ICD JSON at {} (libGLX_nvidia.so found at {}); retrying probe with {}",
+                    synth_icd_path,
+                    libglx_nvidia,
+                    retry_env,
+                )
+                retry_device, _ = _run_vulkan_probe(retry_env)
+                if retry_device and _is_nvidia_vulkan_device(retry_device):
+                    logger.info(
+                        "Vulkan probe (strategy 2d): success with {!r} via synthesised NVIDIA ICD JSON at {}",
+                        retry_device,
+                        synth_icd_path,
+                    )
+                    _VULKAN_ENV_OVERRIDES = dict(retry_env)
+                    return retry_device
+                logger.debug(
+                    "Vulkan probe (strategy 2d): synthesised ICD JSON probe still returned {!r}; running diagnostic capture.",
+                    retry_device,
+                )
+        else:
+            logger.debug(
+                "Vulkan probe: no libGLX_nvidia.so* found in standard library paths ({}); skipping Strategy 2d.",
+                _LIBGLX_NVIDIA_GLOBS,
             )
 
     # Strategy 2b: older heuristic — force VK_DRIVER_FILES at the NVIDIA
@@ -621,10 +700,10 @@ def _probe_vulkan_device() -> str | None:
 
     # Strategy 3: VK_LOADER_DEBUG=all capture for issue reports.
     diag_overrides: dict = {"VK_LOADER_DEBUG": "all"}
-    if nvidia_egl_vendor:
-        diag_overrides["__EGL_VENDOR_LIBRARY_FILENAMES"] = nvidia_egl_vendor
-    if nvidia_icd:
-        diag_overrides["VK_DRIVER_FILES"] = nvidia_icd
+    if nvidia_egl_vendor or synth_vendor_path:
+        diag_overrides["__EGL_VENDOR_LIBRARY_FILENAMES"] = nvidia_egl_vendor or synth_vendor_path
+    if nvidia_icd or synth_icd_path:
+        diag_overrides["VK_DRIVER_FILES"] = nvidia_icd or synth_icd_path
     _, diag_stderr = _run_vulkan_probe(diag_overrides)
     _VULKAN_DEBUG_BUFFER = (diag_stderr or "")[-_VULKAN_DEBUG_BUFFER_CAP:]
     # One-line WARNING at Strategy-3 exit is fine because it only runs
@@ -635,7 +714,7 @@ def _probe_vulkan_device() -> str | None:
         more_help = _NODE_VULKAN_HELP
     else:
         more_help = _DASHBOARD_VULKAN_HELP.format(size=len(_VULKAN_DEBUG_BUFFER))
-    tried = " even after trying NVIDIA-specific fixes" if nvidia_icd or nvidia_egl_vendor else ""
+    tried = " even after trying NVIDIA-specific fixes" if nvidia_icd or nvidia_egl_vendor or synth_icd_path else ""
     logger.warning(
         "Vulkan hardware setup couldn't be detected on this container{}. {}",
         tried,

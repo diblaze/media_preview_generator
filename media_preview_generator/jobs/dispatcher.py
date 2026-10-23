@@ -192,6 +192,10 @@ class JobTracker:
         # Files a GPU worker finished on the CPU because its GPU failed (guarded by _counts_lock); the job summary's
         # "N files ran on the CPU because the GPU failed" line. Not an outcome: those files keep their own outcome.
         self.cpu_fallback_files = 0
+        # Files fully decoded because their snapshot frames were further apart than the thumbnail interval (guarded by
+        # _counts_lock), and the interval they ran with; the job summary's "needed a full decode" note.
+        self.slow_path_files = 0
+        self.slow_path_interval = 0
         # Per-server aggregate (one entry per server_id) so the Job
         # views render a fixed-size summary regardless of file count.
         # Per-file × per-server detail lives in the Files-panel JSONL via
@@ -260,6 +264,8 @@ class JobTracker:
             self.outcome_counts.update(carried_state.get("outcome_counts", {}))
             self.publishers_aggregate = dict(carried_state.get("publishers_aggregate", {}))
             self.cpu_fallback_files = int(carried_state.get("cpu_fallback_files", 0))
+            self.slow_path_files = int(carried_state.get("slow_path_files", 0))
+            self.slow_path_interval = int(carried_state.get("slow_path_interval", 0))
             self.total_items = len(items) + self.successful + self.failed
 
     @property
@@ -353,6 +359,7 @@ class JobTracker:
                 completed = self.successful + self.failed
                 outcome_snapshot = dict(self.outcome_counts)
                 cpu_fallback_files = self.cpu_fallback_files
+                slow_path = (self.slow_path_files, self.slow_path_interval)
             fraction = 0.0
             if self.in_progress_fraction_getter is not None:
                 try:
@@ -366,6 +373,7 @@ class JobTracker:
             # (progress.outcome used to be set only at completion).
             self._push_outcome_snapshot(outcome_snapshot)
             self._push_cpu_fallback_files(cpu_fallback_files)
+            self._push_slow_path_files(*slow_path)
             self.progress_callback(
                 completed,
                 self.total_items,
@@ -426,6 +434,17 @@ class JobTracker:
             get_job_manager().set_job_cpu_fallback_files(self.job_id, count)
         except Exception as exc:
             logger.debug("Could not push the CPU-fallback tally for job {}: {}", self.job_id, exc)
+
+    def _push_slow_path_files(self, count: int, interval: int) -> None:
+        """Mirror the slow-path tally onto the Job, on the progress cadence like the CPU-fallback tally."""
+        if count <= 0:
+            return
+        try:
+            from ..web.jobs import get_job_manager
+
+            get_job_manager().set_job_slow_path_files(self.job_id, count, interval)
+        except Exception as exc:
+            logger.debug("Could not push the slow-path tally for job {}: {}", self.job_id, exc)
 
     def cancel(self) -> None:
         """Mark this job cancelled and drain remaining items.
@@ -911,6 +930,8 @@ class JobDispatcher:
                             "outcome_counts": tracker.outcome_counts,
                             "publishers_aggregate": tracker.publishers_aggregate,
                             "cpu_fallback_files": tracker.cpu_fallback_files,
+                            "slow_path_files": tracker.slow_path_files,
+                            "slow_path_interval": tracker.slow_path_interval,
                             "total_items": tracker.total_items,
                         }
                     ),
@@ -1211,6 +1232,9 @@ class JobDispatcher:
                     tracker.outcome_counts[key] += count
             if worker.last_task_cpu_fallback:
                 tracker.cpu_fallback_files += 1
+            if worker.last_task_slow_path_interval is not None:
+                tracker.slow_path_files += 1
+                tracker.slow_path_interval = worker.last_task_slow_path_interval
         # Fold this task's per-server publisher rows into the tracker's per-server aggregate
         # (server_id → status counts) and mirror that fixed-size summary onto the Job. One row
         # per (file × server) would grow job.publishers O(files × servers); the per-file ×

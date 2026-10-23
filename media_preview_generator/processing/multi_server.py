@@ -155,6 +155,9 @@ class MultiServerResult:
     publishers: list[PublisherResult] = field(default_factory=list)
     frame_count: int = 0
     message: str = ""
+    # The thumbnail interval (seconds) when this file's snapshot frames were too far apart for the fast path and it was
+    # fully decoded (slower); None when it took the fast path or no frames were extracted.
+    slow_path_interval: int | None = None
 
     @property
     def published_count(self) -> int:
@@ -194,26 +197,49 @@ MOVIE_LIBRARY_KINDS: frozenset[str] = frozenset({"movie", "movies"})
 _MOVIE_LIBRARY_KINDS = MOVIE_LIBRARY_KINDS
 
 
-def _adapter_for_server(server_config: ServerConfig) -> OutputAdapter | None:
+def _adapter_name(server_config: ServerConfig) -> str:
+    """The server's preview format: ``output.adapter``, else the default for its server type."""
+    adapter_name = str((server_config.output or {}).get("adapter") or "").strip().lower()
+    return adapter_name or {
+        ServerType.PLEX: "plex_bundle",
+        ServerType.EMBY: "emby_sidecar",
+        ServerType.JELLYFIN: "jellyfin_trickplay",
+    }.get(server_config.type, "")
+
+
+def _emby_sidecar_sizes(registry: ServerRegistry) -> frozenset[tuple[int, int]]:
+    """``(width, interval)`` of every configured server writing Emby sidecars, enabled or not: no publish may delete
+    a sidecar another of them writes."""
+    sizes: set[tuple[int, int]] = set()
+    for cfg in registry.configs():
+        if _adapter_name(cfg) != "emby_sidecar":
+            continue
+        output = cfg.output or {}
+        try:
+            sizes.add((int(output.get("width") or 320), resolve_frame_interval(output)))
+        except (TypeError, ValueError):
+            logger.debug("Emby server {!r} has an unreadable preview width {!r}", cfg.name, output.get("width"))
+    return frozenset(sizes)
+
+
+def _adapter_for_server(
+    server_config: ServerConfig, emby_sizes: frozenset[tuple[int, int]] = frozenset()
+) -> OutputAdapter | None:
     """Construct the right :class:`OutputAdapter` for a server's settings.
 
     The adapter type is taken from ``server_config.output.adapter``
     with sensible defaults per server type. Returns ``None`` when the
     requested adapter name is unknown so the caller can skip that
     publisher rather than crashing the whole batch.
+
+    Args:
+        server_config: The server's settings.
+        emby_sizes: From :func:`_emby_sidecar_sizes`, for an Emby adapter that publishes.
     """
     output = server_config.output or {}
-    adapter_name = str(output.get("adapter") or "").strip().lower()
+    adapter_name = _adapter_name(server_config)
     width = int(output.get("width") or 320)
     frame_interval = resolve_frame_interval(output)
-
-    # Default per server type when adapter name is missing.
-    if not adapter_name:
-        adapter_name = {
-            ServerType.PLEX: "plex_bundle",
-            ServerType.EMBY: "emby_sidecar",
-            ServerType.JELLYFIN: "jellyfin_trickplay",
-        }.get(server_config.type, "")
 
     if adapter_name == "plex_bundle":
         plex_config_folder = str(output.get("plex_config_folder") or "")
@@ -231,7 +257,7 @@ def _adapter_for_server(server_config: ServerConfig) -> OutputAdapter | None:
             frame_interval=frame_interval,
         )
     if adapter_name == "emby_sidecar":
-        return EmbyBifAdapter(width=width, frame_interval=frame_interval)
+        return EmbyBifAdapter(width=width, frame_interval=frame_interval, keep_sizes=emby_sizes)
     if adapter_name == "jellyfin_trickplay":
         # ``save_with_media`` defaults true (today's media-adjacent layout).
         # When false, ``jellyfin_config_folder`` is this container's RW mount
@@ -578,6 +604,7 @@ def _resolve_publishers(
     from ..config import is_path_excluded
 
     publishers: list[tuple[MediaServer, OutputAdapter, str | None]] = []
+    emby_sizes: frozenset[tuple[int, int]] | None = None
     item_id_hints = item_id_by_server or {}
 
     matched_ids = {match.server_id for match in registry.find_owning_servers(canonical_path)}
@@ -626,7 +653,9 @@ def _resolve_publishers(
             )
             continue
 
-        adapter = _adapter_for_server(cfg)
+        if emby_sizes is None:
+            emby_sizes = _emby_sidecar_sizes(registry)
+        adapter = _adapter_for_server(cfg, emby_sizes)
         if adapter is None:
             continue
 
@@ -2172,6 +2201,7 @@ def _process_canonical_path_previews(
                     frame_count,
                 )
 
+        took_slow_path = False
         if not cache_hit:
             # Generate into the cache slot (if cache enabled) or an ad-hoc tmp.
             if use_frame_cache:
@@ -2200,6 +2230,11 @@ def _process_canonical_path_previews(
             # A remote worker's frames come from its node; everything around them stays here.
             extract = remote_ops.generate_images if executor.current_placement() else generate_images
             slot_emptied = use_frame_cache
+
+            def _note_slow_path() -> None:
+                nonlocal took_slow_path
+                took_slow_path = True
+
             try:
                 gen_result = extract(
                     canonical_path,
@@ -2211,6 +2246,7 @@ def _process_canonical_path_previews(
                     ffmpeg_threads_override=ffmpeg_threads_override,
                     cancel_check=cancel_check,
                     pause_check=pause_check,
+                    slow_path_callback=_note_slow_path,
                 )
             except CodecNotSupportedError as exc:
                 # Re-raised so callers can fall back to CPU; not a publisher failure. Worded by the real cause: a stall
@@ -2489,6 +2525,7 @@ def _process_canonical_path_previews(
             publishers=results,
             frame_count=frame_count,
             message=_summarise_results(results, status),
+            slow_path_interval=int(config.plex_bif_frame_interval) if took_slow_path else None,
         )
     finally:
         # Only clean up tmp dirs that are *not* in the cache. Cache

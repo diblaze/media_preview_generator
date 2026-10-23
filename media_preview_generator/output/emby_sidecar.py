@@ -14,6 +14,7 @@ configured width and interval, without server-side metadata.
 from __future__ import annotations
 
 import errno
+import glob
 import os
 import re
 import stat
@@ -24,6 +25,7 @@ from loguru import logger
 
 from ..servers.base import MediaServer
 from .base import BifBundle, OutputAdapter
+from .journal import _meta_path_for
 
 # Short hashed staging names, with an optional 32-hex UUID for concurrent writes.
 # Keep accepting the legacy fixed name so interrupted writes from older releases are swept.
@@ -42,11 +44,20 @@ class EmbyBifAdapter(OutputAdapter):
             Encoded into the filename so multiple resolutions can coexist.
         frame_interval: Seconds between frames. Encoded into the filename
             (Emby uses this on its own generation runs too).
+        keep_sizes: ``(width, interval)`` pairs other configured Emby servers
+            write, whose sidecars a publish must leave alone.
     """
 
-    def __init__(self, *, width: int = 320, frame_interval: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        width: int = 320,
+        frame_interval: int = 10,
+        keep_sizes: frozenset[tuple[int, int]] = frozenset(),
+    ) -> None:
         self._width = int(width)
         self._frame_interval = int(frame_interval)
+        self._keep_sizes = frozenset(keep_sizes) | {(self._width, self._frame_interval)}
 
     @property
     def name(self) -> str:
@@ -139,6 +150,42 @@ class EmbyBifAdapter(OutputAdapter):
             )
 
         logger.debug("Emby sidecar BIF written to {}", sidecar)
+        self._remove_superseded_sidecars(sidecar, Path(bundle.canonical_path).stem)
+
+    def _remove_superseded_sidecars(self, sidecar: Path, basename: str) -> None:
+        """Remove this video's sidecars from an earlier width or interval setting, now that ``sidecar`` replaces them.
+
+        The width and interval are part of the name, so changing the thumbnail interval writes a new file and would
+        leave the old one beside the video for Emby to pick from (issue #419). Only a sidecar with our ``.meta``
+        journal is removed: one without it is Emby's own, or from before the journal, and isn't ours to delete.
+        Only on publish: the folder is being written anyway, while listing it for every already-current file during
+        a scan would cost a network round trip each.
+        """
+        prefix = f"{basename}-"
+        try:
+            candidates = list(sidecar.parent.glob(f"{glob.escape(prefix)}*.bif"))
+        except OSError:
+            return
+        for path in candidates:
+            size = path.name[len(prefix) : -len(".bif")].split("-")
+            if len(size) != 2 or not all(part.isascii() and part.isdecimal() for part in size):
+                continue
+            if (int(size[0]), int(size[1])) in self._keep_sizes:
+                continue
+            meta = _meta_path_for(path)
+            if not meta.is_file():
+                continue
+            try:
+                path.unlink()
+                meta.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Couldn't remove the superseded Emby preview file {}: {}", path, exc)
+                continue
+            logger.info(
+                "Removed {}: an Emby preview file made with an earlier thumbnail interval or width, replaced by {}",
+                path.name,
+                sidecar.name,
+            )
 
     @staticmethod
     def sidecar_path(canonical_path: str, *, width: int, frame_interval: int) -> Path:

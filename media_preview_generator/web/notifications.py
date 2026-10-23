@@ -36,6 +36,7 @@ from ..jobs.gpu_fallback import GPU_FALLBACK_STREAK, get_gpu_fallback_tracker, i
 
 VULKAN_SOFTWARE_FALLBACK_ID = "vulkan_software_fallback"
 TIMEZONE_MISCONFIGURED_ID = "timezone_misconfigured"
+NVIDIA_DRIVER_MISSING_ID = "nvidia_driver_missing"
 SCHEMA_MIGRATION_ID = "schema_migration_completed"
 DEPRECATED_IMAGE_ID = "deprecated_docker_image_name"
 MEDIA_MOUNT_UNHEALTHY_ID = "media_mount_unhealthy"
@@ -199,6 +200,28 @@ def _build_vulkan_software_fallback_notification() -> dict[str, Any] | None:
     card["body_html"] = _vulkan_card_body(failures)
     card["action"] = {"href": "/settings#section-processing", "label": "Open GPU check"}
     return card
+
+
+def _build_nvidia_driver_missing_notification() -> dict[str, Any] | None:
+    """Return a notification dict when an NVIDIA GPU is passed in without its driver (issue #419), else None."""
+    from markupsafe import escape
+
+    from ..gpu.detect import NVIDIA_DRIVER_MISSING_FIX, NVIDIA_DRIVER_MISSING_WHY, nvidia_gpu_without_driver
+
+    if not nvidia_gpu_without_driver():
+        return None
+    return {
+        "id": NVIDIA_DRIVER_MISSING_ID,
+        "severity": "warning",
+        "title": "NVIDIA GPU passed in without its driver",
+        "body_html": (
+            f"<p class='mb-2'>{escape(NVIDIA_DRIVER_MISSING_WHY)}</p>"
+            f"<strong>What to do</strong><p class='mb-0'>{escape(NVIDIA_DRIVER_MISSING_FIX[:1].upper())}"
+            f"{escape(NVIDIA_DRIVER_MISSING_FIX[1:])}</p>"
+        ),
+        "dismissable": True,
+        "source": "gpu_detection",
+    }
 
 
 def _build_timezone_misconfigured_notification() -> dict[str, Any] | None:
@@ -771,6 +794,7 @@ def _unconfirmed_node_card(node_id: str, name: str) -> dict[str, Any]:
 def _notification_sources() -> list[dict[str, Any] | None]:
     """All notification builders.  Add new sources here as they arrive."""
     return [
+        _build_nvidia_driver_missing_notification(),
         _build_vulkan_software_fallback_notification(),
         _build_timezone_misconfigured_notification(),
         _build_schema_migration_notification(),

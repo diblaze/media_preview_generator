@@ -9,7 +9,7 @@ Washed-out, grey or green preview thumbnails come from frames taken from HDR vid
 
 - HDR10, HLG and HDR10+ are tone-mapped to SDR.
 - Dolby Vision Profiles 7 and 8 are read through their HDR10 layer.
-- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`, and on some Docker setups `--runtime=nvidia` as well.
+- Dolby Vision Profile 5, which has no HDR10 layer, needs a GPU with a hardware Vulkan driver in the container. On NVIDIA that means `NVIDIA_DRIVER_CAPABILITIES=all`.
 
 ## Why the built-ins get it wrong
 
@@ -45,7 +45,38 @@ docker run -d \
 
 In Docker Compose, set `NVIDIA_DRIVER_CAPABILITIES=all` under `environment:`. `compute,video,utility,graphics` also works if you prefer the minimum. Restart the container after changing it.
 
-If those thumbnails are still tinted, or the dashboard still warns about them, also start the container with `--runtime=nvidia` on Linux (`runtime: nvidia` in compose). With `--gpus all` alone, some Docker setups leave the Vulkan driver out. If the container already uses the NVIDIA runtime and the dashboard says none of NVIDIA's graphics driver files are in it, the host's NVIDIA driver has no Vulkan part. Some NAS driver packages, such as Synology's, leave it out.
+If NVIDIA's Vulkan driver arrives without the small config files that point to it, which happens with `--gpus all` on some Docker setups, the app writes those files itself. If those thumbnails are still tinted, the dashboard says what is missing under **Settings → Processing Options → GPU device tuning**.
+
+### NVIDIA graphics files missing from the container
+
+The dashboard says this when CUDA works in the container but none of NVIDIA's graphics driver files reached it, even with `NVIDIA_DRIVER_CAPABILITIES=all`. The app can't fill this gap itself, because the driver isn't there to use. Look for the files on the host (not in the container):
+
+```bash
+find / -xdev -name 'libGLX_nvidia.so*' 2>/dev/null
+```
+
+**It finds nothing:** the host's NVIDIA driver was installed without its graphics part. Install the full driver.
+
+**It finds them:** the host's NVIDIA container setup isn't passing them in. It's worth telling whoever provides your NVIDIA driver package. Until that's fixed, mount the files in yourself. In the lines below, replace `/usr/lib` with the folder `find` printed, and `595.99.02` with your driver version (the number at the end of `libGLX_nvidia.so.<version>`). First check that every file exists on the host:
+
+```bash
+ls /usr/lib/libGLX_nvidia.so.0 /usr/lib/libEGL_nvidia.so.0 /usr/lib/libnvidia-{glcore,glvkspirv,tls,eglcore,glsi}.so.595.99.02
+```
+
+Then add them to the container's `volumes:` in compose (or as `-v` options) and recreate it:
+
+```yaml
+    volumes:
+      - /usr/lib/libGLX_nvidia.so.0:/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0:ro
+      - /usr/lib/libEGL_nvidia.so.0:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0:ro
+      - /usr/lib/libnvidia-glcore.so.595.99.02:/usr/lib/x86_64-linux-gnu/libnvidia-glcore.so.595.99.02:ro
+      - /usr/lib/libnvidia-glvkspirv.so.595.99.02:/usr/lib/x86_64-linux-gnu/libnvidia-glvkspirv.so.595.99.02:ro
+      - /usr/lib/libnvidia-tls.so.595.99.02:/usr/lib/x86_64-linux-gnu/libnvidia-tls.so.595.99.02:ro
+      - /usr/lib/libnvidia-eglcore.so.595.99.02:/usr/lib/x86_64-linux-gnu/libnvidia-eglcore.so.595.99.02:ro
+      - /usr/lib/libnvidia-glsi.so.595.99.02:/usr/lib/x86_64-linux-gnu/libnvidia-glsi.so.595.99.02:ro
+```
+
+The app writes the config files Vulkan needs, and the log then says `Vulkan ready for Dolby Vision Profile 5 tone-mapping`. After a host driver update, change the version numbers to match. A file that doesn't exist on the host is created there as an empty folder, and Vulkan stays unavailable.
 
 Intel and AMD need no extra step beyond passing `/dev/dri`, which also brings the Mesa Vulkan driver.
 
