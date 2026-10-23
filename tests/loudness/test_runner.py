@@ -531,21 +531,20 @@ def test_follow_up_never_broadens_an_explicit_plex_or_unknown_pin(
                 "file_paths": ["/m/a.mkv"],
                 "follows_job_id": "p1",
                 "server_id": expected_pin,
+                "retry_delay_s": 0,
             }
         ]
 
 
-def test_a_failing_loudness_follow_up_never_costs_the_intro_follow_up(monkeypatch):
+def test_a_failing_loudness_job_never_costs_the_webhooks_intro_job(monkeypatch):
     from media_preview_generator.markers import triggers
 
-    jm = MagicMock()
-    jm.get_job.return_value = SimpleNamespace(
-        config={triggers.INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": ["/m/a.mkv"], "source": "sonarr"}
-    )
-    monkeypatch.setattr(triggers, "get_job_manager", lambda: jm)
-    monkeypatch.setattr(triggers, "submit_follow_ups", lambda **kw: ["intro-job"])
+    submit = MagicMock(return_value=["intro-job"])
+    monkeypatch.setattr(triggers, "submit_follow_ups", submit)
     monkeypatch.setattr(triggers, "_server_configs", MagicMock(side_effect=RuntimeError("settings unreadable")))
-    assert triggers.submit_pending_follow_up("p1") == ["intro-job"]
+    assert triggers.submit_webhook_jobs(paths=["/m/a.mkv"], source="sonarr", pin=None) == ["intro-job"]
+    assert submit.call_args.kwargs["preview_job_id"] is None
+    assert submit.call_args.kwargs["delay_s"] == 0
 
 
 def test_follow_up_runs_at_normal_and_skips_paths_already_queued_for_the_preview(follow_up, monkeypatch):
@@ -596,6 +595,7 @@ def test_different_preview_always_gets_its_own_follow_up(follow_up, monkeypatch,
             "file_paths": ["/m/a.mkv"],
             "follows_job_id": "p1",
             "server_id": incoming_pin,
+            "retry_delay_s": 0,
         }
     ]
 

@@ -25,7 +25,6 @@ def manager(tmp_path, monkeypatch):
         lambda: SimpleNamespace(processing_paused=False),
     )
     monkeypatch.setattr("media_preview_generator.web.webhooks.ensure_pending_webhook", lambda _: False)
-    monkeypatch.setattr(job_runner, "_queue_intro_credits_follow_up", lambda *args: None)
     yield jm
     for runner in (job_runner, marker_runner, loudness_runner):
         for job in jm.get_all_jobs():

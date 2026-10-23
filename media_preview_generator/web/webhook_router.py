@@ -595,6 +595,13 @@ def _create_webhook_job(
             "canonical_path": canonical_path,
             "message": "Recent duplicate webhook for this file — the original Job is the authoritative one.",
         }
+    if not job_id:
+        return {
+            "status": "ignored",
+            "kind": kind,
+            "canonical_path": canonical_path,
+            "message": "Previews, Intro & Credits and loudness are all off for this file's library.",
+        }
     return {
         "status": "queued",
         "kind": kind,

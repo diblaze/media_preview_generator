@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
+from ...job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
 from ...jobs.orchestrator import SUCCESS_OUTCOME_KEYS, count_successes
 from ...jobs.parking import JobParked
 from ...processing.retry_queue import scaled_backoff_delay
@@ -595,10 +595,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
     libraries after a revive), no second thread is started, to avoid
     duplicate work.
 
-    Either way, a webhook preview job that asked for its Intro & Credits
-    follow-up (``INTRO_CREDITS_FOLLOW_UP`` in its saved config) gets it
-    queued once its thread is running (``_queue_intro_credits_follow_up``).
-
     Intro & Credits jobs are handed to their own runner, so every start path (manual resume, pending drain,
     restart requeue, reprocess) runs them with the marker pipeline.
     """
@@ -638,10 +634,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
         if current is None or current.status != JobStatus.PENDING:
             return
         config_overrides = dict(current.config)
-    if config_overrides and INTRO_CREDITS_FOLLOW_UP in config_overrides:
-        # Only the saved config asks for the follow-up (a revival passes a copy of it): the job's own writes below
-        # must never put back a request already taken.
-        config_overrides = {k: v for k, v in config_overrides.items() if k != INTRO_CREDITS_FOLLOW_UP}
     admission_job = queued
     with _inflight_lock:
         duplicate = job_id in _inflight_jobs
@@ -670,7 +662,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
     if duplicate or terminal:
         if duplicate:
             logger.info("Skipping duplicate _start_job_async for {} — already in flight", job_id)
-        _queue_intro_credits_follow_up(job_id, config_overrides)
         return
 
     from ...jobs.admission import claim_admission, finish_admission
@@ -731,7 +722,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                     updates["webhook_basenames"] = [os.path.basename(p) for p in wp][:20]
                     if not merged.get("path_count"):
                         updates["path_count"] = len(wp)
-                # Only these keys: a read-then-replace could put back a key taken off meanwhile (the follow-up request).
+                # Only these keys: a read-then-replace could put back a key another thread changed meanwhile.
                 job_manager.merge_job_config(job_id, updates)
                 logger.info("Job {} not started — global processing paused; job remains pending", job_id)
                 return
@@ -759,8 +750,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
 
             job = job_manager.get_job(job_id)
             if job and config_overrides:
-                # Only the override keys: a read-then-replace could put back a key taken off meanwhile (the
-                # Intro & Credits follow-up request, taken by the thread that started this one).
+                # Only the override keys: a read-then-replace could put back a key another thread changed meanwhile.
                 job_manager.merge_job_config(job_id, config_overrides)
 
             # Ensure webhook_basenames is populated for UI file display.
@@ -2037,7 +2027,7 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
                         if spawned_retry_id:
                             error_parts.append(f"{len(retry_paths)} path(s) sent for retry")
                             # Only this key: replacing the config from the snapshot read above could put back a key
-                            # taken off since (the Intro & Credits follow-up request).
+                            # another thread changed since.
                             job_manager.merge_job_config(
                                 job_id,
                                 {
@@ -2212,25 +2202,6 @@ def _start_job_async(job_id: str, config_overrides: dict | None = None):
         with _inflight_lock:
             _inflight_jobs.discard(job_id)
         raise
-    _queue_intro_credits_follow_up(job_id, config_overrides)
-
-
-def _queue_intro_credits_follow_up(job_id: str, config_overrides: dict | None) -> None:
-    """Queue the Intro & Credits job a webhook preview job asked for (``markers.triggers.submit_pending_follow_up``).
-
-    Called on every start of a preview job, after its thread has started: the follow-up waits for the preview job, and
-    a job that never asked queues nothing. Never raises: a markers problem must not cost the job its previews.
-
-    Args:
-        job_id: The preview job being started.
-        config_overrides: The start's overrides (the fired batch's paths, pin and item ids).
-    """
-    try:
-        from ...markers.triggers import submit_pending_follow_up
-
-        submit_pending_follow_up(job_id, config_overrides)
-    except Exception:
-        logger.exception("Could not queue the Intro & Credits job that follows webhook job {}", job_id)
 
 
 def _recently_added_since(job, lookback_hours) -> datetime | None:

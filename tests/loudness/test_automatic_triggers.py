@@ -133,19 +133,11 @@ def test_two_preview_arrivals_each_keep_their_own_follow_up_and_source(automatic
     }
 
 
-def test_upfront_webhook_and_dispatch_share_one_job_preserving_sender_path(automatic):
+def test_a_webhooks_loudness_job_is_queued_at_intake_and_its_preview_run_adds_none(automatic):
     manager, preview, cfg = automatic
     cfg.path_mappings = [{"remote_prefix": "/sender", "local_prefix": "/media/movies"}]
-    manager.merge_job_config(
-        preview.id,
-        {
-            triggers.INTRO_CREDITS_FOLLOW_UP: True,
-            "webhook_paths": ["/sender/a.mkv"],
-            "source": "sonarr",
-            "server_id": "plex",
-        },
-    )
-    triggers.submit_pending_follow_up(preview.id)
+    manager.merge_job_config(preview.id, {"webhook_paths": ["/sender/a.mkv"], "source": "sonarr", "server_id": "plex"})
+    triggers.submit_webhook_jobs(paths=["/sender/a.mkv"], source="sonarr", pin="plex")
     orchestrator._queue_loudness_follow_up(preview.id, [ProcessableItem("/media/movies/a.mkv", "plex")], "plex")
     assert len(_loudness(manager)) == 1
     assert _loudness(manager)[0].config["file_paths"] == ["/sender/a.mkv"]
@@ -208,40 +200,10 @@ def test_real_dispatch_queues_already_previewed_files_before_checking(automatic,
     assert "follows_job_ids" not in seen[0].config
 
 
-def test_upfront_directory_defers_to_selected_enumerated_files_without_duplicate(automatic, tmp_path):
-    manager, preview, cfg = automatic
-    folder = tmp_path / "Movies"
-    folder.mkdir()
-    included = folder / "a.mkv"
-    excluded = folder / "b.mkv"
-    included.touch()
-    excluded.touch()
-    cfg.libraries = [Library("movie", "Movies", (str(folder),), kind="movie")]
-    cfg.exclude_paths = [{"value": str(excluded), "type": "path"}]
-    cfg.path_mappings = [{"remote_prefix": "/sender", "local_prefix": str(folder)}]
-    manager.merge_job_config(
-        preview.id,
-        {triggers.INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": ["/sender"], "source": "sonarr", "server_id": "plex"},
-    )
-    triggers.submit_pending_follow_up(preview.id)
-    assert _loudness(manager) == []
-    orchestrator._queue_loudness_follow_up(
-        preview.id, [ProcessableItem(str(path), "plex") for path in [included, excluded]], "plex"
-    )
-    assert len(_loudness(manager)) == 1
-    assert _loudness(manager)[0].config["file_paths"] == [str(included)]
-    assert _loudness(manager)[0].config["follows_job_id"] == preview.id
-    assert "follows_job_ids" not in _loudness(manager)[0].config
-
-
-def test_upfront_missing_file_retains_sender_path_for_loudness_retry(automatic):
+def test_a_webhook_file_missing_from_disk_retains_sender_path_for_loudness_retry(automatic):
     manager, preview, _ = automatic
     missing = "/media/movies/not-arrived.mkv"
-    manager.merge_job_config(
-        preview.id,
-        {triggers.INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": [missing], "source": "sonarr", "server_id": "plex"},
-    )
-    triggers.submit_pending_follow_up(preview.id)
+    triggers.submit_webhook_jobs(paths=[missing], source="sonarr", pin="plex")
     assert len(_loudness(manager)) == 1
     assert _loudness(manager)[0].config["file_paths"] == [missing]
     assert _loudness(manager)[0].config["source"] == "sonarr"

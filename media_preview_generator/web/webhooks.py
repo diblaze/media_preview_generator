@@ -21,7 +21,6 @@ from typing import Any, cast
 from flask import Blueprint, g, jsonify, request
 from loguru import logger
 
-from ..job_kinds import INTRO_CREDITS_FOLLOW_UP
 from ..processing.retry_queue import retry_policy
 from .auth import api_token_required, validate_token
 from .jobs import Job, JobStatus, get_job_manager, incoming_job_priority
@@ -355,6 +354,62 @@ def _resolve_webhook_server_context(server_id: str | None) -> tuple[str | None, 
     return (entry.get("id"), entry.get("name") or entry.get("id"), (entry.get("type") or "").lower() or None)
 
 
+def _previews_wanted(path: str, pin: str | None) -> bool:
+    """Whether a webhook's file needs a preview job: Previews is on for a library that holds it.
+
+    Only the pinned server counts when the webhook is pinned. A file under no library of those servers still gets one:
+    its retries cover a library the server is still adding, and its log points at a wrong path mapping.
+
+    Args:
+        path: The file path the webhook reported.
+        pin: The server the webhook is pinned to; None = every server.
+
+    Returns:
+        False only when the file is in a known library and Previews is off for every library that holds it.
+    """
+    from ..servers.ownership import find_library_matches, find_owning_servers, webhook_path_candidates
+    from ..servers.registry import server_config_from_dict
+
+    try:
+        configs = []
+        for entry in get_settings_manager().get("media_servers") or []:
+            if isinstance(entry, dict):
+                try:
+                    configs.append(server_config_from_dict(entry))
+                except Exception:
+                    continue
+        servers = [cfg for cfg in configs if cfg.id == pin] if pin else configs
+        candidates = webhook_path_candidates(path, configs)
+        if any(find_owning_servers(candidate, servers) for candidate in candidates):
+            return True
+        return not any(find_library_matches(candidate, servers) for candidate in candidates)
+    except Exception as exc:
+        logger.debug("Couldn't check whether Previews is on for {}: {}", path, exc)
+        return True
+
+
+def _queue_webhook_jobs(
+    source: str,
+    path: str,
+    pin: str | None,
+    delay: int,
+    item_id_hints: dict[str, dict[str, str]] | None = None,
+) -> list[str]:
+    """Queue the webhook's Intro & Credits and loudness jobs, each only where that feature is on for the file."""
+    from ..markers.triggers import submit_webhook_jobs
+
+    return submit_webhook_jobs(paths=[path], source=source, pin=pin, item_id_hints=item_id_hints, delay_s=delay)
+
+
+def _log_previews_off(source: str, title: str, queued: list[str]) -> None:
+    logger.info(
+        "Webhook from {}: '{}' — Previews is off for its library, so no preview job; {}",
+        source,
+        title,
+        f"queued {len(queued)} other job(s)" if queued else "Intro & Credits and loudness are off for it too",
+    )
+
+
 def _as_dict(value: object) -> dict:
     """Return value if dict-like, otherwise an empty dict."""
     return value if isinstance(value, dict) else {}
@@ -454,6 +509,10 @@ def create_vendor_webhook_job(
     identical jobs per imported file. Returns the new job's id, or
     ``None`` when the dispatch was skipped as a recent duplicate.
 
+    When Previews is off for the file's library, no preview job is made: the
+    Intro & Credits and loudness jobs are queued on their own, and the first
+    of their ids is returned ("" when those are off too).
+
     Args:
         source: Vendor identifier (``"plex"``, ``"emby"``, ``"jellyfin"``).
             Surfaces in the Jobs UI as the "source" chip.
@@ -502,6 +561,26 @@ def create_vendor_webhook_job(
         settings = get_settings_manager()
         retry_count, retry_delay = retry_policy(settings)
         delay = _effective_webhook_delay(delay)
+        clean_hints = {str(sid): str(item_id) for sid, item_id in (item_id_by_server or {}).items() if sid and item_id}
+        hints = {canonical_path: clean_hints} if clean_hints else None
+
+        # Where the previews would publish (``jobs.worker.resolve_per_item_pin``): the URL's pin, else an Emby or
+        # Jellyfin sender alone, else every server.
+        previews_pin = server_id_filter or (b_sid if b_stype not in (None, "plex") else None)
+        if not _previews_wanted(canonical_path, previews_pin):
+            queued = _queue_webhook_jobs(safe_source, canonical_path, server_id_filter, delay, hints)
+            _log_previews_off(safe_source, library_display, queued)
+            _add_history_entry(
+                safe_source,
+                "Webhook",
+                library_display,
+                "queued" if queued else "ignored",
+                job_id=queued[0] if queued else None,
+                server_id=b_sid,
+                server_name=b_sname,
+                server_type=b_stype,
+            )
+            return queued[0] if queued else ""
 
         overrides: dict[str, object] = {
             "sort_by": "newest",
@@ -516,12 +595,9 @@ def create_vendor_webhook_job(
             # source pill.
             "source": safe_source,
         }
-        if item_id_by_server:
-            # Wrap as {path: {server_id: item_id}} so the orchestrator can
-            # short-circuit Plex resolution and pass hints straight through.
-            clean_hints = {str(sid): str(item_id) for sid, item_id in item_id_by_server.items() if sid and item_id}
-            if clean_hints:
-                overrides["webhook_item_id_hints"] = {canonical_path: clean_hints}
+        if hints:
+            # {path: {server_id: item_id}} lets the orchestrator short-circuit Plex resolution and pass hints through.
+            overrides["webhook_item_id_hints"] = hints
         if server_id_filter:
             overrides["server_id"] = server_id_filter
         if regenerate:
@@ -538,7 +614,6 @@ def create_vendor_webhook_job(
                     **overrides,
                     "path_count": 1,
                     "webhook_basenames": [basename],
-                    INTRO_CREDITS_FOLLOW_UP: True,
                     "webhook_debounce_pending": True,
                     "webhook_delay_mode": "vendor",
                     "webhook_fire_at": datetime.fromtimestamp(fire_at, tz=UTC).isoformat(),
@@ -554,6 +629,7 @@ def create_vendor_webhook_job(
         with _pending_lock:
             _forget_dispatch(safe_source, server_id, canonical_path)
         raise
+    _queue_webhook_jobs(safe_source, canonical_path, server_id_filter, delay, hints)
     _add_history_entry(
         safe_source,
         "Webhook",
@@ -1013,6 +1089,19 @@ def _schedule_webhook_job(
     debounce_key = _debounce_key(safe_source, server_id)
     normalized_path = os.path.normpath(normalized_input_path).replace("\\", "/")
     basename = os.path.basename(normalized_path)
+    b_sid, b_sname, b_stype = _resolve_webhook_server_context(server_id)
+
+    if not _previews_wanted(normalized_path, b_sid):
+        with _pending_lock:
+            age_sec = _check_and_record_dedup(safe_source, server_id, normalized_path)
+        if age_sec is not None:
+            logger.info(
+                "Webhook: {} duplicate of '{}' ignored (already dispatched {}s ago)", safe_source, safe_title, age_sec
+            )
+            _add_history_entry(safe_source, "Download", safe_title, "deduped")
+            return False
+        _log_previews_off(safe_source, safe_title, _queue_webhook_jobs(safe_source, normalized_path, b_sid, delay))
+        return True
 
     # NOTE: _schedule_webhook_job uses _check_and_record_dedup ONLY as a
     # "have I already created a Job for this path very recently?" guard —
@@ -1067,11 +1156,6 @@ def _schedule_webhook_job(
                 fire_at_iso = datetime.fromtimestamp(fire_at_ts, tz=UTC).isoformat()
 
                 if is_fresh_batch:
-                    # Pull server-context resolution forward so the Job can be
-                    # created with the correct pinned-server fields. Previously
-                    # this happened inside ``_execute_webhook_job`` 60s later.
-                    b_sid, b_sname, b_stype = _resolve_webhook_server_context(server_id)
-
                     job_manager = get_job_manager()
                     job = job_manager.create_job(
                         library_name=safe_title,
@@ -1095,12 +1179,9 @@ def _schedule_webhook_job(
                             # the dashboard's job-row countdown reads this.
                             "webhook_fire_at": fire_at_iso,
                             # Like webhook_paths, persisted now so a job revived
-                            # after a restart during the debounce keeps what the
-                            # fire would have given it: its publish pin, and the
-                            # Intro & Credits job that follows it (queued by the
-                            # preview runner when it starts the job).
+                            # after a restart during the debounce keeps the publish
+                            # pin the fire would have given it.
                             **({"server_id": b_sid} if b_sid else {}),
-                            INTRO_CREDITS_FOLLOW_UP: True,
                             "webhook_debounce_pending": True,
                             "webhook_batch_opened_at": opened_at,
                             "webhook_batch_max_wait": max_wait,
@@ -1167,7 +1248,6 @@ def _schedule_webhook_job(
                             # This call replaces the config: keep what batch-open
                             # persisted for a revival (see the fresh-batch branch).
                             **({"server_id": batch["server_id_pin"]} if batch.get("server_id_pin") else {}),
-                            INTRO_CREDITS_FOLLOW_UP: True,
                             "webhook_debounce_pending": True,
                             "webhook_batch_opened_at": opened_at,
                             "webhook_batch_max_wait": max_wait,
@@ -1216,6 +1296,7 @@ def _schedule_webhook_job(
     # season-pack get their own head start).
     if early_scan and early_scan_job_id is not None:
         _kick_early_scan(normalized_path, server_id, early_scan_job_id)
+    _queue_webhook_jobs(safe_source, normalized_path, b_sid, round(wait_s))
 
     logger.info(
         "Webhook: {} imported '{}' — scheduling job with {} path(s) in {}s",

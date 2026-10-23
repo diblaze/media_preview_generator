@@ -32,7 +32,6 @@ from ..web.job_gate import format_wait_message, get_job_gate, release_slot
 from ..web.jobs import (
     PAUSED_BY_SCHEDULE,
     JobLogSink,
-    JobStatus,
     WorkerStatus,
     get_job_manager,
     wait_for_job_log,
@@ -81,9 +80,6 @@ from .source_counts import DecidedByTally, stored_groups
 from .store import MarkerStore
 
 _POLL_S = 1.0
-# Polls a PENDING preview job may go without a thread before its follow-up stops waiting for it. Covers the moment
-# between two starts of the pending drain or the restart requeue; a job not revived after a restart never gets one.
-_ORPHAN_GRACE_POLLS = 30
 # Largest retry (or verify) job, and the most files one Check servers run takes; a bigger backlog (a new library's
 # unindexed files, many drifted items) waits for a later run instead.
 MAX_RETRY_FILES = 500
@@ -96,6 +92,8 @@ _USER_PICKED_SOURCES = frozenset({"manual", "inspector", "inspector_season"})
 RECENTLY_ADDED_SOURCE = "recently_added"
 # A follow-up's config key once its runner has read its files: nothing joins it after that.
 FILES_SEALED = "files_sealed"
+# A webhook's job's config key: episodes of the same season that later webhooks report join it until it seals its files.
+WEBHOOK_FILES = "webhook_files"
 # Serialises webhook episodes joining a waiting follow-up with its runner reading them.
 FOLLOW_UP_LOCK = threading.Lock()
 # Config keys updated by webhook joins or the runner's file seal.
@@ -512,7 +510,7 @@ def _seal_files(jm, job_id: str, job, cfg: dict) -> dict:
     Returns:
         The config to list the files of.
     """
-    if not cfg.get("follows_job_id"):
+    if not cfg.get(WEBHOOK_FILES):
         return cfg
     with FOLLOW_UP_LOCK:
         # Only the seal is written (under the job manager's lock): a key another thread set meanwhile stays.
@@ -524,7 +522,7 @@ def _seal_files(jm, job_id: str, job, cfg: dict) -> dict:
 def wait_for_retry_time(
     job_id: str, cfg: dict, cancel_check: Callable[[], bool], *, progress_job_id: str | None = None
 ) -> bool:
-    """Hold a retry job until it is due. Runs before the gate, so waiting costs no slot.
+    """Hold a retry, a verify or a webhook's job until it is due. Runs before the gate, so waiting costs no slot.
 
     Returns:
         False if the job was cancelled while waiting.
@@ -549,6 +547,8 @@ def wait_for_retry_time(
         waiting_for = (
             f"Check starting in {remaining}s — servers often rescan a replaced file after its markers are sent"
         )
+    elif not cfg.get("retry_attempt"):
+        waiting_for = f"Starting in {remaining}s — giving the servers time to add these files"
     else:
         waiting_for = f"Retry starting in {remaining}s — waiting for these files to appear on disk or on a server"
     update_wait(
@@ -748,63 +748,6 @@ def _mark_retried_items_gone(
             except Exception as exc:
                 logger.warning("Check servers couldn't mark item {} of {} gone: {}", item_id, server_id,
                                type(exc).__name__)  # fmt: skip
-
-
-def _in_flight(job_id: str) -> bool:
-    with _inflight_lock:
-        return job_id in _inflight_jobs
-
-
-def wait_for_preceding_job(job_id: str, follows_job_id: str | None, cancel_check: Callable[[], bool]) -> bool:
-    """Hold a webhook follow-up until its preview job has finished.
-
-    Priority alone can't order them: users can set incoming preview jobs to Normal or Low, and then this job
-    (which does less work before the gate) would take the slot first and run before the previews for the same
-    files. Runs before the gate, so waiting costs no slot. A preview job counting down to a retry
-    (PENDING with ``progress.retry_eta``) counts as finished, so this job starts after the preview job's first try: its
-    backoff can run for over an hour; files a server hasn't indexed yet, or not on disk yet, are retried in this job's
-    own retry chain (``_queue_retry``). A PENDING preview job with no thread to run it (too old to be revived after a
-    restart) counts as finished after ``_ORPHAN_GRACE_POLLS``; while processing is paused it doesn't, as resuming
-    starts it.
-
-    Returns:
-        False if the job was cancelled while waiting.
-    """
-    if not follows_job_id:
-        return True
-    from ..jobs.admission import preceding_job_ready
-
-    jm = get_job_manager()
-    announced = False
-    polls_without_thread = 0
-    while True:
-        if cancel_check():
-            return False
-        preceding = jm.get_job(follows_job_id)
-        if preceding_job_ready(preceding):
-            return True
-        assert preceding is not None  # preceding_job_ready is True for a missing job
-        if (
-            preceding.status is JobStatus.PENDING
-            and not get_settings_manager().processing_paused
-            and not _in_flight(follows_job_id)
-        ):
-            polls_without_thread += 1
-            if polls_without_thread > _ORPHAN_GRACE_POLLS:
-                jm.add_log(job_id, "INFO - The preview job for these files isn't queued to run; starting without it")
-                return True
-        else:
-            polls_without_thread = 0
-        if not announced:
-            jm.update_progress(
-                job_id,
-                percent=0,
-                processed_items=0,
-                total_items=0,
-                current_item="Queued — waiting for the preview job for these files to finish",
-            )
-            announced = True
-        time.sleep(_POLL_S)
 
 
 def hold_pause_from_before_restart(job_id: str, cancel_check: Callable[[], bool]) -> bool:
@@ -1297,7 +1240,7 @@ def _wait_for_job_slot(
     cancel_check: Callable[[], bool],
     live_priority: Callable[[], int],
 ) -> bool:
-    """Wait for the job's turn: the job it follows, its retry time, a pause, then capacity and a gate slot.
+    """Wait for the job's turn: its start time, a pause, then capacity and a gate slot.
 
     Args:
         jm: The job manager.
@@ -1316,10 +1259,6 @@ def _wait_for_job_slot(
         jm.update_progress(job_id, current_item=format_wait_message(active))
         jm.note_slot_wait(job_id)  # JobManager.requeue_interrupted_jobs ages a waiting job by the downtime only
 
-    if not wait_for_preceding_job(job_id, cfg.get("follows_job_id"), cancel_check):
-        jm.add_log(job_id, "WARNING - Job cancelled while waiting for its preview job")
-        jm.cancel_job(job_id)
-        return False
     if not wait_for_retry_time(job_id, cfg, cancel_check):
         jm.add_log(job_id, "WARNING - Job cancelled while waiting to retry")
         jm.cancel_job(job_id)

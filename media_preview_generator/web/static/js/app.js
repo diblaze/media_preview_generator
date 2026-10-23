@@ -921,7 +921,6 @@ window._dedupeActivityCount = _dedupeActivityCount;
 // Pending rows already say "Pending" in the Status column, so the Progress cell shows only a short reason; the
 // backend text stays untouched and is carried in the title. Unknown reasons lose just the "Queued — " prefix.
 const _QUEUE_REASON_SHORT = [
-    [/^waiting for the preview job for these files to finish\b/i, 'Waiting for previews to finish'],
     [/^waiting to start\b/i, 'Waiting to start'],
 ];
 function _queueReasonShort(text) {
@@ -2635,7 +2634,8 @@ function updateJobQueue(force) {
         } else if (isWaitingRetryRow) {
             const remaining = Math.max(0, Math.ceil((new Date(countdownTarget).getTime() - Date.now()) / 1000));
             const waitWord = _countdownWord(job, 'Retry starting');
-            const label = remaining > 0 ? `${waitWord} ${_formatCountdown(remaining)}` : 'Queued for retry';
+            const doneWord = _isWebhookStartWait(job) ? 'Queued' : 'Queued for retry';
+            const label = remaining > 0 ? `${waitWord} ${_formatCountdown(remaining)}` : doneWord;
             progressCell = `<span class="text-warning small" data-scheduled-at="${escapeHtml(countdownTarget)}" data-countdown-label="${escapeHtml(waitWord)}"><i class="bi bi-hourglass-split me-1"></i>${label}</span>`;
         } else if (isActiveRetryChain) {
             const processed = Number(job.progress.processed_items) || 0;
@@ -2877,7 +2877,9 @@ function updateActiveJobs(runningJobs, force) {
             const note = _markersPauseNote(markersPause, job);
             statusBadge = `<span class="badge bg-warning text-dark"${note ? ` title="${escapeHtml(note)}"` : ''}>Paused</span>`;
         } else if (isRetryWaiting) {
-            const waitText = _isMarkersVerifyJob(job) ? 'Waiting to check again' : 'Waiting to retry';
+            const waitText = _isMarkersVerifyJob(job)
+                ? 'Waiting to check again'
+                : (_isWebhookStartWait(job) ? 'Waiting to start' : 'Waiting to retry');
             statusBadge = `<span class="badge bg-warning text-dark"><i class="bi bi-hourglass-split me-1"></i>${waitText}</span>`;
         } else {
             statusBadge = '<span class="badge bg-primary pulse">Running</span>';
@@ -4249,9 +4251,16 @@ function _isMarkersVerifyJob(job) {
     return _isMarkersJob(job) && !!(job.config && job.config.verify);
 }
 
-// The words before a retry-wait countdown: "Checking again" for a verify job, the retry wording otherwise.
+// The words before a wait countdown: "Checking again" for a verify job, "Starting" for a webhook's Intro & Credits or
+// loudness job waiting out the webhook delay, the retry wording otherwise.
 function _countdownWord(job, retryWord) {
-    return _isMarkersVerifyJob(job) ? 'Checking again' : retryWord;
+    if (_isMarkersVerifyJob(job)) return 'Checking again';
+    return _isWebhookStartWait(job) ? 'Starting' : retryWord;
+}
+
+function _isWebhookStartWait(job) {
+    const cfg = (job && job.config) || {};
+    return !!job && job.kind !== 'previews' && !cfg.retry_attempt && !cfg.verify && !!cfg.retry_not_before;
 }
 
 // Retry countdowns: "in 45 s" below 90 seconds, then rounded minutes ("in 5 min").

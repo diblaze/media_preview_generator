@@ -241,7 +241,7 @@ def test_deferred_older_job_does_not_block_ready_recovered_job(lifecycle: Lifecy
             assert not thread.is_alive()
 
 
-def test_loudness_ignores_unfinished_companion_jobs_but_markers_still_wait(lifecycle: Lifecycle, monkeypatch):
+def test_no_job_waits_for_the_unfinished_job_it_follows(lifecycle: Lifecycle, monkeypatch):
     from types import SimpleNamespace
 
     from media_preview_generator.jobs.admission import _policy
@@ -259,9 +259,9 @@ def test_loudness_ignores_unfinished_companion_jobs_but_markers_still_wait(lifec
         kind="loudness",
         config={"follows_job_id": preview.id, "follows_job_ids": [preview.id, intro.id], "file_paths": ["/m/a.mkv"]},
     )
-    blocked_marker = manager.create_job(kind="intro_credits", config={"follows_job_id": preview.id})
+    labelled_marker = manager.create_job(kind="intro_credits", config={"follows_job_id": preview.id})
     assert _policy(manager, loudness.id, False) == (loudness.priority, True)
-    assert _policy(manager, blocked_marker.id, False) == (blocked_marker.priority, False)
+    assert _policy(manager, labelled_marker.id, False) == (labelled_marker.priority, True)
 
 
 def test_recovery_failed_older_launcher_does_not_leave_a_reservation(lifecycle: Lifecycle, monkeypatch):

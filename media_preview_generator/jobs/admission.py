@@ -4,18 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from ..job_kinds import JOB_KIND_LOUDNESS, JOB_KIND_PREVIEWS
-
-
-def preceding_job_ready(preceding) -> bool:
-    """A follow-up may run after the parent's first pass, including a retry wait."""
-    from ..web.jobs import JobStatus
-
-    return (
-        preceding is None
-        or preceding.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
-        or (preceding.status is JobStatus.PENDING and bool(preceding.progress.retry_eta))
-    )
+from ..job_kinds import JOB_KIND_PREVIEWS
 
 
 def _future(raw: object) -> bool:
@@ -49,12 +38,6 @@ def _policy(manager, job_id: str, preflight_complete: bool) -> tuple[int, bool] 
         return priority, False
     if preflight_complete:
         return priority, True
-    # Loudness never waits for other jobs: it checks Plex has the file itself and retries when not.
-    dependencies = (
-        [] if job.kind == JOB_KIND_LOUDNESS else [cfg.get("follows_job_id"), *(cfg.get("follows_job_ids") or [])]
-    )
-    if any(parent and not preceding_job_ready(manager.get_job(parent)) for parent in dependencies):
-        return priority, False
     if not cfg.get("force_fire_now"):
         deadline = cfg.get("retry_not_before")
         if job.kind == JOB_KIND_PREVIEWS and cfg.get("is_retry"):

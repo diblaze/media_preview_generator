@@ -1,38 +1,24 @@
-"""Webhook preview jobs ask for their Intro & Credits follow-up in their saved config.
+"""A webhook queues its Intro & Credits and loudness jobs when it arrives, with its pin, item ids and delay.
 
-The batch asks when it opens, so a job revived after a restart during the debounce asks too; the preview runner
-queues the follow-up when it starts the job (``markers.triggers.submit_pending_follow_up``) and takes the request
-off. The end-to-end journeys (fire, restart revival, vendor pins) are in
-tests/journeys/test_journey_webhook_markers_follow_up.py.
+The jobs are queued beside the preview job, not by it: none waits for another, and Previews being off for the file's
+library never holds them up. The end-to-end journeys (each sender route, restart during the delay, vendor pins,
+Previews off) are in tests/journeys/test_journey_webhook_jobs_per_feature.py.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from media_preview_generator.job_kinds import INTRO_CREDITS_FOLLOW_UP
 from media_preview_generator.markers import triggers
 from media_preview_generator.processing.types import ProcessableItem
 from media_preview_generator.web import webhooks as wh
 
 SONARR_PATH = "/data/TV Shows/Show (2023)/Season 02/Show - S02E04.mkv"
-SUBMIT = "media_preview_generator.markers.triggers.submit_follow_ups"
+SUBMIT_JOBS = "media_preview_generator.markers.triggers.submit_webhook_jobs"
 SERVERS = [
     {"id": "plex-1", "type": "plex", "name": "Plex", "enabled": True},
     {"id": "jf-1", "type": "jellyfin", "name": "Jellyfin", "enabled": True},
 ]
-
-
-@pytest.fixture
-def started(monkeypatch):
-    """Patch ``_start_job_async`` and capture every (job_id, overrides) call."""
-    captured: list[dict] = []
-
-    def fake_start(job_id, overrides):
-        captured.append({"job_id": job_id, "overrides": dict(overrides or {})})
-
-    monkeypatch.setattr("media_preview_generator.web.routes._start_job_async", fake_start)
-    return captured
 
 
 @pytest.fixture(autouse=True)
@@ -52,33 +38,19 @@ def _isolate_jobs(tmp_path):
 
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
+    wh._pending_batches.clear()
     yield
+    wh._pending_batches.clear()
     with jobs_mod._job_lock:
         jobs_mod._job_manager = None
 
 
-def _saved_config(job_id):
-    from media_preview_generator.web.jobs import get_job_manager
-
-    return get_job_manager().get_job(job_id).config
-
-
-def _open_batch(source, path, *, fire, **kwargs):
-    captured = []
-
-    def fake_timer(_delay, fn, *positional, args=None, kwargs=None):
-        t = MagicMock()
-        t.start = lambda: captured.append((fn, list(positional) + list(args or []), kwargs or {}))
-        return t
-
+def _schedule(source, path, **kwargs):
     with (
         patch.object(wh, "_check_and_record_dedup", return_value=None),
-        patch("media_preview_generator.web.webhooks.threading.Timer", side_effect=fake_timer),
+        patch("media_preview_generator.web.webhooks.threading.Timer", MagicMock()),
     ):
-        assert wh._schedule_webhook_job(source, "Show S02E04", path, early_scan=False, **kwargs) is True
-        if fire:
-            assert wh._fire_pending_batch_now(wh._debounce_key(source, kwargs.get("server_id")))
-    return next(iter(wh._pending_batches.values()))["job_id"] if not fire else None
+        return wh._schedule_webhook_job(source, "Show S02E04", path, early_scan=False, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -94,184 +66,143 @@ def _open_batch(source, path, *, fire, **kwargs):
         ("recently_added", None, None),
     ],
 )
-def test_the_batch_asks_when_it_opens_and_the_runner_queues_it_with_the_preview_pin(
-    started, monkeypatch, source, server_id, pin
-):
-    import media_preview_generator.web.webhooks as wh_mod
-
-    wh_mod._pending_batches.clear()
-    job_id = _open_batch(source, SONARR_PATH, fire=False, **({"server_id": server_id} if server_id else {}))
-    opened = _saved_config(job_id)
-    assert opened[INTRO_CREDITS_FOLLOW_UP] is True
-    assert opened["webhook_paths"] == [SONARR_PATH]
-    assert opened.get("server_id") == pin  # a revival publishes previews and markers where the fire would have
-
-    (key,) = wh_mod._pending_batches
-    wh_mod._execute_webhook_job(key)
-    (start,) = started
-    assert start["job_id"] == job_id
-    assert start["overrides"].get("server_id") == pin
-    assert _saved_config(job_id)[INTRO_CREDITS_FOLLOW_UP] is True  # still asking when the runner starts it
-
-    with patch(SUBMIT, return_value=["ic-1"]) as submit:
-        assert triggers.submit_pending_follow_up(job_id, start["overrides"]) == ["ic-1"]
-    submit.assert_called_once_with(
-        preview_job_id=job_id,
-        items=[ProcessableItem(canonical_path=SONARR_PATH, server_id="", item_id_by_server={})],
-        source=source,
-        pin=pin,
-    )
-    assert INTRO_CREDITS_FOLLOW_UP not in _saved_config(job_id)
+def test_a_sender_webhook_queues_its_jobs_on_arrival_with_the_preview_pin(source, server_id, pin):
+    with patch(SUBMIT_JOBS, return_value=["ic-1"]) as submit:
+        assert _schedule(source, SONARR_PATH, **({"server_id": server_id} if server_id else {})) is True
+    submit.assert_called_once_with(paths=[SONARR_PATH], source=source, pin=pin, item_id_hints=None, delay_s=60)
+    (batch,) = wh._pending_batches.values()
+    assert batch["server_id_pin"] == pin  # the preview job publishes where its Intro & Credits job does
 
 
-def test_a_batch_that_grows_keeps_asking_and_keeps_its_pin(started):
-    import media_preview_generator.web.webhooks as wh_mod
-
-    wh_mod._pending_batches.clear()
-    job_id = _open_batch("sonarr", SONARR_PATH, fire=False, server_id="jf-1")
+def test_each_file_a_batch_takes_queues_its_own_jobs():
     other = SONARR_PATH.replace("S02E04", "S02E05")
-    _open_batch("sonarr", other, fire=False, server_id="jf-1")
-    saved = _saved_config(job_id)
-    assert saved["webhook_paths"] == sorted([SONARR_PATH, other])
-    assert saved[INTRO_CREDITS_FOLLOW_UP] is True
-    assert saved["server_id"] == "jf-1"
-    assert started == []
+    with patch(SUBMIT_JOBS, return_value=[]) as submit:
+        _schedule("sonarr", SONARR_PATH, server_id="jf-1")
+        _schedule("sonarr", other, server_id="jf-1")
+    assert [c.kwargs["paths"] for c in submit.call_args_list] == [[SONARR_PATH], [other]]
+    assert {c.kwargs["pin"] for c in submit.call_args_list} == {"jf-1"}
+
+
+def test_a_duplicate_sender_webhook_queues_nothing():
+    with (
+        patch.object(wh, "_check_and_record_dedup", return_value=12),
+        patch(SUBMIT_JOBS) as submit,
+    ):
+        assert wh._schedule_webhook_job("sonarr", "Show", SONARR_PATH, early_scan=False) is False
+    submit.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    ("source", "hints", "server_id_filter", "items", "pin"),
+    ("hints", "server_id_filter", "expected_hints", "pin"),
     [
-        ("jellyfin", {"jf-1": "abc"}, None, [("jf-1", {"jf-1": "abc"})], None),
-        ("emby", {"emby-1": "42"}, None, [("emby-1", {"emby-1": "42"})], None),
-        ("plex", {"plex-1": "9"}, None, [("plex-1", {"plex-1": "9"})], None),
-        ("plex", None, None, [("", {})], None),
-        ("jellyfin", {"jf-1": ""}, None, [("", {})], None),  # empty ids are dropped before they reach the job
-        ("jellyfin", {"jf-1": "abc"}, "jf-1", [("jf-1", {"jf-1": "abc"})], "jf-1"),  # /api/webhooks/server/<id>
+        ({"jf-1": "abc"}, None, {"/data/Movies/Foo.mkv": {"jf-1": "abc"}}, None),
+        ({"plex-1": "9"}, None, {"/data/Movies/Foo.mkv": {"plex-1": "9"}}, None),
+        (None, None, None, None),
+        ({"jf-1": ""}, None, None, None),  # empty ids are dropped before they reach the jobs
+        ({"jf-1": "abc"}, "jf-1", {"/data/Movies/Foo.mkv": {"jf-1": "abc"}}, "jf-1"),  # /api/webhooks/server/<id>
     ],
 )
-def test_a_vendor_webhook_asks_and_hands_its_item_ids_and_pin_to_the_runner(
-    started, source, hints, server_id_filter, items, pin
-):
-    with patch.object(wh, "_check_and_record_dedup", return_value=None):
+def test_a_vendor_webhook_hands_its_item_ids_and_pin_to_its_jobs(hints, server_id_filter, expected_hints, pin):
+    with (
+        patch.object(wh, "_check_and_record_dedup", return_value=None),
+        patch(SUBMIT_JOBS, return_value=[]) as submit,
+    ):
         job_id = wh.create_vendor_webhook_job(
-            source=source,
+            source="jellyfin",
             title="Foo",
             canonical_path="/data/Movies/Foo.mkv",
             item_id_by_server=hints,
-            server_id=None,
             server_id_filter=server_id_filter,
         )
-        assert job_id is not None
-        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
-    assert _saved_config(job_id)[INTRO_CREDITS_FOLLOW_UP] is True
-    (start,) = started
-    with patch(SUBMIT, return_value=[]) as submit:
-        triggers.submit_pending_follow_up(job_id, start["overrides"])
+    assert job_id is not None
     submit.assert_called_once_with(
-        preview_job_id=job_id,
-        items=[ProcessableItem("/data/Movies/Foo.mkv", origin, dict(ids)) for origin, ids in items],
-        source=source,
-        pin=pin,
+        paths=["/data/Movies/Foo.mkv"], source="jellyfin", pin=pin, item_id_hints=expected_hints, delay_s=60
     )
 
 
-def test_the_vendor_request_uses_the_sanitised_source(started):
-    with patch.object(wh, "_check_and_record_dedup", return_value=None):
-        job_id = wh.create_vendor_webhook_job(source="  JellyFin ", canonical_path="/data/Movies/Foo.mkv")
-        assert job_id is not None
-        assert wh._fire_pending_batch_now(wh.find_pending_batch_key_for_job(job_id))
-    with patch(SUBMIT, return_value=[]) as submit:
-        triggers.submit_pending_follow_up(job_id, started[0]["overrides"])
+def test_the_vendor_jobs_use_the_sanitised_source():
+    with (
+        patch.object(wh, "_check_and_record_dedup", return_value=None),
+        patch(SUBMIT_JOBS, return_value=[]) as submit,
+    ):
+        wh.create_vendor_webhook_job(source="  JellyFin ", canonical_path="/data/Movies/Foo.mkv")
     assert submit.call_args.kwargs["source"] == "jellyfin"
 
 
-def test_a_duplicate_vendor_webhook_creates_no_job(started):
-    with patch.object(wh, "_check_and_record_dedup", return_value=12):
+def test_a_duplicate_vendor_webhook_creates_no_job():
+    with (
+        patch.object(wh, "_check_and_record_dedup", return_value=12),
+        patch(SUBMIT_JOBS) as submit,
+    ):
         assert wh.create_vendor_webhook_job(source="plex", canonical_path="/data/Movies/Foo.mkv") is None
-    assert started == []
+    submit.assert_not_called()
 
 
-class TestSubmitPendingFollowUp:
-    def _job(self, config):
-        from media_preview_generator.web.jobs import get_job_manager
-
-        return get_job_manager().create_job(library_name="x", config=config)
-
-    def test_a_job_that_never_asked_queues_nothing(self):
-        job = self._job({"webhook_paths": [SONARR_PATH], "source": "sonarr"})
-        with patch(SUBMIT) as submit:
-            assert triggers.submit_pending_follow_up(job.id, {"webhook_paths": [SONARR_PATH]}) == []
-        submit.assert_not_called()
-
-    def test_a_stale_copy_of_the_request_asks_nothing(self):
-        # A revival's snapshot of the config still holds the request the first start already took.
-        job = self._job({"webhook_paths": [SONARR_PATH], "source": "sonarr"})
-        with patch(SUBMIT) as submit:
-            triggers.submit_pending_follow_up(job.id, {INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": [SONARR_PATH]})
-        submit.assert_not_called()
-
-    def test_it_asks_once(self):
-        job = self._job({INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": [SONARR_PATH], "source": "sonarr"})
-        with patch(SUBMIT, return_value=["ic-1"]) as submit:
-            assert triggers.submit_pending_follow_up(job.id) == ["ic-1"]
-            assert triggers.submit_pending_follow_up(job.id) == []
-        submit.assert_called_once()
-
-    def test_a_failure_takes_the_request_off_too(self):
-        job = self._job({INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": [SONARR_PATH], "source": "sonarr"})
-        with patch(SUBMIT, side_effect=RuntimeError("boom")), pytest.raises(RuntimeError):
-            triggers.submit_pending_follow_up(job.id)
-        assert INTRO_CREDITS_FOLLOW_UP not in _saved_config(job.id)
-
-    def test_a_request_it_cant_read_is_taken_off_too(self):
-        job = self._job(
-            {
-                INTRO_CREDITS_FOLLOW_UP: True,
-                "webhook_paths": [SONARR_PATH],
-                "webhook_item_id_hints": {SONARR_PATH: "not-a-mapping"},
-            }
-        )
-        with patch(SUBMIT) as submit, pytest.raises(ValueError):
-            triggers.submit_pending_follow_up(job.id)
-        submit.assert_not_called()
-        assert INTRO_CREDITS_FOLLOW_UP not in _saved_config(job.id)
-
-    def test_files_a_batch_merge_added_meanwhile_keep_the_request(self):
-        """A resume drain started the job during its debounce; a webhook merged a second file into the batch while
-        the follow-up for the first was being queued. The request stays, so the fire (or a revival) queues it."""
-        from media_preview_generator.web.jobs import get_job_manager
-
-        other = SONARR_PATH.replace("S02E04", "S02E05")
-        job = self._job({INTRO_CREDITS_FOLLOW_UP: True, "webhook_paths": [SONARR_PATH], "source": "sonarr"})
-
-        def merged_meanwhile(**_kwargs):
-            get_job_manager().merge_job_config(
-                job.id, {"webhook_paths": [SONARR_PATH, other], INTRO_CREDITS_FOLLOW_UP: True}
+class TestSubmitWebhookJobs:
+    def test_items_carry_the_sender_of_each_file_and_every_job_gets_the_delay(self):
+        hints = {"/a.mkv": {"jf-1": "abc"}}
+        with (
+            patch("media_preview_generator.markers.triggers.submit_follow_ups", return_value=["ic-1"]) as follow_ups,
+            patch(
+                "media_preview_generator.markers.triggers._submit_loudness_follow_up", return_value=["ld-1"]
+            ) as loudness,
+        ):
+            queued = triggers.submit_webhook_jobs(
+                paths=["/a.mkv", "/b.mkv"], source="sonarr", pin="plex-1", item_id_hints=hints, delay_s=45
             )
-            return ["ic-1"]
+        assert queued == ["ic-1", "ld-1"]
+        follow_ups.assert_called_once_with(
+            preview_job_id=None,
+            items=[
+                ProcessableItem(canonical_path="/a.mkv", server_id="jf-1", item_id_by_server={"jf-1": "abc"}),
+                ProcessableItem(canonical_path="/b.mkv", server_id="", item_id_by_server={}),
+            ],
+            source="sonarr",
+            pin="plex-1",
+            delay_s=45,
+        )
+        loudness.assert_called_once_with(None, ["/a.mkv", "/b.mkv"], "sonarr", "plex-1", delay_s=45)
 
-        with patch(SUBMIT, side_effect=merged_meanwhile):
-            triggers.submit_pending_follow_up(job.id)
-        assert _saved_config(job.id)[INTRO_CREDITS_FOLLOW_UP] is True
+    def test_an_intro_credits_failure_still_queues_loudness(self):
+        with (
+            patch("media_preview_generator.markers.triggers.submit_follow_ups", side_effect=RuntimeError("boom")),
+            patch("media_preview_generator.markers.triggers._submit_loudness_follow_up", return_value=["ld-1"]),
+        ):
+            assert triggers.submit_webhook_jobs(paths=["/a.mkv"], source="sonarr", pin=None) == ["ld-1"]
 
-    def test_the_fire_writing_the_paths_meanwhile_takes_the_request(self):
-        """The fire's own write of the batch's paths (the job thread merging its start overrides) is no new file."""
-        from media_preview_generator.web.jobs import get_job_manager
 
-        job = self._job({INTRO_CREDITS_FOLLOW_UP: True, "source": "sonarr"})  # the fire replaced webhook_paths
+def _library_server(sid, *, previews, remote="/data/tv"):
+    return {
+        "id": sid,
+        "type": "jellyfin",
+        "name": sid,
+        "enabled": True,
+        "url": "http://x",
+        "auth": {"method": "api_key", "api_key": "k"},
+        "libraries": [{"id": "1", "name": "TV", "remote_paths": [remote], "enabled": previews}],
+    }
 
-        def thread_merged_the_overrides(**_kwargs):
-            get_job_manager().merge_job_config(job.id, {"webhook_paths": [SONARR_PATH]})
-            return ["ic-1"]
 
-        with patch(SUBMIT, side_effect=thread_merged_the_overrides):
-            triggers.submit_pending_follow_up(job.id, {"webhook_paths": [SONARR_PATH]})
-        assert INTRO_CREDITS_FOLLOW_UP not in _saved_config(job.id)
+class TestPreviewsWanted:
+    PATH = "/data/tv/Show/Season 01/Show - S01E01.mkv"
 
-    def test_the_overrides_fill_in_what_the_fired_batch_gave_the_job(self):
-        job = self._job({INTRO_CREDITS_FOLLOW_UP: True, "source": "sonarr"})  # the fire replaced webhook_paths
-        with patch(SUBMIT, return_value=[]) as submit:
-            triggers.submit_pending_follow_up(job.id, {"webhook_paths": [SONARR_PATH], "server_id": "jf-1"})
-        kwargs = submit.call_args.kwargs
-        assert [i.canonical_path for i in kwargs["items"]] == [SONARR_PATH]
-        assert kwargs["pin"] == "jf-1"
+    @pytest.mark.parametrize(
+        ("servers", "pin", "wanted"),
+        [
+            ([_library_server("a", previews=True)], None, True),
+            ([_library_server("a", previews=False)], None, False),
+            ([_library_server("a", previews=False), _library_server("b", previews=True)], None, True),
+            # Pinned: only the pinned server's libraries count.
+            ([_library_server("a", previews=False), _library_server("b", previews=True)], "a", False),
+            ([_library_server("a", previews=False), _library_server("b", previews=True)], "b", True),
+            # Under no known library: keep the preview job (a library being added, a wrong path mapping).
+            ([_library_server("a", previews=False, remote="/other")], None, True),
+            ([], None, True),
+        ],
+        ids=["on", "off", "off-and-on", "pinned-off", "pinned-on", "unknown-library", "no-servers"],
+    )
+    def test_previews_wanted(self, servers, pin, wanted):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        get_settings_manager().set("media_servers", servers)
+        assert wh._previews_wanted(self.PATH, pin) is wanted

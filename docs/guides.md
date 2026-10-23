@@ -1553,31 +1553,27 @@ ahead on a stale setting.
 
 ### Webhook follow-ups and retries
 
-A Sonarr/Radarr/webhook import queues an Intro & Credits job right after the preview job for the same files, and so
-does each **Recently Added** scan for the files it finds. A restart while a webhook batch is still waiting to run
-doesn't lose it: the revived preview job queues its Intro & Credits job when it starts. An Intro & Credits job
-waiting for its preview job stays with it across a restart, revived with it or held with it by **Pause**,
-however long ago it was queued. The job sends markers where the
-preview job sends previews: a webhook pinned to one server (`/api/webhooks/server/<id>`, or `?server_id=`), an Emby or
+A webhook queues each job its file needs when it arrives: previews, Intro & Credits and Plex loudness, each only where
+that feature is on for the file's library, and none waits for another. With Previews off for the library, no preview
+job is made at all. Each **Recently Added** scan also queues an Intro & Credits job for the files it finds. The
+Intro & Credits job starts after the webhook delay, so the server can add the file first, and is kept across a
+restart. It sends markers where previews would go: a webhook pinned to one server (`/api/webhooks/server/<id>`, or `?server_id=`), an Emby or
 Jellyfin webhook, a file a Recently Added scan found on Emby or Jellyfin, or a Recently Added schedule pinned to one
 server, publishes to that server only; anything else goes to every server with Intro & Credits on. It
-runs at Normal priority, or at Low when the preview job itself runs at Low, and it starts after that preview job's
-first try (it doesn't wait out the preview job's retries; episodes that join it later, see below, don't wait for their
-own preview jobs). If a file isn't on disk yet, a server hasn't indexed it into its library yet, or Plex didn't answer
+runs at Normal priority, or at Low when incoming jobs run at Low. If a file isn't on disk yet, a server hasn't indexed it into its library yet, or Plex didn't answer
 its Plex Pass check, it's retried the way preview jobs are, with the same backoff — **Settings → Processing options → Retry policy → Retry
 count / Initial retry delay**. The job stays one row in the queue: **Pending**, with a **Retry 1/5** chip (5 retries
 by default) and "Retry starting in …", then **Running** while the retry checks the files still waiting. Files that were already
 done keep their results. The row turns **Completed** once every file is in, or **Failed** when the retries run out
-with files still waiting (the Files panel lists them). **Retry now** starts the waiting retry at once. A job with no
-preview job before it (markers on with previews off, a manual job, the Inspector) retries the same way.
+with files still waiting (the Files panel lists them). **Retry now** starts the waiting retry at once. A manual job or an Inspector one
+retries the same way.
 A retry resolves the path Sonarr/Radarr sent again, so a file that lands on a
 different disk than the first mapped one is still found. A retry batch holds at most 500 files at a time — a bigger backlog (e.g. a brand new library)
 is picked up on the next run instead.
 
-Plex, Emby and Jellyfin send one webhook per episode. Episodes of a season that arrive while an earlier episode's
-follow-up is still waiting join that job (up to 500 files), so a season pack becomes one Intro & Credits job rather
-than one per episode. An episode that joins doesn't wait for its own preview job: the job runs once the first
-episode's preview job has finished, and markers don't need previews.
+Senders report one file at a time. A file that arrives while an earlier webhook's Intro & Credits job is still
+waiting joins it (up to 500 files) when it came from the same sender or is in the same season, so a season pack
+becomes one Intro & Credits job rather than one per episode.
 
 A new episode can change what the season's other episodes should get (for example, an intro chapter that looked
 normal turns out far longer than the rest of the season). Other episodes wait until a manual or scheduled
@@ -1587,7 +1583,7 @@ queued Season jobs remain available, but do not create another job when they fin
 
 ### Reading an Intro & Credits job's log
 
-A job starts with one line saying how many files it checks and why it ran: a follow-up to a preview job, a Season job,
+A job starts with one line saying how many files it checks and why it ran: a webhook, a Season job,
 a re-check after an update, a schedule, or a Re-detect you asked for. Every step of every file is then logged as it
 happens, one line each. A file opens with a line naming it and what it's checked for, and every later line of that
 file starts with its title, so files checked at the same time can share the log and still be read one at a time. When
@@ -1595,7 +1591,7 @@ a GPU or CPU worker reads the file, the worker's own "picked up" and "completed"
 text a GPU worker read:
 
 ```
-[2026-10-02 13:49:15] INFO - Intro & Credits job 524d043e started: 1 file, follow-up to preview job 0ea63e4a (Plex webhook)
+[2026-10-02 13:49:15] INFO - Intro & Credits job 524d043e started: 1 file, Plex webhook
 [2026-10-02 13:49:15] INFO - Example Movie (2026): checking credits (films get credits only)
 [2026-10-02 13:49:15] INFO - Example Movie (2026) · Checking chapters… none (asked now)
 [2026-10-02 13:49:16] INFO - Example Movie (2026) · Checking SkipDB… no entry (asked now)

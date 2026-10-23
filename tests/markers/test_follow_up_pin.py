@@ -195,6 +195,7 @@ class TestFollowUpsForItems:
             "source": "emby",
             "server_id": expected,
             "item_id_hints": {"/media/tv/S/a.mkv": {origin: "7"}} if origin else None,
+            "delay_s": 0,
         }
 
     def test_items_of_different_pins_get_one_follow_up_each(self, submit):
@@ -231,7 +232,7 @@ class TestWaitingFollowUpsCoverOnlyWhatTheyPublish:
         return manager
 
     def _waiting(self, jm, paths, pin):
-        config = {"kind": JOB_KIND_INTRO_CREDITS, "file_paths": paths, "follows_job_id": "prev-0", "force": False}
+        config = {"kind": JOB_KIND_INTRO_CREDITS, "file_paths": paths, "webhook_files": True, "force": False}
         if pin:
             config["server_id"] = pin
         return jm.create_job(library_name="waiting", kind=JOB_KIND_INTRO_CREDITS, config=config)

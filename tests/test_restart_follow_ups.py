@@ -1,8 +1,7 @@
 """A restart keeps a file's Intro & Credits follow-up wherever it keeps the file's preview job.
 
 Three changes meet at the restart: leftover PENDING preview jobs are failed at boot unless Pause all holds them
-(``_fail_unrevived_preview_jobs``); a webhook preview job asks for its follow-up in its saved config, and the preview
-runner queues it on every start (``INTRO_CREDITS_FOLLOW_UP``); a scheduled Recently Added scan is a preview job the
+(``_fail_unrevived_preview_jobs``); a webhook queues its follow-ups itself at intake; a scheduled Recently Added scan is a preview job the
 restart revives over the window it was created for. Together they must never keep a file's previews and drop its
 markers, queue a follow-up twice, or turn a revived Recently Added scan into a scan of everything.
 """
@@ -17,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import media_preview_generator.web.jobs as jobs_mod
-from media_preview_generator.job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS
+from media_preview_generator.job_kinds import JOB_KIND_INTRO_CREDITS
 from media_preview_generator.web.jobs import JobManager, JobStatus
 from media_preview_generator.web.settings_manager import reset_settings_manager
 
@@ -207,42 +206,6 @@ class TestRestartWhilePausedThenResume:
 
         get_settings_manager().processing_paused = False
         resume_running_and_drain_pending()
-
-    @pytest.mark.parametrize("age_hours", [1, 20], ids=["recent", "older-than-recovery-window"])
-    def test_a_webhook_job_saved_in_its_debounce_queues_its_follow_up_once_across_the_restart_and_resume(
-        self, app, age_hours
-    ):
-        from media_preview_generator.web.settings_manager import get_settings_manager
-
-        jm = jobs_mod.get_job_manager()
-        job = jm.create_job(
-            library_name="Sonarr: S01E01",
-            config={
-                "source": "sonarr",
-                "webhook_paths": [EPISODE],
-                "server_id": "plex-1",
-                INTRO_CREDITS_FOLLOW_UP: True,
-            },
-        )
-        get_settings_manager().processing_paused = True
-
-        with (
-            patch(SUBMIT, return_value=["ic-1"]) as submit,
-            patch("media_preview_generator.jobs.orchestrator.run_processing", return_value={"outcome": {}}) as run,
-        ):
-            after = self._restart(app, age_hours=age_hours)
-            assert after.get_job(job.id).status is JobStatus.PENDING  # held by the pause
-            run.assert_not_called()
-            self._resume()
-
-        submit.assert_called_once()
-        kwargs = submit.call_args.kwargs
-        assert kwargs["preview_job_id"] == job.id
-        assert [item.canonical_path for item in kwargs["items"]] == [EPISODE]
-        assert kwargs["pin"] == "plex-1"
-        assert INTRO_CREDITS_FOLLOW_UP not in after.get_job(job.id).config
-        run.assert_called_once()
-        assert run.call_args.args[0].webhook_paths == [EPISODE]
 
     def test_a_recently_added_scan_held_by_the_pause_runs_its_own_window_on_resume_not_a_full_scan(self, app):
         from media_preview_generator.web.routes.job_runner import _start_recently_added_job_async

@@ -104,14 +104,8 @@ class TestExplicitSeasonRefresh:
 
 
 class TestFollowUpConfigIsReadWhenItsFilesAreListed:
-    def test_episodes_that_joined_while_waiting_are_listed_and_the_job_is_sealed(self, env, monkeypatch):
-        env.job.config = {"file_paths": [ep(S1, 1)], "follows_job_id": "p1", "source": "plex"}
-
-        def joined_while_waiting(job_id, follows_job_id, cancel_check):
-            env.job.config = {**env.job.config, "file_paths": [ep(S1, 1), ep(S1, 2)]}
-            return True
-
-        monkeypatch.setattr(job_runner, "wait_for_preceding_job", joined_while_waiting)
+    def test_a_webhook_job_lists_the_episodes_that_joined_it_and_is_sealed(self, env):
+        env.job.config = {"file_paths": [ep(S1, 1), ep(S1, 2)], job_runner.WEBHOOK_FILES: True, "source": "plex"}
         with patch.object(job_runner, "build_items", return_value=([_item(ep(S1, 1))], [], {})) as build:
             job_runner.run_intro_credits_job("j1")
         listed = build.call_args.args[0]
@@ -120,15 +114,14 @@ class TestFollowUpConfigIsReadWhenItsFilesAreListed:
         env.jm.merge_job_config.assert_called_once_with("j1", {job_runner.FILES_SEALED: True})
         env.jm.update_job_config.assert_not_called()
 
-    def test_jobs_that_follow_no_preview_job_are_not_sealed(self, env):
+    def test_jobs_that_are_not_webhook_jobs_are_not_sealed(self, env):
         with patch.object(job_runner, "build_items", return_value=([_item()], [], {})):
             job_runner.run_intro_credits_job("j1")
         env.jm.update_job_config.assert_not_called()
         env.jm.merge_job_config.assert_not_called()
 
     def test_an_episode_joining_while_the_runner_reads_the_files_is_listed(self, env, monkeypatch):
-        env.job.config = {"file_paths": [ep(S1, 1)], "follows_job_id": "p1", "source": "plex"}
-        monkeypatch.setattr(job_runner, "wait_for_preceding_job", lambda *args: True)
+        env.job.config = {"file_paths": [ep(S1, 1)], job_runner.WEBHOOK_FILES: True, "source": "plex"}
         about_to_read = threading.Event()
 
         def registry():  # the runner's last step before it reads the files
@@ -190,7 +183,7 @@ class TestWebhookSeasonGrouping:
         return queue
 
     def _existing(self, jm, paths, **extra):
-        config = {"kind": JOB_KIND_INTRO_CREDITS, "file_paths": paths, "follows_job_id": "prev-0", "force": False}
+        config = {"kind": JOB_KIND_INTRO_CREDITS, "file_paths": paths, job_runner.WEBHOOK_FILES: True, "force": False}
         return jm.create_job(library_name="existing", kind=JOB_KIND_INTRO_CREDITS, config={**config, **extra})
 
     def _submit(self, paths, hints=None):
@@ -293,9 +286,9 @@ class TestWebhookSeasonGrouping:
             {"retry_attempt": 1},
             {"verify": True},
             {"force": True},
-            {"follows_job_id": None, "source": "schedule"},  # only webhook follow-ups take episodes
+            {job_runner.WEBHOOK_FILES: False, "source": "schedule"},  # only webhook follow-ups take episodes
         ],
-        ids=["sealed", "retry", "verify", "forced", "no-preview-job"],
+        ids=["sealed", "retry", "verify", "forced", "not-webhook-files"],
     )
     def test_sealed_retry_verify_and_forced_jobs_take_no_more_files(self, jm, extra):
         existing = self._existing(jm, [ep(S1, 1)], **extra)
@@ -390,7 +383,7 @@ class TestResumeKeepsJoinedFiles:
             "kind": JOB_KIND_INTRO_CREDITS,
             "source": "plex",
             "file_paths": [ep(S1, 1)],
-            "follows_job_id": "p1",
+            job_runner.WEBHOOK_FILES: True,
             "force": False,
             "webhook_item_id_hints": {},
         }
@@ -409,7 +402,12 @@ class TestResumeKeepsJoinedFiles:
         assert merged[job_runner.FILES_SEALED] is True and merged["force"] is True
 
     def test_a_join_racing_the_resume_merge_waits_for_it(self, queue, monkeypatch):
-        config = {"kind": JOB_KIND_INTRO_CREDITS, "source": "plex", "file_paths": [ep(S1, 1)], "follows_job_id": "p1"}
+        config = {
+            "kind": JOB_KIND_INTRO_CREDITS,
+            "source": "plex",
+            "file_paths": [ep(S1, 1)],
+            job_runner.WEBHOOK_FILES: True,
+        }
         job = queue.create_job(library_name="A", kind=JOB_KIND_INTRO_CREDITS, config=config)
         snapshot = {**job.config, "force": True}
         real_merge = queue.merge_job_config
@@ -493,7 +491,7 @@ class TestExplicitSeasonRefreshThroughTheRealEngine:
                 assert _intro_decision(store, e2)[0] is DecisionStatus.DECIDED  # one other intro chapter: no check yet
                 assert len(jm.get_all_jobs()) == 1
                 _write(e3, 103)
-                arrival = run(library_name="E3", priority=2, source="sonarr", file_paths=[e3], follows_job_id="prev-3")
+                arrival = run(library_name="E3", priority=2, source="sonarr", file_paths=[e3], webhook_files=True)
                 assert len(jm.get_all_jobs()) == 2
                 assert _intro_decision(store, e2)[0] is DecisionStatus.DECIDED
                 assert jm.get_job(arrival.id).config[job_runner.FILES_SEALED] is True

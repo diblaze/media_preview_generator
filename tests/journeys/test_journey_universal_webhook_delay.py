@@ -242,33 +242,34 @@ def test_vendor_timer_cannot_resurrect_or_duplicate_finished_job(vendor_flow, ac
     assert flow.run.call_count == (1 if action == "fire_now" else 0)
 
 
-def test_duplicate_native_event_keeps_deadline_and_does_not_start_markers_early(vendor_flow):
+def test_duplicate_native_event_keeps_deadline_and_queues_the_other_jobs_once_at_intake(vendor_flow):
     from unittest.mock import patch
 
     flow = vendor_flow
-    with patch("media_preview_generator.markers.triggers.submit_pending_follow_up", return_value=[]) as follow_up:
+    with patch("media_preview_generator.markers.triggers.submit_webhook_jobs", return_value=[]) as queue_jobs:
         first = _post(flow, "jellyfin", True, "?delay=30").get_json()
         job = jobs.get_job_manager().get_job(first["job_id"])
         deadline = job.config["webhook_fire_at"]
         timer = flow.timers[-1]
+        queue_jobs.assert_called_once()
+        kwargs = queue_jobs.call_args.kwargs
+        assert kwargs["paths"] == [_PATH]
+        assert kwargs["source"] == "jellyfin"
+        assert kwargs["pin"] == "jelly-1"
+        assert kwargs["item_id_hints"] == {_PATH: {"jelly-1": "42"}}
+        assert kwargs["delay_s"] == 30
         flow.clock.now += timedelta(seconds=10)
         duplicate = _post(flow, "jellyfin", True, "?delay=3600")
         assert duplicate.status_code == 202
         assert duplicate.get_json()["status"] == "ignored_duplicate"
         assert job.config["webhook_fire_at"] == deadline
         assert flow.timers == [timer]
-        follow_up.assert_not_called()
+        queue_jobs.assert_called_once()
         flow.run.assert_not_called()
         flow.clock.now += timedelta(seconds=20)
         timer.fire()
         _assert_dispatch(flow, "jellyfin", True)
-        follow_up.assert_called_once()
-        assert follow_up.call_args.args[0] == job.id
-        overrides = follow_up.call_args.args[1]
-        assert overrides["server_id"] == "jelly-1"
-        assert overrides["webhook_paths"] == [_PATH]
-        assert overrides["webhook_item_id_hints"] == {_PATH: {"jelly-1": "42"}}
-        assert overrides["source"] == "jellyfin"
+        queue_jobs.assert_called_once()
 
 
 def test_paused_vendor_deadline_finalizes_then_resume_uses_current_config(vendor_flow):

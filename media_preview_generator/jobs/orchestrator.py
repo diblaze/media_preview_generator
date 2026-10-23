@@ -1243,7 +1243,8 @@ def _queue_intro_credits_follow_ups(
 ) -> dict[str, list[str]]:
     """Queue the Intro & Credits jobs for a Recently Added scan's files, as a webhook's are queued.
 
-    Each follows this preview job and publishes where the file's previews do (``markers.triggers.submit_follow_ups``).
+    Each names this preview job as its companion and publishes where the file's previews do
+    (``markers.triggers.submit_follow_ups``); none waits for it.
     Queued before the dispatch, like a webhook's: a job revived after a restart lists its files again, and files a
     waiting follow-up already lists aren't queued twice. Never raises: a markers problem must not cost the scan its
     previews.
@@ -1282,8 +1283,9 @@ def _queue_loudness_follow_up(
 ) -> list[str]:
     """Queue opted-in loudness for this preview's enumerated files, without another library scan.
 
-    Manual and retry runs never spawn new feature jobs. ``follows_job_id`` identifies this preview's own follow-ups across
-    restart, deduplicating this preview's upfront webhook or Recently Added follow-up at dispatch time.
+    Manual and retry runs never spawn new feature jobs, and a webhook's preview job doesn't either: the webhook queued
+    its loudness job when it arrived. ``follows_job_id`` identifies this preview's own follow-ups across restart,
+    deduplicating its upfront Recently Added follow-up at dispatch time.
 
     Returns:
         The id of the loudness job queued, as a list; empty when none was.
@@ -1298,6 +1300,9 @@ def _queue_loudness_follow_up(
             return []
         cfg = preview.config or {}
         if cfg.get("is_retry") or cfg.get("is_retry_attempt") or cfg.get("retry_attempt"):
+            return []
+        if cfg.get("webhook_paths"):
+            # The webhook queued its own loudness job when it arrived (``markers.triggers.submit_webhook_jobs``).
             return []
         origin = source or str(cfg.get("source") or "manual")
         if origin == "manual":

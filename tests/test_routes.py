@@ -3946,23 +3946,6 @@ class TestReprocessJob:
         assert FILES_SEALED not in new_config
         assert new_config == {"file_paths": ["/data/tv/S01E01.mkv"], **kept}
 
-    def test_reprocess_of_a_webhook_job_drops_its_intro_credits_follow_up_request(self, client):
-        # A webhook preview job a restart failed before it started still carries its follow-up request; its Re-run is
-        # the previews again and must not queue a second Intro & Credits job for the same files.
-        from media_preview_generator.job_kinds import INTRO_CREDITS_FOLLOW_UP
-        from media_preview_generator.web.jobs import get_job_manager
-
-        jm = get_job_manager()
-        config = {"source": "sonarr", "webhook_paths": ["/data/tv/S01E01.mkv"], "server_id": "plex-1"}
-        job = jm.create_job(library_name="Sonarr: S01E01", config={**config, INTRO_CREDITS_FOLLOW_UP: True})
-        jm.complete_job(job.id, error="Interrupted by a restart and not resumed")
-        with patch("media_preview_generator.web.routes.api_jobs._start_job_async") as start:
-            resp = client.post(f"/api/jobs/{job.id}/reprocess", headers=_api_headers())
-        assert resp.status_code == 201
-        new_id = resp.get_json()["id"]
-        assert jm.get_job(new_id).config == config
-        assert start.call_args.args == (new_id, config)
-
     def test_reprocess_nonexistent_job(self, client):
         resp = client.post("/api/jobs/nonexistent/reprocess", headers=_api_headers())
         assert resp.status_code == 404

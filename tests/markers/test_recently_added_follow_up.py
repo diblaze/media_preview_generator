@@ -100,7 +100,7 @@ class TestListingAndSentFollowUpsStayApart:
         return manager
 
     def _waiting(self, jm, source):
-        config = {"kind": "intro_credits", "source": source, "file_paths": [self.E1], "follows_job_id": "prev-0"}
+        config = {"kind": "intro_credits", "source": source, "file_paths": [self.E1], "webhook_files": True}
         return jm.create_job(library_name="waiting", kind="intro_credits", config=config)
 
     @pytest.mark.parametrize(

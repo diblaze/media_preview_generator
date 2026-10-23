@@ -11,7 +11,7 @@ from flask import Response, current_app, jsonify, request, session
 from loguru import logger
 
 from ...config import MAX_CPU_THREADS
-from ...job_kinds import INTRO_CREDITS_FOLLOW_UP, JOB_KIND_INTRO_CREDITS, JOB_KINDS
+from ...job_kinds import JOB_KIND_INTRO_CREDITS, JOB_KINDS
 from ...scan_filters import FILTER_CONFIG_KEYS, normalize_scan_filter_config
 from ..auth import (
     api_token_required,
@@ -2245,9 +2245,6 @@ def reprocess_job(job_id):
     new_config.pop(FILES_SEALED, None)
     # The new job was never paused by its schedule's stop time, so that schedule's start doesn't resume it.
     new_config.pop(PAUSED_BY_SCHEDULE, None)
-    # A Re-run is the previews again: a follow-up request the old job never got to take (it never started) would
-    # queue a second Intro & Credits job for files the first one already has or had.
-    new_config.pop(INTRO_CREDITS_FOLLOW_UP, None)
     # The new job hasn't waited for a slot yet: a restart must age it from its own wait, not the old job's.
     new_config.pop(SLOT_WAIT_SINCE, None)
     for key in (

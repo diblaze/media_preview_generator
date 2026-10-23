@@ -557,7 +557,7 @@ column) holds:
 | `source` | string | What created it: `manual`, `schedule`, `inspector` (re-detect, or the job an editor save queues), `inspector_season` (Season view **Publish**), `season` (a Season follow-up job), `reconcile` (Check servers), `recently_added` (the follow-up of a scheduled Recently Added scan), or a webhook source name (`sonarr`, `radarr`, `plex`, `retry`, …). |
 | `libraries` | `[{"server_id", "library_id"}]` | Libraries to enumerate. Empty with no `file_paths` = every library Intro & Credits goes to. |
 | `file_paths` | array of strings | Explicit files/folders instead of libraries (webhook follow-ups, Inspector re-detect, retries). |
-| `follows_job_id` | string \| `null` | The preview job this job waits for before taking a job-gate slot (webhook follow-ups only). Episodes that later joined the job (see below) don't wait for their own preview jobs. |
+| `follows_job_id` | string \| `null` | The Recently Added preview job that listed this job's files, shown as its companion. Never waited for. |
 | `files_sealed` | bool | Present once a webhook follow-up has read its `file_paths`: no more files join it after that. Also retained for legacy Season jobs. |
 | `force` | bool | Re-detect files already decided, asking every source again. |
 | `webhook_item_id_hints` | `{path: {server_id: item_id}}` | Item ids a vendor webhook already supplied, so the job skips a lookup. |
@@ -599,10 +599,9 @@ history; they do not pass pending sibling requests into new jobs. Every job that
 jobs, then starts a background cleanup once it has given back its slot (at most one running, and at most one start an
 hour). It checks up to 2,000 fingerprinted files on disk for at most 60 s, those checked longest ago first, and clears
 the cached fingerprints (and the matches made with them) of files gone from a folder that still exists, or marked missing for 30 days. The app log
-line, not the job's, is `Cleared the cached audio fingerprints of N file(s) no longer on disk`. Plex/Emby/Jellyfin webhooks arrive one episode at a
-time: an episode whose season folder a webhook follow-up that hasn't read its files yet already covers joins that
-follow-up (renamed "Intro & Credits · N files") while it stays within 500 files, instead of queuing another. A joined
-episode doesn't wait for its own preview job: markers don't need previews.
+line, not the job's, is `Cleared the cached audio fingerprints of N file(s) no longer on disk`. A webhook's file joins a
+webhook job that hasn't read its files yet (renamed "Intro & Credits · N files") while it stays within 500 files,
+instead of queuing another: one from the same sender with the same pin, or one already covering its season folder.
 
 **Check servers** (`reconcile: true`, `source: "reconcile"`, named "Intro & Credits · Check servers") is created by
 `POST /api/markers/reconcile`, and by an internal job that runs it every day at 04:30 while Intro & Credits is on
@@ -959,9 +958,9 @@ off until turned on per server.
 
 Same `Job` row, queue, priorities, pause and cancel as the other kinds (see [Jobs Endpoints](#jobs-endpoints)). `config`
 holds `kind` (`"loudness"`), `source`, `libraries` (`[{"server_id", "library_id"}]`; empty with no `file_paths` = every
-library loudness goes to), `file_paths`, and the originating `server_id` when pinned to one server. Automatic
-follow-ups keep the preview job they came from in `follows_job_id`, but never wait for it: they start as soon as a
-loudness worker is free. File outcomes:
+library loudness goes to), `file_paths`, and the originating `server_id` when pinned to one server. A webhook's file
+joins a waiting webhook loudness job from the same sender with the same pin. Automatic jobs start, a webhook's after
+the webhook delay, as soon as a loudness worker is free. File outcomes:
 
 | Outcome | Meaning |
 |---|---|

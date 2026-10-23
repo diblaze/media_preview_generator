@@ -315,11 +315,11 @@ class TestFollowUpDedupe:
         monkeypatch.setattr(triggers, "start_intro_credits_job_async", lambda job_id: None)
         return manager
 
-    def _existing(self, jm, paths, *, kind=JOB_KIND_INTRO_CREDITS, follows="prev-0", force=False):
+    def _existing(self, jm, paths, *, kind=JOB_KIND_INTRO_CREDITS, webhook_files=True, force=False):
         return jm.create_job(
             library_name="existing",
             kind=kind,
-            config={"kind": kind, "file_paths": paths, "follows_job_id": follows, "force": force},
+            config={"kind": kind, "file_paths": paths, "webhook_files": webhook_files, "force": force},
         )
 
     def _submit(self, paths, preview="prev-2"):
@@ -358,7 +358,7 @@ class TestFollowUpDedupe:
         "other",
         [
             {"kind": JOB_KIND_PREVIEWS},
-            {"follows": None},  # a manual / schedule job isn't a webhook follow-up
+            {"webhook_files": False},  # a manual / schedule job isn't a webhook follow-up
             {"force": True},  # a forced re-detect is a different request
         ],
     )
@@ -399,6 +399,8 @@ class TestWebhookFollowUp:
             follows_job_id="prev-1",
             item_id_hints={paths[0]: {"jf-1": "x"}},
             server_id=None,
+            retry_delay_s=0,
+            webhook_files=True,
         )
 
     @pytest.mark.parametrize(
@@ -587,7 +589,7 @@ class TestRedetect:
         "other",
         [
             {"source": "inspector", "file_paths": ["/media/tv/Show/S01E02.mkv"], "force": True},  # another file
-            {"source": "sonarr", "file_paths": [PATH], "force": False, "follows_job_id": "p"},  # webhook follow-up
+            {"source": "sonarr", "file_paths": [PATH], "force": False, "webhook_files": True},  # webhook follow-up
             {"source": "manual", "file_paths": [PATH], "force": True},  # API job, maybe Low priority
             {"source": "inspector", "file_paths": [PATH], "force": False},
             {"source": "inspector", "file_paths": [PATH, "/media/tv/Show/S01E02.mkv"], "force": True},

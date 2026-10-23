@@ -1028,165 +1028,19 @@ class TestRun:
         env.gate.release.assert_called_once_with()
         env.jm.complete_job.assert_not_called()
 
-    @pytest.mark.parametrize("preview_priority", [1, 2, 3])
-    def test_follow_up_waits_for_its_preview_job_whatever_its_priority(self, env, monkeypatch, preview_priority):
-        from media_preview_generator.web.jobs import JobStatus
-
-        env.job.config = {"libraries": [], "follows_job_id": "prev-1"}
-        preview = MagicMock(
-            id="prev-1", priority=preview_priority, status=JobStatus.RUNNING, progress=SimpleNamespace(retry_eta=None)
-        )
-        env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
-        sleeps = []
-
-        def fake_sleep(seconds):
-            sleeps.append(seconds)
-            env.gate.acquire.assert_not_called()
-            if len(sleeps) == 2:
-                preview.status = JobStatus.COMPLETED
-
-        monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
-        self._run()
-        assert len(sleeps) == 2
-        env.gate.acquire.assert_called_once()
-        env.dispatcher.submit_items.assert_called_once()
-        first_progress = env.jm.update_progress.call_args_list[0].kwargs["current_item"]
-        assert "preview job" in first_progress
-        assert env.jm.update_progress.call_count >= 1
-
-    def test_priority_changed_while_waiting_for_the_preview_job_is_used_for_the_slot(self, env, monkeypatch):
+    @pytest.mark.parametrize("preview_status", ["pending", "running", "completed", "failed", "cancelled"])
+    def test_a_job_with_a_follows_label_never_waits_for_the_job_it_names(self, env, monkeypatch, preview_status):
         from media_preview_generator.web.jobs import JobStatus
 
         env.job.config = {"follows_job_id": "prev-1"}
-        preview = MagicMock(status=JobStatus.RUNNING, progress=SimpleNamespace(retry_eta=None))
+        preview = MagicMock(status=JobStatus(preview_status), progress=SimpleNamespace(retry_eta=None))
         env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
-
-        def fake_sleep(_seconds):
-            env.job.priority = 1
-            preview.status = JobStatus.COMPLETED
-
-        monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
-        self._run()
-        assert env.gate.acquire.call_args.kwargs["priority"] == 1
-        env.gate.release.assert_called_once_with()
-
-    @pytest.mark.parametrize("finished", ["completed", "failed", "cancelled"])
-    def test_follow_up_starts_once_its_preview_job_has_ended_any_way(self, env, finished):
-        from media_preview_generator.web.jobs import JobStatus
-
-        env.job.config = {"follows_job_id": "prev-1"}
-        preview = MagicMock(status=JobStatus(finished), progress=SimpleNamespace(retry_eta=None))
-        env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
-        self._run()
-        env.dispatcher.submit_items.assert_called_once()
-
-    def test_follow_up_cancelled_while_waiting_never_takes_a_slot(self, env, monkeypatch):
-        from media_preview_generator.web.jobs import JobStatus
-
-        env.job.config = {"follows_job_id": "prev-1"}
-        preview = MagicMock(status=JobStatus.PENDING, progress=SimpleNamespace(retry_eta=None))
-        env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
-
-        def fake_sleep(_seconds):
-            env.jm.is_cancellation_requested.return_value = True
-
-        monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
-        job_runner.run_intro_credits_job("j1")
-        env.jm.cancel_job.assert_called_once_with("j1")
-        env.gate.acquire.assert_not_called()
-        env.gate.release.assert_not_called()
-        env.dispatcher.submit_items.assert_not_called()
-
-    def test_follow_up_does_not_wait_through_a_preview_retry_countdown(self, env):
-        from media_preview_generator.web.jobs import JobStatus
-
-        env.job.config = {"follows_job_id": "prev-1"}
-        preview = MagicMock(status=JobStatus.PENDING, progress=SimpleNamespace(retry_eta="2026-09-13T10:00:00+00:00"))
-        env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
+        monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=MagicMock(side_effect=AssertionError("waited"))))
         self._run()
         env.dispatcher.submit_items.assert_called_once()
         env.jm.complete_job.assert_called_once_with("j1", warning=None)
 
-    @pytest.fixture
-    def pending_preview(self, env, monkeypatch):
-        """A PENDING preview job the follow-up waits for; ``state`` drives its thread and the global pause per poll."""
-        from media_preview_generator.web.jobs import JobStatus
-
-        env.job.config = {"follows_job_id": "prev-1"}
-        preview = MagicMock(status=JobStatus.PENDING, progress=SimpleNamespace(retry_eta=None))
-        env.jm.get_job.side_effect = lambda jid: preview if jid == "prev-1" else env.job
-        state = {"sleeps": 0, "script": lambda n: None}
-
-        def fake_sleep(_seconds):
-            state["sleeps"] += 1
-            if state["sleeps"] > 1000:
-                raise AssertionError("still waiting for the preview job")
-            env.gate.acquire.assert_not_called()
-            state["script"](state["sleeps"])
-
-        monkeypatch.setattr(job_runner, "time", SimpleNamespace(sleep=fake_sleep))
-        yield SimpleNamespace(preview=preview, state=state)
-        with job_runner._inflight_lock:
-            job_runner._inflight_jobs.discard("prev-1")
-
-    def test_follow_up_of_a_pending_preview_job_no_thread_will_run_starts_after_a_grace_period(
-        self, env, pending_preview
-    ):
-        # Too old to be revived after a restart: nothing will ever finish it.
-        self._run()
-        assert pending_preview.state["sleeps"] == job_runner._ORPHAN_GRACE_POLLS
-        env.dispatcher.submit_items.assert_called_once()
-        assert any("isn't queued to run" in c.args[1] for c in env.jm.add_log.call_args_list)
-
-    def test_follow_up_keeps_waiting_for_a_pending_preview_job_that_has_a_thread(self, env, pending_preview):
-        from media_preview_generator.web.jobs import JobStatus
-
-        with job_runner._inflight_lock:
-            job_runner._inflight_jobs.add("prev-1")  # waiting for a slot
-        limit = job_runner._ORPHAN_GRACE_POLLS * 3
-
-        def script(n):
-            if n == limit:
-                pending_preview.preview.status = JobStatus.COMPLETED
-
-        pending_preview.state["script"] = script
-        self._run()
-        assert pending_preview.state["sleeps"] == limit
-        assert not any("isn't queued to run" in c.args[1] for c in env.jm.add_log.call_args_list)
-
-    def test_grace_period_restarts_when_the_preview_job_gets_a_thread_again(self, env, pending_preview):
-        grace = job_runner._ORPHAN_GRACE_POLLS
-
-        def script(n):
-            with job_runner._inflight_lock:
-                if n == grace - 1:
-                    job_runner._inflight_jobs.add("prev-1")  # the pending drain started it
-                elif n == grace:
-                    job_runner._inflight_jobs.discard("prev-1")  # ...and it went back to pending
-
-        pending_preview.state["script"] = script
-        self._run()
-        assert pending_preview.state["sleeps"] == 2 * grace
-        env.dispatcher.submit_items.assert_called_once()
-
-    def test_follow_up_waits_through_a_global_pause_for_a_pending_preview_job(self, env, pending_preview):
-        from media_preview_generator.web.jobs import JobStatus
-
-        # Paused processing leaves new jobs pending without a thread; resuming starts them in order.
-        env.sm.processing_paused = False
-        limit = job_runner._ORPHAN_GRACE_POLLS * 3
-
-        def script(n):
-            env.sm.processing_paused = n < limit
-            if n == limit:
-                pending_preview.preview.status = JobStatus.COMPLETED
-
-        pending_preview.state["script"] = script
-        self._run()
-        assert pending_preview.state["sleeps"] == limit
-        assert not any("isn't queued to run" in c.args[1] for c in env.jm.add_log.call_args_list)
-
-    def test_follow_up_of_a_deleted_preview_job_starts_straight_away(self, env):
+    def test_a_job_whose_labelled_job_is_gone_runs_straight_away(self, env):
         env.job.config = {"follows_job_id": "gone"}
         env.jm.get_job.side_effect = lambda jid: None if jid == "gone" else env.job
         self._run()
@@ -3663,7 +3517,6 @@ def test_start_job_async_rechecks_terminal_or_deleted_job_before_spawning(curren
     job_id = f"job-reread-{current_status}"
     with (
         patch("media_preview_generator.web.webhooks.ensure_pending_webhook", return_value=False) as debounce,
-        patch.object(preview_runner, "_queue_intro_credits_follow_up"),
         patch.object(preview_runner, "threading") as threading_mod,
     ):
         try:
@@ -3691,7 +3544,6 @@ def test_start_job_async_uses_last_known_status_when_locked_reread_fails(known_s
     job_id = f"job-reread-failure-{known_status}"
     with (
         patch("media_preview_generator.web.webhooks.ensure_pending_webhook", return_value=False),
-        patch.object(preview_runner, "_queue_intro_credits_follow_up"),
         patch.object(preview_runner, "threading") as threading_mod,
     ):
         try:

@@ -30,6 +30,8 @@ from ..jobs.worker import JOB_LOG_SKIP, is_job_thread_for, register_job_thread, 
 from ..markers.external_ids import is_extra
 from ..markers.job_log import display_name, write_line
 from ..markers.job_runner import (
+    FILES_SEALED,
+    WEBHOOK_FILES,
     build_items,
     hold_pause_from_before_restart,
     job_freeze_check,
@@ -79,6 +81,8 @@ from .plex_db import (
 from .resume import CompletionLedger, source_fingerprint
 from .settings import library_chosen, load_server_loudness, loudness_libraries
 
+# Serialises a webhook's files joining a waiting loudness job with its runner sealing the files it runs.
+WEBHOOK_JOIN_LOCK = threading.Lock()
 LABEL = "Plex loudness"
 WRITTEN = "loudness_written"
 UP_TO_DATE = "loudness_up_to_date"
@@ -704,6 +708,15 @@ def kind_handlers(
     )
 
 
+def _seal_files(jm, job_id: str, cfg: dict) -> dict:
+    """A webhook's job's files as of now: files later webhooks report join it until this seal (``markers.triggers``)."""
+    with WEBHOOK_JOIN_LOCK:
+        jm.merge_job_config(job_id, {FILES_SEALED: True})
+        latest = jm.get_job(job_id)
+        paths = ((latest.config if latest is not None else None) or {}).get("file_paths") or cfg.get("file_paths")
+    return {**cfg, "file_paths": list(paths or []), FILES_SEALED: True}
+
+
 def run_loudness_job(job_id: str) -> None:
     """Run or resume one job, releasing each parked pass's queues and registry."""
     while _run_loudness_pass(job_id):
@@ -808,6 +821,8 @@ def _run_loudness_pass(job_id: str) -> bool | None:
                         jm.start_job(job_id)
                 if chain_head:
                     _chain_state(jm, chain_head, cfg, "running")
+                if cfg.get(WEBHOOK_FILES):
+                    cfg = _seal_files(jm, job_id, cfg)
                 config = load_config()
                 config.server_id_filter = server_pin(cfg)
                 registry = _build_multi_server_registry()
@@ -1126,6 +1141,7 @@ def create_loudness_job(
     retry_baseline: dict | None = None,
     parent_schedule_id: str = "",
     scan_filters: dict | None = None,
+    webhook_files: bool = False,
 ):
     """Create and start a loudness job.
 
@@ -1136,15 +1152,17 @@ def create_loudness_job(
         libraries: ``[{"server_id", "library_id"}]``; empty with no ``file_paths`` = every library loudness is on for.
         file_paths: Explicit files or folders instead of libraries.
         follows_job_id: The preview job a follow-up was queued for. Shown as its companion; never waited for.
-        server_id: Only this server (the preview job's pin); None = every server with loudness on.
+        server_id: Only this server (the webhook's or the preview job's pin); None = every server with loudness on.
         retry_attempt: For a retry (``_queue_retry``): which retry (1-based).
-        retry_delay_s: For a retry: seconds to wait before it takes a slot.
+        retry_delay_s: Seconds to wait before it takes a slot: a retry's delay, or a webhook's.
         parent_job_id: Original job whose row represents this hidden retry.
         max_retries: Global retry limit in force when this retry was queued.
         retry_baseline: Immutable aggregate and previous-file counts for this attempt.
         parent_schedule_id: Schedule that created it (a stop time pauses and resumes the job by it).
         scan_filters: Scan-filter keys (``scan_filters.FILTER_CONFIG_KEYS``) limiting which library files are listed;
             other keys are ignored. Not used with ``file_paths``.
+        webhook_files: A webhook's job: files later webhooks from the same sender report join it until it runs
+            (``markers.triggers``).
 
     Returns:
         The created job.
@@ -1161,6 +1179,9 @@ def create_loudness_job(
         config["server_id"] = server_id
     if retry_attempt:
         config["retry_attempt"] = int(retry_attempt)
+    if webhook_files:
+        config[WEBHOOK_FILES] = True
+    if retry_attempt or retry_delay_s:
         # The due time is stored so a job revived after a restart doesn't wait again in full.
         config["retry_not_before"] = (datetime.now(UTC) + timedelta(seconds=int(retry_delay_s))).isoformat()
         config["retry_delay"] = int(retry_delay_s)
