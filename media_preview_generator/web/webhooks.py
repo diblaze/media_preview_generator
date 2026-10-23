@@ -354,38 +354,45 @@ def _resolve_webhook_server_context(server_id: str | None) -> tuple[str | None, 
     return (entry.get("id"), entry.get("name") or entry.get("id"), (entry.get("type") or "").lower() or None)
 
 
-def _previews_wanted(path: str, pin: str | None) -> bool:
-    """Whether a webhook's file needs a preview job: Previews is on for a library that holds it.
+def _webhook_servers(path: str, pin: str | None) -> tuple[list, list[str]]:
+    """The servers a webhook's file counts on (only the pinned one, when pinned) and the file's local path forms."""
+    from ..servers.ownership import webhook_path_candidates
+    from ..servers.registry import server_config_from_dict
 
-    Only the pinned server counts when the webhook is pinned. A file under no library of those servers still gets one:
-    its retries cover a library the server is still adding, and its log points at a wrong path mapping.
+    configs = []
+    for entry in get_settings_manager().get("media_servers") or []:
+        if isinstance(entry, dict):
+            try:
+                configs.append(server_config_from_dict(entry))
+            except Exception:
+                continue
+    servers = [cfg for cfg in configs if cfg.id == pin] if pin else configs
+    return servers, webhook_path_candidates(path, configs)
+
+
+def _previews_wanted(path: str, pin: str | None) -> bool:
+    """Whether a webhook's file gets a preview job: Previews is on for a library that holds it.
 
     Args:
         path: The file path the webhook reported.
-        pin: The server the webhook is pinned to; None = every server.
-
-    Returns:
-        False only when the file is in a known library and Previews is off for every library that holds it.
+        pin: The server the previews would publish to; None = every server.
     """
-    from ..servers.ownership import find_library_matches, find_owning_servers, webhook_path_candidates
-    from ..servers.registry import server_config_from_dict
+    from ..servers.ownership import find_owning_servers
 
-    try:
-        configs = []
-        for entry in get_settings_manager().get("media_servers") or []:
-            if isinstance(entry, dict):
-                try:
-                    configs.append(server_config_from_dict(entry))
-                except Exception:
-                    continue
-        servers = [cfg for cfg in configs if cfg.id == pin] if pin else configs
-        candidates = webhook_path_candidates(path, configs)
-        if any(find_owning_servers(candidate, servers) for candidate in candidates):
-            return True
-        return not any(find_library_matches(candidate, servers) for candidate in candidates)
-    except Exception as exc:
-        logger.debug("Couldn't check whether Previews is on for {}: {}", path, exc)
-        return True
+    servers, candidates = _webhook_servers(path, pin)
+    return any(find_owning_servers(candidate, servers) for candidate in candidates)
+
+
+def _why_no_job(path: str, pin: str | None) -> str:
+    """Why a webhook's file got no job at all: every feature is off for its library, or no library holds it."""
+    from ..jobs.orchestrator import _build_path_mapping_mismatch_hints
+    from ..servers.ownership import find_library_matches
+
+    servers, candidates = _webhook_servers(path, pin)
+    if any(find_library_matches(candidate, servers) for candidate in candidates):
+        return "Previews, Intro & Credits and loudness are all off for its library"
+    hint = _build_path_mapping_mismatch_hints([path], servers).get(path)
+    return f"no library on your servers holds {path}" + (f". {hint}" if hint else "")
 
 
 def _queue_webhook_jobs(
@@ -399,15 +406,6 @@ def _queue_webhook_jobs(
     from ..markers.triggers import submit_webhook_jobs
 
     return submit_webhook_jobs(paths=[path], source=source, pin=pin, item_id_hints=item_id_hints, delay_s=delay)
-
-
-def _log_previews_off(source: str, title: str, queued: list[str]) -> None:
-    logger.info(
-        "Webhook from {}: '{}' — Previews is off for its library, so no preview job; {}",
-        source,
-        title,
-        f"queued {len(queued)} other job(s)" if queued else "Intro & Credits and loudness are off for it too",
-    )
 
 
 def _as_dict(value: object) -> dict:
@@ -569,7 +567,13 @@ def create_vendor_webhook_job(
         previews_pin = server_id_filter or (b_sid if b_stype not in (None, "plex") else None)
         if not _previews_wanted(canonical_path, previews_pin):
             queued = _queue_webhook_jobs(safe_source, canonical_path, server_id_filter, delay, hints)
-            _log_previews_off(safe_source, library_display, queued)
+            if not queued:
+                logger.info(
+                    "Webhook from {}: '{}' ignored — {}",
+                    safe_source,
+                    library_display,
+                    _why_no_job(canonical_path, previews_pin),
+                )
             _add_history_entry(
                 safe_source,
                 "Webhook",
@@ -1100,8 +1104,11 @@ def _schedule_webhook_job(
             )
             _add_history_entry(safe_source, "Download", safe_title, "deduped")
             return False
-        _log_previews_off(safe_source, safe_title, _queue_webhook_jobs(safe_source, normalized_path, b_sid, delay))
-        return True
+        if _queue_webhook_jobs(safe_source, normalized_path, b_sid, delay):
+            return True
+        logger.info("Webhook from {}: '{}' ignored — {}", safe_source, safe_title, _why_no_job(normalized_path, b_sid))
+        _add_history_entry(safe_source, "Download", safe_title, "ignored")
+        return False
 
     # NOTE: _schedule_webhook_job uses _check_and_record_dedup ONLY as a
     # "have I already created a Job for this path very recently?" guard —
@@ -1557,9 +1564,10 @@ def _ignore_no_path_response(source: str, label: str, title: str, data: dict):
     )
 
 
-def _duplicate_response(title: str):
-    """Answer a webhook whose path was dispatched within the dedup window (history already says "deduped")."""
-    return jsonify({"success": True, "message": f"Ignored '{title}': already queued recently"}), 200
+def _not_queued_response(title: str):
+    """Answer a webhook that queued nothing: a recent duplicate, or no job to make (history says which, the log why)."""
+    message = f"Nothing queued for '{title}': already queued recently, or no job to make — see the webhook history"
+    return jsonify({"success": True, "message": message}), 200
 
 
 def _nudge_once_per_folder(queued_paths: list[str], source: str, server_id: str | None) -> None:
@@ -1621,7 +1629,7 @@ def radarr_webhook():
     if not _schedule_webhook_job("radarr", movie_title, movie_file_path, **kwargs):
         if not (movie_file_path or "").strip():
             return _ignore_no_path_response("radarr", "Radarr", movie_title, data)
-        return _duplicate_response(movie_title)
+        return _not_queued_response(movie_title)
 
     _add_history_entry("radarr", "Download", movie_title, "queued")
 
@@ -1701,7 +1709,7 @@ def _handle_sonarr_compatible_webhook(source: str):
     if not _schedule_webhook_job(source, display_title, episode_file_path, **kwargs):
         if not (episode_file_path or "").strip():
             return _ignore_no_path_response(source, label, display_title, data)
-        return _duplicate_response(display_title)
+        return _not_queued_response(display_title)
 
     _add_history_entry(source, "Download", display_title, "queued")
 
@@ -2263,7 +2271,7 @@ def plex_webhook():
     ]
 
     if not queued:
-        return _duplicate_response(display_title)
+        return _not_queued_response(display_title)
 
     _nudge_once_per_folder(queued, "plex", resolved_server_id)
 
@@ -2337,7 +2345,7 @@ def custom_webhook():
     kwargs = _webhook_job_kwargs(server_id)
     queued = [path for path in paths if _schedule_webhook_job("custom", title, path, **kwargs)]
     if not queued:
-        return _duplicate_response(title)
+        return _not_queued_response(title)
 
     _add_history_entry("custom", "Custom", title, "queued")
 

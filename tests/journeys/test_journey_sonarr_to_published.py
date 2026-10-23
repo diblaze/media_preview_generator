@@ -303,3 +303,10 @@ class TestWebhookDisabledShortCircuit:
 
         assert response.status_code == 200  # accepted but no-op
         assert captured_calls == [], f"Disabled webhook must NOT create a job; got {captured_calls!r}"
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

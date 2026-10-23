@@ -15,9 +15,27 @@ from media_preview_generator.web import webhooks as wh
 
 SONARR_PATH = "/data/TV Shows/Show (2023)/Season 02/Show - S02E04.mkv"
 SUBMIT_JOBS = "media_preview_generator.markers.triggers.submit_webhook_jobs"
+# Previews on for a library holding every path these tests send, so each webhook also opens a preview batch.
+_DATA = [{"id": "1", "name": "Data", "remote_paths": ["/data"], "enabled": True}]
 SERVERS = [
-    {"id": "plex-1", "type": "plex", "name": "Plex", "enabled": True},
-    {"id": "jf-1", "type": "jellyfin", "name": "Jellyfin", "enabled": True},
+    {
+        "id": "plex-1",
+        "type": "plex",
+        "name": "Plex",
+        "enabled": True,
+        "url": "http://p",
+        "auth": {"token": "t"},
+        "libraries": _DATA,
+    },
+    {
+        "id": "jf-1",
+        "type": "jellyfin",
+        "name": "Jellyfin",
+        "enabled": True,
+        "url": "http://j",
+        "auth": {"method": "api_key", "api_key": "k"},
+        "libraries": _DATA,
+    },
 ]
 
 
@@ -195,9 +213,9 @@ class TestPreviewsWanted:
             # Pinned: only the pinned server's libraries count.
             ([_library_server("a", previews=False), _library_server("b", previews=True)], "a", False),
             ([_library_server("a", previews=False), _library_server("b", previews=True)], "b", True),
-            # Under no known library: keep the preview job (a library being added, a wrong path mapping).
-            ([_library_server("a", previews=False, remote="/other")], None, True),
-            ([], None, True),
+            # No library holds the file: no preview job.
+            ([_library_server("a", previews=True, remote="/other")], None, False),
+            ([], None, False),
         ],
         ids=["on", "off", "off-and-on", "pinned-off", "pinned-on", "unknown-library", "no-servers"],
     )
@@ -206,3 +224,21 @@ class TestPreviewsWanted:
 
         get_settings_manager().set("media_servers", servers)
         assert wh._previews_wanted(self.PATH, pin) is wanted
+
+
+class TestWhyNoJob:
+    PATH = "/data/tv/Show/Season 01/Show - S01E01.mkv"
+
+    def test_a_library_with_every_feature_off(self):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        get_settings_manager().set("media_servers", [_library_server("a", previews=False)])
+        assert wh._why_no_job(self.PATH, None) == "Previews, Intro & Credits and loudness are all off for its library"
+
+    def test_no_library_holds_the_file_and_the_path_mapping_hint_follows(self):
+        from media_preview_generator.web.settings_manager import get_settings_manager
+
+        get_settings_manager().set("media_servers", [_library_server("a", previews=True, remote="/media/tv")])
+        reason = wh._why_no_job("/data/tv/Show/Season 01/Show - S01E01.mkv", None)
+        assert reason.startswith("no library on your servers holds /data/tv/Show/Season 01/Show - S01E01.mkv. ")
+        assert "/media/tv" in reason  # the hint names the library folder the sender's path should map to

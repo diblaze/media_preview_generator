@@ -477,3 +477,10 @@ def test_batch_merge_persists_full_webhook_paths_list(mock_timer_cls, mock_job_m
         "/tv/s01e02.mkv",
         "/tv/s01e03.mkv",
     ], last_update_config["webhook_paths"]
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

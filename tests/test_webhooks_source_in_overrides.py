@@ -336,3 +336,10 @@ class TestWebhookJobsUseTheGlobalRetryPolicy:
         self._configure(values)
         TestWebhookJobsUseIncomingPriority._fire_debounced("sonarr", "/data/TV Shows/Q/Season 01/Q - S01E01.mkv")
         assert self._retry(captured_overrides[-1]["overrides"]) == expected
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

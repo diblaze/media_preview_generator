@@ -212,7 +212,7 @@ class TestLibraryOffInTheApp:
         from media_preview_generator.web import webhooks as wh
 
         with app.app_context():
-            assert wh._schedule_webhook_job("plex", "Casino Royale", MOVIE_4K, server_id="plex-1") is True
+            assert wh._schedule_webhook_job("plex", "Casino Royale", MOVIE_4K, server_id="plex-1") is False
         assert _jobs(JOB_KIND_PREVIEWS) == []
         assert _jobs(JOB_KIND_INTRO_CREDITS) == []
         assert _jobs(JOB_KIND_LOUDNESS) == []
@@ -293,12 +293,21 @@ class TestPreviewsOn:
         (markers,) = _jobs(JOB_KIND_INTRO_CREDITS)
         assert markers.config.get("server_id") == expected_pin
 
-    def test_a_file_under_no_known_library_still_gets_a_preview_job(self, app):
-        # Its retries cover a library the server is still adding; its log points at a wrong path mapping.
-        with app.app_context():
-            assert _sonarr(UNKNOWN)
-        assert len(_jobs(JOB_KIND_PREVIEWS)) == 1
+    def test_a_file_no_library_holds_gets_no_job_and_the_log_says_why(self, app):
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="INFO")
+        try:
+            with app.app_context():
+                assert _sonarr(UNKNOWN) is False
+        finally:
+            logger.remove(sink)
+        assert _jobs(JOB_KIND_PREVIEWS) == []
         assert _jobs(JOB_KIND_INTRO_CREDITS) == []
+        assert _jobs(JOB_KIND_LOUDNESS) == []
+        (line,) = [line for line in lines if "ignored — no library on your servers holds" in line]
+        assert UNKNOWN in line
 
 
 class TestABatchStaysOneJobOfEachKind:

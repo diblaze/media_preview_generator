@@ -646,3 +646,10 @@ class TestFireWebhookNowByJobId:
             f"fire-webhook-now for a Job with no pending batch must be 404; got {r2.status_code}. "
             f"Body: {r2.get_data(as_text=True)!r}"
         )
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

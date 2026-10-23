@@ -518,3 +518,10 @@ def test_automatic_retry_uses_its_own_backoff_not_global_webhook_delay(delay_flo
     assert not any(call.args[0] == "webhook_delay" for call in get.call_args_list)
     assert job.config["scheduled_at"] == scheduled_at
     assert job.config["retry_delay"] == 7
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

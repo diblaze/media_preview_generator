@@ -2376,3 +2376,10 @@ class TestUntrustedInputHandling:
         assert resp.status_code == 200
         assert "no file path" in resp.get_json()["message"]
         assert any(e["status"] == "ignored_no_path" for e in wh._webhook_history)
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

@@ -341,3 +341,10 @@ def test_vendor_retry_wait_is_independent_of_initial_delay(vendor_flow):
     assert not {"webhook_delay_mode", "webhook_debounce_pending", "webhook_fire_at"}.intersection(retry.config)
     assert len(flow.timers) == 1
     assert not any(call.args[0] == "webhook_delay" for call in get.call_args_list)
+
+
+@pytest.fixture(autouse=True)
+def _previews_on_for_every_path(monkeypatch):
+    """These tests cover webhook batching and delays, so every path gets a preview job. Which files get one is
+    covered in tests/journeys/test_journey_webhook_jobs_per_feature.py."""
+    monkeypatch.setattr("media_preview_generator.web.webhooks._previews_wanted", lambda path, pin: True)

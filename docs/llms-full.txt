@@ -3207,7 +3207,8 @@ ahead on a stale setting.
 
 A webhook queues each job its file needs when it arrives: previews, Intro & Credits and Plex loudness, each only where
 that feature is on for the file's library, and none waits for another. With Previews off for the library, no preview
-job is made at all. Each **Recently Added** scan also queues an Intro & Credits job for the files it finds. The
+job is made at all. A file no library holds (often a missing path mapping) gets no job; the webhook history shows it
+as ignored and the log says why, with the path mapping it likely needs. Each **Recently Added** scan also queues an Intro & Credits job for the files it finds. The
 Intro & Credits job starts after the webhook delay, so the server can add the file first, and is kept across a
 restart. It sends markers where previews would go: a webhook pinned to one server (`/api/webhooks/server/<id>`, or `?server_id=`), an Emby or
 Jellyfin webhook, a file a Recently Added scan found on Emby or Jellyfin, or a Recently Added schedule pinned to one

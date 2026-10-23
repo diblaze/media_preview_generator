@@ -600,7 +600,7 @@ def _create_webhook_job(
             "status": "ignored",
             "kind": kind,
             "canonical_path": canonical_path,
-            "message": "Previews, Intro & Credits and loudness are all off for this file's library.",
+            "message": "Nothing queued: no feature is on for this file's library, or no library holds it.",
         }
     return {
         "status": "queued",
