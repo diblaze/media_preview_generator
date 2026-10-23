@@ -413,6 +413,13 @@ class TestTheWindowsEntryPoint:
         assert "No loudness undo record" in capsys.readouterr().err
 
 
+def test_the_windows_node_serves_with_as_many_threads_as_any_node():
+    # With 4, an app's workers queued their requests, and the node's health check behind them.
+    from media_preview_generator.nodes.server import wsgi
+
+    assert _entry_point().THREADS == wsgi.DEFAULT_THREADS
+
+
 class TestTheInstaller:
     """install.ps1 can't run here; ``windows-node.yml`` runs it. These pin what it must never do again."""
 

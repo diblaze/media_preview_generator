@@ -4318,6 +4318,22 @@ class TestMultiEpisodeFile:
         records.write(pub, [CREDITS_FINAL], previous=[CREDITS_FINAL])
         assert T.INTRO not in [row[0] for row in _served(db, 8)]
 
+    def test_plexs_own_intro_on_one_episode_with_none_decided_is_copied_to_the_other(self, tmp_path):
+        # The live shape: no intro of ours ever, so the first episode's Plex intro was never recorded as kept.
+        folder = tmp_path / "Plex Media Server"
+        db, _parts = _multi_episode_db(folder)
+        _insert_taggings(db, (7, 563, 0, "intro", 990, 29_306, INTRO_ROW_EXTRA))
+        records = _Records()
+        pub = _recording_publisher(tmp_path, folder, records, redetect="keep_plex")
+
+        ours = records.write(pub, [CREDITS_FINAL])
+
+        assert (T.INTRO, 990, 29_306) in _served(db, 8)
+        assert _served(db, 7) == [NATIVE_INTRO_ROW, (T.CREDITS, 1_299_000, DUR)]
+        assert records.shown(pub) is Shown.OURS
+        records.write(pub, [CREDITS_FINAL], previous=ours)
+        assert pub.last_write_changed is False
+
     def test_writes_from_either_episode_leave_the_copied_intro_alone(self, tmp_path):
         folder = tmp_path / "Plex Media Server"
         db, _parts = _multi_episode_db(folder)

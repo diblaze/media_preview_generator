@@ -23,7 +23,9 @@ from loguru import logger
 # Every interface: the app on another machine is the whole point.
 DEFAULT_HOST = "0.0.0.0"  # nosec B104
 DEFAULT_PORT = 9494
-THREADS = 4
+# The node's own default (nodes.server.wsgi.DEFAULT_THREADS): an app's workers send a few dozen requests at once, and
+# with fewer threads they wait in a queue rather than for Plex's database.
+THREADS = 16
 # A line bound with this extra goes to the console only (the node's one-time key notice). The same name as
 # nodes.server.nodelog.SECRET_EXTRA, written out: the package is imported only after logging is set up.
 CONSOLE_ONLY = "node_secret"

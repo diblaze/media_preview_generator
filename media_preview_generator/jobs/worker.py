@@ -16,11 +16,7 @@ from loguru import logger
 
 from ..config import Config
 from ..job_kinds import ItemOutcome, normalize_outcome, outcome_value
-from ..library_health.failures import NO_DURATION_MESSAGE, clear_failure, record_failure
-from ..library_health.models import Feature
 from ..markers.credits.textdet_helper import CREDITS_KEPT_ON_CPU_PREFIX, CREDITS_ON_CPU_PREFIX
-from ..markers.outcomes import OUTCOME_KEYS as MARKER_OUTCOME_KEYS
-from ..markers.outcomes import FileOutcome
 from ..nodes.executor import FileNotVisibleError, NodeRequeue, NodeUnavailableError, Placement, placed_on, requeue_for
 from ..processing.generator import (
     FALLBACK_CODEC,
@@ -51,12 +47,6 @@ _job_thread_ids_lock = threading.Lock()
 # Loguru ``extra`` key: a record bound with it stays out of a job's own log (the app log still has it) — a traceback,
 # say, that belongs in the log file but would bury the job's Logs panel. Honoured by both kinds' job logs.
 JOB_LOG_SKIP = "job_log_skip"
-_MARKER_FEATURES = (Feature.INTRO, Feature.CREDITS)
-# Outcomes that prove intro/credits ran on the file, so its length was read; the others (skipped, waiting, no owners,
-# file gone) never got that far.
-_MARKERS_RAN_OUTCOMES = frozenset(
-    {FileOutcome.PUBLISHED.value, FileOutcome.UP_TO_DATE.value, FileOutcome.NO_MARKERS.value}
-)
 
 
 def register_job_thread(job_id: str = "") -> None:
@@ -1046,8 +1036,6 @@ class Worker:
                     "{} got {} for {}; counting it as failed.", self.display_name, valid.message, display_name
                 )
             outcome = valid
-            if self.outcome_keys == MARKER_OUTCOME_KEYS:
-                self._remember_duration_failure(item.canonical_path, outcome)
             # Counters first: nothing below may skip them, or the job's outcome breakdown drops this item.
             self.outcome_counts[outcome.outcome_key] = self.outcome_counts.get(outcome.outcome_key, 0) + 1
             if outcome.failed:
@@ -1084,14 +1072,6 @@ class Worker:
                 )
             except Exception as persist_exc:
                 logger.warning("Failed to persist result for {}: {}", item.canonical_path, persist_exc)
-
-    @staticmethod
-    def _remember_duration_failure(path: str, outcome: ItemOutcome) -> None:
-        """Tell Library Health when intro and credits can't be done for a file, or now can be."""
-        if outcome.failed and outcome.message == NO_DURATION_MESSAGE:
-            record_failure(_MARKER_FEATURES, path, NO_DURATION_MESSAGE)
-        elif outcome.outcome_key in _MARKERS_RAN_OUTCOMES:
-            clear_failure(_MARKER_FEATURES, path)
 
     def check_completion(self) -> bool:
         """Check if this worker has completed its current task.

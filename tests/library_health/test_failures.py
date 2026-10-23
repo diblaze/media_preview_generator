@@ -7,13 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from media_preview_generator.job_kinds import ItemOutcome
-from media_preview_generator.jobs.worker import Worker
 from media_preview_generator.library_health import failures
 from media_preview_generator.library_health.failures import NO_DURATION_MESSAGE
 from media_preview_generator.library_health.models import Feature
 from media_preview_generator.library_health.store import HealthStore
-from media_preview_generator.loudness.job import OUTCOME_KEYS as LOUDNESS_OUTCOME_KEYS
-from media_preview_generator.markers.outcomes import OUTCOME_KEYS as MARKER_OUTCOME_KEYS
+from media_preview_generator.markers import pipeline
 from media_preview_generator.processing.types import ProcessableItem
 
 
@@ -61,37 +59,32 @@ def test_recording_a_file_that_cannot_be_stat_ed_never_raises(store, tmp_path):
     assert store.failures() == {}
 
 
-def test_the_pipeline_still_words_the_duration_failure_the_way_the_job_matches_it():
-    pipeline = Path(__file__).parents[2] / "media_preview_generator" / "markers" / "pipeline.py"
-
-    assert f'"{NO_DURATION_MESSAGE}"' in pipeline.read_text()
-
-
-def _run_item(path: Path, outcome: ItemOutcome, keys: tuple[str, ...]) -> None:
-    worker = Worker(0, "CPU")
-    with patch("media_preview_generator.jobs.worker._notify_file_result"):
-        worker.assign_task(
-            ProcessableItem(canonical_path=str(path), server_id="s1", title="t"),
-            MagicMock(cpu_threads=0),
-            MagicMock(),
-            job_id="j",
-            process_fn=lambda item, **_kw: outcome,
-            outcome_keys=keys,
-        )
-        worker.current_thread.join(timeout=5)
+def _run_item(path: Path, outcome: ItemOutcome | None, stage: str) -> None:
+    """Run one intro & credits stage on ``path`` with the file's pipeline run returning ``outcome``."""
+    item = ProcessableItem(canonical_path=str(path), server_id="s1", title="t")
+    with patch.object(pipeline, "_run", return_value=outcome):
+        if stage == "check":
+            pipeline.check_item(item, ctx=MagicMock())
+        else:
+            pipeline.process_item(item, ctx=MagicMock())
 
 
-def test_an_intro_job_that_cannot_read_the_duration_records_intro_and_credits(store, video):
-    _run_item(video, ItemOutcome("failed", NO_DURATION_MESSAGE), MARKER_OUTCOME_KEYS)
+STAGES = ["check", "worker"]
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_a_file_whose_duration_cant_be_read_is_recorded_for_intro_and_credits(store, video, stage):
+    _run_item(video, ItemOutcome("failed", NO_DURATION_MESSAGE), stage)
 
     assert set(failures.unreadable_paths(store)) == {Feature.INTRO, Feature.CREDITS}
 
 
+@pytest.mark.parametrize("stage", STAGES)
 @pytest.mark.parametrize("key", ["markers_published", "markers_up_to_date", "markers_none"])
-def test_an_intro_job_that_later_finishes_the_file_clears_the_record(store, video, key):
+def test_a_file_intro_and_credits_later_finish_clears_the_record(store, video, key, stage):
     failures.record_failure((Feature.INTRO, Feature.CREDITS), str(video), "x")
 
-    _run_item(video, ItemOutcome(key), MARKER_OUTCOME_KEYS)
+    _run_item(video, ItemOutcome(key), stage)
 
     assert failures.unreadable_paths(store) == {}
 
@@ -103,21 +96,21 @@ def test_an_intro_job_that_later_finishes_the_file_clears_the_record(store, vide
 def test_an_outcome_that_never_read_the_duration_keeps_the_record(store, video, key):
     failures.record_failure((Feature.INTRO, Feature.CREDITS), str(video), "x")
 
-    _run_item(video, ItemOutcome(key), MARKER_OUTCOME_KEYS)
+    _run_item(video, ItemOutcome(key), "check")
 
     assert set(failures.unreadable_paths(store)) == {Feature.INTRO, Feature.CREDITS}
 
 
-def test_a_loudness_job_never_touches_the_marker_records(store, video):
+def test_a_file_handed_on_to_a_worker_keeps_the_record(store, video):
     failures.record_failure((Feature.INTRO, Feature.CREDITS), str(video), "x")
 
-    _run_item(video, ItemOutcome(next(k for k in LOUDNESS_OUTCOME_KEYS if k != "failed")), LOUDNESS_OUTCOME_KEYS)
+    _run_item(video, None, "check")
 
     assert set(failures.unreadable_paths(store)) == {Feature.INTRO, Feature.CREDITS}
 
 
 def test_a_different_failure_is_not_recorded(store, video):
-    _run_item(video, ItemOutcome("failed", "something else"), MARKER_OUTCOME_KEYS)
+    _run_item(video, ItemOutcome("failed", "something else"), "worker")
 
     assert store.failures() == {}
     assert os.path.exists(video)

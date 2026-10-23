@@ -649,8 +649,9 @@ class TestABusyPlexLeavesTheNodeAnswering:
 
     @pytest.fixture
     def stuck(self, plex_config, tmp_path, monkeypatch):
-        """A node with one slot for the role's requests (two threads), and ``hold()`` to send one that waits there, as
-        it would for Plex's lock, until ``release`` is set; yields ``(app, hold, release)``."""
+        """A node with one slot for the role's requests and room for one to wait for it (three threads), and
+        ``hold()`` to send one that waits in the slot, as it would for Plex's lock, until ``release`` is set; yields
+        ``(app, hold, release)``."""
         monkeypatch.setattr(plex_db_role, "SLOT_WAIT_S", 0.2)
         entered, release = threading.Event(), threading.Event()
         exists = plex_db.LocalPlexDb.item_exists
@@ -662,7 +663,7 @@ class TestABusyPlexLeavesTheNodeAnswering:
 
         monkeypatch.setattr(plex_db.LocalPlexDb, "item_exists", waits_for_release)
         app = node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path))
-        app.config[app_module.SERVER_THREADS] = 2
+        app.config[app_module.SERVER_THREADS] = 3
         holders: list[threading.Thread] = []
 
         def hold() -> None:
@@ -735,6 +736,71 @@ class TestABusyPlexLeavesTheNodeAnswering:
         answer = app.test_client().post("/v1/item/exists", json={"rating_key": 7, "deadline_s": 5}, headers=AUTH)
         assert answer.status_code == 200
         assert answer.get_json()["result"]["exists"] is True
+
+    def test_only_as_many_wait_for_a_slot_as_leave_a_thread_free(self, stuck, monkeypatch):
+        # A thread waiting for a slot can't answer anything else: with every thread taken, waitress would queue the
+        # health check behind whatever the app sent next.
+        app, hold, release = stuck
+        monkeypatch.setattr(plex_db_role, "SLOT_WAIT_S", 10.0)  # the request in the slot stays a quick one
+        hold()
+        body = {"rating_key": 7, "deadline_s": 5}
+        waiter = threading.Thread(target=lambda: app.test_client().post("/v1/item/exists", json=body, headers=AUTH))
+        waiter.start()
+        time.sleep(0.2)  # waiting for the slot
+        started = time.monotonic()
+        answer = app.test_client().post("/v1/item/exists", json=body, headers=AUTH)
+        assert time.monotonic() - started < 1.0
+        assert answer.status_code == 409
+        release.set()
+        waiter.join(10)
+
+    def test_the_wait_limit_leaves_one_thread_for_everything_else(self):
+        assert [(plex_db_role.slot_limit(t), plex_db_role.wait_limit(t)) for t in (2, 3, 4, 8, 16)] == [
+            (1, 0),
+            (1, 1),
+            (2, 1),
+            (4, 3),
+            (8, 7),
+        ]
+        assert plex_db_role.wait_limit(None) is None
+
+    def test_a_burst_from_the_app_leaves_the_health_check_answered(self, plex_config, tmp_path, monkeypatch):
+        # Thirty workers asking a four-thread node at once queued its health check behind all of them (seven seconds
+        # with half-second requests).
+        from media_preview_generator.nodes.server import wsgi
+
+        exists = plex_db.LocalPlexDb.item_exists
+
+        def slow(self, rating_key, *, deadline):
+            time.sleep(0.3)
+            return exists(self, rating_key, deadline=deadline)
+
+        monkeypatch.setattr(plex_db.LocalPlexDb, "item_exists", slow)
+        server = wsgi.create_node_server(
+            node_app(str(plex_config), mountinfo_path=_mountinfo(tmp_path)), host="127.0.0.1", port=0, threads=4
+        )
+        threading.Thread(target=server.run, daemon=True).start()
+        url = f"http://127.0.0.1:{server.effective_port}"
+        answers: list[int] = []
+
+        def ask() -> None:
+            body = {"rating_key": 7, "deadline_s": 5}
+            answers.append(requests.post(f"{url}/v1/item/exists", json=body, headers=AUTH, timeout=30).status_code)
+
+        burst = [threading.Thread(target=ask) for _ in range(20)]
+        try:
+            for asker in burst:
+                asker.start()
+            time.sleep(0.2)  # the burst is at the node
+            started = time.monotonic()
+            assert requests.get(f"{url}/v1/health", timeout=10).status_code == 200
+            assert time.monotonic() - started < 1.0
+            for asker in burst:
+                asker.join(30)
+        finally:
+            server.close()
+        # The two that ran and the one that waited answered; the rest were told the node is full (the app asks again).
+        assert sorted(set(answers)) == [200, 409] and answers.count(200) >= 3
 
     def test_the_app_asks_a_full_node_again_until_the_request_s_wait_is_used_up(self, stuck):
         app, hold, release = stuck
