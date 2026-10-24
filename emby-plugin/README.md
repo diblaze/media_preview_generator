@@ -42,7 +42,7 @@ Emby keeps C# property names as they are, so every JSON field is PascalCase, and
 
 | Endpoint | Auth | What it does |
 |---|---|---|
-| `GET /MediaPreviewBridge/Ping` | anonymous | `{"Ok": true, "Version": "1.0.0.1", "Features": ["markers"]}`. Use `Ok` to detect that the plugin is installed. |
+| `GET /MediaPreviewBridge/Ping` | anonymous | `{"Ok": true, "Version": "1.0.0.2", "Features": ["markers"]}`. Use `Ok` to detect that the plugin is installed. |
 | `GET /MediaPreviewBridge/Markers/{Id}` | admin | The item's stored markers as a `MarkersResponse` (`Stored` is 0). |
 | `POST /MediaPreviewBridge/Markers/{Id}` | admin | Replaces the item's stored markers and writes them into Emby's chapters straight away. Returns a `MarkersResponse`; `Stored` is the number of our marker rows the item now shows. |
 | `DELETE /MediaPreviewBridge/Markers/{Id}` | admin | Removes the rows the plugin wrote for the item and its stored markers. Returns a `MarkersResponse` with `Stored` 0. With nothing stored, no row changes. |
