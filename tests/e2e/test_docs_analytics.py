@@ -18,7 +18,7 @@ def load_docs(page: Page, *, origin: str = ORIGIN, init: str = "", endpoint: str
     """Serve a tiny docs DOM and capture every request; never contact GoatCounter."""
     sent = []
     page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => false});" + init)
-    markup = f'''<button id="docs-analytics-toggle">Exclude my visits</button>
+    markup = f'''<title>Guides</title><button id="docs-analytics-toggle">Exclude my visits</button>
         <span id="docs-analytics-status"></span>
         <a id="start" href="/getting-started/?token=private#secret">Start</a>
         <a id="install" href="https://hub.docker.com/r/stevezzau/media_preview_generator?token=private">Install</a>
@@ -63,6 +63,7 @@ def test_only_canonical_page_referrer_origin_and_fixed_events_are_sent(page: Pag
         assert "private" not in str(query) and "secret" not in str(query)
         assert "referer" not in request["headers"] and "cookie" not in request["headers"]
     assert "e" not in sent[0]["query"]
+    assert sent[0]["query"]["t"] == ["Guides"]
     assert all(x["query"]["e"] == ["true"] for x in sent[1:])
 
 

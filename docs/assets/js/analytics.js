@@ -55,7 +55,8 @@
   }
   function count(name, event) {
     if (!allowed()) return;
-    var query = new URLSearchParams({p: name, r: referrerOrigin(), t: '', rnd: Math.random().toString(36).slice(2, 7)});
+    var query = new URLSearchParams({p: name, r: referrerOrigin(), t: event ? '' : document.title.slice(0, 200),
+      rnd: Math.random().toString(36).slice(2, 7)});
     if (event) query.set('e', 'true');
     // Explicit no-referrer and omitted credentials also protect the HTTP request itself.
     fetch(endpoint + '?' + query.toString(), {

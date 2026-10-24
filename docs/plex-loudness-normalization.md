@@ -1,8 +1,8 @@
 ---
-title: Plex loudness analysis on your workers, for Normalize Loudness
+title: Plex Generating loudness data, done on your own workers
 heading: Plex loudness
-description: Analyses audio tracks on this app's workers and stores loudness measurements in Plex, for
-  Normalize Loudness.
+description: Instead of waiting on Plex's Generating loudness data task, measure audio loudness on this app's workers
+  and store it in Plex for Normalize Loudness.
 ---
 
 <nav class="task-links" aria-label="Plex loudness tasks">
@@ -12,9 +12,10 @@ description: Analyses audio tracks on this app's workers and stores loudness mea
   <a href="#undoing-it"><strong>Undo app writes</strong><span>Journal safeguards and restore command</span></a>
 </nav>
 
-Plex's **Normalize Loudness** needs each audio track analysed first. This app runs FFmpeg's loudness analysis on its
-CPU worker groups, alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats
-the completed tracks as analysed.
+Plex's **Normalize Loudness** needs each audio track analysed first. Plex does that itself in the background, shown as
+**Generating loudness data**. This app runs the same kind of analysis (FFmpeg's) on its CPU worker groups instead,
+alongside previews and Intro & Credits, and stores the measurements where Plex keeps them. Plex then treats the
+completed tracks as analysed.
 
 It is for Plex movie and TV libraries, and it stays off until you turn it on for a server. Music libraries are not
 supported: Plex's music analysis includes album gain and fades that this video feature does not produce. Trailers and
