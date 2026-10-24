@@ -60,7 +60,7 @@ The frames were grabbed without tone mapping, so HDR colours land in an ordinary
 
 ### What does Media Preview Generator do?<a id="what-does-this-tool-do"></a>
 
-Generates video preview thumbnails for **Plex, Emby, and Jellyfin** — alone or in any combination. These are the small images you see when scrubbing through videos. It runs preview generation off the media server, on a machine of your choosing, using every GPU it finds. When two or more of your servers contain the same file, FFmpeg runs only once and the output is written in each server's expected format (Plex stores it as a **BIF** bundle, Emby reads a **BIF** sidecar file next to the video, Jellyfin reads a folder of JPG tiles called **trickplay**). It can also add Skip Intro and Skip Credits markers: see [Intro & Credits](#intro--credits).
+Generates video preview thumbnails for **Plex, Emby, and Jellyfin**, alone or in any combination. These are the small images you see when scrubbing through videos. It runs off the media server, on a machine you choose, and uses every GPU it finds. When two or more of your servers contain the same file, FFmpeg runs only once and the output is written in each server's expected format (Plex stores it as a **BIF** bundle, Emby reads a **BIF** sidecar file next to the video, Jellyfin reads a folder of JPG tiles called **trickplay**). It can also add Skip Intro and Skip Credits markers: see [Intro & Credits](#intro--credits).
 
 ### Which Plex, Emby and Jellyfin settings should I change?<a id="what-plexembyjellyfin-settings-should-i-use"></a>
 
@@ -77,7 +77,7 @@ Disabling each vendor's built-in generation avoids duplicate work and prevents t
 
 ### Does it run on Windows or Unraid?<a id="does-this-work-on-windows"></a>
 
-Yes — run the Docker image on Docker Desktop with the WSL2 backend. If you have an **NVIDIA** GPU it is accelerated: the NVIDIA Windows driver exposes CUDA and NVDEC into WSL2, so `--gpus all` works much as it does on Linux (best-effort — WSL2 GPU detection is less reliable than native Linux). **AMD and Intel** GPUs are not accelerated under Docker (D3D11VA can't be reached from Docker's Linux VM), so those setups process on CPU — add CPU workers under **Settings → Workers**, or run the container on a Linux host. There's no separate Windows native build. See [Getting Started — Windows](getting-started.md#windows). There is an Unraid Community Applications template: see [Unraid](getting-started.md#unraid).
+Yes. Run the Docker image on Docker Desktop with the WSL2 backend. If you have an **NVIDIA** GPU it is accelerated: the NVIDIA Windows driver exposes CUDA and NVDEC into WSL2, so `--gpus all` works much as it does on Linux (best-effort: WSL2 GPU detection is less reliable than native Linux). **AMD and Intel** GPUs are not accelerated under Docker (D3D11VA can't be reached from Docker's Linux VM), so those setups process on CPU — add CPU workers under **Settings → Workers**, or add a Linux machine with the GPU as a [worker node](remote-nodes.md). There's no separate Windows native build. See [Getting Started — Windows](getting-started.md#windows). There is an Unraid Community Applications template: see [Unraid](getting-started.md#unraid).
 
 ### Does it make chapter thumbnails too?<a id="does-this-generate-chapter-thumbnails"></a>
 
@@ -89,12 +89,12 @@ No. Under **Settings → Workers**, use a worker group with only a CPU device an
 
 ### Is there a Windows .exe, or do I need Docker?<a id="is-docker-required-is-there-a-standalone-exe"></a>
 
-Docker is required. There is no standalone executable and no from-source install path — the container bundles the FFmpeg build and codec support the app depends on, so Docker is the only supported deployment. See [Getting Started](getting-started.md) for setup. It runs on Linux, Windows (Docker Desktop, WSL2 backend), macOS, Unraid, Synology, and anywhere else Docker runs.
+Docker is required. There is no standalone executable and no from-source install path. The container bundles the FFmpeg build and codec support the app depends on, so Docker is the only supported deployment. See [Getting Started](getting-started.md) for setup. It runs on Linux, Windows (Docker Desktop, WSL2 backend), macOS, Unraid, Synology, and anywhere else Docker runs.
 
 ### Does my media server need to run in Docker too?
 
 No. Plex, Emby, and Jellyfin can all run bare-metal, in Docker, or any other
-way. This tool just needs:
+way. This app needs:
 
 - **Network access** to each server's API (port 32400 for Plex, 8096 for
   Emby/Jellyfin by default).
@@ -111,16 +111,17 @@ way. This tool just needs:
 
 ### Can it run on a different machine from Plex, Emby or Jellyfin?<a id="can-i-run-this-on-a-different-machine-than-my-media-servers"></a>
 
-Yes. The tool can run anywhere that can reach your servers' APIs over the
+Yes. The app can run anywhere that can reach your servers' APIs over the
 network. For Plex you also need access to the Plex config directory (NFS,
-SMB, shared volume, etc.); for Emby/Jellyfin you just need the media files
+SMB, shared volume, etc.). For Emby and Jellyfin you need the media files
 visible. See [Networking](getting-started.md#networking) for setup details.
 For Intro & Credits, chapter thumbnails or loudness on a Plex on another
 machine, run a [Plex database node](remote-nodes.md) beside Plex.
+To use a GPU in another machine, add it as a [worker node](remote-nodes.md).
 
 ### Does it work with Jellyfin and Emby, not just Plex?<a id="does-this-work-with-jellyfin-or-emby"></a>
 
-Yes. The app supports Plex, Emby, and Jellyfin — alone or in any combination. Each server is added on the **Servers** page. When two or more servers contain the same file, FFmpeg runs only once and the result is written in each server's expected format (Plex stores it as a BIF bundle, Emby reads a BIF sidecar file next to the video, Jellyfin reads a folder of JPG tiles called trickplay). See the [Multi-Server guide](multi-server.md) for setup, webhook routing, and per-server library/exclude rules.
+Yes. The app supports Plex, Emby, and Jellyfin, alone or in any combination. Each server is added on the **Servers** page. When two or more servers contain the same file, FFmpeg runs only once and the result is written in each server's expected format (Plex stores it as a BIF bundle, Emby reads a BIF sidecar file next to the video, Jellyfin reads a folder of JPG tiles called trickplay). See the [Multi-Server guide](multi-server.md) for setup, webhook routing, and per-server library/exclude rules.
 
 ---
 
@@ -181,7 +182,7 @@ Set each device's worker count in **Settings → Workers** (1 to 32). Start low 
 
 ### Why is CPU usage high when I have a GPU configured?
 
-GPU workers use both GPU and CPU — this is normal. The GPU handles video decoding and downscaling to thumbnail size; the CPU handles frame selection, JPEG encoding, and (for HDR content) part of the colour conversion. Standard SDR content barely uses the CPU at all; HDR content — especially Dolby Vision — uses noticeably more because frames have to move between CPU and GPU memory for the colour conversion step.
+GPU workers use both GPU and CPU. This is normal. The GPU handles video decoding and downscaling to thumbnail size; the CPU handles frame selection, JPEG encoding, and (for HDR content) part of the colour conversion. Standard SDR content barely uses the CPU at all; HDR content, especially Dolby Vision, uses noticeably more because frames have to move between CPU and GPU memory for the colour conversion step.
 
 Dolby Vision Profile 5 (no HDR10 fallback layer) needs the most from your setup:
 

@@ -27,6 +27,8 @@ Features:
 The web interface is available at http://[IP]:8080 after starting the container.
 A setup wizard will guide you through connecting to your Plex server.
 
+To use the GPU in another machine, run this same image there with MODE=node and add it under Settings > Nodes.
+
 IMPORTANT - NETWORKING:
 If your Plex container uses a custom network (like br1 or macvlan), this container
 must use the SAME network to communicate with Plex. Change the Network Type setting

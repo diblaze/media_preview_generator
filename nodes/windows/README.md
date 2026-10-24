@@ -1,76 +1,95 @@
 # Plex database node for Windows
 
-A small program that runs beside Plex Media Server on Windows, so that Media Preview Generator, running on another
-machine, can write into Plex's database: intro and credits markers, chapter thumbnails, loudness measurements and
-Library Health's database counts.
+A small program that runs beside Plex Media Server on Windows. It lets Media Preview Generator, running on another
+machine, write into Plex's database: Intro & Credits markers, chapter thumbnails, loudness and Library Health counts.
 
-## Who needs it
+## Do you need it?
 
-You need it when **Plex runs natively on Windows** (the normal Plex installer) and keeps its data on a **local disk of
-that PC** (NTFS or ReFS: the default `%LOCALAPPDATA%\Plex Media Server`), while the app runs somewhere else (a NAS, a
-Linux server, Docker, including Docker Desktop on the same PC).
+Yes, when both of these are true:
 
-Plex has no API for markers, so the app writes them into Plex's SQLite database itself. SQLite's locks only work
-between programs on the same machine; over a network share they can corrupt the database. The node is the part of the
-app that opens the database, running on Plex's machine; the app sends it each item's markers and it does the write,
-with exactly the same checks the app runs when it sits beside Plex.
+- Plex runs on Windows with the normal Plex installer, and keeps its data on a local disk of that PC (NTFS or ReFS,
+  by default `%LOCALAPPDATA%\Plex Media Server`).
+- The app runs somewhere else: a NAS, a Linux server, or Docker, including Docker Desktop on the same PC.
 
-You don't need it when:
+Plex has no API for markers, so the app writes them into Plex's SQLite database. SQLite's locks only work between
+programs on the same machine, and over a network share they can corrupt the database. The node opens the database on
+Plex's machine and makes the write, with the same checks the app runs when it sits beside Plex.
 
-* the app runs natively on the same machine as Plex (it opens the database itself). The app in **Docker Desktop**
-  on Plex's PC does need the node: Docker Desktop's mount of a Windows folder can't hold SQLite's locks, so the
-  app can't open Plex's database through it. Add the node as `http://host.docker.internal:9494`;
-* **Plex runs in Docker Desktop** (WSL 2) or any Linux container: use the Linux Plex database node
-  (`nodes/plex-db/`) instead, inside the same Docker setup as Plex;
-* Plex's data folder is on a network drive: SQLite can't be shared safely there, and the node refuses it.
+No, when:
+
+- The app runs natively on the same PC as Plex. It opens the database itself.
+- Plex runs in Docker Desktop (WSL 2) or another Linux container. Use the [Linux node](../plex-db/) in the same
+  Docker setup.
+- Plex's data folder is on a network drive. SQLite can't be shared safely there, and the node refuses it.
+
+## What you need
+
+- Windows with Plex installed and used by one Windows user. Install the node as that user.
+- The app, reachable from this PC over your network.
+- `PlexDbNode-windows.zip`, from the **Plex database node** release on the
+  [Releases page](https://github.com/stevezau/media_preview_generator/releases). Take the newest one.
 
 ## Install
 
-1. Download `PlexDbNode-windows.zip` from the newest **Plex database node** release on the
-   [Releases page](https://github.com/stevezau/media_preview_generator/releases) and unzip it anywhere. It holds
-   `install.ps1`, `uninstall.ps1`, this README and the `PlexDbNode` program folder. No release with it yet? Build it
-   yourself ([Build](#build), below) and run `nodes\windows\install.ps1` from the checkout in step 2: it finds the
-   build in `dist\PlexDbNode`.
-2. Sign in to Windows **as the user Plex runs as**, open PowerShell in the unzipped folder and run:
+1. Unzip `PlexDbNode-windows.zip` anywhere. It holds `install.ps1`, `uninstall.ps1`, this README and the
+   `PlexDbNode` folder.
+2. Sign in to Windows as the user Plex runs as. Open PowerShell in the unzipped folder and run:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
 
-   It copies the program and `uninstall.ps1` to `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode`, makes
-   it start at every logon of this user, starts it, and prints the **address** and **key** to paste into the app
-   (Settings → Nodes → Add node).
+   It copies the program to `%LOCALAPPDATA%\Programs\MediaPreviewGenerator\PlexDbNode`, makes it start at every logon
+   of this user, starts it, and prints an **address** and a **key**.
+3. If the app runs on another machine, Windows may ask whether to allow `PlexDbNode.exe` through the firewall. Allow it
+   on private networks. Or run the installer with `-AddFirewallRule` (below). With Docker Desktop on the same PC no
+   rule is needed.
 
-Options:
+## Add it in the app
 
-* `-AtStartup` starts the node when Windows starts, before anyone signs in, instead of at logon. Use it when Plex
-  runs as a Windows service (for example with PmsService) or starts at boot: without it, Plex runs after a reboot but
-  the node waits for someone to sign in. The user must be an administrator on this PC (Windows only lets an
-  administrator start a task without a stored password), and it asks for administrator rights once. If you decline
-  that, the node keeps starting at logon. Windows can't show its firewall question to a program started before
-  sign-in, so add `-AddFirewallRule` when the app runs on another machine; Docker Desktop on the same PC needs no rule.
-* `-AddFirewallRule` asks for administrator rights once to let other machines on private and domain networks reach
-  the node (port 9494). It also removes the block Windows adds for `PlexDbNode.exe` when its firewall question is
-  dismissed. Without it, allow `PlexDbNode.exe` when Windows asks, or add the rule yourself.
-* `-Port 9500` listens on another port.
-* `-PlexConfigDir "D:\PlexData\Plex Media Server"` names Plex's data folder. You rarely need it: the node finds the
-  folder from Plex's own setting (the `LocalAppDataPath` registry value, when you moved Plex's data with it), else
-  `%LOCALAPPDATA%\Plex Media Server`. Name only that folder: Plex on Windows keeps its server id in the registry, not
-  in the folder, so for any other folder the node can't tell which Plex it belongs to and refuses loudness and
-  chapter thumbnails.
+1. Open **Settings → Nodes → Add node**.
+2. Enter the address and the key the installer printed. The address is `http://<this PC>:9494`. For the app in Docker
+   Desktop on the same PC, use `http://host.docker.internal:9494`.
+3. Open **Servers**, choose your Plex, then **Edit → Connection → Plex database** and select the node.
+
+## Install options
+
+Add these to the install command.
+
+| Option | What it does |
+|---|---|
+| `-AtStartup` | Starts the node when Windows starts, before anyone signs in, instead of at logon. Use it when Plex runs as a Windows service or starts at boot. The user must be an administrator, and the installer asks for administrator rights once. If you decline, the node keeps starting at logon. Windows can't show its firewall question to a program started before sign-in, so add `-AddFirewallRule` when the app is on another machine. |
+| `-AddFirewallRule` | Asks for administrator rights once, then lets other machines on private and domain networks reach the node (port 9494). It also removes the block Windows adds when its firewall question is dismissed. |
+| `-Port 9500` | Listens on another port. |
+| `-PlexConfigDir "D:\PlexData\Plex Media Server"` | Names Plex's data folder. You rarely need it: the node finds the folder from Plex's own `LocalAppDataPath` registry value, else `%LOCALAPPDATA%\Plex Media Server`. Name only that folder. Plex on Windows keeps its server id in the registry, so for any other folder the node can't tell which Plex it belongs to and refuses loudness and chapter thumbnails. |
 
 The node keeps its id, key, log and loudness undo record in `%LOCALAPPDATA%\MediaPreviewGenerator\node`
 (`node.json`, `logs\node.log`, `loudness-writes.jsonl`). To use a key of your own, set it before installing
-(`$env:NODE_KEY = "..."`); the installer saves it in `node.json`, so it still works after a reboot.
+(`$env:NODE_KEY = "..."`). The installer saves it in `node.json`, so it survives a reboot.
 
-To update it, download the newest release, unzip it and run `install.ps1` again as the same user, with the options
-you installed with (`-Port`, `-PlexConfigDir`, `-AtStartup`). It replaces the program and keeps the key and the undo record.
+## Update
 
-To remove it:
-`powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"`.
-`-RemoveData` also deletes the key and log but keeps the loudness undo record, the only way to put Plex's audio
-tracks back; add `-RemoveUndoRecord` to delete it too. To undo loudness writes after removing the node, install it
-again first.
+1. Download the newest release and unzip it.
+2. Run `install.ps1` again as the same user, with the options you installed with (`-Port`, `-PlexConfigDir`,
+   `-AtStartup`).
+
+It replaces the program and keeps the key and the undo record. The node doesn't have to match the app's version, only
+be new enough. The app shows **Update needed** when it isn't.
+
+## Uninstall
+
+Run this in PowerShell as the same user:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\MediaPreviewGenerator\PlexDbNode\uninstall.ps1"
+```
+
+This removes the program and its startup entry, plus the boot task and firewall rule if you added them. It keeps the node's data folder.
+`-RemoveData` also deletes the key and log, but keeps the loudness undo record, the only way to put Plex's audio
+tracks back. Add `-RemoveUndoRecord` to delete the loudness undo record too. To undo loudness writes after removing
+the node, install it again first.
+
+Then delete the node under **Settings → Nodes** in the app.
 
 ## Undoing loudness writes
 

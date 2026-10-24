@@ -30,7 +30,7 @@ unlock the playback feature. See Plex's [Audio Track Enhancements for Video](htt
 ## Turning it on
 
 1. Run this app on the same machine as Plex and mount Plex's config folder locally, or run the
-   [Plex database node](guides.md#plex-on-another-machine-the-plex-database-node) (version 1.2.0 or newer) beside a Plex on
+   [Plex database node](remote-nodes.md) (version 1.2.0 or newer) beside a Plex on
    another machine. Plex must be running. Loudness supports Plex **1.43.4.x or 1.43.5.x**. A network-mounted
    database is refused.
 2. Under **Servers → Edit → Processing → Loudness**, switch on **Analyse loudness for this server**.

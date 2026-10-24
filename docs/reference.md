@@ -7,8 +7,6 @@ description: Every Media Preview Generator setting, environment variable, path m
 
 > [Back to Docs](README.md)
 
-Complete reference for all configuration options and REST API endpoints.
-
 > [!IMPORTANT]
 > This page is the source of truth for configuration precedence, settings, and REST API behavior.
 > For installation and setup flows, use [Getting Started](getting-started.md).
@@ -34,6 +32,7 @@ Complete reference for all configuration options and REST API endpoints.
 
 - [Getting Started](getting-started.md)
 - [Guides & Troubleshooting](guides.md)
+- [Remote nodes](remote-nodes.md)
 - [FAQ](faq.md)
 - [Main README](https://github.com/stevezau/media_preview_generator/blob/dev/README.md)
 
@@ -177,8 +176,8 @@ workers on one machine (this app, or any one node). These are worker slots, not 
 
 ## Nodes
 
-Other machines that run work for this app, added on the **Nodes** page (see the
-[remote nodes guide](guides.md#remote-nodes)). A worker node runs the files sent to it; a Plex database node opens
+Other machines that run work for this app, added on the **Nodes** page (overview: [Remote nodes](remote-nodes.md);
+details: [remote nodes guide](guides.md#remote-nodes)). A worker node runs the files sent to it; a Plex database node opens
 Plex's database for a Plex on another machine or on Windows. Stored in `settings.json["nodes"]`, a list of:
 
 | Field | Rules |
@@ -341,7 +340,7 @@ These are not migrated to settings.json and remain in effect:
 | `WEB_AUTH_TOKEN` | Auto-generated | Fixed authentication token (overrides wizard-set token) |
 | `AUTH_METHOD` | `internal` | Set to `external` to disable built-in auth when using a reverse proxy or VPN (see below) |
 | `FLASK_SECRET_KEY` | Auto-generated | Override the Flask session signing key. Auto-generated and persisted to `/config/flask_secret.key` if not set. Set this only when you need a fixed key across rebuilds. |
-| `LOG_FORMAT` | `pretty` | Log output format. Set to `json` to emit one JSON object per log line — useful when shipping logs to Loki / Datadog / similar aggregators. |
+| `LOG_FORMAT` | `pretty` | Log output format. `json` writes one JSON object per log line, for log shippers such as Loki or Datadog. |
 | `PLEX_DATA_ROOT` | `/` | Restricts where Plex config folders can be validated. Defaults to the whole filesystem; set it to e.g. `/plex` to refuse anything outside that root. |
 | `MEDIA_ROOT` | `/` | Same as `PLEX_DATA_ROOT` but for media paths (manual jobs, the inspector, the file picker). |
 | `RATELIMIT_STORAGE_URL` | `memory://` | Backend for rate-limit counters. The default in-memory store is fine for a single container. |
@@ -351,8 +350,8 @@ These are not migrated to settings.json and remain in effect:
 
 ### Developer / harness-only
 
-Not for deployment — these override paths used during development and the accuracy harness, and are never migrated
-into `settings.json`:
+Not for deployment. These override paths used in development and the accuracy harness, and are never migrated into
+`settings.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -371,7 +370,7 @@ environment:
 When set to `external`:
 
 - The login page is bypassed; all browser and API requests are treated as authenticated.
-- Webhook authentication (`webhook_secret` / Bearer token) is **not** affected — external services like Radarr and Sonarr still need their shared secret.
+- Webhook authentication (`webhook_secret` / Bearer token) is not affected: Radarr, Sonarr and other callers still need the shared secret.
 - A browser's `POST`/`PUT`/`PATCH`/`DELETE` still needs the page's CSRF token (the app's pages send it). Scripts
   should send the API token (`X-Auth-Token` or `Authorization: Bearer`); see [REST API → Authentication](#authentication).
 - The setup wizard still runs on first boot.
@@ -408,7 +407,7 @@ On first run, these variables are copied into settings.json. After that, setting
 
 ## Web Interface Settings
 
-The web UI is served by [gunicorn](https://gunicorn.org/) (a Python web server) using thread workers — Docker handles launching it, you don't need to know about this unless you're running outside Docker. Listening port and related knobs live in [Infrastructure Variables](#infrastructure-variables) — `WEB_PORT`, `CORS_ORIGINS`, `HTTPS`, and `DEV_RELOAD`.
+The web UI is served by [gunicorn](https://gunicorn.org/) with thread workers. Docker starts it, so you only need this outside Docker. The port and related settings (`WEB_PORT`, `CORS_ORIGINS`, `HTTPS`, `DEV_RELOAD`) are in [Infrastructure Variables](#infrastructure-variables).
 
 ---
 
@@ -528,23 +527,24 @@ An Emby server's block has `"emby": {"on_emby_redetect": "restore"}` in place of
 
 ### Plex database node <a id="plex-marker-agent"></a>
 
-The small container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`),
-added on the Nodes page and chosen per server in `plex.agent`. Its setup, compose file, build steps and version rules
-are in its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md); the app
-side is `media_preview_generator/markers/publishers/plex_remote.py`. Its settings are a node's own
+The container for a Plex on another machine (`nodes/plex-db/`, image `ghcr.io/stevezau/plex-marker-agent`), or the
+[Windows program](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md) for Plex on
+Windows. Add it on the Nodes page and choose it per server in `plex.agent`. Setup, compose file and version rules are in
+its [README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md). The app side is
+`media_preview_generator/markers/publishers/plex_remote.py`. It takes a node's own settings
 ([A node's own settings](#a-nodes-own-settings)), plus:
 
 | Variable | Notes |
 |---|---|
-| `AGENT_TOKEN` | The key's name from the Plex marker agent; still works when `NODE_KEY` isn't set. |
-| `AGENT_PORT` | The port's name from the Plex marker agent; still works when `NODE_PORT` isn't set. |
+| `AGENT_TOKEN` | The old name of `NODE_KEY`. Used when `NODE_KEY` isn't set. |
+| `AGENT_PORT` | The old name of `NODE_PORT`. Used when `NODE_PORT` isn't set. |
 | `PLEX_CONFIG` | Compose only: Plex's config folder on the node's host, mounted at `/plex`. Required. |
 | `AGENT_BIND` | Compose only: the host address to publish on. Default `0.0.0.0`. |
 
-Every request carries the key and the protocol the app speaks, and every answer carries the node's version and the
-protocols it speaks; a mismatch in either direction is refused before anything is written. Once the app has recorded
-the node's id (`node_uid`), every request names it too (protocol 2): another machine given the same key and address
-refuses the request before anything is written, and the app checks the node again while that work waits.
+Every request carries the key and the protocol the app speaks. Every answer carries the node's version and its
+protocols. A mismatch in either direction is refused before anything is written. Once the app has recorded the node's
+id (`node_uid`), every request names it too (protocol 2), so another machine given the same key and address refuses
+the request. The app checks the node again while that work waits.
 
 ### Job kind `intro_credits`
 
@@ -1803,7 +1803,7 @@ Each loudness stream identifies `item_id`, `part_id`, `part_file` (basename), `s
 `integrated_lufs`, `true_peak_dbtp`, `lra_lu`, `threshold_lufs` and `gain_offset_db`. `normalization_available` describes
 Plex's capability, not the player's Normalize Loudness switch. Measurements are finite JSON numbers or null;
 recognized native silence/short-track sentinel values use the strings `"-inf"` and `"inf"` where applicable. Invalid
-or unknown reports remain distinguishable from measurements that are simply absent. Complete native values remain
+or unknown reports remain distinguishable from measurements that are absent. Complete native values remain
 visible when the app's loudness opt-in is off.
 
 `400` when `path` isn't an absolute path inside the media folder.

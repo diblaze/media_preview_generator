@@ -85,7 +85,9 @@ Generate preview thumbnails for **Plex, Emby, Jellyfin**, or any combination of 
    - **Jellyfin Server** — use **Quick Connect** (a code you enter in Jellyfin, no password to type), or a username and password, or an API key
 2. Docker installed on your server
 
-You can configure several servers — even a mix of vendors — and a single FFmpeg pass will publish to every server that owns the file.
+The container can run on the same machine as your media server or on another one. If the best GPU is in a different machine, run the app anywhere and add that machine as a [worker node](remote-nodes.md).
+
+You can configure several servers, even a mix of vendors. One FFmpeg pass publishes to every server that owns the file.
 
 ---
 
@@ -117,7 +119,7 @@ Replace `/path/to/media`, `/path/to/plex/config`, and `/path/to/app/config` with
 > No environment variables are required for first-time setup. Server connections (Plex / Emby / Jellyfin), libraries, workers, and path mappings are all configured in the Setup Wizard, **Servers** and **Settings**. Environment variables are optional overrides (see [Reference](reference.md)).
 
 > [!TIP]
-> **Timezone:** The `/etc/localtime` mount ensures log timestamps and scheduled jobs use your local time. If your host doesn't have this file (e.g. some NAS devices), use `-e TZ=America/New_York` instead (replace with your [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)).
+> **Timezone:** The `/etc/localtime` mount makes log timestamps and scheduled jobs use your local time. If your host doesn't have this file (e.g. some NAS devices), use `-e TZ=America/New_York` instead (replace with your [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)).
 
 ### Step 2: Get Your Access Token
 
@@ -138,13 +140,13 @@ Find your token using the [Authentication Token](#authentication-token) section 
    - **Step 4 — Processing options**: **GPU device tuning** lists detected GPUs (**Re-scan GPUs** re-detects them). Below it, set up your worker groups, then the **Thumbnails** interval and quality. These are shared by every configured server.
    - **Step 5 — Set your access token**: choose a new token (at least 8 characters, different from the current one), then click **Complete Setup**. If `WEB_AUTH_TOKEN` is set, the token is fixed and this step says so.
 
-You can add more servers — any vendor, any number of each — at any time with **Servers → Add Server**. A file present on multiple servers is generated once and published to each in its native format. To go through the wizard again, use **Tools → Run setup again**.
+You can add more servers, any vendor and any number of each, at any time with **Servers → Add Server**. A file present on multiple servers is generated once and published to each in its native format. To go through the wizard again, use **Tools → Run setup again**.
 
 ---
 
 ## Recommended media-server settings
 
-This tool's main job is **video preview thumbnails** — the small frames you
+This app's main job is **video preview thumbnails**, the small frames you
 see when you drag the scrub bar. Plex stores them as **BIF bundles**, Emby
 reads a **BIF sidecar** next to the media file, and Jellyfin reads a folder of
 JPG tile sheets called **trickplay** next to the media file. The app writes
@@ -248,7 +250,7 @@ Copy the file, uncomment the section for your hardware, and adjust volume paths.
 
 ## GPU Acceleration
 
-Hardware-accelerated video processing for faster thumbnail generation. To check what's detected on your system, open the web UI (`http://YOUR_IP:8080`) and go to **Settings → Processing options → GPU device tuning**. Detected GPUs are listed there with device IDs, names, and types. The setup wizard shows the same list in step 4.
+Hardware-accelerated video processing for faster thumbnail generation. To use a GPU in another machine, add it as a [worker node](remote-nodes.md). To check what's detected on your system, open the web UI (`http://YOUR_IP:8080`) and go to **Settings → Processing options → GPU device tuning**. Detected GPUs are listed there with device IDs, names, and types. The setup wizard shows the same list in step 4.
 
 ### Supported GPUs
 
@@ -383,13 +385,13 @@ open safely. Run the [Plex database node for Windows](https://github.com/steveza
 beside Plex and add it as `http://host.docker.internal:9494` (see
 [Plex on another machine](guides.md#plex-on-another-machine)).
 
-**AMD and Intel:** not accelerated under Docker. These rely on D3D11VA, a Windows-only framework that Docker Desktop's Linux VM cannot reach, so processing falls back to CPU. Add CPU workers in **Settings → Workers** to compensate, or run the container on a Linux host to use VAAPI/QuickSync.
+**AMD and Intel:** not accelerated under Docker. These rely on D3D11VA, a Windows-only framework that Docker Desktop's Linux VM cannot reach, so processing falls back to CPU. Add CPU workers in **Settings → Workers** to compensate. Or run a [worker node](remote-nodes.md) on a Linux machine with the GPU.
 
 ### macOS
 
 Not accelerated under Docker, on either Apple Silicon or Intel. VideoToolbox is a macOS framework and Docker Desktop's Linux VM has no access to it, so processing uses CPU. Add CPU workers in **Settings → Workers** to compensate, or run the container on a Linux host for GPU acceleration.
 
-Apple Silicon Macs do still benefit from the native ARM64 image — the container runs without Rosetta emulation overhead, which makes CPU processing meaningfully faster than an emulated x86 image.
+Apple Silicon Macs still benefit from the native ARM64 image: it runs without Rosetta emulation, so CPU processing is faster than with an emulated x86 image.
 
 ### Worker Configuration
 
@@ -399,7 +401,7 @@ Workers are set up in **worker groups** under **Settings → Workers**. Each gro
 
 **Settings → Processing options → GPU device tuning** sets **FFmpeg threads per worker** for each GPU: how many CPU threads each GPU worker may use. The default is 2, and 0 means no cap.
 
-Start with a few workers and increase gradually while you watch system load. The Dashboard's Workers panel shows each group's and device's activity. **Manage groups** opens the group settings.
+Start with a few workers and raise the count while you watch system load. Devices on [worker nodes](remote-nodes.md) appear here too. The Dashboard's Workers panel shows each group's and device's activity. **Manage groups** opens the group settings.
 
 ---
 
@@ -591,6 +593,8 @@ Where is the media server?
 └── Different machine?
     └── Use bridge network with the server's IP address
 ```
+
+If Plex runs on another machine and you want Intro & Credits markers, chapter thumbnails or loudness, also run a [Plex database node](remote-nodes.md) beside it.
 
 The same logic applies whether the target is Plex (port 32400), Emby (port
 8096), or Jellyfin (port 8096). If you run more than one server, check each

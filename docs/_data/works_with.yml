@@ -13,6 +13,8 @@
       note: CUDA decoding, also on Windows through WSL2
     - name: Intel and AMD
       note: VAAPI decoding on Linux
+    - name: Another machine's GPU
+      note: added as a worker node
     - name: No GPU
       note: CPU workers do the same job
 - group: Automation (optional)

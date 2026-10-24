@@ -2,8 +2,8 @@ title: Media Preview Generator
 tagline: Preview thumbnails made on your GPU, plus Skip Intro and Skip Credits, for Plex, Emby and Jellyfin
 description: >-
   Self-hosted, GPU-accelerated preview thumbnails for Plex, Emby and Jellyfin, made as soon as
-  Sonarr or Radarr import a file, plus Skip Intro and Skip Credits markers. HDR tone-mapped, one
-  Docker container.
+  Sonarr or Radarr import a file, plus Skip Intro and Skip Credits markers. HDR tone-mapped, runs in
+  Docker.
 
 # Where the site lives. Every template link derives from these two through relative_url /
 # absolute_url; CNAME and the llms files name the host as text (tests/test_site_urls.py). The Pages
@@ -78,7 +78,7 @@ nav:
         url: /remote-nodes/
   - title: Guides
     url: /guides/
-    blurb: The web UI, webhooks, schedules and troubleshooting
+    blurb: The web UI, webhooks, schedules, nodes and troubleshooting
     header: true
     children:
       - title: Setup Health

@@ -72,7 +72,7 @@ Then open `http://YOUR_IP:8080`, log in with the token saved in `auth.json` in y
 ## Check the GPU is being used
 
 1. **Settings → Workers** offers every GPU the container found, and **GPU device tuning** lists them with name and type. If yours isn't there, the container can't see it. Check the `--device` or `--gpus` flag, then the [troubleshooting table](guides.md#troubleshooting).
-2. Start a job and watch the **Workers** panel on the dashboard. Each worker group has its own card. A yellow **CPU fallback** badge means that file failed on the GPU and was redone on the CPU by the same worker. The job log says why ([CPU fallback](guides.md#automatic-gpu--cpu-fallback)). If several files in a row fall back, the bell menu flags the GPU.
+2. Start a job and watch the **Workers** panel on the dashboard. Each worker group has its own card. A yellow **CPU fallback** badge means no GPU could do that file, so the CPU did. The job log says why ([CPU fallback](guides.md#automatic-gpu--cpu-fallback)). If several files in a row fall back, the bell menu flags the GPU.
 3. On the host, while a job runs, look for FFmpeg processes. On NVIDIA, `nvidia-smi` lists processes using the GPU. On Intel, `intel_gpu_top` (from `intel-gpu-tools`) shows video engine load.
 
 ## Verify one file before a full library

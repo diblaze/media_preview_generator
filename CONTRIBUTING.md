@@ -1,14 +1,12 @@
 # Contributing & Development
 
-Thank you for contributing to Media Preview Generator!
-
-The supported way to run the app in production is **Docker** and the **web UI**. The setup below is for developing and testing the codebase (run the web app locally).
+The supported way to run the app in production is Docker and the web UI. This page is for developing and testing the code: it runs the web app locally.
 
 ---
 
 ## Code of Conduct
 
-Be respectful and inclusive. We're all here to make media server software better — for Plex, Emby, and Jellyfin users alike.
+Be respectful. This project is for Plex, Emby and Jellyfin users alike.
 
 ---
 
@@ -164,6 +162,7 @@ media_preview_generator/
 ├── loudness/             # Loudness analysis jobs (EBU R128), resume and undo
 ├── inspector/            # Per-file previews / markers / loudness status for the Inspector page
 ├── search/               # Library search query parsing and ranking
+├── nodes/                # Remote nodes: the app's client side, and the node server (nodes/server/) for MODE=node
 ├── job_kinds.py          # Job kinds (previews, markers, loudness) and their settings
 ├── worker_groups.py      # Worker groups and their members
 ├── quiet_hours.py        # Quiet-hours windows
@@ -215,13 +214,13 @@ media_preview_generator/
 
 ## Architecture
 
-A few internal invariants worth knowing when modifying the web tier:
+Invariants to keep in mind when changing the web tier:
 
 - **Single Gunicorn worker.** Job state, schedules, and the in-memory frame cache all live in-process. Running two or more Gunicorn workers would split that state and break things (one worker's job would be invisible to the other). The `gthread` worker class with a high thread count handles concurrency within that single process.
-- **WebSocket transport** is Flask-SocketIO with the `threading` async mode, which is what lets a single Gunicorn worker serve both REST and WebSocket from the same process without an event-loop framework like eventlet.
+- **WebSocket transport** is Flask-SocketIO in `threading` mode, so one Gunicorn worker serves REST and WebSocket without an event-loop framework like eventlet.
 - **Long-running jobs** (a full library scan can take hours) survive the default reverse-proxy timeouts because the dashboard polls progress over WebSocket — there's no long-lived HTTP request to time out.
 
-If you need shared state across multiple processes (e.g. for horizontal scaling), you'd move the in-process state (frame cache, scheduler, SocketIO) to shared services such as Redis. We don't currently need that.
+Running more than one process would mean moving that state (frame cache, scheduler, SocketIO) to a shared service such as Redis. Nothing needs that today.
 
 ---
 
@@ -358,4 +357,4 @@ Check detected GPUs in the web UI (**Settings** or **Setup**).
 
 ---
 
-Thank you for contributing! 🎉
+Thank you for contributing.

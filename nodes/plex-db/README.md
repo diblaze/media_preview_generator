@@ -1,93 +1,56 @@
 # Plex database node
 
-A small container you run **next to Plex**, so Media Preview Generator can write into the database of a Plex that runs
-on a different machine: intro and credits markers, chapter thumbnails (1.1.0 and newer), loudness measurements and
+A small container you run **next to Plex**. It lets Media Preview Generator write into the database of a Plex that
+runs on a different machine: Intro & Credits markers, chapter thumbnails (1.1.0 and newer), loudness measurements and
 Library Health's database counts (1.2.0 and newer).
 
-This is the container that used to be called the **Plex marker agent**. It is now the Plex database role of a
-Media Preview Generator *node* (the app's code in `media_preview_generator/nodes/server/`), but nothing you set up
-changes: the same image, the same key (an existing install's `AGENT_TOKEN` keeps working), the same port and the
-same address in the app. An existing install keeps working with this app, and a 1.2.0 node keeps working with an
-older app.
+This is the container that used to be called the **Plex marker agent**. The image, key (`AGENT_TOKEN` still works),
+port and address in the app are unchanged. An existing install keeps working with this app, and a 1.2.0 node keeps
+working with an older app.
 
-You only need it in that one case. If the app and Plex already run on the same machine, don't run this — the app
-writes Plex's database itself.
+Plex on Windows without Docker: use the [Windows node](../windows/README.md) instead.
 
-## Why it has to exist
+## Do you need it?
 
-Plex has no API for intro and credits markers. Markers live in Plex's own library database, and the app writes them
-straight into it — the same rows Plex writes. SQLite's shared-file locking (WAL) only works between processes on the
-same machine: over NFS, SMB or a Docker Desktop share it is not safe, and the app refuses to try
-("Plex's database is on a network share… Plex stays read-only").
+Only when the app and Plex run on different machines. If they run on the same machine, don't run this: the app writes
+Plex's database itself.
 
-So the app needs something *on the Plex machine* to do the write. That is this. It runs the app's own writers
-(`media_preview_generator/markers/publishers/plex_db.py`, `media_preview_generator/loudness/plex_db.py`) on the Plex
-host, and the app asks it to.
+Plex has no API for markers, so the app writes them straight into Plex's library database. SQLite's file locking only
+works between processes on one machine. Over NFS, SMB or a Docker Desktop share it isn't safe, and the app refuses
+("Plex's database is on a network share... Plex stays read-only"). So something has to do the write on the Plex
+machine. That is this node. It is the only supported way to write markers or loudness to a Plex on another machine.
 
-**It is the only supported way to write markers or loudness to a Plex on another machine.** Without it, that Plex
-stays read-only, with the message it has today.
+## What you need
 
-## What it may touch, and what it will not
+- Docker (or Docker Compose) on the machine Plex runs on.
+- The path of Plex's config folder on that machine.
+- The user and group ID (`PUID` / `PGID`) Plex runs as. A node running as anyone else starts and looks healthy, then
+  writes nothing.
 
-It touches exactly one file: `Plug-in Support/Databases/com.plexapp.plugins.library.db` inside the Plex config
-folder you mount into it. Marker requests write the marker rows of one item at a time (`taggings` on Plex's marker tag, and
-`pv:intros` / `pv:credits` in that item's `media_parts.extra_data`). Chapter requests only update existing
-chapter rows' `taggings.thumb_url` after checking every JPEG in the derived media bundle. They never create
-chapters or change marker data. Loudness requests add `ln:*` fields to audio streams' `media_streams.extra_data`
-and mark an item analysed in `metadata_items.extra_data`, only after checking, inside the write's transaction, that
-the streams are still the ones the app measured. Library Health requests run fixed, read-only counting queries.
+## Install
 
-It also reads `Preferences.xml` in that folder, for one string: Plex's own machine identifier. The app compares
-it with the identifier its Plex reports, so a node set up beside the *wrong* Plex is refused before anything is
-written.
+1. Make a folder for the node and put [`docker-compose.yml`](docker-compose.yml) in it.
+2. Create a `.env` file beside it:
 
-The one file it writes outside Plex's folder is `/config/loudness-writes.jsonl` in its own volume: the undo record of
-each loudness write, kept beside the database because undo has to run there (see
-[Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the command in this container). **`/config`
-must be a named volume** (the compose file names one, `plex-db-node-config`) or a folder you mount: without one it is
-only the container's own layer or a volume with no name, which an update throws away together with the undo record
-and the node's id, so the node writes no loudness until it has one.
+   ```bash
+   {
+     printf 'NODE_KEY=%s\n' "$(openssl rand -hex 24)"
+     printf 'PLEX_CONFIG=%s\n' /path/to/plex/config
+     printf 'PUID=%s\nPGID=%s\n' 1000 1000
+   } > .env
+   chmod 600 .env
+   ```
 
-**Updating an install from before nodes?** Its old compose file or `docker run` had no `/config` volume. Add
-`-v plex-db-node-config:/config` (or the compose file's `volumes:` line) when you update, or loudness reports
-"Mount a volume at /config".
+3. Start it: `docker compose up -d`.
 
-It will not:
+Notes on `.env`:
 
-- take a database path from the app — the path comes from this container's own `PLEX_CONFIG_DIR`;
-- run any SQL the caller supplies, or answer anything outside its fixed operations;
-- create Plex's marker tag row (if Plex hasn't made one yet, the write is refused and the app tells you to run
-  Plex's own detection once);
-- write a database that isn't on a local disk **on this machine**, or one whose schema it doesn't recognise;
-- do anything at all without the shared key.
+- `PLEX_CONFIG` has no default. Leave it out and Compose stops with a message naming it.
+- `NODE_KEY` is optional. Without it the node makes a key and prints it once in `docker logs plex-marker-agent`.
+- `PUID` / `PGID` fall back to `1000`.
 
-It refuses exactly what the in-process writer refuses, because it *is* the in-process writer.
-
-## Running it
-
-`docker-compose.yml` is in this folder; everything that has to match your machine lives in `.env` beside it.
-`PLEX_CONFIG` has no default — leave it out and compose stops with a message naming it, instead of starting a
-node with nothing mounted. Without `NODE_KEY` the node makes a key of its own and prints it once in `docker logs`.
-`PUID`/`PGID` do fall back to `1000`, so set them if Plex runs as anyone else: a node running as the wrong user
-starts and reports healthy, then writes no markers at all.
-
-```bash
-{
-  printf 'NODE_KEY=%s\n' "$(openssl rand -hex 24)"
-  printf 'PLEX_CONFIG=%s\n' /path/to/plex/config
-  printf 'PUID=%s\nPGID=%s\n' 1000 1000
-} > .env
-chmod 600 .env
-docker compose up -d
-```
-
-Then add it in the app: **Nodes → Add node**, with the address (`http://<this-machine>:9494`) and the same key,
-and choose it for the server in **Servers → your Plex → Edit → Connection → Plex database**.
-The node can be chosen there while Intro & Credits remains off. Chapter thumbnails use their own
-checkbox in the Processing tab and do not require marker consent or Plex Pass.
-
-Without compose — note `--env-file .env`, so the key comes out of the file you just wrote rather than an empty
-shell variable (with an empty `NODE_KEY` the node generates a key of its own, which the app doesn't have):
+Without Compose, use `--env-file .env` so the key comes from the file. With an empty `NODE_KEY` the node makes a key the
+app doesn't have.
 
 ```bash
 # --user takes no .env value here; put the uid:gid that owns Plex's database in it yourself.
@@ -102,26 +65,106 @@ docker run -d --name plex-marker-agent --restart unless-stopped \
   ghcr.io/stevezau/plex-marker-agent:1.2.0
 ```
 
+## Add it in the app
+
+1. Open **Settings → Nodes → Add node**.
+2. Enter the address (`http://<this-machine>:9494`) and the same key.
+3. Open **Servers → your Plex → Edit → Connection → Plex database** and choose the node.
+
+You can choose the node there while Intro & Credits is off. Chapter thumbnails have their own checkbox in the
+Processing tab and need neither marker consent nor Plex Pass.
+
+## Settings
+
 | Setting | What it is |
 |---|---|
-| `NODE_KEY` | The key both sides share: 16 to 200 characters of printable ASCII with no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node generates a key on first start, keeps it in `/config/node.json` and prints it once in its log. To keep it in a file (a Docker secret), set `FILE__NODE_KEY` to that file's path instead. |
-| `AGENT_TOKEN` | The key's name from the Plex marker agent. An install that set it keeps working (up to 200 characters, with a warning when it is short); new installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
-| `PLEX_CONFIG` | Plex's config folder **on this host** (compose only; the `-v` source above). Required. |
+| `NODE_KEY` | The key both sides share: 16 to 200 characters of printable ASCII, no spaces (make one with `openssl rand -hex 24`). Never logged. Without it, the node makes a key on first start, keeps it in `/config/node.json` and prints it once in its log. To keep it in a file (a Docker secret), set `FILE__NODE_KEY` to the file's path. |
+| `AGENT_TOKEN` | The key's old name. An install that set it keeps working (up to 200 characters, with a warning when it is short). New installs set `NODE_KEY`, which wins when both are set. `FILE__AGENT_TOKEN` works the same way. |
+| `PLEX_CONFIG` | Plex's config folder **on this host**. Compose only (the `-v` source above). Required. |
 | `PLEX_CONFIG_DIR` | Plex's config folder as **this container** sees it. The database path is derived from it. |
-| `NODE_PORT` | Port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the node binds *inside* the container, so the published port has to move with it: compose derives the mapping from this one value, but a hand-written `docker run` needs its `-p` changed to match. |
-| `NODE_NAME` | The name the app shows for it (compose default `plex-database`). |
+| `NODE_PORT` | The port to listen on (default 9494; `AGENT_PORT`, its old name, is used when `NODE_PORT` isn't set). It moves what the node binds inside the container. Compose derives the published port from it. With `docker run`, change `-p` to match. |
+| `NODE_NAME` | The name the app shows (Compose default `plex-database`). |
 | `NODE_ROLES` | Set to `plex_db` by the image. Leave it. |
-| `AGENT_BIND` | Host address compose publishes on (default `0.0.0.0`, all interfaces). Set it to the one LAN address the app reaches this machine on if this host has several. |
-| `PUID` / `PGID` | The user that owns Plex's database (the same values Plex's own container runs as). Defaults to `1000`. Compose runs the node as them (`user:`); with `docker run`, use `--user <uid>:<gid>` instead. The node is non-root and can't write the database as anyone else. |
+| `AGENT_BIND` | The host address Compose publishes on (default `0.0.0.0`, all interfaces). Set it to the one LAN address the app reaches this machine on if the host has several. |
+| `PUID` / `PGID` | The user that owns Plex's database, the same values Plex's own container runs as (default `1000`). Compose runs the node as them (`user:`). With `docker run`, use `--user <uid>:<gid>`. The node is non-root and can't write the database as anyone else. |
 
-Three things to keep in mind:
+Keep three things in mind:
 
-- **Same machine as Plex, and the same path.** The node proves Plex has the database open through the very file it
-  sees; a copy, a snapshot or a different mount of the same folder is refused, not written.
-- **One container per Plex**, and one worker inside it (the image is built that way). Two writers would break the
-  "one writer at a time" guarantee the app relies on.
-- **The key is all that stands between a caller and Plex's database.** Keep the port on your LAN; don't publish it
-  to the internet.
+- **Same machine as Plex, same path.** The node proves Plex has the database open through the file it sees. A copy, a
+  snapshot or a different mount of the same folder is refused.
+- **One container per Plex**, with one worker inside it. Two writers would break the "one writer at a time" rule the
+  app relies on.
+- **The key is all that stands between a caller and Plex's database.** Keep the port on your LAN. Don't publish it to the
+  internet.
+
+## Update
+
+1. Set the new version's tag in `docker-compose.yml`.
+2. Run `docker compose pull && docker compose up -d`.
+
+The `/config` volume stays. The node only has to be new enough for the app, not match its version. The app says when
+it needs an update. Update the node before the app: a newer node still speaks the older app's protocol.
+
+**Updating from before nodes?** The old compose file or `docker run` had no `/config` volume. Add
+`-v plex-db-node-config:/config` (or the compose file's `volumes:` line), or loudness reports "Mount a volume at
+/config". To move from the old Plex marker agent, replace the old compose file with this one and run
+`docker compose up -d`: the service, container name, image and settings are the same.
+
+## Remove
+
+1. In the app, stop using the node: turn off **Plex database** for the server under **Servers → your Plex → Edit →
+   Connection**. Then delete the node under **Settings → Nodes**. The app tells you if something still uses it.
+2. `docker compose down` in the node's folder.
+
+`docker compose down -v` also deletes the `/config` volume, with the loudness undo record in it. To undo loudness writes
+afterwards, start the node again first (see [Undoing it](../../docs/plex-loudness-normalization.md#undoing-it); run the
+command in this container).
+
+## What it touches
+
+It writes one file: `Plug-in Support/Databases/com.plexapp.plugins.library.db` inside the Plex config folder you mount.
+
+- **Markers:** the marker rows of one item at a time (`taggings` on Plex's marker tag, and `pv:intros` / `pv:credits`
+  in that item's `media_parts.extra_data`).
+- **Chapter thumbnails:** only `taggings.thumb_url` on existing chapter rows, after checking every JPEG in the derived
+  media bundle. It never creates chapters or changes marker data.
+- **Loudness:** `ln:*` fields on audio streams' `media_streams.extra_data`, and an "analysed" mark in
+  `metadata_items.extra_data`. It checks inside the write's transaction that the streams are still the ones the app
+  measured.
+- **Library Health:** fixed, read-only counting queries.
+
+It also reads `Preferences.xml` in that folder, for one string: Plex's machine identifier. The app compares it with the
+identifier its Plex reports, so a node set up beside the wrong Plex is refused before anything is written.
+
+Outside Plex's folder it writes `/config/loudness-writes.jsonl` in its own volume: the undo record of each loudness
+write. `/config` must be a named volume (the compose file names one, `plex-db-node-config`) or a mounted folder. Without
+one, an update throws away the undo record and the node's id, so the node writes no loudness until it has one.
+
+It will not:
+
+- take a database path from the app (the path comes from this container's `PLEX_CONFIG_DIR`);
+- run SQL the caller supplies, or answer anything outside its fixed operations;
+- create Plex's marker tag row (if Plex hasn't made one, the write is refused and the app tells you to run Plex's own
+  detection once);
+- write a database that isn't on a local disk of this machine, or whose schema it doesn't recognise;
+- do anything without the shared key.
+
+It refuses exactly what the app's own writer refuses, because it runs that writer (`media_preview_generator/markers/publishers/plex_db.py`,
+`media_preview_generator/loudness/plex_db.py`).
+
+## When something is wrong
+
+| What you see | What it means |
+|---|---|
+| **Can't reach it** | The node isn't running, or the address or port is wrong. Markers wait; nothing is lost. |
+| **Key refused** | The keys don't match. Paste the node's key (its `NODE_KEY` or `AGENT_TOKEN`, or the one it printed in `docker logs`) into the app's node. |
+| **Update needed** | The app and the node are different versions. The message says which side to update. |
+| "is next to a different Plex server" | The address points at the node of another Plex. Both sides compare Plex's machine identifier, so markers never go into the wrong database. |
+| "Plex's database is on a network share" | The node's mount is a network share. It has to be a local disk on the Plex machine. |
+| "Plex doesn't have its database open through this folder right now" | Plex is stopped, or the node has a different path to the file than Plex does. |
+| "Plex hasn't created its marker tag yet" | Run Plex's own intro or credits detection once on any item. The node never creates that row. |
+
+`docker logs plex-marker-agent` shows one line per item or stream written. It never logs the key.
 
 ## Building it
 
@@ -222,20 +265,6 @@ came from that address, so the key isn't checked until then.
 
 The payload shapes live in `media_preview_generator/markers/publishers/plex_remote.py` — one codec, used by both
 sides, so they can't disagree about a field.
-
-## When something is wrong
-
-| What you see | What it means |
-|---|---|
-| **Can't reach it** | The node isn't running, or the address or port is wrong. Markers wait; nothing is lost. |
-| **Key refused** | The keys don't match. Paste the node's key (its `NODE_KEY` or `AGENT_TOKEN`, or the one it printed in `docker logs`) into the app's node. |
-| **Update needed** | The app and the node are different versions. The message says which side to update. |
-| "is next to a different Plex server" | The address points at the node of another Plex. Both sides compare Plex's own machine identifier, so markers never go into the wrong database. |
-| "Plex's database is on a network share" | The *node's* mount is a network share. It has to be a local disk on the Plex machine. |
-| "Plex doesn't have its database open through this folder right now" | Plex is stopped, or the node has a different path to the file than Plex does. |
-| "Plex hasn't created its marker tag yet" | Run Plex's own intro or credits detection once on any item. The node never creates that row. |
-
-`docker logs plex-marker-agent` shows what it did — one line per item or stream written. It never logs the key.
 
 ### Optional capabilities
 

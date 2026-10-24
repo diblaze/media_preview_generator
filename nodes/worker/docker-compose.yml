@@ -1,10 +1,10 @@
-# A worker node: another machine lending the app its GPU (or CPU) for previews, loudness and intro/credits steps.
+# A worker node: another machine that lends the app its GPU (or CPU) for previews, loudness and Intro & Credits.
 #
 # It is the app's own image started with MODE=node. It only reads your media and sends results back; the app does
-# every write. Mount the media read-only. At the same path as in the app's container, the mappings Add node fills in
-# work as they are; at any other path, set them on the node's Media tab (Settings -> Nodes).
+# every write. Mount the media read-only. If you mount it at the same path as in the app's container, the mappings
+# Add node fills in are right as they are. At any other path, set them on the node's Media tab (Settings -> Nodes).
 #
-# Start: docker compose up -d, then add the node in the app (Settings -> Nodes -> Add node) with
+# Start: docker compose up -d. Then add the node in the app (Settings -> Nodes -> Add node) with
 # http://THIS_MACHINE:9494 and the key the node prints once in `docker logs` on first start (or your own NODE_KEY).
 #
 # Update: whenever you update the app, set the same tag below and run docker compose pull && docker compose up -d.
@@ -27,8 +27,8 @@ services:
     #   - /dev/dri:/dev/dri
 
     # --- NVIDIA GPU ---
-    # Uncomment the deploy block (and the two NVIDIA_* variables).
-    # Requires the NVIDIA Container Toolkit.
+    # Uncomment the deploy block and the two NVIDIA_* variables.
+    # Needs the NVIDIA Container Toolkit.
     #
     # deploy:
     #   resources:

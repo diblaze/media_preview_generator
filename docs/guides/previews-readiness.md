@@ -83,7 +83,7 @@ compatible Plex database node beside it. A network-mounted database alone is not
 
 The failure row gives the reason. **Choose the Plex database** opens the **Plex database** selector under
 **Edit → Connection**; you can pick a node while Intro & Credits stays off.
-See [Plex on another machine](../guides.md#plex-on-another-machine-the-plex-database-node).
+See [Plex on another machine](../remote-nodes.md).
 This check reads capability only and does not change chapter rows.
 
 **Plex's own generation:** reads the server-wide **Generate chapter thumbnails** preference
@@ -410,7 +410,7 @@ other row says what to change and where.
   leave the library's own setting on.
 - **Plex's library database isn't on this machine** (critical) / **…is on this machine**. Markers are written into
   Plex's database, which is only safe from the machine the file is on. Run this app on the Plex machine, or run the
-  [Plex database node](../guides.md#plex-on-another-machine-the-plex-database-node) next to Plex. With a node
+  [Plex database node](../remote-nodes.md) next to Plex. With a node
   picked the row reads **The Plex database node isn't on the machine with Plex's database**, and its badge reads
   **Fix on the node**: give the node Plex's config folder from one of that machine's own disks.
 - **The Plex database node** (critical), shown only when a node is picked for this server. **…is connected**,

@@ -32,13 +32,13 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 
 ## Key facts
 
-- Runs as a Docker container, including an Unraid Community Applications template. Web UI plus a token-authenticated REST API; no CLI.
+- Runs as a Docker image, including an Unraid Community Applications template. Web UI plus a token-authenticated REST API; no CLI.
 - Needs network access to each server's API, and write access where previews go: Plex's data folder for Plex; the media folder for Emby and Jellyfin's default layout. Jellyfin must be 10.10 or newer.
 - GPUs: NVIDIA (CUDA), Intel and AMD (VAAPI) on Linux; only NVIDIA on Windows (WSL2); none on macOS. Without a GPU it runs on CPU workers.
 - HDR10, HLG and HDR10+ are tone-mapped; Dolby Vision 7 and 8 use their HDR10 layer; Dolby Vision 5 needs a hardware Vulkan driver in the container.
 - Frame interval 1-60 s (default 10; Plex's own default is 2); thumbnail quality 1-10 (default 4; lower = sharper).
 - Intro & Credits: finds intros and end credits and writes Skip Intro / Skip Credits markers to Plex (needs Plex Pass on the server and for viewers; the app runs on the Plex machine or uses a Plex database node), Jellyfin 10.11/12.0 and Emby 4.9/4.10 (via the app's plugins; Skip Intro on Emby needs Premiere). Off until turned on per server.
-- Remote processing: previews can run on another machine with access to shared media and the required writable output mounts. A Plex database node beside Plex handles markers, chapter thumbnails, loudness and Library Health counts; network-mounted databases are unsupported.
+- Remote nodes: another machine can lend its GPU or CPU as a worker node (same image, `MODE=node`); it needs read access to the media, and the app keeps the queue and every write. A Plex database node beside Plex, in Docker or natively on Windows, handles markers, chapter thumbnails, loudness and Library Health counts; network-mounted Plex databases are unsupported.
 
 ## Docs
 

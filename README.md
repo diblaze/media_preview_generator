@@ -26,7 +26,7 @@
     Plex, Emby and Jellyfin. It starts the moment Sonarr or Radarr imports a file and sends the results
     to every server at once.
     <br />
-    Self-hosted, one Docker container.
+    Self-hosted, in Docker.
     <br />
     <br />
     <a href="https://mediapreviewgenerator.dev/"><strong>Explore the docs »</strong></a>
@@ -61,6 +61,8 @@ server holds the same file, it decodes it once and writes each server's own form
 the markers to every server that has the file. When it isn't sure, it sends nothing; you can add or adjust
 a marker in the Inspector.
 
+**The GPU can be in another machine.** Add it as a [worker node](docs/remote-nodes.md); the app keeps the queue and every write.
+
 ## What it looks like
 
 | It finds every server with that file |
@@ -84,10 +86,10 @@ a marker in the Inspector.
 ## Features
 
 **GPU first, CPU when needed**
-- **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed to the container.
-- **Named worker groups.** Choose each group's devices, their job types and worker counts, and weekly hours. Dashboard +/− changes are saved; reducing capacity lets current files finish. [Worker guide](docs/guides.md#worker-groups-and-availability).
-- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](docs/remote-nodes.md).
-- **CPU fallback built in.** A file the GPU can't decode is retried on the CPU by the same worker.
+- **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2.
+- **Named worker groups.** Pick each group's devices, job types, worker count and weekly hours. [Worker guide](docs/guides.md#worker-groups-and-availability).
+- **Remote nodes.** Use a GPU or CPU on another machine as a worker node. For a Plex on another machine, including Plex on Windows, a Plex database node opens Plex's database beside Plex. The app keeps the queue, tokens and every write. [Nodes guide](docs/remote-nodes.md).
+- **CPU fallback built in.** A file one GPU can't decode tries your other GPUs first, then the CPU.
 - **Key-frame skipping.** Jumps between key frames when a file's key-frame spacing allows it.
 
 **Starts on its own**
@@ -117,15 +119,11 @@ range. Combine filters while keeping existing previews. See the
 - **Emby.** Emby 4.9 or 4.10, with the Media Preview Bridge for Emby plugin. Skip Intro needs Emby Premiere; Skip Credits doesn't.
 
 **Plex loudness**
-- **Normalize Loudness sooner.** Analyses audio tracks on CPU worker groups and stores loudness measurements in Plex. Off until you [turn it on](docs/plex-loudness-normalization.md) for a Plex 1.43.4.x or 1.43.5.x server; independent of Intro & Credits.
+- **Loudness analysis.** Measures audio tracks on CPU worker groups and stores the results in Plex. Off until you [turn it on](docs/plex-loudness-normalization.md) for a Plex 1.43.4.x or 1.43.5.x server; independent of Intro & Credits.
 
 ## Where it fits
 
-The container can [run on a separate GPU machine](https://mediapreviewgenerator.dev/multi-server/#offload-preview-generation-to-another-machine)
-and reuse the same extraction across servers that share a file. Plex chapter thumbnails and loudness analysis
-are separate CPU tasks: [chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails)
-and [loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/) write Plex's database, so they need
-this app on the Plex machine or a Plex database node beside it.
+Plex [chapter thumbnails](https://mediapreviewgenerator.dev/guides/#plex-chapter-thumbnails) and [loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/) write Plex's database, so they need this app on the Plex machine or a [Plex database node](docs/remote-nodes.md) beside it.
 
 It sits next to Sonarr, Radarr and Tdarr and takes over the media server's own preview job. Once it
 runs, the server's own generation is the same work done twice. The app's
@@ -170,6 +168,7 @@ The docs are also a website: **[mediapreviewgenerator.dev](https://mediapreviewg
 | [Getting started](docs/getting-started.md) | Docker, GPUs, mounts, Unraid, networking |
 | [How it compares](docs/comparison.md) | Plex, Jellyfin and Emby built-in generation, side by side |
 | [Guides](docs/guides.md) | The web UI, webhooks, schedules, troubleshooting |
+| [Remote nodes](docs/remote-nodes.md) | Another machine's GPU, and Plex on another machine or Windows |
 | [Multi-server](docs/multi-server.md) | Plex, Emby and Jellyfin from one instance |
 | [Reference](docs/reference.md) | Every setting, environment variable and API endpoint |
 | [FAQ](docs/faq.md) | Windows, GPUs, RAM, skipped files |

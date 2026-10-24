@@ -1,5 +1,6 @@
-# The Plex database node (formerly the Plex marker agent), beside Plex. Run this on the machine Plex runs on — that
-# is the whole point of it.
+# The Plex database node (formerly the Plex marker agent). Run it on the machine Plex runs on.
+#
+# 1. Create a .env file beside this one:
 #
 #   cat > .env <<'EOF'
 #   NODE_KEY=<paste the output of: openssl rand -hex 24>
@@ -8,58 +9,57 @@
 #   PGID=1000
 #   EOF
 #   chmod 600 .env
-#   docker compose up -d
 #
-# PLEX_CONFIG has no default at all: leave it out and compose stops with a message naming it, rather than starting a
-# node with nothing mounted. Without NODE_KEY the node makes a key of its own and prints it once in `docker logs`.
-# PUID/PGID do fall back to 1000:1000 — set them if Plex runs as anyone else, because a node running as the wrong
-# user starts and looks healthy but can write nothing.
+# 2. Start it: docker compose up -d
 #
-# Then add this machine's address (http://<this-host>:9494) and the same key in the app (Nodes → Add node), and choose
-# the node in Servers → your Plex → Edit → Connection → Plex database.
+# 3. In the app, add the node (Settings -> Nodes -> Add node) with http://<this-host>:9494 and the same key. Then
+#    choose it in Servers -> your Plex -> Edit -> Connection -> Plex database.
 #
-# Upgrading from the Plex marker agent: the service, container name, image and settings are the same (its .env's
-# AGENT_TOKEN keeps working), so replacing the old compose file with this one and running `docker compose up -d`
-# updates it in place.
+# PLEX_CONFIG has no default: leave it out and compose stops with a message naming it. Without NODE_KEY the node makes
+# a key and prints it once in `docker logs`. PUID/PGID fall back to 1000:1000; set them if Plex runs as anyone else,
+# because a node running as the wrong user starts, looks healthy and writes nothing.
 #
-# Updating: set the new version's tag below, then `docker compose pull && docker compose up -d` (the /config volume
-# stays). It only has to be new enough for the app, not the app's version: the app says when it needs an update.
+# Upgrading from the Plex marker agent: the service, container name, image and settings are the same, and an old
+# .env's AGENT_TOKEN keeps working. Replace the old compose file with this one and run `docker compose up -d`.
+#
+# Updating: set the new version's tag below, then `docker compose pull && docker compose up -d`. The /config volume
+# stays. The node only has to be new enough for the app: the app says when it needs an update.
 services:
   plex-marker-agent:
     image: ghcr.io/stevezau/plex-marker-agent:1.2.0
     container_name: plex-marker-agent
     restart: unless-stopped
-    # The user that owns Plex's database — the same PUID/PGID Plex's own container runs as. The node can't write
-    # the database as anyone else, and refuses to try. 1000:1000 is only the common case, not a promise about yours.
+    # The user that owns Plex's database: the PUID/PGID Plex's own container runs as. The node can't write the
+    # database as anyone else. 1000:1000 is only the common case.
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
-      # The shared key. Keep it in .env (never in this file, never in the image). AGENT_TOKEN is its name from the
-      # Plex marker agent: an older install's .env keeps working, and NODE_KEY wins when both are set.
+      # The shared key. Keep it in .env, not in this file. AGENT_TOKEN is its old name: an older install's .env keeps
+      # working, and NODE_KEY wins when both are set.
       NODE_KEY: ${NODE_KEY:-}
       AGENT_TOKEN: ${AGENT_TOKEN:-}
-      # Plex's config folder as THIS container sees it. The node derives the database path from it and never takes
-      # a path from the app.
+      # Plex's config folder as this container sees it. The node derives the database path from it and never takes a
+      # path from the app.
       PLEX_CONFIG_DIR: /plex/Library/Application Support/Plex Media Server
       # The name the app shows for this node.
       NODE_NAME: ${NODE_NAME:-plex-database}
       NODE_PORT: ${NODE_PORT:-${AGENT_PORT:-9494}}
       TZ: ${TZ:-UTC}
     volumes:
-      # Plex's config folder on THIS host. Read-write: writing Plex's database is the job. It must be the same local
-      # disk Plex itself uses — a copy or a network share is refused, not written.
+      # Plex's config folder on this host. Read-write, because writing Plex's database is the job. It must be the same
+      # local disk Plex uses: a copy or a network share is refused.
       - ${PLEX_CONFIG:?set PLEX_CONFIG in .env to Plex's config folder on this host}:/plex
-      # The node's own folder: its id, and the undo record of every loudness write it makes. Keep it a volume: the
-      # node's loudness check refuses while /config is only the container's own layer, which an update throws away.
+      # The node's own folder: its id and the undo record of every loudness write. Keep it a volume: loudness refuses
+      # while /config is only the container's own layer, which an update throws away.
       - plex-db-node-config:/config
     ports:
-      # All interfaces by default, because the app that calls this is on another machine — that is the only reason
-      # the node exists, and 127.0.0.1 would make it unreachable. Set AGENT_BIND in .env to the one LAN address the
-      # app reaches this host on if this machine has more than one. The key is all that stands between a caller and
-      # Plex's database: keep this on your LAN and never forward the port from the internet.
+      # All interfaces by default, because the app is on another machine and 127.0.0.1 would make the node
+      # unreachable. If this machine has several addresses, set AGENT_BIND in .env to the one the app reaches it on.
+      # The key is all that stands between a caller and Plex's database: keep this on your LAN and never forward the
+      # port from the internet.
       - "${AGENT_BIND:-0.0.0.0}:${NODE_PORT:-${AGENT_PORT:-9494}}:${NODE_PORT:-${AGENT_PORT:-9494}}"
     networks:
       - plex
-    # It opens one SQLite file as a normal user; nothing it does needs a capability or a setuid binary.
+    # It opens one SQLite file as a normal user and needs no capability or setuid binary.
     security_opt:
       - "no-new-privileges:true"
     cap_drop:
@@ -67,8 +67,8 @@ services:
     deploy:
       resources:
         limits:
-          # It waits on SQLite locks and serialises JSON; Library Health's counts of a large library are the most
-          # it ever holds at once.
+          # It waits on SQLite locks and serialises JSON. Library Health's counts of a large library are the most it
+          # holds at once.
           cpus: "1.0"
           memory: 512M
 

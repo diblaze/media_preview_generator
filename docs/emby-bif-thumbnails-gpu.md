@@ -34,7 +34,7 @@ When Sonarr or Radarr upgrades a file, the old file's BIF is removed. A companio
 
 ## Setup
 
-1. Run the container with your GPU passed through. See [Getting Started — GPU Acceleration](getting-started.md#gpu-acceleration) for the per-vendor `docker run` flags. Then add a GPU worker group in **Settings → Workers** (**FFmpeg threads per worker** lives under **Settings → Processing Options → GPU device tuning**).
+1. Run the container with your GPU passed through. See [Getting Started — GPU Acceleration](getting-started.md#gpu-acceleration) for the per-vendor `docker run` flags. Then add a GPU worker group in **Settings → Workers** (**FFmpeg threads per worker** lives under **Settings → Processing Options → GPU device tuning**). To use a GPU in another machine, add it as a [worker node](remote-nodes.md).
 2. **Mount the media folder read-write.** The BIF is written beside each video, so a `:ro` mount makes every write fail with "permission denied". Set `PUID`/`PGID` to a user that can write there. Emby doesn't need Plex's `/plex` mount.
 3. Add the Emby server in the setup wizard or under **Servers**. Use the server URL plus a username and password, or an API key.
 4. Add **path mappings** if Emby and the container see the media at different paths ([Path Mappings](reference.md#path-mappings)).
@@ -59,6 +59,6 @@ See the [comparison page](comparison.md) for when Emby's built-in is the better 
 
 - Docker only, with a web UI and no CLI.
 - Write access to the media folders is required for Emby output.
-- On Windows only NVIDIA GPUs are accelerated, and on macOS none are.
+- On Windows only NVIDIA GPUs are accelerated, and on macOS none are. A [worker node](remote-nodes.md) on a Linux machine can use any GPU.
 - Dolby Vision Profile 5 needs a hardware Vulkan driver in the container ([HDR and Dolby Vision](hdr-dolby-vision-thumbnails.md)).
 - It doesn't make chapter images.
