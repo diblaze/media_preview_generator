@@ -1,8 +1,8 @@
 """The wire contract between the app and a node — the one module both sides import.
 
 A node is another machine that runs heavy steps for the app (the worker role) or opens Plex's database where Plex
-runs (the Plex database role). Spec: ``docs/design/remote-nodes/README.md`` §3. Everything here is plain data: no
-Flask, no requests, nothing that touches media, so a node's slim builds can import it too.
+runs (the Plex database role). Everything here is plain data: no Flask, no requests, nothing that touches media, so
+a node's slim builds can import it too.
 
 The Plex database role keeps the Plex marker agent's own protocol (``markers.publishers.plex_remote``), so helpers
 already deployed keep working; the constants below cover the node routes, and the node id that protocol's version 2

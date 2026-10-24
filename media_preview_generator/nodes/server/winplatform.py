@@ -6,9 +6,8 @@ those exist on Windows. Here the same answers come from Restart Manager and ``Lo
 open), ``GetDriveTypeW`` (where it sits) and the file's own access check and owner (who may write it).
 
 Pure ctypes and the standard library, so the Windows build needs nothing more and the module imports anywhere: each
-function that needs Windows raises :class:`WindowsOnlyError` elsewhere. Facts measured on a Windows runner
-(``docs/design/remote-nodes/README.md`` §9): a live WAL connection holds a shared lock on exactly byte 128 of
-``<db>-shm``; an exclusive ``LockFileEx`` probe on it fails with error 33 while one is open; ``GetDriveTypeW`` answers 3
+function that needs Windows raises :class:`WindowsOnlyError` elsewhere. Facts measured on a Windows runner: a live WAL
+connection holds a shared lock on exactly byte 128 of ``<db>-shm``; an exclusive ``LockFileEx`` probe on it fails with error 33 while one is open; ``GetDriveTypeW`` answers 3
 for C:\\ and a ``subst`` drive, 4 for a mapped drive and a UNC path.
 """
 

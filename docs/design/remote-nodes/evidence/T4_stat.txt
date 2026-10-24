@@ -1,4 +1,0 @@
-T4 stat across mounts (2026-10-15):
-storage ZFS local: size=775560700 mtime=1771246996.454097500 dev=51 ino=308498
-plex NFS4.2:      size=775560700 mtime=1771246996.454097500 dev=71 ino=308498
-docker bind (other file): size+mtime+dev+ino identical to host

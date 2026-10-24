@@ -1,8 +1,0 @@
-{
- "error": "Type the node's key again: a saved key is only sent to the address it was saved with."
-}
-HTTP 400
-{
- "error": "Type the node's key again: a saved key is only sent to the address it was saved with."
-}
-HTTP 400

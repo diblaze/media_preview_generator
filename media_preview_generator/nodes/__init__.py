@@ -1,4 +1,4 @@
 """Remote nodes: other machines that run heavy steps for the app or open Plex's database where Plex runs.
 
-Spec: ``docs/design/remote-nodes/README.md``.
+User guide: ``docs/remote-nodes.md`` and the Remote nodes section of ``docs/guides.md``.
 """
