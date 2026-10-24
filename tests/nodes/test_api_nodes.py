@@ -1714,4 +1714,4 @@ class TestTheGuide:
         "page", ["multi-server.md", "faq.md", "jellyfin-trickplay-gpu.md", "plex-preview-thumbnails-slow.md"]
     )
     def test_every_page_offering_another_machine_links_remote_nodes(self, page):
-        assert "guides.md#remote-nodes" in (self.DOCS / page).read_text(encoding="utf-8")
+        assert "(remote-nodes.md)" in (self.DOCS / page).read_text(encoding="utf-8")

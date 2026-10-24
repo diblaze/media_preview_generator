@@ -47,7 +47,7 @@ a marker in the Inspector.
 
 | One GPU pass per file |
 | --- |
-| ![Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line](https://raw.githubusercontent.com/stevezau/media_preview_generator/main/docs/images/tour-extract.webp) |
+| ![Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line, and a worker group on the gpu-box node](https://raw.githubusercontent.com/stevezau/media_preview_generator/main/docs/images/tour-extract.webp) |
 
 | Each server gets its own format |
 | --- |

@@ -55,6 +55,7 @@ Status: maintained, released as Docker images (linux/amd64, linux/arm64); releas
 - [HDR and Dolby Vision previews](https://mediapreviewgenerator.dev/hdr-dolby-vision-thumbnails/): tone mapping and the Profile 5 caveat
 - [Skip Intro and Skip Credits](https://mediapreviewgenerator.dev/skip-intro-credits/): what each server needs, how intros and credits are found, Needs review, limits
 - [Plex loudness](https://mediapreviewgenerator.dev/plex-loudness-normalization/): Audio loudness analysis on this app's workers for Plex 1.43.4.x or 1.43.5.x; independent opt-in and scoped undo
+- [Another machine's GPU](https://mediapreviewgenerator.dev/remote-nodes/): Worker nodes that lend a GPU or CPU, and the Plex database node beside Plex on Linux or Windows
 - [Guides and troubleshooting](https://mediapreviewgenerator.dev/guides/): web UI, webhooks, schedules, HDR, CPU fallback
 - [Setup Health](https://mediapreviewgenerator.dev/guides/previews-readiness/): every server setting that decides whether previews show up
 - [Multi-server](https://mediapreviewgenerator.dev/multi-server/): output formats, webhook routing, retries, the Jellyfin plugin
