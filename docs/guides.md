@@ -240,6 +240,7 @@ means history could not be fetched. Neither proves that no webhook was sent.
 Open **Settings** (`/settings`). On a wide screen a side menu groups the sections (**Run**, **System**, **Info**) and highlights the one in view; on a phone the same sections are in a picker at the top.
 
 - **Workers** — named groups, job permissions, counts and availability
+- **Nodes** — other machines that lend a GPU or CPU, or open Plex's database (see [Remote nodes](#remote-nodes))
 - **Global pause schedule** — weekly windows when all processing pauses
 - **Processing options** — incoming job priority, retry policy, restart recovery, GPU device tuning, library scanning, thumbnails and HDR tone mapping, smart caching across servers
 - **Intro & Credits** — detection settings shared by every server
@@ -669,6 +670,8 @@ The dashboard streams live job progress over WebSocket (Flask-SocketIO, `/jobs` 
 
 ## Remote nodes
 
+For what nodes are for and a quick setup, start with [Use another machine's GPU](remote-nodes.md).
+
 A **node** is another machine that helps this app. The app stays in charge: it keeps the queue, the schedules, your
 server tokens and every write to your servers. A node runs one heavy step it is handed and sends the result back.
 
@@ -735,7 +738,8 @@ A **Plex database node** only has to be new enough: its Setup Health says when i
 to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
 and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays.
 An install from before nodes has no `/config` volume: add `-v plex-db-node-config:/config` (or the compose file's
-`volumes:` line) when you update, or it writes no loudness. On Windows, download the newest release and run its
+`volumes:` line) when you update, or it writes no loudness. On Windows, download `PlexDbNode-windows.zip` from the
+newest [Plex database node release](https://github.com/stevezau/media_preview_generator/releases) and run its
 `install.ps1` again, with the options you installed with (`-Port`, `-PlexConfigDir`): the key stays.
 
 ### Removing a node

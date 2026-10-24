@@ -23,7 +23,7 @@ a writable output mount or a plugin before it can use the result.
 
 ## Offload preview generation to another machine
 
-The simplest way is a [worker node](guides.md#remote-nodes): the app stays where it is and hands the heavy work to
+The simplest way is a [worker node](remote-nodes.md): the app stays where it is and hands the heavy work to
 the other machine's GPU, which only needs to read your media. The app keeps every write.
 
 The container itself can also run on a separate GPU machine while Plex, Emby or Jellyfin stays on the media

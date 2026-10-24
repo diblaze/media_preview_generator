@@ -23,12 +23,13 @@
 - title: One GPU pass per file
   body: >-
     FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and
-    tone-maps HDR. If the GPU can't decode a file, your other GPUs try it, then the CPU.
+    tone-maps HDR. The GPU can be in another machine. If one GPU can't decode a file, your other GPUs
+    try it, then the CPU.
   image: tour-extract.webp
-  alt: "Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line"
+  alt: "Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line, and a worker group on the gpu-box node"
   path: /
   width: 1280
-  height: 698
+  height: 831
 - title: Each server gets its own format
   body: >-
     A BIF in Plex's data folder, a BIF next to the video for Emby, trickplay tiles for Jellyfin. Then
@@ -37,7 +38,7 @@
   alt: "A completed job's details with the Files tab open: one file marked Generated, with Home Plex, Home Jellyfin and Home Emby listed as its servers"
   path: /
   width: 1168
-  height: 552
+  height: 566
 - title: It waits for slow servers
   body: >-
     A server that hasn't indexed the new file yet gets another try after 1, 2, 5, 15 and 60

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the app tour screenshots — dark mode, no real data, WebP, 2x.
+"""Regenerate the app tour and Nodes screenshots — dark mode, no real data, WebP, 2x.
 
 Usage:
     python tests/e2e/snapshots/regen_readme.py --out docs/images/
@@ -15,6 +15,7 @@ scrolls:
     /           -> tour-extract.webp  (GPU workers making previews)
     /           -> tour-retry.webp    (a job waiting out a retry)
     /?job=...   -> tour-publish.webp  (one file's per-server publish pills)
+    /nodes      -> nodes.webp         (two Ready remote nodes: a GPU worker and a Windows Plex database)
 
 Each shot is captured as a PNG at ``device_scale_factor=2`` (2x — CSS size
 is half the pixel size) and immediately converted to WebP (quality 88,
@@ -85,7 +86,8 @@ PLACEHOLDER_ORIGIN = f"http://{APP_HOST}:{APP_PORT}"
 # IP scrub (below) leaves these alone and only rewrites IPs it doesn't
 # recognize, so the three vendor cards keep their distinct addresses instead
 # of collapsing to one placeholder.
-ALLOWED_IPS = [APP_HOST, PLEX_HOST, JELLYFIN_HOST, EMBY_HOST]
+FAKE_NODE_HOSTS = ["192.168.1.40", "192.168.1.41"]
+ALLOWED_IPS = [APP_HOST, PLEX_HOST, JELLYFIN_HOST, EMBY_HOST, *FAKE_NODE_HOSTS]
 
 # Init script (runs in every page before app JS boots). Two jobs:
 # 1. Override window.location.origin so _refreshWebhookUrls() in
@@ -178,14 +180,23 @@ INIT_SCRIPT = (
 def _latest_release_tag() -> str:
     """Read the current release version from the latest git tag.
 
-    Excludes ``plugin-v*`` tags — those are Jellyfin-plugin releases in a
-    separate tag namespace, not app releases — so the dashboard "Version"
+    Excludes the ``plugin-v*`` (Jellyfin and Emby plugin) and ``marker-agent-v*``
+    tags — separate tag namespaces, not app releases — so the dashboard "Version"
     line matches an actual shipped release instead of a stray dev snapshot
     like ``4.0.2.dev14``.
     """
     try:
         result = subprocess.run(
-            ["git", "describe", "--tags", "--abbrev=0", "--exclude", "plugin-v*"],
+            [
+                "git",
+                "describe",
+                "--tags",
+                "--abbrev=0",
+                "--exclude",
+                "*plugin-v*",
+                "--exclude",
+                "marker-agent-v*",
+            ],
             cwd=_REPO_ROOT,
             capture_output=True,
             text=True,
@@ -278,6 +289,41 @@ BUSY_CPU_LOUDNESS_SPECS: list[dict] = [
 ]
 
 
+# The one remote-node worker on the dashboard: a busy preview worker on the "gpu-box" node. Field values mirror
+# what ``/api/jobs/workers`` returns for a node member (``api_jobs.py``: ``node_worker_label``, ``node_ref``,
+# ``group_resource_key``).
+FAKE_NODE_ID = "gpu-box"
+FAKE_NODE_GPU = {"device": "cuda:0", "name": "NVIDIA GeForce RTX 3060", "type": "nvidia", "status": "ok"}
+BUSY_NODE_WORKER_SPEC: dict = {
+    "current_title": "Caminandes: Llamigos (2016)",
+    "library_name": "Movies",
+    "progress_percent": 45.0,
+    "speed": "1.8x",
+    "eta": "2m 30s",
+}
+
+
+def _fake_node_worker(worker_id: int, idle_entry: dict) -> dict:
+    """The busy preview worker on the fake ``gpu-box`` node, shaped like a node row of ``/api/jobs/workers``."""
+    return {
+        **idle_entry,
+        "worker_id": worker_id,
+        "worker_type": "GPU",
+        "worker_name": f"{FAKE_NODE_ID} · GPU Worker 1 ({FAKE_NODE_GPU['name']})",
+        "group_id": "node-gpu-group",
+        "member_id": "node-gpu",
+        "group_name": "gpu-box workers",
+        "group_resource": f"node:{FAKE_NODE_ID}:gpu:{FAKE_NODE_GPU['device']}",
+        "retiring": False,
+        "node": {"id": FAKE_NODE_ID, "name": FAKE_NODE_ID},
+        "node_state": "ready",
+        "node_cause": "",
+        **BUSY_NODE_WORKER_SPEC,
+        "status": "processing",
+        "ffmpeg_started": True,
+    }
+
+
 def _fake_worker_statuses() -> list[dict]:
     """Worker rows for the dashboard's "WORKERS" panel — the first three busy, the rest idle.
 
@@ -335,7 +381,117 @@ def _fake_worker_statuses() -> list[dict]:
                     **entry,
                 }
             )
+    workers.append(_fake_node_worker(worker_id + 1, idle_entry))
     return workers
+
+
+def _add_fake_node_group(data: dict) -> None:
+    """Add the ``gpu-box`` worker group and node to a ``GET /api/worker-groups`` answer, as the real API lists them.
+
+    The dashboard builds its group sections from this answer, so a node worker only lands in a section (instead of
+    "Workers without group details") when the group, its capacity row and the node are all here.
+    """
+    member = {
+        "id": "node-gpu",
+        "resource": "gpu",
+        "device": FAKE_NODE_GPU["device"],
+        "node": FAKE_NODE_ID,
+        "count": 1,
+        "job_types": ["previews"],
+    }
+    data["groups"].append(
+        {
+            "id": "node-gpu-group",
+            "name": "gpu-box workers",
+            "enabled": True,
+            "availability": {"mode": "always", "windows": []},
+            "members": [member],
+            **{k: member[k] for k in ("resource", "device", "count", "job_types")},
+        }
+    )
+    member_row = {
+        "id": "node-gpu",
+        "resource": "gpu",
+        "device": FAKE_NODE_GPU["device"],
+        "node": FAKE_NODE_ID,
+        "node_name": FAKE_NODE_ID,
+        "reason": "",
+        "desired": 1,
+        "target": 1,
+        "available": 0,
+        "busy": 1,
+        "finishing": 0,
+        "state": "active",
+        "next_available_at": None,
+    }
+    group_row = {k: member_row[k] for k in ("desired", "target", "available", "busy", "finishing", "next_available_at")}
+    data["capacity"]["groups"].append(
+        {"id": "node-gpu-group", "name": "gpu-box workers", "state": "active", **group_row, "members": [member_row]}
+    )
+    data["capacity"]["nodes_current"]["gpu"] = 1
+    data["capacity"]["nodes_peak"]["gpu"] = 1
+    data["nodes"] = [
+        {
+            "id": FAKE_NODE_ID,
+            "name": FAKE_NODE_ID,
+            "state": "ready",
+            "reason": "",
+            "cause": "",
+            "roles": ["worker"],
+            "devices": [FAKE_NODE_GPU],
+            "cpu_cores": 12,
+        }
+    ]
+
+
+def _fake_nodes_body(app_version: str) -> dict:
+    """``GET /api/nodes`` with two Ready nodes, shaped like ``_list_body()`` / ``_node_row()`` in ``api_nodes.py``."""
+    now = datetime.now(UTC).timestamp()
+    common = {
+        "enabled": True,
+        "state": "ready",
+        "reason": "",
+        "version": app_version,
+        "legacy": False,
+        "last_seen": now - 12,
+        "checking": False,
+        "path_mappings": [],
+        "to_fix": {"must_fix": 0, "recommended": 0},
+        "edit_tag": "0000000000000000",
+    }
+    nodes = [
+        {
+            **common,
+            "id": FAKE_NODE_ID,
+            "name": FAKE_NODE_ID,
+            "url": f"http://{FAKE_NODE_HOSTS[0]}:9494",
+            "roles": ["worker"],
+            "platform": {"os": "Linux", "arch": "x86_64"},
+            "gpus": [FAKE_NODE_GPU],
+            "cpu": {"cores": 12, "load1": 0.6, "ram_total": 33_500_000_000, "ram_available": 24_000_000_000},
+            "busy": 1,
+            "used_by": {"groups": [{"id": "node-gpu-group", "name": "gpu-box workers"}], "servers": []},
+        },
+        {
+            **common,
+            "id": "plex-windows",
+            "name": "plex-windows",
+            "url": f"http://{FAKE_NODE_HOSTS[1]}:9494",
+            "roles": ["plex_db"],
+            "platform": {"os": "Windows", "arch": "AMD64"},
+            "gpus": [],
+            "cpu": {"cores": 8, "load1": None, "ram_total": 17_100_000_000, "ram_available": 9_000_000_000},
+            "busy": 0,
+            "used_by": {"groups": [], "servers": [{"id": "plex-home", "name": "Home Plex"}]},
+        },
+    ]
+    this_app = {
+        "gpus": [{k: gpu[k] for k in ("device", "name", "type", "status")} for gpu in FAKE_GPUS],
+        "cpu": {"cores": 16},
+        "busy": len(BUSY_WORKER_SPECS),
+        "used_by": {"groups": [{"id": g["id"], "name": g["name"]} for g in FAKE_WORKER_GROUPS]},
+    }
+    return {"nodes": nodes, "this_app": this_app, "app_version": app_version}
 
 
 def _install_api_stubs(ctx: BrowserContext, current_version: str) -> None:
@@ -487,8 +643,17 @@ def _install_api_stubs(ctx: BrowserContext, current_version: str) -> None:
                 available=group_row["desired"] - group_busy,
                 busy=group_busy,
             )
+        _add_fake_node_group(data)
         route.fulfill(response=response, json=data)
 
+    def handle_nodes(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(_fake_nodes_body(current_version.lstrip("v"))),
+        )
+
+    ctx.route("**/api/nodes", handle_nodes)
     ctx.route("**/api/system/version", handle_version)
     ctx.route("**/api/system/status", handle_system_status)
     ctx.route("**/api/libraries*", handle_libraries)
@@ -659,7 +824,8 @@ TOUR_SHOTS = [
         "tour-extract",
         "/",
         ".card:has(#workerStatusContainer)",
-        "() => document.querySelectorAll('#workerStatusContainer .progress').length >= 6",
+        "() => document.querySelectorAll('#workerStatusContainer .progress').length >= 6"
+        " && [...document.querySelectorAll('#workerStatusContainer .node-chip')].some(c => c.textContent === 'gpu-box')",
         True,
     ),
     (
@@ -669,6 +835,8 @@ TOUR_SHOTS = [
         "() => /Retry starting/.test(document.getElementById('jobQueue').innerText)",
         True,
     ),
+    # Not a tour step: the Settings -> Nodes list, for the remote-nodes docs.
+    ("nodes", "/nodes", "#nodeList", "() => document.querySelectorAll('#nodeList .nd-row').length >= 2", False),
 ]
 
 

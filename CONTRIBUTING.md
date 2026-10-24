@@ -301,7 +301,7 @@ The repository's GitHub Actions workflows live in `.github/workflows/`:
 | `docker-pr-cleanup.yml` | Removes PR-preview images when PRs close | Works as-is |
 | `docs.yml`, `docs-check.yml` | Build and publish the Jekyll docs site; check docs-only PRs | Works as-is |
 | `emby-plugin.yml`, `jellyfin-plugin.yml`, `plugins-ci.yml` | Build and release the Emby and Jellyfin plugins | Works as-is |
-| `marker-agent.yml` | Builds and publishes the Plex marker agent image to GHCR on `marker-agent-v*` tags | Works as-is |
+| `marker-agent.yml` | Builds and publishes the Plex database node image to GHCR, and attaches the Windows node zip to the release, on `marker-agent-v*` tags | Works as-is |
 | `gpu-tests.yml` | GPU-marker tests; needs a self-hosted runner labelled `gpu` | Skip unless you run one |
 
 Repository secrets (**Settings → Secrets and variables → Actions**):

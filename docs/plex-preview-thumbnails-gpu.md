@@ -22,6 +22,7 @@ It decodes each video with FFmpeg on the GPU and writes the BIF file into Plex's
 - **macOS:** no GPU acceleration under Docker. It runs on CPU, using the native ARM64 image on Apple Silicon.
 - **No GPU:** add a CPU worker group in **Settings → Workers**.
 - **Several GPUs:** add each GPU as a device in a worker group in **Settings → Workers**. A group has a name and hours, and each device in it has a worker count (1–64) and the jobs it may run. **Settings → Processing options → GPU device tuning** lists each detected GPU with its **FFmpeg threads per worker**.
+- **A GPU in another machine:** add that machine as a [worker node](remote-nodes.md).
 
 Details and caveats are in [Getting Started — GPU Acceleration](getting-started.md#gpu-acceleration).
 

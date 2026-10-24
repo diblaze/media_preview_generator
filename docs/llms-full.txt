@@ -59,16 +59,16 @@ Media Preview Generator makes Plex, Emby and Jellyfin preview thumbnails on your
 
 1. **A new file arrives.** Sonarr, Radarr, Tdarr or the media server itself sends a webhook when a file lands, to the URL the Automation page gives it. Scheduled scans and a hand-picked list work too.
 2. **It finds every server with that file.** The path Sonarr reports is mapped to the path the container sees. Then every Plex, Emby and Jellyfin library that holds the file is found.
-3. **One GPU pass per file.** FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and tone-maps HDR. If the GPU can't decode a file, your other GPUs try it, then the CPU.
+3. **One GPU pass per file.** FFmpeg decodes the video on the GPU, jumps between key frames when the file allows it, and tone-maps HDR. The GPU can be in another machine. If one GPU can't decode a file, your other GPUs try it, then the CPU.
 4. **Each server gets its own format.** A BIF in Plex's data folder, a BIF next to the video for Emby, trickplay tiles for Jellyfin. Then each server is told to pick them up.
 5. **It waits for slow servers.** A server that hasn't indexed the new file yet gets another try after 1, 2, 5, 15 and 60 minutes by default. Next time, files whose previews are current are skipped.
 
 ## Features
 
-- **GPU first, CPU when needed.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed in, and a file one GPU can't decode goes to your other GPUs first, then the CPU.
+- **GPU first, CPU when needed.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Add GPUs from other machines as worker nodes. A file one GPU can't decode goes to your other GPUs first, then the CPU.
 - **Starts per file.** Sonarr, Radarr, Sportarr, Tdarr, FileFlows, Plex, Emby and Jellyfin webhooks, or any JSON with a path. A new episode gets its previews without waiting for a nightly task.
 - **One decode, every server.** With Plex and Jellyfin on the same library, each file is read once and both servers get their own output.
-- **Skips what's already done.** A small file next to each preview records the source's size and date. A quality upgrade from Radarr is redone; an untouched file is skipped.
+- **Skips what's already done.** Each preview is matched to the file it came from. A quality upgrade from Radarr is redone; an untouched file is skipped, even after a remount or a move.
 - **Says why previews don't show.** Setup Health checks each server's settings, explains the ones that stop previews appearing, and offers to fix them one library at a time.
 - **Skip Intro and Skip Credits.** Finds intros and end credits from the file's chapters, online skip databases, the season's theme song or the credit roll itself, then sends the markers to every server. When it isn't sure, it sends nothing instead of a guess.
 
@@ -958,7 +958,7 @@ If that is fast enough, stop here. The built-in needs no extra software.
 - **It uses the GPU.** Decoding and downscaling happen on the GPU. If a file won't decode there, another GPU tries it, then the CPU ([CPU fallback](https://mediapreviewgenerator.dev/guides/#automatic-gpu--cpu-fallback)).
 - **It works on several files at once.** You set up worker groups: a group holds the GPUs and CPU you choose, each with its own worker count and allowed jobs, and the group has its hours.
 - **It works per file, when the file arrives.** Triggers include Sonarr and Radarr webhooks, Plex's own webhook (Plex Pass), a "Recently Added" poll (no Plex Pass), schedules, or a manual pick. See [Previews as soon as Sonarr or Radarr imports a file](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/).
-- **It can use another machine's GPU.** Add that machine as a [worker node](https://mediapreviewgenerator.dev/guides/#remote-nodes), or run the app there with network access to Plex and the Plex data folder mounted read-write.
+- **It can use another machine's GPU.** Add that machine as a [worker node](https://mediapreviewgenerator.dev/remote-nodes/), or run the app there with network access to Plex and the Plex data folder mounted read-write.
 
 Once it is running, set Plex's **Settings → Library → Generate video preview thumbnails** to **Never**, so Plex doesn't do the same work again. Setup steps are in [Generate Plex preview thumbnails with a GPU](https://mediapreviewgenerator.dev/plex-preview-thumbnails-gpu/).
 
@@ -1003,6 +1003,7 @@ It decodes each video with FFmpeg on the GPU and writes the BIF file into Plex's
 - **macOS:** no GPU acceleration under Docker. It runs on CPU, using the native ARM64 image on Apple Silicon.
 - **No GPU:** add a CPU worker group in **Settings → Workers**.
 - **Several GPUs:** add each GPU as a device in a worker group in **Settings → Workers**. A group has a name and hours, and each device in it has a worker count (1–64) and the jobs it may run. **Settings → Processing options → GPU device tuning** lists each detected GPU with its **FFmpeg threads per worker**.
+- **A GPU in another machine:** add that machine as a [worker node](https://mediapreviewgenerator.dev/remote-nodes/).
 
 Details and caveats are in [Getting Started — GPU Acceleration](https://mediapreviewgenerator.dev/getting-started/#gpu-acceleration).
 
@@ -1122,7 +1123,7 @@ Hardware decoding is not a guaranteed win. A Jellyfin core team member [has said
 ## When to move it off Jellyfin
 
 - A large backlog still takes days after tuning.
-- You want the decoding done on another machine ([remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes)) or a different GPU.
+- You want the decoding done on another machine ([remote nodes](https://mediapreviewgenerator.dev/remote-nodes/)) or a different GPU.
 - You want trickplay made per file as soon as Sonarr or Radarr imports it ([how](https://mediapreviewgenerator.dev/sonarr-radarr-preview-thumbnails/)).
 - You also run Plex or Emby on the same files. Media Preview Generator decodes each file once and writes each server's format.
 
@@ -1660,6 +1661,81 @@ Plex's change and loses only the fields the app added, and is left alone if Plex
 
 ---
 
+# Use another machine's GPU for Plex, Emby and Jellyfin previews
+Source: https://mediapreviewgenerator.dev/remote-nodes/
+
+Lend the app another machine's GPU with a worker node, or run a Plex database node beside Plex on Linux or Windows for markers and loudness.
+
+The app doesn't have to run on the machine with the best GPU, or on the one that runs Plex. Add the other machine
+as a **node**. The app stays in charge: it keeps the queue, the schedules, your server tokens and every write to
+your servers. A node runs the heavy step it is handed and sends the result back.
+
+![The Nodes page with two nodes, both Ready: gpu-box, a Linux worker with an NVIDIA GPU, and plex-windows, a Plex database node on Windows](https://mediapreviewgenerator.dev/images/nodes.webp)
+
+## Two kinds of node
+
+- **Worker node:** lends its GPU or CPU for previews, Intro & Credits detection and loudness. Run it on any machine
+  that can read your media. It never gets a server token and writes nothing outside its own temp folder.
+- **Plex database node:** runs on the machine Plex runs on and opens Plex's database there, so a Plex on another
+  machine gets Intro & Credits markers, chapter thumbnails, loudness and Library Health counts. It runs in Docker or
+  natively on Windows.
+
+One container on the Plex machine can be both.
+
+## When you want one
+
+- Your GPU is in a different box from the app, or you have GPUs in more than one machine.
+- Plex runs on a NAS or another server, and you want markers, chapter thumbnails or loudness in it. Previews alone
+  don't need a node: they only need Plex's config folder mounted.
+- Plex is installed on Windows (no Docker). Docker Desktop can't open Plex's database safely through a Windows
+  folder mount, so the Windows node does it beside Plex.
+
+## Set up a worker node
+
+1. On the other machine, start the app's image, the **same tag** as the app, with `MODE=node`. Mount your media
+   read-only and pass the GPU the same way you pass it to the app:
+
+   ```bash
+   docker run -d --name media-preview-node -p 9494:9494 \
+     -e MODE=node -e NODE_NAME=gpu-box -e PUID=1000 -e PGID=1000 \
+     --device /dev/dri:/dev/dri \
+     -v /path/to/media:/media:ro -v /path/to/node/config:/config \
+     stevezzau/media_preview_generator:latest
+   ```
+
+   For NVIDIA, use `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all` instead of `--device /dev/dri:/dev/dri`. The node
+   prints its key once in `docker logs`.
+2. In the app, open **Settings → Nodes → Add node** and enter its address (`http://gpu-box:9494`) and key.
+3. On the node's **Media** tab, map each library's folder to the folder the node sees, and click **Test access**. It
+   checks real files from each library.
+4. In **Settings → Workers**, add the node's GPU or CPU to a worker group. Its devices are listed under the node's
+   name.
+
+Update worker nodes to the same tag whenever you update the app. Until then the node says **Update needed** and gets
+no work.
+
+## Set up a Plex database node
+
+- **Plex in Docker, or on Linux, unRAID or a NAS:** run `ghcr.io/stevezau/plex-marker-agent:1.2.0` beside Plex with
+  Plex's config folder mounted. The [compose file and settings](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/README.md)
+  are in the repository.
+- **Plex installed on Windows:** download `PlexDbNode-windows.zip` from the
+  [Plex database node release](https://github.com/stevezau/media_preview_generator/releases/tag/marker-agent-v1.2.0),
+  unzip it and run `install.ps1` as the Windows user Plex runs as. If Plex runs as a service or starts before anyone
+  signs in, add `-AtStartup`. With the app in Docker Desktop on the same PC, the node's address is
+  `http://host.docker.internal:9494`. See the [Windows node's README](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/windows/README.md).
+
+Then add it under **Settings → Nodes**, and pick it in **Servers → your Plex → Edit → Connection → Plex database**.
+A Plex marker agent you set up before is moved to the Nodes page on upgrade and keeps working.
+
+## More detail
+
+The [Remote nodes guide](https://mediapreviewgenerator.dev/guides/#remote-nodes) covers every node state, updating and removing nodes, one node with
+both roles, and running a node behind a reverse proxy. Environment variables are in the
+[reference](https://mediapreviewgenerator.dev/reference/#nodes).
+
+---
+
 # Guides & Troubleshooting
 Source: https://mediapreviewgenerator.dev/guides/
 
@@ -1899,6 +1975,7 @@ means history could not be fetched. Neither proves that no webhook was sent.
 Open **Settings** (`/settings`). On a wide screen a side menu groups the sections (**Run**, **System**, **Info**) and highlights the one in view; on a phone the same sections are in a picker at the top.
 
 - **Workers** — named groups, job permissions, counts and availability
+- **Nodes** — other machines that lend a GPU or CPU, or open Plex's database (see [Remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes))
 - **Global pause schedule** — weekly windows when all processing pauses
 - **Processing options** — incoming job priority, retry policy, restart recovery, GPU device tuning, library scanning, thumbnails and HDR tone mapping, smart caching across servers
 - **Intro & Credits** — detection settings shared by every server
@@ -2328,6 +2405,8 @@ The dashboard streams live job progress over WebSocket (Flask-SocketIO, `/jobs` 
 
 ## Remote nodes
 
+For what nodes are for and a quick setup, start with [Use another machine's GPU](https://mediapreviewgenerator.dev/remote-nodes/).
+
 A **node** is another machine that helps this app. The app stays in charge: it keeps the queue, the schedules, your
 server tokens and every write to your servers. A node runs one heavy step it is handed and sends the result back.
 
@@ -2394,7 +2473,8 @@ A **Plex database node** only has to be new enough: its Setup Health says when i
 to the one in [`nodes/plex-db/docker-compose.yml`](https://github.com/stevezau/media_preview_generator/blob/dev/nodes/plex-db/docker-compose.yml)
 and run `docker compose pull && docker compose up -d`; its `/config` volume, with the loudness undo record, stays.
 An install from before nodes has no `/config` volume: add `-v plex-db-node-config:/config` (or the compose file's
-`volumes:` line) when you update, or it writes no loudness. On Windows, download the newest release and run its
+`volumes:` line) when you update, or it writes no loudness. On Windows, download `PlexDbNode-windows.zip` from the
+newest [Plex database node release](https://github.com/stevezau/media_preview_generator/releases) and run its
 `install.ps1` again, with the options you installed with (`-Port`, `-PlexConfigDir`): the key stays.
 
 ### Removing a node
@@ -4127,7 +4207,7 @@ a writable output mount or a plugin before it can use the result.
 
 ## Offload preview generation to another machine
 
-The simplest way is a [worker node](https://mediapreviewgenerator.dev/guides/#remote-nodes): the app stays where it is and hands the heavy work to
+The simplest way is a [worker node](https://mediapreviewgenerator.dev/remote-nodes/): the app stays where it is and hands the heavy work to
 the other machine's GPU, which only needs to read your media. The app keeps every write.
 
 The container itself can also run on a separate GPU machine while Plex, Emby or Jellyfin stays on the media
@@ -6873,7 +6953,7 @@ Not with Plex itself: Plex documents no GPU option for this job. Media Preview G
 
 ### How do I make Jellyfin trickplay generation faster?
 
-Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](https://mediapreviewgenerator.dev/guides/#remote-nodes)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](https://mediapreviewgenerator.dev/jellyfin-trickplay-gpu/)
+Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](https://mediapreviewgenerator.dev/remote-nodes/)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](https://mediapreviewgenerator.dev/jellyfin-trickplay-gpu/)
 
 ### Does Emby's thumbnail extraction use the GPU?
 
@@ -6948,6 +7028,8 @@ Yes. The tool can run anywhere that can reach your servers' APIs over the
 network. For Plex you also need access to the Plex config directory (NFS,
 SMB, shared volume, etc.); for Emby/Jellyfin you just need the media files
 visible. See [Networking](https://mediapreviewgenerator.dev/getting-started/#networking) for setup details.
+For Intro & Credits, chapter thumbnails or loudness on a Plex on another
+machine, run a [Plex database node](https://mediapreviewgenerator.dev/remote-nodes/) beside Plex.
 
 ### Does it work with Jellyfin and Emby, not just Plex?
 
@@ -6985,7 +7067,7 @@ Open **Settings → Processing options → GPU device tuning**. It lists each de
 
 ### Can it use more than one GPU?
 
-Yes. In **Settings → Workers**, add each GPU as a device in a worker group and set its worker count. Each group can run on its own hours. **FFmpeg threads per worker** for each GPU is under **Settings → Processing options → GPU device tuning**.
+Yes. In **Settings → Workers**, add each GPU as a device in a worker group and set its worker count. GPUs in other machines can join as [worker nodes](https://mediapreviewgenerator.dev/remote-nodes/). Each group can run on its own hours. **FFmpeg threads per worker** for each GPU is under **Settings → Processing options → GPU device tuning**.
 
 ### Which GPU is best for preview thumbnails?
 

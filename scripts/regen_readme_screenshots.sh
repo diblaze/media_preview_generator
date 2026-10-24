@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# regen_readme_screenshots.sh — regenerate the 5 tour screenshots (docs site and README)
+# regen_readme_screenshots.sh — regenerate the 5 tour screenshots plus the Nodes one (docs site and README)
 # (dark mode, sanitized) and offer to prune stray PNGs at repo root.
 #
 # Usage:
@@ -15,7 +15,7 @@ cd "$(git rev-parse --show-toplevel)"
 PYTHON="${PYTHON:-python3}"
 
 echo "[regen] using $PYTHON"
-echo "[regen] capturing 5 tour screenshots (docs site and README) into docs/images/..."
+echo "[regen] capturing 5 tour screenshots + nodes (docs site and README) into docs/images/..."
 "$PYTHON" tests/e2e/snapshots/regen_readme.py --out docs/images/
 
 echo

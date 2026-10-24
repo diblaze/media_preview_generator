@@ -4,7 +4,10 @@
 # its text) under the body.
 - title: GPU first, CPU when needed
   body: >-
-    NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed in, and a file one GPU can't decode goes to your other GPUs first, then the CPU.
+    NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Add GPUs from other machines as
+    worker nodes. A file one GPU can't decode goes to your other GPUs first, then the CPU.
+  url: /remote-nodes/
+  link: Use another machine's GPU
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>
 - title: Starts per file
   body: >-
@@ -18,8 +21,8 @@
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/></svg>
 - title: Skips what's already done
   body: >-
-    A small file next to each preview records the source's size and date. A quality upgrade from
-    Radarr is redone; an untouched file is skipped.
+    Each preview is matched to the file it came from. A quality upgrade from Radarr is redone; an
+    untouched file is skipped, even after a remount or a move.
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg>
 - title: Says why previews don't show
   body: >-

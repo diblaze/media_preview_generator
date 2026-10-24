@@ -40,7 +40,7 @@ Not with Plex itself: Plex documents no GPU option for this job. Media Preview G
 
 ### How do I make Jellyfin trickplay generation faster?
 
-Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](guides.md#remote-nodes)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](jellyfin-trickplay-gpu.md)
+Start with Jellyfin's own settings: hardware decoding, key-frame-only extraction, and more FFmpeg threads than the default of 1. If it still falls behind, this app can make the trickplay tiles on a GPU, also another machine's ([remote nodes](remote-nodes.md)), and tell Jellyfin about them. [More: Faster Jellyfin trickplay](jellyfin-trickplay-gpu.md)
 
 ### Does Emby's thumbnail extraction use the GPU?
 
@@ -115,6 +115,8 @@ Yes. The tool can run anywhere that can reach your servers' APIs over the
 network. For Plex you also need access to the Plex config directory (NFS,
 SMB, shared volume, etc.); for Emby/Jellyfin you just need the media files
 visible. See [Networking](getting-started.md#networking) for setup details.
+For Intro & Credits, chapter thumbnails or loudness on a Plex on another
+machine, run a [Plex database node](remote-nodes.md) beside Plex.
 
 ### Does it work with Jellyfin and Emby, not just Plex?<a id="does-this-work-with-jellyfin-or-emby"></a>
 
@@ -152,7 +154,7 @@ Open **Settings → Processing options → GPU device tuning**. It lists each de
 
 ### Can it use more than one GPU?<a id="can-i-use-multiple-gpus"></a>
 
-Yes. In **Settings → Workers**, add each GPU as a device in a worker group and set its worker count. Each group can run on its own hours. **FFmpeg threads per worker** for each GPU is under **Settings → Processing options → GPU device tuning**.
+Yes. In **Settings → Workers**, add each GPU as a device in a worker group and set its worker count. GPUs in other machines can join as [worker nodes](remote-nodes.md). Each group can run on its own hours. **FFmpeg threads per worker** for each GPU is under **Settings → Processing options → GPU device tuning**.
 
 ### Which GPU is best for preview thumbnails?<a id="which-gpu-should-i-use"></a>
 

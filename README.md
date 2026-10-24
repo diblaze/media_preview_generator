@@ -69,7 +69,7 @@ a marker in the Inspector.
 
 | One GPU pass per file |
 | --- |
-| ![Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line](docs/images/tour-extract.webp) |
+| ![Workers panel as a table: busy GPU and CPU workers with percent, speed and ETA, idle workers folded into one line, and a worker group on the gpu-box node](docs/images/tour-extract.webp) |
 
 | Each server gets its own format |
 | --- |
@@ -86,7 +86,7 @@ a marker in the Inspector.
 **GPU first, CPU when needed**
 - **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed to the container.
 - **Named worker groups.** Choose each group's devices, their job types and worker counts, and weekly hours. Dashboard +/− changes are saved; reducing capacity lets current files finish. [Worker guide](docs/guides.md#worker-groups-and-availability).
-- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](docs/guides.md#remote-nodes).
+- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](docs/remote-nodes.md).
 - **CPU fallback built in.** A file the GPU can't decode is retried on the CPU by the same worker.
 - **Key-frame skipping.** Jumps between key frames when a file's key-frame spacing allows it.
 

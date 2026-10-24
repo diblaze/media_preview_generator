@@ -64,7 +64,7 @@ _App screenshots come from a test setup with made-up servers; the job titles are
 **GPU first, CPU when needed**
 - **Every GPU you pass in.** NVIDIA, Intel and AMD on Linux; NVIDIA on Windows through WSL2. Choose worker groups for the GPUs passed to the container.
 - **Named worker groups.** Choose each group's devices, their job types and worker counts, and weekly hours. Dashboard +/− changes are saved; reducing capacity lets current files finish. [Worker guide](https://mediapreviewgenerator.dev/guides/#worker-groups-and-availability).
-- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](https://mediapreviewgenerator.dev/guides/#remote-nodes).
+- **Remote nodes.** Lend the app another machine's GPU or CPU, or open Plex's database on the machine Plex runs on (Linux or Windows). The app keeps the queue, tokens and every write. [Nodes guide](https://mediapreviewgenerator.dev/remote-nodes/).
 - **CPU fallback built in.** A file the GPU can't decode is retried on the CPU by the same worker.
 - **Key-frame skipping.** Jumps between key frames when a file's key-frame spacing allows it.
 
