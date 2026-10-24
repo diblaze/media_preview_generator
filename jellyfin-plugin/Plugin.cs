@@ -51,12 +51,8 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 
     /// <inheritdoc />
     public override string Description =>
-        "Lets external preview-generator tools (e.g. Media Preview Generator) " +
-        "register pre-written trickplay tiles with Jellyfin without spawning " +
-        "ffmpeg, and publish Skip Intro / Skip Credits markers as media segments. " +
-        "POST /MediaPreviewBridge/Trickplay/{itemId} after writing tiles to " +
-        "<basename>.trickplay/<width> - <tileW>x<tileH>/<n>.jpg; " +
-        "POST /MediaPreviewBridge/Markers/{itemId} with intro, credits, recap and preview times.";
+        "Shows trickplay previews and Skip Intro / Skip Credits markers made by Media Preview Generator, " +
+        "without Jellyfin reading the file again.";
 
     /// <inheritdoc />
     public IEnumerable<PluginPageInfo> GetPages()
