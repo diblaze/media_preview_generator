@@ -1702,8 +1702,7 @@ class EmbyApiClient(MediaServer):
         # uses ``NameStartsWith`` (B-tree on the indexed Name column,
         # ~10 ms), then enumerates only the matching Series/Movies for a
         # local basename check. Empirical: ~10-20 ms per call vs 30-76 s,
-        # with 100% Id agreement against Pass 1+2 across 22 real paths
-        # (see tools/bench_emby_lookup.py if re-running).
+        # with 100% Id agreement against Pass 1+2 across 22 real paths.
         #
         # Two miss flavours, distinguished by ``definitive_miss``:
         # * ``definitive_miss=True`` — prefix extracted cleanly AND

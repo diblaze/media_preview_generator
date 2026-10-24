@@ -63,7 +63,7 @@ _LIBNVIDIA_GLVKSPIRV_GLOBS = (
 )
 
 # Glob patterns for libEGL_nvidia.so, the library GLVND routes to when
-# NVIDIA's vendor config is present.  Strategy 2c in gpu_detection.py only
+# NVIDIA's vendor config is present.  Strategy 2c in vulkan_probe.py only
 # runs when this library is present (otherwise synthesising a vendor JSON
 # would be pointing at a non-existent target).  Exposed in the diagnostic
 # bundle so users / upstream issue readers can see whether Strategy 2c

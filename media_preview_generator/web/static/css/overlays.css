@@ -52,8 +52,6 @@ html[data-bs-theme="light"] { --ov-panel: #fbfcfd; }
 .ov-interval { display: grid; grid-template-columns: 110px 160px; gap: 8px; }
 .ov-modal .form-control, .ov-modal .form-select { min-height: 40px; border-radius: 9px; }
 .ov-modal textarea.form-control { min-height: 0; font-size: 12.5px; }
-.ov-note { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--inset); color: var(--muted); font-size: 13px; }
-.ov-note > i { margin-top: 2px; color: var(--tk); }
 .ov-empty { padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; text-align: center; color: var(--faint); font-size: 13px; }
 .ov-empty.d-none { display: none; }
 .ov-link { background: none; border: 0; padding: 0; color: var(--accent-text); font-weight: 600; font-size: 13px; cursor: pointer; text-decoration: none; }
@@ -108,7 +106,6 @@ html[data-bs-theme="light"] { --ov-panel: #fbfcfd; }
 .ov-libtop { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 12px; background: var(--inset); border-bottom: 1px solid var(--line); }
 .ov-libtop .ov-hint:empty { display: none; }
 .ov-liblist { max-height: 240px; overflow-y: auto; padding: 4px 6px 8px; }
-.ov-liblist-sm { max-height: 220px; }
 .ov-libbox:has(#jobLibraryAll:checked) .ov-liblist, .ov-libbox:has(#scheduleLibraryAll:checked) .ov-liblist { opacity: 0.55; }
 .ov-lg-h { display: flex; align-items: center; gap: 8px; padding: 10px 6px 4px; font-size: 13px; font-weight: 600; }
 .ov-lg-count { margin-left: auto; color: var(--faint); font-size: 12px; font-weight: 500; }

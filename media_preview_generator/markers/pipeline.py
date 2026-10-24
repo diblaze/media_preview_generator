@@ -1147,13 +1147,6 @@ def _ids_of_known_kind(path_ids: MediaIds, known_kind: str) -> MediaIds:
     return MediaIds(known_kind) if known_kind in ("movie", "episode") else MediaIds()
 
 
-def _stored_ids(store: MarkerStore, rec: FileRecord) -> MediaIds:
-    """The kind another file's own last run decided with, as far as the store knows it (without asking its server)."""
-    path_ids = ids_from_path(rec.canonical_path)
-    known_kind = None if path_ids.is_episode else store.get_server_kind(rec.id)
-    return path_ids if known_kind is None else _ids_of_known_kind(path_ids, known_kind)
-
-
 def _lookup_ids(ids: MediaIds, servers: _ItemServers) -> MediaIds:
     """Complete ids from the server when they lack the imdb id most sources need (same kind only)."""
     if ids.kind in ("movie", "episode") and not ids.imdb:
@@ -3076,7 +3069,7 @@ def _attempt(
         # The episode-only chapter names read the kind from the PATH, not the resolved kind: the path is
         # part of the file's identity, so stored candidates can never disagree with it, while a resolved
         # kind can change under a cache that only re-reads on CHAPTER_RULES_VERSION. Measured cost of the
-        # stricter input: none (evidence/eval/phase4-chapters.md).
+        # stricter input: none.
         ctx.store.replace_evidence(
             rec.id,
             Source.CHAPTERS,

@@ -62,7 +62,7 @@ INTRA_ONLY_SPACING_S = 2.0
 # Codecs whose FFmpeg decoder never reads -skip_frame, so the keyframe pass would decode every frame: VP9's (vp9.c, up
 # to 8.1 and master), which every hwaccel decodes inside. Their packets not flagged as keyframes are dropped before the
 # decoder instead. The other decoders honor it (H.264, HEVC, MPEG-1/2, VC-1, MPEG-4 part 2, VP8, AV1 through dav1d or
-# a hwaccel), measured per codec in phase3-harness.md.
+# a hwaccel), measured per codec.
 SKIP_FRAME_IGNORED = frozenset({"vp9"})
 _Y_BYTES = FRAME_W * FRAME_H
 # Every showinfo line is matched, `pts_time:NOPTS` included: a line that can't be read has to drop its own frame's row,

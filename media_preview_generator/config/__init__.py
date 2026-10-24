@@ -498,8 +498,7 @@ def load_config(*, log_validation_errors: bool = True) -> Config:
     exclude_paths = normalize_exclude_paths(ui_settings.get("exclude_paths"))
 
     # Accept either the modern ``thumbnail_interval`` (vendor-neutral) or the
-    # legacy ``plex_bif_frame_interval`` key. settings_manager and parts of
-    # the bootstrap (run_app.py, migrations) write the legacy key; without
+    # legacy ``plex_bif_frame_interval`` key. settings_manager and migrations write the legacy key; without
     # this fallback those values are silently ignored and the env-var/default
     # wins instead — which is exactly how a 30s clip ends up with 13 frames
     # in a "5s-interval" BIF when a stale .env sets PLEX_BIF_FRAME_INTERVAL=2.

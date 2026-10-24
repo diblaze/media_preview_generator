@@ -275,37 +275,6 @@ def mark_missing_files(store: MarkerStore, paths: Iterable[str], configs: Sequen
     return len(marked)
 
 
-def files_on_disk(
-    paths: Sequence[str], *, limit: int | None = None, budget_s: float = LIST_BUDGET_S
-) -> tuple[list[str], list[str]]:
-    """Which of ``paths`` something is at now, in order, until ``limit`` are found, checking for at most ``budget_s``
-    on a helper thread (a stalled hard-mounted share blocks a stat rather than fail). Never raises.
-
-    Args:
-        paths: Local paths, in the order to check them.
-        limit: Stop once this many are found; None checks them all.
-        budget_s: How long the checks may take in all; paths not checked by then are in neither list.
-
-    Returns:
-        The paths found on disk and the paths checked and not found, each in ``paths`` order.
-    """
-    lock = threading.Lock()
-    present: list[str] = []
-    absent: list[str] = []
-
-    def work(stop: threading.Event) -> None:
-        for path in paths:
-            if stop.is_set() or (limit is not None and len(present) >= limit):
-                return
-            found = _on_disk(path)
-            with lock:
-                (present if found else absent).append(path)
-
-    _within(work, budget_s)
-    with lock:
-        return list(present), list(absent)
-
-
 def sweep_missing_files(
     store: MarkerStore,
     configs: Sequence[ServerConfig],

@@ -405,21 +405,6 @@ def version_tag(canonical_path: str) -> str | None:
     return found.group(1) if found else None
 
 
-def season_of(canonical_path: str) -> tuple[str, str]:
-    """The season a Season job's summary line groups an episode under, and the episode's short name.
-
-    Args:
-        canonical_path: The episode's local path.
-
-    Returns:
-        ``("Rick and Morty (2013) S01", "E01")``; the folder and the file's name when the path has no SxxEyy.
-    """
-    ids = ids_from_path(canonical_path)
-    if ids.is_episode and ids.season is not None and ids.episode is not None:
-        return f"{show_name(canonical_path)} S{ids.season:02d}", f"E{ids.episode:02d}"
-    return _clean(os.path.basename(os.path.dirname(canonical_path))), display_name(canonical_path)
-
-
 def _types(types: Iterable[MarkerType]) -> str:
     chosen = set(types)
     return _and([t.value for t in MarkerType if t in chosen]) if chosen else ""

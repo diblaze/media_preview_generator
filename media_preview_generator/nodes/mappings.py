@@ -215,12 +215,6 @@ def _sample_folders(folders: list[str], budget_s: float, *, limit: int) -> list[
     return samplings
 
 
-def _sample_roots(roots: list[LibraryRoot], budget_s: float) -> dict[LibraryRoot, _Sampling]:
-    """:func:`_sample_folders` for every library folder."""
-    samplings = _sample_folders([root.app_root for root in roots], budget_s, limit=SAMPLES_PER_ROOT)
-    return dict(zip(roots, samplings, strict=True))
-
-
 def _rows_inside(app_root: str, mappings: list[PathMapping]) -> list[str]:
     """The folders of rows inside ``app_root`` but not covering it: a node with only some of a library's folders.
 

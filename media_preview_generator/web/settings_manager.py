@@ -845,35 +845,6 @@ class SettingsManager:
         """Check if Plex authentication is configured."""
         return bool(self.plex_token)
 
-    def validate_plex_token(self) -> bool:
-        """Validate the Plex token by testing connection.
-
-        Returns True if the token is valid and can connect to plex.tv.
-        """
-        if not self.plex_token:
-            return False
-
-        try:
-            import requests
-
-            response = requests.get(
-                "https://plex.tv/api/v2/user",
-                headers={
-                    "X-Plex-Token": self.plex_token,
-                    "Accept": "application/json",
-                },
-                timeout=10,
-            )
-            return response.status_code == 200
-        except Exception as e:
-            logger.warning(
-                "Could not check whether the saved Plex token is still valid ({}: {}). "
-                "If you can't open the dashboard or libraries, re-authenticate via the Setup Wizard.",
-                type(e).__name__,
-                e,
-            )
-            return False
-
     # =========================================================================
     # Client Identifier (for Plex OAuth)
     # =========================================================================

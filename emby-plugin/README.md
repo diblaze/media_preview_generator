@@ -42,7 +42,7 @@ Emby keeps C# property names as they are, so every JSON field is PascalCase, and
 
 | Endpoint | Auth | What it does |
 |---|---|---|
-| `GET /MediaPreviewBridge/Ping` | anonymous | `{"Ok": true, "Version": "1.0.0.0", "Features": ["markers"]}`. Use `Ok` to detect that the plugin is installed. |
+| `GET /MediaPreviewBridge/Ping` | anonymous | `{"Ok": true, "Version": "1.0.0.1", "Features": ["markers"]}`. Use `Ok` to detect that the plugin is installed. |
 | `GET /MediaPreviewBridge/Markers/{Id}` | admin | The item's stored markers as a `MarkersResponse` (`Stored` is 0). |
 | `POST /MediaPreviewBridge/Markers/{Id}` | admin | Replaces the item's stored markers and writes them into Emby's chapters straight away. Returns a `MarkersResponse`; `Stored` is the number of our marker rows the item now shows. |
 | `DELETE /MediaPreviewBridge/Markers/{Id}` | admin | Removes the rows the plugin wrote for the item and its stored markers. Returns a `MarkersResponse` with `Stored` 0. With nothing stored, no row changes. |
@@ -107,27 +107,3 @@ dotnet build -c Release -p:EmbyAbi=4.9    # MediaBrowser.Server.Core 4.9.1.90
 ```
 
 Emby's own assemblies are compile-only references, so `MediaPreviewBridge.Emby.dll` is the only DLL in the build output.
-
-## Catalog submission
-
-Text for the Emby plugin catalog entry. Not submitted yet: the entry needs a forum thread and a developer id from Emby
-staff.
-
-**Name:** Media Preview Bridge for Emby
-
-**Short description:** Adds Skip Intro and Skip Credits markers from Media Preview Generator and keeps them in place.
-
-**Description:** Media Preview Generator detects intros and credits once per file (chapters, online intro databases,
-season audio matching) and sends them to every server that has the file. This plugin gives Emby a small API
-(`/MediaPreviewBridge/Markers/{Id}`, administrators only) that stores those markers per item and writes them as Emby's
-own IntroStart / IntroEnd / CreditsStart chapter markers. The file's own chapters are never changed, and markers from
-Emby's own intro detection or other plugins are replaced only when the app asks. When Emby rebuilds an item's chapters
-it writes them again; when the file is replaced by a different file it stops until the app sends new ones; when the item
-is removed it forgets them. Each version of a video is its own Emby item and gets its own markers. Viewers need Emby
-Premiere on the server to skip intros, as for Emby's own intro detection. No data leaves the server.
-
-**Targets:** Emby Server 4.9 and 4.10 (separate DLLs).
-
-**Source / issues:** https://github.com/stevezau/media_preview_generator (folder `emby-plugin/`).
-
-**Developer:** <owner's Emby forum name — to be filled>

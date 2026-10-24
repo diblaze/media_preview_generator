@@ -437,11 +437,6 @@ def _same_identity_on_disk(path: str, size: int, mtime_ns: int) -> bool:
     return (st.st_size, st.st_mtime_ns) == (size, mtime_ns)
 
 
-def _file_name(path: str | None) -> str:
-    """A path's last part, whichever side wrote it (a server on Windows stores backslashes)."""
-    return (path or "").replace("\\", "/").rsplit("/", 1)[-1]
-
-
 @dataclass(frozen=True)
 class ItemPublishStateRow:
     """What this app last left on one server item (from any file)."""
@@ -1290,148 +1285,6 @@ class MarkerStore:
             ).fetchall()
         return [r["canonical_path"] for r in rows]
 
-    def files_with_older_answers(
-        self,
-        detector: str,
-        *,
-        sources: Iterable[Source],
-        types: Iterable[MarkerType],
-        version: int,
-        version_step: int = 0,
-        checks_others: bool = False,
-    ) -> list[str]:
-        """Canonical paths of the files with an answer stored under ``sources`` from a version older than ``version``
-        that a decision rests on (an unlocked decided type of ``types`` whose marker names one of ``sources``; with
-        ``checks_others``, whatever decided it) or that an undecided type of ``types`` was decided without (no
-        evidence), sorted; files marked missing, and files already taken for ``detector`` at ``version``
-        (``record_version_reruns``), are left out.
-
-        Args:
-            detector: The name its re-runs are recorded under.
-            sources: The sources its answers are stored under.
-            types: The marker types it answers.
-            version: Its version now.
-            version_step: A stored version is compared modulo this; 0 compares it whole (credit text stores the
-                user's window above its version).
-            checks_others: Its answer checks what other sources decided (``versions.AnswerVersion.checks_others``).
-
-        Returns:
-            The paths.
-        """
-        names = [source.value for source in sources]
-        type_names = [mtype.value for mtype in types]
-        in_sources = ",".join("?" * len(names))
-        in_types = ",".join("?" * len(type_names))
-        with self._reading() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT f.canonical_path FROM evidence_versions v "
-                "JOIN files f ON f.id = v.file_id "
-                "JOIN decisions d ON d.file_id = v.file_id "
-                "LEFT JOIN markers m ON m.file_id = d.file_id AND m.type = d.type "
-                "LEFT JOIN version_reruns r ON r.file_id = v.file_id AND r.detector = ? "
-                f"WHERE f.missing_since IS NULL AND v.source IN ({in_sources}) AND d.type IN ({in_types}) "
-                "AND (CASE WHEN ? > 0 THEN v.version % ? ELSE v.version END) < ? "
-                "AND (r.version IS NULL OR r.version < ?) "
-                "AND (d.status IN (?, ?) OR (d.status = ? AND m.locked = 0 AND (? OR EXISTS "
-                f"(SELECT 1 FROM json_each(m.decided_by) WHERE json_each.value IN ({in_sources}))))) "
-                "ORDER BY f.canonical_path",
-                (
-                    detector,
-                    *names,
-                    *type_names,
-                    version_step,
-                    version_step,
-                    version,
-                    version,
-                    LEGACY_NEEDS_REVIEW,
-                    DecisionStatus.NO_EVIDENCE.value,
-                    DecisionStatus.DECIDED.value,
-                    int(checks_others),
-                    *names,
-                ),
-            ).fetchall()
-        return [r["canonical_path"] for r in rows]
-
-    def files_decided_under_older_rules(
-        self, detector: str, version: int, *, carried_by: str | None = None
-    ) -> list[str]:
-        """Canonical paths of the files not recorded as decided under ``version`` of the decision rules (``detector``
-        in ``version_reruns``) with a type those rules could decide differently from what is stored, sorted: an
-        unlocked type with a stored answer of its type, decided, not found (its answers failed a
-        check a rule may have changed) or left to the servers' own markers, or one holding a marker carried over from
-        a replaced file (``carried_by`` among its deciding sources: the carry-over is a rule too); not one whose
-        detection is off. Files marked missing are left out.
-
-        Args:
-            detector: The name the rules' version is recorded under.
-            version: The rules' version now.
-            carried_by: ``Marker.decided_by`` of a carried marker (``carry_over.CARRIED_OVER``); None lists none.
-
-        Returns:
-            The paths.
-        """
-        with self._reading() as conn:
-            rows = conn.execute(
-                "SELECT f.canonical_path, d.status, d.reason FROM decisions d "
-                "JOIN files f ON f.id = d.file_id "
-                "LEFT JOIN markers m ON m.file_id = d.file_id AND m.type = d.type "
-                "LEFT JOIN version_reruns r ON r.file_id = d.file_id AND r.detector = ? "
-                "WHERE f.missing_since IS NULL AND (r.version IS NULL OR r.version < ?) AND COALESCE(m.locked, 0) = 0 "
-                "AND (EXISTS (SELECT 1 FROM evidence e WHERE e.file_id = d.file_id AND e.type = d.type) "
-                "OR EXISTS (SELECT 1 FROM json_each(COALESCE(m.decided_by, '[]')) WHERE json_each.value = ?))",
-                (detector, version, carried_by),
-            ).fetchall()
-        found = {
-            r["canonical_path"]
-            for r in rows
-            if _status(r["status"]) is not DecisionStatus.DISABLED or is_kept_own(DecisionStatus.DISABLED, r["reason"])
-        }
-        return sorted(found)
-
-    def files_on_one_version_items_showing_other_times(self, detector: str, version: int) -> list[str]:
-        """Canonical paths of the files whose one-version Plex item holds, of a type they decided, times of ours other
-        than decided, sorted; files marked missing, and files already taken for ``detector`` at ``version``, are left
-        out. Only a Plex publish records an item's versions (``item_versions``).
-
-        The item's one file has to be this file, by name: a file another one replaced keeps its record of the item,
-        which then shows the new file's times. An item's files are the server's own paths, under another folder than
-        this app's wherever the server has a path mapping, so only the names are compared.
-
-        Args:
-            detector: The name its re-runs are recorded under.
-            version: Its version now.
-
-        Returns:
-            The paths.
-        """
-        with self._reading() as conn:
-            rows = conn.execute(
-                "SELECT f.canonical_path, i.markers_json, m.type, m.start_ms, m.end_ms, "
-                "json_extract(iv.files_json, '$[0]') AS item_file FROM publish_state p "
-                "JOIN files f ON f.id = p.file_id "
-                "JOIN item_publish_state i ON i.server_id = p.server_id AND i.item_id = p.item_id "
-                "JOIN item_versions iv ON iv.server_id = i.server_id AND iv.item_id = i.item_id "
-                "JOIN markers m ON m.file_id = f.id "
-                "LEFT JOIN version_reruns r ON r.file_id = f.id AND r.detector = ? "
-                "WHERE f.missing_since IS NULL AND i.status = 'written' AND json_array_length(iv.files_json) = 1 "
-                "AND (r.version IS NULL OR r.version < ?)",
-                (detector, version),
-            ).fetchall()
-        decided: dict[tuple[str, str], dict[MarkerType, tuple[int, int]]] = {}
-        for r in rows:
-            if _file_name(r["item_file"]) != _file_name(r["canonical_path"]):
-                continue
-            decided.setdefault((r["canonical_path"], r["markers_json"]), {})[MarkerType(r["type"])] = (
-                r["start_ms"],
-                r["end_ms"],
-            )
-        found = set()
-        for (path, markers_json), times in decided.items():
-            for left in self._markers_from_json(markers_json):
-                if left.type in times and times[left.type] != (left.start_ms, left.end_ms):
-                    found.add(path)
-        return sorted(found)
-
     def record_version_reruns(self, entries: Iterable[tuple[str, str, int]]) -> None:
         """Record that files were taken to be read again: ``(canonical_path, detector, version)`` each. A path
         markers.db doesn't know is skipped."""
@@ -1450,31 +1303,6 @@ class MarkerStore:
                 "SELECT version FROM version_reruns WHERE file_id=? AND detector=?", (file_id, detector)
             ).fetchone()
         return int(row["version"]) if row else None
-
-    def files_with_old_empty_lookups(self, sources: Iterable[Source], before: datetime) -> list[str]:
-        """Canonical paths of the files whose stored lookup of any of these online sources found nothing ("no entry")
-        and was made before ``before``, sorted; files marked missing from disk are left out.
-
-        Args:
-            sources: The online sources.
-            before: The time (UTC) such a lookup is older than.
-
-        Returns:
-            The paths; empty when no source is given.
-        """
-        values = [source.value for source in sources]
-        if not values:
-            return []
-        marks = ",".join("?" * len(values))
-        with self._reading() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT f.canonical_path FROM files f JOIN (SELECT file_id FROM evidence "
-                f"WHERE origin='' AND source IN ({marks}) GROUP BY file_id, source "  # noqa: S608
-                "HAVING COUNT(type) = 0 AND MAX(fetched_at) < ?) e ON e.file_id = f.id "
-                "WHERE f.missing_since IS NULL ORDER BY f.canonical_path",
-                (*values, before.isoformat()),
-            ).fetchall()
-        return [r["canonical_path"] for r in rows]
 
     def record_member(
         self,

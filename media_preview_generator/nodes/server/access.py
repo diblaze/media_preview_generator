@@ -72,12 +72,6 @@ def mapped_roots(mappings: list[PathMapping]) -> list[str]:
     return [os.path.realpath(row.node_prefix) for row in mappings]
 
 
-def inside_roots(path: str, mappings: list[PathMapping]) -> bool:
-    """Whether ``path``'s real path is inside one of the mapped roots."""
-    real = os.path.realpath(path)
-    return any(_within(real, root) for root in mapped_roots(mappings))
-
-
 def resolve(app_path: str, size: int | None, mtime_ns: int | None, mappings: list[PathMapping]) -> str:
     """This node's real path for the app's file, after every check.
 
