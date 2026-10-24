@@ -38,7 +38,7 @@ jobs:
 
       # A manual run builds the tag it names, never the branch it was started from; checkout fails if the tag doesn't exist.
       - name: Checkout the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ steps.ver.outputs.tag }}
 
@@ -53,7 +53,7 @@ jobs:
           fi
 
       - name: Setup .NET 9
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "9.0.x"
 
@@ -71,7 +71,7 @@ jobs:
           done
 
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           # The app's update check reads /releases/latest; a plugin release must never become "latest".

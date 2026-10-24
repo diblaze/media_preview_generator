@@ -58,10 +58,10 @@ jobs:
       release_version: ${{ steps.ver.outputs.release_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup .NET ${{ matrix.dotnet }}
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ matrix.dotnet }}
 
@@ -128,7 +128,7 @@ jobs:
           echo "$ZIP → MD5 $CHECKSUM"
 
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: plugin-v${{ steps.ver.outputs.release_version }}
           # A manual run creates the tag; without this GitHub puts it on the default branch's head, not on the

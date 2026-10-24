@@ -49,7 +49,7 @@ jobs:
 
       # A manual run builds the tag it names, never the branch it was started from; checkout fails if the tag doesn't exist.
       - name: Checkout the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0  # setuptools-scm needs full history for the app version baked into the image
@@ -92,7 +92,7 @@ jobs:
       # Its own interpreter, like every other pip-installing job here (ci.yml's lint, gpu-tests.yml): the runner's
       # /usr/bin/python3 is PEP 668 externally-managed, so a bare `pip install` into it errors out.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -129,13 +129,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           # BuildKit's image and Docker Hub base images come through Google's Docker Hub mirror: setup-buildx pulls
           # BuildKit before any login, and anonymous pulls from shared runners hit Docker Hub's rate limit (429).
@@ -145,7 +145,7 @@ jobs:
               mirrors = ["mirror.gcr.io"]
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -153,7 +153,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           # The repository root: the image installs the app's own source, which is what the agent runs.
           context: .
@@ -171,7 +171,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: marker-agent-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
@@ -187,13 +187,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0  # setuptools-scm works the app version out from the tags
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -229,7 +229,7 @@ jobs:
           Compress-Archive -Path "$package/*" -DestinationPath dist/PlexDbNode-windows.zip -Force
 
       - name: Upload the zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: PlexDbNode-windows-zip
           path: dist/PlexDbNode-windows.zip
@@ -242,14 +242,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: marker-agent-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           # BuildKit's image and Docker Hub base images come through Google's Docker Hub mirror: setup-buildx pulls
           # BuildKit before any login, and anonymous pulls from shared runners hit Docker Hub's rate limit (429).
@@ -259,7 +259,7 @@ jobs:
               mirrors = ["mirror.gcr.io"]
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -315,13 +315,13 @@ jobs:
       contents: write
     steps:
       - name: Download the zip
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: PlexDbNode-windows-zip
           path: dist
 
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           make_latest: false

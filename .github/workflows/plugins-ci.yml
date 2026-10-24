@@ -21,8 +21,8 @@ jobs:
           - abi: "12.0"
             dotnet: "10.0.x"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ matrix.dotnet }}
       - name: Build
@@ -37,8 +37,8 @@ jobs:
       matrix:
         abi: ["4.9", "4.10"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "9.0.x"
       - name: Build

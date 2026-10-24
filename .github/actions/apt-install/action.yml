@@ -24,7 +24,7 @@ runs:
         echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
     - id: restore
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ${{ steps.key.outputs.dir }}
         key: apt-debs-${{ steps.key.outputs.pkgs }}-${{ steps.key.outputs.image }}
@@ -48,7 +48,7 @@ runs:
         sudo chown -R "$(id -u):$(id -g)" "$DEBS"
 
     - if: steps.restore.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       # Parallel shards race to save the same key; the losers only log a warning.
       continue-on-error: true
       with:
