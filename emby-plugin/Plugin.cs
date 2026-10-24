@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
+using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 
@@ -13,7 +14,7 @@ namespace MediaPreviewBridge.Emby
     }
 
     /// <summary>Receives Skip Intro / Skip Credits markers and keeps them through Emby's metadata refreshes.</summary>
-    public class Plugin : BasePlugin<PluginConfiguration>
+    public class Plugin : BasePlugin<PluginConfiguration>, IHasThumbImage
     {
         /// <summary>Plugin id; never change it (Emby keys the install on it).</summary>
         public static readonly Guid PluginId = new Guid("8d6c1b3e-2f4a-4c5d-9e7f-0a1b2c3d4e5f");
@@ -40,5 +41,11 @@ namespace MediaPreviewBridge.Emby
 
         /// <summary>Gets the folder holding one JSON file per item with markers.</summary>
         public string MarkerStoreDir => Path.Combine(DataFolderPath, "markers");
+
+        /// <inheritdoc />
+        public ImageFormat ThumbImageFormat => ImageFormat.Png;
+
+        /// <inheritdoc />
+        public Stream GetThumbImage() => GetType().Assembly.GetManifestResourceStream(GetType().Namespace + ".thumb.png");
     }
 }

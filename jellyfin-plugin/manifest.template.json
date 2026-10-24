@@ -6,7 +6,7 @@
         "description": "Companion plugin for Media Preview Generator (https://mediapreviewgenerator.dev). The app makes trickplay thumbnails and finds intros and credits; this plugin hands them to Jellyfin, so scrubbing previews and the Skip Intro and Skip Credits buttons work without Jellyfin reading the file again. Install it only if you use Media Preview Generator.",
         "owner": "stevezau",
         "category": "Media Tools",
-        "imageUrl": "",
+        "imageUrl": "https://raw.githubusercontent.com/stevezau/media_preview_generator/dev/jellyfin-plugin/thumb.png",
         "versions": []
     }
 ]

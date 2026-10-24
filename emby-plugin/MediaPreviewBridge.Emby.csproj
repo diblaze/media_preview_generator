@@ -25,4 +25,9 @@
     <PackageReference Include="MediaBrowser.Server.Core" Version="$(EmbyServerCoreVersion)" ExcludeAssets="runtime" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The plugin catalog's thumbnail, served through IHasThumbImage. -->
+    <EmbeddedResource Include="thumb.png" LogicalName="MediaPreviewBridge.Emby.thumb.png" />
+  </ItemGroup>
+
 </Project>
